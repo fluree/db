@@ -150,7 +150,7 @@ pub use ns_encoding::{
 };
 pub use o_type::{DecodeKind, OType};
 pub use o_type_registry::OTypeRegistry;
-pub use overlay::{NoOverlay, OverlayProvider};
+pub use overlay::{NoOverlay, OverlayProvider, OverlaySegmentMeta};
 pub use prefix_trie::PrefixTrie;
 pub use range::{
     flake_matches_range_eq, range, range_bounded_with_overlay, range_with_overlay, ObjectBounds,

@@ -10,9 +10,17 @@
 use crate::error::LedgerError;
 use crate::LedgerState;
 use fluree_db_core::{Flake, GraphDbRef, GraphId, IndexType, OverlayProvider, Sid};
-use fluree_db_novelty::FlakeId;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+/// Index into [`StagedStore`]'s own contiguous arena.
+///
+/// Independent of `fluree_db_novelty::FlakeId`: `StagedOverlay` is a single-shot,
+/// non-segmented store built once from the staged flakes, so its ids are plain
+/// dense `u32`s over `0..len`. Base-novelty ids (which are now segment-packed and
+/// opaque) flow through `base.novelty.get_flake` separately and never mix with
+/// these.
+type FlakeId = u32;
 
 /// Arena-style storage for staged flakes
 struct StagedStore {
@@ -280,13 +288,13 @@ impl OverlayProvider for StagedLedger {
         // Two-way merge of base novelty slice (already per-graph) + staged slice
         // (filtered by g_id using pre-computed graph IDs)
 
-        let base_slice = self
-            .base
-            .novelty
-            .slice_for_range(g_id, index, first, rhs, leftmost);
         let staged_slice = self.staged.slice_for_range(index, first, rhs, leftmost);
 
-        let mut base_iter = base_slice.iter().map(|&id| self.base.novelty.get_flake(id));
+        // Base side reads `&Flake` directly (no `FlakeId` Vec, no `get_flake`).
+        let mut base_iter = self
+            .base
+            .novelty
+            .range_flakes(g_id, index, first, rhs, leftmost);
         // Filter staged flakes to only those matching the requested graph
         let mut staged_iter = staged_slice
             .iter()

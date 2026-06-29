@@ -6,11 +6,20 @@
 //!
 //! # Design
 //!
-//! - **Arena storage**: Flakes stored once in a central arena, referenced by FlakeId
-//! - **Per-index sorted vectors**: Each index (SPOT, PSOT, POST, OPST) maintains
-//!   a sorted vector of FlakeIds ordered by that index's comparator
-//! - **Batch commit**: Epoch bumps once per commit, not per flake
-//! - **LSM-style merge**: Sort batch by index comparator, then linear merge with existing
+//! - **Append-only segments**: Each graph holds a `Vec<Arc<Segment>>`; every
+//!   commit that touches a graph builds one new immutable [`Segment`] (its own
+//!   flakes + four locally-sorted index orders) and appends it. No merge into a
+//!   growing vector, so per-commit write cost is `O(batch log batch)` rather than
+//!   `O(total novelty)`.
+//! - **k-way merge reads**: Range/scan reads merge the per-graph segments on
+//!   demand in index-comparator order ([`GraphMergeIter`]).
+//! - **Cheap clone**: Segments are `Arc`-wrapped, so cloning a `Novelty`
+//!   (snapshot isolation under concurrent readers / `Arc::make_mut` on the
+//!   commit path) copies only pointers — never the flakes.
+//! - **Batch commit**: Epoch bumps once per commit, not per flake.
+//! - **Set-semantics dedup**: `O(log novelty)` per flake via [`fact_state`]'s
+//!   persistent current-state map (which itself clones in `O(1)`) — not the old
+//!   `O(total novelty)` re-merge.
 //!
 //! # Example
 //!
@@ -55,83 +64,164 @@ pub use stats::current_stats;
 
 use fact_state::NoveltyFactState;
 use fluree_db_core::{Flake, GraphId, IndexType, Sid};
-use rayon::Scope;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
 
-/// Index into FlakeStore - u32 limits to ~4B flakes
-pub type FlakeId = u32;
-
-/// Maximum FlakeId before overflow
-pub const MAX_FLAKE_ID: u32 = u32::MAX - 1;
-
-/// Arena-style storage for flakes
+/// Read-scoped handle to a flake inside the novelty overlay.
 ///
-/// Flakes are stored once and referenced by FlakeId across all 4 indexes.
-#[derive(Default, Clone)]
-pub struct FlakeStore {
-    /// The actual flakes
+/// Packs `(g_id, segment_index, local_index)` into a `u64`. A `FlakeId` is only
+/// valid within the read scope that produced it ([`Novelty::slice_for_range`] /
+/// [`Novelty::iter_index`]) and only against the same [`Novelty`] — segment
+/// indices shift when `apply_commit` / `bulk_apply_commits` / `clear_up_to`
+/// mutate novelty. Do not store it across mutations, serialize it, or do
+/// arithmetic on it; round it straight back to [`Novelty::get_flake`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FlakeId(u64);
+
+impl FlakeId {
+    const LOCAL_BITS: u32 = 24;
+    const SEG_BITS: u32 = 24;
+    // The remaining 16 high bits hold the g_id (GraphId = u16).
+    const LOCAL_MASK: u64 = (1 << Self::LOCAL_BITS) - 1;
+    const SEG_MASK: u64 = (1 << Self::SEG_BITS) - 1;
+
+    #[inline]
+    fn pack(g_id: GraphId, seg: usize, local: u32) -> Self {
+        debug_assert!(
+            seg as u64 <= Self::SEG_MASK,
+            "novelty segment index overflow"
+        );
+        debug_assert!(
+            u64::from(local) <= Self::LOCAL_MASK,
+            "novelty local index overflow"
+        );
+        FlakeId(
+            ((g_id as u64) << (Self::SEG_BITS + Self::LOCAL_BITS))
+                | ((seg as u64) << Self::LOCAL_BITS)
+                | u64::from(local),
+        )
+    }
+
+    #[inline]
+    fn graph(self) -> usize {
+        (self.0 >> (Self::SEG_BITS + Self::LOCAL_BITS)) as usize
+    }
+
+    #[inline]
+    fn seg(self) -> usize {
+        ((self.0 >> Self::LOCAL_BITS) & Self::SEG_MASK) as usize
+    }
+
+    #[inline]
+    fn local(self) -> usize {
+        (self.0 & Self::LOCAL_MASK) as usize
+    }
+}
+
+impl std::fmt::Debug for FlakeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FlakeId(g{} s{} l{})",
+            self.graph(),
+            self.seg(),
+            self.local()
+        )
+    }
+}
+
+/// Maximum flakes a single segment can address (local-index width).
+pub const MAX_SEGMENT_FLAKES: usize = FlakeId::LOCAL_MASK as usize + 1;
+
+/// Maximum segments a single graph can hold before a reindex is required.
+pub const MAX_SEGMENTS: usize = FlakeId::SEG_MASK as usize + 1;
+
+/// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
+/// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
+/// novelty size with only bounded per-merge work (no full-novelty rewrite).
+pub const DEFAULT_TIER_WIDTH: usize = 16;
+
+/// Process-global monotonic source of [`Segment`] ids.
+///
+/// Every distinct segment built in this process gets a unique id, so a
+/// per-segment overlay-translation cache keyed on it never collides across
+/// ledgers, reloads, cloned/diverged `Novelty` values, or derived overlays.
+/// `Arc`-clones share the id; compaction builds new segments with new ids
+/// (orphaning stale cache entries). Internal identity only — not persisted and
+/// not part of the observable novelty contract.
+static NEXT_SEG_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// An immutable, append-only batch of novelty flakes for one graph.
+///
+/// Owns its flakes and four locally-sorted index orders (vectors of local
+/// indices into `flakes`). Segments are `Arc`-wrapped inside [`Novelty`], so
+/// cloning a `Novelty` copies only pointers — never the flakes.
+struct Segment {
+    /// Process-global unique id; stable cache identity (see [`NEXT_SEG_ID`]).
+    seg_id: u64,
     flakes: Vec<Flake>,
-    /// Per-flake size in bytes (for accurate size tracking)
-    sizes: Vec<usize>,
+    spot: Vec<u32>,
+    psot: Vec<u32>,
+    post: Vec<u32>,
+    opst: Vec<u32>,
+    min_t: i64,
+    max_t: i64,
+    size: usize,
 }
 
-impl FlakeStore {
-    /// Create a new empty flake store
-    pub fn new() -> Self {
-        Self::default()
+impl Segment {
+    /// Build a segment from a batch of flakes, sorting the four index orders.
+    ///
+    /// `parallel` uses the rayon pool for each sort — worth it for the large
+    /// single-segment builds in [`Novelty::bulk_apply_commits`], not for the
+    /// small per-commit batches where the pool hand-off would dominate.
+    fn build(flakes: Vec<Flake>, parallel: bool) -> Self {
+        let n = flakes.len();
+        let order_by = |index: IndexType| -> Vec<u32> {
+            let mut v: Vec<u32> = (0..n as u32).collect();
+            if parallel {
+                use rayon::prelude::*;
+                v.par_sort_unstable_by(|&a, &b| {
+                    index.compare(&flakes[a as usize], &flakes[b as usize])
+                });
+            } else {
+                v.sort_unstable_by(|&a, &b| {
+                    index.compare(&flakes[a as usize], &flakes[b as usize])
+                });
+            }
+            v
+        };
+
+        let spot = order_by(IndexType::Spot);
+        let psot = order_by(IndexType::Psot);
+        let post = order_by(IndexType::Post);
+        let opst = order_by(IndexType::Opst);
+
+        let mut min_t = i64::MAX;
+        let mut max_t = i64::MIN;
+        let mut size = 0usize;
+        for f in &flakes {
+            min_t = min_t.min(f.t);
+            max_t = max_t.max(f.t);
+            size += f.size_bytes();
+        }
+
+        Segment {
+            seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            flakes,
+            spot,
+            psot,
+            post,
+            opst,
+            min_t,
+            max_t,
+            size,
+        }
     }
 
-    /// Get a flake by ID
-    pub fn get(&self, id: FlakeId) -> &Flake {
-        &self.flakes[id as usize]
-    }
-
-    /// Get the number of flakes stored
-    pub fn len(&self) -> usize {
-        self.flakes.len()
-    }
-
-    /// Check if the store is empty
-    pub fn is_empty(&self) -> bool {
-        self.flakes.is_empty()
-    }
-
-    /// Push a flake with a precomputed size (avoids double size_bytes)
-    fn push_with_size(&mut self, flake: Flake, size: usize) -> FlakeId {
-        let id = self.flakes.len() as FlakeId;
-        self.sizes.push(size);
-        self.flakes.push(flake);
-        id
-    }
-
-    /// Test helper: push a flake (computes size).
-    #[cfg(test)]
-    fn push(&mut self, flake: Flake) -> FlakeId {
-        let size = flake.size_bytes();
-        self.push_with_size(flake, size)
-    }
-
-    /// Get the size of a flake by ID
-    fn size(&self, id: FlakeId) -> usize {
-        self.sizes[id as usize]
-    }
-}
-
-/// Per-graph sorted index vectors.
-///
-/// Each graph gets its own set of 4 sorted FlakeId vectors (SPOT, PSOT, POST, OPST).
-/// FlakeIds reference the shared `FlakeStore` arena.
-#[derive(Clone, Default)]
-struct GraphIndexVectors {
-    spot: Vec<FlakeId>,
-    psot: Vec<FlakeId>,
-    post: Vec<FlakeId>,
-    opst: Vec<FlakeId>,
-}
-
-impl GraphIndexVectors {
-    fn get_index(&self, index: IndexType) -> &[FlakeId] {
+    #[inline]
+    fn order(&self, index: IndexType) -> &[u32] {
         match index {
             IndexType::Spot => &self.spot,
             IndexType::Psot => &self.psot,
@@ -140,73 +230,245 @@ impl GraphIndexVectors {
         }
     }
 
-    /// Get slice of flake IDs for a leaf's range (binary search).
-    fn slice_for_range(
+    /// The sub-slice of this segment's `index` order covering `(first, rhs]`
+    /// (left-exclusive unless `leftmost`, right-inclusive) — binary search, as
+    /// the pre-segmentation per-graph index vectors did.
+    fn range(
         &self,
-        store: &FlakeStore,
         index: IndexType,
         first: Option<&Flake>,
         rhs: Option<&Flake>,
         leftmost: bool,
-    ) -> &[FlakeId] {
-        let ids = self.get_index(index);
-
+    ) -> &[u32] {
+        let ids = self.order(index);
         if ids.is_empty() {
             return &[];
         }
-
         let start = if leftmost {
             0
         } else if let Some(f) = first {
-            ids.partition_point(|&id| index.compare(store.get(id), f) != Ordering::Greater)
+            ids.partition_point(|&id| {
+                index.compare(&self.flakes[id as usize], f) != Ordering::Greater
+            })
         } else {
             0
         };
-
         let end = if let Some(r) = rhs {
-            ids.partition_point(|&id| index.compare(store.get(id), r) != Ordering::Greater)
+            ids.partition_point(|&id| {
+                index.compare(&self.flakes[id as usize], r) != Ordering::Greater
+            })
         } else {
             ids.len()
         };
-
         if start >= end {
             return &[];
         }
-
         &ids[start..end]
     }
 
-    /// Returns true if all index vectors are empty.
-    fn is_empty(&self) -> bool {
-        self.spot.is_empty() && self.psot.is_empty() && self.post.is_empty() && self.opst.is_empty()
+    /// Zone-map prune: can this segment's `index` order possibly contribute to
+    /// the range `(first, rhs]` (left-exclusive unless `leftmost`)? Compares only
+    /// the segment's min/max key for that order (`ids[0]` / `ids[last]`), so it's
+    /// 0–2 comparisons — far cheaper than the two `partition_point` searches in
+    /// [`Self::range`]. Lets the k-way merge skip non-overlapping segments
+    /// entirely, which collapses point/narrow fan-out when segments are mostly
+    /// disjoint by key (does nothing for full scans or heavily overlapping
+    /// ranges — there is no segment to skip).
+    fn may_overlap(
+        &self,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> bool {
+        let ids = self.order(index);
+        let (Some(&lo), Some(&hi)) = (ids.first(), ids.last()) else {
+            return false;
+        };
+        let seg_min = &self.flakes[lo as usize];
+        let seg_max = &self.flakes[hi as usize];
+        // Entirely above the inclusive upper bound?
+        if let Some(r) = rhs {
+            if index.compare(seg_min, r) == Ordering::Greater {
+                return false;
+            }
+        }
+        // Entirely at/below the exclusive lower bound?
+        if !leftmost {
+            if let Some(f) = first {
+                if index.compare(seg_max, f) != Ordering::Greater {
+                    return false;
+                }
+            }
+        }
+        true
     }
+}
 
-    /// Retain only alive flake IDs across all index vectors.
-    fn retain_alive(&mut self, alive: &[bool]) {
-        self.spot.retain(|&id| alive[id as usize]);
-        self.psot.retain(|&id| alive[id as usize]);
-        self.post.retain(|&id| alive[id as usize]);
-        self.opst.retain(|&id| alive[id as usize]);
+/// One segment's cursor within a [`GraphMergeIter`]: a sub-range of that
+/// segment's index order plus the position reached so far.
+struct MergeStream<'a> {
+    seg_idx: usize,
+    order: &'a [u32],
+    pos: usize,
+    flakes: &'a [Flake],
+}
+
+/// Heap entry for the k-way merge: the current front flake of one stream.
+struct MergeHead<'a> {
+    flake: &'a Flake,
+    stream: usize,
+    seg_idx: usize,
+    index: IndexType,
+}
+
+impl Ord for MergeHead<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap is a max-heap; reverse so the comparator-smallest flake
+        // (older segment on ties) becomes the max and pops first. Tie order
+        // among comparator-equal flakes is not observable in results (identical
+        // flakes are indistinguishable), but is kept deterministic.
+        self.index
+            .compare(self.flake, other.flake)
+            .then_with(|| self.seg_idx.cmp(&other.seg_idx))
+            .reverse()
+    }
+}
+impl PartialOrd for MergeHead<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for MergeHead<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for MergeHead<'_> {}
+
+/// Lazy comparator-ordered k-way merge across one graph's segments for a given
+/// index order and range. Yields `(FlakeId, &Flake)` in fully `index`-sorted
+/// order — the single read primitive every novelty read builds on.
+struct GraphMergeIter<'a> {
+    g_id: GraphId,
+    index: IndexType,
+    streams: Vec<MergeStream<'a>>,
+    heap: BinaryHeap<MergeHead<'a>>,
+}
+
+impl<'a> Iterator for GraphMergeIter<'a> {
+    type Item = (FlakeId, &'a Flake);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let head = self.heap.pop()?;
+        let s = head.stream;
+        let (seg_idx, local, advance) = {
+            let stream = &mut self.streams[s];
+            let local = stream.order[stream.pos];
+            stream.pos += 1;
+            let advance = if stream.pos < stream.order.len() {
+                Some((stream.flakes, stream.order[stream.pos]))
+            } else {
+                None
+            };
+            (stream.seg_idx, local, advance)
+        };
+        let id = FlakeId::pack(self.g_id, seg_idx, local);
+        if let Some((flakes, next_local)) = advance {
+            self.heap.push(MergeHead {
+                flake: &flakes[next_local as usize],
+                stream: s,
+                seg_idx,
+                index: self.index,
+            });
+        }
+        Some((id, head.flake))
+    }
+}
+
+/// A novelty range read yielding `&Flake` with NO `FlakeId` packing.
+///
+/// `Single` is the K=1 fast path: one segment, so iterate its range slice
+/// directly — no heap, no id math, matching the pre-segmentation single-vector
+/// read speed. `Merge` is the K>1 k-way merge. Backs [`Novelty::iter_flakes`] and
+/// `for_each_overlay_flake` (the hot read paths).
+enum FlakeRead<'a> {
+    Done,
+    Single {
+        order: std::slice::Iter<'a, u32>,
+        flakes: &'a [Flake],
+    },
+    Merge(GraphMergeIter<'a>),
+}
+
+impl<'a> Iterator for FlakeRead<'a> {
+    type Item = &'a Flake;
+
+    fn next(&mut self) -> Option<&'a Flake> {
+        match self {
+            FlakeRead::Done => None,
+            // Slice iterator (pointer-bump, no bounds check) keeps the K=1 full
+            // scan close to the old single-vector speed.
+            FlakeRead::Single { order, flakes } => {
+                order.next().map(|&local| &flakes[local as usize])
+            }
+            FlakeRead::Merge(it) => it.next().map(|(_, f)| f),
+        }
+    }
+}
+
+/// A novelty range read yielding packed [`FlakeId`]s, for the compat id callers
+/// (`slice_for_range`, `iter_index`). `Single` is the K=1 fast path (no heap);
+/// it still packs ids because the caller asked for ids. `Merge` is the K>1
+/// k-way merge.
+enum IdRead<'a> {
+    Done,
+    Single {
+        g_id: GraphId,
+        seg_idx: usize,
+        order: std::slice::Iter<'a, u32>,
+    },
+    Merge(GraphMergeIter<'a>),
+}
+
+impl Iterator for IdRead<'_> {
+    type Item = FlakeId;
+
+    fn next(&mut self) -> Option<FlakeId> {
+        match self {
+            IdRead::Done => None,
+            IdRead::Single {
+                g_id,
+                seg_idx,
+                order,
+            } => order
+                .next()
+                .map(|&local| FlakeId::pack(*g_id, *seg_idx, local)),
+            IdRead::Merge(it) => it.next().map(|(id, _)| id),
+        }
     }
 }
 
 /// Novelty overlay - in-memory storage for uncommitted transactions
 ///
-/// Stores flakes in a shared arena with per-graph, per-index sorted vectors
-/// for efficient range queries and merge operations.
+/// Append-only, segmented: each graph holds a `Vec` of immutable `Arc<Segment>`,
+/// one appended per commit that touches the graph. `apply_commit` never merges
+/// into a growing vector — it builds one new segment and pushes it, so per-commit
+/// write cost is `O(batch log batch)` instead of `O(total novelty)`. Reads k-way
+/// merge the segments on demand (see [`GraphMergeIter`]).
 ///
-/// GraphIds are dense small integers, so we use `Vec<Option<GraphIndexVectors>>`
-/// indexed by `g_id as usize` instead of a HashMap.
+/// GraphIds are dense small integers, so graphs are a `Vec<Option<...>>` indexed
+/// by `g_id as usize` instead of a HashMap.
 #[derive(Clone, Default)]
 pub struct Novelty {
-    /// Canonical flake storage (arena), shared across all graphs
-    store: FlakeStore,
+    /// Per-graph append-only segment lists, indexed by g_id.
+    graphs: Vec<Option<Vec<Arc<Segment>>>>,
 
-    /// Per-graph sorted index vectors, indexed by g_id
-    graphs: Vec<Option<GraphIndexVectors>>,
-
-    /// Total size in bytes (for backpressure)
+    /// Total live size in bytes (for backpressure)
     pub size: usize,
+
+    /// Total live flake count (keeps `len`/`is_empty` O(1)).
+    flake_count: usize,
 
     /// Latest transaction time in novelty
     pub t: i64,
@@ -230,23 +492,14 @@ impl Novelty {
     /// Create a new empty novelty overlay
     pub fn new(t: i64) -> Self {
         Self {
-            store: FlakeStore::new(),
             graphs: Vec::new(),
             size: 0,
+            flake_count: 0,
             t,
             epoch: 0,
             attachments: AttachmentNovelty::new(),
             fact_state: NoveltyFactState::new(),
         }
-    }
-
-    /// Ensure the graphs vec has a slot for `g_id`, growing if needed.
-    fn ensure_graph(&mut self, g_id: GraphId) -> &mut GraphIndexVectors {
-        let idx = g_id as usize;
-        if idx >= self.graphs.len() {
-            self.graphs.resize_with(idx + 1, || None);
-        }
-        self.graphs[idx].get_or_insert_with(GraphIndexVectors::default)
     }
 
     /// Resolve a flake's graph ID from its `Flake.g` field.
@@ -262,30 +515,239 @@ impl Novelty {
         }
     }
 
-    /// Validate that a batch can be applied WITHOUT mutating any state.
-    ///
-    /// Checks the two conditions that make [`apply_commit`] fallible — FlakeId
-    /// capacity and graph routability. Callers that mutate a shared/live Novelty
-    /// in place (e.g. via `Arc::make_mut`) call this first to guarantee an
-    /// all-or-nothing apply: if it returns `Ok`, the subsequent `apply_commit`
-    /// cannot fail partway and leave the ledger inconsistent.
-    pub fn can_apply(&self, flakes: &[Flake], reverse_graph: &HashMap<Sid, GraphId>) -> Result<()> {
-        if self.store.len() + flakes.len() > MAX_FLAKE_ID as usize {
+    /// Append a freshly built segment to a graph, growing the graphs vec.
+    fn push_segment(&mut self, g_id: GraphId, seg: Segment) {
+        let idx = g_id as usize;
+        if idx >= self.graphs.len() {
+            self.graphs.resize_with(idx + 1, || None);
+        }
+        self.size += seg.size;
+        self.flake_count += seg.flakes.len();
+        self.graphs[idx]
+            .get_or_insert_with(Vec::new)
+            .push(Arc::new(seg));
+    }
+
+    /// Ensure appending one more segment to `g_id` won't overflow the packed
+    /// [`FlakeId`]'s segment field. Append-only growth (no compaction) makes this
+    /// a real ceiling — a reindex resets novelty well before it. The local-index
+    /// field needs no such runtime guard: per-segment flake counts are already
+    /// bounded by the `MAX_SEGMENT_FLAKES` check in `apply_commit` and by the
+    /// chunking in `set_graph_segments`.
+    fn check_segment_capacity(&self, g_id: GraphId) -> Result<()> {
+        let existing = self
+            .graphs
+            .get(g_id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len);
+        if existing + 1 > MAX_SEGMENTS {
             return Err(NoveltyError::overflow(
-                "FlakeId overflow: too many flakes in novelty, trigger reindex",
+                "novelty segment count exceeds capacity, trigger reindex",
             ));
         }
+        Ok(())
+    }
+
+    /// Replace a graph's segment list with `segs` (chunked so no segment exceeds
+    /// the local-index width). Used by the whole-graph-rebuilding paths.
+    fn set_graph_segments(&mut self, g_id: GraphId, mut flakes: Vec<Flake>, parallel: bool) {
+        let idx = g_id as usize;
+        if idx >= self.graphs.len() {
+            self.graphs.resize_with(idx + 1, || None);
+        }
+        if flakes.is_empty() {
+            self.graphs[idx] = None;
+            return;
+        }
+        let mut segs: Vec<Arc<Segment>> = Vec::new();
+        while flakes.len() > MAX_SEGMENT_FLAKES {
+            let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+            segs.push(Arc::new(Segment::build(flakes, parallel)));
+            flakes = tail;
+        }
+        segs.push(Arc::new(Segment::build(flakes, parallel)));
+        self.graphs[idx] = Some(segs);
+    }
+
+    /// Recompute `size` / `flake_count` from the current segments. Used by the
+    /// whole-graph-replacing paths (`bulk_apply_commits`, `clear_up_to`).
+    fn recompute_totals(&mut self) {
+        let mut size = 0usize;
+        let mut count = 0usize;
+        for segs in self.graphs.iter().flatten() {
+            for seg in segs {
+                size += seg.size;
+                count += seg.flakes.len();
+            }
+        }
+        self.size = size;
+        self.flake_count = count;
+    }
+
+    /// Segments currently held by graph `g_id` (0 if the graph is absent/empty).
+    pub fn segment_count(&self, g_id: GraphId) -> usize {
+        self.graphs
+            .get(g_id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len)
+    }
+
+    /// Largest per-graph segment count across all graphs (the read-fan-out driver).
+    pub fn max_segment_count(&self) -> usize {
+        self.graphs
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Whether any graph holds at least `tier_width` segments in one size class —
+    /// i.e. [`Self::tier_compact`] would do work. Cheap read-path policy hook.
+    pub fn needs_tier_compaction(&self, tier_width: usize) -> bool {
+        if tier_width < 2 {
+            return false;
+        }
+        self.graphs.iter().flatten().any(|segs| {
+            segs.len() >= tier_width && {
+                let mut counts: HashMap<u32, usize> = HashMap::new();
+                for seg in segs {
+                    *counts
+                        .entry(size_class(seg.flakes.len(), tier_width))
+                        .or_default() += 1;
+                }
+                counts.values().any(|&c| c >= tier_width)
+            }
+        })
+    }
+
+    /// Tiered structural compaction (size-leveled): one **bounded** cascade pass —
+    /// merge `tier_width` segments of the lowest full size class into one (class+1)
+    /// and continue strictly upward, each class processed at most once per call.
+    /// **Preserves every flake** (no dedup, no tombstone collapse — stats-safe and
+    /// observationally transparent). Per-call work is
+    /// bounded to one cascade chain (`<= classes` merges of `tier_width`
+    /// segments), so even the first read after a long insert-only burst can't
+    /// stall on a huge backlog. In steady state (compaction keeps pace with
+    /// commits) this converges immediately; a large pre-existing backlog drains
+    /// across subsequent calls. Bounds read fan-out to ~`tier_width ·
+    /// log_tier_width(N)`. `epoch` bumps if anything merged. Returns the merge
+    /// count.
+    pub fn tier_compact(&mut self, tier_width: usize) -> usize {
+        if tier_width < 2 {
+            return 0;
+        }
+        let mut merges = 0;
+        for g in 0..self.graphs.len() {
+            merges += self.tier_compact_graph(g, tier_width);
+        }
+        if merges > 0 {
+            self.recompute_totals();
+            self.epoch += 1;
+        }
+        merges
+    }
+
+    /// One bounded cascade pass for a graph. Starting at the lowest full size
+    /// class, merge **exactly `tier_width`** of its segments into one (yielding
+    /// class+1), then move strictly upward — each class is processed at most once
+    /// per call. This bounds per-merge AND per-call work to one cascade chain
+    /// (`<= number_of_classes` merges of `tier_width` segments), so even the first
+    /// read after a long insert-only burst can't stall on a huge class-0 backlog;
+    /// any remaining backlog drains on subsequent reads.
+    fn tier_compact_graph(&mut self, g: usize, tier_width: usize) -> usize {
+        let mut merges = 0;
+        let mut min_class = 0u32;
+        while let Some(Some(segs)) = self.graphs.get_mut(g) {
+            if segs.len() < tier_width {
+                break;
+            }
+            // Lowest still-unprocessed class that holds a full group.
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for seg in segs.iter() {
+                let class = size_class(seg.flakes.len(), tier_width);
+                if class >= min_class {
+                    *counts.entry(class).or_default() += 1;
+                }
+            }
+            let Some(target_class) = counts
+                .iter()
+                .filter(|&(_, &c)| c >= tier_width)
+                .map(|(&class, _)| class)
+                .min()
+            else {
+                break;
+            };
+
+            // Merge exactly `tier_width` segments of the target class (the first
+            // ones in vec order); keep the rest (including any surplus of this
+            // class, which drains on a later call). `tier_width` class-K segments
+            // sum to class K+1 exactly.
+            let taken = std::mem::take(segs);
+            let mut keep: Vec<Arc<Segment>> = Vec::new();
+            let mut flakes: Vec<Flake> = Vec::new();
+            let mut merged = 0usize;
+            for seg in taken {
+                if merged < tier_width && size_class(seg.flakes.len(), tier_width) == target_class {
+                    match Arc::try_unwrap(seg) {
+                        Ok(s) => flakes.extend(s.flakes),
+                        Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
+                    }
+                    merged += 1;
+                } else {
+                    keep.push(seg);
+                }
+            }
+            // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
+            // set_graph_segments) so a tier merge whose sum
+            // exceeds the local-index width can't silently truncate FlakeIds in
+            // release. (A single class-(K+1) result above the cap becomes a few
+            // segments instead; the cascade handles them on later calls.)
+            while flakes.len() > MAX_SEGMENT_FLAKES {
+                let tail = flakes.split_off(MAX_SEGMENT_FLAKES);
+                keep.push(Arc::new(Segment::build(flakes, true)));
+                flakes = tail;
+            }
+            keep.push(Arc::new(Segment::build(flakes, true)));
+            *segs = keep;
+            merges += 1;
+            // Move up so the lowest class is touched at most once per call.
+            min_class = target_class + 1;
+        }
+        merges
+    }
+
+    /// Validate that a batch can be applied WITHOUT mutating any state.
+    ///
+    /// Checks the two conditions that make [`Self::apply_commit`] fallible —
+    /// per-segment capacity and graph routability. Callers that mutate a
+    /// shared/live Novelty in place (e.g. via `Arc::make_mut`) call this first to
+    /// guarantee an all-or-nothing apply: if it returns `Ok`, the subsequent
+    /// `apply_commit` cannot fail partway and leave the ledger inconsistent.
+    pub fn can_apply(&self, flakes: &[Flake], reverse_graph: &HashMap<Sid, GraphId>) -> Result<()> {
+        if flakes.len() > MAX_SEGMENT_FLAKES {
+            return Err(NoveltyError::overflow(
+                "commit batch exceeds max segment flakes, trigger reindex",
+            ));
+        }
+        // Each touched graph gains at most one segment; guard the packed FlakeId's
+        // segment field. Routing is also the only other fallible step.
+        let mut checked: HashSet<GraphId> = HashSet::new();
         for flake in flakes {
-            Self::resolve_flake_g_id(flake, reverse_graph)?;
+            let g_id = Self::resolve_flake_g_id(flake, reverse_graph)?;
+            if checked.insert(g_id) {
+                self.check_segment_capacity(g_id)?;
+            }
         }
         Ok(())
     }
 
     /// Apply a batch of flakes from a commit, routing each flake to its graph.
     ///
-    /// Epoch bumps ONCE per call, not per flake.
-    /// Each flake is routed to its graph via `reverse_graph`. Unknown graph Sids
-    /// cause an error — no silent fallback to the default graph.
+    /// Append-only: builds one new immutable [`Segment`] per touched graph and
+    /// appends it — no merge into existing storage. Epoch bumps ONCE per call.
+    /// Unknown graph Sids cause an error — no silent fallback to the default
+    /// graph.
     ///
     /// Atomic: graph routing (the only fallible step) is resolved before any
     /// mutation, so an error leaves novelty untouched.
@@ -303,15 +765,15 @@ impl Novelty {
             "novelty_apply_commit",
             commit_t = commit_t,
             flake_count = flakes.len(),
-            rayon_threads = rayon::current_num_threads()
         );
         let _guard = span.enter();
 
-        // Check FlakeId overflow (before any mutation)
-        let new_count = self.store.len() + flakes.len();
-        if new_count > MAX_FLAKE_ID as usize {
+        // A single commit batch becomes at most one segment per graph, so it must
+        // fit a segment's local-index width (astronomically larger than any real
+        // commit — reindex long before this). Checked before any mutation.
+        if flakes.len() > MAX_SEGMENT_FLAKES {
             return Err(NoveltyError::overflow(
-                "FlakeId overflow: too many flakes in novelty, trigger reindex",
+                "commit batch exceeds max segment flakes, trigger reindex",
             ));
         }
 
@@ -326,56 +788,50 @@ impl Novelty {
             routed.push((flake, g_id));
         }
 
+        // Each touched graph gains at most one segment; guard the packed FlakeId's
+        // segment field before any mutation so a capacity error stays atomic.
+        let mut checked: HashSet<GraphId> = HashSet::new();
+        for (_, g_id) in &routed {
+            if checked.insert(*g_id) {
+                self.check_segment_capacity(*g_id)?;
+            }
+        }
+
         // From here on every step is infallible.
         self.t = self.t.max(commit_t);
         self.epoch += 1; // Bump epoch once per commit
 
-        // Store flakes in arena and group by graph.
-        //
-        // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m)
-        // is already **currently asserted** in novelty. This prevents duplicate
-        // facts from accumulating when the same triple is asserted in multiple
-        // commits (e.g., via repeated `insert` calls). Retractions are always
-        // accepted — they're needed to cancel existing assertions.
-        //
-        // This mirrors the dedup logic in the indexer's merge pipeline
-        // (KWayMerge::next_deduped, novelty_merge::merge_novelty) which
-        // deduplicates at index-build time.
-        let mut per_graph: HashMap<GraphId, Vec<FlakeId>> = HashMap::new();
+        // RDF set semantics: skip assertion flakes whose fact (s, p, o, dt, m) is
+        // already **currently asserted** in this graph's novelty window. This
+        // prevents duplicate facts from accumulating when the same triple is
+        // asserted across commits. Retractions are always accepted — they cancel
+        // existing assertions. `fact_state` reflects PRIOR-commit state here (it
+        // is updated only after this loop).
+        let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
         let mut deduped = 0u64;
-        // Capture post-dedup `f:reifies*` flakes so the attachment
-        // overlay observer sees exactly the flakes that landed in the
-        // arena. The reserved-predicate test is a single SID compare —
-        // running it per-flake adds negligible overhead even on
+        // Capture post-dedup `f:reifies*` flakes so the attachment overlay
+        // observer sees exactly the flakes that landed in novelty. The
+        // reserved-predicate test is a single SID compare — negligible even on
         // ledgers that never use annotations.
         let mut accepted_reifies: Vec<Flake> = Vec::new();
-
         for (flake, g_id) in routed {
-            // Set semantics: skip assertions already current in this graph's
-            // novelty window. `fact_state` reflects PRIOR-commit state here (it
-            // is updated only after this loop), matching the previous SPOT-vector
-            // dedup which likewise updated after the batch.
             if flake.op && self.fact_state.is_asserted(g_id, &flake) {
                 deduped += 1;
                 continue;
             }
-
             if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
                 accepted_reifies.push(flake.clone());
             }
-
-            let size = flake.size_bytes();
-            self.size += size;
-            let flake_id = self.store.push_with_size(flake, size);
-            per_graph.entry(g_id).or_default().push(flake_id);
+            per_graph.entry(g_id).or_default().push(flake);
         }
 
         // Record every kept flake (assert + retract) into the current-state
-        // index, per graph in batch order so the latest op per identity wins.
-        // After the keep loop, so within-batch decisions saw only prior state.
-        for (&g_id, ids) in &per_graph {
-            for &id in ids {
-                self.fact_state.record(g_id, self.store.get(id));
+        // index. `record` resolves lifecycle order-independently (highest-t
+        // wins, same-t retract wins), so batch order doesn't matter. After the
+        // keep loop, so within-batch dedup decisions saw only prior state.
+        for (&g_id, batch) in &per_graph {
+            for flake in batch {
+                self.fact_state.record(g_id, flake);
             }
         }
 
@@ -386,112 +842,44 @@ impl Novelty {
             );
         }
 
-        // Update the attachment overlay from the post-dedup set. The
-        // observer skips quietly when no `f:reifies*` flakes are
-        // present — most commits never touch annotations.
+        // Update the attachment overlay from the post-dedup set. The observer
+        // skips quietly when no `f:reifies*` flakes are present — most commits
+        // never touch annotations.
         if !accepted_reifies.is_empty() {
             self.attachments.observe_flakes(&accepted_reifies)?;
         }
 
-        // Ensure all graph slots exist
-        for &g_id in per_graph.keys() {
-            self.ensure_graph(g_id);
-        }
-
-        // Merge each graph's batch into its 4 index vectors
-        let store = &self.store;
-        let parent = tracing::Span::current();
-
-        for (g_id, batch_ids) in &per_graph {
-            let graph_vecs = self.graphs[*g_id as usize]
-                .as_mut()
-                .expect("graph slot ensured above");
-            let (spot, psot, post, opst) = (
-                &mut graph_vecs.spot,
-                &mut graph_vecs.psot,
-                &mut graph_vecs.post,
-                &mut graph_vecs.opst,
-            );
-
-            rayon::scope(|scope: &Scope<'_>| {
-                let parent_spot = parent.clone();
-                scope.spawn(move |_| {
-                    let _p = parent_spot.enter();
-                    merge_batch_into_index(store, spot, batch_ids, IndexType::Spot);
-                });
-                let parent_psot = parent.clone();
-                scope.spawn(move |_| {
-                    let _p = parent_psot.enter();
-                    merge_batch_into_index(store, psot, batch_ids, IndexType::Psot);
-                });
-                let parent_post = parent.clone();
-                scope.spawn(move |_| {
-                    let _p = parent_post.enter();
-                    merge_batch_into_index(store, post, batch_ids, IndexType::Post);
-                });
-                let parent_opst = parent.clone();
-                scope.spawn(move |_| {
-                    let _p = parent_opst.enter();
-                    merge_batch_into_index(store, opst, batch_ids, IndexType::Opst);
-                });
-            });
+        // Build + append one immutable segment per touched graph. No merge into
+        // existing storage — this is the per-commit O(novelty) → O(batch)
+        // collapse. Small per-commit batches sort sequentially (rayon hand-off
+        // would dominate).
+        for (g_id, batch) in per_graph {
+            if batch.is_empty() {
+                continue;
+            }
+            let seg = Segment::build(batch, false);
+            self.push_segment(g_id, seg);
         }
 
         Ok(())
     }
 
-    /// Bulk-apply many commits' flakes in a single pass.
+    /// Bulk-apply many commits' flakes in a single pass (first-load / catch-up).
     ///
-    /// Designed for first-load / catch-up paths (e.g. `LedgerState::load_novelty`
-    /// walking a long commit chain) where calling [`apply_commit`] per commit
-    /// degrades to O(N²) cumulative cost: each call's
-    /// `merge_batch_into_index` is O(target.len() + batch.len()), so over
-    /// `M` commits with average batch `B` it accrues `O(M·N̄)` work, where
-    /// `N̄` is the running novelty size.
-    ///
-    /// This method instead:
+    /// Designed for paths like `LedgerState::load_novelty` walking a long commit
+    /// chain. Rather than one segment per commit, it:
     /// 1. Routes every flake into a per-graph bucket in one ingest pass.
-    /// 2. Sorts each graph's flakes once (parallel) by an identity-then-t
-    ///    key (`s, p, o, dt, m, t, op`).
-    /// 3. Walks each `(s, p, o, dt, m)` group linearly to apply set
-    ///    semantics — assertion is dropped iff the prior kept flake for the
-    ///    same identity was also an assertion (mirroring
-    ///    [`apply_commit`]'s `fact_currently_asserted_in_graph` skip rule);
-    ///    retractions are always kept.
-    /// 4. Re-sorts the deduped set into the 4 index orders (SPOT, PSOT,
-    ///    POST, OPST) once each.
+    /// 2. Folds in any pre-existing segments for each touched graph, sorts the
+    ///    combined set once (parallel) by identity-then-t (`s, p, o, dt, m, t,
+    ///    op`), and walks each `(s, p, o, dt, m)` group to apply set semantics
+    ///    (drop an assertion whose prior kept flake for the same identity was
+    ///    also an assertion; retractions always kept).
+    /// 3. Emits ONE consolidated [`Segment`] per graph (good read locality for
+    ///    freshly loaded novelty), replacing that graph's segment list.
     ///
-    /// Total cost is `O(N log N)` over the merged set instead of `O(N²)` —
-    /// for a 787-commit / ~7M-flake chain this drops the catch-up from
-    /// minutes to seconds on Lambda single-CPU.
-    ///
-    /// Existing graph contents (if any) are preserved by merging their
-    /// alive `FlakeId`s into the dedup pass alongside the incoming batches,
-    /// so the post-condition matches what a sequential per-commit
-    /// `apply_commit` chain would have produced — minus retraction-noise
-    /// duplicates that the per-commit path never emits anyway.
-    ///
-    /// `epoch` bumps once per call, regardless of how many commits were
-    /// merged. `t` advances to `max(self.t, max_commit_t)`.
-    ///
-    /// # Memory contract — differs from [`apply_commit`]
-    ///
-    /// Unlike [`apply_commit`] (which checks `fact_currently_asserted_in_graph`
-    /// **before** pushing into the arena, so deduped duplicates never enter
-    /// the [`FlakeStore`]), this method pushes every incoming flake into the
-    /// arena in Phase 1 and only drops `FlakeId`s during the post-sort
-    /// dedup walk. The underlying `Flake` records and their per-flake
-    /// sizes remain in [`FlakeStore::flakes`] / `FlakeStore::sizes` for
-    /// the lifetime of the [`Novelty`], and `self.size` (the
-    /// backpressure-relevant total) accounts for them.
-    ///
-    /// For the design call site (one fresh-load chain walk feeding an
-    /// otherwise-empty arena, after which the [`Novelty`] is consumed and
-    /// dropped), this bloat is bounded and operationally negligible — the
-    /// dedup count is logged at the end of every call so the cost stays
-    /// observable. **Do not wire this into hot-path mutation code without
-    /// either redesigning the dedup to gate `push_with_size` or adding a
-    /// post-walk arena rebuild.**
+    /// Total cost is `O(N log N)` over the merged set. `epoch` bumps once per
+    /// call; `t` advances to `max(self.t, max_commit_t)`. The post-condition
+    /// matches a sequential per-commit `apply_commit` chain.
     pub fn bulk_apply_commits<I>(
         &mut self,
         commit_batches: I,
@@ -510,34 +898,19 @@ impl Novelty {
 
         let started = std::time::Instant::now();
 
-        // ---- Phase 1: ingest into arena, partition by graph ----
-        let mut per_graph: HashMap<GraphId, Vec<FlakeId>> = HashMap::new();
+        // ---- Phase 1: partition incoming flakes by graph ----
+        let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
         let mut max_t = self.t;
         let mut commit_count: u64 = 0;
         let mut total_flakes: usize = 0;
 
         for (flakes, commit_t) in commit_batches {
-            if flakes.is_empty() {
-                commit_count += 1;
-                max_t = max_t.max(commit_t);
-                continue;
-            }
-            let new_count = self.store.len() + flakes.len();
-            if new_count > MAX_FLAKE_ID as usize {
-                return Err(NoveltyError::overflow(
-                    "FlakeId overflow during bulk apply: too many flakes in novelty, trigger reindex",
-                ));
-            }
             commit_count += 1;
-            total_flakes += flakes.len();
             max_t = max_t.max(commit_t);
-
+            total_flakes += flakes.len();
             for flake in flakes {
                 let g_id = Self::resolve_flake_g_id(&flake, reverse_graph)?;
-                let size = flake.size_bytes();
-                self.size += size;
-                let id = self.store.push_with_size(flake, size);
-                per_graph.entry(g_id).or_default().push(id);
+                per_graph.entry(g_id).or_default().push(flake);
             }
         }
 
@@ -547,120 +920,97 @@ impl Novelty {
             return Ok(());
         }
 
-        // Ensure graph slots so we can take existing index vectors.
-        for &g_id in per_graph.keys() {
-            self.ensure_graph(g_id);
-        }
-
-        // ---- Phase 2: per-graph dedup + 4-index sort ----
-        let store = &self.store;
+        // ---- Phase 2: per-graph fold-in existing + dedup + single segment ----
         let mut total_dedup: u64 = 0;
 
-        for (g_id, mut new_ids) in per_graph {
-            // Pull in the graph's existing alive FlakeIds (any prior
-            // novelty content) so the dedup pass sees the full universe.
-            // SPOT/PSOT/POST/OPST have identical alive sets (apply_commit
-            // pushes the same batch_ids to all four), so taking SPOT is
-            // the canonical choice.
-            let graph_vecs = self.graphs[g_id as usize]
-                .as_mut()
-                .expect("ensure_graph above");
-            let existing_spot = std::mem::take(&mut graph_vecs.spot);
-            // Other indexes get rebuilt below; clear them so we don't
-            // double-count if the dedup walk drops some.
-            graph_vecs.psot.clear();
-            graph_vecs.post.clear();
-            graph_vecs.opst.clear();
+        for (g_id, mut new_flakes) in per_graph {
+            // Fold in any existing segments for this graph so the dedup pass sees
+            // the full universe, then replace them with one consolidated segment.
+            let mut combined: Vec<Flake> = Vec::new();
+            if let Some(slot) = self.graphs.get_mut(g_id as usize) {
+                if let Some(segs) = slot.take() {
+                    for seg in segs {
+                        match Arc::try_unwrap(seg) {
+                            Ok(s) => combined.extend(s.flakes),
+                            Err(shared) => combined.extend(shared.flakes.iter().cloned()),
+                        }
+                    }
+                }
+            }
+            combined.append(&mut new_flakes);
 
-            let mut combined = existing_spot;
-            combined.append(&mut new_ids);
-
-            // Sort by (s, p, o, dt, m, t, op) so each (s, p, o, dt, m)
-            // identity forms a contiguous t-ascending run.
-            combined.par_sort_unstable_by(|&a, &b| {
-                let fa = store.get(a);
-                let fb = store.get(b);
-                fa.s.cmp(&fb.s)
-                    .then_with(|| fa.p.cmp(&fb.p))
-                    .then_with(|| cmp_object(fa, fb))
-                    .then_with(|| cmp_meta(fa, fb))
-                    .then_with(|| fa.t.cmp(&fb.t))
-                    .then_with(|| fa.op.cmp(&fb.op))
+            // Sort by (s, p, o, dt, m, t, op) so each identity forms a contiguous
+            // t-ascending run.
+            combined.par_sort_unstable_by(|a, b| {
+                a.s.cmp(&b.s)
+                    .then_with(|| a.p.cmp(&b.p))
+                    .then_with(|| cmp_object(a, b))
+                    .then_with(|| cmp_meta(a, b))
+                    .then_with(|| a.t.cmp(&b.t))
+                    .then_with(|| a.op.cmp(&b.op))
             });
 
-            // Linear set-semantics dedup: for each (s, p, o, dt, m)
-            // identity group, walk in ascending t and drop any assertion
-            // whose prior kept flake for the same identity was also an
-            // assertion. Retractions are always kept.
-            let mut kept: Vec<FlakeId> = Vec::with_capacity(combined.len());
-            let mut group_start = 0usize;
-            while group_start < combined.len() {
-                let head = store.get(combined[group_start]);
-                let mut group_end = group_start + 1;
-                while group_end < combined.len() {
-                    let f = store.get(combined[group_end]);
-                    if !same_identity(head, f) {
-                        break;
+            // Linear set-semantics dedup walk over the identity-sorted, owned
+            // flakes. Mirrors the per-commit fact_state skip rule exactly:
+            // retractions always kept; an assertion is dropped iff the prior kept
+            // flake for the same identity was also an assertion.
+            let mut kept: Vec<Flake> = Vec::with_capacity(combined.len());
+            let mut iter = combined.into_iter();
+            let mut current = iter.next();
+            while let Some(head) = current {
+                // First flake of an identity group is always kept.
+                let mut asserted = head.op;
+                kept.push(head);
+                loop {
+                    match iter.next() {
+                        Some(f) => {
+                            // `kept.last()` is this group's most recent kept flake
+                            // (identities are contiguous after the sort).
+                            if same_identity(kept.last().expect("just pushed"), &f) {
+                                if !f.op {
+                                    kept.push(f);
+                                    asserted = false;
+                                } else if !asserted {
+                                    kept.push(f);
+                                    asserted = true;
+                                } else {
+                                    total_dedup += 1;
+                                }
+                            } else {
+                                current = Some(f);
+                                break;
+                            }
+                        }
+                        None => {
+                            current = None;
+                            break;
+                        }
                     }
-                    group_end += 1;
                 }
-                let mut currently_asserted = false;
-                for &id in &combined[group_start..group_end] {
-                    let f = store.get(id);
-                    if !f.op {
-                        kept.push(id);
-                        currently_asserted = false;
-                    } else if !currently_asserted {
-                        kept.push(id);
-                        currently_asserted = true;
-                    } else {
-                        total_dedup += 1;
-                    }
-                }
-                group_start = group_end;
             }
 
-            // Capture `f:reifies*` flakes from the kept set for the
-            // attachment overlay observer (cheap clone, rare relative to
-            // data flakes), and maintain the current-state fact index so
-            // later apply_commit calls dedup against bulk-loaded facts.
-            // `kept` is in (s,p,o,dt,m,t,op) order, so the last record per
-            // identity is its highest-t (latest) op.
+            // Maintain the current-state index so later apply_commit calls dedup
+            // against bulk-loaded facts, and capture `f:reifies*` flakes for the
+            // attachment overlay observer (cheap clone, rare relative to data
+            // flakes). `kept` is in (s,p,o,dt,m,t,op) order, so the last record
+            // per identity is its highest-t (latest) op.
             let mut accepted_reifies: Vec<Flake> = Vec::new();
-            for &id in &kept {
-                let f = store.get(id);
-                if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
-                    accepted_reifies.push(f.clone());
+            for flake in &kept {
+                if fluree_db_core::namespaces::is_reserved_reifies_predicate(&flake.p) {
+                    accepted_reifies.push(flake.clone());
                 }
-                self.fact_state.record(g_id, f);
+                self.fact_state.record(g_id, flake);
             }
 
-            // Build the 4 sorted index vectors from the deduped set. Each
-            // sort is independently O(N log N); kept.clone() copies only
-            // the small `FlakeId` (u32) array, not the underlying flakes.
-            let mut spot = kept.clone();
-            spot.par_sort_unstable_by(|&a, &b| IndexType::Spot.compare(store.get(a), store.get(b)));
-            let mut psot = kept.clone();
-            psot.par_sort_unstable_by(|&a, &b| IndexType::Psot.compare(store.get(a), store.get(b)));
-            let mut post = kept.clone();
-            post.par_sort_unstable_by(|&a, &b| IndexType::Post.compare(store.get(a), store.get(b)));
-            let mut opst = kept;
-            opst.par_sort_unstable_by(|&a, &b| IndexType::Opst.compare(store.get(a), store.get(b)));
+            // Replace the graph with one consolidated segment (chunked only if it
+            // somehow exceeds the local-index width).
+            self.set_graph_segments(g_id, kept, true);
 
-            let graph_vecs = self.graphs[g_id as usize]
-                .as_mut()
-                .expect("ensure_graph above");
-            graph_vecs.spot = spot;
-            graph_vecs.psot = psot;
-            graph_vecs.post = post;
-            graph_vecs.opst = opst;
-
-            // Update attachment overlay after the per-graph batch is
-            // committed. Malformed bundles are skipped + warned +
-            // counted on `attachments.observed_malformed_bundle_count`
-            // (see `AttachmentNovelty::observe_flakes`); the
-            // `Result` only fails on infrastructure-level errors,
-            // which `?` propagates here.
+            // Update attachment overlay after the per-graph batch is committed.
+            // Malformed bundles are skipped + warned + counted on
+            // `attachments.observed_malformed_bundle_count` (see
+            // `AttachmentNovelty::observe_flakes`); `?` only propagates
+            // infrastructure-level errors.
             if !accepted_reifies.is_empty() {
                 self.attachments.observe_flakes(&accepted_reifies)?;
             }
@@ -668,6 +1018,7 @@ impl Novelty {
 
         self.t = max_t;
         self.epoch += 1;
+        self.recompute_totals();
 
         tracing::debug!(
             commits = commit_count,
@@ -680,118 +1031,295 @@ impl Novelty {
         Ok(())
     }
 
-    /// Clear flakes with t <= cutoff_t (after index merge)
+    /// Clear flakes with t <= cutoff_t (after an index merge publishes them).
     ///
-    /// Uses bitmap instead of HashSet for cache-friendly O(n) clear.
+    /// Segments entirely at/below the cutoff are dropped wholesale; segments
+    /// entirely above are kept untouched; a straddling segment is rebuilt from
+    /// its surviving flakes.
     ///
     /// Note: In the standard Fluree indexing flow, Novelty is replaced entirely
-    /// after each index rebuild rather than mutated in-place. This method exists
-    /// for completeness but is rarely needed.
+    /// after each index rebuild rather than mutated in-place, so this is rarely
+    /// the hot path.
     pub fn clear_up_to(&mut self, cutoff_t: i64) {
-        let n = self.store.len();
-        if n == 0 {
+        if self.flake_count == 0 {
             return;
         }
 
-        // Build alive bitmap and compute new size
-        let mut alive = vec![false; n];
-        let mut new_size = 0usize;
-
-        for (i, is_alive) in alive.iter_mut().enumerate() {
-            let flake = self.store.get(i as FlakeId);
-            if flake.t > cutoff_t {
-                *is_alive = true;
-                new_size += self.store.size(i as FlakeId);
-            }
-        }
-
-        // Retain only alive flakes in each graph's index vectors
         for slot in &mut self.graphs {
-            if let Some(graph_vecs) = slot {
-                graph_vecs.retain_alive(&alive);
-                if graph_vecs.is_empty() {
-                    *slot = None;
+            let Some(segs) = slot.as_mut() else { continue };
+            let mut kept: Vec<Arc<Segment>> = Vec::with_capacity(segs.len());
+            for seg in segs.drain(..) {
+                if seg.max_t <= cutoff_t {
+                    continue; // entirely stale
                 }
+                if seg.min_t > cutoff_t {
+                    kept.push(seg); // entirely fresh
+                    continue;
+                }
+                // Straddling: rebuild from survivors.
+                let survivors: Vec<Flake> = seg
+                    .flakes
+                    .iter()
+                    .filter(|f| f.t > cutoff_t)
+                    .cloned()
+                    .collect();
+                if !survivors.is_empty() {
+                    kept.push(Arc::new(Segment::build(survivors, false)));
+                }
+            }
+            if kept.is_empty() {
+                *slot = None;
+            } else {
+                *slot = Some(kept);
             }
         }
 
-        // Update size
-        self.size = new_size;
+        self.recompute_totals();
 
-        // Rebuild the current-state index from surviving flakes. SPOT order is
-        // ascending-t within an identity, so the last record per identity wins.
-        self.fact_state = NoveltyFactState::new();
-        for (g, slot) in self.graphs.iter().enumerate() {
-            if let Some(gv) = slot {
-                for &id in &gv.spot {
-                    self.fact_state.record(g as GraphId, self.store.get(id));
+        // Rebuild the current-state index from survivors. Per graph, record in
+        // SPOT order (t-ascending within an identity) so the latest op wins.
+        // slice_for_range returns an owned Vec, so the &self borrow ends before
+        // the &mut fact_state writes.
+        let mut fs = NoveltyFactState::new();
+        for g in 0..self.graphs.len() {
+            if self.graphs[g].as_ref().is_some_and(|s| !s.is_empty()) {
+                let ids = self.slice_for_range(g as GraphId, IndexType::Spot, None, None, true);
+                for id in ids {
+                    fs.record(g as GraphId, self.get_flake(id));
                 }
             }
         }
+        self.fact_state = fs;
 
         self.epoch += 1;
     }
 
-    /// Get slice of flake IDs for a specific graph's leaf range.
-    ///
-    /// Returns `&[]` if the graph has no novelty.
-    ///
-    /// Uses binary search for O(log n + k) slicing.
-    ///
-    /// Semantics:
-    /// - If leftmost=false: left boundary is EXCLUSIVE (> first)
-    /// - If leftmost=true: no left boundary
-    /// - rhs is INCLUSIVE when present
-    pub fn slice_for_range(
+    /// Comparator-ordered k-way merge over one graph's segments for `index` and
+    /// the given range. The single primitive all reads build on.
+    fn graph_merge(
         &self,
         g_id: GraphId,
         index: IndexType,
         first: Option<&Flake>,
         rhs: Option<&Flake>,
         leftmost: bool,
-    ) -> &[FlakeId] {
-        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
-            Some(graph_vecs) => {
-                graph_vecs.slice_for_range(&self.store, index, first, rhs, leftmost)
+    ) -> GraphMergeIter<'_> {
+        // Upper-bounded by the graph's segment count (some may zone-map prune),
+        // so size both up front to avoid reallocation churn on the K>1 read path.
+        let cap = self
+            .graphs
+            .get(g_id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len);
+        let mut streams: Vec<MergeStream<'_>> = Vec::with_capacity(cap);
+        let mut heap: BinaryHeap<MergeHead<'_>> = BinaryHeap::with_capacity(cap);
+        if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
+            for (seg_idx, seg) in segs.iter().enumerate() {
+                // Zone-map prune: skip segments whose key range can't intersect
+                // (first, rhs] without paying for the binary search.
+                if !seg.may_overlap(index, first, rhs, leftmost) {
+                    continue;
+                }
+                let order = seg.range(index, first, rhs, leftmost);
+                if order.is_empty() {
+                    continue;
+                }
+                let stream = streams.len();
+                heap.push(MergeHead {
+                    flake: &seg.flakes[order[0] as usize],
+                    stream,
+                    seg_idx,
+                    index,
+                });
+                streams.push(MergeStream {
+                    seg_idx,
+                    order,
+                    pos: 0,
+                    flakes: &seg.flakes,
+                });
             }
-            None => &[],
+        }
+        GraphMergeIter {
+            g_id,
+            index,
+            streams,
+            heap,
         }
     }
 
-    /// Get flake reference by ID
-    pub fn get_flake(&self, id: FlakeId) -> &Flake {
-        self.store.get(id)
+    /// Graph ids (ascending) that currently hold at least one non-empty segment.
+    fn present_graphs(&self) -> Vec<GraphId> {
+        (0..self.graphs.len())
+            .filter(|&g| self.graphs[g].as_ref().is_some_and(|s| !s.is_empty()))
+            .map(|g| g as GraphId)
+            .collect()
     }
 
-    /// Get the number of flakes in novelty
-    pub fn len(&self) -> usize {
-        self.store.len()
+    /// Range read over one graph yielding `&Flake`. K=1 takes the no-heap,
+    /// no-id-packing fast path (direct segment iteration ≈ old single-vector
+    /// speed); K>1 uses the k-way merge.
+    fn read_flakes(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> FlakeRead<'_> {
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) if segs.len() == 1 => {
+                let seg = &segs[0];
+                if seg.may_overlap(index, first, rhs, leftmost) {
+                    FlakeRead::Single {
+                        order: seg.range(index, first, rhs, leftmost).iter(),
+                        flakes: &seg.flakes,
+                    }
+                } else {
+                    FlakeRead::Done
+                }
+            }
+            Some(segs) if !segs.is_empty() => {
+                FlakeRead::Merge(self.graph_merge(g_id, index, first, rhs, leftmost))
+            }
+            _ => FlakeRead::Done,
+        }
     }
 
-    /// Check if novelty is empty
-    pub fn is_empty(&self) -> bool {
-        self.store.is_empty()
+    /// Range read over one graph yielding packed [`FlakeId`]s (compat id path).
+    /// K=1 takes the no-heap fast path; K>1 uses the k-way merge.
+    fn read_ids(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> IdRead<'_> {
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) if segs.len() == 1 => {
+                let seg = &segs[0];
+                if seg.may_overlap(index, first, rhs, leftmost) {
+                    IdRead::Single {
+                        g_id,
+                        seg_idx: 0,
+                        order: seg.range(index, first, rhs, leftmost).iter(),
+                    }
+                } else {
+                    IdRead::Done
+                }
+            }
+            Some(segs) if !segs.is_empty() => {
+                IdRead::Merge(self.graph_merge(g_id, index, first, rhs, leftmost))
+            }
+            _ => IdRead::Done,
+        }
     }
 
-    /// Iterate over all flake IDs for a given index across ALL graphs.
+    /// Get the ordered flake IDs for a graph's leaf range. Returns an owned `Vec`
+    /// — there is no single backing slice once novelty is segmented; callers only
+    /// `.iter()` it. Prefer [`Self::iter_flakes`] / `for_each_overlay_flake` for
+    /// new code so no ids are materialized.
     ///
-    /// Used by stats collection which needs the full picture regardless of graph.
+    /// **The returned [`FlakeId`]s are read-scoped**: they encode `(graph, seg,
+    /// local)` against the *current* segment layout. Any mutation that rebuilds
+    /// segments — [`Self::clear_up_to`], [`Self::tier_compact`],
+    /// [`Self::bulk_apply_commits`] — invalidates them, after which
+    /// [`Self::get_flake`] may panic or resolve a different flake. Resolve every
+    /// id (via `get_flake`) before the next mutation.
+    ///
+    /// Semantics:
+    /// - If leftmost=false: left boundary is EXCLUSIVE (> first)
+    /// - If leftmost=true: no left boundary
+    /// - rhs is INCLUSIVE when present
+    ///
+    /// Crate-internal: the owned ids it returns are read-scoped (see
+    /// [`Self::get_flake`]). External readers use [`Self::range_flakes`].
+    #[must_use]
+    pub(crate) fn slice_for_range(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Vec<FlakeId> {
+        self.read_ids(g_id, index, first, rhs, leftmost).collect()
+    }
+
+    /// Range read over one graph yielding `&Flake` directly — the borrow-friendly
+    /// counterpart to [`Self::slice_for_range`]. Prefer this when the caller only
+    /// iterates flakes: it materializes no [`FlakeId`] `Vec` and skips the
+    /// per-id [`Self::get_flake`] indirection. K=1 takes the no-heap fast path;
+    /// K>1 uses the k-way merge. Same comparator order and boundary semantics as
+    /// [`Self::slice_for_range`].
+    pub fn range_flakes(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> impl Iterator<Item = &Flake> + '_ {
+        self.read_flakes(g_id, index, first, rhs, leftmost)
+    }
+
+    /// Resolve a [`FlakeId`] produced by this novelty back to its flake.
+    ///
+    /// Crate-internal on purpose: a `FlakeId` is read-scoped (it encodes the
+    /// current segment layout), so resolving one after a segment-rebuilding
+    /// mutation would panic or return the wrong flake. Keeping the resolver
+    /// `pub(crate)` makes that hazard unreachable from other crates — external
+    /// readers use the borrow-safe [`Self::range_flakes`] / [`Self::iter_flakes`]
+    /// / `for_each_overlay_flake` which yield `&Flake` directly.
+    pub(crate) fn get_flake(&self, id: FlakeId) -> &Flake {
+        let segs = self.graphs[id.graph()]
+            .as_ref()
+            .expect("FlakeId references a live graph");
+        &segs[id.seg()].flakes[id.local()]
+    }
+
+    /// Get the number of live flakes in novelty.
+    pub fn len(&self) -> usize {
+        self.flake_count
+    }
+
+    /// Check if novelty holds no flakes.
+    pub fn is_empty(&self) -> bool {
+        self.flake_count == 0
+    }
+
+    /// Iterate all flake IDs for `index` across ALL graphs, comparator-ordered
+    /// per graph. IDs are read-scoped — they encode the current segment layout,
+    /// so any segment-rebuilding mutation ([`Self::clear_up_to`],
+    /// [`Self::tier_compact`], [`Self::bulk_apply_commits`]) invalidates them;
+    /// resolve via [`Self::get_flake`] before the next mutation. Prefer
+    /// [`Self::iter_flakes`] for new code (no id packing).
     pub fn iter_index(&self, index: IndexType) -> impl Iterator<Item = FlakeId> + '_ {
-        self.graphs
-            .iter()
-            .filter_map(Option::as_ref)
-            .flat_map(move |graph_vecs| graph_vecs.get_index(index).iter().copied())
+        self.present_graphs()
+            .into_iter()
+            .flat_map(move |g| self.read_ids(g, index, None, None, true))
+    }
+
+    /// Iterate all flakes for `index` across ALL graphs, comparator-ordered per
+    /// graph. The hot full-scan path (stats, dict rebuilds): K=1 graphs iterate
+    /// their segment directly with no heap and no id packing.
+    pub fn iter_flakes(&self, index: IndexType) -> impl Iterator<Item = &Flake> + '_ {
+        self.present_graphs()
+            .into_iter()
+            .flat_map(move |g| self.read_flakes(g, index, None, None, true))
     }
 }
 
 impl std::fmt::Debug for Novelty {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let segments: usize = self.graphs.iter().flatten().map(Vec::len).sum();
         f.debug_struct("Novelty")
-            .field("flake_count", &self.store.len())
+            .field("flake_count", &self.flake_count)
             .field(
                 "graphs",
                 &self.graphs.iter().filter(|s| s.is_some()).count(),
             )
+            .field("segments", &segments)
             .field("size", &self.size)
             .field("t", &self.t)
             .field("epoch", &self.epoch)
@@ -813,9 +1341,10 @@ impl OverlayProvider for Novelty {
     }
 
     fn is_effectively_empty(&self) -> bool {
-        // Not `store.is_empty()`: after `clear_up_to` the arena retains dead
-        // flakes, while `size` tracks only alive bytes.
-        self.size == 0
+        // Segments only ever hold live flakes (`clear_up_to` and tiered
+        // compaction rebuild from survivors), so "no live bytes" (`size == 0`)
+        // and "no flakes" coincide — just defer to `is_empty()`.
+        self.is_empty()
     }
 
     fn for_each_overlay_flake(
@@ -828,19 +1357,79 @@ impl OverlayProvider for Novelty {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     ) {
-        let slice = self.slice_for_range(g_id, index, first, rhs, leftmost);
+        // K=1 (the common steady state) takes a raw slice loop — no iterator/
+        // enum dispatch per flake — recovering the old single-vector read speed
+        // on this query hot path. K>1 k-way merges. Applies the to_t filter.
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) if segs.len() == 1 => {
+                let seg = &segs[0];
+                if seg.may_overlap(index, first, rhs, leftmost) {
+                    let flakes = &seg.flakes;
+                    for &local in seg.range(index, first, rhs, leftmost) {
+                        let flake = &flakes[local as usize];
+                        if flake.t <= to_t {
+                            callback(flake);
+                        }
+                    }
+                }
+            }
+            Some(segs) if !segs.is_empty() => {
+                for (_, flake) in self.graph_merge(g_id, index, first, rhs, leftmost) {
+                    if flake.t <= to_t {
+                        callback(flake);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 
-        for &id in slice {
-            let flake = self.get_flake(id);
-            if flake.t <= to_t {
-                callback(flake);
+    fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {
+        match self.graphs.get(g_id as usize).and_then(Option::as_ref) {
+            Some(segs) => segs
+                .iter()
+                .map(|s| fluree_db_core::OverlaySegmentMeta {
+                    seg_id: s.seg_id,
+                    min_t: s.min_t,
+                    max_t: s.max_t,
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn for_each_overlay_segment_flake(
+        &self,
+        g_id: GraphId,
+        seg_id: u64,
+        seg_idx: usize,
+        index: IndexType,
+        callback: &mut dyn FnMut(&Flake),
+    ) {
+        // Whole segment in `index` order, NO `to_t` filter: the query layer
+        // caches the segment's full translation and applies `to_t` + the cursor
+        // key window after the k-way merge.
+        //
+        // `seg_idx` is the position from `overlay_segments` (same immutable
+        // snapshot the caller enumerated), so index directly — O(1) instead of a
+        // linear `seg_id` scan per segment (avoids O(K²) over a K-segment graph).
+        if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
+            if let Some(seg) = segs.get(seg_idx) {
+                debug_assert_eq!(
+                    seg.seg_id, seg_id,
+                    "seg_idx/seg_id misaligned — caller mixed overlay snapshots"
+                );
+                let flakes = &seg.flakes;
+                for &local in seg.order(index) {
+                    callback(&flakes[local as usize]);
+                }
             }
         }
     }
 }
 
 // =============================================================================
-// Parallel merge helpers (read-only store + disjoint mutable index vectors)
+// Identity helpers for the bulk-apply dedup walk
 // =============================================================================
 
 /// Compare two flakes by their object value (datatype-aware).
@@ -875,38 +1464,25 @@ fn same_identity(a: &Flake, b: &Flake) -> bool {
         && cmp_meta(a, b) == Ordering::Equal
 }
 
-/// LSM-style merge: sort batch by index comparator, then merge with existing target.
-fn merge_batch_into_index(
-    store: &FlakeStore,
-    target: &mut Vec<FlakeId>,
-    batch_ids: &[FlakeId],
-    index: IndexType,
-) {
-    use rayon::prelude::*;
-
-    // Sort batch by this index's comparator
-    let mut sorted_batch = batch_ids.to_vec();
-    sorted_batch.par_sort_unstable_by(|&a, &b| index.compare(store.get(a), store.get(b)));
-
-    // Two-way merge existing + batch
-    let mut merged = Vec::with_capacity(target.len() + sorted_batch.len());
-    let mut i = 0;
-    let mut j = 0;
-
-    while i < target.len() && j < sorted_batch.len() {
-        let cmp = index.compare(store.get(target[i]), store.get(sorted_batch[j]));
-        if cmp != Ordering::Greater {
-            merged.push(target[i]);
-            i += 1;
-        } else {
-            merged.push(sorted_batch[j]);
-            j += 1;
+/// Size-tier class of a segment with `count` flakes: `floor(log_tier_width(count))`.
+/// Segments of comparable size share a class, and merging `tier_width` segments of
+/// class `K` yields one segment of class `K+1` — the invariant
+/// [`Novelty::tier_compact`] relies on. Derived from flake count, so no per-segment
+/// level needs to be stored or threaded through builds/merges.
+fn size_class(count: usize, tier_width: usize) -> u32 {
+    if count <= 1 || tier_width < 2 {
+        return 0;
+    }
+    let mut class = 0u32;
+    let mut bound = tier_width;
+    while count >= bound {
+        class += 1;
+        match bound.checked_mul(tier_width) {
+            Some(b) => bound = b,
+            None => break,
         }
     }
-    merged.extend_from_slice(&target[i..]);
-    merged.extend_from_slice(&sorted_batch[j..]);
-
-    *target = merged;
+    class
 }
 
 #[cfg(test)]
@@ -996,7 +1572,7 @@ mod tests {
         novelty
             .apply_commit(vec![make_flake(1, 1, 1, 1, true)], 1, &no_graphs())
             .expect("first commit applies");
-        let (t, epoch, size, len) = (novelty.t, novelty.epoch, novelty.size, novelty.store.len());
+        let (t, epoch, size, len) = (novelty.t, novelty.epoch, novelty.size, novelty.len());
 
         // Batch with a good flake followed by one referencing an unknown named
         // graph: the old in-place code would have bumped t/epoch and pushed the
@@ -1009,11 +1585,7 @@ mod tests {
         assert_eq!(novelty.t, t, "t unchanged after failed apply");
         assert_eq!(novelty.epoch, epoch, "epoch unchanged after failed apply");
         assert_eq!(novelty.size, size, "size unchanged after failed apply");
-        assert_eq!(
-            novelty.store.len(),
-            len,
-            "no flakes added after failed apply"
-        );
+        assert_eq!(novelty.len(), len, "no flakes added after failed apply");
 
         // can_apply reports the same routing failure without mutating.
         assert!(novelty
@@ -1022,7 +1594,7 @@ mod tests {
                 &no_graphs()
             )
             .is_err());
-        assert_eq!(novelty.store.len(), len, "can_apply does not mutate");
+        assert_eq!(novelty.len(), len, "can_apply does not mutate");
     }
 
     #[test]
@@ -1331,9 +1903,12 @@ mod tests {
         // Drain everything, as an index swap does (apply_index/apply_loaded_db)
         novelty.clear_up_to(1);
 
-        // The arena retains dead flakes, so `is_empty()` stays false — pin that
-        // `is_effectively_empty()` sees through it via `size`.
-        assert!(!novelty.is_empty());
+        // Segmented novelty drops whole segments on clear (no dead-flake arena),
+        // so a full drain genuinely empties it: `is_empty()` and
+        // `is_effectively_empty()` agree. The point being pinned is that the
+        // drained state reads as effectively-empty *despite the bumped epoch* —
+        // that is the gate the post-indexing fast path relies on.
+        assert!(novelty.is_empty());
         assert!(novelty.epoch > 0);
         assert!(novelty.is_effectively_empty());
     }
@@ -1442,25 +2017,6 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("unknown graph Sid"), "got: {err_msg}");
-    }
-
-    #[test]
-    fn test_flake_store() {
-        let mut store = FlakeStore::new();
-        assert!(store.is_empty());
-
-        let f1 = make_flake(1, 1, 100, 1, true);
-        let id1 = store.push(f1);
-        assert_eq!(id1, 0);
-        assert_eq!(store.len(), 1);
-
-        let f2 = make_flake(2, 1, 200, 1, true);
-        let id2 = store.push(f2);
-        assert_eq!(id2, 1);
-        assert_eq!(store.len(), 2);
-
-        assert_eq!(store.get(0).s.namespace_code, 1);
-        assert_eq!(store.get(1).s.namespace_code, 2);
     }
 
     /// Drift guard: the file-local `cmp_object` / `cmp_meta` /
@@ -1572,6 +2128,248 @@ mod tests {
             !same_identity(&with_long, &with_int),
             "datatype is part of identity — must split"
         );
+    }
+
+    // ===== Compaction (structural, tiered) =====
+
+    /// Tiered compaction must not disturb the dedup oracle: re-asserting an
+    /// already-current fact afterwards is still skipped.
+    #[test]
+    fn compaction_preserves_dedup_fact_state() {
+        let mut n = Novelty::new(0);
+        let rg = no_graphs();
+        for i in 0..10u16 {
+            n.apply_commit(
+                vec![make_flake(i, 1, i as i64, (i + 1) as i64, true)],
+                (i + 1) as i64,
+                &rg,
+            )
+            .unwrap();
+        }
+        let before = n.len();
+        let segs_before = n.max_segment_count();
+        assert!(segs_before > 1);
+
+        while n.tier_compact(2) > 0 {}
+        assert!(
+            n.max_segment_count() < segs_before,
+            "tiered compaction must consolidate segments"
+        );
+        assert_eq!(n.len(), before, "no flakes lost in compaction");
+
+        n.apply_commit(vec![make_flake(3, 1, 3, 100, true)], 100, &rg)
+            .unwrap();
+        assert_eq!(
+            n.len(),
+            before,
+            "re-assert after compaction must still dedup"
+        );
+    }
+
+    /// A same-`t` assert+retract of one identity must resolve to ABSENT in
+    /// `fact_state` (retract wins, matching overlay lifecycle resolution), so a
+    /// later re-assert is KEPT, not silently deduped. Stage-level cancellation
+    /// normally prevents such a pair from a live commit, but `bulk_apply_commits`
+    /// (cold load) replays raw persisted flakes, so `fact_state` must not depend
+    /// on that invariant — otherwise the re-assert would be dropped (data loss).
+    #[test]
+    fn same_t_assert_retract_keeps_later_reassert() {
+        let rg = no_graphs();
+        let mut n = Novelty::new(0);
+
+        // One commit at t=1 carrying both ops for the same identity (s=7,p=1,o=1).
+        let commit = vec![
+            make_flake(7, 1, 1, 1, true),  // assert
+            make_flake(7, 1, 1, 1, false), // retract, same identity, same t
+        ];
+        n.bulk_apply_commits(vec![(commit, 1)], &rg).unwrap();
+        let before = n.len();
+
+        // Re-assert the same identity at a later t: the fact was absent (same-t
+        // retract won), so this must be kept rather than deduped.
+        n.apply_commit(vec![make_flake(7, 1, 1, 2, true)], 2, &rg)
+            .unwrap();
+        assert_eq!(
+            n.len(),
+            before + 1,
+            "re-assert after a same-t assert/retract must be kept, not deduped"
+        );
+    }
+
+    /// Cold/bulk load must produce a K=1-per-graph (already-compacted) shape, so
+    /// a cold query Lambda never replays a long chain into thousands of segments.
+    #[test]
+    fn bulk_apply_yields_single_segment_per_graph() {
+        let mut n = Novelty::new(0);
+        let rg = no_graphs();
+        let commits: Vec<(Vec<Flake>, i64)> = (0..20u16)
+            .map(|i| {
+                (
+                    vec![make_flake(i, 1, i as i64, (i + 1) as i64, true)],
+                    (i + 1) as i64,
+                )
+            })
+            .collect();
+        n.bulk_apply_commits(commits, &rg).unwrap();
+        assert_eq!(
+            n.segment_count(0),
+            1,
+            "bulk/cold load must consolidate to K=1 per graph"
+        );
+    }
+
+    /// `size_class` invariant: merging `tier_width` segments of class K yields one
+    /// of class K+1 (count goes c → tier_width·c → class +1). This is what makes
+    /// tiered compaction converge level by level.
+    #[test]
+    fn size_class_increments_on_tier_merge() {
+        for &t in &[2usize, 8, 16] {
+            for &c in &[1usize, 3, t, t * t] {
+                assert_eq!(
+                    size_class(c * t, t),
+                    size_class(c, t) + 1,
+                    "merging {t} class-{} segments (count {c}) must yield class {}",
+                    size_class(c, t),
+                    size_class(c, t) + 1
+                );
+            }
+        }
+    }
+
+    /// Tiered compaction keeps segment count ~logarithmic in commit count (not
+    /// linear), preserving every flake.
+    #[test]
+    fn tier_compact_bounds_segment_count() {
+        let mut n = Novelty::new(0);
+        let rg = no_graphs();
+        let t_width = 4;
+        let commits: u16 = 64;
+        for i in 0..commits {
+            n.apply_commit(
+                vec![make_flake(i, 1, i64::from(i), i64::from(i) + 1, true)],
+                i64::from(i) + 1,
+                &rg,
+            )
+            .unwrap();
+            n.tier_compact(t_width);
+        }
+        assert_eq!(
+            n.len(),
+            commits as usize,
+            "tiering must preserve every flake"
+        );
+        let k = n.max_segment_count();
+        assert!(
+            k <= t_width * 4,
+            "tiered K must stay ~logarithmic; got {k} for {commits} commits"
+        );
+        assert!(
+            k < commits as usize,
+            "tiering must reduce segment count well below commit count"
+        );
+    }
+
+    /// A single `tier_compact` call does BOUNDED work even on a large backlog (the
+    /// write-burst-then-first-read case): it merges one cascade chain, not the
+    /// whole backlog, so the first read can't stall. Repeated calls converge, and
+    /// no flake is lost.
+    #[test]
+    fn tier_compact_bounds_per_call_work_on_backlog() {
+        let mut n = Novelty::new(0);
+        let rg = no_graphs();
+        let t = 4;
+        // Insert-only burst: accumulate a backlog with NO compaction.
+        for i in 0..100u16 {
+            n.apply_commit(
+                vec![make_flake(i, 1, i64::from(i), i64::from(i) + 1, true)],
+                i64::from(i) + 1,
+                &rg,
+            )
+            .unwrap();
+        }
+        assert_eq!(n.max_segment_count(), 100, "no compaction during the burst");
+
+        // First read's compaction is bounded — one cascade chain, not 100/t merges.
+        let first = n.tier_compact(t);
+        assert!(
+            (1..=8).contains(&first),
+            "first call must be bounded; got {first}"
+        );
+        assert!(
+            n.max_segment_count() > t,
+            "one bounded call must not fully drain a 100-segment backlog"
+        );
+
+        // Repeated calls converge to a bounded K, losing nothing.
+        let mut guard = 0;
+        while n.tier_compact(t) > 0 {
+            guard += 1;
+            assert!(guard < 1000, "tier_compact must converge");
+        }
+        assert!(
+            n.max_segment_count() <= t * 4,
+            "converges to ~logarithmic K; got {}",
+            n.max_segment_count()
+        );
+        assert_eq!(n.len(), 100, "tiering must not lose flakes");
+    }
+
+    /// Tiered compaction is observationally transparent: identical reads across
+    /// all orders, graphs, and time-travel bounds before vs after.
+    #[test]
+    fn tier_compaction_is_observationally_transparent() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        const ORDERS: [IndexType; 4] = [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ];
+        let rg = eq_reverse_graph();
+        let mut n = Novelty::new(0);
+        let mut rng = 0xABCD_1234u64;
+        for c in 0..80 {
+            let t = c as i64 + 1;
+            let batch_n = 1 + (sm64(&mut rng) % 5) as usize;
+            let batch: Vec<Flake> = (0..batch_n).map(|_| eq_make(&mut rng, t)).collect();
+            n.apply_commit(batch, t, &rg).expect("apply_commit");
+        }
+        let digest = |n: &Novelty| -> u64 {
+            let mut h = DefaultHasher::new();
+            for g in 0u16..=2 {
+                for idx in ORDERS {
+                    let ids = n.slice_for_range(g, idx, None, None, true);
+                    ids.len().hash(&mut h);
+                    for id in &ids {
+                        format!("{:?}", n.get_flake(*id)).hash(&mut h);
+                    }
+                    for to_t in [1i64, 20, 50, i64::MAX] {
+                        let mut seen = Vec::new();
+                        n.for_each_overlay_flake(g, idx, None, None, true, to_t, &mut |f| {
+                            seen.push(format!("{f:?}"));
+                        });
+                        seen.len().hash(&mut h);
+                        for s in seen {
+                            s.hash(&mut h);
+                        }
+                    }
+                }
+            }
+            h.finish()
+        };
+
+        let before = digest(&n);
+        let (size0, count0) = (n.size, n.len());
+        let merges = n.tier_compact(4);
+        assert!(merges > 0, "fixture should trigger at least one tier merge");
+        assert_eq!(
+            digest(&n),
+            before,
+            "tier_compact changed an observable read"
+        );
+        assert_eq!(n.size, size0, "size preserved");
+        assert_eq!(n.len(), count0, "flake count preserved");
     }
 
     // ===== Equivalence / contract harness for the segmented-novelty rewrite =====

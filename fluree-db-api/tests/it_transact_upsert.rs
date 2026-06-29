@@ -400,11 +400,9 @@ async fn upsert_cancels_identical_pairs_in_novelty() {
         .encode_iri("http://example.org/ns/nums")
         .expect("nums sid");
 
-    let spot_ids: Vec<_> = ledger2.novelty.iter_index(IndexType::Spot).collect();
     let mut name_flakes = 0;
     let mut nums_flakes = 0;
-    for id in spot_ids {
-        let flake = ledger2.novelty.get_flake(id);
+    for flake in ledger2.novelty.iter_flakes(IndexType::Spot) {
         if flake.s == s {
             if flake.p == p_name {
                 name_flakes += 1;
