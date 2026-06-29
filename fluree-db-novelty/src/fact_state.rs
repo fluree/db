@@ -95,9 +95,7 @@ impl NoveltyFactState {
         let m = self.graphs[idx].get_or_insert_with(OrdMap::new);
         let key = key_of(flake);
         let wins = match m.get(&key) {
-            Some(&(cur_t, cur_op)) => {
-                flake.t > cur_t || (flake.t == cur_t && cur_op && !flake.op)
-            }
+            Some(&(cur_t, cur_op)) => flake.t > cur_t || (flake.t == cur_t && cur_op && !flake.op),
             None => true,
         };
         if wins {
@@ -144,12 +142,18 @@ mod tests {
         let mut fs = NoveltyFactState::new();
         fs.record(0, &mk(1, 5, true, None));
         fs.record(0, &mk(1, 5, false, None));
-        assert!(!fs.is_asserted(0, &mk(1, 5, true, None)), "assert then retract");
+        assert!(
+            !fs.is_asserted(0, &mk(1, 5, true, None)),
+            "assert then retract"
+        );
 
         let mut fs2 = NoveltyFactState::new();
         fs2.record(0, &mk(2, 5, false, None));
         fs2.record(0, &mk(2, 5, true, None));
-        assert!(!fs2.is_asserted(0, &mk(2, 5, true, None)), "retract then assert");
+        assert!(
+            !fs2.is_asserted(0, &mk(2, 5, true, None)),
+            "retract then assert"
+        );
     }
 
     #[test]
