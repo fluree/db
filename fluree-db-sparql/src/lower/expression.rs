@@ -21,6 +21,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
 
             AstExpression::Literal(lit) => {
+                // A language-tagged literal must keep its tag in expression
+                // position (`"x"@lang` ≡ `STRLANG("x", "lang")`). Lowering it to
+                // a bare string constant would lose the tag and break language
+                // semantics (e.g. STRBEFORE/STRAFTER argument compatibility,
+                // language-aware equality).
+                if let LiteralValue::LangTagged { value, lang } = &lit.value {
+                    return Ok(Expression::Call {
+                        func: Function::StrLang,
+                        args: vec![
+                            Expression::Const(FlakeValue::String(value.to_string())),
+                            Expression::Const(FlakeValue::String(lang.to_string())),
+                        ],
+                    });
+                }
                 let value = self.lower_filter_value(lit)?;
                 Ok(Expression::Const(value))
             }
