@@ -331,12 +331,28 @@ where
         let main_key = self.ns_key(ledger_name, branch);
         let index_key = self.index_key(ledger_name, branch);
 
-        // Read main record
-        let main_file: Option<NsFileV2> = self.read_json(&main_key).await?;
-
-        let Some(main) = main_file else {
-            return Ok(None);
+        // Read the main record bytes once.
+        let main_bytes = match self.storage.read_bytes(&main_key).await {
+            Ok(bytes) => bytes,
+            Err(CoreError::NotFound(_)) => return Ok(None),
+            Err(e) => {
+                return Err(NameServiceError::storage(format!(
+                    "Failed to read {main_key}: {e}"
+                )))
+            }
         };
+
+        // A graph-source record shares the `ns@v2/{name}/{branch}.json` key space
+        // with ledger records but uses a different schema (no `f:ledger`). Report
+        // it as "not a ledger" (Ok(None)) so single-alias resolution yields a
+        // clean not-found and callers fall back to graph-source resolution —
+        // instead of failing to deserialize NsFileV2 with a "missing field
+        // `f:ledger`" error. Single guard shared by all ledger read paths.
+        if Self::is_graph_source_from_bytes(&main_bytes) {
+            return Ok(None);
+        }
+
+        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
@@ -478,13 +494,8 @@ where
 {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
-        // A graph-source record is not a ledger; deserializing it as `NsFileV2`
-        // fails on the missing `f:ledger` field (#1369). Treat it as "no ledger
-        // here" so the caller can fall back to the graph-source path. Mirrors the
-        // same guard in `FileNameService::lookup`.
-        if self.is_graph_source_record(&ledger_name, &branch).await? {
-            return Ok(None);
-        }
+        // A graph-source record is not a ledger (#1369). `load_record` reports it
+        // as Ok(None) so the caller can fall back to the graph-source path.
         self.load_record(&ledger_name, &branch).await
     }
 
