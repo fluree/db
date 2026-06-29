@@ -2253,12 +2253,11 @@ fn update_from_json_file() {
 }
 
 #[test]
-fn update_sparql_update_in_direct_mode_fails() {
+fn update_sparql_update_in_direct_mode_commits() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "spdb"]).assert().success();
 
-    // SPARQL UPDATE in direct local mode should give a helpful error
     fluree_cmd(&tmp)
         .args([
             "--direct",
@@ -2267,10 +2266,8 @@ fn update_sparql_update_in_direct_mode_fails() {
             "PREFIX ex: <http://example.org/> INSERT DATA { ex:x ex:val \"hello\" }",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "SPARQL UPDATE is not supported in direct local mode",
-        ));
+        .success()
+        .stdout(predicate::str::contains("Committed t=1"));
 }
 
 #[test]

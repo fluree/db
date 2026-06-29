@@ -92,6 +92,17 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         self
     }
 
+    /// Set the operation to a SPARQL UPDATE.
+    ///
+    /// The query is parsed and lowered during `commit()` under the ledger
+    /// write lock — so its namespace allocation and staging share one
+    /// registry. This avoids the namespace-conflict retry that pre-lowering
+    /// against an unlocked snapshot would require.
+    pub fn sparql_update(mut self, sparql: &'g str) -> Self {
+        self.core.set_sparql_update(sparql);
+        self
+    }
+
     // -- Option setters --
 
     /// Set transaction options (author, context, etc.).

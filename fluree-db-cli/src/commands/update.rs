@@ -136,17 +136,22 @@ pub async fn run(
         }
         LedgerMode::Local { fluree, alias } => match txn_format {
             UpdateFormat::SparqlUpdate => {
-                // SPARQL UPDATE requires the server's parsing/lowering pipeline
-                // which needs access to the ledger's namespace registry. This is
-                // handled automatically when routing through the HTTP server.
-                return Err(CliError::Usage(
-                    "SPARQL UPDATE is not supported in direct local mode.\n  \
-                     Start a server with `fluree server start` and retry (the CLI \
-                     auto-routes through a running server), or use --remote to target \
-                     a remote server.\n  \
-                     Alternatively, use JSON-LD format with where/delete/insert keys."
-                        .into(),
-                ));
+                let policy_ctx = build_policy_ctx(&fluree, &alias, policy).await?;
+                let graph = fluree.graph(&alias);
+                let mut b = graph
+                    .transact()
+                    .sparql_update(&content)
+                    .commit_opts(CommitOpts::default());
+                if let Some(ctx) = policy_ctx {
+                    b = b.policy(ctx);
+                }
+                let result = b.commit().await?;
+
+                println!(
+                    "Committed t={}, {} flakes",
+                    result.receipt.t, result.receipt.flake_count
+                );
+                warn_novelty_if_needed(&result.indexing);
             }
             UpdateFormat::JsonLd => {
                 let json: serde_json::Value = serde_json::from_str(&content)?;
