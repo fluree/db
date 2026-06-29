@@ -1137,9 +1137,48 @@ async fn wait_for_voter_demoted(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // Dump leader-side raft metrics so a future flake says *why* the
+    // demote never landed: leader/log advance and the per-peer match
+    // indices the monitor reads. The pre-fix flake left
+    // `peer_match_indices=[..., (target, Some(<old idx>)), ...]` with
+    // the leader several entries ahead — visibly stuck without a
+    // demote propose ever firing.
+    let metrics_dump = leader_metrics_snapshot(cluster, via_node);
     panic!(
-        "timed out waiting for voter {voter} to drop out of worker_eligible_voters; last={last:?}"
+        "timed out waiting for voter {voter} to drop out of worker_eligible_voters; \
+         last={last:?}; leader_metrics={metrics_dump}"
     );
+}
+
+/// Format the leader-side openraft metrics relevant to liveness
+/// demotion decisions: current leader, last log index, and each
+/// peer's last matched log index. Read directly from the in-process
+/// raft handle on `via_node`.
+fn leader_metrics_snapshot(cluster: &TestCluster, via_node: NodeId) -> String {
+    let node = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id == via_node)
+        .expect("node exists");
+    let integration = node
+        ._state
+        .raft
+        .as_ref()
+        .expect("test node always has raft integration");
+    let m = integration.raft.metrics().borrow().clone();
+    let peer_states: Vec<(NodeId, Option<u64>)> = m
+        .replication
+        .as_ref()
+        .map(|r| {
+            r.iter()
+                .map(|(id, log)| (*id, log.as_ref().map(|l| l.index)))
+                .collect()
+        })
+        .unwrap_or_default();
+    format!(
+        "current_leader={:?}, last_log_index={:?}, peer_match_indices={peer_states:?}",
+        m.current_leader, m.last_log_index,
+    )
 }
 
 /// Drive log advancement on the leader. Submits a new insert every
