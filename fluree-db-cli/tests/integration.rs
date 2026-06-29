@@ -282,6 +282,21 @@ fn query_ledger_flag_rejects_extra_positional() {
 }
 
 #[test]
+fn insert_ledger_flag_rejects_missing_file_positional() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // With --ledger, a lone path-shaped positional that doesn't exist (a typo'd
+    // file path) is reported as a missing file rather than fed to the input
+    // reader as inline data, which would fail with a confusing parse error.
+    fluree_cmd(&tmp)
+        .args(["insert", "--ledger", "streamdb", "typo-data.jsonld"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such file"));
+}
+
+#[test]
 fn query_ndjson_bare_streams_row_objects() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");

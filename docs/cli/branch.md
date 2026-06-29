@@ -24,7 +24,7 @@ fluree branch create <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <BRANCH>` | Source branch to create from (defaults to "main") |
 | `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:N` for a transaction number or a hex digest / full CID. |
 | `--remote <REMOTE>` | Execute against a remote server |
@@ -130,7 +130,7 @@ fluree branch drop <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
@@ -194,7 +194,7 @@ fluree branch rebase <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--strategy <STRATEGY>` | Conflict resolution strategy (default: "take-both"). Options: `take-both`, `abort`, `take-source`, `take-branch`, `skip` |
 | `--remote <REMOTE>` | Execute against a remote server |
 
@@ -262,7 +262,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 | `--conflict-details` | Include source/target flake values for returned conflict keys |
 | `--strategy <STRATEGY>` | Strategy used for conflict detail labels (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch` |
 | `--json` | Emit the raw JSON preview |
-| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
@@ -305,7 +305,7 @@ fluree branch merge <SOURCE> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--target <BRANCH>` | Target branch to merge into (defaults to source's parent branch) |
 | `--strategy <STRATEGY>` | Conflict resolution strategy (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch`. |
 | `--remote <REMOTE>` | Execute against a remote server |

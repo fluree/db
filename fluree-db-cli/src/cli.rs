@@ -630,7 +630,7 @@ pub enum Commands {
         entity: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Start of time range (transaction number, default: 1)
@@ -739,7 +739,7 @@ pub enum Commands {
         commit: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -942,7 +942,7 @@ pub enum GraphAction {
     List {
         /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
         /// Defaults to the active ledger.
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// List graphs on a remote server (by remote name, e.g. "origin")
@@ -981,7 +981,7 @@ pub enum GraphAction {
 
         /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
         /// Defaults to the active ledger.
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g. "origin")
@@ -999,7 +999,7 @@ pub enum BranchAction {
         name: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Source branch to create from (defaults to "main")
@@ -1025,7 +1025,7 @@ pub enum BranchAction {
         name: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -1049,7 +1049,7 @@ pub enum BranchAction {
         name: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Conflict resolution strategy (default: "take-both")
@@ -1077,7 +1077,7 @@ pub enum BranchAction {
         strategy: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -1125,7 +1125,7 @@ pub enum BranchAction {
         json: bool,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -1176,7 +1176,7 @@ pub enum BranchAction {
         json: bool,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
