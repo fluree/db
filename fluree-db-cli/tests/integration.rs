@@ -480,6 +480,59 @@ fn query_ndjson_local_with_default_allow_policy_streams() {
         .stdout(predicate::str::contains("Bob"));
 }
 
+/// Regression for the dataset streaming path dropping the ledger's stored
+/// default context. The lean ndjson path attaches it via
+/// `with_default_context(...)`, and the buffered local path uses
+/// `db_with_default_context` — but the dataset path's `load_view_from_source`
+/// goes through `db()` / `db_at()`, which don't. A SPARQL query that omits
+/// `PREFIX ex:` relies on the stored context being attached to the dataset's
+/// primary view; without the attach step in `run_local_ndjson_stream_dataset`
+/// the query parses against an empty prefix table and returns no rows.
+#[test]
+fn query_ndjson_local_dataset_path_uses_stored_default_context() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "ctxdb"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["context", "set", "-e", r#"{"ex": "http://example.org/"}"#])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice"},
+                {"@id": "ex:bob", "ex:name": "Bob"}
+            ]}"#,
+        ])
+        .assert()
+        .success();
+
+    // `--default-allow` is what routes us through the streaming dataset
+    // producer; the SPARQL body deliberately omits `PREFIX ex:` so the only
+    // way `ex:name` can resolve is through the ledger's stored default
+    // context. If the dataset path drops the context, the parse fails (or
+    // rows go to zero) and this assertion catches it.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--default-allow",
+            "-e",
+            "SELECT ?name WHERE { ?s ex:name ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+}
+
 #[test]
 fn use_command_switches_active_ledger() {
     let tmp = TempDir::new().unwrap();

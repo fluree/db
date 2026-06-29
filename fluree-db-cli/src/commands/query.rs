@@ -1147,7 +1147,7 @@ async fn run_local_ndjson_stream_dataset(
     };
     let time_spec = at.map(parse_time_spec);
 
-    let (dataset, input) = match query_format {
+    let (mut dataset, input) = match query_format {
         detect::QueryFormat::Sparql => {
             // Local time-travel + SPARQL via FROM is encoded directly in the
             // dataset spec (no SPARQL string rewrite needed). Reject queries
@@ -1196,6 +1196,18 @@ async fn run_local_ndjson_stream_dataset(
             (dataset, OwnedStreamQuery::JsonLd(json_query))
         }
     };
+
+    // Parity with the lean ndjson path and the buffered local path: attach the
+    // ledger's stored default context to the primary view if the dataset
+    // builder didn't load it (it doesn't, today — `load_view_from_source`
+    // routes through `db()` / `db_at()`, not the `_with_default_context`
+    // variants). Without this, PREFIX-less SPARQL and @context-less JSON-LD
+    // queries silently return empty rows on the streaming dataset path.
+    if let Some(primary) = dataset.primary_mut() {
+        if primary.default_context.is_none() {
+            primary.default_context = fluree.get_default_context(alias).await?;
+        }
+    }
 
     let plan = fluree.plan_stream_query_dataset(&dataset, &input).await?;
     let producer = fluree.run_stream_query_dataset(dataset, plan, tracker, exec_opts, tx);
