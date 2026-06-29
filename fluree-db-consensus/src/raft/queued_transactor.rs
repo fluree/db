@@ -21,7 +21,7 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
-    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, EnqueueCommandArgs, PoisonRecord,
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, PoisonRecord, QueueSubmission,
     RefKey, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
@@ -42,7 +42,7 @@ use fluree_db_transact::CommitOptsRequest;
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// How long a single waiter `await` blocks before the transactor
 /// considers the call stranded by a leader transition and either
@@ -145,7 +145,7 @@ impl QueuedTransactor {
     ///   retry is unreferenced and released here.
     async fn submit_and_await(
         &self,
-        args: EnqueueCommandArgs,
+        args: QueueSubmission,
         ref_key: RefKey,
         retry_eligible: bool,
     ) -> Result<SubmissionOutcome, SubmissionError> {
@@ -424,14 +424,14 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
             request_cid,
             body_cid,
             body_kind,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -495,14 +495,14 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
             body_cid,
             body_kind: BodyKind::Revert,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -592,14 +592,14 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch: target_for_queue.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
             body_cid,
             body_kind: BodyKind::Merge,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -665,14 +665,14 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch: branch.clone(),
             idempotency: idempotency_cache_key,
             request_cid,
             body_cid,
             body_kind: BodyKind::Rebase,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -767,14 +767,14 @@ impl Committer for QueuedTransactor {
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
-        let args = EnqueueCommandArgs {
+        let args = QueueSubmission {
             ledger_id: ledger_name,
             branch,
             idempotency: idempotency_cache_key,
             request_cid,
             body_cid,
             body_kind: BodyKind::Pushed,
-            applied_at_millis: current_millis(),
+            applied_at_millis: crate::raft::current_millis(),
         };
 
         match self.submit_and_await(args, ref_key, retry_eligible).await? {
@@ -868,13 +868,6 @@ fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
         status: 500,
         message: format!("submission failed: {:?}", record.reason),
     }
-}
-
-fn current_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Conservative `IndexingStatus` for paths that don't observe the

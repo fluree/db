@@ -650,11 +650,97 @@ fn ir_term_to_rdf_term(term: &IrTerm) -> RdfTerm {
 // Convert Fluree CONSTRUCT JSON-LD output → SparqlResults::Graph
 // ---------------------------------------------------------------------------
 
+/// A minimal JSON-LD `@context` used to expand compact IRIs in CONSTRUCT output.
+///
+/// Fluree emits CONSTRUCT graphs as *compact* JSON-LD (e.g. `@id: ":s1"` with a
+/// context `{"": "http://example.org/"}`). To compare against the W3C expected
+/// graphs we must expand those compact IRIs back to absolute form. This handles
+/// the subset of context features Fluree actually produces: prefix terms
+/// (including the empty prefix), `@vocab`, and `@base`.
+#[derive(Default)]
+struct JsonLdContext {
+    /// Prefix/term → namespace IRI (keyed by the part before `:`; `""` = empty prefix).
+    prefixes: HashMap<String, String>,
+    vocab: Option<String>,
+    base: Option<String>,
+}
+
+impl JsonLdContext {
+    fn parse(json: &serde_json::Value) -> Self {
+        let mut ctx = JsonLdContext::default();
+        let Some(obj) = json.get("@context").and_then(|c| c.as_object()) else {
+            return ctx;
+        };
+        for (key, val) in obj {
+            // A term may be defined directly as an IRI string, or as an
+            // expanded term object `{"@id": "..."}`.
+            let iri = match val {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(o) => {
+                    o.get("@id").and_then(|v| v.as_str()).map(String::from)
+                }
+                _ => None,
+            };
+            let Some(iri) = iri else { continue };
+            match key.as_str() {
+                "@vocab" => ctx.vocab = Some(iri),
+                "@base" => ctx.base = Some(iri),
+                _ => {
+                    ctx.prefixes.insert(key.clone(), iri);
+                }
+            }
+        }
+        ctx
+    }
+
+    /// Expand a node identifier or `@id` reference (NOT vocab-mapped).
+    fn expand_id(&self, value: &str) -> String {
+        if let Some((prefix, suffix)) = value.split_once(':') {
+            // `scheme://…` absolute IRIs must pass through untouched.
+            if suffix.starts_with("//") {
+                return value.to_string();
+            }
+            if let Some(ns) = self.prefixes.get(prefix) {
+                return format!("{ns}{suffix}");
+            }
+            return value.to_string();
+        }
+        // Relative reference: resolve against @base when present.
+        match &self.base {
+            Some(base) => format!("{base}{value}"),
+            None => value.to_string(),
+        }
+    }
+
+    /// Expand a predicate key or `@type` value (vocab-mapped).
+    fn expand_vocab(&self, value: &str) -> String {
+        if let Some((prefix, suffix)) = value.split_once(':') {
+            if suffix.starts_with("//") {
+                return value.to_string();
+            }
+            if let Some(ns) = self.prefixes.get(prefix) {
+                return format!("{ns}{suffix}");
+            }
+            return value.to_string();
+        }
+        // Bare term: an explicit term definition wins, else fall back to @vocab.
+        if let Some(ns) = self.prefixes.get(value) {
+            return ns.clone();
+        }
+        match &self.vocab {
+            Some(vocab) => format!("{vocab}{value}"),
+            None => value.to_string(),
+        }
+    }
+}
+
 /// Convert Fluree's CONSTRUCT JSON-LD output into a [`SparqlResults::Graph`].
 ///
 /// Expects a JSON-LD `@graph` array (or a single node object). Each node has
 /// `@id` as the subject; every other key is a predicate whose values are objects.
+/// Compact IRIs are expanded against the result's `@context`.
 pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<SparqlResults> {
+    let ctx = JsonLdContext::parse(json);
     let nodes = if let Some(graph) = json.get("@graph").and_then(|g| g.as_array()) {
         graph.clone()
     } else if json.is_array() {
@@ -675,7 +761,7 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
         let subject = match obj.get("@id").and_then(|v| v.as_str()) {
             Some(id) => match id.strip_prefix("_:") {
                 Some(label) => RdfTerm::BlankNode(label.to_string()),
-                None => RdfTerm::Iri(id.to_string()),
+                None => RdfTerm::Iri(ctx.expand_id(id)),
             },
             None => continue, // skip nodes without @id
         };
@@ -697,21 +783,21 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
                         triples.push(Triple {
                             subject: subject.clone(),
                             predicate: rdf_type.clone(),
-                            object: RdfTerm::Iri(t.to_string()),
+                            object: RdfTerm::Iri(ctx.expand_vocab(t)),
                         });
                     }
                 }
                 continue;
             }
 
-            let predicate = RdfTerm::Iri(key.clone());
+            let predicate = RdfTerm::Iri(ctx.expand_vocab(key));
             let values = match value {
                 serde_json::Value::Array(arr) => arr.clone(),
                 other => vec![other.clone()],
             };
 
             for val in &values {
-                if let Some(term) = json_ld_value_to_rdf_term(val) {
+                if let Some(term) = json_ld_value_to_rdf_term(val, &ctx) {
                     triples.push(Triple {
                         subject: subject.clone(),
                         predicate: predicate.clone(),
@@ -729,13 +815,13 @@ pub fn fluree_construct_to_sparql_results(json: &serde_json::Value) -> Result<Sp
 ///
 /// Handles `{"@id": "..."}`, `{"@value": "...", "@type": "...", "@language": "..."}`,
 /// and plain string/number values.
-fn json_ld_value_to_rdf_term(val: &serde_json::Value) -> Option<RdfTerm> {
+fn json_ld_value_to_rdf_term(val: &serde_json::Value, ctx: &JsonLdContext) -> Option<RdfTerm> {
     if let Some(obj) = val.as_object() {
         // Node reference: {"@id": "http://..."}
         if let Some(id) = obj.get("@id").and_then(|v| v.as_str()) {
             return Some(match id.strip_prefix("_:") {
                 Some(label) => RdfTerm::BlankNode(label.to_string()),
-                None => RdfTerm::Iri(id.to_string()),
+                None => RdfTerm::Iri(ctx.expand_id(id)),
             });
         }
 
@@ -747,7 +833,10 @@ fn json_ld_value_to_rdf_term(val: &serde_json::Value) -> Option<RdfTerm> {
                 serde_json::Value::Bool(b) => b.to_string(),
                 _ => return None,
             };
-            let datatype = obj.get("@type").and_then(|v| v.as_str()).map(String::from);
+            let datatype = obj
+                .get("@type")
+                .and_then(|v| v.as_str())
+                .map(|t| ctx.expand_vocab(t));
             let language = obj
                 .get("@language")
                 .and_then(|v| v.as_str())
@@ -1022,6 +1111,68 @@ ex:bob ex:name "Bob" .
             }
             _ => panic!("Expected Graph, got {result:?}"),
         }
+    }
+
+    #[test]
+    fn test_construct_jsonld_expands_compact_iris() {
+        // Fluree emits CONSTRUCT graphs as compact JSON-LD. The converter must
+        // expand `@id`, predicate keys, and node references against `@context`
+        // (here using the empty prefix `""`), matching the W3C expected graph.
+        let json = serde_json::json!({
+            "@context": { "": "http://example.org/" },
+            "@graph": [
+                { "@id": ":s1", ":p": [ { "@id": ":o1" } ] },
+                { "@id": ":s2", ":p": [ { "@id": ":o1" }, { "@id": ":o2" } ] },
+            ]
+        });
+        let result = fluree_construct_to_sparql_results(&json).unwrap();
+        let SparqlResults::Graph(triples) = result else {
+            panic!("expected Graph");
+        };
+        assert_eq!(triples.len(), 3);
+        assert!(triples.contains(&Triple {
+            subject: RdfTerm::Iri("http://example.org/s1".into()),
+            predicate: RdfTerm::Iri("http://example.org/p".into()),
+            object: RdfTerm::Iri("http://example.org/o1".into()),
+        }));
+        assert!(triples.contains(&Triple {
+            subject: RdfTerm::Iri("http://example.org/s2".into()),
+            predicate: RdfTerm::Iri("http://example.org/p".into()),
+            object: RdfTerm::Iri("http://example.org/o2".into()),
+        }));
+    }
+
+    #[test]
+    fn test_construct_jsonld_vocab_and_absolute_passthrough() {
+        // @vocab maps bare predicate terms; already-absolute IRIs pass through.
+        let json = serde_json::json!({
+            "@context": { "@vocab": "http://example.org/" },
+            "@graph": [
+                {
+                    "@id": "http://example.org/s1",
+                    "name": [ { "@value": "Alice" } ],
+                    "@type": "Person"
+                }
+            ]
+        });
+        let result = fluree_construct_to_sparql_results(&json).unwrap();
+        let SparqlResults::Graph(triples) = result else {
+            panic!("expected Graph");
+        };
+        assert!(triples.contains(&Triple {
+            subject: RdfTerm::Iri("http://example.org/s1".into()),
+            predicate: RdfTerm::Iri("http://example.org/name".into()),
+            object: RdfTerm::Literal {
+                value: "Alice".into(),
+                datatype: None,
+                language: None,
+            },
+        }));
+        assert!(triples.contains(&Triple {
+            subject: RdfTerm::Iri("http://example.org/s1".into()),
+            predicate: RdfTerm::Iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into()),
+            object: RdfTerm::Iri("http://example.org/Person".into()),
+        }));
     }
 
     #[test]

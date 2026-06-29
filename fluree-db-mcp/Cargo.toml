@@ -1,0 +1,21 @@
+[package]
+name = "fluree-db-mcp"
+description = "Unified Fluree MCP service — one configurable stdio surface exposing selectable toolsets (memory, docs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Toolset logic lives in the domain crates; this crate is the rmcp surface over them.
+fluree-db-memory = { path = "../fluree-db-memory" }
+fluree-db-docs = { path = "../fluree-db-docs" }
+
+rmcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

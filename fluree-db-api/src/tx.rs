@@ -1789,31 +1789,10 @@ impl crate::Fluree {
             .await
             .map_err(|e| TrackedErrorResponse::new(500, e.to_string(), tracker.tally()))?;
 
-        // Compute indexing status AFTER publish_commit succeeds
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = ledger.should_reindex(index_config);
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: ledger.novelty_size(),
-            index_t: ledger.index_t(),
-            commit_t: receipt.t,
-        };
-
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                handle.trigger(ledger.ledger_id(), receipt.t).await;
-            }
-        }
-
-        Ok((
-            TransactResult {
-                receipt,
-                ledger,
-                indexing: indexing_status,
-            },
-            tracker.tally(),
-        ))
+        let result = self
+            .finalize_owned_commit(receipt, ledger, index_config)
+            .await;
+        Ok((result, tracker.tally()))
     }
 
     /// Commit a staged transaction (persists commit record + publishes nameservice head).
@@ -1836,6 +1815,81 @@ impl crate::Fluree {
         )
         .await?;
         Ok((receipt, ledger))
+    }
+
+    /// Write a freshly-committed owned-state `LedgerState` back into the
+    /// ledger-manager cache so a subsequent `db()` / `ledger_cached()` observes
+    /// the commit (read-your-writes).
+    ///
+    /// Only an already-cached handle is updated — an uncached ledger loads fresh
+    /// from the nameservice head on next access, which already reflects the
+    /// commit. The replace is monotonic (skipped when the cache has advanced
+    /// past `new_state`) so a concurrent writer can't be rolled back.
+    ///
+    /// The guarded builder path does NOT use this: it holds the write guard
+    /// across stage + commit and updates the cache via `finalize_commit`.
+    pub(crate) async fn sync_owned_commit_to_cache(&self, new_state: &LedgerState) {
+        let Some(mgr) = self.ledger_manager.as_ref() else {
+            return;
+        };
+        let Some(handle) = mgr.get_loaded_handle(new_state.ledger_id()).await else {
+            return;
+        };
+        let mut guard = handle.lock_for_write().await;
+        if new_state.t() <= guard.state().t() {
+            return;
+        }
+        let mut refreshed = new_state.clone();
+        if let Err(e) = self.refresh_index(&mut refreshed).await {
+            // Couldn't reattach the index for the new state — evict so the next
+            // access reloads fresh rather than serving a stale cached handle.
+            drop(guard);
+            tracing::warn!(
+                error = %e,
+                ledger_id = new_state.ledger_id(),
+                "post-commit cache refresh failed; evicting cached handle"
+            );
+            mgr.disconnect(new_state.ledger_id()).await;
+            return;
+        }
+        handle.sync_binary_store_from_state(&refreshed).await;
+        guard.replace(refreshed);
+    }
+
+    /// Shared tail for the owned-state commit methods: write the new state
+    /// back into the cache (read-your-writes), compute the indexing status,
+    /// and trigger background indexing when needed.
+    pub(crate) async fn finalize_owned_commit(
+        &self,
+        receipt: CommitReceipt,
+        ledger: LedgerState,
+        index_config: &IndexConfig,
+    ) -> TransactResult {
+        self.sync_owned_commit_to_cache(&ledger).await;
+
+        // Compute indexing status AFTER publish_commit succeeds.
+        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
+        let indexing_needed = ledger.should_reindex(index_config);
+        let indexing_status = IndexingStatus {
+            enabled: indexing_enabled,
+            needed: indexing_needed,
+            novelty_size: ledger.novelty_size(),
+            index_t: ledger.index_t(),
+            commit_t: receipt.t,
+        };
+
+        // Trigger indexing AFTER publish_commit succeeds (fast operation).
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            if indexing_enabled && indexing_needed {
+                handle.trigger(ledger.ledger_id(), receipt.t).await;
+            }
+        }
+
+        TransactResult {
+            receipt,
+            ledger,
+            indexing: indexing_status,
+        }
     }
 
     /// Convenience: stage + commit.
@@ -1901,30 +1955,9 @@ impl crate::Fluree {
                     .await?
             };
 
-        // Compute indexing status AFTER publish_commit succeeds
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = ledger.should_reindex(index_config);
-
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: ledger.novelty_size(),
-            index_t: ledger.index_t(),
-            commit_t: receipt.t,
-        };
-
-        // Trigger indexing AFTER publish_commit succeeds (fast operation)
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                handle.trigger(ledger.ledger_id(), receipt.t).await;
-            }
-        }
-
-        Ok(TransactResult {
-            receipt,
-            ledger,
-            indexing: indexing_status,
-        })
+        Ok(self
+            .finalize_owned_commit(receipt, ledger, index_config)
+            .await)
     }
 
     /// Execute a transaction with optional TriG metadata.
@@ -1995,30 +2028,9 @@ impl crate::Fluree {
                     .await?
             };
 
-        // Compute indexing status AFTER publish_commit succeeds
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = ledger.should_reindex(index_config);
-
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: ledger.novelty_size(),
-            index_t: ledger.index_t(),
-            commit_t: receipt.t,
-        };
-
-        // Trigger indexing AFTER publish_commit succeeds (fast operation)
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                handle.trigger(ledger.ledger_id(), receipt.t).await;
-            }
-        }
-
-        Ok(TransactResult {
-            receipt,
-            ledger,
-            indexing: indexing_status,
-        })
+        Ok(self
+            .finalize_owned_commit(receipt, ledger, index_config)
+            .await)
     }
 
     /// Execute a transaction with optional TriG metadata and named graphs.
@@ -2093,30 +2105,9 @@ impl crate::Fluree {
                     .await?
             };
 
-        // Compute indexing status AFTER publish_commit succeeds
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = ledger.should_reindex(index_config);
-
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: ledger.novelty_size(),
-            index_t: ledger.index_t(),
-            commit_t: receipt.t,
-        };
-
-        // Trigger indexing AFTER publish_commit succeeds (fast operation)
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                handle.trigger(ledger.ledger_id(), receipt.t).await;
-            }
-        }
-
-        Ok(TransactResult {
-            receipt,
-            ledger,
-            indexing: indexing_status,
-        })
+        Ok(self
+            .finalize_owned_commit(receipt, ledger, index_config)
+            .await)
     }
 
     /// Insert new data into the ledger
@@ -2228,30 +2219,9 @@ impl crate::Fluree {
             .commit_staged(view, ns_registry, index_config, commit_opts)
             .await?;
 
-        // Compute indexing status (same logic as transact())
-        let indexing_enabled = self.indexing_mode.is_enabled() && self.defaults_indexing_enabled();
-        let indexing_needed = ledger.should_reindex(index_config);
-
-        let indexing_status = IndexingStatus {
-            enabled: indexing_enabled,
-            needed: indexing_needed,
-            novelty_size: ledger.novelty_size(),
-            index_t: ledger.index_t(),
-            commit_t: receipt.t,
-        };
-
-        // Trigger indexing AFTER publish_commit succeeds
-        if let IndexingMode::Background(handle) = &self.indexing_mode {
-            if indexing_enabled && indexing_needed {
-                handle.trigger(ledger.ledger_id(), receipt.t).await;
-            }
-        }
-
-        Ok(TransactResult {
-            receipt,
-            ledger,
-            indexing: indexing_status,
-        })
+        Ok(self
+            .finalize_owned_commit(receipt, ledger, index_config)
+            .await)
     }
 
     /// Stage a Turtle INSERT by parsing directly to flakes (bypass JSON-LD / IR).

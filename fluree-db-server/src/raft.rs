@@ -28,6 +28,7 @@ use fluree_db_consensus::raft::{
     admin as raft_admin,
     forward::LeaderForwarder,
     log_adapter::LogAdapter,
+    nameservice::{apply_queue_poison_router, apply_staged_commit_router, RaftNameService},
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     staged_receipt::StagedReceiptMap,
     state_machine_adapter::{SharedState, StateMachineAdapter},
@@ -59,12 +60,13 @@ pub struct RaftIntegration {
     /// Raft handle. Cloned into the network, admin, and forward
     /// routers; also used by
     /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
-    /// and the [`CommitWorker`](fluree_db_consensus::raft::commit_worker::CommitWorker).
+    /// and each per-branch
+    /// [`Worker`](fluree_db_consensus::raft::commit_worker::Worker).
     pub raft: Arc<Raft<TypeConfig>>,
     /// This node's id. Cached so callers (notably the leader-aware
     /// indexer watcher) don't have to dip into `raft.metrics()` just
     /// to ask "is this me?"
-    pub self_id: NodeId,
+    pub id: NodeId,
     /// Follower-forward middleware state. Cloned into the
     /// client-facing router's middleware layer.
     pub forwarder: Arc<LeaderForwarder>,
@@ -82,8 +84,8 @@ pub struct RaftIntegration {
     /// [`QueuedTransactor`](fluree_db_consensus::raft::queued_transactor::QueuedTransactor)
     /// so submission-side registrations meet apply-side resolutions.
     pub waiter_map: Arc<WaiterMap>,
-    /// Per-process side channel the
-    /// [`CommitWorker`](fluree_db_consensus::raft::commit_worker::CommitWorker)
+    /// Per-process side channel each per-branch
+    /// [`Worker`](fluree_db_consensus::raft::commit_worker::Worker)
     /// stashes typed [`AppliedReceipt`](fluree_db_consensus::raft::staged_receipt::AppliedReceipt)
     /// values into before proposing `ApplyHead`; the adapter takes
     /// them during waiter resolution so transactors see staged-time
@@ -95,6 +97,13 @@ pub struct RaftIntegration {
     /// built with — same `NetworkConfig` instance configures both
     /// sides of every RPC.
     network_config: NetworkConfig,
+    /// `NameService` adapter over the replicated state machine. Owns
+    /// reads of the shared state, all publish-paths (refs, indexes,
+    /// commits), and the cross-node `apply_staged_commit` forwarding
+    /// for follower workers. Held here so the same handle threads
+    /// through `Fluree`, the worker supervisor, and the inbound
+    /// `apply_staged_commit` HTTP route on `raft_rpc_router`.
+    nameservice: Arc<RaftNameService>,
     /// One-shot slot holding the [`ReleaseReceiver`] half of the
     /// adapter's CAS release channel. Server startup
     /// [`take_release_receiver`](Self::take_release_receiver)s the
@@ -105,20 +114,20 @@ pub struct RaftIntegration {
     release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
 }
 
-/// Parts the [`RaftIntegration::new`] assembler stitches together.
-/// Grouped so the constructor stays a single positional struct
-/// argument instead of an eight-parameter call site — each field
-/// is independently produced upstream and they only meet here.
-pub struct RaftIntegrationParts {
-    pub raft: Arc<Raft<TypeConfig>>,
-    pub self_id: NodeId,
-    pub http_client: reqwest::Client,
-    pub shared_state: SharedState,
+/// Shared HTTP transport: a `reqwest::Client` paired with the
+/// `NetworkConfig` it was built from.
+pub struct HttpTransport {
+    pub client: reqwest::Client,
+    pub config: NetworkConfig,
+}
+
+/// The in-process channels the state-machine adapter writes to on
+/// apply: a `NameServiceEvent` broadcast bus, a per-`queue_id`
+/// waiter map, and the per-leader staged-receipt stash.
+pub struct AdapterChannels {
     pub event_bus: Arc<LedgerEventBus>,
     pub waiter_map: Arc<WaiterMap>,
     pub staged_receipts: Arc<StagedReceiptMap>,
-    pub network_config: NetworkConfig,
-    pub release_rx: ReleaseReceiver,
 }
 
 impl RaftIntegration {
@@ -126,32 +135,43 @@ impl RaftIntegration {
     /// The HTTP client is shared with the leader-forward middleware
     /// so a single connection pool serves both inter-node RPC and
     /// follower→leader request relays.
-    pub fn new(parts: RaftIntegrationParts) -> Self {
-        let RaftIntegrationParts {
-            raft,
-            self_id,
-            http_client,
-            shared_state,
+    pub fn new(
+        raft: Arc<Raft<TypeConfig>>,
+        id: NodeId,
+        shared_state: SharedState,
+        channels: AdapterChannels,
+        transport: HttpTransport,
+        release_rx: ReleaseReceiver,
+    ) -> Self {
+        let AdapterChannels {
             event_bus,
             waiter_map,
             staged_receipts,
-            network_config,
-            release_rx,
-        } = parts;
+        } = channels;
+        let HttpTransport {
+            client: http_client,
+            config: network_config,
+        } = transport;
         let forwarder = Arc::new(LeaderForwarder::new(
             Arc::clone(&raft),
-            self_id,
-            http_client,
+            id,
+            http_client.clone(),
         ));
+        let nameservice = Arc::new(
+            RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
+                .with_staged_receipts(Arc::clone(&staged_receipts))
+                .with_forwarding(id, http_client, network_config.cross_node_propose_timeout),
+        );
         Self {
             raft,
-            self_id,
+            id,
             forwarder,
             shared_state,
             event_bus,
             waiter_map,
             staged_receipts,
             network_config,
+            nameservice,
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
         }
     }
@@ -198,6 +218,26 @@ impl RaftIntegration {
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
 
+        // Liveness invariant: a candidate must outlast its own vote
+        // RPCs before re-electing, or votes land on stale terms and a
+        // failover livelocks (every survivor climbs to the same term
+        // with no leader). openraft's own `validate()` can't see this —
+        // it doesn't know the transport timeout — so check it here, the
+        // one place that holds both configs. Warn rather than reject so
+        // an operator who has deliberately tuned for a fast link isn't
+        // hard-blocked; `default_raft_config` keeps the shipped default
+        // safe.
+        let rpc_timeout_ms = config.network_config.rpc_timeout.as_millis() as u64;
+        if raft_cfg.election_timeout_min <= rpc_timeout_ms {
+            tracing::warn!(
+                election_timeout_min = raft_cfg.election_timeout_min,
+                rpc_timeout_ms,
+                "election_timeout_min <= rpc_timeout: candidates may re-elect before their vote \
+                 RPCs resolve, risking election livelock on leader failover; set \
+                 election_timeout_min comfortably above rpc_timeout"
+            );
+        }
+
         let http_client = HttpRaftNetworkFactory::build_client(&config.network_config)?;
         let network_config = config.network_config.clone();
         let factory =
@@ -205,17 +245,21 @@ impl RaftIntegration {
 
         let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
 
-        Ok(Self::new(RaftIntegrationParts {
-            raft: Arc::new(raft),
-            self_id: config.node_id,
-            http_client,
+        Ok(Self::new(
+            Arc::new(raft),
+            config.node_id,
             shared_state,
-            event_bus,
-            waiter_map,
-            staged_receipts,
-            network_config,
+            AdapterChannels {
+                event_bus,
+                waiter_map,
+                staged_receipts,
+            },
+            HttpTransport {
+                client: http_client,
+                config: network_config,
+            },
             release_rx,
-        }))
+        ))
     }
 
     /// Inter-node Raft RPC router. Mount under `/raft` on the private
@@ -224,8 +268,30 @@ impl RaftIntegration {
     /// inside that boundary. [`Self::cluster_admin_router`] is the
     /// layer that gates membership changes against operator
     /// credentials.
+    ///
+    /// Includes both the openraft RPCs (append-entries, vote,
+    /// install-snapshot) and the cross-node `apply_staged_commit`
+    /// and `apply_queue_poison` endpoints follower-owned workers
+    /// POST to.
     pub fn raft_rpc_router(&self) -> Router {
         raft_network::router(Arc::clone(&self.raft), &self.network_config)
+            .merge(apply_staged_commit_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+            .merge(apply_queue_poison_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+    }
+
+    /// Borrow the shared [`RaftNameService`] handle. The integration
+    /// builds one in `new` and threads the same handle through the
+    /// HTTP routes, `Fluree`, and the worker supervisor so reads,
+    /// publishes, and the cross-node propose all observe one map of
+    /// staged receipts.
+    pub fn nameservice(&self) -> Arc<RaftNameService> {
+        Arc::clone(&self.nameservice)
     }
 
     /// Cluster admin router — bootstrap and membership-change
@@ -286,13 +352,46 @@ impl RaftBootstrapConfig {
     /// tune `raft_config` / `network_config` as workload patterns
     /// demand.
     pub fn new(node_id: NodeId, storage_path: impl Into<PathBuf>) -> Self {
+        let network_config = NetworkConfig::default();
         Self {
             node_id,
             storage_path: storage_path.into(),
-            raft_config: RaftConfig::default(),
-            network_config: NetworkConfig::default(),
+            raft_config: default_raft_config(&network_config),
+            network_config,
             event_bus_capacity: 1024,
         }
+    }
+}
+
+/// Election timeouts derived from [`NetworkConfig`]'s RPC timeouts,
+/// rather than openraft's stock 150–300 ms.
+///
+/// openraft's defaults assume sub-millisecond, always-reachable peers.
+/// Ours don't hold: `rpc_timeout` is 500 ms and a *dead but not yet
+/// evicted* voter costs `connect_timeout` (250 ms) on every vote round.
+/// With the stock 150–300 ms election window, a candidate re-elects —
+/// bumping its term — before its own vote RPCs from the previous round
+/// resolve, so every vote lands on a now-stale term and no quorum ever
+/// forms. On a leader failover the survivors then livelock: all climb
+/// to the same term with no leader and never converge.
+///
+/// The fix is the invariant `election_timeout_min > rpc_timeout`: a
+/// candidate must give the live quorum (which answers in well under a
+/// millisecond on a LAN) time to vote before it abandons the term.
+/// Deriving the window from `rpc_timeout` keeps that invariant intact
+/// if the network defaults are ever retuned. We use 2× `rpc_timeout`
+/// with a 750 ms floor for `min`, and a 2× spread to `max` so timers
+/// desynchronize. Cost is a slightly slower failover (~1–2 s at the
+/// defaults). [`RaftIntegration::bootstrap`] re-checks the invariant
+/// at runtime so an override of *either* config that breaks it is
+/// caught even when this constructor isn't used.
+fn default_raft_config(network: &NetworkConfig) -> RaftConfig {
+    let rpc_ms = network.rpc_timeout.as_millis() as u64;
+    let election_timeout_min = rpc_ms.saturating_mul(2).max(750);
+    RaftConfig {
+        election_timeout_min,
+        election_timeout_max: election_timeout_min.saturating_mul(2),
+        ..RaftConfig::default()
     }
 }
 
@@ -367,41 +466,37 @@ impl LeaderTracker {
     }
 }
 
-/// Handle returned by [`spawn_leader_watcher`]. Holds the watcher's
-/// `JoinHandle` plus a `CancellationToken` the caller uses to signal
-/// shutdown. Callers should use [`Self::shutdown`] (graceful) on the
-/// normal server-shutdown path so the watcher reaches its leader-
-/// task cleanup; [`Self::abort`] is a defensive last resort that
-/// drops the watcher mid-await and leaks any still-running leader
-/// tasks.
-pub struct LeaderWatcherHandle {
+/// Handle to a cancellable background task: the spawned future
+/// receives a [`CancellationToken`] and is expected to drain its
+/// own work before returning when the token fires. Callers drive
+/// graceful shutdown via [`Self::shutdown`] — cancels the token,
+/// awaits the task. [`Self::abort`] is a test-only escape hatch.
+///
+/// Returned by both [`spawn_leader_watcher`] and
+/// [`spawn_worker_supervisor`]; the handle's contract is the same
+/// for both — only the task body differs.
+pub struct CancellableTaskHandle {
     join: JoinHandle<()>,
     cancel: tokio_util::sync::CancellationToken,
 }
 
-impl LeaderWatcherHandle {
-    /// Cooperatively shut the watcher down. Cancels the watcher's
-    /// internal token so its `select!` loop exits naturally, runs the
-    /// trailing `abort_and_await` over any in-flight leader tasks,
-    /// and awaits the watcher's own `JoinHandle` so the function
-    /// returns only after every leader task this node spawned has
-    /// stopped.
+impl CancellableTaskHandle {
+    /// Cooperatively shut the task down. Cancels the token so the
+    /// task's loop exits naturally and runs whatever drain code its
+    /// body owns, then awaits the `JoinHandle` so the function
+    /// returns only after the task has actually stopped.
     ///
-    /// This is the path the server's shutdown sequence uses. Without
-    /// it (e.g. `JoinHandle::abort` straight on the watcher) the
-    /// watcher's Future is dropped mid-await and its cleanup code
-    /// never runs — leader tasks keep ticking on a runtime that's
-    /// about to disappear.
+    /// Without it (e.g. `JoinHandle::abort` straight on the task)
+    /// the task's Future is dropped mid-await and its cleanup code
+    /// never runs.
     pub async fn shutdown(self) {
         self.cancel.cancel();
-        // The watcher catches the cancel, drains its leader tasks,
-        // and returns. `JoinError` here would mean the watcher
-        // panicked — log via `_` since shutdown has no caller to
-        // surface it to.
+        // `JoinError` here would mean the task panicked — log via
+        // `_` since shutdown has no caller to surface it to.
         let _ = self.join.await;
     }
 
-    /// Hard abort: signal cancellation *and* abort the watcher's
+    /// Hard abort: signal cancellation *and* abort the task's
     /// JoinHandle without awaiting. Test-only escape hatch — leaves
     /// the cleanup invariants to whoever's tearing the runtime down.
     #[cfg(test)]
@@ -409,6 +504,21 @@ impl LeaderWatcherHandle {
         self.cancel.cancel();
         self.join.abort();
     }
+}
+
+/// Spawn a task whose body receives the matching
+/// [`CancellationToken`] for graceful shutdown, returning a handle
+/// that owns the join + cancel pair. Private — public spawn
+/// functions (e.g. [`spawn_leader_watcher`],
+/// [`spawn_worker_supervisor`]) delegate.
+fn spawn_cancellable<F, Fut>(future_fn: F) -> CancellableTaskHandle
+where
+    F: FnOnce(tokio_util::sync::CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let join = tokio::spawn(future_fn(cancel.clone()));
+    CancellableTaskHandle { join, cancel }
 }
 
 /// Spawn a background task that watches `raft.metrics()` and drives
@@ -424,10 +534,8 @@ impl LeaderWatcherHandle {
 /// leader (indexer, commit-queue worker, periodic idempotency
 /// evictor, …) into the returned `Vec`.
 ///
-/// The returned [`LeaderWatcherHandle`] is the watcher itself.
-/// Shutdown should call [`LeaderWatcherHandle::shutdown`] — cancels
-/// the token, lets the watcher reach its cleanup code, and awaits
-/// completion.
+/// Shutdown via [`CancellableTaskHandle::shutdown`] — cancels the
+/// token, lets the watcher reach its cleanup code, awaits.
 ///
 /// `tokio::sync::watch` is a "latest value" channel, so transient
 /// flips that don't cross the leader/not-leader boundary from this
@@ -437,21 +545,19 @@ impl LeaderWatcherHandle {
 /// with us back at the lead, no spawn/abort churn.
 pub fn spawn_leader_watcher<F>(
     raft: Arc<Raft<TypeConfig>>,
-    self_id: NodeId,
+    id: NodeId,
     spawn_leader_tasks: F,
-) -> LeaderWatcherHandle
+) -> CancellableTaskHandle
 where
     F: Fn() -> Vec<JoinHandle<()>> + Send + 'static,
 {
-    let cancel = tokio_util::sync::CancellationToken::new();
-    let cancel_inner = cancel.clone();
-    let join = tokio::spawn(async move {
+    spawn_cancellable(move |cancel| async move {
         let mut metrics = raft.metrics();
         let mut tracker = LeaderTracker::default();
         let mut current_tasks: Vec<JoinHandle<()>> = Vec::new();
 
         loop {
-            let is_leader = metrics.borrow().current_leader == Some(self_id);
+            let is_leader = metrics.borrow().current_leader == Some(id);
             match tracker.tick(is_leader) {
                 LeadershipTransition::Spawn => {
                     current_tasks = spawn_leader_tasks();
@@ -471,7 +577,7 @@ where
                         break;
                     }
                 }
-                () = cancel_inner.cancelled() => {
+                () = cancel.cancelled() => {
                     break;
                 }
             }
@@ -481,8 +587,19 @@ where
         // Awaiting here is what guarantees `shutdown()` returns only
         // after every leader task has actually stopped.
         abort_and_await(std::mem::take(&mut current_tasks)).await;
-    });
-    LeaderWatcherHandle { join, cancel }
+    })
+}
+
+/// Spawn the per-node worker supervisor as a long-running background
+/// task. Unlike [`spawn_leader_watcher`], this is node-lifetime — the
+/// supervisor runs on every node (leader and followers alike) because
+/// distributed workers can land anywhere under rendezvous assignment.
+///
+/// Shutdown via [`CancellableTaskHandle::shutdown`].
+pub fn spawn_worker_supervisor(
+    supervisor: fluree_db_consensus::raft::commit_worker::WorkerSupervisor,
+) -> CancellableTaskHandle {
+    spawn_cancellable(|cancel| async move { supervisor.run(cancel).await })
 }
 
 /// Abort every handle and wait for the joins to resolve. `abort` is
@@ -602,7 +719,7 @@ mod tests {
 
         let watcher = spawn_leader_watcher(
             Arc::clone(&integration.raft),
-            1, // self_id
+            1, // id
             move || {
                 count_for_closure.fetch_add(1, Ordering::SeqCst);
                 // Two parked tasks stand in for the indexer + commit

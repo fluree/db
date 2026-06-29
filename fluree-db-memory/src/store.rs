@@ -176,6 +176,23 @@ impl MemoryStore {
         *self.synced_hash.lock().expect("synced_hash poisoned") = hash;
     }
 
+    /// Acquire the in-process mutation lock, bounded by [`crate::file_sync::lock_timeout`].
+    ///
+    /// Using a timeout instead of an unbounded `.lock().await` means that if a
+    /// prior memory operation is stuck holding the lock (e.g. a wedged task
+    /// spinning under it), later calls fail with a recoverable error rather than
+    /// freezing the session forever.
+    async fn lock_mutation(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let timeout = crate::file_sync::lock_timeout();
+        match tokio::time::timeout(timeout, self.mutation_lock.lock()).await {
+            Ok(guard) => Ok(guard),
+            Err(_) => Err(MemoryError::FileSync(format!(
+                "timed out after {timeout:?} waiting for the in-process memory lock; \
+                 a prior memory operation may be stuck"
+            ))),
+        }
+    }
+
     /// Check if the memory ledger has been initialized.
     pub async fn is_initialized(&self) -> Result<bool> {
         Ok(self.fluree.ledger_exists(MEMORY_LEDGER_ID).await?)
@@ -266,7 +283,7 @@ impl MemoryStore {
     ///
     /// Used by the rebuild pipeline to recreate the ledger from `.ttl` files.
     pub async fn drop_and_reinit(&self) -> Result<()> {
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutation().await?;
         let file_lock = self.acquire_file_lock().await?;
         let result = self.drop_and_reinit_unlocked().await;
         drop(file_lock);
@@ -309,7 +326,7 @@ impl MemoryStore {
     /// No-op if `memory_dir` is `None`.
     pub async fn ensure_synced(&self) -> Result<()> {
         if let Some(dir) = &self.memory_dir {
-            let _guard = self.mutation_lock.lock().await;
+            let _guard = self.lock_mutation().await?;
             crate::file_sync::ensure_synced(self, dir).await?;
         }
         Ok(())
@@ -351,7 +368,7 @@ impl MemoryStore {
     /// the ledger cache commit succeeds so that any cache failure leaves a hash
     /// mismatch and triggers a rebuild on the next `ensure_synced()`.
     pub async fn add(&self, input: MemoryInput) -> Result<String> {
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutation().await?;
         let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
         self.sync_under_lock().await?;
@@ -373,24 +390,23 @@ impl MemoryStore {
             alternatives: input.alternatives,
         };
 
-        // File is truth — sorted rewrite so memories from different branches
-        // land in different regions of the file, reducing merge conflicts.
+        // File is truth — splice the new block into its sorted (branch, id)
+        // position by reading only the `.ttl` text, never re-querying the
+        // ledger. Untouched blocks stay byte-identical, so concurrent adds on
+        // different branches land in different regions and merge cleanly under
+        // a default git merge, while same-memory edits still conflict.
         if let Some(dir) = &self.memory_dir {
-            let (path, header, scope_filter) = match mem.scope {
+            let (path, header) = match mem.scope {
                 Scope::Repo => (
                     crate::turtle_io::repo_ttl_path(dir),
                     crate::turtle_io::REPO_HEADER,
-                    Some(Scope::Repo),
                 ),
                 Scope::User => (
                     crate::turtle_io::user_ttl_path(dir),
                     crate::turtle_io::USER_HEADER,
-                    Some(Scope::User),
                 ),
             };
-            let mut all = self.all_memories_for_scope(scope_filter.as_ref()).await?;
-            all.push(mem.clone());
-            crate::turtle_io::write_memory_file(&path, &all, header)?;
+            crate::turtle_io::insert_memory_into_file(&path, &mem, header)?;
         }
 
         // Then update the ledger cache
@@ -451,7 +467,7 @@ WHERE {{\n\
     /// In file-based mode, the `.ttl` file is rewritten first (authoritative),
     /// then the ledger is updated via retract-all + re-insert.
     pub async fn update(&self, id: &str, update: MemoryUpdate) -> Result<String> {
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutation().await?;
         let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
         self.sync_under_lock().await?;
@@ -541,7 +557,7 @@ WHERE {{\n\
     /// In file-based mode, the `.ttl` file is rewritten first (authoritative),
     /// then the ledger cache is updated. This is the only non-append file mutation.
     pub async fn forget(&self, id: &str) -> Result<()> {
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutation().await?;
         let file_lock = self.acquire_file_lock().await?;
         self.initialize().await?;
         self.sync_under_lock().await?;
@@ -843,7 +859,7 @@ WHERE {{\n\
     ///
     /// Returns the number of memories imported.
     pub async fn import(&self, data: Value) -> Result<usize> {
-        let _guard = self.mutation_lock.lock().await;
+        let _guard = self.lock_mutation().await?;
         self.initialize().await?;
 
         let memories: Vec<Memory> = serde_json::from_value(data)?;

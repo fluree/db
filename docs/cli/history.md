@@ -18,7 +18,7 @@ fluree history <ENTITY> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <TIME>` | Start of time range (default: `1`) |
 | `--to <TIME>` | End of time range (default: `latest`) |
 | `-p, --predicate <PRED>` | Filter to specific predicate |

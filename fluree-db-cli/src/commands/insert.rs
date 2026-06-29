@@ -65,6 +65,15 @@ pub fn resolve_inputs<'a>(
             let p = Path::new(&args[0]);
             if !looks_like_query(&args[0]) && p.is_file() {
                 Ok((Some(ledger), None, Some(p.to_path_buf())))
+            } else if !looks_like_query(&args[0]) && looks_like_path(&args[0]) {
+                // Path-shaped but no such file: almost always a typo'd file
+                // path rather than inline data. Feeding it to the input reader
+                // would surface a confusing parse error, so reject clearly.
+                Err(CliError::Usage(format!(
+                    "no such file: '{}' — with --ledger, the positional argument \
+                     must be inline data/query or an existing file path",
+                    args[0]
+                )))
             } else {
                 // Inline data/query (or a path the input reader will reject).
                 Ok((Some(ledger), Some(&args[0]), None))
@@ -76,6 +85,26 @@ pub fn resolve_inputs<'a>(
                 .into(),
         )),
     }
+}
+
+/// Heuristic: does this string look like an intended file path (so a missing
+/// file is a typo worth flagging) rather than inline data? Single-token, no
+/// whitespace, and either contains a path separator or ends in a known
+/// data-file extension.
+fn looks_like_path(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return false;
+    }
+    if t.contains('/') || t.contains('\\') {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    [
+        ".json", ".jsonld", ".ttl", ".nt", ".nq", ".trig", ".rq", ".sparql",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
 }
 
 /// Heuristic: does this string look like a query or data literal rather than a

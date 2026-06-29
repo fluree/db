@@ -39,7 +39,8 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 query_min_t_timeout_ms = 5000
-# cache_max_mb = 4096  # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
 
 [server.query_refresh]
 enabled = false
@@ -363,6 +364,7 @@ Global cache budget (MB):
 | Flag              | Env Var              | Default                |
 | ----------------- | -------------------- | ---------------------- |
 | `--cache-max-mb`  | `FLUREE_CACHE_MAX_MB`| Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`    |
+| `--disk-cache-max-mb` | `FLUREE_DISK_CACHE_MAX_MB`| Auto-detect from free disk; `0` disables. Shared across object storage + Iceberg |
 
 ### Background Indexing
 
@@ -785,6 +787,7 @@ With a config file:
 [server]
 connection_config = "/etc/fluree/connection.jsonld"
 cache_max_mb = 4096
+disk_cache_max_mb = 20480
 
 [server.indexing]
 enabled = true
@@ -821,7 +824,9 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
-| `FLUREE_CACHE_MAX_MB`                   | Global cache budget (MB)                        | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
+| `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
+| `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
+| `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |
 | `FLUREE_QUERY_TIMEOUT_MS`               | Max query execution time in milliseconds (`0` disables) | `900000`                                                     |
 | `FLUREE_QUERY_MIN_T_TIMEOUT_MS`         | Max read-after-write min-t wait in milliseconds | `5000`                                                                  |
