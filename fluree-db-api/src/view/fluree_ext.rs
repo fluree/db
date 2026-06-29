@@ -610,7 +610,7 @@ impl Fluree {
     /// the single source of truth for the genesis graph-source view; see
     /// [`db_or_graph_source`](Self::db_or_graph_source) and the dataset path's
     /// `resolve_as_graph_source`.
-    pub(crate) async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
+    pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
         let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
             .unwrap_or_else(|_| ledger_id.to_string());
 
