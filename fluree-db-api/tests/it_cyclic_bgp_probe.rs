@@ -18,7 +18,7 @@ use fluree_db_api::{FlureeBuilder, IndexConfig, LedgerManagerConfig, QueryInput}
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
 use support::{
-    genesis_ledger_for_fluree, normalize_rows, start_background_indexer_local,
+    genesis_ledger_for_fluree, normalize_rows, span_capture, start_background_indexer_local,
     trigger_index_and_wait_outcome,
 };
 
@@ -131,6 +131,13 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                 ),
             ];
 
+            // Track whether the bounded probe actually engaged on at least one
+            // query. At the indexed HEAD with no novelty the overlay lane is
+            // Clean and probing is allowed, so a probe-eligible query must emit
+            // the per-subject probe event. Without this, every assertion below
+            // is result-equivalence against the fallback — which a silently
+            // always-declining probe would still satisfy.
+            let mut probe_engaged = false;
             for (name, query) in queries {
                 // 1. Fallback operator tree = ground truth.
                 clear_cyclic_env();
@@ -141,8 +148,11 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                 // 2. Cascade with probing forced on (every gate-passing edge probes).
                 clear_cyclic_env();
                 std::env::set_var("FLUREE_CYCLIC_BGP_PROBE_SCAN_RATIO", "1");
+                let (spans, guard) = span_capture::init_test_tracing();
                 let probed = run_query(&fluree, &view, query).await;
+                drop(guard);
                 assert_eq!(probed, expected, "{name}: probed cascade != fallback");
+                probe_engaged |= spans.has_event("cyclic cascade: probing edge per-subject");
 
                 // 3. Cascade with probing forced off (full-scan semi-join path).
                 clear_cyclic_env();
@@ -150,6 +160,11 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                 let scanned = run_query(&fluree, &view, query).await;
                 assert_eq!(scanned, expected, "{name}: full-scan cascade != fallback");
             }
+            assert!(
+                probe_engaged,
+                "bounded probe never engaged on the indexed HEAD view; \
+                 probe-activation coverage is gone"
+            );
 
             // Phase 2: novelty tail — retract triangle 2's closing edge and
             // assert a triangle that exists only in novelty. Probes must merge
@@ -198,7 +213,8 @@ async fn cyclic_bgp_bounded_probe_matches_fallback() {
                     // At head the view is the binary index plus a separate
                     // novelty overlay; the bounded probe declines on that fast
                     // path (the overlay-merging fallback serves these rows), so
-                    // we assert the merged result rather than probe engagement.
+                    // the `db()` run above asserts the merged result rather
+                    // than probe engagement.
                     assert!(
                         expected
                             .iter()
