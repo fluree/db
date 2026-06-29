@@ -29,6 +29,7 @@ use fluree_db_transact::{
     lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
+use std::time::Instant;
 
 /// Parse a SPARQL UPDATE string and lower it to the transaction IR against
 /// a snapshot's namespace registry. Errors map to HTTP 400 with the same
@@ -38,9 +39,19 @@ pub(crate) fn parse_and_lower_sparql_update(
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
 ) -> Result<Txn> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
     let parsed = fluree_db_sparql::parse_sparql(sparql);
+    let parse_elapsed = parse_started.elapsed();
     if parsed.has_errors() {
         let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "sparql_parse",
+            ok = false,
+            elapsed_ms = parse_elapsed.as_millis() as u64,
+            "transaction timing"
+        );
         return Err(ApiError::http(
             400,
             format!("SPARQL UPDATE parse error: {}", messages.join("; ")),
@@ -50,8 +61,20 @@ pub(crate) fn parse_and_lower_sparql_update(
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
     let mut ns = NamespaceRegistry::from_db(snapshot);
-    lower_sparql_update_ast(&ast, &mut ns, txn_opts)
-        .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
+    let lower_started = Instant::now();
+    let lowered = lower_sparql_update_ast(&ast, &mut ns, txn_opts)
+        .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")));
+    let lower_elapsed = lower_started.elapsed();
+    tracing::info!(
+        target: "fluree::tx_timing",
+        phase = "sparql_parse_lower",
+        ok = lowered.is_ok(),
+        parse_ms = parse_elapsed.as_millis() as u64,
+        lower_ms = lower_elapsed.as_millis() as u64,
+        total_ms = total_started.elapsed().as_millis() as u64,
+        "transaction timing"
+    );
+    lowered
 }
 
 /// Conflicts that heal by reconciling the cached writer state to the durable
@@ -977,8 +1000,10 @@ impl Fluree {
         index_config: &IndexConfig,
         store_raw_txn: bool,
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
+        let total_started = Instant::now();
         if let Some(txn) = core.pre_built_txn {
             let txn_type = txn.txn_type;
+            let stage_started = Instant::now();
             let stage_result = self
                 .stage_transaction_from_txn(
                     ledger_state,
@@ -988,12 +1013,29 @@ impl Fluree {
                     Some(tracker),
                 )
                 .await?;
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "stage_transaction_from_txn",
+                input = "pre_built_txn",
+                txn_type = ?txn_type,
+                elapsed_ms = stage_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "stage_under_lock",
+                input = "pre_built_txn",
+                txn_type = ?txn_type,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
             return Ok((stage_result, txn_type, core.commit_opts));
         }
 
         if let Some(sparql) = core.pending_sparql {
             let txn = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
             let txn_type = txn.txn_type;
+            let stage_started = Instant::now();
             let stage_result = self
                 .stage_transaction_from_txn(
                     ledger_state,
@@ -1003,6 +1045,22 @@ impl Fluree {
                     Some(tracker),
                 )
                 .await?;
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "stage_transaction_from_txn",
+                input = "pending_sparql",
+                txn_type = ?txn_type,
+                elapsed_ms = stage_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "stage_under_lock",
+                input = "pending_sparql",
+                txn_type = ?txn_type,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
             return Ok((stage_result, txn_type, core.commit_opts));
         }
 
@@ -1012,6 +1070,7 @@ impl Fluree {
 
         // Direct flake path for InsertTurtle (bypass JSON-LD / IR).
         if let TransactOperation::InsertTurtle(turtle) = op {
+            let stage_started = Instant::now();
             let stage_result = self
                 .stage_turtle_insert(
                     ledger_state,
@@ -1027,15 +1086,39 @@ impl Fluree {
                 serde_json::Value::String(turtle.to_string()),
                 store_raw_txn,
             );
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "stage_turtle_insert",
+                input = "insert_turtle",
+                elapsed_ms = stage_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "stage_under_lock",
+                input = "insert_turtle",
+                txn_type = ?TxnType::Insert,
+                elapsed_ms = total_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
             return Ok((stage_result, TxnType::Insert, commit_opts));
         }
 
         // JSON-like operation: parse, extracting TriG metadata + named graphs.
         let txn_type = op.txn_type();
+        let parse_started = Instant::now();
         let parsed = op.to_json_with_trig_meta()?;
         let txn_json = parsed.json;
         let trig_meta = parsed.trig_meta;
         let named_graphs = parsed.named_graphs;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "transaction_body_parse",
+            input = "json_like",
+            txn_type = ?txn_type,
+            elapsed_ms = parse_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         let commit_opts = self.maybe_spawn_txn_upload(
             core.commit_opts,
@@ -1056,6 +1139,14 @@ impl Fluree {
                 core.policy.as_ref(),
             )
             .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "stage_transaction_with_named_graphs",
+            input = "json_like",
+            txn_type = ?txn_type,
+            elapsed_ms = total_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         Ok((stage_result, txn_type, commit_opts))
     }
@@ -1165,9 +1256,18 @@ impl Fluree {
             });
         }
 
+        let commit_started = Instant::now();
         let (receipt, new_state) = self
             .commit_staged(view, ns_registry, index_config, commit_opts)
             .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "commit_staged",
+            commit_t = receipt.t,
+            flake_count = receipt.flake_count,
+            elapsed_ms = commit_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         let indexing_status = IndexingStatus {
             enabled: self.indexing_mode.is_enabled(),
@@ -1177,8 +1277,19 @@ impl Fluree {
             commit_t: receipt.t,
         };
 
+        let finalize_started = Instant::now();
         self.finalize_commit(write_guard, new_state, receipt.t, indexing_status.needed)
             .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "finalize_commit",
+            commit_t = receipt.t,
+            indexing_needed = indexing_status.needed,
+            novelty_size = indexing_status.novelty_size,
+            index_t = indexing_status.index_t,
+            elapsed_ms = finalize_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         Ok(TransactResultRef {
             receipt,
@@ -1216,7 +1327,16 @@ impl Fluree {
             .map(Tracker::new)
             .unwrap_or_else(Tracker::disabled);
 
+        let lock_started = Instant::now();
         let write_guard = ledger.lock_for_write().await;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "lock_for_write",
+            path = "build_commit_with_handle",
+            ledger_id = ledger.id(),
+            elapsed_ms = lock_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
         let (stage_result, _txn_type, commit_opts) = self
             .stage_under_lock(
                 write_guard.clone_state(),
@@ -1244,6 +1364,7 @@ impl Fluree {
         // local pending upload — both pointing to the same CID would
         // be redundant work. The result CID ends up referenced by the
         // commit record.
+        let raw_txn_started = Instant::now();
         let txn_id = if let Some(cid) = commit_opts.raw_txn_id.take() {
             // Drop any redundant pending upload — its blob (if it
             // landed) shares the same CID and stays content-addressed.
@@ -1254,6 +1375,14 @@ impl Fluree {
         } else {
             None
         };
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "raw_txn_upload_wait",
+            path = "build_commit_with_handle",
+            had_raw_txn = txn_id.is_some(),
+            elapsed_ms = raw_txn_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         // We hold the write guard for the entire build → propose →
         // apply window, so the staged base IS authoritative. There is
@@ -1274,6 +1403,7 @@ impl Fluree {
         // `txn_id_for_release` on the staged commit, so release here
         // to avoid orphaning the raw-txn blob.
         let txn_id_for_cleanup = txn_id.clone();
+        let build_started = Instant::now();
         let mut staged = match fluree_db_transact::build_commit(
             view,
             ns_registry,
@@ -1295,6 +1425,15 @@ impl Fluree {
                 return Err(ApiError::from(e));
             }
         };
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "build_commit",
+            path = "build_commit_with_handle",
+            commit_t = staged.commit.t,
+            flake_count = staged.commit.flakes.len(),
+            elapsed_ms = build_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         if tracker.is_enabled() {
             staged.tally = tracker.tally();
@@ -1331,7 +1470,16 @@ impl Fluree {
         // pre-built `Txn` carries internal references; SPARQL namespace
         // allocation must share the staging registry.
         if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
+            let lock_started = Instant::now();
             let write_guard = ledger.lock_for_write().await;
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "lock_for_write",
+                path = "commit_with_handle_fast",
+                ledger_id = ledger.id(),
+                elapsed_ms = lock_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
             let (stage_result, txn_type, commit_opts) = self
                 .stage_under_lock(
                     write_guard.clone_state(),

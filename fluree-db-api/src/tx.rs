@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::config_resolver;
 use crate::{ApiError, Result};
@@ -133,9 +134,19 @@ fn is_empty_default_graph(json: &JsonValue) -> bool {
 ///
 /// Returns `None` if config graph is empty or unreadable (best-effort).
 async fn load_transaction_config(ledger: &LedgerState) -> Option<Arc<LedgerConfig>> {
-    match config_resolver::resolve_ledger_config(&ledger.snapshot, &*ledger.novelty, ledger.t())
-        .await
-    {
+    let started = Instant::now();
+    let resolved =
+        config_resolver::resolve_ledger_config(&ledger.snapshot, &*ledger.novelty, ledger.t())
+            .await;
+    tracing::info!(
+        target: "fluree::tx_timing",
+        phase = "load_transaction_config",
+        found = matches!(resolved, Ok(Some(_))),
+        ok = resolved.is_ok(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "transaction timing"
+    );
+    match resolved {
         Ok(Some(config)) => Some(Arc::new(config)),
         Ok(None) => None,
         Err(e) => {
@@ -1558,13 +1569,23 @@ impl crate::Fluree {
         let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
+        let stage_started = Instant::now();
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
             stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "stage_txn_core",
+            path = "stage_transaction_with_named_graphs",
+            txn_type = ?txn_type,
+            elapsed_ms = stage_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         // Enforce uniqueness constraints (independent of shacl feature)
+        let unique_started = Instant::now();
         enforce_unique_after_staging(
             &view,
             &graph_delta,
@@ -1573,6 +1594,14 @@ impl crate::Fluree {
             &ns_registry,
         )
         .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "enforce_unique_after_staging",
+            path = "stage_transaction_with_named_graphs",
+            txn_type = ?txn_type,
+            elapsed_ms = unique_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         Ok(StageResult {
             view,
@@ -1647,13 +1676,22 @@ impl crate::Fluree {
         let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
+        let stage_started = Instant::now();
         #[cfg(feature = "shacl")]
         let (view, ns_registry) =
             stage_with_config_shacl(ledger, txn, ns_registry, options, &mut resolve_ctx).await?;
         #[cfg(not(feature = "shacl"))]
         let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "stage_txn_core",
+            path = "stage_transaction_from_txn",
+            elapsed_ms = stage_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         // Enforce uniqueness constraints (independent of shacl feature)
+        let unique_started = Instant::now();
         enforce_unique_after_staging(
             &view,
             &graph_delta,
@@ -1662,6 +1700,13 @@ impl crate::Fluree {
             &ns_registry,
         )
         .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "enforce_unique_after_staging",
+            path = "stage_transaction_from_txn",
+            elapsed_ms = unique_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         Ok(StageResult {
             view,

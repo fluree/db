@@ -34,6 +34,7 @@ use fluree_db_sparql::ast::{
 use fluree_db_sparql::lower_sparql;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::Instrument;
 
 #[cfg(feature = "shacl")]
@@ -601,6 +602,7 @@ pub async fn stage(
     mut ns_registry: NamespaceRegistry,
     options: StageOptions<'_>,
 ) -> Result<(StagedLedger, NamespaceRegistry)> {
+    let total_started = Instant::now();
     let span = tracing::debug_span!("txn_stage",
         current_t = ledger.t(),
         txn_type = ?txn.txn_type,
@@ -691,6 +693,7 @@ pub async fn stage(
             retraction_count = tracing::field::Empty,
             assertion_count = tracing::field::Empty,
         );
+        let where_started = Instant::now();
         let stream_stats = async {
             let stats = stream_where_into_accumulator(
                 &ledger,
@@ -711,6 +714,15 @@ pub async fn stage(
         }
         .instrument(where_span)
         .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "txn_stage_where",
+            binding_rows = stream_stats.total_binding_rows,
+            retraction_count = stream_stats.retraction_count as u64,
+            assertion_count = stream_stats.assertion_count as u64,
+            elapsed_ms = where_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         // Per SPARQL 1.1 Update §3.1.3: INSERT/DELETE templates are instantiated
         // once per WHERE solution, so a WHERE that matches zero solutions is a
@@ -788,6 +800,7 @@ pub async fn stage(
         // explicit-IRI metadata cascade (LPG mode opt-in) are tracked
         // as follow-ups in the plan.
         let lpg_edge_lifecycle = txn.opts.lpg_edge_lifecycle.unwrap_or(false);
+        let cascade_started = Instant::now();
         let cascade = cascade_attachment_retracts(
             &flakes,
             &ledger,
@@ -796,6 +809,13 @@ pub async fn stage(
             lpg_edge_lifecycle,
         )
         .await?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "txn_stage_cascade_attachment_retracts",
+            cascade_count = cascade.len(),
+            elapsed_ms = cascade_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
         if !cascade.is_empty() {
             // Dedup cascade retracts against retracts already in
             // `flakes` (e.g. a same-txn by-id annotation retract that
@@ -1009,10 +1029,18 @@ pub async fn stage(
             "transaction staging completed"
         );
 
-        Ok((
-            StagedLedger::new(ledger, flakes, &reverse_graph)?,
-            ns_registry,
-        ))
+        let staged = StagedLedger::new(ledger, flakes, &reverse_graph)?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "txn_stage_total",
+            flake_count = total_flakes,
+            assertions = assertions,
+            retractions = retractions,
+            elapsed_ms = total_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
+
+        Ok((staged, ns_registry))
     }
     .instrument(span)
     .await

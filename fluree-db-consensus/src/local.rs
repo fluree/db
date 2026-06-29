@@ -19,6 +19,7 @@ use fluree_db_api::{
 };
 use fluree_db_ledger::IndexConfig;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Upper bound on stage + commit attempts when a retryable
 /// inter-writer conflict surfaces. Mirrors the prior monolithic
@@ -98,11 +99,19 @@ impl Committer for LocalCommitter {
             governance,
         } = request;
 
+        let load_started = Instant::now();
         let ledger_handle = self
             .ledger_manager()?
             .get_or_load(&ledger_id)
             .await
             .map_err(execution_failure)?;
+        tracing::info!(
+            target: "fluree::tx_timing",
+            phase = "committer_get_or_load",
+            ledger_id = %ledger_id,
+            elapsed_ms = load_started.elapsed().as_millis() as u64,
+            "transaction timing"
+        );
 
         // Bounded reconcile-and-retry around stage + commit. See
         // [`is_retryable_txn_conflict`] for the conflict variants that
@@ -113,7 +122,17 @@ impl Committer for LocalCommitter {
         // `CommitOpts` / `TrackingOptions`.
         let mut last_error: Option<ApiError> = None;
         for attempt in 1..=MAX_TXN_RETRIES {
+            let policy_started = Instant::now();
             let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
+            tracing::info!(
+                target: "fluree::tx_timing",
+                phase = "build_policy_context",
+                ledger_id = %ledger_id,
+                attempt,
+                has_policy = policy_ctx.is_some(),
+                elapsed_ms = policy_started.elapsed().as_millis() as u64,
+                "transaction timing"
+            );
 
             // Cypher lowers to a `Txn` here — under the write lock and re-resolved
             // each retry attempt — rather than pre-lock in the route. A conditional
@@ -167,8 +186,20 @@ impl Committer for LocalCommitter {
                 builder = builder.policy(policy);
             }
 
+            let execute_started = Instant::now();
             match builder.execute().await {
                 Ok(result) => {
+                    tracing::info!(
+                        target: "fluree::tx_timing",
+                        phase = "builder_execute",
+                        ledger_id = %ledger_id,
+                        attempt,
+                        ok = true,
+                        commit_t = result.receipt.t,
+                        flake_count = result.receipt.flake_count,
+                        elapsed_ms = execute_started.elapsed().as_millis() as u64,
+                        "transaction timing"
+                    );
                     return Ok(TransactionReceipt {
                         idempotency_key,
                         commit: result.receipt,
@@ -176,6 +207,16 @@ impl Committer for LocalCommitter {
                     });
                 }
                 Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                    tracing::info!(
+                        target: "fluree::tx_timing",
+                        phase = "builder_execute",
+                        ledger_id = %ledger_id,
+                        attempt,
+                        ok = false,
+                        retryable = true,
+                        elapsed_ms = execute_started.elapsed().as_millis() as u64,
+                        "transaction timing"
+                    );
                     tracing::warn!(
                         attempt,
                         max_attempts = MAX_TXN_RETRIES,
@@ -196,7 +237,19 @@ impl Committer for LocalCommitter {
                     last_error = Some(e);
                     continue;
                 }
-                Err(e) => return Err(execution_failure(e)),
+                Err(e) => {
+                    tracing::info!(
+                        target: "fluree::tx_timing",
+                        phase = "builder_execute",
+                        ledger_id = %ledger_id,
+                        attempt,
+                        ok = false,
+                        retryable = false,
+                        elapsed_ms = execute_started.elapsed().as_millis() as u64,
+                        "transaction timing"
+                    );
+                    return Err(execution_failure(e));
+                }
             }
         }
 

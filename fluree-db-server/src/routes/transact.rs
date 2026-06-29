@@ -44,6 +44,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::Instrument;
 
 /// Query parameters for transaction endpoints
@@ -294,14 +295,25 @@ async fn transact_via_consensus(
     tx_id: String,
     headers: &HeaderMap,
 ) -> Result<Response> {
+    let operation = request.body.operation_tag();
     let correlation = IndexRequestCorrelation::new(
         extract_request_id(headers, &state.telemetry_config),
         extract_trace_id(headers),
-        Some(request.body.operation_tag()),
+        Some(operation),
     );
 
+    let submit_started = Instant::now();
     let submission =
         with_index_request_correlation(correlation, state.committer.transact(request)).await;
+    tracing::info!(
+        target: "fluree::tx_timing",
+        phase = "transact_via_consensus",
+        ledger_id,
+        operation,
+        ok = submission.is_ok(),
+        elapsed_ms = submit_started.elapsed().as_millis() as u64,
+        "transaction timing"
+    );
     let receipt = match submission {
         Ok(receipt) => {
             tracing::info!(
