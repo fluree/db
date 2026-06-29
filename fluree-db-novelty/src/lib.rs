@@ -1230,8 +1230,11 @@ impl Novelty {
     /// - If leftmost=false: left boundary is EXCLUSIVE (> first)
     /// - If leftmost=true: no left boundary
     /// - rhs is INCLUSIVE when present
+    ///
+    /// Crate-internal: the owned ids it returns are read-scoped (see
+    /// [`Self::get_flake`]). External readers use [`Self::range_flakes`].
     #[must_use]
-    pub fn slice_for_range(
+    pub(crate) fn slice_for_range(
         &self,
         g_id: GraphId,
         index: IndexType,
@@ -1260,7 +1263,14 @@ impl Novelty {
     }
 
     /// Resolve a [`FlakeId`] produced by this novelty back to its flake.
-    pub fn get_flake(&self, id: FlakeId) -> &Flake {
+    ///
+    /// Crate-internal on purpose: a `FlakeId` is read-scoped (it encodes the
+    /// current segment layout), so resolving one after a segment-rebuilding
+    /// mutation would panic or return the wrong flake. Keeping the resolver
+    /// `pub(crate)` makes that hazard unreachable from other crates — external
+    /// readers use the borrow-safe [`Self::range_flakes`] / [`Self::iter_flakes`]
+    /// / `for_each_overlay_flake` which yield `&Flake` directly.
+    pub(crate) fn get_flake(&self, id: FlakeId) -> &Flake {
         let segs = self.graphs[id.graph()]
             .as_ref()
             .expect("FlakeId references a live graph");
