@@ -225,11 +225,12 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
         &self,
         g_id: GraphId,
         seg_id: u64,
+        seg_idx: usize,
         index: IndexType,
         callback: &mut dyn FnMut(&Flake),
     ) {
         self.0
-            .for_each_overlay_segment_flake(g_id, seg_id, index, callback);
+            .for_each_overlay_segment_flake(g_id, seg_id, seg_idx, index, callback);
     }
 }
 

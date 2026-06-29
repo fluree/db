@@ -2476,6 +2476,7 @@ fn translate_segment_cached(
     index: IndexType,
     order: RunSortOrder,
     seg_id: u64,
+    seg_idx: usize,
 ) -> Option<Arc<CachedOverlaySegment>> {
     let cache = store.leaflet_cache();
     let cache_key = LeafletCache::segment_ops_key(store.store_id(), seg_id, index);
@@ -2495,7 +2496,7 @@ fn translate_segment_cached(
     let mut next_ephemeral_p_id = base_p_id;
     let mut hard_error = false;
 
-    overlay.for_each_overlay_segment_flake(g_id, seg_id, index, &mut |flake| {
+    overlay.for_each_overlay_segment_flake(g_id, seg_id, seg_idx, index, &mut |flake| {
         if hard_error {
             return;
         }
@@ -2562,7 +2563,7 @@ fn collect_segment_merged_ops(
     let mut merged_untranslated: Vec<Flake> = Vec::new();
     let mut merged_eph: EphemeralPredicateMap = HashMap::new();
 
-    for seg in &segs {
+    for (seg_idx, seg) in segs.iter().enumerate() {
         // Zone-map: a segment entirely after `to_t` contributes nothing.
         if seg.min_t > to_t {
             continue;
@@ -2576,6 +2577,7 @@ fn collect_segment_merged_ops(
             index,
             order,
             seg.seg_id,
+            seg_idx,
         )?;
 
         // Whole segments below `to_t` need no per-op filter; only a straddling

@@ -137,12 +137,6 @@ pub const MAX_SEGMENT_FLAKES: usize = FlakeId::LOCAL_MASK as usize + 1;
 /// Maximum segments a single graph can hold before a reindex is required.
 pub const MAX_SEGMENTS: usize = FlakeId::SEG_MASK as usize + 1;
 
-/// Default per-graph segment count above which [`Novelty::compact_over`] rewrites
-/// a graph into one consolidated segment. Append-only reads fan out linearly in
-/// segment count, so this caps read fan-out while keeping the write path append
-/// only. Tuned later from compaction-cost benchmarks.
-pub const DEFAULT_COMPACTION_THRESHOLD: usize = 128;
-
 /// Default tier width for [`Novelty::tier_compact`]: merge a size class once it
 /// holds this many segments. Bounds read fan-out to ~`tier_width · log` of the
 /// novelty size with only bounded per-merge work (no full-novelty rewrite).
@@ -608,70 +602,6 @@ impl Novelty {
             .unwrap_or(0)
     }
 
-    /// Whether any graph holds more than `threshold` segments (a policy hook so
-    /// callers can decide when to call [`Self::compact_over`]).
-    pub fn needs_compaction(&self, threshold: usize) -> bool {
-        self.graphs
-            .iter()
-            .flatten()
-            .any(|segs| segs.len() > threshold)
-    }
-
-    /// Structural compaction: rewrite every graph whose segment count exceeds
-    /// `threshold` into ONE consolidated immutable segment, **preserving every
-    /// flake** — each assert and retraction with its original `t/op/m/g`. Only the
-    /// representation changes (reads collapse to the K=1 fast path); the live
-    /// flake multiset, `size`, `t`, time-travel semantics, and the assert/retract
-    /// log are all unchanged, so this is safe for immutability and never reopens
-    /// stats semantics. No dedup, no tombstone collapsing.
-    ///
-    /// `fact_state` is left as-is (it already reflects the unchanged latest-op per
-    /// identity). `epoch` bumps when anything changed — prior [`FlakeId`]s are
-    /// layout-scoped and any epoch-keyed caches must refresh. Returns the number
-    /// of graphs rewritten.
-    pub fn compact_over(&mut self, threshold: usize) -> usize {
-        let targets: Vec<usize> = (0..self.graphs.len())
-            .filter(|&g| self.graphs[g].as_ref().is_some_and(|s| s.len() > threshold))
-            .collect();
-        for &g in &targets {
-            self.compact_graph(g);
-        }
-        if !targets.is_empty() {
-            self.recompute_totals();
-            self.epoch += 1;
-        }
-        targets.len()
-    }
-
-    /// Compact every multi-segment graph to a single segment (`compact_over(1)`).
-    /// Used by cold/bulk load paths that want a K=1-per-graph starting shape.
-    pub fn compact_all(&mut self) -> usize {
-        self.compact_over(1)
-    }
-
-    /// Merge graph `g`'s segments into one consolidated segment, preserving every
-    /// flake (no dedup — the assert/retract log is kept intact for time travel).
-    fn compact_graph(&mut self, g: usize) {
-        let flakes = {
-            let Some(Some(segs)) = self.graphs.get_mut(g) else {
-                return;
-            };
-            if segs.len() <= 1 {
-                return;
-            }
-            let total: usize = segs.iter().map(|s| s.flakes.len()).sum();
-            let mut flakes = Vec::with_capacity(total);
-            for seg in std::mem::take(segs) {
-                match Arc::try_unwrap(seg) {
-                    Ok(s) => flakes.extend(s.flakes),
-                    Err(shared) => flakes.extend(shared.flakes.iter().cloned()),
-                }
-            }
-            flakes
-        };
-        self.set_graph_segments(g as GraphId, flakes, true);
-    }
-
     /// Whether any graph holds at least `tier_width` segments in one size class —
     /// i.e. [`Self::tier_compact`] would do work. Cheap read-path policy hook.
     pub fn needs_tier_compaction(&self, tier_width: usize) -> bool {
@@ -695,7 +625,7 @@ impl Novelty {
     /// merge `tier_width` segments of the lowest full size class into one (class+1)
     /// and continue strictly upward, each class processed at most once per call.
     /// **Preserves every flake** (no dedup, no tombstone collapse — stats-safe and
-    /// observationally transparent, like [`Self::compact_all`]). Per-call work is
+    /// observationally transparent). Per-call work is
     /// bounded to one cascade chain (`<= classes` merges of `tier_width`
     /// segments), so even the first read after a long insert-only burst can't
     /// stall on a huge backlog. In steady state (compaction keeps pace with
@@ -769,7 +699,7 @@ impl Novelty {
                 }
             }
             // Chunk the merged flakes at MAX_SEGMENT_FLAKES (matching
-            // set_graph_segments / compact_graph) so a tier merge whose sum
+            // set_graph_segments) so a tier merge whose sum
             // exceeds the local-index width can't silently truncate FlakeIds in
             // release. (A single class-(K+1) result above the cap becomes a few
             // segments instead; the cascade handles them on later calls.)
@@ -1282,10 +1212,18 @@ impl Novelty {
     /// `.iter()` it. Prefer [`Self::iter_flakes`] / `for_each_overlay_flake` for
     /// new code so no ids are materialized.
     ///
+    /// **The returned [`FlakeId`]s are read-scoped**: they encode `(graph, seg,
+    /// local)` against the *current* segment layout. Any mutation that rebuilds
+    /// segments — [`Self::clear_up_to`], [`Self::tier_compact`],
+    /// [`Self::bulk_apply_commits`] — invalidates them, after which
+    /// [`Self::get_flake`] may panic or resolve a different flake. Resolve every
+    /// id (via `get_flake`) before the next mutation.
+    ///
     /// Semantics:
     /// - If leftmost=false: left boundary is EXCLUSIVE (> first)
     /// - If leftmost=true: no left boundary
     /// - rhs is INCLUSIVE when present
+    #[must_use]
     pub fn slice_for_range(
         &self,
         g_id: GraphId,
@@ -1295,6 +1233,23 @@ impl Novelty {
         leftmost: bool,
     ) -> Vec<FlakeId> {
         self.read_ids(g_id, index, first, rhs, leftmost).collect()
+    }
+
+    /// Range read over one graph yielding `&Flake` directly — the borrow-friendly
+    /// counterpart to [`Self::slice_for_range`]. Prefer this when the caller only
+    /// iterates flakes: it materializes no [`FlakeId`] `Vec` and skips the
+    /// per-id [`Self::get_flake`] indirection. K=1 takes the no-heap fast path;
+    /// K>1 uses the k-way merge. Same comparator order and boundary semantics as
+    /// [`Self::slice_for_range`].
+    pub fn range_flakes(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> impl Iterator<Item = &Flake> + '_ {
+        self.read_flakes(g_id, index, first, rhs, leftmost)
     }
 
     /// Resolve a [`FlakeId`] produced by this novelty back to its flake.
@@ -1316,8 +1271,11 @@ impl Novelty {
     }
 
     /// Iterate all flake IDs for `index` across ALL graphs, comparator-ordered
-    /// per graph. IDs are read-scoped — resolve via [`Self::get_flake`] before the
-    /// next mutation. Prefer [`Self::iter_flakes`] for new code (no id packing).
+    /// per graph. IDs are read-scoped — they encode the current segment layout,
+    /// so any segment-rebuilding mutation ([`Self::clear_up_to`],
+    /// [`Self::tier_compact`], [`Self::bulk_apply_commits`]) invalidates them;
+    /// resolve via [`Self::get_flake`] before the next mutation. Prefer
+    /// [`Self::iter_flakes`] for new code (no id packing).
     pub fn iter_index(&self, index: IndexType) -> impl Iterator<Item = FlakeId> + '_ {
         self.present_graphs()
             .into_iter()
@@ -1365,9 +1323,10 @@ impl OverlayProvider for Novelty {
     }
 
     fn is_effectively_empty(&self) -> bool {
-        // Not `store.is_empty()`: after `clear_up_to` the arena retains dead
-        // flakes, while `size` tracks only alive bytes.
-        self.size == 0
+        // Segments only ever hold live flakes (`clear_up_to` and tiered
+        // compaction rebuild from survivors), so "no live bytes" (`size == 0`)
+        // and "no flakes" coincide — just defer to `is_empty()`.
+        self.is_empty()
     }
 
     fn for_each_overlay_flake(
@@ -1425,14 +1384,23 @@ impl OverlayProvider for Novelty {
         &self,
         g_id: GraphId,
         seg_id: u64,
+        seg_idx: usize,
         index: IndexType,
         callback: &mut dyn FnMut(&Flake),
     ) {
         // Whole segment in `index` order, NO `to_t` filter: the query layer
         // caches the segment's full translation and applies `to_t` + the cursor
         // key window after the k-way merge.
+        //
+        // `seg_idx` is the position from `overlay_segments` (same immutable
+        // snapshot the caller enumerated), so index directly — O(1) instead of a
+        // linear `seg_id` scan per segment (avoids O(K²) over a K-segment graph).
         if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
-            if let Some(seg) = segs.iter().find(|s| s.seg_id == seg_id) {
+            if let Some(seg) = segs.get(seg_idx) {
+                debug_assert_eq!(
+                    seg.seg_id, seg_id,
+                    "seg_idx/seg_id misaligned — caller mixed overlay snapshots"
+                );
                 let flakes = &seg.flakes;
                 for &local in seg.order(index) {
                     callback(&flakes[local as usize]);
@@ -2144,76 +2112,9 @@ mod tests {
         );
     }
 
-    // ===== Compaction (structural compact-all) =====
+    // ===== Compaction (structural, tiered) =====
 
-    /// Compaction must be observationally transparent: rewriting K segments into
-    /// one must not change ANY read — every order, every graph, every time-travel
-    /// `to_t` bound — because it preserves the whole assert/retract log.
-    #[test]
-    fn compaction_is_observationally_transparent() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        const ORDERS: [IndexType; 4] = [
-            IndexType::Spot,
-            IndexType::Psot,
-            IndexType::Post,
-            IndexType::Opst,
-        ];
-        let rg = eq_reverse_graph();
-        let mut n = Novelty::new(0);
-        let mut rng = 0x1234_5678u64;
-        for c in 0..60 {
-            let t = c as i64 + 1;
-            let batch_n = 1 + (sm64(&mut rng) % 5) as usize;
-            let batch: Vec<Flake> = (0..batch_n).map(|_| eq_make(&mut rng, t)).collect();
-            n.apply_commit(batch, t, &rg).expect("apply_commit");
-        }
-        assert!(n.max_segment_count() > 1, "fixture must be multi-segment");
-
-        let digest = |n: &Novelty| -> u64 {
-            let mut h = DefaultHasher::new();
-            for g in 0u16..=2 {
-                for idx in ORDERS {
-                    let ids = n.slice_for_range(g, idx, None, None, true);
-                    ids.len().hash(&mut h);
-                    for id in &ids {
-                        format!("{:?}", n.get_flake(*id)).hash(&mut h);
-                    }
-                    // Time-travel: callback scan at several `to_t` bounds.
-                    for to_t in [1i64, 10, 30, i64::MAX] {
-                        let mut seen = Vec::new();
-                        n.for_each_overlay_flake(g, idx, None, None, true, to_t, &mut |f| {
-                            seen.push(format!("{f:?}"));
-                        });
-                        seen.len().hash(&mut h);
-                        for s in seen {
-                            s.hash(&mut h);
-                        }
-                    }
-                }
-            }
-            h.finish()
-        };
-
-        let before = digest(&n);
-        let (size0, count0, epoch0) = (n.size, n.len(), n.epoch);
-
-        let compacted = n.compact_all();
-
-        assert!(compacted >= 1, "at least one graph compacted");
-        assert_eq!(
-            n.max_segment_count(),
-            1,
-            "every graph collapses to one segment"
-        );
-        assert_eq!(digest(&n), before, "compaction changed an observable read");
-        assert_eq!(n.size, size0, "size must be preserved");
-        assert_eq!(n.len(), count0, "flake count must be preserved");
-        assert!(n.epoch > epoch0, "epoch must bump after compaction");
-        assert_eq!(n.compact_all(), 0, "second compaction is a no-op");
-    }
-
-    /// Compaction must not disturb the dedup oracle: re-asserting an
+    /// Tiered compaction must not disturb the dedup oracle: re-asserting an
     /// already-current fact afterwards is still skipped.
     #[test]
     fn compaction_preserves_dedup_fact_state() {
@@ -2227,11 +2128,15 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(n.max_segment_count() > 1);
         let before = n.len();
+        let segs_before = n.max_segment_count();
+        assert!(segs_before > 1);
 
-        n.compact_all();
-        assert_eq!(n.max_segment_count(), 1);
+        while n.tier_compact(2) > 0 {}
+        assert!(
+            n.max_segment_count() < segs_before,
+            "tiered compaction must consolidate segments"
+        );
         assert_eq!(n.len(), before, "no flakes lost in compaction");
 
         n.apply_commit(vec![make_flake(3, 1, 3, 100, true)], 100, &rg)
@@ -2241,26 +2146,6 @@ mod tests {
             before,
             "re-assert after compaction must still dedup"
         );
-    }
-
-    /// `compact_over` only rewrites graphs strictly above the threshold.
-    #[test]
-    fn compact_over_respects_threshold() {
-        let mut n = Novelty::new(0);
-        let rg = no_graphs();
-        for i in 0..5u16 {
-            n.apply_commit(
-                vec![make_flake(i, 1, i as i64, (i + 1) as i64, true)],
-                (i + 1) as i64,
-                &rg,
-            )
-            .unwrap();
-        }
-        assert_eq!(n.segment_count(0), 5);
-        assert_eq!(n.compact_over(10), 0, "under threshold: no compaction");
-        assert_eq!(n.segment_count(0), 5);
-        assert_eq!(n.compact_over(2), 1, "over threshold: compacted");
-        assert_eq!(n.segment_count(0), 1);
     }
 
     /// Cold/bulk load must produce a K=1-per-graph (already-compacted) shape, so

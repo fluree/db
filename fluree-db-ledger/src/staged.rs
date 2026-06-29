@@ -288,13 +288,13 @@ impl OverlayProvider for StagedLedger {
         // Two-way merge of base novelty slice (already per-graph) + staged slice
         // (filtered by g_id using pre-computed graph IDs)
 
-        let base_slice = self
-            .base
-            .novelty
-            .slice_for_range(g_id, index, first, rhs, leftmost);
         let staged_slice = self.staged.slice_for_range(index, first, rhs, leftmost);
 
-        let mut base_iter = base_slice.iter().map(|&id| self.base.novelty.get_flake(id));
+        // Base side reads `&Flake` directly (no `FlakeId` Vec, no `get_flake`).
+        let mut base_iter = self
+            .base
+            .novelty
+            .range_flakes(g_id, index, first, rhs, leftmost);
         // Filter staged flakes to only those matching the requested graph
         let mut staged_iter = staged_slice
             .iter()

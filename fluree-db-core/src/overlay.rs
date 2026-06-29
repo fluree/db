@@ -139,10 +139,17 @@ pub trait OverlayProvider: Send + Sync {
     /// segment's translation and applies `to_t` + the cursor key window after
     /// the k-way merge). **Default:** the whole overlay (the single synthetic
     /// segment), so non-segmented overlays stay correct.
+    ///
+    /// `seg_idx` is the segment's position in [`Self::overlay_segments`] order;
+    /// segmented overlays use it for an O(1) lookup (avoiding a linear scan by
+    /// `seg_id` per segment). `seg_id` remains the stable identity the caller
+    /// keys its translation cache on. Callers must pass them from the same
+    /// `overlay_segments` enumeration so they stay aligned.
     fn for_each_overlay_segment_flake(
         &self,
         g_id: GraphId,
         _seg_id: u64,
+        _seg_idx: usize,
         index: IndexType,
         callback: &mut dyn FnMut(&Flake),
     ) {
