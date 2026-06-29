@@ -4,7 +4,7 @@
 //! queue-mediated submission and only shrinks via
 //! [`Command::EvictIdempotency`]. This scheduler runs on the current
 //! leader (spawned by the same leader watcher as the
-//! [`CommitWorker`](super::commit_worker::CommitWorker)), sleeps
+//! [`WorkerSupervisor`](super::commit_worker::WorkerSupervisor)), sleeps
 //! `eviction_interval`, and proposes the eviction command. The actual
 //! CAS releases happen on every node: the state-machine adapter
 //! drains `Response::EvictionApplied.released_envelopes` into a
@@ -21,7 +21,7 @@ use crate::raft::state_machine::{Command as SmCommand, Response as SmResponse};
 use crate::raft::TypeConfig;
 use openraft::Raft;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tracing::warn;
 
 /// Default TTL for idempotency cache entries before eviction. Matches
@@ -125,10 +125,7 @@ impl EvictionScheduler {
 /// evict). Pulled out as a free function so it can be unit-tested
 /// without an Arc<Raft>.
 fn cutoff_millis(ttl: Duration) -> Option<u64> {
-    let now_millis = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()?
-        .as_millis() as u64;
+    let now_millis = crate::raft::current_millis();
     let ttl_millis = ttl.as_millis() as u64;
     now_millis.checked_sub(ttl_millis)
 }
@@ -139,10 +136,7 @@ mod tests {
 
     #[test]
     fn cutoff_is_now_minus_ttl_and_shrinks_with_larger_ttl() {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now = crate::raft::current_millis();
         let one_sec =
             cutoff_millis(Duration::from_secs(1)).expect("system clock is past 1s of epoch");
         let one_hour =

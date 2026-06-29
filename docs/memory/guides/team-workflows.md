@@ -39,7 +39,7 @@ Memories in `repo.ttl` are sorted by `(branch, id)` — memories from the same g
 
 The branch name is captured automatically when a memory is created, so memories from `feature/auth` sort separately from memories created on `feature/indexer`. Within each branch group, memories are ordered chronologically (ULID encodes creation time).
 
-When conflicts do occur, they're usually because two branches modified the same existing memory (via `update`) or both worked on the same branch. These are typically clean to resolve:
+When conflicts do occur, they're usually because two branches modified the same existing memory (via `update`/`forget`) or both worked on the same branch. That's by design: a normal git merge surfaces the overlap so you choose the right version, rather than silently fusing two edits into one corrupted memory. These are typically clean to resolve:
 
 ```ttl
 <<<<<<< HEAD

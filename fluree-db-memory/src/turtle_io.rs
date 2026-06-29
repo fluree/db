@@ -148,12 +148,102 @@ pub fn append_memory_to_file(path: &Path, mem: &Memory, header_comment: &str) ->
     Ok(())
 }
 
+/// Insert one memory block into an existing `.ttl` file at its sorted
+/// `(branch, id)` position, leaving every other block byte-for-byte unchanged.
+///
+/// This is the hot path for `add`. It reads only the `.ttl` text (never the
+/// ledger), so it is O(file size) in cheap string work rather than an O(N)
+/// SPARQL round-trip. Keeping the untouched blocks byte-identical is what lets
+/// two branches' inserts merge cleanly under a default git merge: their changes
+/// land in different regions, while a change to the *same* block still
+/// conflicts. Ordering matches [`write_memory_file`].
+pub fn insert_memory_into_file(path: &Path, mem: &Memory, header_comment: &str) -> Result<()> {
+    // No file yet (or it lost its header) → create it with this single block.
+    if !path.exists() {
+        return append_memory_to_file(path, mem, header_comment);
+    }
+
+    let existing = fs::read_to_string(path)?;
+
+    // Byte offsets of each block's subject line (column-0 `mem:… a mem:…`).
+    let mut starts: Vec<usize> = Vec::new();
+    let mut pos = 0;
+    for line in existing.split_inclusive('\n') {
+        let l = line.trim_end_matches('\n');
+        if l.starts_with("mem:") && l.contains(" a mem:") {
+            starts.push(pos);
+        }
+        pos += line.len();
+    }
+
+    // Empty (header only) → behave like the create path: append after header.
+    if starts.is_empty() {
+        return append_memory_to_file(path, mem, header_comment);
+    }
+
+    let header = &existing[..starts[0]];
+    let blocks: Vec<&str> = (0..starts.len())
+        .map(|i| {
+            let end = starts.get(i + 1).copied().unwrap_or(existing.len());
+            &existing[starts[i]..end]
+        })
+        .collect();
+
+    let new_key = (mem.branch.clone().unwrap_or_default(), mem.id.clone());
+    let new_block = memory_to_turtle_block(mem);
+    let idx = blocks
+        .iter()
+        .position(|b| parse_block_key(b) > new_key)
+        .unwrap_or(blocks.len());
+
+    let mut out = String::with_capacity(existing.len() + new_block.len() + 2);
+    out.push_str(header);
+    for (i, b) in blocks.iter().enumerate() {
+        if i == idx {
+            out.push_str(&new_block);
+            out.push('\n');
+        }
+        out.push_str(b);
+    }
+    if idx == blocks.len() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&new_block);
+    }
+
+    fs::write(path, out)?;
+    Ok(())
+}
+
+/// Extract the `(branch, id)` sort key from a block's text, matching the order
+/// `write_memory_file` sorts by. `branch` defaults to "" when absent.
+fn parse_block_key(block: &str) -> (String, String) {
+    let mut id = String::new();
+    let mut branch = String::new();
+    for line in block.lines() {
+        if id.is_empty() && line.starts_with("mem:") {
+            if let Some(tok) = line.split_whitespace().next() {
+                id = tok.to_string();
+            }
+        } else if let Some(rest) = line.trim_start().strip_prefix("mem:branch \"") {
+            if let Some(end) = rest.find('"') {
+                branch = rest[..end].to_string();
+            }
+        }
+    }
+    (branch, id)
+}
+
 /// Write a full `.ttl` file from scratch with all memories.
 ///
-/// Used by `add`, `update`, and `forget` for all file mutations.
-/// Memories are sorted by `(branch, id)` so that memories from the same
-/// branch cluster together. This reduces merge conflicts: two feature
-/// branches adding memories will insert into different regions of the file.
+/// Used by `update` and `forget`, which must rewrite the whole file. `add`
+/// uses [`insert_memory_into_file`] instead. Memories are sorted by
+/// `(branch, id)` so memories from the same branch cluster together: two
+/// feature branches adding memories land in different regions of the file, so
+/// a default git merge resolves their additions without conflict while still
+/// surfacing a real conflict when both branches change the *same* memory.
 /// **Skips write if the new content is byte-identical** to the existing file.
 pub fn write_memory_file(path: &Path, memories: &[Memory], header_comment: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -164,8 +254,9 @@ pub fn write_memory_file(path: &Path, memories: &[Memory], header_comment: &str)
     content.push_str(header_comment);
     content.push_str(TURTLE_PREFIXES);
 
-    // Sort by (branch, id): groups memories by originating branch,
-    // chronological within each branch (ULID encodes time).
+    // Sort by (branch, id): groups memories by originating branch, chronological
+    // within each branch (ULID encodes time). Keep this in sync with the
+    // ordering used by `insert_memory_into_file`.
     let mut sorted: Vec<&Memory> = memories.iter().collect();
     sorted.sort_by(|a, b| {
         let branch_a = a.branch.as_deref().unwrap_or("");
@@ -488,6 +579,96 @@ mod tests {
         assert!(
             pos2 < pos1,
             "memories should be sorted by (branch, id) — no-branch before 'main'"
+        );
+    }
+
+    #[test]
+    fn insert_matches_full_rewrite() {
+        // Inserting memories one at a time must yield the same file a full
+        // sorted rewrite would — byte-for-byte — regardless of insert order.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("insert.ttl");
+
+        let mut a = make_test_memory(); // branch "main", id fact-01jdxyz...
+        a.content = "memory A".to_string();
+        a.tags = vec![];
+        a.artifact_refs = vec![];
+        let mut b = make_test_memory();
+        b.id = "mem:fact-01zzzz0000000000000000".to_string();
+        b.content = "memory B".to_string();
+        b.tags = vec![];
+        b.artifact_refs = vec![];
+        b.branch = None; // sorts before "main"
+        let mut c = make_test_memory();
+        c.id = "mem:fact-01aaaa0000000000000000".to_string();
+        c.content = "memory C".to_string();
+        c.tags = vec![];
+        c.artifact_refs = vec![];
+        c.branch = Some("zzz".to_string()); // sorts after "main"
+
+        // Insert in an order that exercises end placement (c after a) then
+        // front placement (b before both). The strictly-between-two-blocks
+        // case is covered separately by `insert_between_existing_blocks`.
+        insert_memory_into_file(&path, &a, REPO_HEADER).unwrap();
+        insert_memory_into_file(&path, &c, REPO_HEADER).unwrap();
+        insert_memory_into_file(&path, &b, REPO_HEADER).unwrap();
+        let spliced = fs::read_to_string(&path).unwrap();
+
+        let rewritten_path = dir.path().join("rewrite.ttl");
+        write_memory_file(&rewritten_path, &[a, b, c], REPO_HEADER).unwrap();
+        let rewritten = fs::read_to_string(&rewritten_path).unwrap();
+
+        assert_eq!(
+            spliced, rewritten,
+            "incremental splice must match a full sorted rewrite byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn insert_between_existing_blocks() {
+        // Seed [X, Z] then insert a Y that sorts strictly between them, so the
+        // splice lands in the middle of the block list (idx > 0 and
+        // idx < blocks.len()) rather than at the front or end. Must still match
+        // a full sorted rewrite byte-for-byte.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("between.ttl");
+
+        // All on the same branch so ordering is purely by id.
+        let mut x = make_test_memory();
+        x.id = "mem:fact-01aaaa0000000000000000".to_string();
+        x.content = "memory X".to_string();
+        x.tags = vec![];
+        x.artifact_refs = vec![];
+        let mut y = make_test_memory();
+        y.id = "mem:fact-01mmmm0000000000000000".to_string();
+        y.content = "memory Y".to_string();
+        y.tags = vec![];
+        y.artifact_refs = vec![];
+        let mut z = make_test_memory();
+        z.id = "mem:fact-01zzzz0000000000000000".to_string();
+        z.content = "memory Z".to_string();
+        z.tags = vec![];
+        z.artifact_refs = vec![];
+
+        // Seed the outer pair, then splice Y between X and Z.
+        insert_memory_into_file(&path, &x, REPO_HEADER).unwrap();
+        insert_memory_into_file(&path, &z, REPO_HEADER).unwrap();
+        insert_memory_into_file(&path, &y, REPO_HEADER).unwrap();
+        let spliced = fs::read_to_string(&path).unwrap();
+
+        // Y must land between X and Z.
+        let px = spliced.find("fact-01aaaa").unwrap();
+        let py = spliced.find("fact-01mmmm").unwrap();
+        let pz = spliced.find("fact-01zzzz").unwrap();
+        assert!(px < py && py < pz, "Y should splice between X and Z");
+
+        let rewritten_path = dir.path().join("rewrite.ttl");
+        write_memory_file(&rewritten_path, &[x, y, z], REPO_HEADER).unwrap();
+        let rewritten = fs::read_to_string(&rewritten_path).unwrap();
+
+        assert_eq!(
+            spliced, rewritten,
+            "middle splice must match a full sorted rewrite byte-for-byte"
         );
     }
 

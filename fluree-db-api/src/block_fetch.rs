@@ -299,7 +299,7 @@ pub fn decode_leaf_block(
                 );
             }
 
-            let dt = match store.resolve_datatype_sid(o_type) {
+            let dt = match store.resolve_datatype_sid_for_value(o_type, &o) {
                 None => fluree_db_core::Sid::new(0, ""),
                 Some(sid) => {
                     let iri = store.sid_to_iri(&sid).ok_or_else(|| {

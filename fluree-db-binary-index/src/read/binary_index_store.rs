@@ -1422,6 +1422,22 @@ impl BinaryIndexStore {
         }
     }
 
+    /// Resolve the datatype Sid for a decoded value, disambiguating o_types
+    /// that name no single datatype.
+    ///
+    /// The `NUM_BIG_OVERFLOW` arena holds both overflow `xsd:integer` (BigInt)
+    /// and `xsd:decimal` (BigDecimal) values, so [`resolve_datatype_sid`] can't
+    /// name its type from `o_type` alone and returns `None`. Fall back to the
+    /// decoded value's variant so the datatype isn't lost — otherwise arena-
+    /// served big numerics render with an empty `@type` while their novelty
+    /// counterparts (still o_type-tagged) render correctly (issue #1329).
+    ///
+    /// [`resolve_datatype_sid`]: Self::resolve_datatype_sid
+    pub fn resolve_datatype_sid_for_value(&self, o_type: u16, val: &FlakeValue) -> Option<Sid> {
+        self.resolve_datatype_sid(o_type)
+            .or_else(|| val.overflow_numeric_datatype_sid())
+    }
+
     /// Look up an o_type table entry by o_type value. O(1).
     pub fn lookup_o_type(&self, o_type: u16) -> Option<&OTypeTableEntry> {
         self.o_type_index

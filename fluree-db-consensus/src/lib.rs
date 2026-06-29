@@ -242,7 +242,7 @@ impl TransactionBody {
 }
 
 /// Discriminator for [`Committer`] submission kinds. The Raft path
-/// stores it alongside each `EnqueueCommandArgs` so the worker can
+/// stores it alongside each `QueueSubmission` so the worker can
 /// route without first parsing the body from CAS; status responses
 /// surface it on [`SubmissionState::Committed`] so clients can tell
 /// what kind of submission they're confirming.
@@ -295,7 +295,7 @@ impl From<&TransactionBody> for BodyKind {
 /// shared content-addressed storage before enqueueing work.
 ///
 /// The CID of this blob is what travels through the Raft command queue
-/// (as `EnqueueCommandArgs::request_cid`); the worker reads the blob
+/// (as `QueueSubmission::request_cid`); the worker reads the blob
 /// back to recover everything it needs to advance the head. Bundling
 /// the per-request context here means the queue itself stays thin
 /// (one CID + a body-kind discriminator) and we don't have to
@@ -335,7 +335,7 @@ pub enum QueuedRequest {
 impl QueuedRequest {
     /// Encode the envelope for content-addressed storage. The leader
     /// writes these bytes to CAS; the resulting `ContentId` becomes
-    /// the `request_cid` in `EnqueueCommandArgs`.
+    /// the `request_cid` in `QueueSubmission`.
     ///
     /// JSON is used here (not postcard like state-machine snapshots)
     /// because the body and several option fields carry
@@ -416,7 +416,7 @@ pub struct QueuedPush {
 
 /// Revert-side envelope payload. Mirrors the fields of
 /// [`RevertRequest`] the worker needs to re-run `prepare_revert`. The
-/// branch + ledger come from the `EnqueueCommandArgs` shell so we
+/// branch + ledger come from the `QueueSubmission` shell so we
 /// don't duplicate them in the envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedRevert {

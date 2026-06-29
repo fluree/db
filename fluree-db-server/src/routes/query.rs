@@ -1977,8 +1977,35 @@ async fn execute_query(
         return execute_query_proxy(state, ledger_id, query_json, &span).await;
     }
 
-    // Shared storage mode: use load_ledger_for_query with freshness checking
-    let ledger = load_ledger_for_query(state, ledger_id, &span).await?;
+    // Shared storage mode: use load_ledger_for_query with freshness checking.
+    // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
+    // ledger; those resolve through the connection/dataset path, which queries
+    // them via their source engine instead of loading a ledger (#1369).
+    let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Non-not-found errors (real load failures) propagate unchanged.
+            if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
+                return Err(e);
+            }
+            // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather
+            // than a ledger. A registered source runs through the dataset path
+            // (queried via its source engine); a delimited format on a real
+            // source gets the explicit format error (matching the SPARQL
+            // handler). A genuinely-missing ledger returns a clean NotFound
+            // (404 + NotFound span) instead of being misreported by that path.
+            if state.fluree.resolve_graph_source(ledger_id).await?.is_some() {
+                if let Some(fmt) = delimited {
+                    return Err(ServerError::not_acceptable(format!(
+                        "{} format not supported for graph source queries",
+                        fmt.name().to_uppercase()
+                    )));
+                }
+                return execute_dataset_query(state, ledger_id, query_json, &span).await;
+            }
+            return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
+        }
+    };
     let graph = GraphDb::from_ledger_state(&ledger);
     let fluree = &state.fluree;
 
@@ -2490,8 +2517,20 @@ async fn execute_sparql_ledger(
             }
 
             // Ensure head is fresh in shared storage mode before time-travel view loading.
+            // The URL alias may name a graph source rather than a ledger; a graph
+            // source is a genesis view with no ledger head to refresh, so a clean
+            // not-found there is expected — let the dataset build resolve it (it
+            // already supports graph sources via `load_view_from_source`). A
+            // genuinely-missing ledger still propagates its not-found.
             if !state.config.is_proxy_storage_mode() {
-                let _ = load_ledger_for_query(state, ledger_id, &span).await?;
+                if let Err(e) = load_ledger_for_query(state, ledger_id, &span).await {
+                    let is_not_found = matches!(&e, ServerError::Api(api) if api.is_not_found());
+                    if !(is_not_found
+                        && state.fluree.resolve_graph_source(ledger_id).await?.is_some())
+                    {
+                        return Err(e);
+                    }
+                }
             }
 
             let spec = ledger_scoped_sparql_dataset_spec(ledger_id, dc)?;
@@ -2676,12 +2715,59 @@ async fn execute_sparql_ledger(
                 .into_response());
         }
 
-        // Shared storage mode: use load_ledger_for_query with freshness checking
-        let ledger = load_ledger_for_query(state, ledger_id, &span)
-            .await
-            .inspect_err(|_| {
-                set_span_error_code(&span, "error:LedgerLoad");
-            })?;
+        // Shared storage mode: use load_ledger_for_query with freshness checking.
+        // The alias may name a graph source (Iceberg/R2RML) rather than a ledger;
+        // on a clean not-found, resolve it through the graph-source-aware single
+        // target path (`graph().query()` auto-enables R2RML), which queries it via
+        // its source engine (#1369). Mirrors the JSON-LD `execute_query` ->
+        // `execute_dataset_query` fallback. Graph sources support JSON output only.
+        let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                // Non-not-found errors (real load failures) keep the LedgerLoad tag.
+                if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
+                    set_span_error_code(&span, "error:LedgerLoad");
+                    return Err(e);
+                }
+                // As in execute_query: resolve the alias as a graph source; only a
+                // registered source reports the JSON-only format errors before
+                // running via the R2RML-aware single-target path. A genuinely-
+                // missing ledger returns a clean NotFound.
+                if state.fluree.resolve_graph_source(ledger_id).await?.is_some() {
+                    if wants_sparql_xml || wants_rdf_xml {
+                        return Err(ServerError::not_acceptable(
+                            "Only JSON output is supported for graph source queries".to_string(),
+                        ));
+                    }
+                    if let Some(fmt) = delimited {
+                        return Err(ServerError::not_acceptable(format!(
+                            "{} format not supported for graph source queries",
+                            fmt.name().to_uppercase()
+                        )));
+                    }
+                    let result = state
+                        .fluree
+                        .graph(ledger_id)
+                        .query()
+                        .sparql(sparql)
+                        .format(json_fmt_config.clone())
+                        .execution_options(query_execution_options(state))
+                        .execute_formatted()
+                        .await
+                        .map_err(|e| {
+                            set_span_error_code(&span, "error:QueryFailed");
+                            ServerError::Api(e)
+                        })?;
+                    tracing::info!(status = "success", graph_source = true);
+                    return Ok((
+                        [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                        Json(result),
+                    )
+                        .into_response());
+                }
+                return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
+            }
+        };
         let graph = attach_default_context_to_graph(
             state,
             ledger_id,

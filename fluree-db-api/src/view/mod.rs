@@ -104,7 +104,11 @@ macro_rules! view_context_config {
             fulltext_providers: __fulltext_map.as_ref(),
             english_lang_id: __english_lang_id,
             remote_service: $self.remote_service_executor(),
-            strict_bind_errors: true,
+            // Queries follow SPARQL 1.1 §18.5 `Extend`: a BIND/projection/ORDER-BY
+            // expression error leaves the variable unbound for that solution
+            // rather than failing the query (the default; strict is the
+            // transaction opt-in).
+            strict_bind_errors: false,
             include_system_facts: $executable.query.include_system_facts,
             ..Default::default()
         };

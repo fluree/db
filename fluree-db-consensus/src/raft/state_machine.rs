@@ -17,6 +17,7 @@
 //! a [`Command`], and the log index the command was committed at;
 //! returns a [`Response`] describing the outcome.
 
+use crate::raft::NodeId;
 use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
@@ -24,7 +25,7 @@ use fluree_db_nameservice::{
     ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue, StatusValue,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -36,12 +37,55 @@ use thiserror::Error;
 /// at the consensus boundary. Carried on [`AdvanceRefArgs`] and
 /// cached in [`ApplyRecord`] so idempotent retries return the
 /// original submission's tally.
+///
+/// The nested `reasoning` field uses [`RecordedReasoningTally`] for
+/// the same reason — `fluree_db_core::tracking::ReasoningTally` has
+/// its own skip-on-None field (`capped_reason`) that would silently
+/// drop on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecordedTally {
     pub time: Option<String>,
     pub fuel: Option<f64>,
     pub policy: Option<HashMap<String, PolicyStats>>,
-    pub reasoning: Option<fluree_db_core::tracking::ReasoningTally>,
+    pub reasoning: Option<RecordedReasoningTally>,
+}
+
+/// Postcard-friendly mirror of
+/// [`fluree_db_core::tracking::ReasoningTally`]. See
+/// [`RecordedTally`] for why a mirror is needed; this type strips the
+/// `skip_serializing_if` on `capped_reason` so the field always rides
+/// at the same byte offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedReasoningTally {
+    pub capped: bool,
+    pub capped_reason: Option<String>,
+    pub derived_facts: u64,
+    pub iterations: u64,
+    pub duration_ms: u64,
+}
+
+impl From<&fluree_db_core::tracking::ReasoningTally> for RecordedReasoningTally {
+    fn from(r: &fluree_db_core::tracking::ReasoningTally) -> Self {
+        Self {
+            capped: r.capped,
+            capped_reason: r.capped_reason.clone(),
+            derived_facts: r.derived_facts,
+            iterations: r.iterations,
+            duration_ms: r.duration_ms,
+        }
+    }
+}
+
+impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
+    fn from(r: RecordedReasoningTally) -> Self {
+        fluree_db_core::tracking::ReasoningTally {
+            capped: r.capped,
+            capped_reason: r.capped_reason,
+            derived_facts: r.derived_facts,
+            iterations: r.iterations,
+            duration_ms: r.duration_ms,
+        }
+    }
 }
 
 impl From<&TrackingTally> for RecordedTally {
@@ -50,7 +94,7 @@ impl From<&TrackingTally> for RecordedTally {
             time: t.time.clone(),
             fuel: t.fuel,
             policy: t.policy.clone(),
-            reasoning: t.reasoning.clone(),
+            reasoning: t.reasoning.as_ref().map(RecordedReasoningTally::from),
         }
     }
 }
@@ -61,7 +105,7 @@ impl From<RecordedTally> for TrackingTally {
             time: r.time,
             fuel: r.fuel,
             policy: r.policy,
-            reasoning: r.reasoning,
+            reasoning: r.reasoning.map(Into::into),
         }
     }
 }
@@ -69,16 +113,21 @@ impl From<RecordedTally> for TrackingTally {
 /// Composite identity of a single branch within a ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RefKey {
-    pub ledger_id: String,
+    pub ledger_name: String,
     pub branch: String,
 }
 
 impl RefKey {
-    pub fn new(ledger_id: impl Into<String>, branch: impl Into<String>) -> Self {
+    pub fn new(ledger_name: impl Into<String>, branch: impl Into<String>) -> Self {
         Self {
-            ledger_id: ledger_id.into(),
+            ledger_name: ledger_name.into(),
             branch: branch.into(),
         }
+    }
+
+    /// Canonical `name:branch` ledger ID.
+    pub fn ledger_id(&self) -> String {
+        format_ledger_id(&self.ledger_name, &self.branch)
     }
 }
 
@@ -443,6 +492,25 @@ pub struct NameServiceState {
     /// [`Command::RetractGraphSource`] flips the retracted flag.
     #[serde(default)]
     pub graph_sources: HashMap<String, GraphSourceRecord>,
+    /// Subset of the configured voter set the cluster considers
+    /// eligible to host commit workers. Read by the per-node worker
+    /// supervisor's `compute_desired_owners` as the rendezvous-hash
+    /// input; mutated by [`Command::SetWorkerEligibility`] proposed
+    /// from the current leader's liveness monitor. Empty when the
+    /// state machine hasn't observed an explicit eligibility yet —
+    /// the supervisor falls back to the raft membership in that
+    /// case so a fresh cluster works without explicit init.
+    pub worker_eligible_voters: BTreeSet<NodeId>,
+    /// The currently-configured voter set, mirrored from the raft
+    /// `last_membership` by the state-machine adapter on every
+    /// `EntryPayload::Membership` apply. Held here so apply paths
+    /// stay pure — [`apply_set_worker_eligibility`]'s validation and
+    /// quorum check both read it directly instead of threading the
+    /// voter set through the `apply` signature. The adapter resets
+    /// [`worker_eligible_voters`](Self::worker_eligible_voters) to
+    /// this set on every membership change so newly-added voters
+    /// start eligible and removed voters disappear from both sets.
+    pub configured_voters: BTreeSet<NodeId>,
 }
 
 /// Replicated commands the state machine accepts.
@@ -455,23 +523,23 @@ pub enum Command {
     /// indexer running on the current leader after it finishes a
     /// build. Apply enforces strict monotonicity and rejects index
     /// claims for commits the state machine hasn't applied yet.
-    AdvanceIndexHead(AdvanceIndexHeadArgs),
+    AdvanceIndexHead(NewIndexHead),
     /// Rewrite the published index head for a branch with relaxed
     /// monotonicity: accepts `new.t == existing.t` so an admin
     /// reindex can land a fresh root at the same commit watermark.
     /// `new.t < existing.t` is still rejected, and the
     /// commits-not-yet-applied guard from
     /// [`Self::AdvanceIndexHead`] still fires.
-    RewriteIndexHead(AdvanceIndexHeadArgs),
+    RewriteIndexHead(NewIndexHead),
     /// Register a branch on a ledger. The branch starts unborn — no
     /// [`RefEntry`] is created until the first
     /// [`Command::ApplyHead`] for the branch.
-    CreateLedger(CreateLedgerArgs),
+    CreateLedger(NewLedger),
     /// Fork a new branch from an existing one. Increments the
     /// source branch's child counter and records parentage on the
     /// new [`RefEntry`]. The new branch is born with the source's
     /// current head (or `at_commit` if supplied).
-    CreateBranch(CreateBranchArgs),
+    CreateBranch(NewBranch),
     /// Drop a branch created via [`Command::CreateBranch`] (or
     /// implicit branch creation through [`Command::ApplyHead`]),
     /// decrementing the parent's child counter when applicable.
@@ -560,7 +628,7 @@ pub enum Command {
     /// registered branch. The args are boxed because
     /// [`ConfigValue`]'s `ConfigPayload` carries an `extra` map
     /// whose size dominates the enum otherwise.
-    PushConfig(Box<PushConfigArgs>),
+    PushConfig(Box<ConfigUpdate>),
     /// Upsert a graph source's config-side fields (source type,
     /// config blob, dependencies). On an existing record the index
     /// pointer (`index_id`, `index_t`) and `retracted` flag are
@@ -590,18 +658,18 @@ pub enum Command {
     /// checks idempotency, the in-flight queue, and the queue
     /// depth caps; on success appends a [`QueueEntry`] and returns
     /// [`Response::Enqueued`]. See `docs/design/raft-command-queue.md`.
-    EnqueueCommand(EnqueueCommandArgs),
+    EnqueueCommand(QueueSubmission),
     /// Advance a branch head from a worker-staged commit. Pops the
     /// per-branch queue front (must match `queue_id`), records the
     /// idempotency outcome from the entry, and signals waiters.
     /// Replaces the role of `Command::AdvanceRef` in the queue
     /// migration path.
-    ApplyHead(ApplyHeadArgs),
+    ApplyHead(StagedHead),
     /// Worker gave up on a queue entry. Pops the front, records
     /// the failure in the poisoned-idempotency map keyed by the
     /// entry's idempotency key, and signals the waiter with an
     /// abort outcome.
-    PoisonQueueEntry(PoisonQueueEntryArgs),
+    PoisonQueueEntry(EntryPoisoning),
     /// Periodic leader-proposed eviction of stale idempotency
     /// records. Removes entries whose `recorded_at_millis` is
     /// older than `cutoff_millis`, bounded per apply by an
@@ -618,11 +686,18 @@ pub enum Command {
         cutoff_millis: u64,
         marker_cutoff_millis: u64,
     },
+    /// Flip a voter's entry in
+    /// [`NameServiceState::worker_eligible_voters`]. Proposed by the
+    /// current leader's liveness monitor based on observed openraft
+    /// replication state: a sustained outage flips the voter to
+    /// ineligible (no new worker assignments rendezvous to it);
+    /// restored contact flips it back to eligible.
+    SetWorkerEligibility(WorkerEligibility),
 }
 
 /// Payload for [`Command::PushConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushConfigArgs {
+pub struct ConfigUpdate {
     pub ledger_id: String,
     pub expected: Option<ConfigValue>,
     pub new: ConfigValue,
@@ -630,7 +705,7 @@ pub struct PushConfigArgs {
 
 /// Payload for [`Command::EnqueueCommand`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnqueueCommandArgs {
+pub struct QueueSubmission {
     pub ledger_id: String,
     pub branch: String,
     pub idempotency: Option<IdempotencyCacheKey>,
@@ -651,7 +726,7 @@ pub struct EnqueueCommandArgs {
 
 /// Payload for [`Command::ApplyHead`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplyHeadArgs {
+pub struct StagedHead {
     pub ledger_id: String,
     pub branch: String,
     /// Queue entry this commit was staged from. Apply rejects
@@ -677,11 +752,27 @@ pub struct ApplyHeadArgs {
 
 /// Payload for [`Command::PoisonQueueEntry`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoisonQueueEntryArgs {
+pub struct EntryPoisoning {
     pub ledger_id: String,
     pub branch: String,
     pub queue_id: u64,
     pub reason: PoisonReason,
+    pub applied_at_millis: u64,
+}
+
+/// Payload for [`Command::SetWorkerEligibility`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerEligibility {
+    /// Voter whose entry in
+    /// [`NameServiceState::worker_eligible_voters`] is being toggled.
+    pub voter: NodeId,
+    /// Desired post-apply membership of `voter` in the set:
+    /// `true` inserts (idempotent), `false` removes (idempotent).
+    pub eligible: bool,
+    /// Leader's wall-clock at propose, milliseconds since epoch.
+    /// Metadata only — the apply doesn't use it for any ordering or
+    /// eviction decision; carried for parity with the other state-
+    /// mutating commands and as an audit hook.
     pub applied_at_millis: u64,
 }
 
@@ -692,7 +783,7 @@ pub struct PoisonQueueEntryArgs {
 /// current commit `t` (we never publish an index that claims to
 /// cover commits the state machine hasn't applied).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdvanceIndexHeadArgs {
+pub struct NewIndexHead {
     pub ledger_id: String,
     pub branch: String,
     /// Content id of the new index root blob.
@@ -711,7 +802,7 @@ pub struct AdvanceIndexHeadArgs {
 /// adapter at `RaftNameService::init` splits it before building this
 /// command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateLedgerArgs {
+pub struct NewLedger {
     pub ledger_id: String,
     pub branch: String,
     pub created_at_millis: u64,
@@ -719,7 +810,7 @@ pub struct CreateLedgerArgs {
 
 /// Payload for [`Command::CreateBranch`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateBranchArgs {
+pub struct NewBranch {
     pub ledger_id: String,
     /// New branch name to create.
     pub branch: String,
@@ -938,6 +1029,27 @@ pub enum Response {
         removed: usize,
         released_envelopes: Vec<(String, ContentId)>,
     },
+    /// [`Command::SetWorkerEligibility`] applied. `changed` is
+    /// `true` when the apply actually mutated
+    /// [`NameServiceState::worker_eligible_voters`], `false` when
+    /// the voter's membership in the set already matched the
+    /// requested `eligible` flag — distinguishing the two lets the
+    /// leader's monitor log a state flip without confusing it with
+    /// an idempotent re-propose.
+    WorkerEligibilitySet {
+        voter: NodeId,
+        eligible: bool,
+        changed: bool,
+    },
+    /// [`Command::SetWorkerEligibility`] was rejected without
+    /// mutating state. `reason` carries the specific failure mode
+    /// so the leader's monitor can react (back off, re-evaluate
+    /// targets, etc.) instead of treating every refusal the same.
+    WorkerEligibilityRefused {
+        voter: NodeId,
+        eligible: bool,
+        reason: EligibilityRefusal,
+    },
     /// Command was understood but no state change resulted (e.g.,
     /// [`Command::ReleaseContent`]).
     NoOp,
@@ -952,6 +1064,17 @@ pub enum QueueFullScope {
     Global,
 }
 
+/// Why [`Response::WorkerEligibilityRefused`] fired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EligibilityRefusal {
+    /// `voter` isn't in [`NameServiceState::configured_voters`].
+    /// Either the command was proposed against a stale view of
+    /// membership, or the proposer is targeting a learner — either
+    /// way the apply refuses to mutate worker eligibility for a
+    /// non-voter.
+    VoterNotConfigured,
+}
+
 /// Why [`Response::QueueDesync`] fired. See the design doc.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesyncReason {
@@ -962,6 +1085,15 @@ pub enum DesyncReason {
     /// Per-branch queue was drained by a head-mutating admin
     /// command between the worker's stage and apply.
     QueueCleared { reason: ClearReason },
+    /// Proposed `commit_t` doesn't strictly advance the branch's
+    /// current head. Fires when a worker stages on a stale local
+    /// view (a Fluree handle that lags the replicated `state.refs`
+    /// — post-leader-flip cold replica, backed-up event listener),
+    /// so the staged commit's `t` lands at or below the head the
+    /// state machine already published. The queue entry is left at
+    /// the front so the worker can retry once its local view
+    /// catches up.
+    HeadNotMonotonic { current_t: i64, proposed_t: i64 },
     /// State-machine invariant violation — apply was reached
     /// without a matching admin clear marker, but the queue is
     /// missing or empty. Surfaces as an error for investigation
@@ -1074,11 +1206,51 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             cutoff_millis,
             marker_cutoff_millis,
         } => apply_evict_idempotency(state, cutoff_millis, marker_cutoff_millis),
+        Command::SetWorkerEligibility(args) => apply_set_worker_eligibility(state, args),
     }
 }
 
-fn create_ledger(state: &mut NameServiceState, log_index: u64, args: CreateLedgerArgs) -> Response {
-    let CreateLedgerArgs {
+/// Apply [`Command::SetWorkerEligibility`]. Validate the voter is
+/// configured, then insert or remove `voter` from
+/// [`NameServiceState::worker_eligible_voters`] per the `eligible`
+/// flag. Idempotent: a no-op apply returns `changed: false`.
+///
+/// Worker eligibility and raft voting quorum are independent
+/// concerns — a peer can stop hosting workers without affecting
+/// its raft vote. The apply path doesn't impose a "minimum
+/// eligible count" floor; an operator or the liveness monitor can
+/// drive eligibility to zero. Routing degrades gracefully (queues
+/// stall until eligibility is restored) rather than refusing to
+/// record the operator's intent.
+fn apply_set_worker_eligibility(state: &mut NameServiceState, args: WorkerEligibility) -> Response {
+    let WorkerEligibility {
+        voter,
+        eligible,
+        applied_at_millis: _,
+    } = args;
+
+    if !state.configured_voters.contains(&voter) {
+        return Response::WorkerEligibilityRefused {
+            voter,
+            eligible,
+            reason: EligibilityRefusal::VoterNotConfigured,
+        };
+    }
+
+    let changed = if eligible {
+        state.worker_eligible_voters.insert(voter)
+    } else {
+        state.worker_eligible_voters.remove(&voter)
+    };
+    Response::WorkerEligibilitySet {
+        voter,
+        eligible,
+        changed,
+    }
+}
+
+fn create_ledger(state: &mut NameServiceState, log_index: u64, args: NewLedger) -> Response {
+    let NewLedger {
         ledger_id,
         branch,
         created_at_millis,
@@ -1179,8 +1351,8 @@ fn purge_ledger(
     }
 }
 
-fn create_branch(state: &mut NameServiceState, log_index: u64, args: CreateBranchArgs) -> Response {
-    let CreateBranchArgs {
+fn create_branch(state: &mut NameServiceState, log_index: u64, args: NewBranch) -> Response {
+    let NewBranch {
         ledger_id,
         branch,
         source_branch,
@@ -1385,7 +1557,7 @@ fn clear_queue_for_admin(
             applied_at_millis,
         },
     );
-    let ledger_id = format_ledger_id(&ref_key.ledger_id, &ref_key.branch);
+    let ledger_id = ref_key.ledger_id();
     queue
         .into_iter()
         .map(|entry| (ledger_id.clone(), entry.request_cid))
@@ -1407,11 +1579,11 @@ fn decrement_child_count(
     }
 }
 
-fn advance_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
+fn advance_index_head(state: &mut NameServiceState, args: NewIndexHead) -> Response {
     set_index_head(state, args, |existing_t, new_t| new_t <= existing_t)
 }
 
-fn rewrite_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) -> Response {
+fn rewrite_index_head(state: &mut NameServiceState, args: NewIndexHead) -> Response {
     set_index_head(state, args, |existing_t, new_t| new_t < existing_t)
 }
 
@@ -1421,10 +1593,10 @@ fn rewrite_index_head(state: &mut NameServiceState, args: AdvanceIndexHeadArgs) 
 /// ledger / ref-entry / ahead-of-commit-t checks and the write.
 fn set_index_head(
     state: &mut NameServiceState,
-    args: AdvanceIndexHeadArgs,
+    args: NewIndexHead,
     is_stale: impl FnOnce(i64, i64) -> bool,
 ) -> Response {
-    let AdvanceIndexHeadArgs {
+    let NewIndexHead {
         ledger_id,
         branch,
         new_index_head,
@@ -1485,7 +1657,7 @@ fn set_index_head(
 fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> Option<RefValue> {
     if !state
         .ledgers
-        .get(&key.ledger_id)
+        .get(&key.ledger_name)
         .is_some_and(|l| l.branches.iter().any(|b| b == &key.branch))
     {
         return None;
@@ -1645,8 +1817,8 @@ fn apply_push_status(
     Response::StatusUpdated
 }
 
-fn apply_push_config(state: &mut NameServiceState, args: PushConfigArgs) -> Response {
-    let PushConfigArgs {
+fn apply_push_config(state: &mut NameServiceState, args: ConfigUpdate) -> Response {
+    let ConfigUpdate {
         ledger_id,
         expected,
         new,
@@ -1753,9 +1925,9 @@ fn apply_retract_graph_source(
 fn apply_enqueue_command(
     state: &mut NameServiceState,
     log_index: u64,
-    args: EnqueueCommandArgs,
+    args: QueueSubmission,
 ) -> Response {
-    let EnqueueCommandArgs {
+    let QueueSubmission {
         ledger_id,
         branch,
         idempotency,
@@ -1927,8 +2099,8 @@ fn pop_validated_front(
     Ok(queue.pop_front().expect("non-empty checked above"))
 }
 
-fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs) -> Response {
-    let ApplyHeadArgs {
+fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) -> Response {
+    let StagedHead {
         ledger_id,
         branch,
         queue_id,
@@ -1957,6 +2129,34 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
         Ok(entry) => entry,
         Err(resp) => return *resp,
     };
+
+    // Monotonicity guard: refuse to overwrite a head whose `t` is
+    // at least the proposed `commit_t`. Fires when a worker stages
+    // on a stale local view (a Fluree handle lagging the replicated
+    // `state.refs` — cold replica, backed-up event listener) and
+    // produces a `commit_t` that wouldn't advance the published
+    // head. Without this guard the apply would silently regress
+    // `t` and replace the head's content lineage with a non-
+    // descendant. Push the popped entry back at the front so the
+    // worker retries once its local view catches up.
+    if let Some(existing) = state.refs.get(&ref_key) {
+        if commit_t <= existing.t {
+            let current_t = existing.t;
+            state
+                .queues
+                .get_mut(&ref_key)
+                .expect("queue still present; just popped from it")
+                .push_front(entry);
+            return Response::QueueDesync {
+                ledger_id: full_ledger_id,
+                requested_queue_id: queue_id,
+                reason: DesyncReason::HeadNotMonotonic {
+                    current_t,
+                    proposed_t: commit_t,
+                },
+            };
+        }
+    }
 
     // Advance the branch's `RefEntry`, carrying forward index +
     // lineage state from any existing entry (matches the
@@ -2015,9 +2215,9 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: ApplyHeadArgs)
 fn apply_poison_queue_entry(
     state: &mut NameServiceState,
     log_index: u64,
-    args: PoisonQueueEntryArgs,
+    args: EntryPoisoning,
 ) -> Response {
-    let PoisonQueueEntryArgs {
+    let EntryPoisoning {
         ledger_id,
         branch,
         queue_id,
@@ -2126,7 +2326,7 @@ mod tests {
     }
 
     fn create_branch_cmd(ledger_id: &str, branch: &str) -> Command {
-        Command::CreateLedger(CreateLedgerArgs {
+        Command::CreateLedger(NewLedger {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             created_at_millis: 1_000,
@@ -2539,7 +2739,7 @@ mod tests {
         source_branch: &str,
         at_commit: Option<(ContentId, i64)>,
     ) -> Command {
-        Command::CreateBranch(CreateBranchArgs {
+        Command::CreateBranch(NewBranch {
             ledger_id: ledger_id.into(),
             branch: new_branch.into(),
             source_branch: source_branch.into(),
@@ -2925,7 +3125,7 @@ mod tests {
     // -------------------------------------------------------------
 
     fn advance_index(ledger_id: &str, branch: &str, head: ContentId, t: i64) -> Command {
-        Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+        Command::AdvanceIndexHead(NewIndexHead {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             new_index_head: head,
@@ -3072,7 +3272,7 @@ mod tests {
     // -------------------------------------------------------------
 
     fn rewrite_index(ledger_id: &str, branch: &str, head: ContentId, t: i64) -> Command {
-        Command::RewriteIndexHead(AdvanceIndexHeadArgs {
+        Command::RewriteIndexHead(NewIndexHead {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             new_index_head: head,
@@ -3154,7 +3354,7 @@ mod tests {
         body_seed: u8,
         idempotency: Option<IdempotencyCacheKey>,
     ) -> Command {
-        Command::EnqueueCommand(EnqueueCommandArgs {
+        Command::EnqueueCommand(QueueSubmission {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             idempotency,
@@ -3347,7 +3547,7 @@ mod tests {
         commit: ContentId,
         t: i64,
     ) -> Command {
-        Command::ApplyHead(ApplyHeadArgs {
+        Command::ApplyHead(StagedHead {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             queue_id,
@@ -3452,6 +3652,108 @@ mod tests {
     }
 
     #[test]
+    fn apply_head_refuses_commit_t_not_strictly_greater_than_current_head() {
+        // A worker whose local Fluree handle lags the replicated
+        // `state.refs` stages on an older base and produces a
+        // `commit_t` at or below the published head's `t`. Without
+        // the monotonicity guard, the apply would overwrite the
+        // head with a non-descendant commit and regress `t`. The
+        // guard refuses with `HeadNotMonotonic`, leaves the head
+        // intact, and pushes the popped queue entry back so the
+        // worker can retry once its local view catches up.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let qid1 = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        // First apply succeeds and lifts the head to t=15.
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid1, cid(15), 15),
+            3,
+        );
+        assert!(matches!(resp, Response::HeadApplied { commit_t: 15, .. }));
+
+        // Enqueue a second entry, then attempt to apply it with a
+        // stale-base commit_t (would-be commit_t = 11, below the
+        // current head's t=15).
+        let enq2 = apply(&mut state, enqueue("test/db", "main", 8, None), 4);
+        let qid2 = match enq2 {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid2, cid(11), 11),
+            5,
+        );
+        match resp {
+            Response::QueueDesync {
+                reason:
+                    DesyncReason::HeadNotMonotonic {
+                        current_t,
+                        proposed_t,
+                    },
+                ..
+            } => {
+                assert_eq!(current_t, 15);
+                assert_eq!(proposed_t, 11);
+            }
+            other => panic!("expected HeadNotMonotonic, got {other:?}"),
+        }
+
+        // Head unchanged.
+        let ref_key = RefKey::new("test/db", "main");
+        let entry = state.refs.get(&ref_key).expect("ref still present");
+        assert_eq!(entry.head, cid(15));
+        assert_eq!(entry.t, 15);
+        // Queue entry pushed back so the worker can retry.
+        let queue = state.queues.get(&ref_key).expect("queue present");
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().unwrap().queue_id, qid2);
+    }
+
+    #[test]
+    fn apply_head_refuses_commit_t_equal_to_current_head() {
+        // Strict monotonicity — equality is also a refusal,
+        // matching the `RefKind::CommitHead` rule on the explicit
+        // CAS path (state_machine.rs apply_cas_ref).
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let qid1 = match apply(&mut state, enqueue("test/db", "main", 7, None), 2) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid1, cid(20), 20),
+            3,
+        );
+
+        let qid2 = match apply(&mut state, enqueue("test/db", "main", 8, None), 4) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", qid2, cid(21), 20),
+            5,
+        );
+        assert!(matches!(
+            resp,
+            Response::QueueDesync {
+                reason: DesyncReason::HeadNotMonotonic {
+                    current_t: 20,
+                    proposed_t: 20
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn apply_head_wrong_front_when_queue_id_mismatches() {
         let mut state = NameServiceState::new();
         apply(&mut state, create_ledger("test/db"), 1);
@@ -3540,7 +3842,7 @@ mod tests {
     // ====================================================================
 
     fn poison_cmd(ledger_id: &str, branch: &str, queue_id: u64, reason: PoisonReason) -> Command {
-        Command::PoisonQueueEntry(PoisonQueueEntryArgs {
+        Command::PoisonQueueEntry(EntryPoisoning {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             queue_id,
@@ -3982,7 +4284,7 @@ mod tests {
         // Seed an index at t = 0 against the genesis commit.
         apply(
             &mut state,
-            Command::AdvanceIndexHead(AdvanceIndexHeadArgs {
+            Command::AdvanceIndexHead(NewIndexHead {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 new_index_head: cid(10),
@@ -4181,7 +4483,7 @@ mod tests {
         expected: Option<ConfigValue>,
         new: ConfigValue,
     ) -> Command {
-        Command::PushConfig(Box::new(PushConfigArgs {
+        Command::PushConfig(Box::new(ConfigUpdate {
             ledger_id: ledger_id.into(),
             expected,
             new,
@@ -4744,5 +5046,206 @@ mod tests {
         // Marker is one-shot.
         let ref_key = RefKey::new("test/db", "feature");
         assert!(!state.recently_cleared.contains_key(&ref_key));
+    }
+
+    // ----------------------------------------------------------------
+    // Command::SetWorkerEligibility
+    // ----------------------------------------------------------------
+
+    fn set_eligibility(voter: NodeId, eligible: bool) -> Command {
+        Command::SetWorkerEligibility(WorkerEligibility {
+            voter,
+            eligible,
+            applied_at_millis: 1_000,
+        })
+    }
+
+    /// Seed `configured_voters` with `voters` and start them all
+    /// eligible — mirrors the state the adapter leaves behind after
+    /// a membership-apply. Most eligibility tests start from this
+    /// shape because demotion + validation depend on it.
+    fn seed_voters<I>(state: &mut NameServiceState, voters: I)
+    where
+        I: IntoIterator<Item = NodeId>,
+    {
+        let set: BTreeSet<NodeId> = voters.into_iter().collect();
+        state.worker_eligible_voters = set.clone();
+        state.configured_voters = set;
+    }
+
+    #[test]
+    fn set_eligibility_promotes_demoted_configured_voter() {
+        // Voter is configured but currently ineligible — promotion
+        // adds it back to the eligible set and returns
+        // `changed: true`.
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [1, 2, 3]);
+        state.worker_eligible_voters.remove(&2);
+
+        let resp = apply(&mut state, set_eligibility(2, true), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet {
+                voter,
+                eligible,
+                changed,
+            } => {
+                assert_eq!(voter, 2);
+                assert!(eligible);
+                assert!(changed);
+            }
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        assert!(state.worker_eligible_voters.contains(&2));
+    }
+
+    #[test]
+    fn set_eligibility_promoting_already_eligible_voter_is_unchanged_noop() {
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [1, 2, 3]);
+
+        let resp = apply(&mut state, set_eligibility(3, true), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet { changed, .. } => assert!(!changed),
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        assert!(state.worker_eligible_voters.contains(&3));
+    }
+
+    #[test]
+    fn set_eligibility_demotes_above_quorum_floor() {
+        // 5 configured voters → quorum floor is 3. Demoting one
+        // when 5 are eligible drops to 4 — still above floor.
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [1, 2, 3, 4, 5]);
+
+        let resp = apply(&mut state, set_eligibility(5, false), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet {
+                voter,
+                eligible,
+                changed,
+            } => {
+                assert_eq!(voter, 5);
+                assert!(!eligible);
+                assert!(changed);
+            }
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+        assert!(!state.worker_eligible_voters.contains(&5));
+        assert_eq!(state.worker_eligible_voters.len(), 4);
+    }
+
+    #[test]
+    fn set_eligibility_demoting_already_ineligible_voter_is_unchanged_noop() {
+        // Idempotent demotion bypasses the quorum check because no
+        // mutation would occur.
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [1, 2, 3]);
+        state.worker_eligible_voters.remove(&3);
+
+        let resp = apply(&mut state, set_eligibility(3, false), 1);
+
+        match resp {
+            Response::WorkerEligibilitySet { changed, .. } => assert!(!changed),
+            other => panic!("expected WorkerEligibilitySet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_eligibility_refuses_voter_not_in_configured_set() {
+        // Voter 99 isn't configured — apply must refuse without
+        // mutating either set.
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [1, 2, 3]);
+
+        let resp = apply(&mut state, set_eligibility(99, true), 1);
+
+        match resp {
+            Response::WorkerEligibilityRefused {
+                voter,
+                eligible,
+                reason: EligibilityRefusal::VoterNotConfigured,
+            } => {
+                assert_eq!(voter, 99);
+                assert!(eligible);
+            }
+            other => panic!("expected VoterNotConfigured refusal, got {other:?}"),
+        }
+        assert!(!state.worker_eligible_voters.contains(&99));
+        assert_eq!(state.worker_eligible_voters.len(), 3);
+    }
+
+    #[test]
+    fn set_eligibility_allows_demoting_every_voter_in_sequence() {
+        // Worker eligibility and raft voting quorum are independent
+        // — the apply path imposes no minimum on
+        // `worker_eligible_voters`. An operator (or the monitor
+        // chasing a wave of unreachable peers) can drive eligibility
+        // all the way to empty; routing degrades gracefully
+        // (queues stall until eligibility is restored) rather than
+        // refusing to record the operator's intent.
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [1, 2, 3]);
+
+        for voter in [1, 2, 3] {
+            let resp = apply(&mut state, set_eligibility(voter, false), voter);
+            assert!(
+                matches!(
+                    resp,
+                    Response::WorkerEligibilitySet {
+                        changed: true,
+                        eligible: false,
+                        ..
+                    }
+                ),
+                "demoting voter {voter} should succeed regardless of remaining count, got {resp:?}"
+            );
+        }
+        assert!(
+            state.worker_eligible_voters.is_empty(),
+            "every demote lands; eligible set drains to empty"
+        );
+    }
+
+    #[test]
+    fn set_eligibility_apply_is_deterministic_for_back_to_back_flips() {
+        // Same voter, opposite eligibility — exercises that each
+        // apply observes the prior apply's mutation rather than the
+        // pre-state.
+        let mut state = NameServiceState::new();
+        seed_voters(&mut state, [10, 11, 12, 13, 14]);
+
+        let r1 = apply(&mut state, set_eligibility(11, false), 1);
+        let r2 = apply(&mut state, set_eligibility(11, true), 2);
+        let r3 = apply(&mut state, set_eligibility(11, false), 3);
+
+        assert!(matches!(
+            r1,
+            Response::WorkerEligibilitySet {
+                changed: true,
+                eligible: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            r2,
+            Response::WorkerEligibilitySet {
+                changed: true,
+                eligible: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            r3,
+            Response::WorkerEligibilitySet {
+                changed: true,
+                eligible: false,
+                ..
+            }
+        ));
+        assert!(!state.worker_eligible_voters.contains(&11));
     }
 }

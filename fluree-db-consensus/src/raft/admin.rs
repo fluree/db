@@ -50,8 +50,8 @@ use thiserror::Error;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InitializeRequest {
     /// Initial cluster members. Typically a single-node bootstrap
-    /// (`{self_id: self_addrs}`) followed by `add_learner` calls;
-    /// a multi-node initialize is supported but less common.
+    /// (`{id: addrs}` for this node) followed by `add_learner`
+    /// calls; a multi-node initialize is supported but less common.
     pub members: BTreeMap<NodeId, NodeAddrs>,
 }
 
