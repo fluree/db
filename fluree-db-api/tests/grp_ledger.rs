@@ -15,6 +15,8 @@ mod it_ledger_lifecycle;
 mod it_merge;
 #[path = "it_merge_preview.rs"]
 mod it_merge_preview;
+#[path = "it_read_your_writes.rs"]
+mod it_read_your_writes;
 #[path = "it_rebase.rs"]
 mod it_rebase;
 #[path = "it_refresh.rs"]

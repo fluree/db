@@ -8719,9 +8719,13 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .db_at_t(ledger_id, ledger2.t())
                 .await
                 .expect("view t=2");
+            // AVG (a decimal) renders as a bare number on the indexed leaflet
+            // lane (phase 1) but as a precision-preserving decimal string on the
+            // overlay fast path that serves head-with-novelty views (the same
+            // rendering `db()` returns in production; see it_join_batched_overlay).
             for (q, expected) in [
                 (sum_q, json!([[100]])),
-                (avg_q, json!([[25.0]])),
+                (avg_q, json!([["25"]])),
                 (cd_q, json!([[3]])),
             ] {
                 let result = fluree
@@ -8756,7 +8760,8 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .expect("view t=3");
             for (q, expected) in [
                 (sum_q, json!([[90]])),
-                (avg_q, json!([[30.0]])),
+                // Overlay fast-path decimal rendering (see phase 2).
+                (avg_q, json!([["30"]])),
                 (cd_q, json!([[2]])),
             ] {
                 let result = fluree
