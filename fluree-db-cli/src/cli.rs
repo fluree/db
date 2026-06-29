@@ -141,6 +141,64 @@ impl PolicyArgs {
             default_allow: self.default_allow,
         })
     }
+
+    /// Fold the policy flags into an existing `opts` JSON object using the
+    /// default-vs-override rule: each field is inserted only when the map
+    /// doesn't already carry that key, so explicit body opts always win.
+    /// Mirrors the server-side `FlureeHeaders::inject_into_opts` behavior.
+    pub fn inject_into_opts(
+        &self,
+        opts: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        if !self.is_set() {
+            return Ok(());
+        }
+
+        let resolved_policy = self.resolve_policy()?;
+        let resolved_values = self.resolve_policy_values()?;
+
+        if let Some(id) = self.identity.as_ref() {
+            opts.entry("identity")
+                .or_insert_with(|| serde_json::Value::String(id.clone()));
+        }
+
+        // policy-class is ALWAYS an array — typed Vec<String> from the
+        // PolicyArgs flag keeps every value, matching the server-side
+        // `FlureeHeaders.policy_class` shape.
+        if !self.policy_class.is_empty() && !opts.contains_key("policy-class") {
+            opts.insert(
+                "policy-class".to_string(),
+                serde_json::Value::Array(
+                    self.policy_class
+                        .iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+
+        if let Some(p) = resolved_policy {
+            opts.entry("policy").or_insert(p);
+        }
+
+        if let Some(values_map) = resolved_values {
+            let as_object: serde_json::Map<String, serde_json::Value> =
+                values_map.into_iter().collect();
+            opts.entry("policy-values")
+                .or_insert_with(|| serde_json::Value::Object(as_object));
+        }
+
+        if self.default_allow
+            && !opts.contains_key("default-allow")
+            && !opts.contains_key("default_allow")
+            && !opts.contains_key("defaultAllow")
+        {
+            opts.insert("default-allow".to_string(), serde_json::Value::Bool(true));
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Parser)]
