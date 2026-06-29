@@ -144,6 +144,11 @@ fn build_history_query(
         ])
     };
 
+    // This projection order is a contract: rows come back as positional arrays
+    // in exactly this order, and `HistoryRow::from_value` reads them by index.
+    // If you change the select list (order, length, or which vars are
+    // projected), update `HistoryRow::from_value` to match or the table/CSV
+    // formatters will silently render the wrong columns.
     let select = if predicate.is_some() {
         serde_json::json!(["?v", "?t", "?op"])
     } else {
