@@ -337,20 +337,27 @@ fn str_arg_and_lang<R: RowAccess>(
     value: Option<ComparableValue>,
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
-) -> Option<(String, Option<Arc<str>>)> {
+) -> Option<(Arc<str>, Option<Arc<str>>)> {
     match value? {
-        ComparableValue::String(s) => Some((s.to_string(), extract_lang_tag(expr, row, ctx))),
+        // Common case: a variable-bound string already holds an `Arc<str>`,
+        // so this is a zero-copy move.
+        ComparableValue::String(s) => Some((s, extract_lang_tag(expr, row, ctx))),
         ComparableValue::TypedLiteral {
             val: FlakeValue::String(s),
             dtc,
-        } => {
-            let lang = match dtc {
-                Some(UnresolvedDatatypeConstraint::LangTag(tag)) => Some(tag),
-                // xsd:string (or any non-lang datatype) carries no language tag.
-                _ => extract_lang_tag(expr, row, ctx),
-            };
-            Some((s, lang))
-        }
+        } => match dtc {
+            Some(UnresolvedDatatypeConstraint::LangTag(tag)) => Some((Arc::from(s), Some(tag))),
+            // A non-string custom datatype (e.g. `STRDT("x","ex:dt")`) is not a
+            // valid STRBEFORE/STRAFTER argument per SPARQL 1.1 — raise a type
+            // error (→ unbound) rather than treating it as a plain string.
+            Some(UnresolvedDatatypeConstraint::Explicit(iri))
+                if iri.as_ref() != fluree_vocab::xsd::STRING =>
+            {
+                None
+            }
+            // Simple literal (no dtc) or explicit `xsd:string`: no language tag.
+            _ => Some((Arc::from(s), extract_lang_tag(expr, row, ctx))),
+        },
         _ => None,
     }
 }
@@ -363,7 +370,10 @@ fn str_arg_and_lang<R: RowAccess>(
 fn args_compatible(lang1: &Option<Arc<str>>, lang2: &Option<Arc<str>>) -> bool {
     match lang2 {
         None => true,
-        Some(l2) => lang1.as_deref() == Some(l2.as_ref()),
+        // RDF 1.1 language tags compare case-insensitively (`@en` == `@EN`).
+        Some(l2) => lang1
+            .as_deref()
+            .is_some_and(|l1| l1.eq_ignore_ascii_case(l2)),
     }
 }
 
@@ -384,7 +394,7 @@ pub fn eval_str_before<R: RowAccess>(
     if !args_compatible(&lang1, &lang2) {
         return Ok(None);
     }
-    match s.find(&sub) {
+    match s.find(sub.as_ref()) {
         // Found (including the empty search string, found at position 0):
         // the result carries arg1's language tag.
         Some(pos) => Ok(Some(string_with_lang(&s[..pos], lang1))),
@@ -410,7 +420,7 @@ pub fn eval_str_after<R: RowAccess>(
     if !args_compatible(&lang1, &lang2) {
         return Ok(None);
     }
-    match s.find(&sub) {
+    match s.find(sub.as_ref()) {
         // Found (the empty search string matches at 0 → the whole string):
         // the result carries arg1's language tag.
         Some(pos) => Ok(Some(string_with_lang(&s[pos + sub.len()..], lang1))),
@@ -809,5 +819,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r, None);
+    }
+
+    fn strdt_const(value: &str, dt_iri: &str) -> Expression {
+        Expression::Call {
+            func: Function::StrDt,
+            args: vec![
+                Expression::Const(FlakeValue::String(value.to_string())),
+                Expression::Const(FlakeValue::String(dt_iri.to_string())),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_strbefore_custom_datatype_arg_is_unbound() {
+        // A string with a custom (non-xsd:string) datatype is not a valid
+        // STRBEFORE argument per SPARQL 1.1 → type error → unbound.
+        let batch = make_string_batch();
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[strdt_const("hello", "http://example.org/dt"), s_const("l")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, None);
+
+        // An explicit `xsd:string` datatype IS valid (behaves like a simple literal).
+        let r2 = eval_str_before::<_>(
+            &[
+                strdt_const("hello", "http://www.w3.org/2001/XMLSchema#string"),
+                s_const("l"),
+            ],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2, Some(ComparableValue::String(Arc::from("he"))));
+    }
+
+    #[test]
+    fn test_strbefore_lang_tags_compare_case_insensitively() {
+        // RDF 1.1 language tags are case-insensitive: arg1 @EN, arg2 @en are
+        // compatible, and the result preserves arg1's tag verbatim.
+        let batch = make_string_batch();
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[lang_const("english", "EN"), lang_const("s", "en")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, Some(string_with_lang("engli", Some(Arc::from("EN")))));
     }
 }
