@@ -426,7 +426,7 @@ pub async fn wait_for_index_application(
 pub fn assert_index_defaults() {
     assert_eq!(
         fluree_db_api::server_defaults::DEFAULT_REINDEX_MIN_BYTES,
-        100_000
+        100
     );
 }
 
