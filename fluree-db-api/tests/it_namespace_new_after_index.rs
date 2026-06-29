@@ -366,6 +366,10 @@ async fn cached_handle_query_after_new_namespace_commit_still_works() {
         .expect("reindex at t=1");
 
     let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    let before = handle.snapshot().await.to_ledger_state();
+    let before_store =
+        extract_binary_store_ref(&before.binary_store).expect("binary store before namespace tx");
+    let before_store_id = before_store.store_id();
 
     let tx2 = json!({
         "@context": { "b": "http://example.org/b/" },
@@ -378,19 +382,18 @@ async fn cached_handle_query_after_new_namespace_commit_still_works() {
     // Re-read through the cached handle. This is the path that can retain a
     // stale binary store after commit-time namespace changes.
     let cached = handle.snapshot().await.to_ledger_state();
-    let b_prefix = "http://example.org/b/";
-    let Some((&b_code, _)) = cached
-        .snapshot
-        .namespaces()
-        .iter()
-        .find(|(_, p)| p.as_str() == b_prefix)
-    else {
-        panic!("expected cached snapshot to contain namespace prefix {b_prefix}");
-    };
     let store = extract_binary_store_ref(&cached.binary_store).expect("cached binary store");
     assert!(
-        store.namespace_codes().contains_key(&b_code),
-        "cached binary store should include newly introduced namespace code {b_code}"
+        store
+            .namespace_codes()
+            .values()
+            .all(|p| p != "http://example.org/b/"),
+        "namespace-only commit should not reload/augment the binary store itself"
+    );
+    assert_eq!(
+        store.store_id(),
+        before_store_id,
+        "namespace-only commit should preserve the attached binary store identity"
     );
 
     let sparql = r#"
