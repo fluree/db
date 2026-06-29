@@ -1033,12 +1033,13 @@ fn inject_remote_time_travel_sparql(
 
 /// Stream a SELECT query against a local ledger as NDJSON.
 ///
-/// Mirrors the server's single-ledger `/stream/query/<ledger>` shape: streams
-/// against the current head with no per-request policy or time travel (those
-/// route through the server's dataset path, which the in-process producer does
-/// not build here). The producer ([`Fluree::run_stream_query`]) and the stdout
-/// consumer run concurrently on this task via `join!`, with the bounded channel
-/// providing backpressure.
+/// Mirrors the server's `/stream/query/<ledger>` routing: plain head-time
+/// queries with no policy take the lean single-ledger producer
+/// ([`Fluree::run_stream_query`]); `--at` and/or `--policy*` route through the
+/// dataset producer ([`Fluree::run_stream_query_dataset`]) so time travel and
+/// per-request policy enforcement run exactly like the buffered local path.
+/// The producer and the stdout consumer run concurrently on this task via
+/// `join!`, with the bounded channel providing backpressure.
 #[allow(clippy::too_many_arguments)]
 async fn run_local_ndjson_stream(
     fluree: &fluree_db_api::Fluree,
@@ -1050,47 +1051,197 @@ async fn run_local_ndjson_stream(
     envelope: bool,
     tracking: TrackingFlags,
 ) -> CliResult<()> {
-    if at.is_some() {
-        return Err(CliError::Usage(
-            "time travel (--at) is not supported with --format ndjson on local ledgers; \
-             use --remote or a buffered --format"
-                .to_string(),
-        ));
-    }
-    if policy.is_set() {
-        return Err(CliError::Usage(
-            "per-request policy (--policy*) is not supported with --format ndjson on local \
-             ledgers; use --remote or a buffered --format"
-                .to_string(),
-        ));
-    }
-
-    let input = match query_format {
-        detect::QueryFormat::Sparql => OwnedStreamQuery::Sparql(content.to_string()),
-        detect::QueryFormat::JsonLd => OwnedStreamQuery::JsonLd(serde_json::from_str(content)?),
-    };
-
-    // Owned ledger state for the producer; a planning view carrying the
-    // ledger's default context so PREFIX/@context-less queries still resolve
-    // prefixes (parity with the buffered local path's db_with_default_context).
-    let ledger_state = fluree.ledger(alias).await?;
-    let planning_view = GraphDb::from_ledger_state(&ledger_state)
-        .with_default_context(fluree.get_default_context(alias).await?);
-    let plan = fluree.plan_stream_query(&planning_view, &input).await?;
-
     let tracker = Tracker::new(tracking.as_options().unwrap_or_default());
     let exec_opts = QueryExecutionOptions::default();
-
     let (tx, rx) = mpsc::channel::<bytes::Bytes>(STREAM_CHANNEL_DEPTH);
     let mut consumer = NdjsonConsumer::new(BufWriter::new(std::io::stdout()), envelope);
-
     let timer = Instant::now();
-    let producer = fluree.run_stream_query(ledger_state, plan, tracker, exec_opts, tx);
-    let driver = query_stream::drive_channel(rx, &mut consumer);
-    let ((), drive_res) = tokio::join!(producer, driver);
-    drive_res?;
+
+    if at.is_some() || policy.is_set() {
+        run_local_ndjson_stream_dataset(
+            fluree,
+            alias,
+            content,
+            query_format,
+            at,
+            policy,
+            tracker,
+            exec_opts,
+            tx,
+            &mut consumer,
+            rx,
+        )
+        .await?;
+    } else {
+        let input = match query_format {
+            detect::QueryFormat::Sparql => OwnedStreamQuery::Sparql(content.to_string()),
+            detect::QueryFormat::JsonLd => OwnedStreamQuery::JsonLd(serde_json::from_str(content)?),
+        };
+
+        // Owned ledger state for the producer; a planning view carrying the
+        // ledger's default context so PREFIX/@context-less queries still resolve
+        // prefixes (parity with the buffered local path's db_with_default_context).
+        let ledger_state = fluree.ledger(alias).await?;
+        let planning_view = GraphDb::from_ledger_state(&ledger_state)
+            .with_default_context(fluree.get_default_context(alias).await?);
+        let plan = fluree.plan_stream_query(&planning_view, &input).await?;
+
+        let producer = fluree.run_stream_query(ledger_state, plan, tracker, exec_opts, tx);
+        let driver = query_stream::drive_channel(rx, &mut consumer);
+        let ((), drive_res) = tokio::join!(producer, driver);
+        drive_res?;
+    }
+
     let outcome = consumer.finish()?;
     print_stream_footer(&outcome, timer.elapsed());
+    Ok(())
+}
+
+/// Dataset variant of [`run_local_ndjson_stream`]: builds a single-ledger
+/// `DataSetDb` carrying the time-travel spec and policy options, then streams
+/// through [`Fluree::run_stream_query_dataset`]. Same wire protocol as the
+/// single-ledger path; required for `--at` (historical snapshot loading) and
+/// `--policy*` (per-source policy enforcement).
+#[allow(clippy::too_many_arguments)]
+async fn run_local_ndjson_stream_dataset(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    content: &str,
+    query_format: detect::QueryFormat,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+    tracker: Tracker,
+    exec_opts: QueryExecutionOptions,
+    tx: mpsc::Sender<bytes::Bytes>,
+    consumer: &mut NdjsonConsumer<BufWriter<std::io::Stdout>>,
+    rx: mpsc::Receiver<bytes::Bytes>,
+) -> CliResult<()> {
+    let qc_opts = if policy.is_set() {
+        policy.to_options().map_err(CliError::Usage)?
+    } else {
+        fluree_db_api::GovernanceOptions::default()
+    };
+    let time_spec = at.map(parse_time_spec);
+
+    let (dataset, input) = match query_format {
+        detect::QueryFormat::Sparql => {
+            // Local time-travel + SPARQL via FROM is encoded directly in the
+            // dataset spec (no SPARQL string rewrite needed). Reject queries
+            // that already carry their own FROM/FROM NAMED — the dataset
+            // spec we'd build would conflict with the in-query clauses, and
+            // the remote `--at` path makes the same call.
+            if at.is_some()
+                && fluree_db_api::sparql_dataset_ledger_ids(content)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            {
+                return Err(CliError::Usage(
+                    "SPARQL query already contains FROM/FROM NAMED; \
+                     for time travel, encode it in the FROM IRI \
+                     (e.g., FROM <ledger@t:1>) instead of using --at"
+                        .to_string(),
+                ));
+            }
+            let mut source = fluree_db_api::GraphSource::new(alias);
+            if let Some(spec) = time_spec.clone() {
+                source = source.with_time(spec);
+            }
+            let mut dataset_spec = fluree_db_api::DatasetSpec::new();
+            dataset_spec.default_graphs.push(source);
+            let dataset = fluree
+                .build_stream_dataset_from_spec(&dataset_spec, &qc_opts)
+                .await?;
+            (dataset, OwnedStreamQuery::Sparql(content.to_string()))
+        }
+        detect::QueryFormat::JsonLd => {
+            let mut json_query: serde_json::Value = serde_json::from_str(content)?;
+            let obj = json_query.as_object_mut().ok_or_else(|| {
+                CliError::Input("JSON-LD query must be a JSON object".to_string())
+            })?;
+
+            let from_id = match &time_spec {
+                Some(spec) => {
+                    attach_time_suffix_preserving_fragment(alias, &time_spec_to_suffix(spec))
+                }
+                None => alias.to_string(),
+            };
+            obj.insert("from".to_string(), serde_json::Value::String(from_id));
+
+            inject_policy_into_jsonld_opts(obj, policy)?;
+            let dataset = fluree.build_stream_dataset(&json_query).await?;
+            (dataset, OwnedStreamQuery::JsonLd(json_query))
+        }
+    };
+
+    let plan = fluree.plan_stream_query_dataset(&dataset, &input).await?;
+    let producer = fluree.run_stream_query_dataset(dataset, plan, tracker, exec_opts, tx);
+    let driver = query_stream::drive_channel(rx, consumer);
+    let ((), drive_res) = tokio::join!(producer, driver);
+    drive_res?;
+    Ok(())
+}
+
+/// Fold CLI `--policy*` flags into a JSON-LD query body's `opts` map. Mirrors
+/// the server-side header injection: each field is inserted only when the
+/// body's `opts` doesn't already carry that key, so explicit body opts win.
+fn inject_policy_into_jsonld_opts(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    policy: &PolicyArgs,
+) -> CliResult<()> {
+    if !policy.is_set() {
+        return Ok(());
+    }
+
+    let resolved_policy = policy.resolve_policy().map_err(CliError::Input)?;
+    let resolved_values = policy.resolve_policy_values().map_err(CliError::Input)?;
+
+    let opts = body
+        .entry("opts".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let opts_obj = opts
+        .as_object_mut()
+        .ok_or_else(|| CliError::Input("query 'opts' must be a JSON object".to_string()))?;
+
+    if let Some(id) = policy.identity.as_ref() {
+        opts_obj
+            .entry("identity")
+            .or_insert_with(|| serde_json::Value::String(id.clone()));
+    }
+
+    if !policy.policy_class.is_empty() && !opts_obj.contains_key("policy-class") {
+        opts_obj.insert(
+            "policy-class".to_string(),
+            serde_json::Value::Array(
+                policy
+                    .policy_class
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    }
+
+    if let Some(p) = resolved_policy {
+        opts_obj.entry("policy").or_insert(p);
+    }
+
+    if let Some(values_map) = resolved_values {
+        let as_object: serde_json::Map<String, serde_json::Value> =
+            values_map.into_iter().collect();
+        opts_obj
+            .entry("policy-values")
+            .or_insert_with(|| serde_json::Value::Object(as_object));
+    }
+
+    if policy.default_allow
+        && !opts_obj.contains_key("default-allow")
+        && !opts_obj.contains_key("default_allow")
+        && !opts_obj.contains_key("defaultAllow")
+    {
+        opts_obj.insert("default-allow".to_string(), serde_json::Value::Bool(true));
+    }
+
     Ok(())
 }
 

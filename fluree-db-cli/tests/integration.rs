@@ -291,7 +291,7 @@ fn query_ndjson_rejects_bench() {
 }
 
 #[test]
-fn query_ndjson_local_rejects_time_travel() {
+fn query_ndjson_local_time_travel_streams_historical_rows() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");
 
@@ -307,10 +307,80 @@ fn query_ndjson_local_rejects_time_travel() {
             "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
         ])
         .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
+fn query_ndjson_local_time_travel_jsonld_streams_historical_rows() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--format",
+            "ndjson",
+            "--at",
+            "1",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"},
+                "select": ["?name"],
+                "where": {"@id": "?s", "ex:name": "?name"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
+fn query_ndjson_local_sparql_at_rejects_inline_from() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--at",
+            "1",
+            "-e",
+            "SELECT ?name FROM <streamdb:main> WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "time travel (--at) is not supported",
+            "SPARQL query already contains FROM/FROM NAMED",
         ));
+}
+
+#[test]
+fn query_ndjson_local_with_default_allow_policy_streams() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // --default-allow is the cheapest --policy* flag to exercise: it routes the
+    // streaming query through the dataset producer (the only path that honors
+    // per-request policy) and asserts rows still flow when the policy is a
+    // no-op blanket allow.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--default-allow",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
 }
 
 #[test]
