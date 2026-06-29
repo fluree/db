@@ -18,7 +18,7 @@ fluree show <COMMIT> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <NAME>` | Ledger name (defaults to active ledger) |
+| `-l, --ledger <NAME>` | Ledger name (defaults to active ledger) |
 | `--remote <NAME>` | Execute against a remote server (by remote name, e.g., "origin") |
 
 ## Description

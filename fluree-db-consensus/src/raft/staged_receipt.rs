@@ -1,5 +1,5 @@
 //! Per-leader side channel carrying staged-time receipt details from
-//! the [`CommitWorker`](super::commit_worker::CommitWorker) to the
+//! the per-branch [`Worker`](super::commit_worker::Worker) to the
 //! [`QueuedTransactor`](super::queued_transactor::QueuedTransactor)
 //! that registered the waiter.
 //!
@@ -22,6 +22,7 @@ use crate::raft::state_machine::RefKey;
 use dashmap::DashMap;
 use fluree_db_api::{ConflictStrategy, IndexingStatus, TrackingTally};
 use fluree_db_core::{CommitId, ContentId};
+use serde::{Deserialize, Serialize};
 
 /// Typed receipt the worker stashes after staging and before
 /// proposing [`ApplyHead`](super::state_machine::Command::ApplyHead).
@@ -29,7 +30,12 @@ use fluree_db_core::{CommitId, ContentId};
 /// One variant per queue-mediated `Committer` method, plus
 /// [`Minimal`](Self::Minimal) for the fallback case where the
 /// adapter resolves a waiter without finding a stashed receipt.
-#[derive(Debug)]
+///
+/// `Serialize`/`Deserialize` so a follower-staged receipt can ferry
+/// to the leader over the cross-node `apply_head_on_behalf` RPC —
+/// the leader's adapter then resolves the parked waiter with the
+/// typed payload instead of falling back to [`Minimal`](Self::Minimal).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AppliedReceipt {
     Transact(TransactApplied),
     Push(PushApplied),
@@ -73,7 +79,7 @@ impl AppliedReceipt {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -81,7 +87,7 @@ pub struct TransactApplied {
     pub tally: Option<TrackingTally>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PushApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -89,7 +95,7 @@ pub struct PushApplied {
     pub indexing: IndexingStatus,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevertApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -98,7 +104,7 @@ pub struct RevertApplied {
     pub strategy: ConflictStrategy,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MergeApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -108,7 +114,7 @@ pub struct MergeApplied {
     pub strategy: ConflictStrategy,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RebaseApplied {
     pub commit_id: ContentId,
     pub commit_t: i64,
@@ -155,8 +161,33 @@ impl StagedReceiptMap {
     /// staging and before proposing `ApplyHead`. `ref_key` is
     /// recorded so [`take_for_ref_key`](Self::take_for_ref_key) can
     /// drain every receipt belonging to a cleared branch.
+    ///
+    /// Overwrites any prior entry for `queue_id` silently. Callers
+    /// that need to detect a collision (e.g. the leader-side handler
+    /// guarding against a duplicate ferry under an ownership flap)
+    /// should use [`Self::stash_if_absent`] instead.
     pub fn stash(&self, queue_id: u64, ref_key: RefKey, receipt: AppliedReceipt) {
         self.receipts.insert(queue_id, (ref_key, receipt));
+    }
+
+    /// Park a receipt under `queue_id` only if no entry exists for
+    /// that slot. Returns `true` on insert, `false` when a prior
+    /// entry was already present (the existing entry is left in
+    /// place; the new `receipt` is discarded).
+    ///
+    /// Used by the leader-side `apply_staged_commit` handler so a
+    /// concurrent ferry from a second follower (ownership flap)
+    /// can't silently overwrite the first ferry's receipt and
+    /// resolve the waiter against the wrong stash payload.
+    pub fn stash_if_absent(&self, queue_id: u64, ref_key: RefKey, receipt: AppliedReceipt) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.receipts.entry(queue_id) {
+            Entry::Vacant(slot) => {
+                slot.insert((ref_key, receipt));
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     /// Remove and return the receipt for `queue_id`. The state-
@@ -185,10 +216,50 @@ impl StagedReceiptMap {
             .collect()
     }
 
+    /// Return the queue_id of the pending stash entry for `ref_key`,
+    /// or `None` if no entry is currently stashed. Non-destructive
+    /// — leaves the receipt for the adapter to consume during apply.
+    ///
+    /// Used by the leader-local publish path to recover the worker's
+    /// queue_id from the stash instead of re-peeking the queue front
+    /// (which can shift between stage and publish under admin clears
+    /// or ownership flaps, attributing the worker's `commit_id` to
+    /// the wrong `queue_id`).
+    ///
+    /// Picks the smallest matching queue_id deterministically — the
+    /// worker invariant is one in-flight stash per branch per node,
+    /// so any match is the pending publish.
+    pub fn peek_queue_id_for(&self, ref_key: &RefKey) -> Option<u64> {
+        self.receipts
+            .iter()
+            .filter(|entry| &entry.value().0 == ref_key)
+            .map(|entry| *entry.key())
+            .min()
+    }
+
+    /// Remove and return the (queue_id, receipt) pair for the
+    /// pending stash entry on `ref_key`, or `None` if no entry is
+    /// stashed.
+    ///
+    /// Used by the follower-forward publish path: the worker stashes
+    /// before proposing, the publisher then takes both queue_id and
+    /// receipt out atomically by branch — avoids re-peeking the
+    /// queue front, which can race a queue shift between stage and
+    /// ferry and attribute the worker's `commit_id` to a different
+    /// `queue_id`.
+    ///
+    /// Same smallest-queue_id tiebreaker as [`Self::peek_queue_id_for`].
+    pub fn take_pending(&self, ref_key: &RefKey) -> Option<(u64, AppliedReceipt)> {
+        let queue_id = self.peek_queue_id_for(ref_key)?;
+        self.receipts
+            .remove(&queue_id)
+            .map(|(qid, (_, v))| (qid, v))
+    }
+
     /// Non-destructively read the per-transact metadata from a stashed
     /// [`AppliedReceipt::Transact`]. Returns `None` for any other
     /// variant or when the slot is empty. Used by `publish_commit`
-    /// to thread the metadata into [`ApplyHeadArgs`] without
+    /// to thread the metadata into [`StagedHead`] without
     /// consuming the receipt the adapter still needs for waiter
     /// resolution.
     pub fn peek_transact_metadata(&self, queue_id: u64) -> Option<TransactStashMetadata> {
@@ -224,6 +295,60 @@ impl StagedReceiptMap {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.receipts.is_empty()
+    }
+}
+
+/// RAII wrapper around a [`StagedReceiptMap`] stash slot. Stashes a
+/// typed [`AppliedReceipt`] on construction; removes it on `Drop`.
+/// Ensures the caller's task being aborted mid-propose doesn't
+/// strand the receipt in the shared map — every exit path (normal
+/// return, error, task cancellation, panic) runs `Drop`. Removal
+/// is idempotent: paths where the state-machine adapter or the
+/// cross-node forward already consumed the receipt see `Drop`
+/// perform a no-op `take`.
+pub(crate) struct StashGuard<'a> {
+    receipts: &'a StagedReceiptMap,
+    queue_id: u64,
+}
+
+impl<'a> StashGuard<'a> {
+    /// Stash and return a guard. Always succeeds; existing entries
+    /// for `queue_id` are silently overwritten — for the worker
+    /// path where the invariant is one in-flight stash per
+    /// `queue_id` at a time, enforced by the guard's `Drop`.
+    pub(crate) fn stash(
+        receipts: &'a StagedReceiptMap,
+        queue_id: u64,
+        ref_key: RefKey,
+        receipt: AppliedReceipt,
+    ) -> Self {
+        receipts.stash(queue_id, ref_key, receipt);
+        Self { receipts, queue_id }
+    }
+
+    /// Stash and return a guard only if the slot is empty. Returns
+    /// `None` if an entry is already present for `queue_id` — for
+    /// the leader-side `apply_staged_commit` handler where a
+    /// duplicate ferry from a second follower (ownership flap)
+    /// must be rejected rather than silently overwriting the
+    /// first ferry's receipt.
+    pub(crate) fn try_stash(
+        receipts: &'a StagedReceiptMap,
+        queue_id: u64,
+        ref_key: RefKey,
+        receipt: AppliedReceipt,
+    ) -> Option<Self> {
+        if receipts.stash_if_absent(queue_id, ref_key, receipt) {
+            Some(Self { receipts, queue_id })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for StashGuard<'_> {
+    fn drop(&mut self) {
+        self.receipts.take(self.queue_id);
     }
 }
 
@@ -305,6 +430,184 @@ mod tests {
     fn take_on_unknown_queue_id_is_none() {
         let map = StagedReceiptMap::new();
         assert!(map.take(9_999).is_none());
+    }
+
+    #[test]
+    fn peek_queue_id_for_returns_pending_stash_queue_id() {
+        // The worker stashes under entry.queue_id before publishing.
+        // The publish path must recover that exact queue_id from the
+        // stash — re-peeking the queue front would let a queue shift
+        // attribute the worker's commit_id to a different queue_id.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        map.stash(
+            42,
+            main.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(1),
+                commit_t: 10,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+        assert_eq!(map.peek_queue_id_for(&main), Some(42));
+        // Non-destructive — receipt still available for the adapter
+        // to consume during apply.
+        assert!(map.take(42).is_some());
+    }
+
+    #[test]
+    fn peek_queue_id_for_empty_branch_is_none() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        let feature = RefKey::new("test/db", "feature");
+        map.stash(
+            1,
+            feature,
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(1),
+                commit_t: 1,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+        assert_eq!(map.peek_queue_id_for(&main), None);
+    }
+
+    #[test]
+    fn take_pending_returns_queue_id_and_receipt_atomically() {
+        // The follower-forward publish path needs (queue_id, receipt)
+        // as an atomic pair sourced from the worker's stash. Without
+        // this atomicity (taking by ref_key rather than re-peeking
+        // queue_id and then taking the receipt under that key), a
+        // queue shift between the peek and take could attribute the
+        // wrong commit_id to the popped queue_id.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        map.stash(
+            7,
+            main.clone(),
+            AppliedReceipt::Transact(TransactApplied {
+                commit_id: cid(99),
+                commit_t: 5,
+                flake_count: 0,
+                tally: None,
+            }),
+        );
+        let (queue_id, receipt) = map.take_pending(&main).expect("entry present");
+        assert_eq!(queue_id, 7);
+        assert_eq!(receipt.commit_id(), &cid(99));
+        // Stash drained.
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn take_pending_on_empty_branch_is_none() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        assert!(map.take_pending(&main).is_none());
+    }
+
+    #[test]
+    fn peek_and_take_pending_pick_smallest_queue_id_when_multiple_match() {
+        // The worker invariant is one in-flight stash per branch per
+        // node, so multi-match shouldn't happen in production. Pin
+        // the tiebreaker as smallest-queue_id for deterministic
+        // behavior if the invariant is ever violated.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        for qid in [9_u64, 3, 7] {
+            map.stash(
+                qid,
+                main.clone(),
+                AppliedReceipt::Minimal {
+                    commit_id: cid(qid as u8),
+                    commit_t: qid as i64,
+                },
+            );
+        }
+        assert_eq!(map.peek_queue_id_for(&main), Some(3));
+        let (taken_qid, taken_receipt) = map.take_pending(&main).expect("entry present");
+        assert_eq!(taken_qid, 3);
+        assert_eq!(taken_receipt.commit_id(), &cid(3));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn stash_if_absent_inserts_on_empty_slot_and_refuses_on_conflict() {
+        // The leader-side handler depends on this rejection. Without
+        // it, a second ferry for the same queue_id (ownership flap)
+        // would silently overwrite the first ferry's receipt and
+        // the waiter would resolve against the wrong payload.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        assert!(
+            map.stash_if_absent(
+                7,
+                main.clone(),
+                AppliedReceipt::Minimal {
+                    commit_id: cid(1),
+                    commit_t: 10,
+                },
+            ),
+            "insert into empty slot succeeds"
+        );
+        let conflict = AppliedReceipt::Minimal {
+            commit_id: cid(2),
+            commit_t: 20,
+        };
+        assert!(
+            !map.stash_if_absent(7, main.clone(), conflict),
+            "second insert at occupied slot must refuse"
+        );
+        // First receipt still in place.
+        let taken = map.take(7).expect("first receipt still present");
+        assert_eq!(taken.commit_id(), &cid(1));
+        assert_eq!(taken.commit_t(), 10);
+    }
+
+    #[test]
+    fn stash_guard_try_stash_returns_none_on_conflict() {
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        let first = AppliedReceipt::Minimal {
+            commit_id: cid(1),
+            commit_t: 10,
+        };
+        let second = AppliedReceipt::Minimal {
+            commit_id: cid(2),
+            commit_t: 20,
+        };
+        let _g1 = StashGuard::try_stash(&map, 7, main.clone(), first).expect("first stash");
+        assert!(
+            StashGuard::try_stash(&map, 7, main.clone(), second).is_none(),
+            "duplicate queue_id stash must return None"
+        );
+        // First entry is still present until _g1 drops.
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn stash_guard_try_stash_drop_cleans_up_first_entry() {
+        // The RAII property: even when the conflict path returns
+        // None and propagates an error, the original guard still
+        // cleans up its own entry on scope exit.
+        let map = StagedReceiptMap::new();
+        let main = RefKey::new("test/db", "main");
+        {
+            let _g = StashGuard::try_stash(
+                &map,
+                7,
+                main.clone(),
+                AppliedReceipt::Minimal {
+                    commit_id: cid(1),
+                    commit_t: 10,
+                },
+            )
+            .expect("stash");
+            assert_eq!(map.len(), 1);
+        }
+        assert_eq!(map.len(), 0, "guard drop must clean up the entry");
     }
 
     #[test]

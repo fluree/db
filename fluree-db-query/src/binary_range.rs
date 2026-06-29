@@ -557,9 +557,9 @@ fn binary_range_eq_v3(
             };
             // Decode object.
             let o_val = view.decode_value(o_type, o_key, p_id)?;
-            // Resolve datatype.
+            // Resolve datatype (value-aware: NUM_BIG_OVERFLOW names no o_type).
             let dt = store
-                .resolve_datatype_sid(o_type)
+                .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
             // Language tag.
             let lang = store
@@ -1201,7 +1201,7 @@ fn binary_range_bounded_v3(
             };
             let o_val = view.decode_value(o_type, o_key, p_id)?;
             let dt = store
-                .resolve_datatype_sid(o_type)
+                .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
             let lang = store
                 .resolve_lang_tag(o_type)
