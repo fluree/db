@@ -141,6 +141,79 @@ async fn sparql_graph_source_delimited_is_406_not_404() {
     );
 }
 
+/// SPARQL `FROM <alias>` on `POST /query/<alias>` where the alias is a graph
+/// source: the dataset-clause branch's freshness preload must not block on the
+/// alias not being a ledger. It should reach the dataset build and execute (the
+/// bogus catalog then fails at scan time — proving resolution got that far,
+/// rather than a `Ledger not found` from the preload).
+#[tokio::test]
+async fn sparql_from_same_graph_source_alias_resolves_past_preload() {
+    let (_tmp, state) = state_with_graph_source().await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/gs:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/json")
+                .body(Body::from(
+                    "SELECT ?s FROM <gs:main> WHERE { ?s ?p ?o } LIMIT 1",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, text) = body_text(resp).await;
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "graph-source alias with a self-referential FROM should resolve, got {status}: {text}"
+    );
+    assert!(
+        !text.contains("Ledger not found"),
+        "must get past the ledger-only freshness preload, got: {text}"
+    );
+    assert!(
+        !text.contains("Ledger mismatch"),
+        "a self-referential FROM must not trip the cross-target guard, got: {text}"
+    );
+}
+
+/// The cross-target guard still fires for a graph-source alias: `FROM` pointing
+/// at a *different* target must be a `400 "Ledger mismatch"`. Reaching this
+/// (rather than the preload's not-found) proves the preload was correctly
+/// bypassed for the graph source.
+#[tokio::test]
+async fn sparql_from_other_target_on_graph_source_is_mismatch() {
+    let (_tmp, state) = state_with_graph_source().await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/gs:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/json")
+                .body(Body::from("SELECT ?s FROM <other:main> WHERE { ?s ?p ?o }"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, text) = body_text(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "cross-target FROM should be a 400 mismatch, got {status}: {text}"
+    );
+    assert!(
+        text.contains("Ledger mismatch"),
+        "expected the cross-target mismatch error, got: {text}"
+    );
+}
+
 /// A genuinely-missing ledger requested as CSV must keep its 404 — it is not a
 /// graph source, so it must not borrow the graph-source format message.
 #[tokio::test]

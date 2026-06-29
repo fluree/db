@@ -2517,8 +2517,20 @@ async fn execute_sparql_ledger(
             }
 
             // Ensure head is fresh in shared storage mode before time-travel view loading.
+            // The URL alias may name a graph source rather than a ledger; a graph
+            // source is a genesis view with no ledger head to refresh, so a clean
+            // not-found there is expected — let the dataset build resolve it (it
+            // already supports graph sources via `load_view_from_source`). A
+            // genuinely-missing ledger still propagates its not-found.
             if !state.config.is_proxy_storage_mode() {
-                let _ = load_ledger_for_query(state, ledger_id, &span).await?;
+                if let Err(e) = load_ledger_for_query(state, ledger_id, &span).await {
+                    let is_not_found = matches!(&e, ServerError::Api(api) if api.is_not_found());
+                    if !(is_not_found
+                        && state.fluree.resolve_graph_source(ledger_id).await?.is_some())
+                    {
+                        return Err(e);
+                    }
+                }
             }
 
             let spec = ledger_scoped_sparql_dataset_spec(ledger_id, dc)?;
