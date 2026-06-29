@@ -40,14 +40,14 @@ These shape everything below; read them first.
 |--------|:------:|-------|
 | `MATCH` | ✅ | Node/relationship patterns, `WHERE`. |
 | `OPTIONAL MATCH` | ✅ | Nullable bindings; poisoned-binding semantics. |
-| `WITH` | ✅ | Projection boundary; `WHERE`→HAVING when it references aggregates; `DISTINCT`/`ORDER BY`/`SKIP`/`LIMIT`; `collect()` carries forward as a list. |
+| `WITH` | ◑ | Projection boundary; `WHERE`→HAVING when it references aggregates; `DISTINCT`/`ORDER BY`/`SKIP`/`LIMIT`; `collect()` carries forward as a list. Before a **write** clause only the pass-through / rename / computed-alias / filter subset is allowed (no aggregation / `DISTINCT` / `ORDER BY` / `SKIP` / `LIMIT`); `WITH` before `DELETE` deferred. |
 | `UNWIND` | ✅ | Inline lists and runtime list expressions; `$param` lists via API substitution. |
-| `RETURN` | ✅ | `*`, aliases, `DISTINCT`, `ORDER BY`/`SKIP`/`LIMIT`. |
+| `RETURN` | ✅ | `*`, aliases, `DISTINCT`, `ORDER BY`/`SKIP`/`LIMIT`. `SKIP`/`LIMIT` must be literal integers. |
 | `UNION` / `UNION ALL` | ✅ | Column-name-match + uniform-variant rules enforced. |
 | `CALL { … }` (subquery) | ✅ | Imports `(a,b)` / `(*)`, uncorrelated broadcast, inner `UNION`, nesting, strict scope/shadowing, correlated-aggregate soundness. |
 | `CREATE` | ✅ | Nodes + relationships (relationships reify). |
-| `MERGE` (node) | ✅ | `ON CREATE SET` / `ON MATCH SET`. |
-| `MERGE` (relationship) | ◑ | Standalone + bound-endpoint forms; `ON CREATE SET`. Deferred: property-bearing rel MERGE (`-[:T {p:v}]->`), `ON MATCH SET` on a rel MERGE, multi-hop/multi-part MERGE. |
+| `MERGE` (node) | ✅ | Find-or-create with `ON CREATE SET`. `ON MATCH SET` deferred (for **all** MERGE forms — node and relationship). |
+| `MERGE` (relationship) | ◑ | Standalone + bound-endpoint forms; `ON CREATE SET`. Deferred: property-bearing rel MERGE (`-[:T {p:v}]->`), multi-hop / multi-part MERGE, multiple `MERGE` clauses, and `MERGE` combined with another write clause in one statement. |
 | `SET` / `REMOVE` | ✅ | Properties, `+=` map merge, labels. |
 | `DELETE` / `DETACH DELETE` | ✅ | |
 | `FOREACH` | ⏳ | |
@@ -60,19 +60,23 @@ These shape everything below; read them first.
 | Feature | Status | Notes |
 |---------|:------:|-------|
 | Node pattern (labels, inline props) | ✅ | |
+| Bare unconstrained `MATCH (n)` | ⟂ | Rejected — a node must be constrained by a label, property, or relationship (no whole-graph scan). |
 | Directed typed relationship `-[:T]->`, `<-[:T]-` | ✅ | |
 | Type alternation `-[:A\|B]->` | ✅ | `Union` of concrete predicates. |
 | Undirected `-[:T]-` | ✅ | Forward ∪ reverse `Union`. |
 | Untyped relationship `-[r]->` | ✅ | Variable predicate; system facts hidden. |
 | Bounded var-length `-[:T*m..n]->` | ✅ | **Enumerates trails** (one row per path, relationship-uniqueness). |
 | Unbounded var-length `-[:T*]->` | ⟂ | **Reachability** (one row per reachable endpoint), not path enumeration. |
-| Untyped var-length `-[*m..n]->` | ⟂ | Wildcard reachability over node→node edges; excludes `rdf:type`/`f:reifies*`. |
+| Untyped var-length `-[*m..n]->` | ⟂ | Wildcard reachability over node→node edges; excludes `rdf:type`/`f:reifies*`. A direction is required (`-[*]-` deferred); an unbounded lower bound above 1 (`-[*2..]->`) deferred — give an upper bound or name a type. |
 | Bounded var-length **binding** `-[r:T*m..n]->` / `p = …` | ✅ | `r` = rel list, `p` = path; via per-branch construction. |
 | Unbounded var-length binding | ⏳ | Needs a path-enumeration operator. |
 | `shortestPath` / `allShortestPaths` | ✅ | Anchored, single typed predicate; `All` emits one row per minimal path. |
 | `relationships(p)` / `nodes(p)` / `pathPairs(p)` / `length(p)` | ✅ | `relationships(p)` carries the stored edge orientation. |
 | Bounded type-alternation var-length `-[:A\|B*1..3]->` | ⏳ | Use the unbounded form. |
 | Undirected **unbounded** path `-[:T*]-` | ⏳ | |
+| Free path value `MATCH p = (...)` without a `shortestPath`/`allShortestPaths` wrapper | ⏳ | Wrap with a path-finding function. |
+| Zero-length *typed* bounded path `-[:T*0..M]->` | ⏳ | Use `*1..M`. |
+| Property filter on a var-length / `shortestPath` relationship | ⏳ | |
 
 ## Expressions & operators
 
@@ -85,8 +89,9 @@ These shape everything below; read them first.
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` | ✅ | |
 | `x IN [ … ]` | ✅ | |
 | `IS NULL` / `IS NOT NULL` | ✅ | |
-| `CASE` (simple + generic) | ✅ | Aggregates inside `CASE` deferred. |
-| Property access `n.prop` | ◑ | Bare-variable target; chained `n.a.b` deferred. |
+| `CASE` (simple + generic) | ✅ | Aggregates inside `CASE` deferred; `CASE`/`EXISTS` inside a write-statement `MATCH … WHERE` deferred. |
+| `NULL` literal | ⏳ | Use an absent value / `IS NULL`. |
+| Property access `n.prop` | ◑ | Bare-variable target; chained `n.a.b` deferred — except temporal-field chains like `x.date.month`, which lower to an extraction function. |
 | List literal / indexing `[a,b]`, `list[i]` | ✅ | Negative index from end. |
 | Map literal `{k: v}` | ✅ | Key-order-insensitive identity (⟂ vs strict insertion order for equality). |
 | Map projection `n{.k, .*, x: e}` | ◑ | Mixing `.*` with other selectors deferred. |
