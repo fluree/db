@@ -440,6 +440,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".local")).unwrap();
         // Keep the timeout short so the test is fast.
+        // NOTE: this mutates the process-global env that `lock_timeout()` reads.
+        // It is safe only because no sibling test in this binary reads
+        // `lock_timeout()`; if one is added, this test must serialize against it
+        // (e.g. a shared mutex) or scope the var, since nextest runs siblings on
+        // parallel threads in the same process.
         std::env::set_var("FLUREE_MEMORY_LOCK_TIMEOUT_SECS", "1");
 
         // First acquisition succeeds and holds the lock.

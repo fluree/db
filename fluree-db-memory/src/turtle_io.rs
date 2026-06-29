@@ -606,7 +606,9 @@ mod tests {
         c.artifact_refs = vec![];
         c.branch = Some("zzz".to_string()); // sorts after "main"
 
-        // Insert in an order that exercises front/middle/end placement.
+        // Insert in an order that exercises end placement (c after a) then
+        // front placement (b before both). The strictly-between-two-blocks
+        // case is covered separately by `insert_between_existing_blocks`.
         insert_memory_into_file(&path, &a, REPO_HEADER).unwrap();
         insert_memory_into_file(&path, &c, REPO_HEADER).unwrap();
         insert_memory_into_file(&path, &b, REPO_HEADER).unwrap();
@@ -619,6 +621,54 @@ mod tests {
         assert_eq!(
             spliced, rewritten,
             "incremental splice must match a full sorted rewrite byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn insert_between_existing_blocks() {
+        // Seed [X, Z] then insert a Y that sorts strictly between them, so the
+        // splice lands in the middle of the block list (idx > 0 and
+        // idx < blocks.len()) rather than at the front or end. Must still match
+        // a full sorted rewrite byte-for-byte.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("between.ttl");
+
+        // All on the same branch so ordering is purely by id.
+        let mut x = make_test_memory();
+        x.id = "mem:fact-01aaaa0000000000000000".to_string();
+        x.content = "memory X".to_string();
+        x.tags = vec![];
+        x.artifact_refs = vec![];
+        let mut y = make_test_memory();
+        y.id = "mem:fact-01mmmm0000000000000000".to_string();
+        y.content = "memory Y".to_string();
+        y.tags = vec![];
+        y.artifact_refs = vec![];
+        let mut z = make_test_memory();
+        z.id = "mem:fact-01zzzz0000000000000000".to_string();
+        z.content = "memory Z".to_string();
+        z.tags = vec![];
+        z.artifact_refs = vec![];
+
+        // Seed the outer pair, then splice Y between X and Z.
+        insert_memory_into_file(&path, &x, REPO_HEADER).unwrap();
+        insert_memory_into_file(&path, &z, REPO_HEADER).unwrap();
+        insert_memory_into_file(&path, &y, REPO_HEADER).unwrap();
+        let spliced = fs::read_to_string(&path).unwrap();
+
+        // Y must land between X and Z.
+        let px = spliced.find("fact-01aaaa").unwrap();
+        let py = spliced.find("fact-01mmmm").unwrap();
+        let pz = spliced.find("fact-01zzzz").unwrap();
+        assert!(px < py && py < pz, "Y should splice between X and Z");
+
+        let rewritten_path = dir.path().join("rewrite.ttl");
+        write_memory_file(&rewritten_path, &[x, y, z], REPO_HEADER).unwrap();
+        let rewritten = fs::read_to_string(&rewritten_path).unwrap();
+
+        assert_eq!(
+            spliced, rewritten,
+            "middle splice must match a full sorted rewrite byte-for-byte"
         );
     }
 
