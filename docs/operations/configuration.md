@@ -48,7 +48,7 @@ ttl_ms = 1000
 
 [server.indexing]
 enabled = true
-reindex_min_bytes = 100000
+reindex_min_bytes = 100
 # reindex_max_bytes defaults to 20% of system RAM; override only if needed:
 # reindex_max_bytes = 536870912  # 512 MB
 
@@ -91,7 +91,7 @@ Example `.fluree/config.jsonld`:
     "log_level": "info",
     "indexing": {
       "enabled": true,
-      "reindex_min_bytes": 100000
+      "reindex_min_bytes": 100
     }
   },
   "profiles": {
@@ -373,7 +373,7 @@ Enable background indexing and configure novelty backpressure thresholds:
 | Flag                  | Env Var                    | Default   | Description                                     |
 | --------------------- | -------------------------- | --------- | ----------------------------------------------- |
 | `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage) |
-| `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100000`  | Soft threshold (triggers background indexing)   |
+| `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold (blocks commits until reindexed) |
 
 Config file equivalent:
@@ -381,7 +381,7 @@ Config file equivalent:
 ```toml
 [server.indexing]
 enabled = true
-reindex_min_bytes = 100000         # 100 KB — soft trigger
+reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
 ```
 
