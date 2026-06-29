@@ -1,34 +1,44 @@
-//! Per-leader worker that drains [`NameServiceState`] queues into
-//! head advances.
+//! Per-branch staging tasks that drain [`NameServiceState`] queues
+//! into head advances.
 //!
 //! The state machine appends `QueueEntry` rows to per-branch FIFOs as
-//! [`Command::EnqueueCommand`] applies; the worker (running only on
-//! the current Raft leader) pulls each front entry, restages the
-//! commit locally, writes the commit blob to shared CAS, and proposes
-//! [`Command::ApplyHead`] — at which point the entry pops and the
-//! head advances.
+//! [`Command::EnqueueCommand`](crate::raft::state_machine::Command::EnqueueCommand)
+//! applies. One [`Worker`] runs per active branch on whichever node
+//! the rendezvous-hash owner resolves to; each polls its branch's
+//! queue front, restages the commit locally, writes the commit blob
+//! to shared CAS, and publishes the head advance through
+//! [`CommitPublisher::publish_commit`] — which proposes
+//! [`Command::ApplyHead`](crate::raft::state_machine::Command::ApplyHead).
+//! The entry pops and the head advances on that apply.
+//!
+//! [`WorkerSupervisor`] runs at node lifetime on every node. Each
+//! tick it computes the desired set (branches in
+//! [`NameServiceState::queues`] whose rendezvous owner is this node)
+//! and reconciles its running workers to match — spawning new ones,
+//! aborting reassigned ones. A cancellation token drives graceful
+//! shutdown; the supervisor exits its loop, aborts every per-branch
+//! worker, then returns.
 //!
 //! Scope cuts for v1 (tracked in `docs/design/raft-command-queue.md`):
 //! - No retry budget. Any staging failure poisons the entry.
 //! - [`BodyKind::Pushed`] handling is deferred; the worker poisons
 //!   any pushed entry until that path lands.
+//! - Idle branches are not reaped; workers run until ownership
+//!   moves or the supervisor shuts down.
 //! - Token-bearing fields in [`crate::QueuedRequest::governance`]
 //!   travel verbatim; redaction is future work.
-//!
-//! The worker is owned by the raft integration layer, which spawns
-//! it on leadership gain and aborts it on leadership loss (the same
-//! lifecycle as the indexer launcher in `fluree-db-server`).
+
+use async_trait::async_trait;
 
 use crate::local::build_policy_context;
+use crate::raft::ownership::owner;
 use crate::raft::staged_receipt::{
     AppliedReceipt, MergeApplied, PushApplied, RebaseApplied, RevertApplied, StagedReceiptMap,
-    TransactApplied,
+    StashGuard, TransactApplied,
 };
-use crate::raft::state_machine::{
-    BodyKind, Command as SmCommand, PoisonQueueEntryArgs, PoisonReason, QueueEntry, RefKey,
-};
+use crate::raft::state_machine::{BodyKind, PoisonReason, QueueEntry, RefKey};
 use crate::raft::state_machine_adapter::SharedState;
-use crate::raft::TypeConfig;
+use crate::raft::{NodeId, TypeConfig};
 use crate::{
     QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
     SubmissionError, TransactionBody,
@@ -39,87 +49,167 @@ use fluree_db_api::{
 };
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
-use fluree_db_nameservice::CommitPublisher;
+use fluree_db_nameservice::{CommitPublisher, NameServiceError};
 use futures::FutureExt;
 use openraft::Raft;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-/// How often the drain loop polls [`NameServiceState::queues`] when
-/// no work was found on the previous tick.
+/// [`Worker`] poll interval when the previous tick found nothing on
+/// its branch queue.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How long the drain loop waits after a Raft propose failure before
-/// trying again. Long enough that we don't tight-loop against a lost
-/// leader; short enough that recovery feels responsive.
+/// [`WorkerSupervisor`] scan interval for branches in
+/// [`NameServiceState::queues`] without a running worker. Bounds
+/// the time-to-spawn for a freshly-seen branch.
+const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// [`Worker`] backoff after a Raft propose failure before the next
+/// retry.
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Max staging attempts before [`process_entry`] gives up and
-/// proposes a poison. Only `PoisonReason::StagingFailed` is
-/// retried — the other variants are deterministic and would just
-/// burn worker rounds. Three tries balances "recover from a
-/// transient CAS hiccup or lock contention" against "don't hold a
-/// branch's queue front hostage indefinitely."
+/// proposes a poison. Only [`PoisonReason::StagingFailed`] is
+/// retried; the other variants are deterministic.
 const MAX_STAGE_ATTEMPTS: u32 = 3;
 
-/// First-attempt backoff between staging retries; subsequent
-/// attempts double it. With three total attempts the worst-case
-/// wait before poisoning is `100 + 200 = 300ms` — short enough
-/// that downstream waiters don't time out, long enough to ride
-/// through a transient hiccup.
+/// First-attempt backoff between staging retries; doubles per
+/// subsequent attempt. With [`MAX_STAGE_ATTEMPTS`] = 3, the worst-
+/// case wait before poisoning is `100 + 200 = 300ms`.
 const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Per-leader worker that processes the per-branch command queue.
+/// Cross-node propose path for [`SmCommand::PoisonQueueEntry`].
 ///
-/// Cloning is cheap (`Arc` clones); a single worker instance is
-/// driven by the leader watcher.
-///
-/// Head advances flow through `publisher.publish_commit` — a Raft
-/// deployment supplies a [`RaftNameService`](crate::raft::nameservice::RaftNameService)
-/// here, which proposes `ApplyHead` against the current per-branch
-/// queue front. Poisoning still goes direct to Raft because there's
-/// no trait surface for "fail this queue entry."
-#[derive(Clone)]
-pub struct CommitWorker {
-    raft: Arc<Raft<TypeConfig>>,
-    publisher: Arc<dyn CommitPublisher>,
-    fluree: Arc<Fluree>,
-    index_config: IndexConfig,
-    shared_state: SharedState,
-    /// Side channel paired with the state-machine adapter's
-    /// `StagedReceiptMap`. The worker stashes a typed
-    /// [`AppliedReceipt`] here before proposing `ApplyHead`; the
-    /// adapter takes it during waiter resolution. Cleanup on
-    /// propose failure prevents stale receipts from accumulating.
-    staged_receipts: Arc<StagedReceiptMap>,
+/// `Worker`s running on a follower can't propose to raft directly —
+/// `client_write` returns `ForwardToLeader` for non-leader proposes
+/// — so a deterministic poison (e.g. [`PoisonReason::BodyMalformed`])
+/// would otherwise bounce forever and head-of-line-block the
+/// branch. Implementations dispatch by local-leader status, mirroring
+/// how [`CommitPublisher::publish_commit`] routes `ApplyHead` via
+/// `RaftNameService::publish_commit_via_leader` on a follower.
+#[async_trait]
+pub trait QueuePoisonPublisher: Send + Sync {
+    /// Propose `PoisonQueueEntry` for the given queue entry. On a
+    /// follower, ferries the args to the current leader's
+    /// `apply_queue_poison` endpoint; on the leader, calls
+    /// `client_write` directly. Either way returns `Ok(())` once
+    /// the poison is durably proposed.
+    async fn poison_queue_entry(
+        &self,
+        ref_key: &RefKey,
+        queue_id: u64,
+        reason: PoisonReason,
+    ) -> Result<(), QueuePoisonError>;
 }
 
-impl CommitWorker {
-    pub fn new(
-        raft: Arc<Raft<TypeConfig>>,
-        publisher: Arc<dyn CommitPublisher>,
-        fluree: Arc<Fluree>,
-        index_config: IndexConfig,
+/// Failure modes for [`QueuePoisonPublisher::poison_queue_entry`].
+///
+/// All variants are surfaced to the worker's outer `WorkerError::Raft`
+/// path, which logs and backs off. Distinguishing them at this layer
+/// keeps the cause explicit in logs without forcing the worker to
+/// switch on opaque strings.
+#[derive(Debug, Error)]
+pub enum QueuePoisonError {
+    /// Local `client_write` rejected the propose (leader-side path),
+    /// or the leader's `client_write` rejected it after the
+    /// follower forwarded.
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+    /// HTTP-level failure ferrying the poison to the leader: connect
+    /// refused, timeout, leader address missing from membership, etc.
+    #[error("apply_queue_poison transport: {0}")]
+    Transport(String),
+    /// Leader returned a non-success HTTP status (transport-layer
+    /// failure on the leader side — distinct from a structured
+    /// `Result::Err` body returned with 200).
+    #[error("apply_queue_poison returned HTTP {0}")]
+    HttpStatus(reqwest::StatusCode),
+    /// Postcard encode/decode of the request or response failed.
+    #[error("apply_queue_poison codec: {0}")]
+    Codec(String),
+    /// No leader currently elected — `current_leader()` returned
+    /// `None`. The worker backs off and retries on the next loop tick.
+    #[error("no leader currently elected; poison deferred")]
+    NoLeader,
+}
+
+/// Handles a [`Worker`] uses to commit its staged work.
+///
+/// - [`commits`](Self::commits) proposes `ApplyHead` after a
+///   successful stage. Dispatches via `client_write` on the leader
+///   and via the `apply_staged_commit` HTTP endpoint on a follower.
+/// - [`poison`](Self::poison) proposes `PoisonQueueEntry` for
+///   deterministic failures, with the same dispatch via the
+///   `apply_queue_poison` endpoint.
+/// - [`staged_receipts`](Self::staged_receipts) is the per-leader
+///   stash the `apply_staged_commit` path reads typed receipt detail
+///   from. The worker writes to it before proposing through
+///   [`commits`](Self::commits); on propose failure the worker takes
+///   the entry back out; on success the state-machine adapter takes
+///   during waiter resolution.
+#[derive(Clone)]
+pub struct PublishingChannel {
+    pub commits: Arc<dyn CommitPublisher>,
+    pub poison: Arc<dyn QueuePoisonPublisher>,
+    pub staged_receipts: Arc<StagedReceiptMap>,
+}
+
+/// Handles a [`Worker`] uses to stage a commit locally.
+///
+/// - [`fluree`](Self::fluree) owns content storage, the per-branch
+///   write guards, and the staging machinery (`stage`, `prepare_*`,
+///   `content_store`).
+/// - [`index_config`](Self::index_config) shapes what staging
+///   produces. Consumed by `fluree`'s commit path.
+#[derive(Clone)]
+pub struct StagingContext {
+    pub fluree: Arc<Fluree>,
+    pub index_config: IndexConfig,
+}
+
+/// Per-branch staging task.
+///
+/// Drains a single branch's queue: peeks the front, stages the
+/// commit, writes the commit blob, publishes the head advance through
+/// [`CommitPublisher::publish_commit`], and retires the entry. One
+/// worker runs per active [`RefKey`] on whichever node the rendezvous
+/// owner resolves to; cross-branch concurrency is the supervisor's
+/// responsibility.
+///
+/// Head advances flow through [`PublishingChannel::commits`] — a
+/// Raft deployment supplies a
+/// [`RaftNameService`](crate::raft::nameservice::RaftNameService)
+/// here, which proposes `ApplyHead` against the current per-branch
+/// queue front (forwarding to the leader when this worker runs on a
+/// follower). Deterministic failures route through
+/// [`PublishingChannel::poison`] with the same dispatch.
+#[derive(Clone)]
+pub struct Worker {
+    ref_key: RefKey,
+    shared_state: SharedState,
+    publishing: PublishingChannel,
+    staging: StagingContext,
+}
+
+impl Worker {
+    fn new(
+        ref_key: RefKey,
         shared_state: SharedState,
-        staged_receipts: Arc<StagedReceiptMap>,
+        publishing: PublishingChannel,
+        staging: StagingContext,
     ) -> Self {
         Self {
-            raft,
-            publisher,
-            fluree,
-            index_config,
+            ref_key,
             shared_state,
-            staged_receipts,
+            publishing,
+            staging,
         }
-    }
-
-    /// Borrow the shared state. Drain loops use this to peek queue
-    /// fronts without going through Raft RPC.
-    pub fn shared_state(&self) -> &SharedState {
-        &self.shared_state
     }
 
     /// Process a single queue entry end-to-end.
@@ -138,15 +228,11 @@ impl CommitWorker {
     /// leadership mid-write) heals instead of producing the same
     /// failure forever. Returns once the entry has reached a
     /// terminal state in the queue (advanced or poisoned).
-    pub async fn process_entry(
-        &self,
-        ref_key: &RefKey,
-        entry: QueueEntry,
-    ) -> Result<(), WorkerError> {
+    async fn process_entry(&self, entry: QueueEntry) -> Result<(), WorkerError> {
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match self.try_advance_head(ref_key, &entry).await {
+            match self.try_advance_head(&entry).await {
                 Ok(()) => return Ok(()),
                 Err(WorkerError::Transient(error)) => {
                     if attempt < MAX_STAGE_ATTEMPTS {
@@ -166,8 +252,9 @@ impl CommitWorker {
                         // leader transition is the canonical case)
                         // reproduce on every attempt and the entry
                         // poisons.
-                        let ledger_id = format_full_ledger_id(ref_key);
+                        let ledger_id = self.ref_key.ledger_id();
                         if let Err(refresh_err) = self
+                            .staging
                             .fluree
                             .refresh(&ledger_id, RefreshOpts::default())
                             .await
@@ -189,7 +276,6 @@ impl CommitWorker {
                     );
                     return self
                         .propose_poison(
-                            ref_key,
                             entry.queue_id,
                             PoisonReason::StagingFailed {
                                 error,
@@ -199,19 +285,15 @@ impl CommitWorker {
                         .await;
                 }
                 Err(WorkerError::Stage(reason)) => {
-                    return self.propose_poison(ref_key, entry.queue_id, *reason).await;
+                    return self.propose_poison(entry.queue_id, *reason).await;
                 }
                 Err(other) => return Err(other),
             }
         }
     }
 
-    async fn try_advance_head(
-        &self,
-        ref_key: &RefKey,
-        entry: &QueueEntry,
-    ) -> Result<(), WorkerError> {
-        let envelope = self.load_envelope(ref_key, entry).await?;
+    async fn try_advance_head(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
+        let envelope = self.load_envelope(entry).await?;
         // The state machine doesn't introspect the envelope at enqueue
         // time, so the inline discriminator could disagree with what
         // the leader actually wrote. Bail explicitly rather than
@@ -219,79 +301,158 @@ impl CommitWorker {
         check_envelope_kind(entry.body_kind, &envelope)?;
 
         let StagedOutcome { receipt, install } = match envelope {
-            QueuedRequest::Transact(transact) => self.stage_and_persist(ref_key, *transact).await?,
-            QueuedRequest::Push(push) => self.process_push(ref_key, *push).await?,
-            QueuedRequest::Revert(revert) => self.process_revert(ref_key, revert).await?,
-            QueuedRequest::Merge(merge) => self.process_merge(ref_key, merge).await?,
-            QueuedRequest::Rebase(rebase) => self.process_rebase(ref_key, rebase).await?,
+            QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
+            QueuedRequest::Push(push) => self.process_push(*push).await?,
+            QueuedRequest::Revert(revert) => self.process_revert(revert).await?,
+            QueuedRequest::Merge(merge) => self.process_merge(merge).await?,
+            QueuedRequest::Rebase(rebase) => self.process_rebase(rebase).await?,
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
 
-        // Stash the typed receipt, then propose. The error path
-        // can't blindly drop `install` — `publish_head_advance` may
-        // return `Err` (lost response, stepped-down leader after
-        // local apply, post-apply fatal) for an `ApplyHead` that
-        // actually committed and was applied on this node. In that
-        // case the replicated `state.refs` reflects our advance but
-        // dropping the install leaves the local Fluree cache at the
+        // Stash the typed receipt through `StashGuard` so an abort
+        // mid-publish (ownership flap during the propose await)
+        // doesn't strand the receipt. The error path can't blindly
+        // drop `install` — `publish_head_advance` may return `Err`
+        // (lost response, stepped-down leader after local apply,
+        // post-apply fatal) for an `ApplyHead` that actually
+        // committed and was applied on this node. In that case the
+        // replicated `state.refs` reflects our advance but dropping
+        // the install leaves the local Fluree cache at the
         // pre-stage head → silent stale reads. So on error we
         // reconcile against the replicated head and finalize the
         // install only if our commit landed.
-        self.staged_receipts
-            .stash(entry.queue_id, ref_key.clone(), receipt);
-        match self
-            .publish_head_advance(ref_key, commit_id.clone(), commit_t)
-            .await
-        {
+        let _stash = StashGuard::stash(
+            &self.publishing.staged_receipts,
+            entry.queue_id,
+            self.ref_key.clone(),
+            receipt,
+        );
+        match self.publish_head_advance(commit_id.clone(), commit_t).await {
             Ok(()) => {
                 if let Some(install) = install {
-                    self.finalize_local_state(install).await?;
+                    self.finalize_after_publish(entry.queue_id, commit_t, install)
+                        .await;
                 }
                 Ok(())
             }
             Err(err) => {
-                if self.commit_replicated(ref_key, &commit_id).await {
-                    // Apply landed; the adapter already took the
-                    // stash during waiter resolution, so our own
-                    // `take` here is a defensive no-op. Finalize the
-                    // local cache so this node catches up with the
+                let landed = self.commit_replicated(&commit_id).await;
+                if landed {
+                    // Apply landed via another path (idempotency hit
+                    // or a sibling worker's race). Finalize the local
+                    // cache so this node catches up with the
                     // replicated head.
-                    self.staged_receipts.take(entry.queue_id);
                     if let Some(install) = install {
-                        self.finalize_local_state(install).await?;
+                        self.finalize_after_publish(entry.queue_id, commit_t, install)
+                            .await;
                     }
                     Ok(())
+                } else if matches!(err, WorkerError::Stale(_)) {
+                    // Queue front moved past our queue_id (admin
+                    // clear or sibling worker race that landed a
+                    // different commit). Our commit didn't land and
+                    // never will — release the staged commit blob
+                    // (no replicated head references it), drop the
+                    // local install (write_guard releases without
+                    // `replace`, the Fluree handle stays at its
+                    // pre-stage head), and let the run loop pick up
+                    // the new queue front.
+                    self.release_orphaned_commit_blob(&commit_id).await;
+                    Ok(())
                 } else {
-                    // Apply didn't land. Clean up the staged receipt
-                    // and drop `install`: write_guard releases
-                    // without calling `replace`, so this node's
-                    // Fluree handle stays at its pre-stage head —
-                    // same as every other node.
-                    self.staged_receipts.take(entry.queue_id);
+                    // Apply didn't land. Release the staged commit
+                    // blob — the next retry rebuilds the commit with
+                    // a fresh timestamp, producing a different
+                    // `commit_id`, so this one is orphaned. Drop
+                    // `install` (write_guard releases without
+                    // calling `replace`, so this node's Fluree
+                    // handle stays at its pre-stage head — same as
+                    // every other node) and propagate the error for
+                    // the outer retry/poison logic.
+                    self.release_orphaned_commit_blob(&commit_id).await;
                     Err(err)
                 }
             }
         }
+        // `_stash`'s Drop fires on function return (or on abort
+        // mid-await) — idempotent `take` cleans the slot regardless
+        // of which path won.
+    }
+
+    /// Finalize the local cache after a confirmed publish, treating
+    /// any failure as non-fatal. The commit is already replicated in
+    /// the state machine — the replicated head advance is the source
+    /// of truth — so a transient failure to install the staged state
+    /// locally just leaves the cache momentarily stale; the per-node
+    /// commit-event listener reconciles it on the next apply. Crucially,
+    /// we do NOT return the error: re-running the staging loop after
+    /// a successful publish would call `publish_commit` a second time,
+    /// and the publisher samples the queue front at that moment — which
+    /// has already advanced past our entry, so the second `ApplyHead`
+    /// would consume the NEXT queue entry while carrying our commit
+    /// body. That race produces a duplicate of our commit and silently
+    /// drops the next entry.
+    async fn finalize_after_publish(
+        &self,
+        queue_id: u64,
+        commit_t: i64,
+        install: StagedStateInstall,
+    ) {
+        if let Err(err) = self.finalize_local_state(install).await {
+            warn!(
+                queue_id,
+                commit_t,
+                error = %err,
+                "finalize_local_state failed after publish; commit is replicated, \
+                 local cache will catch up via event listener"
+            );
+        }
     }
 
     /// Read the replicated state to see whether `commit_id` is the
-    /// current head for `ref_key`. Used by [`Self::try_advance_head`]
-    /// to disambiguate a publish error that may have committed
-    /// anyway (lost response, post-apply step-down) from one that
-    /// genuinely failed.
+    /// current head for this worker's [`RefKey`]. Used by
+    /// [`Self::try_advance_head`] to disambiguate a publish error
+    /// that may have committed anyway (lost response, post-apply
+    /// step-down) from one that genuinely failed.
     ///
     /// Only an exact head match is treated as "landed." A different
     /// head — even at a higher `t` — means something other than our
     /// install reached consensus, so dropping the install is the
     /// correct outcome (the next drain pass will re-derive state
     /// from the replicated head).
-    async fn commit_replicated(&self, ref_key: &RefKey, commit_id: &ContentId) -> bool {
+    async fn commit_replicated(&self, commit_id: &ContentId) -> bool {
         let state = self.shared_state.read().await;
         state
             .refs
-            .get(ref_key)
+            .get(&self.ref_key)
             .is_some_and(|entry| &entry.head == commit_id)
+    }
+
+    /// Release the staged commit blob from the local content store.
+    /// Called on the orphan paths in [`Self::try_advance_head`] —
+    /// the entry's `commit_t` won't land (either the queue front
+    /// moved past us, or the publish failed and the next retry
+    /// will rebuild the commit with a fresh timestamp, producing a
+    /// different `commit_id`). Without this release, every
+    /// transport blip or sibling-worker race leaks one blob per
+    /// failed attempt with no GC path: `release_envelopes` covers
+    /// the request body, not the staged commit; the state machine
+    /// doesn't track unreferenced commit blobs.
+    ///
+    /// Best effort — a failed release is logged but doesn't abort
+    /// the worker's retry loop. `ContentStore::release` is
+    /// idempotent on non-existent CIDs.
+    async fn release_orphaned_commit_blob(&self, commit_id: &ContentId) {
+        let full_ledger_id = self.ref_key.ledger_id();
+        let content_store = self.staging.fluree.content_store(&full_ledger_id);
+        if let Err(err) = content_store.release(commit_id).await {
+            warn!(
+                commit_id = %commit_id,
+                error = %err,
+                "failed to release orphaned commit blob; CAS will accumulate one entry"
+            );
+        }
     }
 
     /// Install staged ledger state through the held write guard
@@ -304,20 +465,18 @@ impl CommitWorker {
             new_state,
             commit_t,
         } = install;
-        let needs_reindex = new_state.should_reindex(&self.index_config);
-        self.fluree
+        let needs_reindex = new_state.should_reindex(&self.staging.index_config);
+        self.staging
+            .fluree
             .finalize_commit(write_guard, new_state, commit_t, needs_reindex)
             .await
             .map_err(api_error_to_stage)
     }
 
-    async fn load_envelope(
-        &self,
-        ref_key: &RefKey,
-        entry: &QueueEntry,
-    ) -> Result<QueuedRequest, WorkerError> {
-        let ledger_id = format_full_ledger_id(ref_key);
+    async fn load_envelope(&self, entry: &QueueEntry) -> Result<QueuedRequest, WorkerError> {
+        let ledger_id = self.ref_key.ledger_id();
         let bytes = self
+            .staging
             .fluree
             .content_store(&ledger_id)
             .get(&entry.request_cid)
@@ -337,7 +496,6 @@ impl CommitWorker {
     /// finalizes the install after the publish succeeds.
     async fn stage_and_persist(
         &self,
-        ref_key: &RefKey,
         transact: QueuedTransact,
     ) -> Result<StagedOutcome, WorkerError> {
         let QueuedTransact {
@@ -348,8 +506,9 @@ impl CommitWorker {
             governance,
         } = transact;
 
-        let ledger_id = format_full_ledger_id(ref_key);
+        let ledger_id = self.ref_key.ledger_id();
         let ledger_manager = self
+            .staging
             .fluree
             .ledger_manager()
             .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
@@ -362,7 +521,7 @@ impl CommitWorker {
             .await
             .map_err(submission_to_stage)?;
 
-        let staged = self.fluree.stage(&ledger_handle);
+        let staged = self.staging.fluree.stage(&ledger_handle);
         let staged = match &body {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
@@ -377,7 +536,7 @@ impl CommitWorker {
         let mut builder = staged
             .txn_opts(txn_opts)
             .commit_opts(commit_opts.into_commit_opts())
-            .index_config(self.index_config.clone());
+            .index_config(self.staging.index_config.clone());
         if let Some(tracking) = tracking {
             builder = builder.tracking(tracking);
         }
@@ -403,7 +562,7 @@ impl CommitWorker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        let content_store = self.fluree.content_store(&ledger_id);
+        let content_store = self.staging.fluree.content_store(&ledger_id);
         content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
             .await
@@ -448,11 +607,7 @@ impl CommitWorker {
     /// surfaces via `QueueDesync::WrongFront` only if another
     /// transactor jumped ahead, which is exactly the race the queue
     /// already serializes against.
-    async fn process_revert(
-        &self,
-        ref_key: &RefKey,
-        revert: QueuedRevert,
-    ) -> Result<StagedOutcome, WorkerError> {
+    async fn process_revert(&self, revert: QueuedRevert) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedRevert {
@@ -460,8 +615,8 @@ impl CommitWorker {
             strategy,
         } = revert;
 
-        let ledger_name = ref_key.ledger_id.clone();
-        let branch = ref_key.branch.clone();
+        let ledger_name = self.ref_key.ledger_name.clone();
+        let branch = self.ref_key.branch.clone();
         let StagedRevert {
             reverted_commits,
             conflict_count,
@@ -472,6 +627,7 @@ impl CommitWorker {
             commit,
             ..
         } = self
+            .staging
             .fluree
             .prepare_revert(&ledger_name, &branch, selection, strategy)
             .await
@@ -504,8 +660,8 @@ impl CommitWorker {
         })?;
         let commit_t = staged_commit.commit.t;
 
-        let ledger_id = format_full_ledger_id(ref_key);
-        let content_store = self.fluree.content_store(&ledger_id);
+        let ledger_id = self.ref_key.ledger_id();
+        let content_store = self.staging.fluree.content_store(&ledger_id);
         content_store
             .put_with_id(&commit_cid, &staged_commit.commit_bytes)
             .await
@@ -541,18 +697,14 @@ impl CommitWorker {
     /// validation + CAS persistence + local state derivation, then
     /// finalize through the held write guard so this node's cache
     /// catches up with the head we're about to publish.
-    async fn process_push(
-        &self,
-        ref_key: &RefKey,
-        push: QueuedPush,
-    ) -> Result<StagedOutcome, WorkerError> {
+    async fn process_push(&self, push: QueuedPush) -> Result<StagedOutcome, WorkerError> {
         let QueuedPush {
             commit_cids,
             blobs,
             governance,
         } = push;
-        let ledger_id = format_full_ledger_id(ref_key);
-        let content_store = self.fluree.content_store(&ledger_id);
+        let ledger_id = self.ref_key.ledger_id();
+        let content_store = self.staging.fluree.content_store(&ledger_id);
         // Read each commit's bytes back from CAS by CID. The
         // transactor wrote them before enqueueing, so a definitive
         // `NotFound` means the blob has been GC'd (or never landed)
@@ -589,8 +741,9 @@ impl CommitWorker {
             indexing_status,
             ..
         } = self
+            .staging
             .fluree
-            .prepare_push(&ledger_id, payload, &governance, &self.index_config)
+            .prepare_push(&ledger_id, payload, &governance, &self.staging.index_config)
             .await
             .map_err(|e| stage_failure(&format!("prepare_push failed: {e}")))?;
 
@@ -614,11 +767,7 @@ impl CommitWorker {
     /// target namespace from the build phase); general merges write
     /// the merge commit blob. Either path produces a `(new_head_id,
     /// new_head_t)` pair for the publisher.
-    async fn process_merge(
-        &self,
-        ref_key: &RefKey,
-        merge: QueuedMerge,
-    ) -> Result<StagedOutcome, WorkerError> {
+    async fn process_merge(&self, merge: QueuedMerge) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedMerge {
@@ -626,7 +775,7 @@ impl CommitWorker {
             target_branch,
             strategy,
         } = merge;
-        let ledger_name = ref_key.ledger_id.clone();
+        let ledger_name = self.ref_key.ledger_name.clone();
         let StagedMerge {
             target,
             target_id,
@@ -639,6 +788,7 @@ impl CommitWorker {
             commit,
             ..
         } = self
+            .staging
             .fluree
             .prepare_merge(
                 &ledger_name,
@@ -649,15 +799,15 @@ impl CommitWorker {
             .await
             .map_err(|e| stage_failure(&format!("prepare_merge failed: {e}")))?;
 
-        // Defensive: if the worker resolves a different target than
-        // the queue entry's branch, the transactor and worker
+        // Defensive: if prepare_merge resolves a different target
+        // than the queue entry's branch, the transactor and worker
         // disagree about which queue the entry belongs on. Poison
         // rather than advance the wrong branch.
-        if target != ref_key.branch {
+        if target != self.ref_key.branch {
             return Err(stage(PoisonReason::BodyMalformed {
                 error: format!(
                     "queue entry on branch {} but prepare_merge resolved target to {target}",
-                    ref_key.branch
+                    self.ref_key.branch
                 ),
             }));
         }
@@ -678,7 +828,7 @@ impl CommitWorker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            let content_store = self.fluree.content_store(&target_id);
+            let content_store = self.staging.fluree.content_store(&target_id);
             content_store
                 .put_with_id(&commit_cid, &staged.commit_bytes)
                 .await
@@ -719,14 +869,10 @@ impl CommitWorker {
     /// `Skip`, or every replay had empty flakes) republish the
     /// pre-rebase head so the queue entry completes without
     /// observable mutation.
-    async fn process_rebase(
-        &self,
-        ref_key: &RefKey,
-        rebase: QueuedRebase,
-    ) -> Result<StagedOutcome, WorkerError> {
+    async fn process_rebase(&self, rebase: QueuedRebase) -> Result<StagedOutcome, WorkerError> {
         let QueuedRebase { strategy } = rebase;
-        let ledger_name = ref_key.ledger_id.clone();
-        let branch = ref_key.branch.clone();
+        let ledger_name = self.ref_key.ledger_name.clone();
+        let branch = self.ref_key.branch.clone();
         let StagedRebase {
             branch_id,
             source_head_id,
@@ -745,6 +891,7 @@ impl CommitWorker {
             pending_replays,
             ..
         } = self
+            .staging
             .fluree
             .prepare_rebase(&ledger_name, &branch, strategy)
             .await
@@ -766,7 +913,7 @@ impl CommitWorker {
             }
         };
 
-        let content_store = self.fluree.content_store(&branch_id);
+        let content_store = self.staging.fluree.content_store(&branch_id);
         for replay in &pending_replays {
             content_store
                 .put_with_id(&replay.commit_id, &replay.commit_bytes)
@@ -798,150 +945,429 @@ impl CommitWorker {
 
     async fn publish_head_advance(
         &self,
-        ref_key: &RefKey,
         commit_id: ContentId,
         commit_t: i64,
     ) -> Result<(), WorkerError> {
-        let full_ledger_id = format_full_ledger_id(ref_key);
-        self.publisher
+        let full_ledger_id = self.ref_key.ledger_id();
+        match self
+            .publishing
+            .commits
             .publish_commit(&full_ledger_id, commit_t, &commit_id)
             .await
-            .map_err(|e| WorkerError::Raft(format!("publish_commit failed: {e}")))
+        {
+            Ok(()) => Ok(()),
+            // Terminal classifications from the publisher (notably
+            // the leader-forwarded apply_staged_commit) route into
+            // the poison path so the worker doesn't loop a known-
+            // unfixable error forever and head-of-line-block the
+            // branch's queue.
+            Err(NameServiceError::NotFound(id)) => {
+                Err(stage(PoisonReason::LedgerNotFound { ledger_id: id }))
+            }
+            // Admin-driven retraction. The branch's queue was
+            // drained by `RetractLedger` (waiters resolved at drain
+            // time), so the staged commit has nowhere to land. Map
+            // to `Stale` — same drop-install-and-advance semantics
+            // as a queue-front race, no spurious poison record for
+            // an entry that's already gone.
+            Err(NameServiceError::Retracted(msg)) => Err(WorkerError::Stale(msg)),
+            Err(NameServiceError::ApplyRejected(msg)) => Err(stage(PoisonReason::WorkerPanic {
+                message: format!("state machine rejected ApplyHead: {msg}"),
+            })),
+            // The queue front advanced past our queue_id (racing
+            // worker or admin clear). Retrying won't help — the
+            // caller drops the install and lets the run loop pick
+            // up the new queue front once local raft applies the
+            // pop.
+            Err(NameServiceError::ApplyStale(msg)) => Err(WorkerError::Stale(msg)),
+            Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
+        }
     }
 
-    async fn propose_poison(
-        &self,
-        ref_key: &RefKey,
-        queue_id: u64,
-        reason: PoisonReason,
-    ) -> Result<(), WorkerError> {
-        let cmd = SmCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
-            ledger_id: ref_key.ledger_id.clone(),
-            branch: ref_key.branch.clone(),
-            queue_id,
-            reason,
-            applied_at_millis: current_millis(),
-        });
-        // The state-machine response (`Poisoned` vs `QueueDesync`) is
-        // informational once the poison is durably proposed — either
-        // way the entry is done from the worker's perspective. Only
-        // surface Raft-side failures.
-        self.raft
-            .client_write(cmd)
+    async fn propose_poison(&self, queue_id: u64, reason: PoisonReason) -> Result<(), WorkerError> {
+        // Route through the publisher's leader-aware path: on a
+        // follower this ferries to the leader's `apply_queue_poison`
+        // endpoint, on the leader it calls `client_write` directly.
+        // Without the indirection a follower-owned worker would
+        // bounce `ForwardToLeader` indefinitely and the branch's
+        // queue front would stall on a deterministic poison.
+        self.publishing
+            .poison
+            .poison_queue_entry(&self.ref_key, queue_id, reason)
             .await
-            .map(|_| ())
             .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))
     }
 
-    /// Drain per-branch queues until aborted by the caller.
+    /// Drain this branch's queue until aborted by the caller.
     ///
-    /// Each tick snapshots the current front entry for every
-    /// non-empty branch and runs them through [`Self::process_entry`]
-    /// in turn. Cross-branch ordering inside a single tick is
-    /// non-deterministic (driven by the underlying `HashMap`); the
-    /// per-branch FIFO ordering the design promises is preserved
-    /// because each tick only takes the front of each branch.
-    ///
-    /// Sequential within a tick keeps the worker simple for v1 — the
-    /// design doc notes parallel-across-branches dispatch as a
-    /// follow-up if profile data justifies it.
+    /// Each tick peeks the front of [`Self::ref_key`]'s queue and
+    /// runs it through [`Self::process_entry`]. The per-branch FIFO
+    /// ordering the design promises is preserved because only the
+    /// front is sampled. Cross-branch concurrency is the supervisor's
+    /// responsibility — each branch runs in its own worker task.
     pub async fn run(self) {
+        // Track the most recently committed queue_id so we don't re-stage
+        // an entry our locally-replicated state hasn't yet observed the
+        // pop for. After a successful publish, the leader's state machine
+        // pops the entry, but the follower's local apply lags behind the
+        // round-trip HTTP response — `snapshot_front` would still return
+        // the same `queue_id` until the follower applies. Re-staging it
+        // would cause a duplicate commit, because the publisher's
+        // `build_apply_head_command` samples the leader's current queue
+        // front at propose time (which has already advanced to the
+        // *next* entry), so the second ApplyHead carries our body but
+        // pops the next entry — silently dropping that entry's work.
+        let mut last_committed: Option<u64> = None;
         loop {
-            let pending = self.snapshot_pending_fronts().await;
-            if pending.is_empty() {
+            let Some(entry) = self.snapshot_front().await else {
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
+            };
+            if let Some(last) = last_committed {
+                if entry.queue_id <= last {
+                    // Local state hasn't yet observed the pop for the
+                    // entry we just published. Wait briefly for raft
+                    // replication to catch up rather than spin or
+                    // re-stage the same body against a stale front.
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
             }
-
-            let mut raft_blocked = false;
-            for (ref_key, entry) in pending {
-                let queue_id = entry.queue_id;
-                // Wrap `process_entry` in `catch_unwind` so a panic
-                // (third-party crate, future-proofed invariant slip)
-                // poisons just this entry instead of killing the
-                // worker task and halting every other branch's drain.
-                // `process_entry` consumes `Stage` failures by
-                // proposing `PoisonQueueEntry`, so only `Raft`
-                // propagates from the `Ok` arm.
-                let outcome = AssertUnwindSafe(self.process_entry(&ref_key, entry))
-                    .catch_unwind()
-                    .await;
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
-                        unreachable!(
-                            "process_entry maps Transient/Stage failures to PoisonQueueEntry"
-                        )
-                    }
-                    Ok(Err(WorkerError::Raft(propose_error))) => {
-                        // Skip the failing branch but keep draining
-                        // the rest. A Raft propose can fail because
-                        // the leader stepped down (every subsequent
-                        // branch will fail too — backoff catches
-                        // that) or because something specific to
-                        // this branch's reconcile path went wrong
-                        // (other branches are still serviceable).
-                        // Breaking outright let one bad branch
-                        // starve every other branch on this tick.
-                        warn!(
-                            ledger_id = %ref_key.ledger_id,
-                            branch = %ref_key.branch,
-                            queue_id,
-                            error = %propose_error,
-                            "raft publish failed; skipping this branch and continuing drain"
-                        );
-                        raft_blocked = true;
-                    }
-                    Err(panic_payload) => {
-                        let message = panic_message(panic_payload);
-                        error!(
-                            ledger_id = %ref_key.ledger_id,
-                            branch = %ref_key.branch,
-                            queue_id,
-                            panic = %message,
-                            "commit worker panicked while processing entry; poisoning and continuing"
-                        );
-                        if let Err(propose_error) = self
-                            .propose_poison(
-                                &ref_key,
-                                queue_id,
-                                PoisonReason::WorkerPanic { message },
-                            )
-                            .await
-                        {
+            let queue_id = entry.queue_id;
+            // Wrap `process_entry` in `catch_unwind` so a panic
+            // (third-party crate, future-proofed invariant slip)
+            // poisons this entry rather than killing the worker task
+            // and halting drain for this branch. `process_entry`
+            // consumes `Stage` failures by proposing
+            // `PoisonQueueEntry`, so only `Raft` propagates from the
+            // `Ok` arm.
+            let outcome = AssertUnwindSafe(self.process_entry(entry))
+                .catch_unwind()
+                .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    last_committed = Some(queue_id);
+                }
+                Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
+                    unreachable!("process_entry maps Transient/Stage failures to PoisonQueueEntry")
+                }
+                Ok(Err(WorkerError::Stale(_))) => {
+                    unreachable!("try_advance_head consumes Stale internally and returns Ok")
+                }
+                Ok(Err(WorkerError::Raft(propose_error))) => {
+                    // Raft propose failed (leader stepped down, quorum
+                    // unreachable, branch-specific reconcile bug).
+                    // Back off so we don't tight-loop, then retry the
+                    // same front on the next tick. Other branches'
+                    // workers are independent — they progress or fail
+                    // on their own.
+                    warn!(
+                        ledger_id = %self.ref_key.ledger_name,
+                        branch = %self.ref_key.branch,
+                        queue_id,
+                        error = %propose_error,
+                        "raft publish failed; backing off and retrying"
+                    );
+                    tokio::time::sleep(RAFT_BACKOFF).await;
+                }
+                Err(panic_payload) => {
+                    let message = panic_message(panic_payload);
+                    error!(
+                        ledger_id = %self.ref_key.ledger_name,
+                        branch = %self.ref_key.branch,
+                        queue_id,
+                        panic = %message,
+                        "worker panicked while processing entry; poisoning and continuing"
+                    );
+                    match self
+                        .propose_poison(queue_id, PoisonReason::WorkerPanic { message })
+                        .await
+                    {
+                        Ok(()) => last_committed = Some(queue_id),
+                        Err(propose_error) => {
                             warn!(
-                                ledger_id = %ref_key.ledger_id,
-                                branch = %ref_key.branch,
+                                ledger_id = %self.ref_key.ledger_name,
+                                branch = %self.ref_key.branch,
                                 queue_id,
                                 error = %propose_error,
                                 "failed to publish poison after worker panic; entry stays at queue head"
                             );
-                            raft_blocked = true;
+                            tokio::time::sleep(RAFT_BACKOFF).await;
                         }
                     }
                 }
             }
-
-            if raft_blocked {
-                tokio::time::sleep(RAFT_BACKOFF).await;
-            }
         }
     }
 
-    async fn snapshot_pending_fronts(&self) -> Vec<(RefKey, QueueEntry)> {
+    async fn snapshot_front(&self) -> Option<QueueEntry> {
         let state = self.shared_state.read().await;
         state
             .queues
-            .iter()
-            .filter_map(|(ref_key, queue)| {
-                queue.front().map(|entry| (ref_key.clone(), entry.clone()))
-            })
-            .collect()
+            .get(&self.ref_key)
+            .and_then(|queue| queue.front().cloned())
     }
 }
 
-fn format_full_ledger_id(ref_key: &RefKey) -> String {
-    format!("{}:{}", ref_key.ledger_id, ref_key.branch)
+/// Signal `abort` on every handle, then `await` each one. Returns
+/// after every task has reached its `Drop`, so a follow-up spawn
+/// for the same `RefKey` can't race the aborting task on shared
+/// state like [`StagedReceiptMap`]. `JoinError::Cancelled` and
+/// task panics surfaced through the join are discarded.
+async fn abort_and_await<I>(handles: I)
+where
+    I: IntoIterator<Item = JoinHandle<()>>,
+{
+    let handles: Vec<_> = handles.into_iter().collect();
+    for handle in &handles {
+        handle.abort();
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+}
+
+/// Supervises per-branch [`Worker`]s on this node. Watches the
+/// replicated [`NameServiceState::queues`] and the cluster's voter
+/// set, computes which branches this node owns under rendezvous
+/// hashing, and reconciles the running worker set to match.
+///
+/// Spawned at process start (not bound to leadership) so every node
+/// can host workers under distributed assignment. Shutdown is
+/// driven through a [`CancellationToken`]; the supervisor's
+/// `select!` loop catches the cancel, exits, and aborts every
+/// per-branch worker it owns.
+#[derive(Clone)]
+pub struct WorkerSupervisor {
+    id: NodeId,
+    raft: Arc<Raft<TypeConfig>>,
+    shared_state: SharedState,
+    publishing: PublishingChannel,
+    staging: StagingContext,
+}
+
+impl WorkerSupervisor {
+    pub fn new(
+        id: NodeId,
+        raft: Arc<Raft<TypeConfig>>,
+        shared_state: SharedState,
+        publishing: PublishingChannel,
+        staging: StagingContext,
+    ) -> Self {
+        Self {
+            id,
+            raft,
+            shared_state,
+            publishing,
+            staging,
+        }
+    }
+
+    /// Reconcile the set of running workers against the branches
+    /// this node owns. Runs until the cancellation token is signaled.
+    ///
+    /// Each tick:
+    /// 1. Compute the desired set: branches in
+    ///    [`NameServiceState::queues`] whose rendezvous owner under
+    ///    the current voter set is this node.
+    /// 2. Spawn a worker for any newly-desired branch; abort the
+    ///    worker for any branch this node no longer owns.
+    /// 3. Sleep until either the metrics watch fires (membership /
+    ///    leader changed → recompute ownership), the poll interval
+    ///    elapses (queues may have new branches), or the cancel
+    ///    token signals shutdown.
+    ///
+    /// On shutdown, every still-running worker is aborted before the
+    /// loop returns so the caller's `JoinHandle::await` sees the
+    /// supervisor stop only after its children have.
+    pub async fn run(self, cancel: CancellationToken) {
+        let mut workers: HashMap<RefKey, JoinHandle<()>> = HashMap::new();
+        let mut metrics_rx = self.raft.metrics();
+
+        loop {
+            let desired = self.compute_desired_owners().await;
+            self.reconcile_workers(&mut workers, desired).await;
+
+            tokio::select! {
+                // Metrics changed (membership, leader, term, index, …).
+                // Recompute ownership on the next iteration. `Err`
+                // means the Raft handle has been dropped — nothing
+                // more to observe, exit.
+                changed = metrics_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                () = tokio::time::sleep(SUPERVISOR_POLL_INTERVAL) => {}
+                () = cancel.cancelled() => break,
+            }
+        }
+
+        // Shutdown drain: same await-on-abort discipline reconcile
+        // uses. The caller wraps `run` in `CancellableTaskHandle::shutdown`,
+        // which awaits the supervisor's JoinHandle — without the
+        // inner await here, that outer await returns while workers
+        // are still racing on shutdown.
+        abort_and_await(workers.drain().map(|(_, h)| h)).await;
+    }
+
+    async fn compute_desired_owners(&self) -> HashSet<RefKey> {
+        // Steady-state path: one lock acquisition, no allocation.
+        // `desired_owners` iterates `worker_eligible_voters`
+        // (a `BTreeSet`) through `owner`'s borrowed-iter input, so
+        // passing an empty fallback slice costs nothing — it's never
+        // consulted when the eligible set is non-empty.
+        {
+            let state = self.shared_state.read().await;
+            if !state.worker_eligible_voters.is_empty() {
+                return desired_owners(&state, self.id, &[]);
+            }
+        }
+        // Boot-window fallback: the lock is released before the
+        // `watch::Ref` borrow so the apply path's writer isn't
+        // contended on the membership read. Re-acquire to iterate
+        // queues. The eligible set being empty is monotonic — once
+        // the first membership-apply populates it the quorum-floor
+        // invariant keeps it non-empty — so racing back to empty
+        // between these two acquisitions can't happen in practice.
+        let fallback = self.current_voters();
+        let state = self.shared_state.read().await;
+        desired_owners(&state, self.id, &fallback)
+    }
+
+    fn current_voters(&self) -> Vec<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    }
+
+    /// Spawn workers for newly-desired branches; respawn workers
+    /// whose handle has finished (panic outside `catch_unwind`, or
+    /// any other path that exits `Worker::run` unexpectedly); tear
+    /// down workers for branches no longer owned. Without the
+    /// respawn step, a single panic in an unguarded path
+    /// (`unreachable!()` arm, `propose_poison` await, lock
+    /// acquisition) would leave a dead handle in the map and stall
+    /// that branch's queue until ownership rotates off the node.
+    ///
+    /// Teardown uses [`abort_and_await`] — every aborted handle is
+    /// awaited before this method returns. That serialization is
+    /// what guarantees a fast ownership flap (the same `RefKey`
+    /// moves away and back inside one supervisor tick) can't
+    /// respawn a worker before the previous task has fully yielded;
+    /// the two would otherwise race on the shared
+    /// [`StagedReceiptMap`] under that `RefKey`.
+    async fn reconcile_workers(
+        &self,
+        workers: &mut HashMap<RefKey, JoinHandle<()>>,
+        desired: HashSet<RefKey>,
+    ) {
+        // Drain dead handles for still-desired branches first so the
+        // spawn pass below treats them as missing entries. Joining
+        // returns immediately (the handles are already finished);
+        // log the cause so a panic outside `catch_unwind` is visible
+        // instead of silently respawning.
+        for dead in drain_dead_workers(workers, &desired) {
+            match dead.await {
+                Ok(()) => warn!(
+                    "worker task exited cleanly — Worker::run is supposed to loop forever; respawning"
+                ),
+                Err(err) if err.is_panic() => warn!(
+                    panic = %panic_message(err.into_panic()),
+                    "worker task panicked outside catch_unwind — respawning"
+                ),
+                Err(err) => warn!(error = ?err, "worker task ended unexpectedly — respawning"),
+            }
+        }
+        for key in &desired {
+            if !workers.contains_key(key) {
+                let handle = tokio::spawn(self.make_worker(key.clone()).run());
+                workers.insert(key.clone(), handle);
+            }
+        }
+        // Two-step removal: HashMap::extract_if is unstable, so
+        // collect the keys we no longer want first, then pull each
+        // handle out by key. The intermediate Vec is bounded by the
+        // number of branches whose ownership just moved off this
+        // node — small under any realistic deployment.
+        let to_drop: Vec<RefKey> = workers
+            .keys()
+            .filter(|key| !desired.contains(*key))
+            .cloned()
+            .collect();
+        let dropped = to_drop.into_iter().filter_map(|key| workers.remove(&key));
+        abort_and_await(dropped).await;
+    }
+
+    fn make_worker(&self, ref_key: RefKey) -> Worker {
+        Worker::new(
+            ref_key,
+            self.shared_state.clone(),
+            self.publishing.clone(),
+            self.staging.clone(),
+        )
+    }
+}
+
+/// Pure computation of the branches this node owns under
+/// rendezvous-hash assignment. Reads `state.worker_eligible_voters`
+/// when populated (the replicated, monitor-curated voter set);
+/// otherwise uses `fallback_voters` (the raft membership view that
+/// only the boot window sees). Empty voter set under either path
+/// yields no owners.
+///
+/// Pulled out as a free function so the same logic can be exercised
+/// by unit tests without constructing an `Arc<Raft<TypeConfig>>` —
+/// the async wrapper at
+/// [`WorkerSupervisor::compute_desired_owners`] just supplies the
+/// fallback from `raft.metrics()` when needed.
+fn desired_owners(
+    state: &crate::raft::state_machine::NameServiceState,
+    id: NodeId,
+    fallback_voters: &[NodeId],
+) -> HashSet<RefKey> {
+    if !state.worker_eligible_voters.is_empty() {
+        return state
+            .queues
+            .keys()
+            .filter(|ref_key| owner(ref_key, &state.worker_eligible_voters) == Some(id))
+            .cloned()
+            .collect();
+    }
+    if fallback_voters.is_empty() {
+        return HashSet::new();
+    }
+    state
+        .queues
+        .keys()
+        .filter(|ref_key| owner(ref_key, fallback_voters) == Some(id))
+        .cloned()
+        .collect()
+}
+
+/// Remove and return the [`JoinHandle`]s for `workers` entries whose
+/// task has finished and whose [`RefKey`] is still in `desired`.
+/// Caller awaits each (returns immediately since they're already
+/// finished) to surface the panic cause, then the spawn pass
+/// recreates the worker. Dead handles whose key has dropped out of
+/// `desired` are left for the teardown pass to clean up.
+fn drain_dead_workers(
+    workers: &mut HashMap<RefKey, JoinHandle<()>>,
+    desired: &HashSet<RefKey>,
+) -> Vec<JoinHandle<()>> {
+    let dead_keys: Vec<RefKey> = workers
+        .iter()
+        .filter(|(key, handle)| desired.contains(*key) && handle.is_finished())
+        .map(|(key, _)| key.clone())
+        .collect();
+    dead_keys
+        .into_iter()
+        .filter_map(|key| workers.remove(&key))
+        .collect()
 }
 
 /// Cross-check the queue entry's inline discriminator against the
@@ -965,13 +1391,6 @@ fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<
             ),
         }))
     }
-}
-
-fn current_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn stage_failure(message: &str) -> WorkerError {
@@ -1006,10 +1425,10 @@ fn stage(reason: PoisonReason) -> WorkerError {
     WorkerError::Stage(Box::new(reason))
 }
 
-/// Internal classification for worker outcomes.
+/// Internal classification for staging outcomes.
 ///
 /// `Transient` is a retryable hiccup — the per-entry loop in
-/// [`CommitWorker::process_entry`] retries with backoff up to
+/// [`Worker::process_entry`] retries with backoff up to
 /// [`MAX_STAGE_ATTEMPTS`] and then promotes the carried message
 /// into [`PoisonReason::StagingFailed`] stamped with the real
 /// final attempt count. Producers don't need to know how many
@@ -1022,8 +1441,8 @@ fn stage(reason: PoisonReason) -> WorkerError {
 ///
 /// `Raft` is reserved for propose failures the caller propagates —
 /// those mean the cluster fundamentally can't accept commands
-/// right now (leader changed, quorum lost) and the drain loop
-/// should yield.
+/// right now (leader changed, quorum lost) and the run loop should
+/// yield.
 #[derive(Debug, Error)]
 pub enum WorkerError {
     /// Retryable backend hiccup. Promoted to
@@ -1040,6 +1459,13 @@ pub enum WorkerError {
     Stage(Box<PoisonReason>),
     #[error("raft propose: {0}")]
     Raft(String),
+    /// The replicated apply observed the queue front had moved past
+    /// our `queue_id` (racing worker or admin clear). Distinct from
+    /// [`Self::Raft`] so the retry path treats it as "drop work and
+    /// move on" rather than backing off and trying the same
+    /// `snapshot_front` again.
+    #[error("apply stale: {0}")]
+    Stale(String),
 }
 
 /// Output of a per-op staging path before consensus has confirmed
@@ -1072,7 +1498,7 @@ mod tests {
     use fluree_db_core::ContentKind;
     use fluree_db_transact::TxnOpts;
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, HashSet, VecDeque};
     use tokio::sync::RwLock;
 
     fn cid(seed: u8) -> ContentId {
@@ -1092,7 +1518,7 @@ mod tests {
     fn sample_push_envelope() -> QueuedRequest {
         QueuedRequest::Push(Box::new(QueuedPush {
             commit_cids: vec![cid(5)],
-            blobs: std::collections::HashMap::new(),
+            blobs: HashMap::new(),
             governance: GovernanceOptions::default(),
         }))
     }
@@ -1166,14 +1592,34 @@ mod tests {
             .insert(RefKey::new(ledger_id, branch), VecDeque::from(entries));
     }
 
-    /// Verify the snapshot only takes the front of each branch — the
-    /// per-branch FIFO invariant the drain loop relies on.
+    /// Replicates the per-branch peek logic in [`Worker::snapshot_front`]
+    /// against a bare `SharedState`. Lets us exercise the queue-front
+    /// invariants without wiring up Raft + Fluree.
+    async fn snapshot_front_for_test(state: &SharedState, ref_key: &RefKey) -> Option<QueueEntry> {
+        let state = state.read().await;
+        state
+            .queues
+            .get(ref_key)
+            .and_then(|queue| queue.front().cloned())
+    }
+
+    /// Drive [`desired_owners`] through the same lock acquisition the
+    /// supervisor's async wrapper does. Reads `worker_eligible_voters`
+    /// from the shared state when populated; otherwise uses
+    /// `fallback_voters` (the test stand-in for raft membership).
+    async fn desired_owners_under_lock(
+        shared: &SharedState,
+        id: NodeId,
+        fallback_voters: &[NodeId],
+    ) -> HashSet<RefKey> {
+        let state = shared.read().await;
+        desired_owners(&state, id, fallback_voters)
+    }
+
+    /// A worker only ever takes the front of its own branch — never
+    /// the second entry, never another branch's entry.
     #[tokio::test]
-    async fn snapshot_pending_fronts_takes_one_per_branch() {
-        // Build the worker around a SharedState only — none of the
-        // other deps are exercised by the snapshot path. We construct
-        // a temporary CommitWorker by hand-poking the fields because
-        // the Fluree/Raft handles are not needed for this slice.
+    async fn snapshot_front_returns_only_this_branches_front() {
         let mut state = NameServiceState::default();
         install_queue(
             &mut state,
@@ -1190,33 +1636,199 @@ mod tests {
             "feature",
             vec![enqueued_entry(9, cid(3), BodyKind::Sparql)],
         );
-        install_queue(&mut state, "test/db", "empty", vec![]);
-
         let shared = Arc::new(RwLock::new(state));
-        let pending = snapshot_pending_fronts_for_test(&shared).await;
 
-        assert_eq!(pending.len(), 2, "empty branches must not appear");
-        let queue_ids: Vec<u64> = pending.iter().map(|(_, entry)| entry.queue_id).collect();
-        assert!(queue_ids.contains(&7));
-        assert!(queue_ids.contains(&9));
+        let main_front = snapshot_front_for_test(&shared, &RefKey::new("test/db", "main"))
+            .await
+            .expect("main has a front");
+        assert_eq!(main_front.queue_id, 7);
+
+        let feature_front = snapshot_front_for_test(&shared, &RefKey::new("test/db", "feature"))
+            .await
+            .expect("feature has a front");
+        assert_eq!(feature_front.queue_id, 9);
+    }
+
+    /// Empty queues and unknown branches both yield `None` — the
+    /// worker treats them identically (sleep and re-poll).
+    #[tokio::test]
+    async fn snapshot_front_is_none_when_empty_or_missing() {
+        let mut state = NameServiceState::default();
+        install_queue(&mut state, "test/db", "empty", vec![]);
+        let shared = Arc::new(RwLock::new(state));
+
         assert!(
-            !queue_ids.contains(&8),
-            "only the front of each branch is sampled"
+            snapshot_front_for_test(&shared, &RefKey::new("test/db", "empty"))
+                .await
+                .is_none(),
+            "empty queue has no front"
+        );
+        assert!(
+            snapshot_front_for_test(&shared, &RefKey::new("test/db", "missing"))
+                .await
+                .is_none(),
+            "absent ref_key has no front"
         );
     }
 
-    /// Replicates the snapshot logic in `CommitWorker::run` against a
-    /// bare `SharedState`. Lets us exercise the queue-traversal
-    /// invariants without wiring up Raft + Fluree.
-    async fn snapshot_pending_fronts_for_test(state: &SharedState) -> Vec<(RefKey, QueueEntry)> {
-        let state = state.read().await;
-        state
-            .queues
-            .iter()
-            .filter_map(|(ref_key, queue)| {
-                queue.front().map(|entry| (ref_key.clone(), entry.clone()))
-            })
-            .collect()
+    /// On a single-voter cluster every branch is owned by the sole
+    /// voter — supervisor running on that node claims them all.
+    #[tokio::test]
+    async fn supervisor_owns_every_branch_when_alone() {
+        let mut state = NameServiceState::default();
+        install_queue(
+            &mut state,
+            "test/db",
+            "main",
+            vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
+        );
+        install_queue(&mut state, "test/db", "feature", vec![]);
+        let shared = Arc::new(RwLock::new(state));
+
+        let desired = desired_owners_under_lock(&shared, 1, &[1]).await;
+        assert_eq!(desired.len(), 2);
+        assert!(desired.contains(&RefKey::new("test/db", "main")));
+        assert!(desired.contains(&RefKey::new("test/db", "feature")));
+    }
+
+    /// On a multi-voter cluster ownership is partitioned: this node
+    /// claims only the subset of branches whose rendezvous owner
+    /// resolves to it. The complement is empty for branches owned by
+    /// peers.
+    #[tokio::test]
+    async fn supervisor_owns_only_its_partition_share() {
+        let mut state = NameServiceState::default();
+        for i in 0..50 {
+            install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
+        }
+        let shared = Arc::new(RwLock::new(state));
+        let voters = vec![1u64, 2, 3, 4];
+
+        let mut union = HashSet::new();
+        for id in &voters {
+            let mine = desired_owners_under_lock(&shared, *id, &voters).await;
+            // Every claimed branch must belong to exactly one node.
+            for k in &mine {
+                assert!(
+                    union.insert(k.clone()),
+                    "branch {k:?} claimed by two voters"
+                );
+            }
+        }
+        assert_eq!(
+            union.len(),
+            50,
+            "every branch must be claimed by exactly one voter"
+        );
+    }
+
+    /// Empty voter set (cluster not yet bootstrapped or all voters
+    /// dropped) → no branch resolves an owner, so the supervisor
+    /// claims nothing rather than crashing on the empty hash input.
+    #[tokio::test]
+    async fn supervisor_claims_nothing_with_empty_voter_set() {
+        let mut state = NameServiceState::default();
+        install_queue(
+            &mut state,
+            "test/db",
+            "main",
+            vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
+        );
+        let shared = Arc::new(RwLock::new(state));
+
+        let desired = desired_owners_under_lock(&shared, 1, &[]).await;
+        assert!(desired.is_empty());
+    }
+
+    /// When `worker_eligible_voters` is populated, ownership ranks
+    /// against that set — the fallback raft membership is ignored.
+    /// Verifies the supervisor honors the leader's monitor demoting
+    /// voter 3, even though raft still configures it as a voter.
+    #[tokio::test]
+    async fn supervisor_ranks_against_worker_eligible_voters_when_populated() {
+        let mut state = NameServiceState::default();
+        for i in 0..50 {
+            install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
+        }
+        // Configured = {1, 2, 3}, but the monitor demoted 3 — so
+        // only {1, 2} should host workers, and 3 must own nothing.
+        state.configured_voters = [1, 2, 3].into_iter().collect();
+        state.worker_eligible_voters = [1, 2].into_iter().collect();
+        let shared = Arc::new(RwLock::new(state));
+        let fallback = vec![1u64, 2, 3];
+
+        // The demoted voter claims nothing despite still being in
+        // the fallback list.
+        let demoted_share = desired_owners_under_lock(&shared, 3, &fallback).await;
+        assert!(
+            demoted_share.is_empty(),
+            "demoted voter must not own any branches"
+        );
+
+        // The remaining eligible voters partition every branch
+        // between them — nothing strands on the demoted voter.
+        let voter_1 = desired_owners_under_lock(&shared, 1, &fallback).await;
+        let voter_2 = desired_owners_under_lock(&shared, 2, &fallback).await;
+        let union: HashSet<RefKey> = voter_1.union(&voter_2).cloned().collect();
+        assert_eq!(
+            union.len(),
+            50,
+            "every branch must be claimed by exactly one eligible voter"
+        );
+        assert!(
+            voter_1.is_disjoint(&voter_2),
+            "no branch is double-claimed by two eligible voters"
+        );
+    }
+
+    /// When `worker_eligible_voters` is empty (fresh boot, snapshot
+    /// predating the field), the supervisor falls back to the raft
+    /// membership input. Demonstrates the supervisor stays
+    /// functional during the initial window before any
+    /// membership-apply has populated the replicated set.
+    #[tokio::test]
+    async fn supervisor_falls_back_to_membership_when_eligible_set_empty() {
+        let mut state = NameServiceState::default();
+        for i in 0..20 {
+            install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
+        }
+        // `worker_eligible_voters` deliberately left empty.
+        let shared = Arc::new(RwLock::new(state));
+        let fallback = vec![1u64, 2, 3];
+
+        // Each of the three fallback voters covers a share of the
+        // 20 branches, and they partition the full set.
+        let mut union = HashSet::new();
+        for id in &fallback {
+            let mine = desired_owners_under_lock(&shared, *id, &fallback).await;
+            for k in &mine {
+                assert!(
+                    union.insert(k.clone()),
+                    "branch {k:?} claimed twice during fallback"
+                );
+            }
+        }
+        assert_eq!(union.len(), 20);
+    }
+
+    /// When `worker_eligible_voters` is populated but a voter not
+    /// in the configured-voter input asks for its share, it gets
+    /// nothing — the eligible set is authoritative regardless of
+    /// what the caller passes as fallback.
+    #[tokio::test]
+    async fn supervisor_demoted_voter_claims_nothing_even_in_fallback() {
+        let mut state = NameServiceState::default();
+        install_queue(
+            &mut state,
+            "test/db",
+            "main",
+            vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
+        );
+        state.worker_eligible_voters = [1, 2].into_iter().collect();
+        let shared = Arc::new(RwLock::new(state));
+        // Voter 3 is in the fallback, but not in the eligible set.
+        let desired = desired_owners_under_lock(&shared, 3, &[1, 2, 3]).await;
+        assert!(desired.is_empty());
     }
 
     #[test]
@@ -1235,5 +1847,168 @@ mod tests {
     fn panic_message_falls_back_for_unknown_payload() {
         let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
         assert_eq!(panic_message(payload), "non-string panic payload");
+    }
+
+    /// `abort_and_await` must return only after every aborted task
+    /// has reached its `Drop`. Without that property, the
+    /// supervisor's `reconcile_workers` could respawn a worker for
+    /// a `RefKey` while the previous task is still in-flight on
+    /// the shared `StagedReceiptMap`. The test stands in for the
+    /// supervisor's contract: park a fleet of tasks on a never-
+    /// resolving future, have each one decrement an `AliveGuard`
+    /// in Drop, abort+await them as a batch, and assert the
+    /// counter is back to zero by the time the await returns.
+    #[tokio::test]
+    async fn abort_and_await_waits_for_every_task_to_drop() {
+        use std::future::pending;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AliveGuard(Arc<AtomicUsize>);
+        impl Drop for AliveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let alive = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<JoinHandle<()>> = (0..4)
+            .map(|_| {
+                alive.fetch_add(1, Ordering::SeqCst);
+                let guard = AliveGuard(Arc::clone(&alive));
+                tokio::spawn(async move {
+                    let _g = guard;
+                    pending::<()>().await;
+                })
+            })
+            .collect();
+        // Sanity check: every spawned task is alive before we
+        // touch them. If this fails, the test setup is broken
+        // and the assertion below would be misleading.
+        assert_eq!(alive.load(Ordering::SeqCst), 4);
+
+        super::abort_and_await(handles).await;
+
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "every aborted task's Drop must run before abort_and_await returns"
+        );
+    }
+
+    /// Without [`drain_dead_workers`], a worker that exited (panic
+    /// outside `catch_unwind`, an `unreachable!()` arm tripping, the
+    /// poison-publish path panicking under future invariants slip)
+    /// would leave a finished [`JoinHandle`] in the supervisor's map,
+    /// and the next `reconcile_workers` tick would skip respawning
+    /// because `contains_key` is true. This test pins the helper:
+    /// a finished handle for a still-desired branch is drained out
+    /// so the spawn pass can replace it; a finished handle for a
+    /// branch that's no longer desired is left for the teardown
+    /// pass; a still-running handle is left alone.
+    #[tokio::test]
+    async fn drain_dead_workers_drains_only_finished_handles_for_desired_keys() {
+        use crate::raft::state_machine::RefKey;
+        use std::future::pending;
+
+        // Spawn a task that returns immediately so its handle is
+        // finished by the time we inspect it.
+        let dead_desired = tokio::spawn(async {});
+        let dead_undesired = tokio::spawn(async {});
+        while !dead_desired.is_finished() || !dead_undesired.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        // Spawn a task that never resolves so its handle stays
+        // unfinished — proves the helper doesn't touch live workers.
+        let alive_desired = tokio::spawn(pending::<()>());
+
+        let key_dead = RefKey::new("ledger", "dead");
+        let key_undesired = RefKey::new("ledger", "undesired");
+        let key_alive = RefKey::new("ledger", "alive");
+        let mut workers = HashMap::new();
+        workers.insert(key_dead.clone(), dead_desired);
+        workers.insert(key_undesired.clone(), dead_undesired);
+        workers.insert(key_alive.clone(), alive_desired);
+        let desired = HashSet::from([key_dead.clone(), key_alive.clone()]);
+
+        let drained = super::drain_dead_workers(&mut workers, &desired);
+
+        assert_eq!(drained.len(), 1, "only the desired+dead handle drains");
+        assert!(
+            !workers.contains_key(&key_dead),
+            "dead+desired handle removed so spawn pass can replace it"
+        );
+        assert!(
+            workers.contains_key(&key_undesired),
+            "dead+undesired handle stays for teardown pass"
+        );
+        assert!(workers.contains_key(&key_alive), "alive handle untouched");
+
+        // Cleanup so the pending task doesn't leak into other tests.
+        workers.remove(&key_alive).unwrap().abort();
+        workers.remove(&key_undesired);
+    }
+
+    /// `StashGuard` removes the receipt when the guard goes out of
+    /// scope. This is the load-bearing property for the abort case:
+    /// if a worker is aborted between the stash and the propose
+    /// completing, the future is dropped, all locals drop, the
+    /// guard's `Drop` fires, and the receipt is cleaned up.
+    #[tokio::test]
+    async fn stash_guard_removes_receipt_on_drop() {
+        use crate::raft::staged_receipt::{
+            AppliedReceipt, StagedReceiptMap, StashGuard, TransactApplied,
+        };
+        use crate::raft::state_machine::RefKey;
+        use fluree_db_api::{ContentId, ContentKind};
+
+        let map = StagedReceiptMap::new();
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: ContentId::new(ContentKind::Commit, &[1]),
+            commit_t: 10,
+            flake_count: 0,
+            tally: None,
+        });
+
+        {
+            let _guard = StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
+            assert_eq!(map.len(), 1, "stash should populate the map");
+        }
+        assert_eq!(
+            map.len(),
+            0,
+            "scope exit must drop the guard and clean the stash"
+        );
+    }
+
+    /// Even when an unrelated path has already consumed the
+    /// receipt (the state-machine adapter on apply, or the
+    /// cross-node forward's pre-post take), the guard's `Drop` must
+    /// be a safe no-op rather than panic or corrupt the map.
+    #[tokio::test]
+    async fn stash_guard_drop_is_idempotent_after_external_take() {
+        use crate::raft::staged_receipt::{
+            AppliedReceipt, StagedReceiptMap, StashGuard, TransactApplied,
+        };
+        use crate::raft::state_machine::RefKey;
+        use fluree_db_api::{ContentId, ContentKind};
+
+        let map = StagedReceiptMap::new();
+        let receipt = AppliedReceipt::Transact(TransactApplied {
+            commit_id: ContentId::new(ContentKind::Commit, &[1]),
+            commit_t: 10,
+            flake_count: 0,
+            tally: None,
+        });
+
+        {
+            let _guard = StashGuard::stash(&map, 42, RefKey::new("test/db", "main"), receipt);
+            // Simulate the adapter / via-leader path taking the
+            // receipt before the guard drops.
+            assert!(map.take(42).is_some());
+            assert_eq!(map.len(), 0);
+        }
+        // Guard's Drop ran on the empty slot — still empty, no
+        // panic, no side effects.
+        assert_eq!(map.len(), 0);
     }
 }

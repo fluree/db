@@ -26,6 +26,7 @@ use openraft::{
     AnyError, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, Snapshot, SnapshotMeta,
     StorageError, StorageIOError, StoredMembership,
 };
+use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -200,9 +201,9 @@ where
 
     /// Set the [`StagedReceiptMap`] the adapter reads from when
     /// constructing an [`AppliedReceipt`] for a resolved waiter.
-    /// Pair it with the same handle the
-    /// [`CommitWorker`](super::commit_worker::CommitWorker) stashes
-    /// per-op staging detail into.
+    /// Pair it with the same handle the per-branch
+    /// [`Worker`](super::commit_worker::Worker) stashes per-op staging
+    /// detail into.
     pub fn with_staged_receipts(mut self, staged_receipts: Arc<StagedReceiptMap>) -> Self {
         self.staged_receipts = Some(staged_receipts);
         self
@@ -428,6 +429,34 @@ where
                         responses.push(response);
                     }
                     EntryPayload::Membership(m) => {
+                        // Mirror the new voter set into the replicated
+                        // state machine so `apply_set_worker_eligibility`
+                        // can validate against it without threading
+                        // membership through the apply signature.
+                        //
+                        // Voters demoted before the change keep their
+                        // demotion if they remain in the new voter
+                        // set; newly-added voters start eligible;
+                        // removed voters disappear from both sets in
+                        // the same step. Without preserving surviving
+                        // demotions, a membership change that doesn't
+                        // drop the demoted voter (e.g. adding a new
+                        // voter to grow the cluster) re-promotes the
+                        // demoted voter, opening an
+                        // `unreachable_after`-long window where work
+                        // rendezvouses to the unreachable node.
+                        let new_voters: BTreeSet<NodeId> = m.voter_ids().collect();
+                        let surviving_demotions: BTreeSet<NodeId> = state
+                            .configured_voters
+                            .difference(&state.worker_eligible_voters)
+                            .copied()
+                            .filter(|id| new_voters.contains(id))
+                            .collect();
+                        state.worker_eligible_voters = new_voters
+                            .difference(&surviving_demotions)
+                            .copied()
+                            .collect();
+                        state.configured_voters = new_voters;
                         self.last_membership = StoredMembership::new(Some(log_id), m);
                         responses.push(Response::NoOp);
                     }
@@ -633,7 +662,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::CreateLedgerArgs;
+    use crate::raft::state_machine::NewLedger;
     use crate::raft::storage::memory::MemoryRaftStorage;
     use crate::raft::Command as RaftCommand;
     use fluree_db_api::{ContentId, ContentKind};
@@ -653,7 +682,7 @@ mod tests {
     fn create_ledger_entry(index: u64, ledger_id: &str) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::CreateLedger(CreateLedgerArgs {
+            payload: EntryPayload::Normal(RaftCommand::CreateLedger(NewLedger {
                 ledger_id: ledger_id.into(),
                 branch: "main".into(),
                 created_at_millis: 1_000,
@@ -690,6 +719,124 @@ mod tests {
         assert_eq!(responses, vec![Response::NoOp]);
         let (applied, _) = sm.applied_state().await.unwrap();
         assert_eq!(applied, Some(log_id(1, 5)));
+    }
+
+    fn cluster_node(id: NodeId) -> ClusterNode {
+        ClusterNode::new(
+            format!("http://node-{id}:9090/raft"),
+            format!("http://node-{id}:8080"),
+        )
+    }
+
+    fn membership_entry(index: u64, voters: &[NodeId]) -> Entry<TypeConfig> {
+        let voter_set: BTreeSet<NodeId> = voters.iter().copied().collect();
+        let nodes: std::collections::BTreeMap<NodeId, ClusterNode> =
+            voters.iter().map(|&id| (id, cluster_node(id))).collect();
+        Entry {
+            log_id: log_id(1, index),
+            payload: EntryPayload::Membership(openraft::Membership::new(vec![voter_set], nodes)),
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_apply_mirrors_voter_set_into_state() {
+        // First membership-apply sets `configured_voters` from
+        // empty and seeds every voter as eligible — the shape the
+        // worker supervisor's rendezvous expects at cluster boot.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+
+        let shared = sm.shared_state();
+        let state = shared.read().await;
+        let expected: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
+        assert_eq!(state.configured_voters, expected);
+        assert_eq!(state.worker_eligible_voters, expected);
+    }
+
+    #[tokio::test]
+    async fn membership_change_removing_demoted_voter_drops_it_from_both_sets() {
+        // A prior membership-apply seeded {1,2,3}; the leader's
+        // monitor then demoted 2. The next membership-apply that
+        // adds 4 and removes 2 should snap both sets to {1,3,4}
+        // — newly-configured voters start eligible, demoted-then-
+        // removed voters disappear from both sets.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+        let shared = sm.shared_state();
+        // Mid-life demotion of 2.
+        {
+            let mut state = shared.write().await;
+            state.worker_eligible_voters.remove(&2);
+        }
+
+        // Membership change: drop 2, add 4.
+        sm.apply([membership_entry(2, &[1, 3, 4])]).await.unwrap();
+
+        let state = shared.read().await;
+        let expected: BTreeSet<NodeId> = [1, 3, 4].into_iter().collect();
+        assert_eq!(state.configured_voters, expected);
+        // 4 starts eligible alongside the survivors, 2 is gone.
+        assert_eq!(state.worker_eligible_voters, expected);
+    }
+
+    #[tokio::test]
+    async fn membership_change_preserves_demotion_for_voter_that_survives() {
+        // A prior membership-apply seeded {1,2,3}; the leader's
+        // monitor demoted 2 (still unreachable). The next
+        // membership-apply *adds* 4 without dropping 2 — common
+        // case when growing the cluster while a node is down.
+        // 2's demotion must survive the membership change:
+        // worker_eligible_voters should be {1,3,4}, not {1,2,3,4}.
+        // Without this guard, work would rendezvous to the
+        // unreachable 2 until the monitor re-demoted it
+        // ~`unreachable_after` later.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+        let shared = sm.shared_state();
+        // Mid-life demotion of 2.
+        {
+            let mut state = shared.write().await;
+            state.worker_eligible_voters.remove(&2);
+        }
+
+        // Membership change: add 4, keep 2 in the voter set.
+        sm.apply([membership_entry(2, &[1, 2, 3, 4])])
+            .await
+            .unwrap();
+
+        let state = shared.read().await;
+        let expected_configured: BTreeSet<NodeId> = [1, 2, 3, 4].into_iter().collect();
+        let expected_eligible: BTreeSet<NodeId> = [1, 3, 4].into_iter().collect();
+        assert_eq!(state.configured_voters, expected_configured);
+        assert_eq!(
+            state.worker_eligible_voters, expected_eligible,
+            "demotion of 2 must survive the membership change; 4 starts eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_change_starts_newly_added_voters_eligible() {
+        // No prior demotions, just a cluster-growth scenario:
+        // {1,2,3} → {1,2,3,4,5}. Both new voters start eligible.
+        let storage = Arc::new(MemoryRaftStorage::new());
+        let mut sm = StateMachineAdapter::new(storage);
+
+        sm.apply([membership_entry(1, &[1, 2, 3])]).await.unwrap();
+        sm.apply([membership_entry(2, &[1, 2, 3, 4, 5])])
+            .await
+            .unwrap();
+
+        let shared = sm.shared_state();
+        let state = shared.read().await;
+        let expected: BTreeSet<NodeId> = [1, 2, 3, 4, 5].into_iter().collect();
+        assert_eq!(state.configured_voters, expected);
+        assert_eq!(state.worker_eligible_voters, expected);
     }
 
     /// Direct head seed used by event-bus tests that need a populated
@@ -869,7 +1016,7 @@ mod tests {
         sm.apply([Entry {
             log_id: log_id(1, 3),
             payload: EntryPayload::Normal(RaftCommand::CreateBranch(
-                crate::raft::state_machine::CreateBranchArgs {
+                crate::raft::state_machine::NewBranch {
                     ledger_id: "test/db".into(),
                     branch: "feature".into(),
                     source_branch: "main".into(),
@@ -907,7 +1054,7 @@ mod tests {
         sm.apply([Entry {
             log_id: log_id(1, 3),
             payload: EntryPayload::Normal(RaftCommand::CreateBranch(
-                crate::raft::state_machine::CreateBranchArgs {
+                crate::raft::state_machine::NewBranch {
                     ledger_id: "test/db".into(),
                     branch: "feature".into(),
                     source_branch: "main".into(),
@@ -1035,15 +1182,14 @@ mod tests {
     // ====================================================================
 
     use crate::raft::state_machine::{
-        ApplyHeadArgs, BodyKind, EnqueueCommandArgs, PoisonQueueEntryArgs, PoisonReason,
-        ResetHeadSnapshot,
+        BodyKind, EntryPoisoning, PoisonReason, QueueSubmission, ResetHeadSnapshot, StagedHead,
     };
     use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
 
     fn enqueue_entry(index: u64, ledger_id: &str, branch: &str) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::EnqueueCommand(EnqueueCommandArgs {
+            payload: EntryPayload::Normal(RaftCommand::EnqueueCommand(QueueSubmission {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
                 idempotency: None,
@@ -1065,7 +1211,7 @@ mod tests {
     ) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::ApplyHead(ApplyHeadArgs {
+            payload: EntryPayload::Normal(RaftCommand::ApplyHead(StagedHead {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
                 queue_id,
@@ -1087,7 +1233,7 @@ mod tests {
     ) -> Entry<TypeConfig> {
         Entry {
             log_id: log_id(1, index),
-            payload: EntryPayload::Normal(RaftCommand::PoisonQueueEntry(PoisonQueueEntryArgs {
+            payload: EntryPayload::Normal(RaftCommand::PoisonQueueEntry(EntryPoisoning {
                 ledger_id: ledger_id.into(),
                 branch: branch.into(),
                 queue_id,
