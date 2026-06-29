@@ -1204,37 +1204,25 @@ pub fn spawn_local_cache_event_listener(
 
         loop {
             match subscription.receiver.recv().await {
+                // A new commit OR a new index head both move the ledger
+                // forward relative to a cached follower view. Reconcile
+                // on either: without the commit arm, a follower's cache
+                // only advances when an index publish happens to follow,
+                // leaving committed-but-unindexed writes invisible to
+                // reads served by that node (the exact failure exercised
+                // by raft failover — a write lands, replicates, applies
+                // on every node, yet only the staging node's cache shows
+                // it).
                 Ok(
-                    fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                    fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                        ledger_id, ..
+                    }
+                    | fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
                         ledger_id,
                         ..
-                    }
-                    | fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                        ledger_id, ..
                     },
                 ) => {
-                    match ledger_manager
-                        .notify(NsNotify {
-                            ledger_id: ledger_id.clone(),
-                            record: None,
-                        })
-                        .await
-                    {
-                        Ok(result) => {
-                            tracing::debug!(
-                                alias = %ledger_id,
-                                ?result,
-                                "local cache event listener reconciled ledger"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                alias = %ledger_id,
-                                error = %error,
-                                "local cache event listener failed to reconcile ledger"
-                            );
-                        }
-                    }
+                    reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
                     ledger_manager.disconnect(&ledger_id).await;
@@ -1245,10 +1233,30 @@ pub fn spawn_local_cache_event_listener(
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The channel overflowed and dropped events. With
+                    // commit publishes on the bus this is the only
+                    // notice some ledger gets, so a bare log would leave
+                    // its cache stale until the next event happens to
+                    // land. Fall back to a catch-up sweep: re-reconcile
+                    // every currently-loaded ledger against the
+                    // nameservice head (a no-op for any already current).
+                    //
+                    // The sweep runs inline in this receive loop, so it
+                    // does not drain the channel while it executes. If a
+                    // future workload makes reconciles slow enough that
+                    // the sweep itself keeps the receiver from draining,
+                    // this could re-trigger Lagged. Not observed in
+                    // practice; revisit with a bound or a provably-behind
+                    // scope only if it proves to arise.
+                    let aliases = ledger_manager.cached_aliases().await;
                     tracing::warn!(
                         skipped,
-                        "local cache event listener lagged behind nameservice events"
+                        ledgers = aliases.len(),
+                        "local cache event listener lagged; sweeping loaded ledgers"
                     );
+                    for alias in aliases {
+                        reconcile_cached_ledger(&ledger_manager, &alias).await;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::debug!("local cache event listener stopped");
@@ -1257,6 +1265,34 @@ pub fn spawn_local_cache_event_listener(
             }
         }
     });
+}
+
+/// Reconcile one cached ledger against the current nameservice head.
+/// A no-op when the cache is already current or the ledger isn't
+/// loaded. Shared by the per-event path and the lag catch-up sweep.
+async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &str) {
+    match ledger_manager
+        .notify(NsNotify {
+            ledger_id: ledger_id.to_string(),
+            record: None,
+        })
+        .await
+    {
+        Ok(result) => {
+            tracing::debug!(
+                alias = %ledger_id,
+                ?result,
+                "local cache event listener reconciled ledger"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                alias = %ledger_id,
+                error = %error,
+                "local cache event listener failed to reconcile ledger"
+            );
+        }
+    }
 }
 
 impl FlureeBuilder {
@@ -1588,6 +1624,21 @@ impl FlureeBuilder {
     /// available system memory. Use this method to override with a specific MB limit.
     pub fn cache_max_mb(mut self, max_mb: usize) -> Self {
         self.config.cache = fluree_db_connection::CacheConfig::with_max_mb(max_mb);
+        self
+    }
+
+    /// Set the maximum **on-disk** cache budget in MB, shared globally across
+    /// Fluree's object storage and Iceberg data files.
+    ///
+    /// By default the disk budget auto-detects from available disk space. This
+    /// sets a process-global default for caches created afterwards; the
+    /// `FLUREE_DISK_CACHE_BUDGET_BYTES` env var still overrides it, and `0`
+    /// disables disk caching. No effect without the `native` feature.
+    pub fn disk_cache_max_mb(self, max_mb: usize) -> Self {
+        #[cfg(feature = "native")]
+        fluree_db_core::disk_cache::set_configured_budget_bytes((max_mb as u64) << 20);
+        #[cfg(not(feature = "native"))]
+        let _ = max_mb;
         self
     }
 

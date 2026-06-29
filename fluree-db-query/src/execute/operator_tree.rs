@@ -2430,6 +2430,42 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Fast-path: a single R2RML graph-source scan feeding a simple COUNT
+    // aggregate — fold straight from column batches instead of materializing an
+    // RDF binding per table row. Falls back to the normal pipeline at open if
+    // its column-resolution gates fail.
+    if enable_fused_fast_paths {
+        if let Some(plan) = crate::r2rml::detect_fused_r2rml_aggregate(query) {
+            // Build the fallback with ORDER BY / OFFSET / LIMIT stripped: those
+            // wrap the operator below, so the fallback (which the operator streams
+            // when its column-resolution gates fail) must not apply them too —
+            // a doubled OFFSET would otherwise skip twice as many rows.
+            let mut fallback_query = query.clone();
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let fallback =
+                build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
+            let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
+                plan, fallback,
+            ));
+            // The fused operator emits the final grouped result; apply ORDER BY /
+            // OFFSET / LIMIT on top with the engine's own operators (exact
+            // semantics on the small grouped output).
+            if !query.ordering.is_empty() {
+                op = Box::new(crate::sort::SortOperator::new(op, query.ordering.clone()));
+            }
+            if let Some(offset) = query.offset {
+                op = Box::new(OffsetOperator::new(op, offset));
+            }
+            if let Some(limit) = query.limit {
+                op = Box::new(LimitOperator::new(op, limit));
+            }
+            return Ok(op);
+        }
+    }
+
     // Fast-path: `SELECT (COUNT(?x) AS ?c) WHERE { ?s <p> ?o }` (and COUNT(*))
     // answered from PSOT leaflet directory row counts (no scan / no decoding).
     if enable_fused_fast_paths {

@@ -6,8 +6,18 @@
 use crate::error::Result;
 use async_trait::async_trait;
 use fluree_db_tabular::ColumnBatch;
+use futures::stream::Stream;
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// A streamed sequence of column batches from a table scan.
+///
+/// Batches arrive as data files are read and decoded, so a consumer that
+/// materializes and aggregates incrementally holds only O(in-flight files)
+/// in memory instead of the whole table. The stream is `'static` + `Send` so
+/// an operator can own it across `next_batch` calls.
+pub type ColumnBatchStream = Pin<Box<dyn Stream<Item = Result<ColumnBatch>> + Send + Sync>>;
 
 // Re-export from fluree-db-r2rml for convenience
 pub use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
@@ -123,8 +133,8 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     ///
     /// # Returns
     ///
-    /// An iterator/stream of column batches. The exact streaming mechanism
-    /// depends on the implementation.
+    /// A [`ColumnBatchStream`] yielding column batches as data files are read,
+    /// so a streaming consumer never holds the whole table in memory.
     /// `filters` are conservative pushdown predicates (resolved to columns) for
     /// Iceberg file pruning. Implementations may ignore them (correctness is
     /// preserved by the in-engine FILTER) but honoring them skips data files.
@@ -135,7 +145,7 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         projection: &[String],
         filters: &[ScanFilter],
         as_of_t: Option<i64>,
-    ) -> Result<Vec<ColumnBatch>>;
+    ) -> Result<ColumnBatchStream>;
 }
 
 // =============================================================================
@@ -185,7 +195,7 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
         _projection: &[String],
         _filters: &[ScanFilter],
         _as_of_t: Option<i64>,
-    ) -> Result<Vec<ColumnBatch>> {
+    ) -> Result<ColumnBatchStream> {
         Err(crate::error::QueryError::Internal(format!(
             "R2RML table scanning not available for graph source '{graph_source_id}'. \
              This Fluree instance does not support graph source operations."

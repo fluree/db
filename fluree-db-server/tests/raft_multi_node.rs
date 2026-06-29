@@ -765,7 +765,6 @@ async fn leader_failover_resumes_writes() {
 
     cluster.shutdown_node(old_leader).await;
 
-    // Quorum survives losing one of five nodes; a new leader should
     // emerge within a few election timeouts. Waiting for *every*
     // surviving node to observe the new leader — not just the first
     // peer we polled — is what closes the race the CI run exposed:

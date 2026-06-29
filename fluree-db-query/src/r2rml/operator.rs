@@ -36,6 +36,7 @@ use crate::error::{QueryError, Result};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::r2rml::ColumnBatchStream;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TriplesMap};
@@ -44,6 +45,7 @@ use fluree_db_r2rml::materialize::{
 };
 use fluree_db_tabular::ColumnBatch;
 use fluree_vocab::xsd;
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -52,6 +54,72 @@ use std::sync::Arc;
 /// Maps parent join key (as `Vec<String>`) to materialized parent subject IRI.
 /// The key is a composite key of all parent columns specified in join conditions.
 pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
+
+/// Composite key for caching a parent lookup: `(parent_tm_iri, sorted_parent_join_cols)`.
+type LookupCacheKey = (String, Vec<String>);
+
+/// Target number of table rows to materialize into bindings per parallel window.
+///
+/// Materialization explodes the compact columnar form into fat `Binding` rows
+/// (the memory wall: a full-table materialize of a 6M-row scan is ~14 GB). By
+/// materializing one bounded window at a time — still in parallel on rayon —
+/// the resident binding footprint is capped at roughly this many rows while the
+/// scan streams to the downstream operator. Override with
+/// `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS`.
+const DEFAULT_MATERIALIZE_WINDOW_ROWS: usize = 512 * 1024;
+
+fn materialize_window_rows() -> usize {
+    std::env::var("FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MATERIALIZE_WINDOW_ROWS)
+}
+
+/// How a window of produced rows is combined with the buffered child rows.
+///
+/// The join is *flipped* relative to a naive per-child probe: the (small,
+/// already-buffered) child side is indexed once, and the (large) produced side
+/// is streamed window-by-window and probed against it. This is what lets the
+/// scan avoid materializing the whole table's bindings at once.
+enum JoinPlan {
+    /// No shared variables: every produced row pairs with every child row
+    /// (typically the single seed row).
+    Cross,
+    /// Shared join variables: child rows indexed by their join-key values.
+    Hash {
+        join_vars: Vec<VarId>,
+        /// Fully-bound child rows: join key → child row indices.
+        full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>>,
+        /// Child rows with an unbound join var (a wildcard position, matched
+        /// linearly): `(child_row_idx, key with None for the unbound vars)`.
+        partial_rows: Vec<(usize, Vec<Option<GroupKeyOwned>>)>,
+    },
+}
+
+/// One TriplesMap's streaming scan state: the live batch stream from the table
+/// scan, the parent lookups for its RefObjectMap joins, and the precomputed join
+/// plan against the buffered child. Batches are pulled in bounded windows and
+/// dropped after materializing, so the whole table is never resident.
+struct TmStream {
+    tm_iri: String,
+    stream: ColumnBatchStream,
+    exhausted: bool,
+    parent_lookups: HashMap<LookupCacheKey, ParentLookup>,
+    join: JoinPlan,
+}
+
+/// In-flight streaming scan for one buffered child batch. The child is held
+/// resident (it is the small side and is indexed by the join plans); each
+/// TriplesMap's produced batches are materialized in bounded windows and emitted
+/// incrementally, so the operator never holds the whole table's bindings.
+struct ScanProgress {
+    child_batch: Batch,
+    child_schema: Vec<VarId>,
+    tms: Vec<TmStream>,
+    tm_idx: usize,
+    window_rows: usize,
+}
 
 /// R2RML scan operator for `Pattern::R2rml`.
 ///
@@ -67,8 +135,11 @@ pub struct R2rmlScanOperator {
     out_pos: HashMap<VarId, usize>,
     /// Cached compiled mapping (loaded once in open)
     mapping: Option<Arc<CompiledR2rmlMapping>>,
-    /// Pending output rows from current scan
+    /// Pending output rows that overflowed the current output batch.
     pending: VecDeque<Vec<Binding>>,
+    /// In-flight streaming scan for the current buffered child batch, advanced
+    /// one window per `next_batch` so the whole table is never materialized.
+    progress: Option<ScanProgress>,
     /// State
     state: OperatorState,
 }
@@ -117,6 +188,7 @@ impl R2rmlScanOperator {
             out_pos,
             mapping: None,
             pending: VecDeque::new(),
+            progress: None,
             state: OperatorState::Created,
         }
     }
@@ -181,15 +253,16 @@ impl R2rmlScanOperator {
         out
     }
 
-    /// Materialize all produced rows of a TriplesMap (independent of the child
-    /// stream) so the result can be hash-joined against the child. Datatype Sids
-    /// are resolved once into a `LiteralEncoder` (not per cell) and the data
-    /// files are materialized in parallel on the rayon pool.
-    fn materialize_produced_rows(
+    /// Materialize one window of a TriplesMap's produced column batches into
+    /// variable assignments. Datatype Sids are resolved once into a
+    /// `LiteralEncoder` (not per cell) and the window's batches are materialized
+    /// in parallel on the rayon pool. The window (not the whole table) bounds the
+    /// resident binding footprint.
+    fn materialize_window(
         &self,
         triples_map: &TriplesMap,
         batches: &[ColumnBatch],
-        parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+        parent_lookups: &HashMap<LookupCacheKey, ParentLookup>,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Vec<Vec<(VarId, Binding)>>> {
         use rayon::prelude::*;
@@ -201,17 +274,537 @@ impl R2rmlScanOperator {
             .collect::<Result<Vec<_>>>()?;
         Ok(per_batch.into_iter().flatten().collect())
     }
+
+    /// Index the buffered child rows by their join-key values, so the streamed
+    /// produced side can be probed against them. Mirrors the per-child key logic
+    /// of the previous probe (poisoned → drop, unbound → wildcard) with the roles
+    /// flipped (child indexed, produced streamed).
+    fn build_join_plan(
+        &self,
+        join_vars: &[VarId],
+        child_schema: &[VarId],
+        child_batch: &Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> JoinPlan {
+        if join_vars.is_empty() {
+            return JoinPlan::Cross;
+        }
+        let store = ctx.binary_store.as_deref();
+        let gv = ctx.graph_view();
+        let gv = gv.as_ref();
+
+        let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
+        let mut partial_rows: Vec<(usize, Vec<Option<GroupKeyOwned>>)> = Vec::new();
+        for row_idx in 0..child_batch.len() {
+            let mut key: Vec<Option<GroupKeyOwned>> = Vec::with_capacity(join_vars.len());
+            let mut all_bound = true;
+            let mut poisoned = false;
+            for &jv in join_vars {
+                let pos = child_schema.iter().position(|&v| v == jv).unwrap();
+                let b = &child_batch.column_by_idx(pos).unwrap()[row_idx];
+                if b.is_poisoned() {
+                    poisoned = true;
+                    break;
+                }
+                if b.is_bound() {
+                    key.push(Some(binding_to_group_key_normalized(b, store, gv)));
+                } else {
+                    all_bound = false;
+                    key.push(None);
+                }
+            }
+            if poisoned {
+                // A poisoned binding can never match — drop the row.
+                continue;
+            }
+            if all_bound {
+                let full: Vec<GroupKeyOwned> = key.into_iter().map(Option::unwrap).collect();
+                full_index.entry(full).or_default().push(row_idx);
+            } else {
+                partial_rows.push((row_idx, key));
+            }
+        }
+        JoinPlan::Hash {
+            join_vars: join_vars.to_vec(),
+            full_index,
+            partial_rows,
+        }
+    }
+
+    /// Buffer one child batch and set up its streaming scan: resolve the matching
+    /// TriplesMap(s), scan each table (and any RefObjectMap parent tables), and
+    /// build the per-TriplesMap join plan against the child. Returns `None` when
+    /// no TriplesMap matches this pattern (the caller pulls the next child).
+    async fn build_progress(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        child_batch: Batch,
+    ) -> Result<Option<ScanProgress>> {
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or_else(|| QueryError::Internal("R2RML mapping not loaded".to_string()))?
+            .clone();
+        let child_schema = self.child.schema().to_vec();
+
+        // Resolve the TriplesMap(s) for this pattern (same for every child row).
+        let triples_maps: Vec<&TriplesMap> = if let Some(ref tm_iri) = self.pattern.triples_map_iri
+        {
+            let tm = mapping.get(tm_iri).ok_or_else(|| {
+                QueryError::InvalidQuery(format!(
+                    "TriplesMap '{tm_iri}' not found in R2RML mapping"
+                ))
+            })?;
+            vec![tm]
+        } else {
+            mapping
+                .triples_maps
+                .values()
+                .filter(|tm| {
+                    // class_filter: only maps that produce this class.
+                    if let Some(ref class_filter) = self.pattern.class_filter {
+                        if !tm.classes().contains(class_filter) {
+                            return false;
+                        }
+                    }
+                    // predicate_filter: only maps that have this predicate.
+                    if let Some(ref pred_filter) = self.pattern.predicate_filter {
+                        let has_pred = tm.predicate_object_maps.iter().any(|pom| {
+                            pom.predicate_map.as_constant() == Some(pred_filter.as_str())
+                        });
+                        if !has_pred {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect()
+        };
+
+        if triples_maps.is_empty() {
+            return Ok(None);
+        }
+
+        let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
+            QueryError::InvalidQuery("R2RML table provider not configured".to_string())
+        })?;
+
+        // Join vars (pattern-produced vars the child already binds) are the same
+        // for every TriplesMap of this pattern.
+        let join_vars: Vec<VarId> = self
+            .pattern
+            .produced_vars()
+            .into_iter()
+            .filter(|v| child_schema.contains(v))
+            .collect();
+
+        let mut tms: Vec<TmStream> = Vec::with_capacity(triples_maps.len());
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for triples_map in &triples_maps {
+            if !seen.insert(triples_map.iri.clone()) {
+                continue;
+            }
+
+            let table_name = triples_map.table_name().ok_or_else(|| {
+                QueryError::InvalidQuery("TriplesMap has no logical table".to_string())
+            })?;
+
+            // Determine projection columns. For a same-subject star, project the
+            // union of columns needed for every star predicate so the whole star
+            // is satisfied by one scan.
+            let projection: Vec<String> = if self.pattern.star_bindings.is_empty() {
+                triples_map
+                    .columns_for_predicate(self.pattern.predicate_filter.as_deref())
+                    .into_iter()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            } else {
+                let mut cols: Vec<String> = Vec::new();
+                for pred in self.pattern_predicates() {
+                    cols.extend(
+                        triples_map
+                            .columns_for_predicate(Some(pred))
+                            .into_iter()
+                            .map(std::string::ToString::to_string),
+                    );
+                }
+                cols.sort();
+                cols.dedup();
+                cols
+            };
+
+            // Scan the table, pushing resolved FILTER predicates for file pruning
+            // (column resolution needs the mapping, so it happens here).
+            let scan_filters = self.build_scan_filters(triples_map);
+            let as_of_t = if ctx.dataset.is_some() {
+                None
+            } else {
+                Some(ctx.to_t)
+            };
+            let stream = table_provider
+                .scan_table(
+                    &self.pattern.graph_source_id,
+                    table_name,
+                    &projection,
+                    &scan_filters,
+                    as_of_t,
+                )
+                .await?;
+
+            // Build parent lookup tables for RefObjectMap POMs that pass the
+            // predicate filter. Parent (dimension) tables are small and consumed
+            // whole into the lookup, so they are not streamed.
+            let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
+            let star_preds = self.pattern_predicates();
+            let filtered_poms: Vec<_> = triples_map
+                .predicate_object_maps
+                .iter()
+                .filter(|pom| {
+                    if !self.pattern.star_bindings.is_empty() {
+                        pom.predicate_map
+                            .as_constant()
+                            .is_some_and(|p| star_preds.contains(&p))
+                    } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
+                        pom.predicate_map.as_constant() == Some(pred_filter.as_str())
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            for pom in &filtered_poms {
+                if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
+                    let mut parent_join_cols: Vec<String> = rom
+                        .parent_columns()
+                        .into_iter()
+                        .map(std::string::ToString::to_string)
+                        .collect();
+                    parent_join_cols.sort();
+                    let lookup_key: LookupCacheKey =
+                        (rom.parent_triples_map.clone(), parent_join_cols.clone());
+
+                    if parent_lookups.contains_key(&lookup_key) {
+                        continue;
+                    }
+
+                    let parent_tm = match mapping.get(&rom.parent_triples_map) {
+                        Some(tm) => tm,
+                        None => {
+                            tracing::warn!(
+                                parent = %rom.parent_triples_map,
+                                "Parent TriplesMap not found for RefObjectMap, skipping"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let parent_table = match parent_tm.table_name() {
+                        Some(name) => name,
+                        None => {
+                            tracing::warn!(
+                                parent = %rom.parent_triples_map,
+                                "Parent TriplesMap has no logical table, skipping"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Columns needed from the parent: join columns + subject
+                    // template columns (+ rr:column if the subject uses one).
+                    let mut parent_projection: Vec<String> = parent_join_cols.clone();
+                    parent_projection
+                        .extend(parent_tm.subject_map.template_columns.iter().cloned());
+                    if let Some(ref col) = parent_tm.subject_map.column {
+                        parent_projection.push(col.clone());
+                    }
+                    parent_projection.sort();
+                    parent_projection.dedup();
+
+                    let as_of_t = if ctx.dataset.is_some() {
+                        None
+                    } else {
+                        Some(ctx.to_t)
+                    };
+                    // Parent (dimension) tables are small; collect the stream
+                    // fully into the lookup rather than streaming it.
+                    let parent_stream = table_provider
+                        .scan_table(
+                            &self.pattern.graph_source_id,
+                            parent_table,
+                            &parent_projection,
+                            &[],
+                            as_of_t,
+                        )
+                        .await?;
+                    let parent_batches = collect_stream(parent_stream).await?;
+
+                    let lookup = build_parent_lookup(parent_tm, &parent_join_cols, parent_batches)?;
+                    parent_lookups.insert(lookup_key, lookup);
+                }
+            }
+
+            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx);
+
+            tms.push(TmStream {
+                tm_iri: triples_map.iri.clone(),
+                stream,
+                exhausted: false,
+                parent_lookups,
+                join,
+            });
+        }
+
+        Ok(Some(ScanProgress {
+            child_batch,
+            child_schema,
+            tms,
+            tm_idx: 0,
+            window_rows: materialize_window_rows(),
+        }))
+    }
+
+    /// Pull and materialize the next window from the in-flight scan and emit its
+    /// rows. Each call pulls one bounded window of batches from the current
+    /// TriplesMap's stream (so only O(window + in-flight files) is resident),
+    /// materializes them in parallel, emits, and drops the window. Returns `true`
+    /// while batches remain, `false` once the scan for this child batch is fully
+    /// consumed.
+    async fn advance_one_window(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        progress: &mut ScanProgress,
+        num_cols: usize,
+        columns: &mut [Vec<Binding>],
+    ) -> Result<bool> {
+        let mapping = self
+            .mapping
+            .as_ref()
+            .ok_or_else(|| QueryError::Internal("R2RML mapping not loaded".to_string()))?
+            .clone();
+
+        while progress.tm_idx < progress.tms.len() {
+            let i = progress.tm_idx;
+            if progress.tms[i].exhausted {
+                progress.tm_idx += 1;
+                continue;
+            }
+
+            // Pull a window of batches from the stream: at least one, then up to
+            // the row budget. The stream itself bounds in-flight file decodes.
+            let mut window: Vec<ColumnBatch> = Vec::new();
+            let mut rows = 0usize;
+            while rows < progress.window_rows {
+                match progress.tms[i].stream.next().await {
+                    Some(batch) => {
+                        let batch = batch?;
+                        rows += batch.num_rows;
+                        window.push(batch);
+                    }
+                    None => {
+                        progress.tms[i].exhausted = true;
+                        break;
+                    }
+                }
+            }
+
+            if window.is_empty() {
+                // Stream ended with nothing left for this TriplesMap.
+                progress.tm_idx += 1;
+                continue;
+            }
+
+            let triples_map = mapping.get(&progress.tms[i].tm_iri).ok_or_else(|| {
+                QueryError::Internal(format!(
+                    "TriplesMap '{}' missing from mapping mid-scan",
+                    progress.tms[i].tm_iri
+                ))
+            })?;
+            let produced = self.materialize_window(
+                triples_map,
+                &window,
+                &progress.tms[i].parent_lookups,
+                ctx,
+            )?;
+
+            if !produced.is_empty() {
+                emit_produced_window(
+                    &self.out_pos,
+                    &progress.child_schema,
+                    &progress.child_batch,
+                    &progress.tms[i].join,
+                    &produced,
+                    num_cols,
+                    ctx.batch_size,
+                    columns,
+                    &mut self.pending,
+                    ctx,
+                )?;
+            }
+            // `window` is dropped here, freeing the batches before the next pull.
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+/// Drain a [`ColumnBatchStream`] fully into a vector. Used for small dimension
+/// (parent) tables whose entire contents become a lookup.
+async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch>> {
+    let mut out = Vec::new();
+    while let Some(batch) = stream.next().await {
+        out.push(batch?);
+    }
+    Ok(out)
+}
+
+/// Emit one combined output row: the child row's bindings overlaid with a
+/// produced assignment, into `columns` (or `pending` once the batch is full).
+///
+/// The common (not-yet-full) path writes straight into the columnar buffers
+/// instead of allocating a per-row `Vec<Binding>` — that per-row allocation was
+/// the single largest heap-allocation site for analytical R2RML scans.
+#[allow(clippy::too_many_arguments)]
+fn emit_combined_row(
+    out_pos: &HashMap<VarId, usize>,
+    child_schema: &[VarId],
+    child_batch: &Batch,
+    child_row_idx: usize,
+    prod: &[(VarId, Binding)],
+    num_cols: usize,
+    batch_size: usize,
+    columns: &mut [Vec<Binding>],
+    pending: &mut VecDeque<Vec<Binding>>,
+) {
+    if columns[0].len() < batch_size {
+        // Push an `Unbound` placeholder to every column, then overwrite the
+        // bound positions in place — no per-row temporary vector.
+        for col in columns.iter_mut() {
+            col.push(Binding::Unbound);
+        }
+        for (col_idx, &var) in child_schema.iter().enumerate() {
+            let out_idx = *out_pos.get(&var).unwrap();
+            *columns[out_idx].last_mut().unwrap() =
+                child_batch.column_by_idx(col_idx).unwrap()[child_row_idx].clone();
+        }
+        for (var, binding) in prod {
+            *columns[*out_pos.get(var).unwrap()].last_mut().unwrap() = binding.clone();
+        }
+    } else {
+        // Overflow path: the batch is full, so stage a complete row for `pending`.
+        let mut out_row: Vec<Binding> = vec![Binding::Unbound; num_cols];
+        for (col_idx, &var) in child_schema.iter().enumerate() {
+            out_row[*out_pos.get(&var).unwrap()] =
+                child_batch.column_by_idx(col_idx).unwrap()[child_row_idx].clone();
+        }
+        for (var, binding) in prod {
+            out_row[*out_pos.get(var).unwrap()] = binding.clone();
+        }
+        pending.push_back(out_row);
+    }
+}
+
+/// Combine a window of produced rows with the buffered child rows per the join
+/// plan, emitting into `columns`/`pending`. The produced side is the streamed
+/// (large) side; the child index was built once in `build_progress`.
+#[allow(clippy::too_many_arguments)]
+fn emit_produced_window(
+    out_pos: &HashMap<VarId, usize>,
+    child_schema: &[VarId],
+    child_batch: &Batch,
+    join: &JoinPlan,
+    produced: &[Vec<(VarId, Binding)>],
+    num_cols: usize,
+    batch_size: usize,
+    columns: &mut [Vec<Binding>],
+    pending: &mut VecDeque<Vec<Binding>>,
+    ctx: &ExecutionContext<'_>,
+) -> Result<()> {
+    let mut emit = |child_row_idx: usize, prod: &[(VarId, Binding)]| -> Result<()> {
+        ctx.tracker.consume_fuel(1)?;
+        emit_combined_row(
+            out_pos,
+            child_schema,
+            child_batch,
+            child_row_idx,
+            prod,
+            num_cols,
+            batch_size,
+            columns,
+            pending,
+        );
+        Ok(())
+    };
+
+    match join {
+        JoinPlan::Cross => {
+            // No shared vars: every produced row pairs with every child row
+            // (child is usually the single seed row).
+            for prod in produced {
+                for child_row_idx in 0..child_batch.len() {
+                    emit(child_row_idx, prod)?;
+                }
+            }
+        }
+        JoinPlan::Hash {
+            join_vars,
+            full_index,
+            partial_rows,
+        } => {
+            let store = ctx.binary_store.as_deref();
+            let gv = ctx.graph_view();
+            let gv = gv.as_ref();
+            for prod in produced {
+                // A produced row always binds every pattern var, so its join key
+                // is complete.
+                let pkey: Vec<GroupKeyOwned> = join_vars
+                    .iter()
+                    .filter_map(|jv| {
+                        prod.iter()
+                            .find(|(v, _)| v == jv)
+                            .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
+                    })
+                    .collect();
+                if pkey.len() != join_vars.len() {
+                    continue;
+                }
+                // Fully-bound child rows: exact hash probe.
+                if let Some(rows) = full_index.get(&pkey) {
+                    for &child_row_idx in rows {
+                        emit(child_row_idx, prod)?;
+                    }
+                }
+                // Child rows with an unbound (wildcard) join var: match those that
+                // agree on every bound position.
+                for (child_row_idx, partial) in partial_rows {
+                    let agrees = partial
+                        .iter()
+                        .zip(pkey.iter())
+                        .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
+                    if agrees {
+                        emit(*child_row_idx, prod)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Datatype Sids resolved once per scan instead of per literal cell — the
-/// per-cell `encode_iri` was a large share of materialization cost.
-struct LiteralEncoder {
+/// per-cell `encode_iri` was a large share of materialization cost. Shared with
+/// the fused-aggregate operator so its filter/expression eval-var bindings are
+/// encoded identically to the normal materialization path.
+pub(crate) struct LiteralEncoder {
     dt_sids: HashMap<String, fluree_db_core::Sid>,
     xsd_string: fluree_db_core::Sid,
 }
 
 impl LiteralEncoder {
-    fn build(triples_map: &TriplesMap, snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+    pub(crate) fn build(
+        triples_map: &TriplesMap,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Self {
         let fallback = fluree_db_core::Sid::new(2, "string");
         let mut dt_sids: HashMap<String, fluree_db_core::Sid> = HashMap::new();
         for pom in &triples_map.predicate_object_maps {
@@ -231,7 +824,7 @@ impl LiteralEncoder {
     /// Convert an RdfTerm to a Binding without touching the snapshot (datatype
     /// Sids are pre-resolved). IRIs are kept as raw strings — graph source IRIs
     /// are independent of any Fluree namespace table.
-    fn encode(&self, term: &RdfTerm) -> Binding {
+    pub(crate) fn encode(&self, term: &RdfTerm) -> Binding {
         use fluree_db_core::FlakeValue;
         use fluree_vocab::UnresolvedDatatypeConstraint as Udc;
         match term {
@@ -526,409 +1119,52 @@ impl Operator for R2rmlScanOperator {
             return Ok(None);
         }
 
-        let mapping = self
-            .mapping
-            .as_ref()
-            .ok_or_else(|| QueryError::Internal("R2RML mapping not loaded".to_string()))?;
-
-        let child_schema = self.child.schema().to_vec();
         let num_cols = self.schema.len();
-
-        // Prepare output columns
         let mut columns: Vec<Vec<Binding>> = (0..num_cols)
             .map(|_| Vec::with_capacity(ctx.batch_size))
             .collect();
 
-        // Process pending rows first
-        while !self.pending.is_empty() && columns[0].len() < ctx.batch_size {
-            if let Some(row) = self.pending.pop_front() {
+        loop {
+            // 1. Drain overflow from a prior window before doing more work.
+            while !self.pending.is_empty() && columns[0].len() < ctx.batch_size {
+                let row = self.pending.pop_front().unwrap();
                 for (col_idx, binding) in row.into_iter().enumerate() {
                     columns[col_idx].push(binding);
                 }
             }
-        }
+            if columns[0].len() >= ctx.batch_size {
+                return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+            }
 
-        // If we've filled the batch from pending, return it
-        if columns[0].len() >= ctx.batch_size {
-            return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
-        }
+            // 2. Advance an in-flight scan by one materialization window. The
+            //    window's rows fill `columns` (overflow spills to `pending`), so
+            //    the whole table is never materialized at once.
+            if let Some(mut progress) = self.progress.take() {
+                let more = self
+                    .advance_one_window(ctx, &mut progress, num_cols, &mut columns)
+                    .await?;
+                if more {
+                    self.progress = Some(progress);
+                }
+                continue;
+            }
 
-        // Pull more input from child
-        while columns[0].len() < ctx.batch_size {
-            let child_batch = match self.child.next_batch(ctx).await? {
-                Some(batch) => batch,
+            // 3. No scan in flight: pull the next child batch and start one.
+            match self.child.next_batch(ctx).await? {
+                Some(child_batch) => {
+                    if let Some(progress) = self.build_progress(ctx, child_batch).await? {
+                        self.progress = Some(progress);
+                    }
+                    continue;
+                }
                 None => {
-                    // Child exhausted
                     if columns[0].is_empty() {
                         self.state = OperatorState::Exhausted;
                         return Ok(None);
                     }
-                    break;
-                }
-            };
-
-            // Get the TriplesMap(s) for this pattern (same for all child rows)
-            let triples_maps: Vec<_> = if let Some(ref tm_iri) = self.pattern.triples_map_iri {
-                // Explicit TriplesMap IRI specified
-                let tm = mapping.get(tm_iri).ok_or_else(|| {
-                    QueryError::InvalidQuery(format!(
-                        "TriplesMap '{tm_iri}' not found in R2RML mapping"
-                    ))
-                })?;
-                vec![tm]
-            } else {
-                // Find TriplesMap(s) by class and/or predicate filter
-                let all_maps: Vec<_> = mapping.triples_maps.values().collect();
-
-                let filtered: Vec<_> = all_maps
-                    .into_iter()
-                    .filter(|tm| {
-                        // Apply class_filter: only include maps that produce this class
-                        if let Some(ref class_filter) = self.pattern.class_filter {
-                            if !tm.classes().contains(class_filter) {
-                                return false;
-                            }
-                        }
-                        // Apply predicate_filter: only include maps that have this predicate
-                        if let Some(ref pred_filter) = self.pattern.predicate_filter {
-                            let has_pred = tm.predicate_object_maps.iter().any(|pom| {
-                                pom.predicate_map.as_constant() == Some(pred_filter.as_str())
-                            });
-                            if !has_pred {
-                                return false;
-                            }
-                        }
-                        true
-                    })
-                    .collect();
-
-                filtered
-            };
-
-            if triples_maps.is_empty() {
-                // No matching TriplesMap found - skip this batch
-                continue;
-            }
-
-            // Get the table provider (same for all child rows)
-            let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
-                QueryError::InvalidQuery("R2RML table provider not configured".to_string())
-            })?;
-
-            // Type for composite lookup cache key: (parent_tm_iri, sorted_parent_join_cols)
-            // This ensures different join conditions on the same parent TM get separate lookups.
-            type LookupCacheKey = (String, Vec<String>);
-
-            // Pre-scan tables and build lookups for each TriplesMap (outside row loop)
-            // Stores: (TriplesMap IRI) -> (batches, parent_lookups)
-            let mut tm_scan_cache: HashMap<
-                String,
-                (Vec<ColumnBatch>, HashMap<LookupCacheKey, ParentLookup>),
-            > = HashMap::new();
-
-            for triples_map in &triples_maps {
-                if tm_scan_cache.contains_key(&triples_map.iri) {
-                    continue;
-                }
-
-                let table_name = triples_map.table_name().ok_or_else(|| {
-                    QueryError::InvalidQuery("TriplesMap has no logical table".to_string())
-                })?;
-
-                // Determine projection columns. For a same-subject star, project
-                // the union of columns needed for every star predicate so the
-                // whole star is satisfied by one scan.
-                let projection: Vec<String> = if self.pattern.star_bindings.is_empty() {
-                    triples_map
-                        .columns_for_predicate(self.pattern.predicate_filter.as_deref())
-                        .into_iter()
-                        .map(std::string::ToString::to_string)
-                        .collect()
-                } else {
-                    let mut cols: Vec<String> = Vec::new();
-                    for pred in self.pattern_predicates() {
-                        cols.extend(
-                            triples_map
-                                .columns_for_predicate(Some(pred))
-                                .into_iter()
-                                .map(std::string::ToString::to_string),
-                        );
-                    }
-                    cols.sort();
-                    cols.dedup();
-                    cols
-                };
-
-                // Scan the table, pushing resolved FILTER predicates for file
-                // pruning (column resolution needs the mapping, so it happens here).
-                let scan_filters = self.build_scan_filters(triples_map);
-                let as_of_t = if ctx.dataset.is_some() {
-                    None
-                } else {
-                    Some(ctx.to_t)
-                };
-                let batches = table_provider
-                    .scan_table(
-                        &self.pattern.graph_source_id,
-                        table_name,
-                        &projection,
-                        &scan_filters,
-                        as_of_t,
-                    )
-                    .await?;
-
-                // Build parent lookup tables for RefObjectMap POMs that match predicate_filter
-                // Key: (parent_tm_iri, parent_join_cols) -> ParentLookup
-                let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
-
-                // Only process POMs that pass the predicate filter. For a star,
-                // include POMs for any of the star predicates so RefObjectMap
-                // lookups are available during the wide-row emit below.
-                let star_preds = self.pattern_predicates();
-                let filtered_poms: Vec<_> = triples_map
-                    .predicate_object_maps
-                    .iter()
-                    .filter(|pom| {
-                        if !self.pattern.star_bindings.is_empty() {
-                            pom.predicate_map
-                                .as_constant()
-                                .is_some_and(|p| star_preds.contains(&p))
-                        } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
-                            pom.predicate_map.as_constant() == Some(pred_filter.as_str())
-                        } else {
-                            true
-                        }
-                    })
-                    .collect();
-
-                for pom in &filtered_poms {
-                    if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
-                        // Build composite cache key: (parent_tm_iri, sorted_parent_join_cols)
-                        let mut parent_join_cols: Vec<String> = rom
-                            .parent_columns()
-                            .into_iter()
-                            .map(std::string::ToString::to_string)
-                            .collect();
-                        parent_join_cols.sort(); // Normalize for consistent key
-                        let lookup_key: LookupCacheKey =
-                            (rom.parent_triples_map.clone(), parent_join_cols.clone());
-
-                        // Skip if we already built this exact lookup
-                        if parent_lookups.contains_key(&lookup_key) {
-                            continue;
-                        }
-
-                        // Get the parent TriplesMap
-                        let parent_tm = match mapping.get(&rom.parent_triples_map) {
-                            Some(tm) => tm,
-                            None => {
-                                tracing::warn!(
-                                    parent = %rom.parent_triples_map,
-                                    "Parent TriplesMap not found for RefObjectMap, skipping"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Get parent table name
-                        let parent_table = match parent_tm.table_name() {
-                            Some(name) => name,
-                            None => {
-                                tracing::warn!(
-                                    parent = %rom.parent_triples_map,
-                                    "Parent TriplesMap has no logical table, skipping"
-                                );
-                                continue;
-                            }
-                        };
-
-                        // Determine columns needed from parent table:
-                        // - Parent columns from join conditions
-                        // - Subject template columns
-                        // - Subject column (if using rr:column instead of template)
-                        let mut parent_projection: Vec<String> = parent_join_cols.clone();
-                        parent_projection
-                            .extend(parent_tm.subject_map.template_columns.iter().cloned());
-                        // Include rr:column if subject map uses column instead of template
-                        if let Some(ref col) = parent_tm.subject_map.column {
-                            parent_projection.push(col.clone());
-                        }
-                        parent_projection.sort();
-                        parent_projection.dedup();
-
-                        // Scan the parent table
-                        let as_of_t = if ctx.dataset.is_some() {
-                            None
-                        } else {
-                            Some(ctx.to_t)
-                        };
-                        let parent_batches = table_provider
-                            .scan_table(
-                                &self.pattern.graph_source_id,
-                                parent_table,
-                                &parent_projection,
-                                &[],
-                                as_of_t,
-                            )
-                            .await?;
-
-                        // Build the lookup
-                        let lookup =
-                            build_parent_lookup(parent_tm, &parent_join_cols, parent_batches)?;
-
-                        parent_lookups.insert(lookup_key, lookup);
-                    }
-                }
-
-                tm_scan_cache.insert(triples_map.iri.clone(), (batches, parent_lookups));
-            }
-
-            // Materialize each TriplesMap's produced rows ONCE, then hash-join
-            // them against the child on the shared variables, instead of
-            // re-scanning/re-materializing the table per child row (O(N*M)).
-            for triples_map in &triples_maps {
-                let (batches, parent_lookups) = match tm_scan_cache.get(&triples_map.iri) {
-                    Some(cached) => cached,
-                    None => continue,
-                };
-
-                let produced =
-                    self.materialize_produced_rows(triples_map, batches, parent_lookups, ctx)?;
-                if produced.is_empty() {
-                    continue;
-                }
-
-                // Join vars = pattern-produced vars the child already binds.
-                let join_vars: Vec<VarId> = self
-                    .pattern
-                    .produced_vars()
-                    .into_iter()
-                    .filter(|v| child_schema.contains(v))
-                    .collect();
-
-                // Emit child[row_idx] combined with a produced assignment.
-                macro_rules! emit_combined {
-                    ($row_idx:expr, $prod:expr) => {{
-                        ctx.tracker.consume_fuel(1)?;
-                        let mut out_row: Vec<Binding> = vec![Binding::Unbound; num_cols];
-                        for (col_idx, &var) in child_schema.iter().enumerate() {
-                            let out_idx = *self.out_pos.get(&var).unwrap();
-                            out_row[out_idx] =
-                                child_batch.column_by_idx(col_idx).unwrap()[$row_idx].clone();
-                        }
-                        for (var, binding) in $prod {
-                            out_row[*self.out_pos.get(var).unwrap()] = binding.clone();
-                        }
-                        if columns[0].len() < ctx.batch_size {
-                            for (col_idx, binding) in out_row.into_iter().enumerate() {
-                                columns[col_idx].push(binding);
-                            }
-                        } else {
-                            self.pending.push_back(out_row);
-                        }
-                    }};
-                }
-
-                if join_vars.is_empty() {
-                    // No shared vars: cross product (child is usually the seed row).
-                    for row_idx in 0..child_batch.len() {
-                        for prod in &produced {
-                            emit_combined!(row_idx, prod);
-                        }
-                    }
-                } else {
-                    // Hash join: index produced rows by the join-var values, then
-                    // probe once per child row. O(N + M) instead of O(N * M).
-                    let store = ctx.binary_store.as_deref();
-                    let gv = ctx.graph_view();
-                    let gv = gv.as_ref();
-
-                    // Per-join-var keys for each produced row, aligned with
-                    // `produced`. A produced row always binds every pattern var,
-                    // so a complete key has len == join_vars.len().
-                    let produced_keys: Vec<Vec<GroupKeyOwned>> = produced
-                        .iter()
-                        .map(|prod| {
-                            join_vars
-                                .iter()
-                                .filter_map(|jv| {
-                                    prod.iter()
-                                        .find(|(v, _)| v == jv)
-                                        .map(|(_, b)| binding_to_group_key_normalized(b, store, gv))
-                                })
-                                .collect()
-                        })
-                        .collect();
-
-                    let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
-                    for (pi, keys) in produced_keys.iter().enumerate() {
-                        if keys.len() == join_vars.len() {
-                            index.entry(keys.clone()).or_default().push(pi);
-                        }
-                    }
-                    for row_idx in 0..child_batch.len() {
-                        // Build the child's join key. An unbound join var is a
-                        // wildcard (SPARQL compatibility: unbound is compatible
-                        // with any value, binding from the produced side), so we
-                        // keep `None` for it and match the bound positions only.
-                        // A poisoned binding can never match, so the row is
-                        // dropped.
-                        let mut child_key: Vec<Option<GroupKeyOwned>> =
-                            Vec::with_capacity(join_vars.len());
-                        let mut all_bound = true;
-                        let mut poisoned = false;
-                        for &jv in &join_vars {
-                            let pos = child_schema.iter().position(|&v| v == jv).unwrap();
-                            let b = &child_batch.column_by_idx(pos).unwrap()[row_idx];
-                            if b.is_poisoned() {
-                                poisoned = true;
-                                break;
-                            }
-                            if b.is_bound() {
-                                child_key.push(Some(binding_to_group_key_normalized(b, store, gv)));
-                            } else {
-                                all_bound = false;
-                                child_key.push(None);
-                            }
-                        }
-                        if poisoned {
-                            continue;
-                        }
-                        if all_bound {
-                            // Fast path: full key, hash probe.
-                            let full: Vec<GroupKeyOwned> =
-                                child_key.into_iter().map(Option::unwrap).collect();
-                            if let Some(matches) = index.get(&full) {
-                                for &pi in matches {
-                                    emit_combined!(row_idx, &produced[pi]);
-                                }
-                            }
-                        } else {
-                            // Partial key: match produced rows agreeing on every
-                            // bound join var (unbound positions are wildcards).
-                            for (pi, keys) in produced_keys.iter().enumerate() {
-                                if keys.len() != join_vars.len() {
-                                    continue;
-                                }
-                                let agrees = child_key
-                                    .iter()
-                                    .zip(keys.iter())
-                                    .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
-                                if agrees {
-                                    emit_combined!(row_idx, &produced[pi]);
-                                }
-                            }
-                        }
-                    }
+                    return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
                 }
             }
-        }
-
-        if columns[0].is_empty() {
-            self.state = OperatorState::Exhausted;
-            Ok(None)
-        } else {
-            Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?))
         }
     }
 
@@ -936,6 +1172,7 @@ impl Operator for R2rmlScanOperator {
         self.child.close();
         self.mapping = None;
         self.pending.clear();
+        self.progress = None;
         self.state = OperatorState::Closed;
     }
 
