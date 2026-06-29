@@ -1,5 +1,5 @@
 use crate::cli::PolicyArgs;
-use crate::commands::insert::resolve_positional_args;
+use crate::commands::insert::resolve_inputs;
 use crate::commands::query_stream::{self, NdjsonConsumer};
 use crate::context::{self, LedgerMode};
 use crate::detect;
@@ -213,6 +213,7 @@ fn inject_sparql_from_before_where(sparql: &str, from_iri: &str) -> Option<Strin
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: &[String],
+    ledger_flag: Option<&str>,
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format_str: &str,
@@ -233,7 +234,7 @@ pub async fn run(
     const BENCH_ROWS: usize = 5;
     const DEFAULT_TABLE_PREVIEW_ROWS: usize = 200;
     let limit = if bench { Some(BENCH_ROWS) } else { None };
-    let (explicit_ledger, positional_inline, positional_file) = resolve_positional_args(args)?;
+    let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
 
     // Resolve input: -e > positional inline > -f > positional file > stdin
     let source = input::resolve_input(

@@ -233,7 +233,7 @@ impl super::Parser<'_> {
 
             // Parse predicate-object list (simple predicates only, no paths)
             let mut triples: Vec<crate::ast::TriplePattern> = Vec::new();
-            self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            self.parse_template_triples_for_subject(&subject, &mut triples)?;
             for t in triples {
                 quads.push(QuadPatternElement::Triple(Box::new(t)));
             }
@@ -291,7 +291,7 @@ impl super::Parser<'_> {
 
             let mut triples: Vec<crate::ast::TriplePattern> = Vec::new();
             // Parse predicate-object list (simple predicates only, no paths)
-            self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            self.parse_template_triples_for_subject(&subject, &mut triples)?;
             for t in triples {
                 patterns.push(QuadPatternElement::Triple(Box::new(t)));
             }
@@ -346,7 +346,7 @@ impl super::Parser<'_> {
                     return None;
                 }
             };
-            self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            self.parse_template_triples_for_subject(&subject, &mut triples)?;
             self.stream.match_token(&TokenKind::Dot);
         }
 

@@ -16,10 +16,14 @@ fluree query [LEDGER] [QUERY] [OPTIONS]
 | `<arg>` | Auto-detected: if it looks like a query, uses it inline with the active ledger; if it's an existing file, reads from it; otherwise treats it as a ledger name |
 | `<ledger> <query>` | Specified ledger + inline query |
 
+The ledger may also be given explicitly with `-l`/`--ledger`, which bypasses
+the positional auto-detection (e.g. `fluree query --ledger mydb:main 'SELECT …'`).
+
 ## Options
 
 | Option | Description |
 |--------|-------------|
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger); explicit alternative to the positional ledger argument |
 | `-e, --expr <EXPR>` | Inline query expression (alternative to positional) |
 | `-f, --file <FILE>` | Read query from a file |
 | `--format <FORMAT>` | Output format: `json`, `typed-json`, `table`, `csv`, `tsv`, or `ndjson` (default: `table`) |

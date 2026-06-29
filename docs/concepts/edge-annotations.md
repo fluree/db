@@ -86,6 +86,23 @@ You can give the annotation an IRI when you need stable identity — for updates
 
 Two inserts that target the same explicit `@id` reattach to the same annotation subject — idempotent. Two inserts with no explicit `@id` mint two distinct annotations on the same edge (see *Parallel annotations* below).
 
+### Minting an annotation in an update
+
+The same `@annotation` form works inside an update's `insert` clause, so you can annotate edges selected by a `WHERE` pattern. Variables bound in `WHERE` are usable as the edge subject/object, and each solution mints its own annotation:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "where":  { "@id": "?person", "ex:worksFor": "?org" },
+  "insert": {
+    "@id": "?person",
+    "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "Staff" } }
+  }
+}
+```
+
+This is distinct from *editing* an existing annotation's metadata (below), which addresses the annotation subject directly by `@id`.
+
 ### Annotating literal-valued edges
 
 RDF 1.2 permits annotations on triples whose object is a literal — `:alice :name "Alice" {| :source :hr |}` in Turtle-star, equivalently:

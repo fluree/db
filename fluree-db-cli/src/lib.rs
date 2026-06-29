@@ -193,6 +193,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Insert {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -202,6 +203,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::insert::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 format.as_deref(),
@@ -215,6 +217,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Update {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -224,6 +227,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::update::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 format.as_deref(),
@@ -237,6 +241,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Upsert {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -246,6 +251,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::upsert::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 format.as_deref(),
@@ -259,6 +265,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Query {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -281,6 +288,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::query::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 &format,

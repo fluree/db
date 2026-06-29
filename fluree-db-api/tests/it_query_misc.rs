@@ -1327,3 +1327,47 @@ async fn union_passthrough_variables() {
 
     assert_eq!(normalize_rows(&rows), normalize_rows(&expected));
 }
+
+#[tokio::test]
+async fn projection_expression_error_leaves_var_unbound() {
+    // SPARQL↔JSON-LD parity (#1374 review): a value error in a SELECT/BIND
+    // projection expression leaves that one cell UNBOUND for the row instead of
+    // failing the whole query (or returning HTTP 400). Mirrors the SPARQL
+    // surface test `sparql_projection_expression_error_leaves_var_unbound`;
+    // both surfaces share the Extend (§18.5) execution path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprerr-jsonld:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {"@id": "ex:s1", "ex:p": "abc"},
+            {"@id": "ex:s2", "ex:p": {"@value": "2", "@type": "xsd:integer"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?v", "(as (+ ?v 1) ?plus)"],
+        "where": { "@id": "?s", "ex:p": "?v" },
+        "orderBy": ["?v"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("expression error must not fail the whole query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let rows = rows.as_array().expect("rows array");
+    assert_eq!(rows.len(), 2, "both rows must be returned: {rows:?}");
+
+    // The string row ("abc" + 1) errors → ?plus is null (unbound). The integer
+    // row (2 + 1) yields 3. Order-independent so formatting can't flake the test.
+    let has_error_row = rows
+        .iter()
+        .any(|r| r[0] == json!("abc") && r[1] == json!(null));
+    let has_ok_row = rows.iter().any(|r| r[1] == json!(3));
+    assert!(
+        has_error_row,
+        "errored ?plus must be unbound (null) on the string row: {rows:?}"
+    );
+    assert!(has_ok_row, "?plus must be 3 on the integer row: {rows:?}");
+}

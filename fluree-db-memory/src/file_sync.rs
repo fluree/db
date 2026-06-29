@@ -190,6 +190,7 @@ pub(crate) async fn acquire_memory_lock(memory_dir: &Path) -> Result<fs::File> {
 }
 
 async fn acquire_lock_file(lock_path: PathBuf) -> Result<fs::File> {
+    let timeout = lock_timeout();
     tokio::task::spawn_blocking(move || {
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)?;
@@ -201,14 +202,51 @@ async fn acquire_lock_file(lock_path: PathBuf) -> Result<fs::File> {
             .truncate(false)
             .open(&lock_path)?;
 
+        // Poll `try_lock` to a deadline instead of blocking forever. A wedged
+        // peer process (e.g. a spun memory server from another IDE window) must
+        // not be able to freeze this one indefinitely — time out with a clear
+        // error so the caller can surface it and recover.
         use fs2::FileExt;
-        lock_file
-            .lock_exclusive()
-            .map_err(|e| MemoryError::FileSync(format!("failed to acquire rebuild lock: {e}")))?;
-        Ok(lock_file)
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match lock_file.try_lock_exclusive() {
+                Ok(()) => return Ok(lock_file),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(MemoryError::FileSync(format!(
+                            "timed out after {timeout:?} waiting for the memory rebuild lock \
+                             ({}); another fluree process may be stuck holding it",
+                            lock_path.display()
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(MemoryError::FileSync(format!(
+                        "failed to acquire rebuild lock: {e}"
+                    )))
+                }
+            }
+        }
     })
     .await
     .map_err(|e| MemoryError::FileSync(format!("failed to join rebuild lock task: {e}")))?
+}
+
+/// Maximum time to wait for either memory lock before giving up.
+///
+/// Bounds both the cross-process flock and the in-process mutation lock so a
+/// stuck operation surfaces a recoverable error instead of freezing a session.
+/// Generous by default (legitimate rebuilds are sub-second now that adds are
+/// append-only) and overridable via `FLUREE_MEMORY_LOCK_TIMEOUT_SECS`.
+pub(crate) fn lock_timeout() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 30;
+    let secs = std::env::var("FLUREE_MEMORY_LOCK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(DEFAULT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Rebuild the ledger from files if this process's ledger is stale, assuming
@@ -396,6 +434,40 @@ mod hex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rebuild_lock_times_out_when_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".local")).unwrap();
+        // Keep the timeout short so the test is fast.
+        // NOTE: this mutates the process-global env that `lock_timeout()` reads.
+        // It is safe only because no sibling test in this binary reads
+        // `lock_timeout()`; if one is added, this test must serialize against it
+        // (e.g. a shared mutex) or scope the var, since nextest runs siblings on
+        // parallel threads in the same process.
+        std::env::set_var("FLUREE_MEMORY_LOCK_TIMEOUT_SECS", "1");
+
+        // First acquisition succeeds and holds the lock.
+        let held = acquire_memory_lock(dir.path()).await.expect("first lock");
+
+        // A second acquisition (separate fd, same process) must not block
+        // forever — it times out with an error.
+        let start = std::time::Instant::now();
+        let res = acquire_memory_lock(dir.path()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            res.is_err(),
+            "second acquisition should time out while the lock is held"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "timeout should fire promptly (took {elapsed:?})"
+        );
+
+        drop(held);
+        std::env::remove_var("FLUREE_MEMORY_LOCK_TIMEOUT_SECS");
+    }
 
     #[test]
     fn hash_determinism() {
