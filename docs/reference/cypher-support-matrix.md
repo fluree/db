@@ -12,7 +12,7 @@ see the [Cypher cookbook](../guides/cookbook-cypher.md).
 |------|---------|
 | ✅ | **Supported** — works as openCypher 9 specifies. |
 | ◑ | **Partial** — a common subset works; specific forms are deferred (noted). |
-| ⟂ | **Divergent by design** — intentionally different because Fluree is an RDF / immutable graph, not an LPG store. Rejected-or-adapted, never silently wrong. |
+| ⟂ | **Divergent by design** — intentionally different because Fluree is multi-modal graph. Rejected-or-adapted, never silently wrong. |
 | ⏳ | **Deferred** — not yet implemented; rejected with a clear error. |
 
 **Guiding invariant:** an unsupported construct produces a *clear error*, never a
