@@ -1103,8 +1103,15 @@ impl Novelty {
         rhs: Option<&Flake>,
         leftmost: bool,
     ) -> GraphMergeIter<'_> {
-        let mut streams: Vec<MergeStream<'_>> = Vec::new();
-        let mut heap: BinaryHeap<MergeHead<'_>> = BinaryHeap::new();
+        // Upper-bounded by the graph's segment count (some may zone-map prune),
+        // so size both up front to avoid reallocation churn on the K>1 read path.
+        let cap = self
+            .graphs
+            .get(g_id as usize)
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len);
+        let mut streams: Vec<MergeStream<'_>> = Vec::with_capacity(cap);
+        let mut heap: BinaryHeap<MergeHead<'_>> = BinaryHeap::with_capacity(cap);
         if let Some(Some(segs)) = self.graphs.get(g_id as usize) {
             for (seg_idx, seg) in segs.iter().enumerate() {
                 // Zone-map prune: skip segments whose key range can't intersect
