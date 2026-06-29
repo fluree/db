@@ -23,7 +23,7 @@ use crate::ir::{
     Query, QueryOutput, Restriction, Root,
 };
 use crate::ir::{
-    Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, Pattern,
+    Expression, Function, IndexSearchPattern, IndexSearchTarget, PathModifier, PathStep, Pattern,
     PropertyPathPattern, ShortestPathPattern, SubqueryPattern, VectorSearchPattern,
     VectorSearchTarget,
 };
@@ -295,6 +295,8 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                     path_var: path_var_id,
                     min_hops: *min_hops,
                     max_hops: *max_hops,
+                    // JSON-LD/FQL has no `relationships()`; never build edges.
+                    needs_relationships: false,
                 })]),
                 // Predicate IRI not in the dictionary → no edges of that type
                 // exist → the search yields no rows.
@@ -641,12 +643,39 @@ fn lower_path_to_patterns<E: IriEncoder>(
     match effective_path {
         // Transitive: `p+` / `p*`, plus alternation-transitive `(a|b…)+` / `(a|b…)*`
         // whose closure follows an edge of any listed predicate per hop.
-        UnresolvedPathExpr::OneOrMore(inner) | UnresolvedPathExpr::ZeroOrMore(inner) => {
-            let iris = extract_transitive_predicate_iris(inner)?;
-            let modifier = match effective_path {
-                UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
-                _ => PathModifier::ZeroOrMore,
+        UnresolvedPathExpr::OneOrMore(_)
+        | UnresolvedPathExpr::ZeroOrMore(_)
+        | UnresolvedPathExpr::ZeroOrOne(_) => {
+            // Collapse directly-nested modifiers (`((p)*)*`, `(p+)?`, …) to one
+            // modifier over the innermost path. See `collapse_path_modifiers`.
+            let ((zero, unbounded), innermost) = collapse_path_modifiers(effective_path);
+            let modifier = match (unbounded, zero) {
+                (true, true) => PathModifier::ZeroOrMore,
+                (true, false) => PathModifier::OneOrMore,
+                (false, _) => PathModifier::ZeroOrOne,
             };
+
+            // `(^X)+ ≡ ^(X+)`: peel inverse wrappers around the repeated unit,
+            // swapping endpoints each time, then traverse the core forward. This
+            // reduces `(^p)+`, `(^(a|b))+`, and `(^(a/b))+` to forward paths.
+            let mut swapped = false;
+            let mut core = innermost;
+            while let UnresolvedPathExpr::Inverse(inner) = core {
+                swapped = !swapped;
+                core = inner.as_ref();
+            }
+            let (pp_subject, pp_object) = if swapped { (o, s) } else { (s, o) };
+
+            // Composite (sequence) inner — `(p1/p2/…)+` — each hop follows the
+            // whole sub-path.
+            if let UnresolvedPathExpr::Sequence(steps) = core {
+                let composite = extract_composite_path_steps(steps, encoder)?;
+                return Ok(vec![Pattern::PropertyPath(
+                    PropertyPathPattern::new_composite(pp_subject, composite, modifier, pp_object),
+                )]);
+            }
+
+            let iris = extract_transitive_predicate_iris(core)?;
             let mut predicates = Vec::with_capacity(iris.len());
             for iri in iris {
                 predicates.push(
@@ -656,17 +685,20 @@ fn lower_path_to_patterns<E: IriEncoder>(
                 );
             }
             Ok(vec![Pattern::PropertyPath(
-                PropertyPathPattern::new_alternatives(s, predicates, modifier, o),
+                PropertyPathPattern::new_alternatives(pp_subject, predicates, modifier, pp_object),
             )])
         }
 
         // Inverse: ^path
         UnresolvedPathExpr::Inverse(inner) => match inner.as_ref() {
-            // Inverse-transitive: ^p+ or ^p* → PropertyPathPattern with swapped s/o
-            UnresolvedPathExpr::OneOrMore(tp_inner) | UnresolvedPathExpr::ZeroOrMore(tp_inner) => {
+            // Inverse-transitive: ^p+ or ^p* or ^p? → PropertyPathPattern with swapped s/o
+            UnresolvedPathExpr::OneOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrOne(tp_inner) => {
                 let iri = expect_simple_iri(tp_inner)?;
                 let modifier = match inner.as_ref() {
                     UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
+                    UnresolvedPathExpr::ZeroOrOne(_) => PathModifier::ZeroOrOne,
                     _ => PathModifier::ZeroOrMore,
                 };
                 let predicate = encoder
@@ -708,10 +740,6 @@ fn lower_path_to_patterns<E: IriEncoder>(
              use a regular predicate or add + or *"
                 .to_string(),
         )),
-        UnresolvedPathExpr::ZeroOrOne(_) => Err(ParseError::InvalidWhere(
-            "Optional (?) property paths are parsed but not yet supported for execution"
-                .to_string(),
-        )),
     }
 }
 
@@ -725,6 +753,28 @@ fn lower_path_to_patterns<E: IriEncoder>(
 ///
 /// Returns `Some(rewritten)` if the input was a complex inverse that was
 /// transformed, `None` if no rewrite was needed (simple/transitive inverse).
+/// Collapse a chain of directly-nested transitive/optional modifiers into a
+/// single modifier over the innermost path, returning `((allows_zero,
+/// unbounded), innermost)`. Mirrors the SPARQL-side collapse: the chain allows a
+/// zero-length match if ANY layer is `*`/`?`, and is unbounded if ANY layer is
+/// `+`/`*`. So `(p*)*`→`*`, `(p+)?`→`*`, `(p?)?`→`?`.
+fn collapse_path_modifiers(path: &UnresolvedPathExpr) -> ((bool, bool), &UnresolvedPathExpr) {
+    let mut cur = path;
+    let (mut zero, mut unbounded) = (false, false);
+    loop {
+        let (layer_zero, layer_unbounded, inner) = match cur {
+            UnresolvedPathExpr::OneOrMore(inner) => (false, true, inner),
+            UnresolvedPathExpr::ZeroOrMore(inner) => (true, true, inner),
+            UnresolvedPathExpr::ZeroOrOne(inner) => (true, false, inner),
+            _ => break,
+        };
+        zero |= layer_zero;
+        unbounded |= layer_unbounded;
+        cur = inner;
+    }
+    ((zero, unbounded), cur)
+}
+
 fn rewrite_inverse_of_complex(path: &UnresolvedPathExpr) -> Option<UnresolvedPathExpr> {
     match path {
         UnresolvedPathExpr::Inverse(inner) => match inner.as_ref() {
@@ -994,7 +1044,9 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
                 next.clone().into(),
             )))
         }
-        UnresolvedPathExpr::OneOrMore(inner) | UnresolvedPathExpr::ZeroOrMore(inner) => {
+        UnresolvedPathExpr::OneOrMore(inner)
+        | UnresolvedPathExpr::ZeroOrMore(inner)
+        | UnresolvedPathExpr::ZeroOrOne(inner) => {
             if prev.is_bound() && next.is_bound() {
                 return Err(ParseError::InvalidWhere(
                     "Property path requires at least one variable (cannot have both subject and object as constants)"
@@ -1004,6 +1056,7 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
             let iri = expect_simple_iri(inner)?;
             let modifier = match step {
                 UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
+                UnresolvedPathExpr::ZeroOrOne(_) => PathModifier::ZeroOrOne,
                 _ => PathModifier::ZeroOrMore,
             };
             let predicate = encoder
@@ -1025,7 +1078,9 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
                     prev.clone().into(),
                 )))
             }
-            UnresolvedPathExpr::OneOrMore(tp_inner) | UnresolvedPathExpr::ZeroOrMore(tp_inner) => {
+            UnresolvedPathExpr::OneOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrMore(tp_inner)
+            | UnresolvedPathExpr::ZeroOrOne(tp_inner) => {
                 if prev.is_bound() && next.is_bound() {
                     return Err(ParseError::InvalidWhere(
                         "Property path requires at least one variable (cannot have both subject and object as constants)"
@@ -1035,6 +1090,7 @@ fn lower_sequence_step_pattern<E: IriEncoder>(
                 let iri = expect_simple_iri(tp_inner)?;
                 let modifier = match inner.as_ref() {
                     UnresolvedPathExpr::OneOrMore(_) => PathModifier::OneOrMore,
+                    UnresolvedPathExpr::ZeroOrOne(_) => PathModifier::ZeroOrOne,
                     _ => PathModifier::ZeroOrMore,
                 };
                 let predicate = encoder
@@ -1204,6 +1260,37 @@ fn expect_simple_iri(path: &UnresolvedPathExpr) -> Result<&Arc<str>> {
             "Transitive paths (+ or *) currently require a simple predicate IRI".to_string(),
         )),
     }
+}
+
+/// Resolve the per-step [`PathStep`]s of a composite-transitive path
+/// `(p1/p2/…)+`. Each step must be a simple predicate, an alternation of simple
+/// predicates, or either of those inverted (`^p`, `^(a|b)`); other step shapes
+/// are rejected.
+fn extract_composite_path_steps<E: IriEncoder>(
+    steps: &[UnresolvedPathExpr],
+    encoder: &E,
+) -> Result<Vec<PathStep>> {
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let (inner, inverse) = match step {
+            UnresolvedPathExpr::Inverse(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        };
+        let iris = extract_transitive_predicate_iris(inner)?;
+        let mut sids = Vec::with_capacity(iris.len());
+        for iri in iris {
+            sids.push(
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.to_string()))?,
+            );
+        }
+        out.push(PathStep {
+            predicates: sids,
+            inverse,
+        });
+    }
+    Ok(out)
 }
 
 /// Lower an unresolved subquery to a resolved SubqueryPattern
@@ -1577,6 +1664,8 @@ fn lower_function_name(name: &str) -> Function {
         "-" => Function::Sub,
         "*" => Function::Mul,
         "/" => Function::Div,
+        "%" | "mod" => Function::Mod,
+        "xor" => Function::Xor,
         "negate" => Function::Negate,
         // String functions
         "strlen" => Function::Strlen,

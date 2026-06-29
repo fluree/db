@@ -556,6 +556,8 @@ pub async fn query(
     // Detect input format before span creation so otel.name is set at open time
     let input_format = if is_sparql_request(&headers, &credential, &params) {
         "sparql"
+    } else if headers.is_cypher_query() {
+        "cypher"
     } else {
         "json-ld"
     };
@@ -593,6 +595,15 @@ pub async fn query(
         set_span_error_code(&span, "error:BadRequest");
         tracing::warn!(error = %error, "SPARQL UPDATE sent to query endpoint");
         return Err(error);
+    }
+
+    // Cypher has no FROM/dataset clause, so the connection-scoped route can't
+    // resolve a ledger — direct callers at the ledger-scoped endpoint.
+    if headers.is_cypher_query() {
+        set_span_error_code(&span, "error:BadRequest");
+        return Err(ServerError::bad_request(
+            "Cypher queries must target a ledger; use the /v1/fluree/query/<ledger> endpoint.",
+        ));
     }
 
     let delimited = wants_delimited(&headers);
@@ -1014,6 +1025,48 @@ pub async fn query_ledger(
             params.default_context,
         )
             .await;
+    }
+
+    // Handle Cypher query (Content-Type: application/cypher) — ledger is
+    // known from the path. JSON-LD output; tracking/delimited/agent-json are
+    // not negotiated yet, but policy/identity are enforced for parity with
+    // the SPARQL/JSON-LD paths.
+    if headers.is_cypher_query() {
+        if let Some(p) = bearer.0.as_ref() {
+            if !credential.is_signed() && !p.can_read(&ledger) {
+                set_span_error_code(&span, "error:Forbidden");
+                return Err(ServerError::not_found("Ledger not found"));
+            }
+        }
+        let cypher = credential.body_string()?;
+        log_query_text(&cypher, &state.telemetry_config, &span);
+        // Resolve the effective identity (impersonation-aware), same as the
+        // SPARQL read path, so policy enforcement applies to Cypher too.
+        let bearer_identity = effective_identity(&credential, &bearer);
+        let identity = crate::routes::policy_auth::resolve_sparql_identity(
+            &state,
+            &ledger,
+            bearer_identity.as_deref(),
+            headers.identity.as_deref(),
+        )
+        .await;
+        // Honor the `Fluree-Min-T` read-your-writes freshness wait, same as the
+        // SPARQL/JSON-LD paths. Cypher has no FROM/dataset clause or `@t:` pin,
+        // so the header is the only requirement source, against this one ledger.
+        let mut min_t_requirements = BTreeMap::new();
+        if let Some(min_t) = headers.min_t {
+            merge_min_t_requirement(&mut min_t_requirements, &ledger, min_t);
+        }
+        await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
+        return execute_cypher_ledger(
+            &state,
+            &ledger,
+            &cypher,
+            identity.as_deref(),
+            &headers,
+            &span,
+        )
+        .await;
     }
 
     // Handle JSON-LD query (JSON body)
@@ -1977,8 +2030,35 @@ async fn execute_query(
         return execute_query_proxy(state, ledger_id, query_json, &span).await;
     }
 
-    // Shared storage mode: use load_ledger_for_query with freshness checking
-    let ledger = load_ledger_for_query(state, ledger_id, &span).await?;
+    // Shared storage mode: use load_ledger_for_query with freshness checking.
+    // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
+    // ledger; those resolve through the connection/dataset path, which queries
+    // them via their source engine instead of loading a ledger (#1369).
+    let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+        Ok(l) => l,
+        Err(e) => {
+            // Non-not-found errors (real load failures) propagate unchanged.
+            if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
+                return Err(e);
+            }
+            // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather
+            // than a ledger. A registered source runs through the dataset path
+            // (queried via its source engine); a delimited format on a real
+            // source gets the explicit format error (matching the SPARQL
+            // handler). A genuinely-missing ledger returns a clean NotFound
+            // (404 + NotFound span) instead of being misreported by that path.
+            if state.fluree.resolve_graph_source(ledger_id).await?.is_some() {
+                if let Some(fmt) = delimited {
+                    return Err(ServerError::not_acceptable(format!(
+                        "{} format not supported for graph source queries",
+                        fmt.name().to_uppercase()
+                    )));
+                }
+                return execute_dataset_query(state, ledger_id, query_json, &span).await;
+            }
+            return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
+        }
+    };
     let graph = GraphDb::from_ledger_state(&ledger);
     let fluree = &state.fluree;
 
@@ -2169,10 +2249,6 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
-/// Build `GovernanceOptions` for a ledger-scoped SPARQL request from the
-/// resolved identity plus header-supplied policy fields. SPARQL has no body
-/// `opts` block, so headers are the only transport for `policy-class`,
-/// `policy`, `policy-values`, and `default-allow`.
 pub(crate) fn sparql_qc_opts(
     identity: Option<&str>,
     headers: &FlureeHeaders,
@@ -2300,6 +2376,86 @@ pub(crate) fn ledger_scoped_sparql_dataset_spec(
     }
 
     Ok(spec)
+}
+
+async fn execute_cypher_ledger(
+    state: &AppState,
+    ledger_id: &str,
+    cypher: &str,
+    identity: Option<&str>,
+    headers: &FlureeHeaders,
+    span: &tracing::Span,
+) -> Result<Response> {
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(cypher);
+
+    // Build policy options from the resolved identity + headers. Cypher has no
+    // body `opts` block, so headers are the only transport for `policy-class`,
+    // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
+    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
+        set_span_error_code(span, "error:BadRequest");
+    })?;
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        identity: identity.map(String::from),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+    };
+
+    let view = state
+        .fluree
+        .db_with_default_context(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    // Wrap the view with policy when any policy input is present (identity,
+    // policy-class, inline policy, etc.), so restricted data is filtered.
+    let view = if qc_opts.has_any_policy_inputs() {
+        state
+            .fluree
+            .wrap_policy(view, &qc_opts, None)
+            .await
+            .map_err(ServerError::Api)?
+    } else {
+        view
+    };
+
+    let result = state
+        .fluree
+        .query_cypher_with_params(&view, &cypher, params.as_ref())
+        .await
+        .map_err(|e| {
+            set_span_error_code(span, "error:InvalidQuery");
+            ServerError::Api(e)
+        })?;
+    // Cypher defaults to cypher-json (Neo4j-compatible, native scalars);
+    // `Accept: application/ld+json` opts into the RDF JSON-LD form.
+    let (json, content_type) = if headers.wants_jsonld() {
+        (
+            result
+                .to_jsonld_async(view.as_graph_db_ref())
+                .await
+                .map_err(|e| ServerError::Api(e.into()))?,
+            "application/ld+json; charset=utf-8",
+        )
+    } else {
+        (
+            result
+                .to_cypher_json_async(view.as_graph_db_ref())
+                .await
+                .map_err(|e| ServerError::Api(e.into()))?,
+            "application/vnd.fluree.cypher+json; charset=utf-8",
+        )
+    };
+    tracing::info!(status = "success", query_kind = "cypher");
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, content_type)],
+        Json(json),
+    )
+        .into_response())
 }
 
 /// Execute a SPARQL query against a specific ledger and return result
@@ -2490,8 +2646,20 @@ async fn execute_sparql_ledger(
             }
 
             // Ensure head is fresh in shared storage mode before time-travel view loading.
+            // The URL alias may name a graph source rather than a ledger; a graph
+            // source is a genesis view with no ledger head to refresh, so a clean
+            // not-found there is expected — let the dataset build resolve it (it
+            // already supports graph sources via `load_view_from_source`). A
+            // genuinely-missing ledger still propagates its not-found.
             if !state.config.is_proxy_storage_mode() {
-                let _ = load_ledger_for_query(state, ledger_id, &span).await?;
+                if let Err(e) = load_ledger_for_query(state, ledger_id, &span).await {
+                    let is_not_found = matches!(&e, ServerError::Api(api) if api.is_not_found());
+                    if !(is_not_found
+                        && state.fluree.resolve_graph_source(ledger_id).await?.is_some())
+                    {
+                        return Err(e);
+                    }
+                }
             }
 
             let spec = ledger_scoped_sparql_dataset_spec(ledger_id, dc)?;
@@ -2676,12 +2844,59 @@ async fn execute_sparql_ledger(
                 .into_response());
         }
 
-        // Shared storage mode: use load_ledger_for_query with freshness checking
-        let ledger = load_ledger_for_query(state, ledger_id, &span)
-            .await
-            .inspect_err(|_| {
-                set_span_error_code(&span, "error:LedgerLoad");
-            })?;
+        // Shared storage mode: use load_ledger_for_query with freshness checking.
+        // The alias may name a graph source (Iceberg/R2RML) rather than a ledger;
+        // on a clean not-found, resolve it through the graph-source-aware single
+        // target path (`graph().query()` auto-enables R2RML), which queries it via
+        // its source engine (#1369). Mirrors the JSON-LD `execute_query` ->
+        // `execute_dataset_query` fallback. Graph sources support JSON output only.
+        let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                // Non-not-found errors (real load failures) keep the LedgerLoad tag.
+                if !matches!(&e, ServerError::Api(api) if api.is_not_found()) {
+                    set_span_error_code(&span, "error:LedgerLoad");
+                    return Err(e);
+                }
+                // As in execute_query: resolve the alias as a graph source; only a
+                // registered source reports the JSON-only format errors before
+                // running via the R2RML-aware single-target path. A genuinely-
+                // missing ledger returns a clean NotFound.
+                if state.fluree.resolve_graph_source(ledger_id).await?.is_some() {
+                    if wants_sparql_xml || wants_rdf_xml {
+                        return Err(ServerError::not_acceptable(
+                            "Only JSON output is supported for graph source queries".to_string(),
+                        ));
+                    }
+                    if let Some(fmt) = delimited {
+                        return Err(ServerError::not_acceptable(format!(
+                            "{} format not supported for graph source queries",
+                            fmt.name().to_uppercase()
+                        )));
+                    }
+                    let result = state
+                        .fluree
+                        .graph(ledger_id)
+                        .query()
+                        .sparql(sparql)
+                        .format(json_fmt_config.clone())
+                        .execution_options(query_execution_options(state))
+                        .execute_formatted()
+                        .await
+                        .map_err(|e| {
+                            set_span_error_code(&span, "error:QueryFailed");
+                            ServerError::Api(e)
+                        })?;
+                    tracing::info!(status = "success", graph_source = true);
+                    return Ok((
+                        [(axum::http::header::CONTENT_TYPE, json_content_type)],
+                        Json(result),
+                    )
+                        .into_response());
+                }
+                return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
+            }
+        };
         let graph = attach_default_context_to_graph(
             state,
             ledger_id,

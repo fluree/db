@@ -21,6 +21,9 @@ pub struct LimitOperator {
     limit: usize,
     /// Rows emitted so far
     emitted: usize,
+    /// Budget inherited from an outer LIMIT (rare: LIMIT under LIMIT). The child
+    /// is seeded with `min(self.limit, inherited)`.
+    inherited_budget: Option<usize>,
     /// Output schema (same as child)
     schema: Arc<[VarId]>,
     /// Operator state
@@ -40,6 +43,7 @@ impl LimitOperator {
             child,
             limit,
             emitted: 0,
+            inherited_budget: None,
             schema,
             state: OperatorState::Created,
         }
@@ -73,10 +77,21 @@ impl Operator for LimitOperator {
             return Err(crate::error::QueryError::OperatorAlreadyOpened);
         }
 
+        // Seed the row budget down the (row/order-preserving) child chain before
+        // opening it, so eager operators can bound their work before producing.
+        let budget = self
+            .inherited_budget
+            .map_or(self.limit, |inherited| inherited.min(self.limit));
+        self.child.set_row_budget(budget);
+
         self.child.open(ctx).await?;
         self.emitted = 0;
         self.state = OperatorState::Open;
         Ok(())
+    }
+
+    fn set_row_budget(&mut self, budget: usize) {
+        self.inherited_budget = Some(budget);
     }
 
     async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
@@ -413,5 +428,84 @@ mod tests {
         // Can't open after close
         let err = limit_op.open(&ctx).await;
         assert!(matches!(err, Err(QueryError::OperatorClosed)));
+    }
+
+    /// Leaf operator that records the row budget pushed to it (and never
+    /// forwards — it is an absorbing leaf), so a test can assert the budget that
+    /// reached the bottom of a forwarder chain.
+    struct BudgetRecorder {
+        received: Arc<std::sync::Mutex<Option<usize>>>,
+        schema: Arc<[VarId]>,
+        state: OperatorState,
+    }
+
+    #[async_trait]
+    impl Operator for BudgetRecorder {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            self.state = OperatorState::Open;
+            Ok(())
+        }
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(None)
+        }
+        fn close(&mut self) {
+            self.state = OperatorState::Closed;
+        }
+        fn set_row_budget(&mut self, budget: usize) {
+            *self.received.lock().unwrap() = Some(budget);
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_threads_through_offset_and_project() {
+        use crate::offset::OffsetOperator;
+        use crate::project::ProjectOperator;
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let recorder = BudgetRecorder {
+            received: Arc::clone(&received),
+            schema: schema.clone(),
+            state: OperatorState::Created,
+        };
+
+        // LIMIT 10 ( OFFSET 5 ( PROJECT ( recorder ) ) )
+        // Project passes 10 through; Offset adds its 5 → recorder sees 15.
+        let project = ProjectOperator::new(Box::new(recorder), vec![VarId(0)]);
+        let offset = OffsetOperator::new(Box::new(project), 5);
+        let mut limit = LimitOperator::new(Box::new(offset), 10);
+
+        limit.open(&ctx).await.unwrap();
+
+        assert_eq!(*received.lock().unwrap(), Some(15));
+    }
+
+    #[tokio::test]
+    async fn budget_is_min_of_limit_and_inherited() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let recorder = BudgetRecorder {
+            received: Arc::clone(&received),
+            schema: schema.clone(),
+            state: OperatorState::Created,
+        };
+
+        // Inner LIMIT 100 under an inherited budget of 3 seeds min(100, 3) = 3.
+        let mut limit = LimitOperator::new(Box::new(recorder), 100);
+        limit.set_row_budget(3);
+        limit.open(&ctx).await.unwrap();
+
+        assert_eq!(*received.lock().unwrap(), Some(3));
     }
 }

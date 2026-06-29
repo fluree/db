@@ -78,6 +78,25 @@ pub trait Operator: Send + Sync {
         Ok(None)
     }
 
+    /// Advisory row budget pushed down from a top-of-tree `LIMIT`.
+    ///
+    /// Tells this operator that its parent needs at most `budget` rows, so an
+    /// eager operator MAY bound its work (e.g. flush a batched accumulator
+    /// early). It is **purely advisory**: a fully-drained operator must still
+    /// produce the identical multiset *and* order, so the hint can never change
+    /// query results.
+    ///
+    /// **Default = ABSORB** (no-op). An operator forwards a budget to its
+    /// children only by explicitly overriding this, and only when it is
+    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`.
+    /// Row-dropping / reordering / materializing operators (`Bind`, `Filter`,
+    /// `Sort`, `Distinct`, `GroupAggregate`, hash-join build) absorb, so a
+    /// budget never leaks past a boundary where it would be unsound.
+    ///
+    /// Set **before** `open()`. Consult only at batch/leaflet boundaries —
+    /// never inside fused per-row/per-group loops (hot-loop purity).
+    fn set_row_budget(&mut self, _budget: usize) {}
+
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)
     // ------------------------------------------------------------------

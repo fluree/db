@@ -149,8 +149,9 @@ impl super::Parser<'_> {
                 }
             };
 
-            // Parse predicate-object list
-            self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            // Parse predicate-object list (folding in any blank-node
+            // property-list triples the subject produced).
+            self.parse_template_triples_for_subject(&subject, &mut triples)?;
 
             // Optional dot
             self.stream.match_token(&TokenKind::Dot);

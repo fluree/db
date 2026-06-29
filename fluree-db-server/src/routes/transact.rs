@@ -637,6 +637,15 @@ async fn update_local(
             .await;
         }
 
+        // Cypher needs an explicit ledger; the connection-scoped endpoint
+        // can't resolve one — direct callers at the ledger-scoped route.
+        if headers.is_cypher_query() {
+            set_span_error_code(&span, "error:BadRequest");
+            return Err(ServerError::bad_request(
+                "Cypher writes must target a ledger; use the /v1/fluree/update/<ledger> endpoint.",
+            ));
+        }
+
         // Update does not accept Turtle/TriG. Use /insert or /upsert.
         if credential.is_turtle_or_trig() {
             set_span_error_code(&span, "error:BadRequest");
@@ -745,6 +754,8 @@ async fn update_ledger_local(
 
     let input_format = if credential.is_sparql_update() {
         "sparql-update"
+    } else if headers.is_cypher_query() {
+        "cypher"
     } else if credential.is_trig() {
         "trig"
     } else if credential.is_turtle_or_trig() {
@@ -779,6 +790,22 @@ async fn update_ledger_local(
                 &credential,
                 &span,
                 bearer.as_ref(),
+            )
+            .await;
+        }
+
+        // Cypher write (Content-Type: application/cypher) — ledger from path.
+        if headers.is_cypher_query() {
+            tracing::info!(status = "start", format = "cypher", "Cypher write request received");
+            let cypher = credential.body_string()?;
+            return execute_cypher_transact(
+                &state,
+                &ledger,
+                &cypher,
+                &headers,
+                bearer.as_ref(),
+                &credential,
+                &span,
             )
             .await;
         }
@@ -1716,7 +1743,92 @@ async fn execute_turtle_transaction(
     .await
 }
 
-// ===== SPARQL UPDATE execution =====
+// ===== Cypher / SPARQL UPDATE execution =====
+
+/// Execute a Cypher write statement (CREATE, SET, REMOVE) against a ledger.
+///
+/// Goes through the same cached-handle commit path as SPARQL UPDATE
+/// (`ledger_cached` plus `stage(&handle)`) so the in-memory ledger cache stays
+/// current, meaning a subsequent read in the same process sees the write. The
+/// Cypher AST is lowered to a `Txn` via the shared `lower_cypher_to_txn`, which
+/// threads the ledger's default context. v1 does a single attempt with no
+/// reconcile/retry loop, so a concurrent-writer conflict surfaces as an error.
+#[allow(clippy::too_many_arguments)]
+async fn execute_cypher_transact(
+    state: &AppState,
+    ledger_id: &str,
+    body: &str,
+    headers: &FlureeHeaders,
+    bearer: Option<&crate::extract::DataPrincipal>,
+    credential: &MaybeCredential,
+    span: &tracing::Span,
+) -> Result<Response> {
+    enforce_write_access(state, ledger_id, bearer, credential)?;
+
+    // Hash the full request body (statement + any params envelope) so two
+    // requests with the same statement but different params get distinct
+    // tx-ids.
+    let tx_id = compute_tx_id_sparql(body);
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(body);
+
+    // Resolve the effective identity (impersonation-aware) and build policy
+    // options from headers, same as the SPARQL UPDATE path.
+    let bearer_identity = effective_author(credential, bearer);
+    let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
+        state,
+        ledger_id,
+        bearer_identity.as_deref(),
+        headers.identity.as_deref(),
+    )
+    .await;
+    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
+        set_span_error_code(span, "error:BadRequest");
+    })?;
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        identity: effective_identity.clone(),
+        policy_class: if headers.policy_class.is_empty() {
+            None
+        } else {
+            Some(headers.policy_class.clone())
+        },
+        policy: headers.policy.clone(),
+        policy_values: policy_values_map,
+        default_allow: headers.default_allow,
+    };
+
+    // Submit through consensus, exactly like SPARQL UPDATE: the Cypher statement
+    // is lowered to a `Txn` inside the consensus layer under the ledger write
+    // lock — including conditional `MERGE … ON MATCH/ON CREATE` branch
+    // resolution against a policy-wrapped probe — so a retried submission is
+    // deduplicated by `Idempotency-Key` and there is no pre-lock TOCTOU on the
+    // branch choice. `build_commit_opts` is built from the cached handle for
+    // raw-txn provenance / identity, identical to the SPARQL path.
+    let handle = state
+        .fluree
+        .ledger_cached(ledger_id)
+        .await
+        .map_err(ServerError::Api)?;
+    let commit_opts = build_commit_opts(
+        effective_identity.as_deref(),
+        credential,
+        &state.fluree,
+        &handle,
+    );
+    let tracking = tracking_from_headers(headers);
+    let request = TransactionRequest {
+        idempotency_key: extract_idempotency_key(&credential.headers)?,
+        ledger_id: ledger_id.to_string(),
+        body: TransactionBody::Cypher {
+            query: cypher,
+            params,
+        },
+        txn_opts: TxnOpts::default(),
+        commit_opts,
+        tracking,
+        governance: qc_opts,
+    };
+    transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+}
 
 /// Execute a SPARQL UPDATE request
 ///

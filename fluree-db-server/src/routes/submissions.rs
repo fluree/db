@@ -242,16 +242,17 @@ impl From<OperationReceipt> for OperationDetailResponse {
 
 fn body_kind_tag(kind: BodyKind) -> &'static str {
     match kind {
-        // The seven transact body shapes share one public tag —
+        // The eight transact body shapes share one public tag —
         // clients branch on `kind` without having to know JSON-LD
-        // vs Turtle vs SPARQL.
+        // vs Turtle vs SPARQL vs Cypher.
         BodyKind::JsonLdInsert
         | BodyKind::JsonLdUpsert
         | BodyKind::JsonLdUpdate
         | BodyKind::TurtleInsert
         | BodyKind::TurtleUpsert
         | BodyKind::TrigUpsert
-        | BodyKind::Sparql => "transact",
+        | BodyKind::Sparql
+        | BodyKind::Cypher => "transact",
         BodyKind::Pushed => "push",
         BodyKind::Revert => "revert",
         BodyKind::Merge => "merge",

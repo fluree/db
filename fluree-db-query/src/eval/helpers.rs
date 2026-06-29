@@ -253,6 +253,24 @@ fn bool_predicate_var_usage(expr: &Expression) -> VarUsage {
             }
             vars
         }
+        Expression::Map(entries) => {
+            let mut vars = VarUsage::None;
+            for (_, v) in entries {
+                vars = merge_var_usage(vars, bool_predicate_var_usage(v));
+                if matches!(vars, VarUsage::Multiple) {
+                    return VarUsage::Multiple;
+                }
+            }
+            vars
+        }
+        // Scoped iteration / member access aren't single-var bool predicates;
+        // mark Multiple so the single-var bool cache declines them (safe).
+        Expression::ListComprehension { .. }
+        | Expression::Reduce { .. }
+        | Expression::ListPredicate { .. }
+        | Expression::Member { .. }
+        | Expression::PatternComprehension { .. }
+        | Expression::Resolved(_) => VarUsage::Multiple,
     }
 }
 
@@ -338,7 +356,14 @@ fn analyze_bool_cache_inner(expr: &Expression, state: &mut impl Hasher) -> BoolC
                 may_materialize: false,
             }
         }
-        Expression::Exists { .. } => BoolCacheAnalysis {
+        Expression::Exists { .. }
+        | Expression::Map(_)
+        | Expression::ListComprehension { .. }
+        | Expression::Reduce { .. }
+        | Expression::ListPredicate { .. }
+        | Expression::Member { .. }
+        | Expression::PatternComprehension { .. }
+        | Expression::Resolved(_) => BoolCacheAnalysis {
             expr_hash: state.finish(),
             vars: VarUsage::None,
             supported: false,
@@ -416,7 +441,7 @@ fn function_returns_bool(func: &Function, all_children_return_bool: bool) -> boo
         | Function::Regex
         | Function::LangMatches
         | Function::SameTerm => true,
-        Function::And | Function::Or | Function::Not => all_children_return_bool,
+        Function::And | Function::Or | Function::Not | Function::Xor => all_children_return_bool,
         _ => false,
     }
 }
@@ -445,6 +470,13 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::StrBefore
             | Function::StrAfter
             | Function::Replace
+            | Function::ReplaceAll
+            | Function::Split
+            | Function::Trim
+            | Function::LTrim
+            | Function::RTrim
+            | Function::Left
+            | Function::Right
             | Function::Substr
             | Function::EncodeForUri
             | Function::StrDt

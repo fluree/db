@@ -484,16 +484,59 @@ pub(crate) fn binding_to_group_key_owned(binding: &Binding) -> GroupKeyOwned {
             GroupKeyOwned::MaterializedSid(0, iri.clone())
         }
         Binding::Grouped(_) => GroupKeyOwned::Absent, // Shouldn't happen
-        // A path / list groups per distinct element sequence — needed for
-        // `WITH path, collect(...)` over allShortestPaths (IC14).
-        Binding::Path(nodes) => GroupKeyOwned::Seq(
-            nodes
-                .iter()
-                .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
-                .collect(),
-        ),
+        // A path groups per distinct (nodes, per-hop edges) identity — needed
+        // for `WITH path, collect(...)` over allShortestPaths (IC14). Edges are
+        // included to match PartialEq/Hash: two paths over the same node
+        // sequence via different (parallel) edges are distinct paths and must
+        // not merge under GROUP BY when DISTINCT would keep them apart. (On the
+        // RDF/JSON-LD surface `edges` is always empty, so this is a no-op there.)
+        Binding::Path { nodes, edges } => {
+            let sid_key =
+                |sid: &Sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone());
+            let node_keys = GroupKeyOwned::Seq(nodes.iter().map(sid_key).collect());
+            let edge_keys = GroupKeyOwned::Seq(
+                edges
+                    .iter()
+                    .map(|(s, p, e)| GroupKeyOwned::Seq(vec![sid_key(s), sid_key(p), sid_key(e)]))
+                    .collect(),
+            );
+            GroupKeyOwned::Seq(vec![node_keys, edge_keys])
+        }
+        // A relationship groups per (start, predicate, end) identity.
+        // Relationship identity (matches PartialEq/Hash): the reifier when
+        // present, else (start, predicate, end). The single-vs-triple length
+        // keeps the two cases distinct.
+        Binding::Rel(rel) => {
+            let sids: Vec<&Sid> = match &rel.reifier {
+                Some(r) => vec![r],
+                None => vec![&rel.start, &rel.predicate, &rel.end],
+            };
+            GroupKeyOwned::Seq(
+                sids.into_iter()
+                    .map(|sid| GroupKeyOwned::MaterializedSid(sid.namespace_code, sid.name.clone()))
+                    .collect(),
+            )
+        }
         Binding::List(items) => {
             GroupKeyOwned::Seq(items.iter().map(binding_to_group_key_owned).collect())
+        }
+        // A map groups per distinct {key→value} set: each entry contributes its
+        // key string (sentinel namespace) and its value key. Sorted by key so the
+        // group key is order-insensitive, matching map equality/hash.
+        Binding::Map(entries) => {
+            let mut sorted: Vec<_> = entries.iter().collect();
+            sorted.sort_by(|x, y| x.0.cmp(&y.0));
+            GroupKeyOwned::Seq(
+                sorted
+                    .into_iter()
+                    .map(|(k, v)| {
+                        GroupKeyOwned::Seq(vec![
+                            GroupKeyOwned::MaterializedSid(u16::MAX, k.clone()),
+                            binding_to_group_key_owned(v),
+                        ])
+                    })
+                    .collect(),
+            )
         }
     }
 }
@@ -1045,6 +1088,38 @@ mod tests {
 
     fn make_test_snapshot() -> LedgerSnapshot {
         LedgerSnapshot::genesis("test/main")
+    }
+
+    /// A path's group key keys on nodes AND per-hop edges, matching
+    /// PartialEq/Hash — so GROUP BY does not merge two paths that DISTINCT keeps
+    /// apart (same node sequence reached via different parallel edges). With no
+    /// edges (the RDF/JSON-LD surface) two same-node paths still group together.
+    #[test]
+    fn path_group_key_includes_edges() {
+        let sid = |n: &str| Sid::new(1, n);
+        let nodes = vec![sid("a"), sid("b")];
+        let path = |edges: Vec<(Sid, Sid, Sid)>| Binding::Path {
+            nodes: nodes.clone(),
+            edges,
+        };
+
+        let key = |b: &Binding| binding_to_group_key_owned(b);
+
+        // Same nodes, different edge predicate → distinct group keys (and the
+        // bindings are distinct under PartialEq, the DISTINCT contract).
+        let p_knows = path(vec![(sid("a"), sid("knows"), sid("b"))]);
+        let p_likes = path(vec![(sid("a"), sid("likes"), sid("b"))]);
+        assert_ne!(key(&p_knows), key(&p_likes));
+        assert_ne!(p_knows, p_likes);
+
+        // Same nodes and edges → identical group key.
+        assert_eq!(
+            key(&p_knows),
+            key(&path(vec![(sid("a"), sid("knows"), sid("b"))]))
+        );
+
+        // No edges (RDF surface): two same-node paths group together.
+        assert_eq!(key(&path(vec![])), key(&path(vec![])));
     }
 
     #[tokio::test]

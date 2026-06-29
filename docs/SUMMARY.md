@@ -66,6 +66,7 @@
 
 - [Guides (cookbooks)](guides/README.md)
   - [Query patterns](guides/cookbook-query-patterns.md)
+  - [Cypher](guides/cookbook-cypher.md)
   - [Full-text and vector search](guides/cookbook-search.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
@@ -101,6 +102,7 @@
 - [Query](query/README.md)
   - [JSON-LD Query](query/jsonld-query.md)
   - [SPARQL](query/sparql.md)
+  - [Cypher (openCypher subset)](query/cypher.md)
   - [Output formats (JSON-LD / SPARQL JSON / typed JSON / Agent JSON)](query/output-formats.md)
   - [Datasets, FROM/FROM NAMED, and multi-graph execution](query/datasets.md)
   - [CONSTRUCT](query/construct.md)
@@ -216,6 +218,7 @@
   - [Standards and feature flags](reference/compatibility.md)
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
+  - [openCypher support matrix](reference/cypher-support-matrix.md)
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)

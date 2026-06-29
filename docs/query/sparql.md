@@ -141,9 +141,11 @@ SPARQL property paths allow complex traversal patterns in the predicate position
 |--------|------|-------------|
 | `p+` | One or more | Transitive closure (follows `p` one or more hops) |
 | `p*` | Zero or more | Reflexive transitive closure (includes self) |
+| `p?` | Zero or one | Optional step — the node itself plus a single `p` hop |
 | `^p` | Inverse | Traverses `p` in reverse direction |
 | `p\|q` | Alternative | Matches either `p` or `q` (UNION semantics) |
 | `p/q` | Sequence | Follows `p` then `q` (property chain) |
+| `!p`, `!(p\|q)`, `!(^p)` | Negated property set | Matches any predicate **not** in the set |
 
 **One or More (`+`):**
 
@@ -156,6 +158,35 @@ SPARQL property paths allow complex traversal patterns in the predicate position
 ```sparql
 ?person ex:parent* ?ancestorOrSelf .
 ```
+
+**Zero or One (`?`):**
+
+```sparql
+?person ex:parent? ?parentOrSelf .
+```
+
+Matches `?person` itself (zero-length) plus its direct `ex:parent` neighbors — no transitive closure beyond one hop. Works with an alternation of simple predicates (`(ex:a|ex:b)?`) and inverse (`^ex:p?`).
+
+**Negated Property Sets (`!`):**
+
+```sparql
+?s !ex:knows ?o .          -- any predicate except ex:knows
+?s !(ex:a|ex:b) ?o .       -- any predicate not in {ex:a, ex:b}
+?s !(^ex:parent) ?o .      -- any inverse edge except ex:parent
+?s !(ex:a|^ex:b) ?o .      -- forward not-a OR inverse not-b
+```
+
+A negated set matches any predicate **not** listed. Forward members (`ex:a`) constrain forward edges; inverse members (`^ex:b`) constrain reverse edges. A set with members in both directions is the union of a forward branch and a reverse branch; a single-direction set matches only that direction. Internally this lowers to a triple over a fresh predicate variable plus a `FILTER` excluding the listed predicates.
+
+**Nested modifiers** collapse algebraically: `((ex:p)*)*` ≡ `ex:p*`, `(ex:p+)?` ≡ `ex:p*`, and `(ex:p?)?` ≡ `ex:p?`.
+
+**Transitive over a sequence (`(p1/p2/…)+`):**
+
+```sparql
+?person (ex:parent/ex:knows)+ ?reached .
+```
+
+A `+`, `*`, or `?` modifier can be applied to a sequence: each hop follows the entire sub-path. `(ex:p/ex:q)+` repeatedly follows `ex:p` then `ex:q`; `*` adds the zero-length start, `?` is the start plus exactly one composite hop. Sequence steps may be alternations of simple predicates (`(ex:a/(ex:b|ex:c))+`) and may be inverted (`(^ex:p/ex:q)+`, where the first step runs backward).
 
 **Inverse (`^`):**
 
@@ -175,6 +206,7 @@ Inverse can also be applied to complex paths (sequences and alternatives):
 - `^(ex:friend/ex:name)` reverses the step order and inverts each step: `(^ex:name)/(^ex:friend)`
 - `^(ex:name|ex:nick)` distributes inverse into each branch: `(^ex:name)|(^ex:nick)`
 - Double inverse cancels: `^(^ex:p)` simplifies to `ex:p`
+- An inverse can also carry a modifier: `(^ex:p)+` is equivalent to `^ex:p+` (and `(^(ex:a/ex:b))+` to the reversed composite walk)
 
 **Alternative (`|`):**
 
@@ -233,18 +265,13 @@ Multiple alternative steps are supported: `(ex:a|ex:b)/(ex:c|ex:d)` expands to 4
 
 **Rules:**
 
-- Transitive paths (`+`, `*`) require at least one variable (both subject and object cannot be constants).
-- Sequence (`/`) steps must be simple predicates (`ex:p`), inverse simple predicates (`^ex:p`), or alternatives of simple predicates (`(ex:a|ex:b)`). Transitive (`+`/`*`) and nested sequence modifiers are not allowed inside sequence steps.
+- A transitive path with both endpoints constant — e.g. `:a :p+ :b` — is evaluated as a reachability test: it yields one solution if a path exists between them, none otherwise.
+- Sequence (`/`) steps may be simple predicates (`ex:p`), inverse simple predicates (`^ex:p`), alternatives of simple predicates (`(ex:a|ex:b)`), or a modifier applied to a simple predicate (`ex:p+`, `ex:p*`, `ex:p?`, and their inverses such as `^ex:p+`). A modifier applied to a parenthesized composite (e.g. `(ex:a/ex:b)+`) is the composite-transitive form described above, not a sequence step.
 - Variable names starting with `?__` are reserved for internal use and will not appear in `SELECT *` (wildcard) output.
 
 #### Not Yet Supported
 
-The following operators are parsed but not yet supported for execution:
-
-| Syntax | Name |
-|--------|------|
-| `p?` | Zero or one (optional step) |
-| `!p` or `!(p\|q)` | Negated property set |
+A **nested transitive** step inside a composite repeated unit is not yet supported — for example `(ex:a+/ex:b)+`, where a step of the repeated sub-path is itself transitive. Composite steps may be simple predicates, alternations of simple predicates, or either of those inverted (`(^ex:a/ex:b)+`), but not themselves quantified. Workaround: lift the inner closure out, or expand a known-depth path into a `UNION` of fixed-length joins.
 
 ## Query Modifiers
 

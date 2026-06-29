@@ -634,6 +634,126 @@ async fn sparql_order_by_expression_dedup_only_group_by() {
 }
 
 #[tokio::test]
+async fn sparql_group_by_datatype_expression_collapses() {
+    // Issue #1362: `GROUP BY DATATYPE(?v)` directly on an expression must collapse
+    // to one row per distinct datatype (here all favNums are xsd:integer, so a
+    // single group), matching the behavior of `GROUP BY (LCASE(?x))` and of
+    // `BIND(DATATYPE(?v) AS ?dt) ... GROUP BY ?dt`. Previously it returned one row
+    // per binding (group key not collapsed) and LIMIT did not cap the output.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (DATATYPE(?favNum) AS ?dt) (COUNT(?favNum) AS ?n)
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY DATATYPE(?favNum)
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = jsonld.as_array().expect("array result");
+    assert_eq!(
+        rows.len(),
+        1,
+        "GROUP BY DATATYPE(?v) should collapse to one group, got: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_group_by_datatype_expression_collapses_decimal() {
+    // Issue #1362 (as reported): three xsd:decimal values must collapse to a single
+    // `GROUP BY DATATYPE(?v)` group. Decimals exercise the NumBig/arena value path,
+    // distinct from the integer fast path above.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "gbdt:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "ex:amount": {"@value": "1.5", "@type": "xsd:decimal"}},
+            {"@id": "ex:b", "ex:amount": {"@value": "2.5", "@type": "xsd:decimal"}},
+            {"@id": "ex:c", "ex:amount": {"@value": "3.0", "@type": "xsd:decimal"}}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT (DATATYPE(?v) AS ?dt) (COUNT(?v) AS ?n)
+        WHERE { ?s ex:amount ?v }
+        GROUP BY DATATYPE(?v)
+        LIMIT 10
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "GROUP BY DATATYPE(?v) over decimals should collapse to one group, got: {sparql_json}"
+    );
+    // The single group is xsd:decimal with a count of 3.
+    assert_eq!(
+        bindings[0]["dt"]["value"],
+        json!("http://www.w3.org/2001/XMLSchema#decimal")
+    );
+    assert_eq!(bindings[0]["n"]["value"], json!("3"));
+}
+
+#[tokio::test]
+async fn sparql_group_by_bare_builtin_not_projected() {
+    // Issue #1362: a bare-builtin GROUP BY whose expression is NOT projected as a
+    // SELECT alias must still collapse. This exercises the synthetic group-var
+    // lowering branch (no `(expr AS ?k)` to match against), distinct from the
+    // alias-matching path the other tests cover.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (COUNT(?favNum) AS ?n)
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY DATATYPE(?favNum)
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "bare-builtin GROUP BY should collapse to one group, got: {sparql_json}"
+    );
+}
+
+#[tokio::test]
 async fn sparql_order_by_inline_aggregate_shared_with_select_alias() {
     // `ORDER BY DESC(COUNT(?x))` with an explicit GROUP BY. The inline aggregate
     // is hoisted and deduped against the SELECT alias `?c`, so it sorts by the
@@ -1047,6 +1167,363 @@ async fn sparql_subquery_order_by_select_alias_expression() {
 }
 
 #[tokio::test]
+async fn sparql_subquery_limit_scopes_outer_join() {
+    // Issue (W3C subquery/sq11): a sub-SELECT with ORDER BY ... LIMIT n must be
+    // evaluated to its complete (limited, ordered) solution sequence BEFORE it
+    // joins the enclosing pattern. A "top-N then decorate" query must therefore
+    // only decorate the N selected resources, not the whole dataset.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "sqlimit:main");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://www.example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+        },
+        "@graph": [
+            {"@id": "ex:order1", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Ice Cream"}, {"rdfs:label": "Pizza"}, {"rdfs:label": "Wine"}]},
+            {"@id": "ex:order2", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Ice Cream"}, {"rdfs:label": "Pasta"}, {"rdfs:label": "Soft Drink"}]},
+            {"@id": "ex:order3", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Sandwich"}, {"rdfs:label": "Soft Drink"}]},
+            {"@id": "ex:order4", "@type": "ex:Order",
+             "ex:hasItem": [{"rdfs:label": "Bagel"}, {"rdfs:label": "Soft Drink"}]}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert+commit should succeed")
+        .ledger;
+
+    let query = r"
+        PREFIX ex: <http://www.example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?O ?item ?L
+        WHERE {
+          ?O ex:hasItem ?item .
+          OPTIONAL { ?item rdfs:label ?L }
+          {
+            SELECT DISTINCT ?O
+            WHERE { ?O a ex:Order }
+            ORDER BY ?O
+            LIMIT 2
+          }
+        } ORDER BY ?O ?item
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+
+    // The inner LIMIT 2 (ORDER BY ?O) selects only order1 and order2, which have
+    // 3 items each → 6 outer rows. order3/order4 must not appear. (Match on the
+    // IRI suffix to stay robust to compact-vs-full IRI rendering.)
+    let orders: std::collections::BTreeSet<String> = bindings
+        .iter()
+        .filter_map(|b| b["O"]["value"].as_str())
+        .map(|s| {
+            s.rsplit('/')
+                .next()
+                .unwrap_or(s)
+                .rsplit(':')
+                .next()
+                .unwrap_or(s)
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        orders,
+        ["order1".to_string(), "order2".to_string()]
+            .into_iter()
+            .collect(),
+        "sub-SELECT LIMIT must scope the outer join, got: {sparql_json}"
+    );
+    assert_eq!(
+        bindings.len(),
+        6,
+        "expected 6 item rows (3 each for order1/order2), got: {sparql_json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_projection_expression_error_leaves_var_unbound() {
+    // SPARQL 1.1 §18.5 (Extend): when a SELECT/BIND expression raises an
+    // evaluation error for a solution, that variable is left UNBOUND for that
+    // solution and the remaining solutions are still returned — the query must
+    // NOT fail. (W3C functions/plus-1-corrected, project-expression/projexp02.)
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprerr:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {"@id": "ex:s1", "ex:p": "abc"},
+            {"@id": "ex:s2", "ex:p": {"@value": "2", "@type": "xsd:integer"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?v (?v + 1 AS ?plus)
+        WHERE { ?s ex:p ?v }
+        ORDER BY ?s
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("expression error must not fail the whole query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "both rows must be returned: {sparql_json}"
+    );
+    // s1: "abc" + 1 errors → ?plus unbound (absent from the binding map).
+    assert_eq!(bindings[0]["v"]["value"], "abc");
+    assert!(
+        bindings[0].get("plus").is_none(),
+        "?plus must be unbound where the addition errors: {sparql_json}"
+    );
+    // s2: 2 + 1 = 3.
+    assert_eq!(bindings[1]["v"]["value"], "2");
+    assert_eq!(bindings[1]["plus"]["value"], "3");
+}
+
+#[tokio::test]
+async fn sparql_bind_and_order_by_expression_errors_do_not_fail_query() {
+    // §18.5 Extend applies to WHERE-clause BIND and ORDER BY expressions too: a
+    // value error leaves the variable unbound (BIND) or sorts as unbound (ORDER
+    // BY) rather than failing the query. Structural errors (arity etc.) still
+    // surface — covered by the JSON-LD bind-error tests.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprerr2:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {"@id": "ex:s1", "ex:p": "abc"},
+            {"@id": "ex:s2", "ex:p": {"@value": "2", "@type": "xsd:integer"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // WHERE-clause BIND that errors on the string row, plus an ORDER BY whose
+    // key also errors on that row — both must demote, not 400.
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?v ?plus
+        WHERE { ?s ex:p ?v . BIND(?v + 1 AS ?plus) }
+        ORDER BY (?v + 1)
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("BIND/ORDER BY expression error must not fail the query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "both rows must be returned: {sparql_json}"
+    );
+    // Exactly one row binds ?plus (the integer row → 3); the string row is unbound.
+    let plus: Vec<Option<&str>> = bindings
+        .iter()
+        .map(|b| b["plus"]["value"].as_str())
+        .collect();
+    assert!(
+        plus.contains(&Some("3")) && plus.contains(&None),
+        "one ?plus bound to 3, one unbound: {sparql_json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_empty_group_sum_avg_return_zero() {
+    // SPARQL 1.1 §18.5.1.3 / §18.5.1.4 (W3C agg-avg-03, agg-empty-group-count-2):
+    // over an implicit single group (no GROUP BY) whose pattern matches nothing,
+    // COUNT/SUM/AVG return their identity `"0"^^xsd:integer` in one row. (MIN/MAX/
+    // SAMPLE have no identity and stay unbound — not asserted here.)
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "emptyagg:main");
+
+    for (agg, var) in [("COUNT", "count"), ("SUM", "sum"), ("AVG", "avg")] {
+        let query = format!(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ({agg}(?o) AS ?{var}) WHERE {{ ?s ex:nonexistent ?o }}"
+        );
+        let result = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap();
+        let sparql_json = result
+            .to_sparql_json(&ledger.snapshot)
+            .expect("to_sparql_json");
+        let bindings = sparql_json["results"]["bindings"]
+            .as_array()
+            .expect("bindings array");
+        assert_eq!(
+            bindings.len(),
+            1,
+            "{agg}: expected one row, got {sparql_json}"
+        );
+        assert_eq!(
+            bindings[0][var]["value"], "0",
+            "{agg} over an empty group must be 0, got {sparql_json}"
+        );
+        assert_eq!(
+            bindings[0][var]["datatype"], "http://www.w3.org/2001/XMLSchema#integer",
+            "{agg} empty-group identity must be xsd:integer, got {sparql_json}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_subquery_limit_w3c_sq11_blank_node_form() {
+    // W3C subquery/sq11 verbatim: a blank-node property-list object
+    // (`?O :hasItem [ rdfs:label ?L ]`) joined to a `SELECT DISTINCT ?O … LIMIT 2`
+    // sub-SELECT, loaded via Turtle (as the W3C runner does). Exercises three
+    // fixes together: (1) blank-node property lists must bind `?L`; (2) the inner
+    // LIMIT must scope the outer join; (3) a parent batch that matches no
+    // subquery row must not terminate the SubqueryOperator early. Turtle batching
+    // surfaces (3) — a non-matching parent batch (order3/order4) arrives first.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "sq11ttl:main");
+
+    let ttl = r#"@prefix : <http://www.example.org> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:order1 a :Order; :hasItem
+    [ :amount 2 ; rdfs:label "Ice Cream" ; :price 4 ],
+    [ :amount 2 ; rdfs:label "Pizza" ; :price 10 ],
+    [ :amount 1 ; rdfs:label "Wine" ; :price 8 ].
+:order2 a :Order; :hasItem
+    [ :amount 3 ; rdfs:label "Ice Cream" ; :price 4 ],
+    [ :amount 2 ; rdfs:label "Pasta" ; :price 8 ],
+    [ :amount 3 ; rdfs:label "Soft Drink" ; :price 6 ].
+:order3 a :Order; :hasItem
+    [ :amount 1 ; rdfs:label "Sandwich" ; :price 3 ],
+    [ :amount 1 ; rdfs:label "Soft Drink" ; :price 2 ].
+:order4 a :Order; :hasItem
+    [ :amount 1 ; rdfs:label "Bagel" ; :price 3.5 ],
+    [ :amount 1 ; rdfs:label "Soft Drink" ; :price 2 ].
+"#;
+    let ledger = fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger;
+
+    let query = r"
+        PREFIX : <http://www.example.org>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?L
+        WHERE {
+          ?O :hasItem [ rdfs:label ?L ] .
+          { SELECT DISTINCT ?O WHERE { ?O a :Order } ORDER BY ?O LIMIT 2 }
+        } ORDER BY ?L
+    ";
+
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .unwrap();
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let labels: Vec<&str> = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["L"]["value"].as_str().expect("L bound"))
+        .collect();
+    // sq11 expected: the labels of order1 + order2 items, ordered.
+    assert_eq!(
+        labels,
+        [
+            "Ice Cream",
+            "Ice Cream",
+            "Pasta",
+            "Pizza",
+            "Soft Drink",
+            "Wine"
+        ],
+        "got: {sparql_json}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_blank_node_property_list_binds_vars() {
+    // A variable inside an inline blank-node property list
+    // (`?s :p [ :q ?x ]`) must be bound and projectable — the list desugars to a
+    // fresh blank node plus its nested triples (SPARQL 1.1 §4.1.4). Covers object
+    // position, the multi-predicate `;` form, and nesting.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bnpl:main");
+    let ttl = r#"@prefix ex: <http://example.org/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:cart ex:has [ rdfs:label "Apple" ; ex:qty 3 ] , [ rdfs:label "Pear" ; ex:qty 1 ] .
+"#;
+    let ledger = fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger;
+
+    // Object position, multi-predicate `;` list: both ?label and ?qty bind.
+    let q = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?label ?qty
+        WHERE { ex:cart ex:has [ rdfs:label ?label ; ex:qty ?qty ] . }
+        ORDER BY ?label
+    ";
+    let jsonld = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["Apple", 3], ["Pear", 1]])),
+        "blank-node property list must bind both nested vars"
+    );
+
+    // Bare blank-node-property-list subject form: `[ rdfs:label ?label ] ...`.
+    let q2 = r"
+        PREFIX ex: <http://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?label WHERE { [ rdfs:label ?label ] ex:qty 3 . }
+    ";
+    let jsonld2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld2),
+        normalize_rows(&json!([["Apple"]])),
+        "subject-position blank-node property list must bind and join"
+    );
+}
+
+#[tokio::test]
 async fn sparql_subquery_full_modifier_stack() {
     // Pattern 8: GROUP BY + HAVING + aggregate ORDER BY + LIMIT in one subquery.
     assert_index_defaults();
@@ -1168,11 +1645,15 @@ async fn sparql_subquery_having_eliminates_all_groups() {
 }
 
 #[tokio::test]
-async fn sparql_correlated_subquery_order_by_limit_per_row() {
-    // Correlated subquery where the inner ORDER BY + LIMIT genuinely matter:
-    // for each outer ?person, pick that person's MAX favNum via
-    // `ORDER BY DESC(?top) LIMIT 1`. Proves per-row correlation seeding is
-    // preserved AND the inner sort/limit run before the merge-back.
+async fn sparql_subquery_order_by_limit_is_uncorrelated() {
+    // SPARQL 1.1 §18.2: a sub-SELECT is evaluated to its complete (ordered,
+    // sliced) solution sequence INDEPENDENTLY of the enclosing pattern, then
+    // joined. There are no correlated (LATERAL) sub-SELECTs in SPARQL 1.1, so
+    // `{ SELECT ?person ?top WHERE { ?person person:favNums ?top }
+    //    ORDER BY DESC(?top) LIMIT 1 }` yields the single GLOBAL max-favNum row
+    // (jdoe, 99) — NOT one row per outer ?person — and the outer join on ?person
+    // then keeps only jdoe. (Issue: inner LIMIT must scope the subquery, not the
+    // outer join; W3C subquery/sq11.)
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "people:main").await;
@@ -1193,10 +1674,11 @@ async fn sparql_correlated_subquery_order_by_limit_per_row() {
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    // Per-person max favNum: jdoe 99, bbob 23, jbob 9; dankeshön (no favNums) drops.
+    // Global max favNum is 99 (jdoe); the inner LIMIT 1 keeps only that row,
+    // which joins to exactly one handle.
     assert_eq!(
         normalize_rows(&jsonld),
-        normalize_rows(&json!([["jdoe", 99], ["bbob", 23], ["jbob", 9]]))
+        normalize_rows(&json!([["jdoe", 99]]))
     );
 }
 
@@ -1247,9 +1729,10 @@ async fn sparql_subquery_group_concat_sum_respects_inner_offset() {
         .to_jsonld(&ledger.snapshot)
         .expect("to_jsonld");
     // With the guard, the fast path declines and the generic pipeline honors the
-    // OFFSET: the subquery is empty, so SUM has nothing to add (unbound). Without
-    // the guard this would wrongly equal the all-groups sum (15).
-    assert_eq!(offset_rows, json!([[null]]));
+    // OFFSET: the subquery is empty, so SUM is its empty-multiset identity 0
+    // (SPARQL 1.1 §18.5.1.3). Without the guard this would wrongly equal the
+    // all-groups sum (15).
+    assert_eq!(offset_rows, json!([[0]]));
 }
 
 #[tokio::test]
@@ -5121,4 +5604,566 @@ async fn sparql_both_bound_path_reachability() {
         normalize_rows(&json!([])),
         "a cannot reach z: {j2}"
     );
+}
+
+/// Seed a simple `a -> b -> c` chain over `ex:p` for ZeroOrOne path tests.
+async fn seed_pp_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:c"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+/// Seed `a -p-> m -q-> b -p-> n -q-> c`: an alternating two-predicate chain so
+/// each `(ex:p/ex:q)` hop advances a→b→c.
+async fn seed_composite_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:n"}},
+            {"@id": "ex:n", "ex:q": {"@id": "ex:c"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_composite_star_both_unbound_includes_all_self_pairs() {
+    // Both-unbound `?s (ex:p/ex:q)* ?o`. Data a -p-> m -q-> b. The zero-length
+    // path pairs EVERY node in the path's domain {a, m, b} with itself — not just
+    // hop-start subjects — plus the one composite hop a→b.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-star-closure");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s (ex:p/ex:q)* ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite star both-unbound");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([
+            ["ex:a", "ex:a"],
+            ["ex:m", "ex:m"],
+            ["ex:b", "ex:b"],
+            ["ex:a", "ex:b"]
+        ])),
+        "(p/q)* closure: self-pair for every domain node incl. mid m and sink b, plus a→b: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_inside_sequence() {
+    // `?` as a sequence step: `ex:a ex:p?/ex:q ?o`. The optional `ex:p` step
+    // yields a itself (zero hops) and its p-neighbor b, then `ex:q` from each:
+    // a→q→x (zero p) and b→q→y (one p) → {x, y}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:zoo-in-seq");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}, "ex:q": {"@id": "ex:x"}},
+            {"@id": "ex:b", "ex:q": {"@id": "ex:y"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a ex:p?/ex:q ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one inside sequence");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x"], ["ex:y"]])),
+        "p?/q from a = {{x (zero p), y (one p)}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_sequence() {
+    // W3C `pp02` shape: transitive over a sequence. `(ex:p/ex:q)+` from a walks
+    // one composite hop to b, two to c → {b, c}. The intermediate m, n nodes are
+    // not endpoints.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_composite_chain(&fluree, "it/sparql:composite").await;
+
+    let plus = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)+ ?x }";
+    let r = support::query_sparql(&fluree, &ledger, plus)
+        .await
+        .expect("composite +");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:b"], ["ex:c"]])),
+        "(p/q)+ from a = {{b, c}}: {j}"
+    );
+
+    // `*` includes the zero-length start.
+    let star = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)* ?x }";
+    let r2 = support::query_sparql(&fluree, &ledger, star)
+        .await
+        .expect("composite *");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "(p/q)* from a includes start: {j2}"
+    );
+
+    // `?` is the start plus exactly one composite hop.
+    let opt = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)? ?x }";
+    let r3 = support::query_sparql(&fluree, &ledger, opt)
+        .await
+        .expect("composite ?");
+    let j3 = r3.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j3),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "(p/q)? = start + one hop: {j3}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_inverse_step() {
+    // A composite hop with an INVERSE leading step: `(^ex:p/ex:q)+`. The unit
+    // `^p/q` is the "co-parent" relation — x0 and x1 share hub0 (hub0 p x0,
+    // hub0 q x1), so x0 (^p/q) x1; likewise x1 (^p/q) x2 via hub1. Transitively
+    // from x0: {x1, x2}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let plus = r"PREFIX ex: <http://example.org/>
+        SELECT ?y WHERE { ex:x0 (^ex:p/ex:q)+ ?y }";
+    let r = support::query_sparql(&fluree, &ledger, plus)
+        .await
+        .expect("composite inverse-step +");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(^p/q)+ from x0 = {{x1, x2}}: {j}"
+    );
+
+    // Backward: who reaches x2 via `(^ex:p/ex:q)+`? x1 (1 hop) and x0 (2 hops).
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (^ex:p/ex:q)+ ex:x2 }";
+    let rb = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite inverse-step backward");
+    let jb = rb.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jb),
+        normalize_rows(&json!([["ex:x0"], ["ex:x1"]])),
+        "?s (^p/q)+ x2 = {{x0, x1}}: {jb}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_parenthesized_inverse_transitive() {
+    // `(^ex:p)+` is the parenthesized form of `^ex:p+` — `(^X)+ ≡ ^(X+)`. Over a
+    // p-chain x -p-> y -p-> z, from z it walks p backwards: `+` → {y, x},
+    // `*` → {z, y, x}, `?` → {z, y}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:paren-inv");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:x", "ex:p": {"@id": "ex:y"}},
+            {"@id": "ex:y", "ex:p": {"@id": "ex:z"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    for (op, expect) in [
+        ("+", json!([["ex:y"], ["ex:x"]])),
+        ("*", json!([["ex:z"], ["ex:y"], ["ex:x"]])),
+        ("?", json!([["ex:z"], ["ex:y"]])),
+    ] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?o WHERE {{ ex:z (^ex:p){op} ?o }}"
+        );
+        let r = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .unwrap_or_else(|e| panic!("(^p){op} failed: {e}"));
+        let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&j),
+            normalize_rows(&expect),
+            "(^p){op} from z: {j}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_step_both_unbound() {
+    // Both-unbound `?s (^ex:p/ex:q)+ ?o` — exercises the inverse-leading seed
+    // (start candidates come from the OBJECT side of the first step). hub0/hub1
+    // make `^p/q` the co-parent relation x0~x1~x2, so the transitive closure is
+    // {(x0,x1), (x0,x2), (x1,x2)}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-unbound");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s (^ex:p/ex:q)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite inverse both-unbound");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([
+            ["ex:x0", "ex:x1"],
+            ["ex:x0", "ex:x2"],
+            ["ex:x1", "ex:x2"]
+        ])),
+        "(^p/q)+ closure seeds from object side of first step: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_second_step() {
+    // Inverse step in a NON-leading position: `(ex:p/^ex:q)+`. The unit `p/^q`
+    // links x and y that share a target via different predicates: x p m, y q m.
+    // x0 p m0, x1 q m0 → x0 (p/^q) x1; x1 p m1, x2 q m1 → x1 (p/^q) x2.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv2");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:x0", "ex:p": {"@id": "ex:m0"}},
+            {"@id": "ex:x1", "ex:q": {"@id": "ex:m0"}, "ex:p": {"@id": "ex:m1"}},
+            {"@id": "ex:x2", "ex:q": {"@id": "ex:m1"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Forward from x0 → {x1, x2}.
+    let fwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:x0 (ex:p/^ex:q)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, fwd)
+        .await
+        .expect("composite inverse 2nd step forward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(p/^q)+ from x0 = {{x1, x2}}: {j}"
+    );
+
+    // Backward into x2 → {x0, x1} — exercises the per-step `!inverse` retreat.
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (ex:p/^ex:q)+ ex:x2 }";
+    let rb = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite inverse 2nd step backward");
+    let jb = rb.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jb),
+        normalize_rows(&json!([["ex:x0"], ["ex:x1"]])),
+        "?s (p/^q)+ x2 = {{x0, x1}}: {jb}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_alternation_step() {
+    // An inverse ALTERNATION step inside a composite: `(^(ex:p|ex:q)/ex:r)+`.
+    // hub reaches a via p and b via q; both a and b have an r-edge to the next
+    // hub. One hop: a (^(p|q)/r) ? — from a, `^(p|q)` finds hub (hub p a), then
+    // `r` from hub → c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-alt");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub", "ex:p": {"@id": "ex:a"}, "ex:r": {"@id": "ex:c"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // a `^(p|q)` hub (hub p a), then `r` → c. So a (^(p|q)/r)+ ?o = {c}.
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a (^(ex:p|ex:q)/ex:r)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite inverse-alternation step");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:c"]])),
+        "(^(p|q)/r)+ from a = {{c}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_backward_and_both_bound() {
+    // Subject-var (backward) and both-bound (reachability) modes over a composite
+    // hop.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_composite_chain(&fluree, "it/sparql:composite-bwd").await;
+
+    // `?s (ex:p/ex:q)+ ex:c` — who reaches c? a (2 hops) and b (1 hop).
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (ex:p/ex:q)+ ex:c }";
+    let r = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite backward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "?s (p/q)+ c = {{a, b}}: {j}"
+    );
+
+    // Both bound: a reaches c (true), a reaches n (false — n is mid-hop).
+    for (o, expect) in [("ex:c", true), ("ex:n", false)] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE {{ ex:a (ex:p/ex:q)+ {o} . BIND(1 AS ?x) }}"
+        );
+        let rr = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("composite both-bound");
+        let jj = rr.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&jj).len() == 1,
+            expect,
+            "a (p/q)+ {o} expected reachable={expect}: {jj}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_nested_modifier_star_of_star() {
+    // W3C `pp37` shape: `((:p)*)*` collapses to `:p*`. From a (a→b→c chain),
+    // zero-or-more yields {a, b, c}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:nested-mod").await;
+
+    // `((ex:p)*)*` ≡ `ex:p*` ≡ {a, b, c}.
+    let star2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a ((ex:p)*)* ?x }";
+    let r = support::query_sparql(&fluree, &ledger, star2)
+        .await
+        .expect("nested star-of-star");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "((p)*)* = p* = full closure incl. start: {j}"
+    );
+
+    // `(ex:p+)?` ≡ `ex:p*` (zero-or-one of one-or-more) — also {a, b, c}.
+    let plus_opt = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p+)? ?x }";
+    let r2 = support::query_sparql(&fluree, &ledger, plus_opt)
+        .await
+        .expect("plus-then-optional");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "(p+)? = p* : {j2}"
+    );
+
+    // `(ex:p?)?` ≡ `ex:p?` (bounded) — {a, b} only, NOT c.
+    let opt2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p?)? ?x }";
+    let r3 = support::query_sparql(&fluree, &ledger, opt2)
+        .await
+        .expect("optional-of-optional");
+    let j3 = r3.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j3),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "(p?)? stays bounded at one hop: {j3}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_negated_set_forward_excludes_type() {
+    // W3C `nps_a`: `?s !a ?o`. Data has a type edge (sa→oa) and a plain edge
+    // (sp→op). The negated set excludes rdf:type, so only (sp, op) matches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:nps-fwd");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:sa", "@type": "ex:oa"},
+            {"@id": "ex:sp", "ex:p": {"@id": "ex:op"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !a ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set forward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:sp", "ex:op"]])),
+        "!a excludes the rdf:type edge: {j}"
+    );
+}
+
+/// Seed the W3C nps data: `sd pd od . sr pr or .`
+async fn seed_nps(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:sd", "ex:pd": {"@id": "ex:od"}},
+            {"@id": "ex:sr", "ex:pr": {"@id": "ex:or"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_negated_set_inverse_only() {
+    // W3C `nps_inverse`: `?s !^ex:pr ?o`. Inverse-only set → reversed edges whose
+    // predicate ≠ pr. Only sd-pd-od qualifies → reversed (od, sd). No forward
+    // branch (the sr-pr-or forward edge must NOT appear).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nps(&fluree, "it/sparql:nps-inv").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !^ex:pr ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set inverse");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:od", "ex:sd"]])),
+        "!^pr = reversed non-pr edges: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_negated_set_direct_and_inverse() {
+    // W3C `nps_direct_and_inverse`: `?s !(ex:pd|^ex:pr) ?o` = UNION of the forward
+    // branch (edges with pred ≠ pd → sr,or) and the inverse branch (reversed
+    // edges with pred ≠ pr → od,sd).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nps(&fluree, "it/sparql:nps-mixed").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !(ex:pd|^ex:pr) ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set mixed");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:od", "ex:sd"], ["ex:sr", "ex:or"]])),
+        "mixed negated set unions both directions: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_object_var() {
+    // `:a :p? ?o` — zero-length (a itself) plus one direct hop (b). NOT c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-obj").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a ex:p? ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one object var");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "a p? ?o = {{a, b}}, not the transitive c: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_subject_var() {
+    // `?s :p? :b` — zero-length (b itself) plus one direct predecessor (a).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-subj").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s ex:p? ex:b }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one subject var");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "?s p? b = {{a, b}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_both_bound() {
+    // `:a :p? :b` is true (one hop); `:a :p? :c` is false (needs two hops);
+    // `:a :p? :a` is true (zero-length).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-both").await;
+
+    for (s, o, expect) in [
+        ("ex:a", "ex:b", true),
+        ("ex:a", "ex:c", false),
+        ("ex:a", "ex:a", true),
+    ] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE {{ {s} ex:p? {o} . BIND(1 AS ?x) }}"
+        );
+        let r = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("zero-or-one both bound");
+        let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        let rows = normalize_rows(&j).len();
+        assert_eq!(
+            rows == 1,
+            expect,
+            "{s} p? {o} expected reachable={expect}, got {rows} rows: {j}"
+        );
+    }
 }

@@ -84,6 +84,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             if !target_vars.is_empty() {
                 let mut subq = SubqueryPattern::new(target_vars.clone(), where_patterns);
                 subq.distinct = true;
+                subq.uncorrelated = true;
                 self.lower_describe_modifiers(
                     &describe.modifiers,
                     describe.span,

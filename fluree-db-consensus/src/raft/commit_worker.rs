@@ -521,6 +521,28 @@ impl Worker {
             .await
             .map_err(submission_to_stage)?;
 
+        // Cypher lowers to a `Txn` here, against the just-loaded handle. The
+        // commit worker is the single serialized writer for this ledger, so a
+        // conditional `MERGE … ON MATCH/ON CREATE` chooses its branch against
+        // the same state the staged commit lands on — no pre-lock TOCTOU. (The
+        // local committer does the same inside its retry loop; both share
+        // `resolve_cypher_under_lock`.)
+        let cypher_txn = match &body {
+            TransactionBody::Cypher { query, params } => Some(
+                crate::local::resolve_cypher_under_lock(
+                    &self.staging.fluree,
+                    &ledger_handle,
+                    &ledger_id,
+                    query,
+                    params.as_ref(),
+                    &governance,
+                )
+                .await
+                .map_err(|e| stage_failure(&format!("cypher lowering failed: {e}")))?,
+            ),
+            _ => None,
+        };
+
         let staged = self.staging.fluree.stage(&ledger_handle);
         let staged = match &body {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
@@ -531,6 +553,9 @@ impl Worker {
                 staged.upsert_turtle(text.as_str())
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+            TransactionBody::Cypher { .. } => {
+                staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+            }
         };
 
         let mut builder = staged

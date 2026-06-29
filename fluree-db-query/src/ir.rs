@@ -51,7 +51,8 @@ pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
 pub use grouping::{AggregateFn, AggregateSpec, Aggregation, Grouping, InputSemantics};
 pub use path::{
-    PathDirection, PathModifier, PropertyPathPattern, ShortestPathMode, ShortestPathPattern,
+    PathDirection, PathModifier, PathStep, PropertyPathPattern, ShortestPathMode,
+    ShortestPathPattern,
 };
 pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
 pub use projection::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Projection, Root};
