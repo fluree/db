@@ -1182,8 +1182,8 @@ async fn run_local_ndjson_stream_dataset(
 }
 
 /// Fold CLI `--policy*` flags into a JSON-LD query body's `opts` map. Mirrors
-/// the server-side header injection: each field is inserted only when the
-/// body's `opts` doesn't already carry that key, so explicit body opts win.
+/// the server-side header injection: explicit body opts always win over CLI
+/// flags.
 fn inject_policy_into_jsonld_opts(
     body: &mut serde_json::Map<String, serde_json::Value>,
     policy: &PolicyArgs,
@@ -1191,58 +1191,13 @@ fn inject_policy_into_jsonld_opts(
     if !policy.is_set() {
         return Ok(());
     }
-
-    let resolved_policy = policy.resolve_policy().map_err(CliError::Input)?;
-    let resolved_values = policy.resolve_policy_values().map_err(CliError::Input)?;
-
     let opts = body
         .entry("opts".to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     let opts_obj = opts
         .as_object_mut()
         .ok_or_else(|| CliError::Input("query 'opts' must be a JSON object".to_string()))?;
-
-    if let Some(id) = policy.identity.as_ref() {
-        opts_obj
-            .entry("identity")
-            .or_insert_with(|| serde_json::Value::String(id.clone()));
-    }
-
-    if !policy.policy_class.is_empty() && !opts_obj.contains_key("policy-class") {
-        opts_obj.insert(
-            "policy-class".to_string(),
-            serde_json::Value::Array(
-                policy
-                    .policy_class
-                    .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
-                    .collect(),
-            ),
-        );
-    }
-
-    if let Some(p) = resolved_policy {
-        opts_obj.entry("policy").or_insert(p);
-    }
-
-    if let Some(values_map) = resolved_values {
-        let as_object: serde_json::Map<String, serde_json::Value> =
-            values_map.into_iter().collect();
-        opts_obj
-            .entry("policy-values")
-            .or_insert_with(|| serde_json::Value::Object(as_object));
-    }
-
-    if policy.default_allow
-        && !opts_obj.contains_key("default-allow")
-        && !opts_obj.contains_key("default_allow")
-        && !opts_obj.contains_key("defaultAllow")
-    {
-        opts_obj.insert("default-allow".to_string(), serde_json::Value::Bool(true));
-    }
-
-    Ok(())
+    policy.inject_into_opts(opts_obj).map_err(CliError::Input)
 }
 
 /// Print the NDJSON streaming footer to stderr: row count, wall-clock time, and
