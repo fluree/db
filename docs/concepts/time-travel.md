@@ -170,7 +170,11 @@ This provides:
 
 ## Consistency and Read-After-Write
 
-Fluree's query engine is **eventually consistent**. When a transaction commits at `t=N`, queries running against a different process or a warm cache may still see a state older than `t=N` until the cache is refreshed.
+A writer reads its own writes: a commit through the embedded API updates the
+in-process ledger cache, so a later query in that same process sees `t=N`. Across
+processes, Fluree's query engine is **eventually consistent** — a transaction that
+commits at `t=N` in one process may not be visible to another process holding a warm
+cache until that cache is refreshed.
 
 ### The Problem
 

@@ -20,6 +20,7 @@ fluree update [LEDGER] [DATA] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
+| `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger); explicit alternative to the positional ledger argument |
 | `-e, --expr <EXPR>` | Inline data expression (alternative to positional) |
 | `-f, --file <FILE>` | Read data from a file |
 | `-m, --message <MSG>` | Commit message |

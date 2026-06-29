@@ -559,7 +559,7 @@ fn decode_event_to_flake(
         .decode_value(o_type, o_key, p_id)
         .map_err(|e| QueryError::from_io("history decode decode_value", e))?;
     let dt = store
-        .resolve_datatype_sid(o_type)
+        .resolve_datatype_sid_for_value(o_type, &o_val)
         .unwrap_or_else(|| Sid::new(0, ""));
     let lang = store
         .resolve_lang_tag(o_type)

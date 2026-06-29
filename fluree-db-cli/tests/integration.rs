@@ -200,6 +200,103 @@ fn seed_named_people(tmp: &TempDir, ledger: &str) {
 }
 
 #[test]
+fn query_and_insert_accept_ledger_flag() {
+    let tmp = TempDir::new().unwrap();
+    // Seed `streamdb`, then create `otherdb` so it becomes the active ledger.
+    seed_named_people(&tmp, "streamdb");
+    fluree_cmd(&tmp)
+        .args(["create", "otherdb"])
+        .assert()
+        .success();
+
+    // `query --ledger` targets a non-active ledger; the positional arg is the
+    // inline query (heuristic bypassed because the ledger is explicit).
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "--sparql",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+
+    // Short form `-l` plus `-e` behaves identically.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "streamdb",
+            "--sparql",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // `insert --ledger` writes to the named ledger regardless of the active one.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "--ledger",
+            "streamdb",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@id": "ex:carol", "ex:name": "Carol"}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "--sparql",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Carol"));
+}
+
+#[test]
+fn query_ledger_flag_rejects_extra_positional() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // With --ledger, a second positional (a stray ledger name) is ambiguous.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "streamdb",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--ledger"));
+}
+
+#[test]
+fn insert_ledger_flag_rejects_missing_file_positional() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // With --ledger, a lone path-shaped positional that doesn't exist (a typo'd
+    // file path) is reported as a missing file rather than fed to the input
+    // reader as inline data, which would fail with a confusing parse error.
+    fluree_cmd(&tmp)
+        .args(["insert", "--ledger", "streamdb", "typo-data.jsonld"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such file"));
+}
+
+#[test]
 fn query_ndjson_bare_streams_row_objects() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");
@@ -1432,6 +1529,27 @@ fn history_shows_changes() {
         .args(["history", "ex:alice", "--format", "json"])
         .assert()
         .success();
+
+    // Default (table) output must render the records, not blank `?` cells.
+    let assert = fluree_cmd(&tmp)
+        .args(["history", "ex:alice"])
+        .assert()
+        .success()
+        // Header + populated value cells.
+        .stdout(predicate::str::contains("predicate"))
+        .stdout(predicate::str::contains("Alice Smith"))
+        .stdout(predicate::str::contains("ex:name"));
+
+    // The pre-fix bug produced a `?` op column. comfy-table pads each cell to
+    // the column width, so the raw output is `| ?  |` (header "op" is 2 wide),
+    // never `| ? |` — asserting on the raw form would never catch a regression.
+    // Collapse whitespace first so a `?` op cell surfaces as `| ? |`.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let normalized = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !normalized.contains("| ? |"),
+        "op column should render +/- not `?`; got:\n{stdout}"
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use crate::cli::PolicyArgs;
 use crate::commands::insert::{
-    build_policy_ctx, print_txn_result, resolve_positional_args, warn_novelty_if_needed,
+    build_policy_ctx, print_txn_result, resolve_inputs, warn_novelty_if_needed,
 };
 use crate::context::{self, LedgerMode};
 use crate::detect;
@@ -13,6 +13,7 @@ use std::path::Path;
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: &[String],
+    ledger_flag: Option<&str>,
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format_flag: Option<&str>,
@@ -21,7 +22,7 @@ pub async fn run(
     direct: bool,
     policy: &PolicyArgs,
 ) -> CliResult<()> {
-    let (explicit_ledger, positional_inline, positional_file) = resolve_positional_args(args)?;
+    let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
 
     // Resolve input: -e > positional inline > -f > positional file > stdin
     let source = input::resolve_input(

@@ -414,6 +414,12 @@ pub enum Commands {
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
 
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline data or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]
         expr: Option<String>,
@@ -452,6 +458,12 @@ pub enum Commands {
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
 
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline data or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
         /// Inline data expression (JSON-LD or SPARQL UPDATE).
         #[arg(short = 'e', long = "expr")]
         expr: Option<String>,
@@ -488,6 +500,12 @@ pub enum Commands {
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
+
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline data or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]
@@ -526,6 +544,12 @@ pub enum Commands {
         /// With 2 args: first is ledger name, second is inline query.
         #[arg(num_args = 0..=2)]
         args: Vec<String>,
+
+        /// Ledger name (defaults to active ledger). Explicit alternative to
+        /// the positional ledger argument; when given, positional args carry
+        /// only the inline query or a file path.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
 
         /// Inline query expression (SPARQL or JSON-LD query).
         #[arg(short = 'e', long = "expr")]
@@ -664,7 +688,7 @@ pub enum Commands {
         entity: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Start of time range (transaction number, default: 1)
@@ -773,7 +797,7 @@ pub enum Commands {
         commit: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -982,7 +1006,7 @@ pub enum GraphAction {
     List {
         /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
         /// Defaults to the active ledger.
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// List graphs on a remote server (by remote name, e.g. "origin")
@@ -1021,7 +1045,7 @@ pub enum GraphAction {
 
         /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
         /// Defaults to the active ledger.
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g. "origin")
@@ -1039,7 +1063,7 @@ pub enum BranchAction {
         name: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Source branch to create from (defaults to "main")
@@ -1065,7 +1089,7 @@ pub enum BranchAction {
         name: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -1089,7 +1113,7 @@ pub enum BranchAction {
         name: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Conflict resolution strategy (default: "take-both")
@@ -1117,7 +1141,7 @@ pub enum BranchAction {
         strategy: String,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -1165,7 +1189,7 @@ pub enum BranchAction {
         json: bool,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
@@ -1216,7 +1240,7 @@ pub enum BranchAction {
         json: bool,
 
         /// Ledger name (defaults to active ledger)
-        #[arg(long)]
+        #[arg(short = 'l', long)]
         ledger: Option<String>,
 
         /// Execute against a remote server (by remote name, e.g., "origin")

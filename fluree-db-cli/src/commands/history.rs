@@ -144,6 +144,11 @@ fn build_history_query(
         ])
     };
 
+    // This projection order is a contract: rows come back as positional arrays
+    // in exactly this order, and `HistoryRow::from_value` reads them by index.
+    // If you change the select list (order, length, or which vars are
+    // projected), update `HistoryRow::from_value` to match or the table/CSV
+    // formatters will silently render the wrong columns.
     let select = if predicate.is_some() {
         serde_json::json!(["?v", "?t", "?op"])
     } else {
@@ -194,6 +199,66 @@ fn format_history_result(json: &serde_json::Value, format: OutputFormatKind) -> 
     }
 }
 
+/// Field accessors for one history result row.
+///
+/// History queries project a select list, so the engine returns each row as a
+/// positional JSON array matching the projected variable order:
+///   - no predicate filter: `[?p, ?v, ?t, ?op]`
+///   - predicate filter:     `[?v, ?t, ?op]`
+///
+/// Object-keyed rows (`{"?t": ...}`) are also accepted defensively.
+struct HistoryRow<'a> {
+    predicate: Option<&'a serde_json::Value>,
+    value: Option<&'a serde_json::Value>,
+    t: Option<&'a serde_json::Value>,
+    op: Option<&'a serde_json::Value>,
+}
+
+impl<'a> HistoryRow<'a> {
+    fn from_value(row: &'a serde_json::Value) -> Self {
+        match row {
+            serde_json::Value::Array(cols) if cols.len() >= 4 => HistoryRow {
+                predicate: cols.first(),
+                value: cols.get(1),
+                t: cols.get(2),
+                op: cols.get(3),
+            },
+            serde_json::Value::Array(cols) if cols.len() == 3 => HistoryRow {
+                predicate: None,
+                value: cols.first(),
+                t: cols.get(1),
+                op: cols.get(2),
+            },
+            serde_json::Value::Object(_) => HistoryRow {
+                predicate: row.get("?p"),
+                value: row.get("?v"),
+                t: row.get("?t"),
+                op: row.get("?op"),
+            },
+            _ => HistoryRow {
+                predicate: None,
+                value: None,
+                t: None,
+                op: None,
+            },
+        }
+    }
+
+    fn t_str(&self) -> String {
+        self.t
+            .and_then(serde_json::Value::as_i64)
+            .map(|n| n.to_string())
+            .unwrap_or_default()
+    }
+
+    fn op_str(&self) -> &'static str {
+        self.op
+            .and_then(serde_json::Value::as_bool)
+            .map(|b| if b { "+" } else { "-" })
+            .unwrap_or("?")
+    }
+}
+
 fn format_history_table(json: &serde_json::Value) -> CliResult<String> {
     use comfy_table::{ContentArrangement, Table};
 
@@ -209,8 +274,12 @@ fn format_history_table(json: &serde_json::Value) -> CliResult<String> {
     let mut table = Table::new();
     table.set_content_arrangement(ContentArrangement::Dynamic);
 
-    // Determine columns from first row
-    let has_predicate = arr.first().map(|r| r.get("?p").is_some()).unwrap_or(false);
+    // Determine columns from first row: the predicate is projected only when
+    // the query was not filtered to a single predicate.
+    let has_predicate = arr
+        .first()
+        .map(|r| HistoryRow::from_value(r).predicate.is_some())
+        .unwrap_or(false);
 
     if has_predicate {
         table.set_header(["t", "op", "predicate", "value"]);
@@ -219,20 +288,13 @@ fn format_history_table(json: &serde_json::Value) -> CliResult<String> {
     }
 
     for row in arr {
-        let t = row
-            .get("?t")
-            .and_then(serde_json::Value::as_i64)
-            .map(|n| n.to_string())
-            .unwrap_or_default();
-        let op = row
-            .get("?op")
-            .and_then(serde_json::Value::as_bool)
-            .map(|b| if b { "+" } else { "-" })
-            .unwrap_or("?");
-        let val = format_value(row.get("?v"));
+        let fields = HistoryRow::from_value(row);
+        let t = fields.t_str();
+        let op = fields.op_str();
+        let val = format_value(fields.value);
 
         if has_predicate {
-            let pred = format_value(row.get("?p"));
+            let pred = format_value(fields.predicate);
             table.add_row([t, op.to_string(), pred, val]);
         } else {
             table.add_row([t, op.to_string(), val]);
@@ -252,7 +314,10 @@ fn format_history_csv(json: &serde_json::Value) -> CliResult<String> {
         return Ok(String::new());
     }
 
-    let has_predicate = arr.first().map(|r| r.get("?p").is_some()).unwrap_or(false);
+    let has_predicate = arr
+        .first()
+        .map(|r| HistoryRow::from_value(r).predicate.is_some())
+        .unwrap_or(false);
 
     let mut lines = Vec::new();
 
@@ -264,20 +329,13 @@ fn format_history_csv(json: &serde_json::Value) -> CliResult<String> {
     }
 
     for row in arr {
-        let t = row
-            .get("?t")
-            .and_then(serde_json::Value::as_i64)
-            .map(|n| n.to_string())
-            .unwrap_or_default();
-        let op = row
-            .get("?op")
-            .and_then(serde_json::Value::as_bool)
-            .map(|b| if b { "+" } else { "-" })
-            .unwrap_or("?");
-        let val = csv_escape(&format_value(row.get("?v")));
+        let fields = HistoryRow::from_value(row);
+        let t = fields.t_str();
+        let op = fields.op_str();
+        let val = csv_escape(&format_value(fields.value));
 
         if has_predicate {
-            let pred = csv_escape(&format_value(row.get("?p")));
+            let pred = csv_escape(&format_value(fields.predicate));
             lines.push(format!("{t},{op},{pred},{val}"));
         } else {
             lines.push(format!("{t},{op},{val}"));
@@ -310,5 +368,81 @@ fn csv_escape(value: &str) -> String {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unfiltered history rows arrive as `[?p, ?v, ?t, ?op]` positional arrays.
+    #[test]
+    fn table_renders_positional_rows_with_predicate() {
+        let json = serde_json::json!([
+            ["http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "ex:Article", 1, true],
+            ["ex:content", {"@value": "v2", "@type": "https://ns.flur.ee/db#fullText"}, 4, true],
+            ["ex:content", {"@value": "v1", "@type": "https://ns.flur.ee/db#fullText"}, 4, false],
+        ]);
+
+        let out = format_history_table(&json).unwrap();
+
+        assert!(out.contains("predicate"), "predicate column header missing");
+        // t/op/value/predicate cells are populated, not blank or `?`.
+        assert!(out.contains("ex:Article"));
+        assert!(out.contains("rdf-syntax-ns#type"));
+        assert!(out.contains('1') && out.contains('4'));
+        assert!(out.contains('+') && out.contains('-'));
+        assert!(out.contains("v1") && out.contains("v2"));
+        assert!(
+            !out.contains('?'),
+            "rows should not contain `?` placeholders"
+        );
+    }
+
+    /// Predicate-filtered history rows arrive as `[?v, ?t, ?op]` (no `?p`).
+    #[test]
+    fn table_renders_positional_rows_without_predicate() {
+        let json = serde_json::json!([["Alice", 1, true], ["Alice Smith", 2, true],]);
+
+        let out = format_history_table(&json).unwrap();
+
+        assert!(
+            !out.contains("predicate"),
+            "predicate column should be absent"
+        );
+        assert!(out.contains("Alice Smith"));
+        assert!(out.contains('1') && out.contains('2'));
+        assert!(
+            !out.contains('?'),
+            "rows should not contain `?` placeholders"
+        );
+    }
+
+    #[test]
+    fn csv_renders_positional_rows() {
+        let json = serde_json::json!([["http://schema.org/name", "Deployment Runbook", 1, true],]);
+
+        let out = format_history_csv(&json).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(lines[0], "t,op,predicate,value");
+        assert_eq!(lines[1], "1,+,http://schema.org/name,Deployment Runbook");
+    }
+
+    /// Object-keyed rows remain supported for robustness.
+    #[test]
+    fn table_still_handles_object_rows() {
+        let json = serde_json::json!([
+            {"?p": "ex:name", "?v": "Alice", "?t": 1, "?op": true},
+        ]);
+
+        let out = format_history_table(&json).unwrap();
+        assert!(out.contains("ex:name") && out.contains("Alice") && out.contains('1'));
+    }
+
+    #[test]
+    fn empty_history_reports_none_found() {
+        let json = serde_json::json!([]);
+        assert_eq!(format_history_table(&json).unwrap(), "(no history found)");
     }
 }

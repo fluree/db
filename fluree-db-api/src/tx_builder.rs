@@ -480,30 +480,10 @@ impl<'a> OwnedTransactBuilder<'a> {
                         .await?
                 };
 
-            // Compute indexing status AFTER publish_commit succeeds
-            let indexing_enabled =
-                self.fluree.indexing_mode.is_enabled() && self.fluree.defaults_indexing_enabled();
-            let indexing_needed = ledger.should_reindex(&index_config);
-            let indexing_status = IndexingStatus {
-                enabled: indexing_enabled,
-                needed: indexing_needed,
-                novelty_size: ledger.novelty_size(),
-                index_t: ledger.index_t(),
-                commit_t: receipt.t,
-            };
-
-            // Trigger indexing AFTER publish_commit succeeds (fast operation)
-            if let IndexingMode::Background(handle) = &self.fluree.indexing_mode {
-                if indexing_enabled && indexing_needed {
-                    handle.trigger(ledger.ledger_id(), receipt.t).await;
-                }
-            }
-
-            return Ok(TransactResult {
-                receipt,
-                ledger,
-                indexing: indexing_status,
-            });
+            return Ok(self
+                .fluree
+                .finalize_owned_commit(receipt, ledger, &index_config)
+                .await);
         }
 
         let op = self.core.operation.unwrap_or_else(|| {
