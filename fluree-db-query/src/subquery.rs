@@ -154,29 +154,43 @@ impl SubqueryOperator {
             .filter(|v| produced.contains(v))
             .collect();
 
-        let join_mode = if subquery.uncorrelated {
-            // SPARQL 1.1 §18.2: a sub-SELECT is evaluated INDEPENDENTLY (its
-            // complete, ordered, sliced solution sequence) and then joined — it
-            // is never seeded per parent row, which would correlate it (and let
-            // an inner LIMIT/OFFSET apply per row, leaking rows past the slice;
-            // W3C subquery/sq11). Materialize once + hash-join on `join_keys`.
-            // A non-produced correlation var is unbound in every inner row, so
-            // omitting it from the key is the correct natural join (unbound is
-            // compatible with any parent value), and the merge fills it from the
-            // parent. So this is correct regardless of `pass_through_ok`.
+        // Every NON-key correlation var must be either produced by the inner
+        // (seeding it only filters — equivalent to the natural join) or
+        // unreferenced in the inner body (seeding it is a no-op). When that
+        // holds, per-row seeding yields the same multiset as evaluating the
+        // subquery independently and joining; otherwise (a var referenced in an
+        // inner FILTER/BIND/aggregate) only materialize-once is correct.
+        let body_referenced = referenced_vars_set(&subquery.patterns);
+        let pass_through_ok = correlation_vars
+            .iter()
+            .all(|v| produced.contains(v) || !body_referenced.contains(v));
+
+        // SPARQL 1.1 §18.2: a sub-SELECT is evaluated INDEPENDENTLY and then
+        // joined. Materialize-once is only *required* to honor that when the
+        // subquery is sliced, deduplicated, or aggregated (per-row seeding
+        // would then change the result — e.g. an inner LIMIT applying per parent
+        // row, W3C subquery/sq11), or when a correlation var is referenced but
+        // not produced (seeding correlates it). A plain projection sub-SELECT is
+        // equivalent either way, so it falls through to the cardinality-guarded
+        // choice below and may prune via per-row seeding for a small, selective
+        // parent — the legacy optimization we'd otherwise lose for all SPARQL
+        // sub-SELECTs.
+        let must_materialize_once = subquery.uncorrelated
+            && (subquery.limit.is_some()
+                || subquery.offset.is_some()
+                || subquery.distinct
+                || subquery.grouping.is_some()
+                || !pass_through_ok);
+
+        let join_mode = if must_materialize_once {
             true
         } else {
-            // JSON-LD subqueries keep their legacy per-row-seeding (LATERAL)
-            // behavior: evaluate-once + hash-join only when there is no inner
-            // slice and every NON-key correlation var is an unreferenced
-            // pass-through; otherwise per-row seed. The cardinality guard prefers
-            // per-row seeding for a small parent (its pruning seed can be
-            // cheaper); an uncorrelated (no shared key) subquery is always
-            // evaluated once (per-row recomputes identically).
-            let body_referenced = referenced_vars_set(&subquery.patterns);
-            let pass_through_ok = correlation_vars
-                .iter()
-                .all(|v| produced.contains(v) || !body_referenced.contains(v));
+            // Evaluate-once + hash-join only when there is no inner slice and
+            // every non-key correlation var is an unreferenced pass-through;
+            // otherwise per-row seed. The cardinality guard prefers per-row
+            // seeding for a small parent (its pruning seed can be cheaper); an
+            // uncorrelated (no shared key) subquery is always evaluated once
+            // (per-row recomputes identically).
             let eligible = subquery.limit.is_none() && subquery.offset.is_none() && pass_through_ok;
             eligible
                 && (correlation_vars.is_empty()
