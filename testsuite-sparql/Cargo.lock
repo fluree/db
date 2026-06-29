@@ -412,6 +412,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "ctr"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -641,11 +662,13 @@ checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fluree-db-api"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
+ "csv",
  "dirs",
  "flate2",
  "fluree-db-binary-index",
@@ -674,6 +697,7 @@ dependencies = [
  "indexmap",
  "itoa",
  "moka",
+ "percent-encoding",
  "rustc-hash",
  "ryu",
  "serde",
@@ -688,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-binary-index"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "bigdecimal 0.4.10",
  "chrono",
@@ -720,7 +744,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-connection"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -734,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-core"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -768,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-credential"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "base64",
  "bs58",
@@ -781,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-crypto"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -797,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-cypher"
-version = "4.0.6"
+version = "4.1.1"
 dependencies = [
  "fluree-db-core",
  "fluree-db-query",
@@ -812,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-indexer"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -847,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-ledger"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -862,7 +886,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-nameservice"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -878,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-novelty"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -896,7 +920,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-policy"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "fluree-db-core",
  "fluree-vocab",
@@ -908,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-query"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -956,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-r2rml"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "fluree-db-tabular",
@@ -972,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-reasoner"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -988,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-sparql"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
@@ -1005,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-spatial"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -1033,14 +1057,14 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-tabular"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "fluree-db-transact"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1079,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-format"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "fluree-graph-ir",
  "serde",
@@ -1089,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-ir"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "fluree-vocab",
  "serde",
@@ -1099,7 +1123,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-json-ld"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1111,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-turtle"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1124,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-protocol"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1133,7 +1157,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-vocab"
-version = "4.0.7"
+version = "4.1.1"
 
 [[package]]
 name = "foldhash"
@@ -1578,9 +1602,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.89"
+version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4eacb0641a310445a4c513f2a5e23e19952e269c6a38887254d5f837a305506"
+checksum = "8c942ebf8e95485ca0d52d97da7c5a2c387d0e7f0ba4c35e93bfcaee045955b3"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
@@ -2374,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "testsuite-sparql"
-version = "4.0.7"
+version = "4.1.1"
 dependencies = [
  "anyhow",
  "fluree-db-api",
@@ -2588,9 +2612,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.112"
+version = "0.2.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05d7d0fce354c88b7982aec4400b3e7fcf723c32737cef571bd165f7613557ee"
+checksum = "64024a30ec1e37399cf85a7ffefebdb72205ca1c972291c51512360d90bd8566"
 dependencies = [
  "cfg-if",
  "once_cell",
@@ -2601,9 +2625,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.112"
+version = "0.2.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55839b71ba921e4f75b674cb16f843f4b1f3b26ddfcb3454de1cf65cc021ec0f"
+checksum = "008b239d9c740232e71bd39e8ef6429d27097518b6b30bdf9086833bd5b6d608"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -2611,9 +2635,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.112"
+version = "0.2.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caf2e969c2d60ff52e7e98b7392ff1588bffdd1ccd4769eba27222fd3d621571"
+checksum = "5256bae2d58f54820e6490f9839c49780dff84c65aeab9e772f15d5f0e913a55"
 dependencies = [
  "bumpalo",
  "proc-macro2",
@@ -2624,9 +2648,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.112"
+version = "0.2.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0861f0dcdf46ea819407495634953cdcc8a8c7215ab799a7a7ce366be71c7b30"
+checksum = "1f01b580c9ac74c8d8f0c0e4afb04eeef2acf145458e52c03845ee9cd23e3d12"
 dependencies = [
  "unicode-ident",
 ]
