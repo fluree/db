@@ -983,10 +983,14 @@ fn partition_eligible_filters(
         if filter_idxs_consumed.contains(&pf.original_idx) {
             continue;
         }
-        // Filters containing EXISTS subexpressions cannot be inlined because
-        // inline evaluation is synchronous. EXISTS requires async evaluation
-        // via FilterOperator's filter_batch_with_exists path.
-        if pf.required_vars.is_subset(bound) && !contains_exists(&pf.expr) {
+        // Filters containing EXISTS or a Cypher metadata read cannot be inlined:
+        // inline evaluation is synchronous, and both require the async path on
+        // FilterOperator (EXISTS via filter_batch_with_exists, metadata via the
+        // policy-filtered resolver). Defer them to a real FilterOperator.
+        if pf.required_vars.is_subset(bound)
+            && !contains_exists(&pf.expr)
+            && !crate::eval::metadata_resolve::contains_metadata_read(&pf.expr)
+        {
             ready.push(pf.expr);
         } else {
             pending.push(pf);
@@ -1285,7 +1289,14 @@ fn inline_chain(
         changed = false;
         let mut still_pending = Vec::new();
         for bind in remaining_binds {
-            if bind.required_vars.is_subset(available) {
+            // A bind whose expression reads graph flakes for a Cypher metadata
+            // function must not be inlined: the inline evaluator (`apply_inline`)
+            // is synchronous and so cannot run the async view-policy filter. Keep
+            // it as a deferred `BindOperator`, which resolves metadata through the
+            // policy-filtered async path. Cheap to defer — metadata calls are rare.
+            if bind.required_vars.is_subset(available)
+                && !crate::eval::metadata_resolve::contains_metadata_read(&bind.expr)
+            {
                 available.insert(bind.var);
                 ops.push(InlineOperator::Bind {
                     var: bind.var,

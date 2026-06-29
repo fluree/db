@@ -236,7 +236,7 @@ fn write_term(
                 "Binding::Grouped should be disaggregated before SPARQL XML formatting".to_string(),
             ));
         }
-        Binding::Path(_) | Binding::List(_) => {
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
             return Err(FormatError::InvalidBinding(
                 "SPARQL results have no path/list type (Cypher-only)".to_string(),
             ));

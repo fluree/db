@@ -101,6 +101,14 @@ impl ArithmeticOp {
                 ArithmeticOp::Mul => Ok(ComparableValue::Long(
                     a.checked_mul(b).ok_or(ArithmeticError::Overflow)?,
                 )),
+                ArithmeticOp::Mod => {
+                    if b == 0 {
+                        return Err(ArithmeticError::DivideByZero);
+                    }
+                    Ok(ComparableValue::Long(
+                        a.checked_rem(b).ok_or(ArithmeticError::Overflow)?,
+                    ))
+                }
                 // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields
                 // xsd:decimal (e.g. 10 / 4 = 2.5), not a truncated integer.
                 ArithmeticOp::Div => {
@@ -119,6 +127,12 @@ impl ArithmeticOp {
                     ArithmeticOp::Add => a + b,
                     ArithmeticOp::Sub => a - b,
                     ArithmeticOp::Mul => a * b,
+                    ArithmeticOp::Mod => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a % b
+                    }
                     ArithmeticOp::Div => {
                         if b == 0.0 {
                             return Err(ArithmeticError::DivideByZero);
@@ -133,6 +147,12 @@ impl ArithmeticOp {
                 ArithmeticOp::Add => Ok(ComparableValue::BigInt(Box::new(*a + &*b))),
                 ArithmeticOp::Sub => Ok(ComparableValue::BigInt(Box::new(*a - &*b))),
                 ArithmeticOp::Mul => Ok(ComparableValue::BigInt(Box::new(*a * &*b))),
+                ArithmeticOp::Mod => {
+                    if b.is_zero() {
+                        return Err(ArithmeticError::DivideByZero);
+                    }
+                    Ok(ComparableValue::BigInt(Box::new(*a % &*b)))
+                }
                 // integer / integer → xsd:decimal (see the Long/Long arm).
                 ArithmeticOp::Div => {
                     if b.is_zero() {
@@ -150,6 +170,12 @@ impl ArithmeticOp {
                     ArithmeticOp::Add => &*a + &*b,
                     ArithmeticOp::Sub => &*a - &*b,
                     ArithmeticOp::Mul => &*a * &*b,
+                    ArithmeticOp::Mod => {
+                        if b.is_zero() {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        &*a % &*b
+                    }
                     ArithmeticOp::Div => {
                         if b.is_zero() {
                             return Err(ArithmeticError::DivideByZero);

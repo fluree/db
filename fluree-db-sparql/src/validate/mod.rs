@@ -378,20 +378,10 @@ impl<'a> Validator<'a> {
     /// Validate a property path for unsupported features.
     fn validate_property_path(&mut self, path: &PropertyPath, _pattern_span: SourceSpan) {
         match path {
-            PropertyPath::NegatedSet { span, .. } => {
-                self.diagnostics.push(
-                    Diagnostic::error(
-                        DiagCode::UnsupportedNegatedPropertySet,
-                        "Negated property sets are not supported",
-                        *span,
-                    )
-                    .with_label(Label::new(*span, "negated set not supported"))
-                    .with_help(
-                        "Rewrite using FILTER NOT EXISTS or explicit UNION of allowed predicates.",
-                    )
-                    .with_note("Fluree supports +, *, ?, /, |, ^ but not negated property sets."),
-                );
-            }
+            // Negated property sets lower to a fresh-predicate-var triple plus a
+            // FILTER excluding the listed predicates (see lower/path.rs). Members
+            // are leaf IRIs/`a` (optionally inverse), so no inner recursion.
+            PropertyPath::NegatedSet { .. } => {}
             PropertyPath::Iri(_) | PropertyPath::A { .. } => {
                 // Simple paths are always valid
             }
@@ -595,24 +585,26 @@ mod tests {
     }
 
     #[test]
-    fn test_property_path_negated_invalid() {
+    fn test_property_path_negated_now_valid() {
+        // Negated property sets are now supported (lowered to a fresh-predicate
+        // triple + FILTER); the validator no longer rejects them.
         let diags = validate_query("SELECT * WHERE { ?s !ex:hidden ?o }");
         assert!(
-            diags
+            !diags
                 .iter()
                 .any(|d| d.code == DiagCode::UnsupportedNegatedPropertySet),
-            "Negated property sets should be rejected"
+            "Negated property sets are supported and should validate"
         );
     }
 
     #[test]
-    fn test_property_path_negated_set_invalid() {
+    fn test_property_path_negated_set_now_valid() {
         let diags = validate_query("SELECT * WHERE { ?s !(ex:a|ex:b) ?o }");
         assert!(
-            diags
+            !diags
                 .iter()
                 .any(|d| d.code == DiagCode::UnsupportedNegatedPropertySet),
-            "Negated property sets should be rejected"
+            "Negated property sets are supported and should validate"
         );
     }
 
@@ -689,16 +681,5 @@ mod tests {
             .expect("Expected variable error");
         assert!(var_error.help.is_some(), "Error should have help text");
         assert!(var_error.note.is_some(), "Error should have a note");
-    }
-
-    #[test]
-    fn test_negated_path_error_has_help() {
-        let diags = validate_query("SELECT * WHERE { ?s !ex:hidden ?o }");
-        let path_error = diags
-            .iter()
-            .find(|d| d.code == DiagCode::UnsupportedNegatedPropertySet)
-            .expect("Expected path error");
-        assert!(path_error.help.is_some(), "Error should have help text");
-        assert!(path_error.note.is_some(), "Error should have a note");
     }
 }

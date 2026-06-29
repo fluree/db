@@ -7,6 +7,22 @@ use serde_json::Value as JsonValue;
 
 use crate::error::{Result, ServerError};
 
+/// Case-insensitive ASCII substring search that does not allocate.
+///
+/// Used on the request hot path for content-type sniffing, where the previous
+/// `to_ascii_lowercase()` heap-allocated on every request. `haystack` is a short
+/// header value and `needle` a fixed literal, so the windowed scan is cheap.
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// Fluree-specific HTTP headers
 ///
 /// These headers allow clients to specify query options, ledger selection,
@@ -215,6 +231,28 @@ impl FlureeHeaders {
         self.content_type
             .as_ref()
             .map(|ct| ct.contains("application/sparql-update"))
+            .unwrap_or(false)
+    }
+
+    /// Check if this is an openCypher request based on Content-Type.
+    ///
+    /// Matches `application/cypher` or `application/opencypher`
+    /// (case-insensitive). Used by both the query and update routes —
+    /// Cypher is a single surface whose read/write is determined by the
+    /// statement, but the endpoints stay split (query vs update) for parity
+    /// with SPARQL.
+    pub fn is_cypher_query(&self) -> bool {
+        // No allocation: this runs on every query/transact request (the Cypher
+        // check precedes the JSON-LD/SPARQL dispatch), so it must not tax the
+        // standard RDF hot path the way `to_ascii_lowercase()` did. Matches the
+        // same two media types as before, case-insensitively, via a borrowed
+        // scan instead of a lowercased copy.
+        self.content_type
+            .as_ref()
+            .map(|ct| {
+                ascii_contains_ignore_case(ct, "application/cypher")
+                    || ascii_contains_ignore_case(ct, "application/opencypher")
+            })
             .unwrap_or(false)
     }
 

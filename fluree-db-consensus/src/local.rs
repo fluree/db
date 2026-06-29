@@ -14,8 +14,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ApiError, Base64Bytes, Fluree, GovernanceOptions, LedgerHandle, LedgerManager, PolicyContext,
-    PushCommitsRequest, RefreshOpts, TransactError,
+    ApiError, Base64Bytes, Fluree, GovernanceOptions, GraphDb, LedgerHandle, LedgerManager,
+    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError, Txn,
 };
 use fluree_db_ledger::IndexConfig;
 use std::sync::Arc;
@@ -115,6 +115,29 @@ impl Committer for LocalCommitter {
         for attempt in 1..=MAX_TXN_RETRIES {
             let policy_ctx = build_policy_context(&ledger_handle, &governance).await?;
 
+            // Cypher lowers to a `Txn` here — under the write lock and re-resolved
+            // each retry attempt — rather than pre-lock in the route. A conditional
+            // `MERGE … ON MATCH/ON CREATE` therefore chooses its branch against the
+            // same state the commit's head-check guards: if a concurrent writer
+            // commits first, the head-check fails, `refresh()` reconciles, and the
+            // branch is re-chosen on the next attempt. (Other bodies lower inside
+            // `stage`, so only Cypher needs this explicit pre-stage resolution.)
+            let cypher_txn = match &body {
+                TransactionBody::Cypher { query, params } => Some(
+                    resolve_cypher_under_lock(
+                        &self.fluree,
+                        &ledger_handle,
+                        &ledger_id,
+                        query,
+                        params.as_ref(),
+                        &governance,
+                    )
+                    .await
+                    .map_err(execution_failure)?,
+                ),
+                _ => None,
+            };
+
             // The builder API holds the ledger write lock and replaces the cached
             // state internally for the duration of stage + commit — no manual
             // lock/clone/replace dance is needed here. Each body variant fixes
@@ -129,6 +152,9 @@ impl Committer for LocalCommitter {
                     staged.upsert_turtle(text.as_str())
                 }
                 TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
+                TransactionBody::Cypher { .. } => {
+                    staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                }
             };
             let mut builder = staged
                 .txn_opts(txn_opts.clone())
@@ -364,6 +390,51 @@ pub(crate) async fn build_policy_context(
     .await
     .map(Some)
     .map_err(execution_failure)
+}
+
+/// Lower a Cypher write statement to a `Txn` against the ledger's
+/// current (locked) state, resolving a conditional `MERGE` plan with a
+/// policy-wrapped probe.
+///
+/// Called from inside the serialized commit path — the local
+/// committer's stage+commit retry loop (under the ledger write lock)
+/// and the Raft commit worker (single serialized writer per ledger) —
+/// so a conditional `MERGE … ON MATCH/ON CREATE` chooses its branch
+/// against the same state the commit lands on (no pre-lock TOCTOU). The
+/// policy wrap mirrors the Cypher read / SPARQL surfaces so a
+/// restricted writer's branch selection sees only policy-visible data.
+///
+/// Returns the lowered `Txn`; the caller maps [`ApiError`] into its own
+/// failure type.
+pub(crate) async fn resolve_cypher_under_lock(
+    fluree: &Fluree,
+    ledger_handle: &LedgerHandle,
+    ledger_id: &str,
+    query: &str,
+    params: Option<&serde_json::Map<String, serde_json::Value>>,
+    governance: &GovernanceOptions,
+) -> Result<Txn, ApiError> {
+    let snap = ledger_handle.snapshot().await;
+    let plan = fluree
+        .cypher_write_plan(query, params, ledger_id, &snap.snapshot)
+        .await?;
+    match plan {
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(*txn),
+        fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
+            // Fresh owned state for the branch-choosing probe (cheap — the
+            // snapshot is Arc-shared); `snap` stays borrowed for the resolve.
+            let probe_state = ledger_handle.snapshot().await.to_ledger_state();
+            let probe = GraphDb::from_ledger_state(&probe_state);
+            let probe = if governance.has_any_policy_inputs() {
+                fluree.wrap_policy(probe, governance, None).await?
+            } else {
+                probe
+            };
+            fluree
+                .resolve_conditional_cypher(&cw, probe, ledger_id, &snap.snapshot)
+                .await
+        }
+    }
 }
 
 #[cfg(test)]

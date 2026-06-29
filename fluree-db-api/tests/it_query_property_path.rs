@@ -131,6 +131,60 @@ async fn property_path_one_or_more_no_vars_matches_transitively() {
 }
 
 #[tokio::test]
+async fn property_path_zero_or_one_object_var() {
+    // `@path: "ex:knows?"` — JSON-LD parity for SPARQL `ex:knows?`. From `ex:a`,
+    // ZeroOrOne yields a itself (zero-length) plus its direct neighbor b only.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger1 = seed_knows_chain(&fluree, "property/path-zoo-o:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "knowsOpt": {"@path": "ex:knows?"}
+        },
+        "where": [{"@id":"ex:a","knowsOpt":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "knows? from a = {{a, b}}, not the transitive closure: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn property_path_nested_modifier_collapses() {
+    // `@path: "((ex:knows)*)*"` collapses to `ex:knows*` — JSON-LD parity for the
+    // SPARQL nested-modifier simplification. From `ex:a` over a->b->{c,d}->e.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger1 = seed_knows_chain(&fluree, "property/path-nested-mod:main").await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "reach": {"@path": "((ex:knows)*)*"}
+        },
+        "where": [{"@id":"ex:a","reach":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"], ["ex:d"], ["ex:e"]])),
+        "((knows)*)* = knows* = full closure incl. start: {rows}"
+    );
+}
+
+#[tokio::test]
 async fn property_path_one_or_more_object_var_with_and_without_cycle() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger1 = seed_knows_chain(&fluree, "property/path-oneplus-o:main").await;
@@ -412,24 +466,163 @@ async fn property_path_array_form() {
 
 #[tokio::test]
 async fn property_path_unsupported_operator_error() {
-    // Zero-or-one (?) is parsed but not yet supported for execution
+    // Composite-transitive steps may be simple, alternations, or inverse, but a
+    // NESTED transitive step inside the repeated unit — `(ex:knows+/ex:knows)+` —
+    // is still rejected.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger1 = seed_knows_chain(&fluree, "property/path-unsupported:main").await;
 
     let q = json!({
         "@context": {
             "ex": "http://example.org/",
-            "maybeFriend": {"@path": "ex:knows?"}
+            "weird": {"@path": "(ex:knows+/ex:knows)+"}
         },
-        "where": [{"@id":"ex:a","maybeFriend":"?who"}],
+        "where": [{"@id":"ex:a","weird":"?who"}],
         "select": ["?who"]
     });
     let err = support::query_jsonld(&fluree, &ledger1, &q).await;
-    assert!(err.is_err(), "Zero-or-one paths should fail at execution");
-    let msg = format!("{}", err.unwrap_err());
     assert!(
-        msg.contains("not yet supported"),
-        "Error should mention 'not yet supported', got: {msg}"
+        err.is_err(),
+        "A nested transitive step inside a composite repeated unit should be rejected"
+    );
+}
+
+#[tokio::test]
+async fn property_path_parenthesized_inverse_transitive() {
+    // `(^ex:knows)+` (string) and `["+", ["^", "ex:knows"]]` (array) both mean
+    // `^ex:knows+`. Over the seed chain a→b→{c,d}→e, from e walk knows backwards:
+    // {d, b, a}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger1 = seed_knows_chain(&fluree, "property/path-paren-inv:main").await;
+    let expected = json!([["ex:d"], ["ex:b"], ["ex:a"]]);
+
+    for path in [json!("(^ex:knows)+"), json!(["+", ["^", "ex:knows"]])] {
+        let q = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "rev": {"@path": path}
+            },
+            "where": [{"@id":"ex:e","rev":"?who"}],
+            "select": ["?who"]
+        });
+        let rows = support::query_jsonld(&fluree, &ledger1, &q)
+            .await
+            .unwrap()
+            .to_jsonld(&ledger1.snapshot)
+            .unwrap();
+        assert_eq!(
+            normalize_rows(&rows),
+            normalize_rows(&expected),
+            "(^knows)+ from e = {{d, b, a}} for path {path}: {rows}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn property_path_zero_or_one_inside_sequence() {
+    // JSON-LD parity for SPARQL `ex:p?/ex:q`. From a: zero p → a q x; one p → b q y.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "property/path-zoo-seq:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}, "ex:q": {"@id": "ex:x"}},
+            {"@id": "ex:b", "ex:q": {"@id": "ex:y"}}
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "optThenQ": {"@path": "ex:p?/ex:q"}
+        },
+        "where": [{"@id":"ex:a","optThenQ":"?o"}],
+        "select": ["?o"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:x"], ["ex:y"]])),
+        "p?/q from a = {{x, y}}: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn property_path_composite_transitive_inverse_step() {
+    // JSON-LD parity for SPARQL `(^ex:p/ex:q)+`. hub0/hub1 each link a pair of
+    // nodes (hub p x0, hub q x1), making `^p/q` the co-parent relation:
+    // x0 (^p/q) x1 via hub0, x1 (^p/q) x2 via hub1. Transitively from x0:
+    // {x1, x2}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "property/path-composite-inv:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "coParent": {"@path": "(^ex:p/ex:q)+"}
+        },
+        "where": [{"@id":"ex:x0","coParent":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(^p/q)+ from x0 = {{x1, x2}}: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn property_path_composite_transitive_sequence() {
+    // JSON-LD parity for SPARQL `(ex:p/ex:q)+`. Seed a -p-> m -q-> b -p-> n -q-> c
+    // so each composite hop advances a→b→c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "property/path-composite:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:n"}},
+            {"@id": "ex:n", "ex:q": {"@id": "ex:c"}}
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "hop": {"@path": "(ex:p/ex:q)+"}
+        },
+        "where": [{"@id":"ex:a","hop":"?who"}],
+        "select": ["?who"]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger1.snapshot)
+        .unwrap();
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["ex:b"], ["ex:c"]])),
+        "(p/q)+ from a = {{b, c}}: {rows}"
     );
 }
 

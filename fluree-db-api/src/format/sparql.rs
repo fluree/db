@@ -339,7 +339,7 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
                 "Binding::Grouped should be disaggregated before formatting".to_string(),
             ));
         }
-        Binding::Path(_) | Binding::List(_) => {
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
             return Err(FormatError::InvalidBinding(
                 "SPARQL results have no path/list type (Cypher-only)".to_string(),
             ));
@@ -678,9 +678,11 @@ fn format_binding(
             "Binding::Grouped should be disaggregated before formatting".to_string(),
         )),
 
-        Binding::Path(_) | Binding::List(_) => Err(FormatError::InvalidBinding(
-            "SPARQL results have no path/list type (Cypher-only)".to_string(),
-        )),
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+            Err(FormatError::InvalidBinding(
+                "SPARQL results have no path/list type (Cypher-only)".to_string(),
+            ))
+        }
 
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             unreachable!(

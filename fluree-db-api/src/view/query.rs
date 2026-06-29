@@ -4,9 +4,9 @@
 //! a GraphDb, respecting policy and reasoning wrappers.
 
 use crate::query::helpers::{
-    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_jsonld_query,
-    parse_sparql_to_ir, prepare_for_execution, status_for_query_error, tracked_query_tracker,
-    tracker_for_limits,
+    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_cypher_to_ir,
+    parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, status_for_query_error,
+    tracked_query_tracker, tracker_for_limits,
 };
 use crate::view::{GraphDb, QueryInput};
 use crate::{
@@ -132,6 +132,91 @@ impl Fluree {
         );
 
         // 5. Build result
+        Ok(build_query_result(
+            vars,
+            parsed,
+            batches,
+            Some(db.t),
+            Some(db.overlay.clone()),
+            db.binary_graph(),
+        ))
+    }
+
+    /// Execute a Cypher (openCypher 9 subset) query against a GraphDb.
+    ///
+    /// Mirror of [`Self::query`] for Cypher syntax. Parsing happens via
+    /// `fluree_db_cypher::parse_cypher`; lowering produces the same
+    /// shared `Query` IR that JSON-LD and SPARQL use. Executor + planner
+    /// + result formatting are reused unchanged.
+    ///
+    /// The ledger's default context (if any) supplies `@vocab` and bare-
+    /// identifier overrides; see `parse_cypher_to_ir` for the resolution
+    /// rules.
+    pub async fn query_cypher(&self, db: &GraphDb, cypher: &str) -> Result<QueryResult> {
+        self.query_cypher_with_params(db, cypher, None).await
+    }
+
+    /// Like [`query_cypher`](Self::query_cypher) but substitutes `$param`
+    /// references from `params` (a JSON map of name → value) before lowering.
+    pub async fn query_cypher_with_params(
+        &self,
+        db: &GraphDb,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<QueryResult> {
+        let parse_start = std::time::Instant::now();
+        let (vars, mut parsed) =
+            parse_cypher_to_ir(cypher, &db.snapshot, db.default_context.as_ref(), params)?;
+        let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
+
+        maybe_wrap_for_graph_source(db, &mut parsed);
+
+        self.execute_cypher_ir(db, vars, parsed, parse_ms).await
+    }
+
+    /// Execute an already-constructed Cypher read AST. Used by the
+    /// conditional-write probes, which build read ASTs in code rather than
+    /// from text.
+    pub async fn query_cypher_ast(
+        &self,
+        db: &GraphDb,
+        ast: &fluree_db_cypher::CypherAst,
+    ) -> Result<QueryResult> {
+        let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
+            ast,
+            &db.snapshot,
+            db.default_context.as_ref(),
+        )?;
+        maybe_wrap_for_graph_source(db, &mut parsed);
+        self.execute_cypher_ir(db, vars, parsed, 0.0).await
+    }
+
+    async fn execute_cypher_ir(
+        &self,
+        db: &GraphDb,
+        vars: crate::VarRegistry,
+        parsed: fluree_db_query::ir::Query,
+        parse_ms: f64,
+    ) -> Result<QueryResult> {
+        let plan_start = std::time::Instant::now();
+        let executable = self.build_executable_for_view(db, &parsed).await?;
+        let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
+
+        let tracker = Tracker::disabled();
+        let options = QueryExecutionOptions::default();
+        let exec_start = std::time::Instant::now();
+        let batches = self
+            .execute_view_internal(db, &vars, &executable, &tracker, &options)
+            .await?;
+        let exec_ms = exec_start.elapsed().as_secs_f64() * 1000.0;
+
+        tracing::info!(
+            parse_ms = format!("{:.2}", parse_ms),
+            plan_ms = format!("{:.2}", plan_ms),
+            exec_ms = format!("{:.2}", exec_ms),
+            "cypher query phases"
+        );
+
         Ok(build_query_result(
             vars,
             parsed,

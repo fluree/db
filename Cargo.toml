@@ -11,6 +11,7 @@ members = [
     "fluree-db-connection",
     "fluree-db-query",
     "fluree-db-sparql",
+    "fluree-db-cypher",
     "fluree-db-nameservice",
     "fluree-db-novelty",
     "fluree-db-ledger",

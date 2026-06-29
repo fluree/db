@@ -5605,3 +5605,565 @@ async fn sparql_both_bound_path_reachability() {
         "a cannot reach z: {j2}"
     );
 }
+
+/// Seed a simple `a -> b -> c` chain over `ex:p` for ZeroOrOne path tests.
+async fn seed_pp_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:c"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+/// Seed `a -p-> m -q-> b -p-> n -q-> c`: an alternating two-predicate chain so
+/// each `(ex:p/ex:q)` hop advances a→b→c.
+async fn seed_composite_chain(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:p": {"@id": "ex:n"}},
+            {"@id": "ex:n", "ex:q": {"@id": "ex:c"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_composite_star_both_unbound_includes_all_self_pairs() {
+    // Both-unbound `?s (ex:p/ex:q)* ?o`. Data a -p-> m -q-> b. The zero-length
+    // path pairs EVERY node in the path's domain {a, m, b} with itself — not just
+    // hop-start subjects — plus the one composite hop a→b.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-star-closure");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:m"}},
+            {"@id": "ex:m", "ex:q": {"@id": "ex:b"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s (ex:p/ex:q)* ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite star both-unbound");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([
+            ["ex:a", "ex:a"],
+            ["ex:m", "ex:m"],
+            ["ex:b", "ex:b"],
+            ["ex:a", "ex:b"]
+        ])),
+        "(p/q)* closure: self-pair for every domain node incl. mid m and sink b, plus a→b: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_inside_sequence() {
+    // `?` as a sequence step: `ex:a ex:p?/ex:q ?o`. The optional `ex:p` step
+    // yields a itself (zero hops) and its p-neighbor b, then `ex:q` from each:
+    // a→q→x (zero p) and b→q→y (one p) → {x, y}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:zoo-in-seq");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:p": {"@id": "ex:b"}, "ex:q": {"@id": "ex:x"}},
+            {"@id": "ex:b", "ex:q": {"@id": "ex:y"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a ex:p?/ex:q ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one inside sequence");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x"], ["ex:y"]])),
+        "p?/q from a = {{x (zero p), y (one p)}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_sequence() {
+    // W3C `pp02` shape: transitive over a sequence. `(ex:p/ex:q)+` from a walks
+    // one composite hop to b, two to c → {b, c}. The intermediate m, n nodes are
+    // not endpoints.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_composite_chain(&fluree, "it/sparql:composite").await;
+
+    let plus = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)+ ?x }";
+    let r = support::query_sparql(&fluree, &ledger, plus)
+        .await
+        .expect("composite +");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:b"], ["ex:c"]])),
+        "(p/q)+ from a = {{b, c}}: {j}"
+    );
+
+    // `*` includes the zero-length start.
+    let star = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)* ?x }";
+    let r2 = support::query_sparql(&fluree, &ledger, star)
+        .await
+        .expect("composite *");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "(p/q)* from a includes start: {j2}"
+    );
+
+    // `?` is the start plus exactly one composite hop.
+    let opt = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p/ex:q)? ?x }";
+    let r3 = support::query_sparql(&fluree, &ledger, opt)
+        .await
+        .expect("composite ?");
+    let j3 = r3.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j3),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "(p/q)? = start + one hop: {j3}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_inverse_step() {
+    // A composite hop with an INVERSE leading step: `(^ex:p/ex:q)+`. The unit
+    // `^p/q` is the "co-parent" relation — x0 and x1 share hub0 (hub0 p x0,
+    // hub0 q x1), so x0 (^p/q) x1; likewise x1 (^p/q) x2 via hub1. Transitively
+    // from x0: {x1, x2}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let plus = r"PREFIX ex: <http://example.org/>
+        SELECT ?y WHERE { ex:x0 (^ex:p/ex:q)+ ?y }";
+    let r = support::query_sparql(&fluree, &ledger, plus)
+        .await
+        .expect("composite inverse-step +");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(^p/q)+ from x0 = {{x1, x2}}: {j}"
+    );
+
+    // Backward: who reaches x2 via `(^ex:p/ex:q)+`? x1 (1 hop) and x0 (2 hops).
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (^ex:p/ex:q)+ ex:x2 }";
+    let rb = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite inverse-step backward");
+    let jb = rb.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jb),
+        normalize_rows(&json!([["ex:x0"], ["ex:x1"]])),
+        "?s (^p/q)+ x2 = {{x0, x1}}: {jb}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_parenthesized_inverse_transitive() {
+    // `(^ex:p)+` is the parenthesized form of `^ex:p+` — `(^X)+ ≡ ^(X+)`. Over a
+    // p-chain x -p-> y -p-> z, from z it walks p backwards: `+` → {y, x},
+    // `*` → {z, y, x}, `?` → {z, y}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:paren-inv");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:x", "ex:p": {"@id": "ex:y"}},
+            {"@id": "ex:y", "ex:p": {"@id": "ex:z"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    for (op, expect) in [
+        ("+", json!([["ex:y"], ["ex:x"]])),
+        ("*", json!([["ex:z"], ["ex:y"], ["ex:x"]])),
+        ("?", json!([["ex:z"], ["ex:y"]])),
+    ] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?o WHERE {{ ex:z (^ex:p){op} ?o }}"
+        );
+        let r = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .unwrap_or_else(|e| panic!("(^p){op} failed: {e}"));
+        let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&j),
+            normalize_rows(&expect),
+            "(^p){op} from z: {j}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_step_both_unbound() {
+    // Both-unbound `?s (^ex:p/ex:q)+ ?o` — exercises the inverse-leading seed
+    // (start candidates come from the OBJECT side of the first step). hub0/hub1
+    // make `^p/q` the co-parent relation x0~x1~x2, so the transitive closure is
+    // {(x0,x1), (x0,x2), (x1,x2)}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-unbound");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub0", "ex:p": {"@id": "ex:x0"}, "ex:q": {"@id": "ex:x1"}},
+            {"@id": "ex:hub1", "ex:p": {"@id": "ex:x1"}, "ex:q": {"@id": "ex:x2"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s (^ex:p/ex:q)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite inverse both-unbound");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([
+            ["ex:x0", "ex:x1"],
+            ["ex:x0", "ex:x2"],
+            ["ex:x1", "ex:x2"]
+        ])),
+        "(^p/q)+ closure seeds from object side of first step: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_second_step() {
+    // Inverse step in a NON-leading position: `(ex:p/^ex:q)+`. The unit `p/^q`
+    // links x and y that share a target via different predicates: x p m, y q m.
+    // x0 p m0, x1 q m0 → x0 (p/^q) x1; x1 p m1, x2 q m1 → x1 (p/^q) x2.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv2");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:x0", "ex:p": {"@id": "ex:m0"}},
+            {"@id": "ex:x1", "ex:q": {"@id": "ex:m0"}, "ex:p": {"@id": "ex:m1"}},
+            {"@id": "ex:x2", "ex:q": {"@id": "ex:m1"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // Forward from x0 → {x1, x2}.
+    let fwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:x0 (ex:p/^ex:q)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, fwd)
+        .await
+        .expect("composite inverse 2nd step forward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:x1"], ["ex:x2"]])),
+        "(p/^q)+ from x0 = {{x1, x2}}: {j}"
+    );
+
+    // Backward into x2 → {x0, x1} — exercises the per-step `!inverse` retreat.
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (ex:p/^ex:q)+ ex:x2 }";
+    let rb = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite inverse 2nd step backward");
+    let jb = rb.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jb),
+        normalize_rows(&json!([["ex:x0"], ["ex:x1"]])),
+        "?s (p/^q)+ x2 = {{x0, x1}}: {jb}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_inverse_alternation_step() {
+    // An inverse ALTERNATION step inside a composite: `(^(ex:p|ex:q)/ex:r)+`.
+    // hub reaches a via p and b via q; both a and b have an r-edge to the next
+    // hub. One hop: a (^(p|q)/r) ? — from a, `^(p|q)` finds hub (hub p a), then
+    // `r` from hub → c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:composite-inv-alt");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:hub", "ex:p": {"@id": "ex:a"}, "ex:r": {"@id": "ex:c"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    // a `^(p|q)` hub (hub p a), then `r` → c. So a (^(p|q)/r)+ ?o = {c}.
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a (^(ex:p|ex:q)/ex:r)+ ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("composite inverse-alternation step");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:c"]])),
+        "(^(p|q)/r)+ from a = {{c}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_composite_transitive_backward_and_both_bound() {
+    // Subject-var (backward) and both-bound (reachability) modes over a composite
+    // hop.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_composite_chain(&fluree, "it/sparql:composite-bwd").await;
+
+    // `?s (ex:p/ex:q)+ ex:c` — who reaches c? a (2 hops) and b (1 hop).
+    let bwd = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s (ex:p/ex:q)+ ex:c }";
+    let r = support::query_sparql(&fluree, &ledger, bwd)
+        .await
+        .expect("composite backward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "?s (p/q)+ c = {{a, b}}: {j}"
+    );
+
+    // Both bound: a reaches c (true), a reaches n (false — n is mid-hop).
+    for (o, expect) in [("ex:c", true), ("ex:n", false)] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE {{ ex:a (ex:p/ex:q)+ {o} . BIND(1 AS ?x) }}"
+        );
+        let rr = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("composite both-bound");
+        let jj = rr.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&jj).len() == 1,
+            expect,
+            "a (p/q)+ {o} expected reachable={expect}: {jj}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_nested_modifier_star_of_star() {
+    // W3C `pp37` shape: `((:p)*)*` collapses to `:p*`. From a (a→b→c chain),
+    // zero-or-more yields {a, b, c}.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:nested-mod").await;
+
+    // `((ex:p)*)*` ≡ `ex:p*` ≡ {a, b, c}.
+    let star2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a ((ex:p)*)* ?x }";
+    let r = support::query_sparql(&fluree, &ledger, star2)
+        .await
+        .expect("nested star-of-star");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "((p)*)* = p* = full closure incl. start: {j}"
+    );
+
+    // `(ex:p+)?` ≡ `ex:p*` (zero-or-one of one-or-more) — also {a, b, c}.
+    let plus_opt = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p+)? ?x }";
+    let r2 = support::query_sparql(&fluree, &ledger, plus_opt)
+        .await
+        .expect("plus-then-optional");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["ex:a"], ["ex:b"], ["ex:c"]])),
+        "(p+)? = p* : {j2}"
+    );
+
+    // `(ex:p?)?` ≡ `ex:p?` (bounded) — {a, b} only, NOT c.
+    let opt2 = r"PREFIX ex: <http://example.org/>
+        SELECT ?x WHERE { ex:a (ex:p?)? ?x }";
+    let r3 = support::query_sparql(&fluree, &ledger, opt2)
+        .await
+        .expect("optional-of-optional");
+    let j3 = r3.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j3),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "(p?)? stays bounded at one hop: {j3}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_negated_set_forward_excludes_type() {
+    // W3C `nps_a`: `?s !a ?o`. Data has a type edge (sa→oa) and a plain edge
+    // (sp→op). The negated set excludes rdf:type, so only (sp, op) matches.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:nps-fwd");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:sa", "@type": "ex:oa"},
+            {"@id": "ex:sp", "ex:p": {"@id": "ex:op"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !a ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set forward");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:sp", "ex:op"]])),
+        "!a excludes the rdf:type edge: {j}"
+    );
+}
+
+/// Seed the W3C nps data: `sd pd od . sr pr or .`
+async fn seed_nps(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:sd", "ex:pd": {"@id": "ex:od"}},
+            {"@id": "ex:sr", "ex:pr": {"@id": "ex:or"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+#[tokio::test]
+async fn sparql_negated_set_inverse_only() {
+    // W3C `nps_inverse`: `?s !^ex:pr ?o`. Inverse-only set → reversed edges whose
+    // predicate ≠ pr. Only sd-pd-od qualifies → reversed (od, sd). No forward
+    // branch (the sr-pr-or forward edge must NOT appear).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nps(&fluree, "it/sparql:nps-inv").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !^ex:pr ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set inverse");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:od", "ex:sd"]])),
+        "!^pr = reversed non-pr edges: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_negated_set_direct_and_inverse() {
+    // W3C `nps_direct_and_inverse`: `?s !(ex:pd|^ex:pr) ?o` = UNION of the forward
+    // branch (edges with pred ≠ pd → sr,or) and the inverse branch (reversed
+    // edges with pred ≠ pr → od,sd).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_nps(&fluree, "it/sparql:nps-mixed").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s ?o WHERE { ?s !(ex:pd|^ex:pr) ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("negated set mixed");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:od", "ex:sd"], ["ex:sr", "ex:or"]])),
+        "mixed negated set unions both directions: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_object_var() {
+    // `:a :p? ?o` — zero-length (a itself) plus one direct hop (b). NOT c.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-obj").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?o WHERE { ex:a ex:p? ?o }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one object var");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "a p? ?o = {{a, b}}, not the transitive c: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_subject_var() {
+    // `?s :p? :b` — zero-length (b itself) plus one direct predecessor (a).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-subj").await;
+
+    let q = r"PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s ex:p? ex:b }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("zero-or-one subject var");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["ex:a"], ["ex:b"]])),
+        "?s p? b = {{a, b}}: {j}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_zero_or_one_both_bound() {
+    // `:a :p? :b` is true (one hop); `:a :p? :c` is false (needs two hops);
+    // `:a :p? :a` is true (zero-length).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_pp_chain(&fluree, "it/sparql:zoo-both").await;
+
+    for (s, o, expect) in [
+        ("ex:a", "ex:b", true),
+        ("ex:a", "ex:c", false),
+        ("ex:a", "ex:a", true),
+    ] {
+        let q = format!(
+            "PREFIX ex: <http://example.org/>
+             SELECT ?x WHERE {{ {s} ex:p? {o} . BIND(1 AS ?x) }}"
+        );
+        let r = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("zero-or-one both bound");
+        let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        let rows = normalize_rows(&j).len();
+        assert_eq!(
+            rows == 1,
+            expect,
+            "{s} p? {o} expected reachable={expect}, got {rows} rows: {j}"
+        );
+    }
+}
