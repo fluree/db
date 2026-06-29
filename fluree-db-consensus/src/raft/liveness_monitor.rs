@@ -201,24 +201,13 @@ impl LivenessMonitor {
     /// them on abort.
     pub async fn run(self) {
         let mut trackers: HashMap<NodeId, PeerTracker> = HashMap::new();
-        // Cache the log id of the most recently observed membership
-        // change. When it doesn't advance between ticks, the voter
-        // set is unchanged and the tracker-pruning collect+retain
-        // pair can be skipped.
-        let mut last_membership_log_id: Option<LogId<NodeId>> = None;
         loop {
             tokio::time::sleep(self.config.sample_interval).await;
-            self.tick(&mut trackers, &mut last_membership_log_id, Instant::now())
-                .await;
+            self.tick(&mut trackers, Instant::now()).await;
         }
     }
 
-    async fn tick(
-        &self,
-        trackers: &mut HashMap<NodeId, PeerTracker>,
-        last_membership_log_id: &mut Option<LogId<NodeId>>,
-        now: Instant,
-    ) {
+    async fn tick(&self, trackers: &mut HashMap<NodeId, PeerTracker>, now: Instant) {
         // Read what we need from the metrics ref and drop it
         // before any await. Cloning the whole `RaftMetrics` (the
         // earlier shape) deep-copied the per-peer replication
@@ -226,7 +215,7 @@ impl LivenessMonitor {
         // need, leaving the watch ref free for openraft's writer.
         // Holding the ref across `propose_*` awaits would also
         // block metrics updates for the entire tick.
-        let (leader_last_log, peers, configured_voters) = {
+        let (leader_last_log, peers) = {
             let metrics_rx = self.raft.metrics();
             let metrics = metrics_rx.borrow();
             // No replication metrics = not the leader. The leader
@@ -242,38 +231,39 @@ impl LivenessMonitor {
                 .filter(|(id, _)| **id != leader_id)
                 .map(|(id, log)| (*id, *log))
                 .collect();
-            // Skip the voter-set collect when membership hasn't
-            // changed since the previous tick — `log_id` advances
-            // only on a membership-apply, so equality means the
-            // voter set is identical and the retain below would
-            // be a no-op.
-            let current_log_id = *metrics.membership_config.log_id();
-            let configured_voters = if current_log_id != *last_membership_log_id {
-                *last_membership_log_id = current_log_id;
-                Some(
-                    metrics
-                        .membership_config
-                        .membership()
-                        .voter_ids()
-                        .collect::<std::collections::HashSet<NodeId>>(),
-                )
-            } else {
-                None
-            };
-            (leader_last_log, peers, configured_voters)
+            (leader_last_log, peers)
         };
 
-        // Snapshot the replicated eligible set so every per-peer
-        // tracker created in this tick reads a consistent view, and
-        // so the per-peer awaits below don't hold the state lock
-        // against writers. Cloning a `BTreeSet<NodeId>` is cheap at
-        // realistic cluster sizes.
-        let eligible_voters = {
+        // Snapshot the replicated voter + eligibility sets together
+        // so every per-peer tracker created in this tick reads a
+        // consistent view, and so the per-peer awaits below don't
+        // hold the state lock against writers. Membership-apply
+        // updates both sets atomically (see `EntryPayload::Membership`
+        // in the state-machine adapter), so the snapshot can't see a
+        // voter in one set but not the other.
+        let (configured_voters, eligible_voters) = {
             let state = self.shared_state.read().await;
-            state.worker_eligible_voters.clone()
+            (
+                state.configured_voters.clone(),
+                state.worker_eligible_voters.clone(),
+            )
         };
 
         for (peer_id, peer_log) in peers {
+            // Learners appear in openraft's replication map from the
+            // moment `add-learner` starts shipping them log entries,
+            // but they aren't workers — `apply_set_worker_eligibility`
+            // refuses proposes for any voter outside `configured_voters`.
+            // Building a tracker for a learner seeds it as `for_ineligible_peer`
+            // (it's not yet in `worker_eligible_voters`), and once
+            // `change-membership` promotes the learner to a voter the
+            // stale `last_proposed = Some(Demote)` blocks every future
+            // Demote on this peer — including the one a subsequent
+            // kill ought to fire. Skipping non-voters at the top is
+            // what avoids that pre-promotion seeding.
+            if !configured_voters.contains(&peer_id) {
+                continue;
+            }
             let tracker = trackers.entry(peer_id).or_insert_with(|| {
                 if eligible_voters.contains(&peer_id) {
                     PeerTracker::for_eligible_peer()
@@ -311,13 +301,9 @@ impl LivenessMonitor {
             }
         }
         // Drop trackers for peers that left the voter set on a
-        // membership change. Only run when membership actually
-        // changed — the cached `last_membership_log_id` lets us
-        // skip the retain (and the prior collect) on steady-state
-        // ticks where the voter set is unchanged.
-        if let Some(configured) = configured_voters {
-            trackers.retain(|id, _| configured.contains(id));
-        }
+        // membership change. Cheap at realistic cluster sizes — a
+        // BTreeSet lookup per tracked voter.
+        trackers.retain(|id, _| configured_voters.contains(id));
     }
 
     /// Propose `eligible: true` for `voter`. Returns `true` when the
