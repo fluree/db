@@ -138,7 +138,23 @@ fn expr_needs_t(expr: &Expression) -> bool {
         Expression::Call { func, args } => {
             matches!(func, Function::T) || args.iter().any(expr_needs_t)
         }
-        Expression::Exists { .. } => false,
+        Expression::Map(entries) => entries.iter().any(|(_, v)| expr_needs_t(v)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            expr_needs_t(list)
+                || filter.as_deref().is_some_and(expr_needs_t)
+                || map.as_deref().is_some_and(expr_needs_t)
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => expr_needs_t(init) || expr_needs_t(list) || expr_needs_t(body),
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => expr_needs_t(list) || expr_needs_t(predicate),
+        Expression::Member { target, .. } => expr_needs_t(target),
+        Expression::PatternComprehension { projection, .. } => expr_needs_t(projection),
+        Expression::Exists { .. } | Expression::Resolved(_) => false,
     }
 }
 
@@ -1168,14 +1184,35 @@ impl BinaryScanOperator {
     }
 
     /// Check whether this row matches the triple pattern's datatype constraint (if any).
+    ///
+    /// Runs *before* object decode, so the datatype is resolved from `o_type`
+    /// alone on the common path (zero decode cost). `NUM_BIG_OVERFLOW` names no
+    /// single datatype — its arena holds both `xsd:integer` (BigInt) and
+    /// `xsd:decimal` (BigDecimal) — so in that one ambiguous case decode the
+    /// value to disambiguate. Without this, a value-object query like
+    /// `{"@value":"?p","@type":"xsd:decimal"}` silently dropped indexed big
+    /// numerics while novelty copies passed (issue #1329).
     #[inline]
-    fn matches_datatype_constraint(&self, o_type: u16) -> bool {
+    fn matches_datatype_constraint(
+        &self,
+        view: &BinaryGraphView,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+    ) -> bool {
         let Some(dtc) = &self.pattern.dtc else {
             return true;
         };
 
-        let Some(dt_sid) = self.store().resolve_datatype_sid(o_type) else {
-            return false;
+        let dt_sid = match self.store().resolve_datatype_sid(o_type) {
+            Some(sid) => sid,
+            None => match view.decode_value(o_type, o_key, p_id) {
+                Ok(val) => match self.store().resolve_datatype_sid_for_value(o_type, &val) {
+                    Some(sid) => sid,
+                    None => return false,
+                },
+                Err(_) => return false,
+            },
         };
         if !dt_compatible(dtc.datatype(), &dt_sid) {
             return false;
@@ -1297,7 +1334,7 @@ impl BinaryScanOperator {
             }
 
             // Enforce datatype constraints before decoding into bindings.
-            if !self.matches_datatype_constraint(o_type) {
+            if !self.matches_datatype_constraint(&view, o_type, o_key, p_id) {
                 continue;
             }
 

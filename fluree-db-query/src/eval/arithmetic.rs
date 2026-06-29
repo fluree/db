@@ -117,6 +117,14 @@ mod tests {
     }
 
     #[test]
+    fn test_mod_three_args() {
+        let row = empty_row();
+        let args = vec![long(29), long(12), long(5)];
+        let result = ArithmeticOp::Mod.eval(&args, &row, None).unwrap();
+        assert_eq!(result, Some(ComparableValue::Long(0)));
+    }
+
+    #[test]
     fn test_add_single_arg_identity() {
         let row = empty_row();
         let args = vec![long(42)];

@@ -56,6 +56,11 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
+#[cfg(feature = "raft")]
+use fluree_db_consensus::raft::commit_worker::{
+    PublishingChannel, QueuePoisonPublisher, StagingContext, WorkerSupervisor,
+};
+
 /// Private listener config for the Raft inter-node RPC + admin
 /// routers. Only populated when the server is constructed with a
 /// Raft handle via [`FlureeServer::new_with_raft`].
@@ -81,11 +86,20 @@ pub struct FlureeServer {
     #[cfg(feature = "raft")]
     raft_listener: Option<RaftListener>,
     /// Leader-aware watcher driving every leader-only background
-    /// task (indexer, commit-queue worker). `Some` when raft mode is
+    /// task (indexer, idempotency evictor). `Some` when raft mode is
     /// on. Aborted on shutdown so the spawned tasks tear down with
     /// the rest of the server.
     #[cfg(feature = "raft")]
-    raft_leader_watcher: Option<crate::raft::LeaderWatcherHandle>,
+    raft_leader_watcher: Option<crate::raft::CancellableTaskHandle>,
+    /// Per-node worker supervisor. Runs on every node (independent
+    /// of leadership) and drives per-branch [`Worker`] tasks for
+    /// branches this node owns under rendezvous assignment. Shut
+    /// down gracefully so in-flight workers stop before the runtime
+    /// goes away.
+    ///
+    /// [`Worker`]: fluree_db_consensus::raft::commit_worker::Worker
+    #[cfg(feature = "raft")]
+    raft_worker_supervisor: Option<crate::raft::CancellableTaskHandle>,
     /// Per-node release task that drains the state-machine adapter's
     /// CAS release channel. Runs on every node (not just the leader)
     /// so admin-cleared queue entries and idempotency-evicted
@@ -319,14 +333,24 @@ impl FlureeServer {
             task.abort();
         }
         #[cfg(feature = "raft")]
+        if let Some(handle) = self.raft_worker_supervisor {
+            // Drain workers before the leader-only background tasks
+            // (indexer, evictor) shut down — they touch the same
+            // shared state the workers' final publishes go through,
+            // and ordering matters when this node is itself the
+            // leader. The supervisor aborts each per-branch worker
+            // and returns only after they've stopped.
+            handle.shutdown().await;
+        }
+        #[cfg(feature = "raft")]
         if let Some(handle) = self.raft_leader_watcher {
             // Cooperative shutdown: cancel the watcher's token, then
             // await its `JoinHandle`. The watcher exits its select
             // loop, abort-and-awaits every in-flight leader task,
             // and only then returns — so this `await` resolves with
             // a guarantee that every leader-only task (indexer,
-            // commit worker, eviction scheduler) has actually
-            // stopped, not just been signalled.
+            // eviction scheduler) has actually stopped, not just
+            // been signalled.
             handle.shutdown().await;
         }
         #[cfg(feature = "raft")]
@@ -383,6 +407,11 @@ pub struct FlureeServerBuilder {
     /// [`Self::with_raft`].
     #[cfg(feature = "raft")]
     raft: Option<(Arc<crate::raft::RaftIntegration>, std::net::SocketAddr)>,
+    /// Threshold tuning for the leader-only liveness monitor. Defaults
+    /// to [`LivenessConfig::default`]; tests override with sub-second
+    /// thresholds to keep runtimes short.
+    #[cfg(feature = "raft")]
+    liveness_config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig,
 }
 
 impl FlureeServerBuilder {
@@ -398,6 +427,8 @@ impl FlureeServerBuilder {
             config,
             #[cfg(feature = "raft")]
             raft: None,
+            #[cfg(feature = "raft")]
+            liveness_config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig::default(),
         }
     }
 
@@ -438,6 +469,12 @@ impl FlureeServerBuilder {
         self
     }
 
+    /// Set the global on-disk cache budget in MB (Fluree object storage + Iceberg)
+    pub fn disk_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.disk_cache_max_mb = Some(max_mb);
+        self
+    }
+
     /// Attach a [`RaftIntegration`](crate::raft::RaftIntegration) and
     /// the private listener address. The resulting server mounts the
     /// leader-forward middleware over write routes and serves the
@@ -451,6 +488,19 @@ impl FlureeServerBuilder {
         listen_addr: std::net::SocketAddr,
     ) -> Self {
         self.raft = Some((integration, listen_addr));
+        self
+    }
+
+    /// Override the leader-only liveness monitor's threshold tuning.
+    /// Defaults are sane for production; tests use this hook to
+    /// shrink the unreachable / live windows so the demotion path
+    /// fires within a couple of seconds.
+    #[cfg(feature = "raft")]
+    pub fn with_liveness_config(
+        mut self,
+        config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig,
+    ) -> Self {
+        self.liveness_config = config;
         self
     }
 
@@ -469,16 +519,17 @@ impl FlureeServerBuilder {
         // `IndexingNameService`). Keeping a single Arc keeps reads
         // and the index publisher coherent — both observe the same
         // shared state and propose through the same Raft handle.
+        // `RaftIntegration` owns the per-node `RaftNameService` (built
+        // in its constructor with the same shared state, staged
+        // receipts, and HTTP client that drive the rest of the
+        // integration). We borrow the same handle here so reads,
+        // publishes, and the inbound `apply_staged_commit` route all
+        // see one consistent picture.
         #[cfg(feature = "raft")]
-        let raft_nameservice = self.raft.as_ref().map(|(integration, _)| {
-            std::sync::Arc::new(
-                fluree_db_consensus::raft::nameservice::RaftNameService::new(
-                    integration.shared_state.clone(),
-                    std::sync::Arc::clone(&integration.raft),
-                )
-                .with_staged_receipts(std::sync::Arc::clone(&integration.staged_receipts)),
-            )
-        });
+        let raft_nameservice = self
+            .raft
+            .as_ref()
+            .map(|(integration, _)| integration.nameservice());
 
         // Build `Fluree` with the right nameservice for the
         // deployment mode. Raft mode wires `RaftNameService` so
@@ -526,21 +577,6 @@ impl FlureeServerBuilder {
             // layered onto the `/cluster` subtree with `Arc<AppState>`.
             (Arc::clone(integration), *listen_addr)
         });
-
-        // Subscribe Fluree's `LedgerManager` to the raft integration's
-        // event bus so commit / index applies reconcile cached state
-        // on every node, not just the one that staged the commit.
-        // Without this, follower caches only catch up on cold loads
-        // and silently miss any writes that land between two loads.
-        #[cfg(feature = "raft")]
-        if let Some(((integration, _), mgr)) =
-            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
-        {
-            fluree_db_api::spawn_local_cache_event_listener(
-                Arc::clone(&integration.event_bus),
-                Arc::clone(mgr),
-            );
-        }
 
         // Per-node CAS release task. The state-machine adapter pushes
         // `(ledger_id, request_cid)` pairs through the integration's
@@ -591,10 +627,64 @@ impl FlureeServerBuilder {
             None => None,
         };
 
-        // Wire the leader-aware launcher. Bundles both the background
-        // indexer and the commit-queue worker so they share one
-        // metrics watcher and one spawn/abort lifecycle. See
-        // `raft::spawn_leader_watcher` for the contract.
+        // Subscribe Fluree's `LedgerManager` to the raft integration's
+        // event bus so commit / index applies reconcile cached state
+        // on every node, not just the one that staged the commit.
+        #[cfg(feature = "raft")]
+        if let Some(((integration, _), mgr)) =
+            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
+        {
+            fluree_db_api::spawn_local_cache_event_listener(
+                Arc::clone(&integration.event_bus),
+                Arc::clone(mgr),
+            );
+        }
+
+        // Per-node worker supervisor. Runs on every node (leader and
+        // followers alike) because distributed workers can land
+        // anywhere under rendezvous assignment. Spawned here so its
+        // lifecycle is independent of the leader watcher's; followers'
+        // workers ferry their apply through the leader via
+        // `RaftNameService::apply_staged_commit`.
+        #[cfg(feature = "raft")]
+        let raft_worker_supervisor = self.raft.as_ref().map(|(integration, _)| {
+            let raft_ns = std::sync::Arc::clone(
+                raft_nameservice
+                    .as_ref()
+                    .expect("raft_nameservice present whenever self.raft is Some"),
+            );
+            let commits: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
+                std::sync::Arc::clone(&raft_ns) as _;
+            // Same `RaftNameService` Arc upcast a second time, this
+            // time to the queue-poison publisher trait so a follower-
+            // owned worker can ferry deterministic poisons to the
+            // leader instead of looping forever on `client_write`
+            // returning `ForwardToLeader`.
+            let poison: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
+            let supervisor = WorkerSupervisor::new(
+                integration.id,
+                Arc::clone(&integration.raft),
+                integration.shared_state.clone(),
+                PublishingChannel {
+                    commits,
+                    poison,
+                    staged_receipts: Arc::clone(&integration.staged_receipts),
+                },
+                StagingContext {
+                    fluree: Arc::clone(&state_inner.fluree),
+                    index_config: state_inner
+                        .index_config
+                        .clone()
+                        .expect("index_config set by AppState::new"),
+                },
+            );
+            crate::raft::spawn_worker_supervisor(supervisor)
+        });
+
+        // Wire the leader-aware launcher. Bundles the background
+        // indexer and the periodic idempotency evictor — both
+        // leader-only tasks. The worker supervisor lives at node
+        // scope (above) and is *not* in this set.
         #[cfg(feature = "raft")]
         let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
             let raft_ns = std::sync::Arc::clone(
@@ -605,27 +695,16 @@ impl FlureeServerBuilder {
             let backend = state_inner.fluree.backend().clone();
             let indexer_config = fluree_db_indexer::IndexerConfig::default();
             let event_bus = Arc::clone(&integration.event_bus);
-            // Same `RaftNameService` doubles as the
-            // `CommitPublisher` so the worker's head advance
-            // goes through `publish_commit` → `ApplyHead`
-            // under the queue front it sampled.
-            let publisher: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
-                std::sync::Arc::clone(&raft_ns) as _;
-            let commit_worker = fluree_db_consensus::raft::commit_worker::CommitWorker::new(
-                Arc::clone(&integration.raft),
-                publisher,
-                Arc::clone(&state_inner.fluree),
-                state_inner
-                    .index_config
-                    .clone()
-                    .expect("index_config set by AppState::new"),
-                integration.shared_state.clone(),
-                Arc::clone(&integration.staged_receipts),
-            );
             let eviction_scheduler =
                 fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
                     &integration.raft,
                 ));
+            let liveness_monitor =
+                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(
+                    Arc::clone(&integration.raft),
+                    integration.shared_state.clone(),
+                )
+                .with_config(self.liveness_config.clone());
             let spawn_leader_tasks = move || {
                 let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
                     raft_ns.clone();
@@ -637,13 +716,13 @@ impl FlureeServerBuilder {
                 let worker = worker.with_event_bus(Arc::clone(&event_bus));
                 vec![
                     tokio::spawn(worker.run()),
-                    tokio::spawn(commit_worker.clone().run()),
                     tokio::spawn(eviction_scheduler.clone().run()),
+                    tokio::spawn(liveness_monitor.clone().run()),
                 ]
             };
             crate::raft::spawn_leader_watcher(
                 Arc::clone(&integration.raft),
-                integration.self_id,
+                integration.id,
                 spawn_leader_tasks,
             )
         });
@@ -672,6 +751,9 @@ impl FlureeServerBuilder {
                         Arc::clone(&state),
                         crate::routes::admin_auth::require_admin_token,
                     ));
+            // `raft_rpc_router` includes the openraft RPCs plus the
+            // cross-node `apply_staged_commit` endpoint — intra-cluster
+            // trusted, no auth layer.
             let private_router = Router::new()
                 .nest("/raft", integration.raft_rpc_router())
                 .nest("/cluster", cluster_admin);
@@ -719,6 +801,8 @@ impl FlureeServerBuilder {
             raft_listener,
             #[cfg(feature = "raft")]
             raft_leader_watcher,
+            #[cfg(feature = "raft")]
+            raft_worker_supervisor,
             #[cfg(feature = "raft")]
             raft_release_task,
         })

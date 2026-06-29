@@ -238,6 +238,15 @@ impl QueryResult {
         format::format_results(self, &self.context, snapshot, &config)
     }
 
+    /// Format as Cypher JSON (Neo4j-compatible tabular, native scalars).
+    ///
+    /// See [`Self::to_cypher_json_async`]; this sync variant is for results
+    /// without encoded bindings / hydration.
+    pub fn to_cypher_json(&self, snapshot: &LedgerSnapshot) -> format::Result<JsonValue> {
+        let config = FormatterConfig::cypher_json();
+        format::format_results(self, &self.context, snapshot, &config)
+    }
+
     /// Format as AgentJson (LLM/agent-optimized envelope)
     ///
     /// Returns an envelope with schema header, compact object rows, and pagination metadata.
@@ -411,6 +420,17 @@ impl QueryResult {
     /// Every literal value includes explicit `@type` annotation.
     pub async fn to_typed_json_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
         let config = FormatterConfig::typed_json();
+        format::format_results_async(self, &self.context, db, &config, None, None).await
+    }
+
+    /// Format as Cypher JSON (Neo4j-compatible tabular, native scalars).
+    ///
+    /// `{"results":[{"columns":[…],"data":[{"row":[…],"meta":[…]}]}]}` with
+    /// native-scalar values — `xsd:date` as a bare ISO string, longs as bare
+    /// numbers — for openCypher / LDBC tooling. Async to support encoded
+    /// bindings; mirrors `to_jsonld_async`.
+    pub async fn to_cypher_json_async(&self, db: GraphDbRef<'_>) -> format::Result<JsonValue> {
+        let config = FormatterConfig::cypher_json();
         format::format_results_async(self, &self.context, db, &config, None, None).await
     }
 

@@ -278,23 +278,9 @@ impl Fluree {
 
     /// Resolve an identifier as a graph source, creating a minimal genesis context.
     async fn resolve_as_graph_source(&self, identifier: &str) -> Result<GraphDb> {
-        let gs_id = fluree_db_core::normalize_ledger_id(identifier)
-            .unwrap_or_else(|_| identifier.to_string());
-        let record = self
-            .nameservice()
-            .lookup_graph_source(&gs_id)
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-        if record.is_none() {
-            return Err(ApiError::NotFound(identifier.to_string()));
-        }
-
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
-        let state =
-            fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
-        let mut db = GraphDb::from_ledger_state(&state);
-        db.graph_source_id = Some(gs_id.into());
-        Ok(db)
+        self.resolve_graph_source(identifier)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(identifier.to_string()))
     }
 }
 

@@ -2043,6 +2043,67 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
 
+mem:fact-01kvg5mrhz4zvhg425038pfj7m a mem:Fact ;
+    mem:content "SPARQL UPDATE annotation tails are rejected inside GRAPH{}/WITH<g> (\"default-graph only\") only because the lowering never emits f:reifiesGraph — NOT a storage limit (JSON-LD path + EdgeKey fully support named-graph annotations). Closing it is SMALL/localized: add a graph_iri param to expand_annotated_triples + expand_annotated_triples_in_quad_pattern, emit one f:reifiesGraph TriplePattern when graph is non-default (graph IRI already available: with_graph_iri in lower_modify ~L894; GraphName::Iri at the GRAPH rejection ~L410), delete reject_with_scoped_annotations + the two rejection blocks (~L414, ~L517). Downstream .with_graph_id stamping + EdgeKey decoder validation already correct; no schema/invariant changes." ;
+    mem:tag "edge-annotations" ;
+    mem:tag "named-graph" ;
+    mem:tag "rdf12" ;
+    mem:tag "reifiesgraph" ;
+    mem:tag "sparql-update" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-core/src/edge.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_sparql_update.rs" ;
+    mem:artifactRef "fluree-db-transact/src/parse/edge_annotations.rs" ;
+    mem:branch "pr/2-rdf12-annotations" ;
+    mem:createdAt "2026-06-19T14:48:00.319884+00:00"^^xsd:dateTime ;
+    mem:rationale "User explicitly asked to scope this gap; it's the one capability divergence between the JSON-LD and SPARQL write surfaces and a likely follow-up PR." .
+
+mem:fact-01kvgp6b4qm9nx50qfmv5djjfk a mem:Fact ;
+    mem:content "JSON-LD @path and SPARQL share one path IR: only +/*/alternation-transitive survive as PropertyPathPattern (predicates: Vec<Sid>); inverse→swapped Triple, sequence→?__pp{n} triple chain, alt-without-star→Union are desugared at lowering. JSON-LD alternation-transitive (a|b)+/(a|b)* fixed in bf2130cb6 (extract_transitive_predicate_iris mirrors SPARQL; branches must be simple FORWARD IRIs, inverse/compound error). Remaining SPARQL-spec gaps on BOTH surfaces: ZeroOrOne p? (parsed then rejected at lowering) and NegatedPropertySet !iri (unsupported). Hop-bounds {n,m} are NOT SPARQL 1.1/1.2 — Cypher-only, homed in ShortestPathPattern.min/max_hops; shortestPath also non-standard (recent JSON-LD fn surface)." ;
+    mem:tag "jsonld" ;
+    mem:tag "lowering" ;
+    mem:tag "path-ir" ;
+    mem:tag "property-path" ;
+    mem:tag "query" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_query_property_path.rs" ;
+    mem:artifactRef "fluree-db-query/src/ir/path.rs" ;
+    mem:artifactRef "fluree-db-query/src/parse/lower.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/path.rs" ;
+    mem:branch "pr/2-rdf12-annotations" ;
+    mem:createdAt "2026-06-19T19:37:13.623439+00:00"^^xsd:dateTime .
+
+mem:fact-01kw5ecx1yax7x1nxxbsppe5rj a mem:Fact ;
+    mem:content "Cypher parser union-chain length is bounded only by the shared MAX_PARSE_DEPTH(256) enter_recursion guard. parse_call_union_tail now carries its OWN guard (the parse_call_body/parse_call_union_tail cycle bypasses parse_statement, which was the unguarded DoS bug); top-level parse_union_tail is bounded only via guarded parse_statement. CRITICAL: do NOT make union parsing iterative to fix large-union false-rejection, because params.rs subst_query AND Drop both recurse over union_tail, so an unbounded-depth AST just moves the stack overflow to subst/drop time. Also mark()/reset() now snapshot+restore depth (a speculative parse that entered recursion then failed via ? leaked depth)." ;
+    mem:tag "cypher" ;
+    mem:tag "dos" ;
+    mem:tag "parser" ;
+    mem:tag "recursion" ;
+    mem:tag "union" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/parse/stmt.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/parse/stream.rs" ;
+    mem:branch "pr/3-cypher" ;
+    mem:createdAt "2026-06-27T21:05:03.038185+00:00"^^xsd:dateTime ;
+    mem:rationale "The reviewer-flagged flat-UNION over-counts-depth issue cannot be fixed by iteration because downstream walkers (Drop, param substitution) recurse over AST depth." .
+
+mem:fact-01kw5ed99y2bfke2szprh06dz3 a mem:Fact ;
+    mem:content "fluree-db-api/tests/it_query_cypher.rs (166 tests) is NOT wired into any test target: Cargo.toml has autotests=false and no grp_*.rs does `mod it_query_cypher`, so none of it runs in CI. Worse, wiring it into grp_query.rs FAILS TO COMPILE: transact_cypher_detach_delete_works_on_indexed_data (~line 1536) does Arc::new(fluree.nameservice_mode().clone()) but NameServiceMode does not impl IndexingNameService/BranchLifecycle (only Arc<concrete> types do). So the whole Cypher integration suite is dead. Verify Cypher lowering/runtime via fluree-db-cypher/tests/it_lower.rs + it_smoke.rs instead (those compile and run)." ;
+    mem:tag "ci" ;
+    mem:tag "cypher" ;
+    mem:tag "gotcha" ;
+    mem:tag "tests" ;
+    mem:tag "wiring" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/Cargo.toml" ;
+    mem:artifactRef "fluree-db-api/tests/grp_query.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_cypher.rs" ;
+    mem:branch "pr/3-cypher" ;
+    mem:createdAt "2026-06-27T21:05:15.582928+00:00"^^xsd:dateTime ;
+    mem:rationale "A reviewer's claim that a Cypher behavior has test coverage in it_query_cypher.rs is misleading: those tests never execute." .
+
 mem:fact-01ktcfc4gmhn2zh6xn29rskte8 a mem:Fact ;
     mem:content "Query top-k is real but never truncates the upstream scan. apply_solution_modifiers (operator_tree.rs:2740) uses SortOperator::new_topk for ORDER BY+LIMIT, and even under DISTINCT does project-distinct-before-sort+top-k when ORDER BY refs only projected vars (can_project_distinct_before_sort :3011). But SortOperator is blocking: it drains the FULL child stream, building a per-row Vec<Binding> for every input row (sort.rs:589-622); only the final select_nth/heap is k-bounded. So rows_per_returned≫LIMIT is expected. BSBM Explore query1 also has a dedicated bypass: detect_star_const_numeric_label_order_limit→star_const_ordered_limit_operator (operator_tree.rs:280, :2440), tried before the generic tree." ;
     mem:tag "bsbm" ;

@@ -198,8 +198,10 @@ impl VectorSearchOperator {
                     | Binding::IriMatch { .. }
                     | Binding::Iri(_)
                     | Binding::Grouped(_)
-                    | Binding::Path(_)
+                    | Binding::Path { .. }
+                    | Binding::Rel(_)
                     | Binding::List(_)
+                    | Binding::Map(_)
                     | Binding::EncodedSid { .. }
                     | Binding::EncodedPid { .. },
                 ) => Ok(None),

@@ -1,5 +1,5 @@
 use crate::cli::PolicyArgs;
-use crate::commands::insert::resolve_positional_args;
+use crate::commands::insert::resolve_inputs;
 use crate::commands::query_stream::{self, NdjsonConsumer};
 use crate::context::{self, LedgerMode};
 use crate::detect;
@@ -213,6 +213,7 @@ fn inject_sparql_from_before_where(sparql: &str, from_iri: &str) -> Option<Strin
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: &[String],
+    ledger_flag: Option<&str>,
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format_str: &str,
@@ -222,6 +223,7 @@ pub async fn run(
     explain: bool,
     sparql_flag: bool,
     fql_flag: bool,
+    cypher_flag: bool,
     at: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
@@ -232,7 +234,7 @@ pub async fn run(
     const BENCH_ROWS: usize = 5;
     const DEFAULT_TABLE_PREVIEW_ROWS: usize = 200;
     let limit = if bench { Some(BENCH_ROWS) } else { None };
-    let (explicit_ledger, positional_inline, positional_file) = resolve_positional_args(args)?;
+    let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
 
     // Resolve input: -e > positional inline > -f > positional file > stdin
     let source = input::resolve_input(
@@ -245,12 +247,20 @@ pub async fn run(
 
     // For format detection, prefer the -f path, then positional file
     let detect_path = file_flag.or(positional_file.as_deref());
-    let query_format = detect::detect_query_format(detect_path, &content, sparql_flag, fql_flag)?;
+    // Cypher is dispatched out-of-band (separate API method + result shape);
+    // the placeholder format is never used because that path returns early.
+    let is_cypher = detect::detect_is_cypher(detect_path, &content, cypher_flag);
+    let query_format = if is_cypher {
+        detect::QueryFormat::JsonLd
+    } else {
+        detect::detect_query_format(detect_path, &content, sparql_flag, fql_flag)?
+    };
 
     // Parse output format
     let output_format = match format_str.to_lowercase().as_str() {
         "json" | "jsonld" | "json-ld" => OutputFormatKind::Json,
         "typed-json" | "typed_json" | "typedjson" => OutputFormatKind::TypedJson,
+        "cypher-json" | "cypher_json" | "cypherjson" => OutputFormatKind::CypherJson,
         "table" => OutputFormatKind::Table,
         "csv" => OutputFormatKind::Csv,
         "tsv" => OutputFormatKind::Tsv,
@@ -258,7 +268,7 @@ pub async fn run(
         other => {
             return Err(CliError::Usage(format!(
                 "unknown output format '{other}'; valid formats: json, jsonld, typed-json, \
-                 table, csv, tsv, ndjson"
+                 cypher-json, table, csv, tsv, ndjson"
             )));
         }
     };
@@ -333,6 +343,20 @@ pub async fn run(
             context::try_server_route(mode, dirs)
         }
     };
+
+    if is_cypher {
+        return run_cypher_query(
+            mode,
+            &content,
+            output_format,
+            explain,
+            bench,
+            &tracking,
+            at,
+            policy,
+        )
+        .await;
+    }
 
     match mode {
         LedgerMode::Tracked {
@@ -1109,6 +1133,135 @@ fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time
         parts.push(format!("fuel {fuel}"));
     }
     eprintln!("({})", parts.join(", "));
+}
+
+/// Execute a Cypher read query against a local ledger view.
+///
+/// Cypher rides a separate API method (`query_cypher`) and renders its
+/// SELECT-shaped results as JSON-LD (the documented default). Remote/HTTP
+/// execution is not yet available, so a server-routed ledger errors with a
+/// pointer to `--direct`.
+#[allow(clippy::too_many_arguments)]
+async fn run_cypher_query(
+    mode: LedgerMode,
+    content: &str,
+    output_format: OutputFormatKind,
+    explain: bool,
+    bench: bool,
+    tracking: &TrackingFlags,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+) -> CliResult<()> {
+    if explain {
+        return Err(CliError::Usage(
+            "--explain is not yet supported for Cypher queries".to_string(),
+        ));
+    }
+    if bench {
+        return Err(CliError::Usage(
+            "--bench is not yet supported for Cypher queries".to_string(),
+        ));
+    }
+    if tracking.any() {
+        return Err(CliError::Usage(
+            "--track* / --max-fuel are not yet supported for Cypher queries".to_string(),
+        ));
+    }
+    // Cypher results render as a single cypher-json document, not a row stream,
+    // so the NDJSON path (and its `--envelope` shaping) does not apply. Reject it
+    // explicitly rather than silently emitting cypher-json — which would make
+    // `--envelope` look honored when it is not.
+    if output_format == OutputFormatKind::Ndjson {
+        return Err(CliError::Usage(
+            "--format ndjson is not supported for Cypher queries; Cypher renders as \
+             cypher-json (use --format json | typed-json | csv | tsv)"
+                .to_string(),
+        ));
+    }
+
+    let (fluree, alias) = match mode {
+        LedgerMode::Local { fluree, alias } => (fluree, alias),
+        LedgerMode::Tracked { .. } => {
+            return Err(CliError::Usage(
+                "Cypher queries are only supported on local ledgers; the HTTP Cypher \
+                 endpoint is not yet available.\n  \
+                 Retry with --direct to bypass the server route."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let view = match at {
+        Some(at_str) => {
+            let spec = parse_time_spec(at_str);
+            fluree.db_at_with_default_context(&alias, spec).await?
+        }
+        None => fluree.db_with_default_context(&alias).await?,
+    };
+    let view = if policy.is_set() {
+        let opts = policy.to_options().map_err(CliError::Usage)?;
+        fluree.wrap_policy(view, &opts, None).await?
+    } else {
+        view
+    };
+
+    // Accept either raw Cypher or a `{"cypher": "...", "params": {...}}`
+    // envelope (the latter carries parameters).
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(content);
+    let timer = Instant::now();
+    let result = fluree
+        .query_cypher_with_params(&view, &cypher, params.as_ref())
+        .await?;
+    let elapsed = timer.elapsed();
+
+    // Delimited fast path mirrors the SPARQL/JSON-LD handler.
+    if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
+        let total_rows = result.row_count();
+        let bytes = if output_format == OutputFormatKind::Tsv {
+            result.to_tsv_bytes(&view.snapshot)?
+        } else {
+            result.to_csv_bytes(&view.snapshot)?
+        };
+        use std::io::Write;
+        std::io::stdout().write_all(&bytes)?;
+        eprintln!(
+            "({} rows, {})",
+            format_count(total_rows),
+            format_duration(elapsed)
+        );
+        return Ok(());
+    }
+
+    // Cypher defaults to cypher-json (Neo4j-compatible, native scalars).
+    // `--format json|jsonld` gives RDF JSON-LD; `--format typed-json` the typed
+    // form. The default global `--format table` (and csv/tsv) → cypher-json,
+    // since Cypher has no tabular renderer of its own.
+    let (formatted_json, display_format) = match output_format {
+        OutputFormatKind::Json => (
+            result.to_jsonld_async(view.as_graph_db_ref()).await?,
+            OutputFormatKind::Json,
+        ),
+        OutputFormatKind::TypedJson => {
+            let config = fluree_db_api::FormatterConfig::typed_json();
+            (
+                result.format_async(view.as_graph_db_ref(), &config).await?,
+                OutputFormatKind::TypedJson,
+            )
+        }
+        _ => (
+            result.to_cypher_json_async(view.as_graph_db_ref()).await?,
+            OutputFormatKind::CypherJson,
+        ),
+    };
+    let output = output::format_result(
+        &formatted_json,
+        display_format,
+        detect::QueryFormat::JsonLd,
+        None,
+    )?;
+    println!("{}", output.text);
+    print_footer(output.total_rows, None, elapsed);
+    Ok(())
 }
 
 /// Print the timing/row-count footer line to stderr.

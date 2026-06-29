@@ -228,7 +228,7 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
             out.push(']');
         }
         // A path renders as an array of its node IRIs (start → end).
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             out.push('[');
             for (i, sid) in nodes.iter().enumerate() {
                 if i > 0 {
@@ -237,6 +237,17 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
                 push_json_string(out, &compactor.compact_id_sid(sid)?);
             }
             out.push(']');
+        }
+        // A relationship renders as a `{start, type, end}` object of compacted
+        // IRIs (its properties are reached via `properties(r)`).
+        Binding::Rel(rel) => {
+            out.push_str("{\"start\":");
+            push_json_string(out, &compactor.compact_id_sid(&rel.start)?);
+            out.push_str(",\"type\":");
+            push_json_string(out, &compactor.compact_id_sid(&rel.predicate)?);
+            out.push_str(",\"end\":");
+            push_json_string(out, &compactor.compact_id_sid(&rel.end)?);
+            out.push('}');
         }
         // A list (collect / list literal / list function) renders as a JSON
         // array of its elements.
@@ -249,6 +260,19 @@ fn write_value(out: &mut String, binding: &Binding, compactor: &IriCompactor) ->
                 write_value(out, v, compactor)?;
             }
             out.push(']');
+        }
+        // A map (map literal / `properties(n)`) renders as a JSON object.
+        Binding::Map(entries) => {
+            out.push('{');
+            for (i, (k, v)) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, k);
+                out.push(':');
+                write_value(out, v, compactor)?;
+            }
+            out.push('}');
         }
     }
     Ok(())
@@ -552,12 +576,30 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
         }
 
         // A path renders as an array of its node IRIs (start → end).
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             let arr: Result<Vec<_>> = nodes
                 .iter()
                 .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
                 .collect();
             Ok(JsonValue::Array(arr?))
+        }
+
+        // A relationship renders as a `{start, type, end}` object of compacted IRIs.
+        Binding::Rel(rel) => {
+            let mut obj = serde_json::Map::with_capacity(3);
+            obj.insert(
+                "start".to_string(),
+                JsonValue::String(compactor.compact_id_sid(&rel.start)?),
+            );
+            obj.insert(
+                "type".to_string(),
+                JsonValue::String(compactor.compact_id_sid(&rel.predicate)?),
+            );
+            obj.insert(
+                "end".to_string(),
+                JsonValue::String(compactor.compact_id_sid(&rel.end)?),
+            );
+            Ok(JsonValue::Object(obj))
         }
 
         // A list renders as a JSON array of its elements.
@@ -567,6 +609,14 @@ pub(crate) fn format_binding(binding: &Binding, compactor: &IriCompactor) -> Res
                 .map(|v| format_binding(v, compactor))
                 .collect();
             Ok(JsonValue::Array(arr?))
+        }
+        // A map renders as a JSON object (insertion order preserved).
+        Binding::Map(entries) => {
+            let mut obj = serde_json::Map::with_capacity(entries.len());
+            for (k, v) in entries {
+                obj.insert(k.to_string(), format_binding(v, compactor)?);
+            }
+            Ok(JsonValue::Object(obj))
         }
     }
 }

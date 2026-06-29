@@ -2,7 +2,7 @@
 
 Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
 
-RDF 1.1 / 1.2, [Open Cypher Preview](https://github.com/fluree/db/pull/1361), SPARQL and JSON-LD query (includes history query and other Fluree feature extensions).
+RDF 1.1 / 1.2, SPARQL, JSON-LD, and [openCypher](docs/query/cypher.md) query (includes history query and other Fluree feature extensions).
 
 Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. [Benchmark leader](https://labs.flur.ee), 10.4x faster than next  database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.
 
@@ -253,7 +253,7 @@ fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 
 | | |
 |---|---|
-| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md) |
+| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md) |
 | **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
 | **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
 | **Time travel** | [Transaction number, ISO timestamp, commit ID](docs/concepts/time-travel.md) |

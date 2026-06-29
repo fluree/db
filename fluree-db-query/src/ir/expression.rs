@@ -6,6 +6,19 @@ use super::pattern::Pattern;
 use crate::var_registry::VarId;
 use fluree_db_core::value::FlakeValue;
 
+/// Which quantifier a [`Expression::ListPredicate`] applies over a list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPredicateKind {
+    /// `all` — true iff the predicate holds for every element.
+    All,
+    /// `any` — true iff the predicate holds for at least one element.
+    Any,
+    /// `none` — true iff the predicate holds for no element.
+    None,
+    /// `single` — true iff the predicate holds for exactly one element.
+    Single,
+}
+
 /// Filter expression AST
 ///
 /// Represents expressions that can be evaluated against solution bindings.
@@ -21,6 +34,54 @@ pub enum Expression {
         func: Function,
         args: Vec<Expression>,
     },
+    /// Map literal `{k: v, …}` — builds an ordered map value from its entries.
+    /// Keys are static (resolved at lowering); values are sub-expressions
+    /// evaluated per row. Insertion order is preserved for display; identity
+    /// (equality / grouping) is key-order-insensitive. Duplicate keys resolve
+    /// last-wins at construction. Produces a [`crate::binding::Binding::Map`].
+    Map(Vec<(std::sync::Arc<str>, Expression)>),
+
+    /// List comprehension `[var IN list WHERE filter | map]`. Iterates `list`,
+    /// binding `var` to each element (a scoped local, excluded from
+    /// `referenced_vars`); keeps elements passing `filter` (if any) and projects
+    /// `map` (identity if absent). Produces a [`crate::binding::Binding::List`].
+    ListComprehension {
+        var: VarId,
+        list: Box<Expression>,
+        filter: Option<Box<Expression>>,
+        map: Option<Box<Expression>>,
+    },
+    /// `reduce(acc = init, var IN list | body)`. Folds `list` left-to-right:
+    /// `acc` starts at `init`, and each step re-binds `acc` and `var` (both
+    /// scoped locals) and evaluates `body` to the next accumulator.
+    Reduce {
+        acc: VarId,
+        init: Box<Expression>,
+        var: VarId,
+        list: Box<Expression>,
+        body: Box<Expression>,
+    },
+    /// List predicate `all/any/none/single(var IN list WHERE pred)` — tests
+    /// `pred` (with `var` a scoped local) across the elements of `list`,
+    /// short-circuiting. Produces a boolean.
+    ListPredicate {
+        kind: ListPredicateKind,
+        var: VarId,
+        list: Box<Expression>,
+        predicate: Box<Expression>,
+    },
+    /// Eval-time member access `target.key` — used when `target` can't be a
+    /// graph-join variable (a loop-local from a comprehension/reduce). At eval:
+    /// a [`crate::binding::Binding::Map`] target looks up `key`; a node (ref)
+    /// target scans `(node, predicate_iri, ?)` for the data property; anything
+    /// else is null. `predicate_iri` is resolved at lowering (it needs the
+    /// Cypher vocab, absent from the engine). Outer query-variable property
+    /// access still lowers to the efficient auxiliary-pattern join instead.
+    Member {
+        target: Box<Expression>,
+        key: std::sync::Arc<str>,
+        predicate_iri: std::sync::Arc<str>,
+    },
     /// EXISTS / NOT EXISTS subquery inside a compound filter expression.
     ///
     /// Used when EXISTS/NOT EXISTS appears as part of a larger expression
@@ -34,6 +95,20 @@ pub enum Expression {
         patterns: Vec<Pattern>,
         negated: bool,
     },
+    /// Pattern comprehension `[(a)-[:T]->(b) WHERE pred | proj]`: a correlated
+    /// subquery that projects `proj` over each match of `patterns` (the inner
+    /// `WHERE` is folded into `patterns` as a `Filter`) and collects the results
+    /// into a list. Like [`Expression::Exists`] it is resolved **asynchronously**
+    /// per outer row (seeded with that row's bindings) and replaced with a
+    /// [`Expression::Resolved`] list — it never reaches the synchronous evaluator.
+    PatternComprehension {
+        patterns: Vec<Pattern>,
+        projection: Box<Expression>,
+    },
+    /// A value pre-computed by async resolution (the list result of a
+    /// [`Expression::PatternComprehension`]). The synchronous evaluator returns
+    /// it directly. Never produced by lowering — only substituted in at runtime.
+    Resolved(Box<crate::binding::Binding>),
 }
 
 impl Expression {
@@ -52,11 +127,69 @@ impl Expression {
                     arg.substitute_var(old, new);
                 }
             }
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.substitute_var(old, new);
+                }
+            }
+            // Scoped iteration: always rename in the list/init (outer scope), but
+            // not inside the body when the bound (loop/acc) variable shadows.
+            Expression::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => {
+                list.substitute_var(old, new);
+                if *var != old {
+                    if let Some(f) = filter {
+                        f.substitute_var(old, new);
+                    }
+                    if let Some(m) = map {
+                        m.substitute_var(old, new);
+                    }
+                }
+            }
+            Expression::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                body,
+            } => {
+                init.substitute_var(old, new);
+                list.substitute_var(old, new);
+                if *acc != old && *var != old {
+                    body.substitute_var(old, new);
+                }
+            }
+            Expression::ListPredicate {
+                var,
+                list,
+                predicate,
+                ..
+            } => {
+                list.substitute_var(old, new);
+                if *var != old {
+                    predicate.substitute_var(old, new);
+                }
+            }
+            Expression::Member { target, .. } => target.substitute_var(old, new),
             Expression::Exists { patterns, .. } => {
                 for p in patterns {
                     p.substitute_var(old, new);
                 }
             }
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                for p in patterns {
+                    p.substitute_var(old, new);
+                }
+                projection.substitute_var(old, new);
+            }
+            Expression::Resolved(_) => {}
         }
     }
 
@@ -72,9 +205,36 @@ impl Expression {
             Expression::Call { func, args } => {
                 func == target || args.iter().any(|a| a.contains_function(target))
             }
+            Expression::Map(entries) => entries.iter().any(|(_, v)| v.contains_function(target)),
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.contains_function(target)
+                    || filter.as_ref().is_some_and(|f| f.contains_function(target))
+                    || map.as_ref().is_some_and(|m| m.contains_function(target))
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                init.contains_function(target)
+                    || list.contains_function(target)
+                    || body.contains_function(target)
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => list.contains_function(target) || predicate.contains_function(target),
+            Expression::Member { target: t, .. } => t.contains_function(target),
             Expression::Exists { patterns, .. } => {
                 patterns.iter().any(|p| p.contains_function(target))
             }
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                patterns.iter().any(|p| p.contains_function(target))
+                    || projection.contains_function(target)
+            }
+            Expression::Resolved(_) => false,
         }
     }
 }
@@ -89,7 +249,69 @@ impl PartialEq for Expression {
             (Expression::Call { func: f1, args: a1 }, Expression::Call { func: f2, args: a2 }) => {
                 f1 == f2 && a1 == a2
             }
+            (Expression::Map(a), Expression::Map(b)) => a == b,
+            (
+                Expression::ListComprehension {
+                    var: v1,
+                    list: l1,
+                    filter: f1,
+                    map: m1,
+                },
+                Expression::ListComprehension {
+                    var: v2,
+                    list: l2,
+                    filter: f2,
+                    map: m2,
+                },
+            ) => v1 == v2 && l1 == l2 && f1 == f2 && m1 == m2,
+            (
+                Expression::Reduce {
+                    acc: a1,
+                    init: i1,
+                    var: v1,
+                    list: l1,
+                    body: b1,
+                },
+                Expression::Reduce {
+                    acc: a2,
+                    init: i2,
+                    var: v2,
+                    list: l2,
+                    body: b2,
+                },
+            ) => a1 == a2 && i1 == i2 && v1 == v2 && l1 == l2 && b1 == b2,
+            (
+                Expression::ListPredicate {
+                    kind: k1,
+                    var: v1,
+                    list: l1,
+                    predicate: p1,
+                },
+                Expression::ListPredicate {
+                    kind: k2,
+                    var: v2,
+                    list: l2,
+                    predicate: p2,
+                },
+            ) => k1 == k2 && v1 == v2 && l1 == l2 && p1 == p2,
+            (
+                Expression::Member {
+                    target: t1,
+                    key: k1,
+                    predicate_iri: p1,
+                },
+                Expression::Member {
+                    target: t2,
+                    key: k2,
+                    predicate_iri: p2,
+                },
+            ) => t1 == t2 && k1 == k2 && p1 == p2,
             (Expression::Exists { .. }, Expression::Exists { .. }) => false,
+            // Patterns aren't comparable (mirrors Exists); a resolved value is.
+            (Expression::PatternComprehension { .. }, Expression::PatternComprehension { .. }) => {
+                false
+            }
+            (Expression::Resolved(a), Expression::Resolved(b)) => a == b,
             _ => false,
         }
     }
@@ -243,9 +465,79 @@ impl Expression {
             Expression::Call { args, .. } => {
                 args.iter().flat_map(Expression::referenced_vars).collect()
             }
+            Expression::Map(entries) => entries
+                .iter()
+                .flat_map(|(_, v)| v.referenced_vars())
+                .collect(),
+            // The loop/acc variables are bound internally — exclude them, but
+            // keep the free vars referenced by the list and the scoped bodies.
+            Expression::ListComprehension {
+                var,
+                list,
+                filter,
+                map,
+            } => {
+                let mut vars = list.referenced_vars();
+                let mut inner = Vec::new();
+                if let Some(f) = filter {
+                    inner.extend(f.referenced_vars());
+                }
+                if let Some(m) = map {
+                    inner.extend(m.referenced_vars());
+                }
+                inner.retain(|x| x != var);
+                vars.extend(inner);
+                vars
+            }
+            Expression::Reduce {
+                acc,
+                init,
+                var,
+                list,
+                body,
+            } => {
+                let mut vars = init.referenced_vars();
+                vars.extend(list.referenced_vars());
+                let mut inner = body.referenced_vars();
+                inner.retain(|x| x != acc && x != var);
+                vars.extend(inner);
+                vars
+            }
+            Expression::ListPredicate {
+                var,
+                list,
+                predicate,
+                ..
+            } => {
+                let mut vars = list.referenced_vars();
+                let mut inner = predicate.referenced_vars();
+                inner.retain(|x| x != var);
+                vars.extend(inner);
+                vars
+            }
+            Expression::Member { target, .. } => target.referenced_vars(),
+            // EXISTS has no projection — only the pattern's correlation vars.
             Expression::Exists { patterns, .. } => {
                 patterns.iter().flat_map(Pattern::referenced_vars).collect()
             }
+            // A pattern comprehension's projection can capture OUTER variables
+            // that never appear in the inner pattern (e.g. `[(a)-->(b) | c]`).
+            // Those are real dependencies — include them so dependency trimming
+            // can't drop them. Pattern-internal vars (`b`) are already covered.
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                let mut vars: Vec<VarId> =
+                    patterns.iter().flat_map(Pattern::referenced_vars).collect();
+                for v in projection.referenced_vars() {
+                    if !vars.contains(&v) {
+                        vars.push(v);
+                    }
+                }
+                vars
+            }
+            Expression::Resolved(_) => Vec::new(),
         }
     }
 
@@ -310,7 +602,16 @@ impl Expression {
                 _ => false,
             },
             // Var, Const, Exists are not range-safe on their own
-            Expression::Var(_) | Expression::Const(_) | Expression::Exists { .. } => false,
+            Expression::Var(_)
+            | Expression::Const(_)
+            | Expression::Map(_)
+            | Expression::ListComprehension { .. }
+            | Expression::Reduce { .. }
+            | Expression::ListPredicate { .. }
+            | Expression::Member { .. }
+            | Expression::Exists { .. }
+            | Expression::PatternComprehension { .. }
+            | Expression::Resolved(_) => false,
         }
     }
 }
@@ -353,6 +654,7 @@ pub enum ArithmeticOp {
     Sub,
     Mul,
     Div,
+    Mod,
 }
 
 impl std::fmt::Display for ArithmeticOp {
@@ -362,6 +664,7 @@ impl std::fmt::Display for ArithmeticOp {
             ArithmeticOp::Sub => write!(f, "-"),
             ArithmeticOp::Mul => write!(f, "*"),
             ArithmeticOp::Div => write!(f, "/"),
+            ArithmeticOp::Mod => write!(f, "%"),
         }
     }
 }
@@ -390,6 +693,7 @@ impl From<ArithmeticOp> for Function {
             ArithmeticOp::Sub => Function::Sub,
             ArithmeticOp::Mul => Function::Mul,
             ArithmeticOp::Div => Function::Div,
+            ArithmeticOp::Mod => Function::Mod,
         }
     }
 }
@@ -436,6 +740,8 @@ pub enum Function {
     Mul,
     /// Division (/)
     Div,
+    /// Modulus (%)
+    Mod,
     /// Unary negation (-)
     Negate,
 
@@ -448,6 +754,10 @@ pub enum Function {
     Or,
     /// Logical NOT
     Not,
+    /// Logical XOR (Cypher `XOR`). Two-valued: `bool(a) ^ bool(b)`, matching the
+    /// truthiness semantics of the `(a OR b) AND NOT(a AND b)` form it replaces.
+    /// Cypher-only; never produced by SPARQL/JSON-LD lowering.
+    Xor,
     /// IN expression (?x IN (1, 2, 3))
     In,
     /// NOT IN expression (?x NOT IN (1, 2, 3))
@@ -472,6 +782,18 @@ pub enum Function {
     StrDt,
     StrLang,
     EncodeForUri,
+    /// Cypher `replace(s, search, replacement)` — LITERAL replace-all (vs the
+    /// regex [`Replace`]).
+    ReplaceAll,
+    /// Cypher `split(s, delim)` — split a string into a list (list-valued).
+    Split,
+    /// Cypher `trim` / `ltrim` / `rtrim` — strip leading/trailing whitespace.
+    Trim,
+    LTrim,
+    RTrim,
+    /// Cypher `left(s, n)` / `right(s, n)` — first / last `n` characters.
+    Left,
+    Right,
 
     // =========================================================================
     // Numeric functions
@@ -481,6 +803,14 @@ pub enum Function {
     Ceil,
     Floor,
     Rand,
+    /// Cypher `sqrt(x)`.
+    Sqrt,
+    /// Cypher `sign(x)` — -1 / 0 / 1.
+    Sign,
+    /// Cypher `log(x)` — natural logarithm.
+    Ln,
+    /// Exponentiation (`x ^ y`).
+    Pow,
 
     // =========================================================================
     // RDF term constructors
@@ -608,6 +938,37 @@ pub enum Function {
     /// `list[index]` — element access (0-based; negative indexes from the end).
     /// Out-of-range / non-integer index / non-list → unbound (Cypher null).
     ListIndex,
+
+    // =========================================================================
+    // Cypher metadata functions
+    // =========================================================================
+    /// `labels(node)` — Cypher label strings from `rdf:type` assertions.
+    Labels,
+    /// `type(rel)` — relationship type string from `f:reifiesPredicate`.
+    RelType,
+    /// `startNode(rel)` / `endNode(rel)` — the relationship's start / end node
+    /// ref, from `f:reifiesSubject` / `f:reifiesObject` on the reifier.
+    StartNode,
+    EndNode,
+    /// `relationships(path)` — the list of relationship values along a path
+    /// (one per hop), built from the path's nodes and per-hop predicates.
+    Relationships,
+    /// Construct a relationship value: `MakeRel(start, Const(Ref(predicate)), end)`
+    /// → [`crate::binding::Binding::Rel`] (reifier = None). Internal; emitted by
+    /// the var-length relationship-variable binding.
+    MakeRel,
+    /// Construct a path value: `MakePath(Const(Ref(predicate)), node0, …, nodeN)`
+    /// → [`crate::binding::Binding::Path`] with every hop using `predicate`.
+    /// Internal; emitted by the var-length path-variable binding.
+    MakePath,
+    /// `keys(node)` — the list of a node's data-property keys (local names),
+    /// excluding `rdf:type`, the `f:reifies*` bundle, and relationship (ref)
+    /// edges. Produces a [`crate::binding::Binding::List`] of strings.
+    Keys,
+    /// `properties(node)` — a map of a node's data properties (`{key: value}`),
+    /// using the same exclusions as [`Function::Keys`]. Produces a
+    /// [`crate::binding::Binding::Map`].
+    Properties,
 
     // =========================================================================
     // Custom/unknown function

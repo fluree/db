@@ -409,7 +409,9 @@ impl Materializer {
             }
 
             // Paths/lists are not hashed/joined/grouped (v1).
-            Binding::Path(_) | Binding::List(_) => JoinKey::Absent,
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                JoinKey::Absent
+            }
         }
     }
 
@@ -462,7 +464,7 @@ impl Materializer {
             Binding::Grouped(_) => None,
 
             // A path/list is not a scalar comparable value.
-            Binding::Path(_) | Binding::List(_) => None,
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
         }
     }
 
@@ -526,7 +528,7 @@ impl Materializer {
             Binding::Grouped(_) => None,
 
             // No canonical string form for a path/list value.
-            Binding::Path(_) | Binding::List(_) => None,
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
         }
     }
 
@@ -551,8 +553,10 @@ impl Materializer {
             | Binding::Iri(_)
             | Binding::Lit { .. }
             | Binding::Grouped(_)
-            | Binding::Path(_)
-            | Binding::List(_) => binding.clone(),
+            | Binding::Path { .. }
+            | Binding::Rel(_)
+            | Binding::List(_)
+            | Binding::Map(_) => binding.clone(),
 
             Binding::EncodedSid { s_id, .. } => {
                 let sid = self.resolve_sid(*s_id);
@@ -578,13 +582,17 @@ impl Materializer {
             {
                 Ok(FlakeValue::Ref(sid)) => Binding::sid(sid),
                 Ok(val) => {
-                    let dt_sid = self
-                        .graph_view
-                        .store()
-                        .dt_sids()
-                        .get(*dt_id as usize)
-                        .cloned()
-                        .unwrap_or_else(|| Sid::new(0, ""));
+                    // NUM_BIG arena values share one EncodedLit whose dt_id is
+                    // hardcoded to decimal — recover xsd:integer vs xsd:decimal
+                    // from the decoded value, not dt_id (issue #1329).
+                    let dt_sid = val.overflow_numeric_datatype_sid().unwrap_or_else(|| {
+                        self.graph_view
+                            .store()
+                            .dt_sids()
+                            .get(*dt_id as usize)
+                            .cloned()
+                            .unwrap_or_else(|| Sid::new(0, ""))
+                    });
                     let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),

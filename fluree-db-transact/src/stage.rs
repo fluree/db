@@ -1857,7 +1857,7 @@ fn binding_to_flake_object(
             );
             None
         }
-        Binding::Path(_) | Binding::List(_) => {
+        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
             debug_assert!(
                 false,
                 "Path/List binding encountered in flake generation (unexpected)"

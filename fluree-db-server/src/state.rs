@@ -388,6 +388,9 @@ async fn build_direct_fluree(
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);
     }
+    if let Some(max_mb) = config.disk_cache_max_mb {
+        builder = builder.disk_cache_max_mb(max_mb);
+    }
     if config.indexing_enabled {
         let max_bytes = config
             .reindex_max_bytes

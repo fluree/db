@@ -48,6 +48,15 @@ use std::sync::Arc;
 /// This prevents runaway closure enumeration for both-variable patterns
 pub const DEFAULT_MAX_VISITED: usize = 10_000;
 
+/// Predicates a wildcard (untyped) path must never traverse: `rdf:type` (its
+/// object is a class, not a node) and the `f:reifies*` reifier bundle (the
+/// edge-annotation sidecar, hidden from variable-predicate reads). Data
+/// properties are already excluded by the `Ref`-object filter in the scan.
+#[inline]
+fn is_reserved_edge_predicate(p: &Sid) -> bool {
+    fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
+}
+
 /// Property path operator - transitive graph traversal
 ///
 /// Supports two execution modes:
@@ -139,13 +148,55 @@ impl PropertyPathOperator {
         self
     }
 
+    /// Whether a node reached at `depth` hops should be emitted, given the
+    /// pattern's hop bounds. For an unbounded fixed path (`min_hops`/`max_hops`
+    /// both `None`) this is `depth >= modifier-lower-bound`, reproducing the
+    /// original `*`/`+` behavior exactly.
+    fn emit_at_depth(&self, depth: u32) -> bool {
+        depth >= self.pattern.effective_min_hops()
+            && self.pattern.max_hops.is_none_or(|hi| depth <= hi)
+    }
+
+    /// Whether to keep expanding from a node reached at `depth` — only when a
+    /// further hop could still land within `max_hops`. Always true when
+    /// unbounded, so fixed `*`/`+` paths expand exactly as before.
+    fn can_expand(&self, depth: u32) -> bool {
+        self.pattern.max_hops.is_none_or(|hi| depth < hi)
+    }
+
     /// One forward hop from `node`. For a simple/alternation path this is the
     /// ref objects of `(node, p, ?)` over every traversed predicate. For a
     /// composite path `(p1/p2/…)+` it follows the whole sub-path — the first
     /// step (`predicates`, `first_inverse`) then each `sequence_steps` entry,
-    /// each honoring its own direction — and returns the set of nodes reachable
-    /// by exactly one composite hop.
+    /// each honoring its own direction. For a wildcard (untyped Cypher) path it
+    /// follows **any** node→node edge — a subject-prefix scan keeping only `Ref`
+    /// objects and skipping the reserved predicates (`rdf:type`, `f:reifies*`).
     async fn forward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        if self.pattern.wildcard {
+            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let mut out = Vec::new();
+            let range_match = RangeMatch::new().with_subject(node.clone());
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Spot,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                if is_reserved_edge_predicate(&flake.p) {
+                    continue;
+                }
+                if let FlakeValue::Ref(o) = flake.o {
+                    out.push(o);
+                }
+            }
+            return Ok(out);
+        }
         // Traversing a step forward reads SPOT for a forward step and POST for
         // an inverse step (`^p` follows object→subject).
         let mut frontier = self
@@ -170,8 +221,33 @@ impl PropertyPathOperator {
     /// One backward hop into `node`: the sources from which a single (composite)
     /// hop reaches `node`. Walks the unit in reverse, and each step is retreated
     /// the opposite way it is advanced (a forward step retreats via POST, an
-    /// inverse step via SPOT).
+    /// inverse step via SPOT). For a wildcard (untyped) path it follows any
+    /// node→node edge backward — an object-prefix scan (OPST) skipping the
+    /// reserved predicates.
     async fn backward_step(&self, ctx: &ExecutionContext<'_>, node: &Sid) -> Result<Vec<Sid>> {
+        if self.pattern.wildcard {
+            let (db, overlay, to_t) = ctx.require_single_graph()?;
+            let mut out = Vec::new();
+            let range_match = RangeMatch::new().with_object(FlakeValue::Ref(node.clone()));
+            let flakes = range_with_overlay(
+                db,
+                ctx.binary_g_id,
+                overlay,
+                IndexType::Opst,
+                RangeTest::Eq,
+                range_match,
+                RangeOptions::new().with_to_t(to_t),
+            )
+            .await?;
+            let flakes = self.filter_edges(ctx, flakes).await?;
+            for flake in flakes {
+                if is_reserved_edge_predicate(&flake.p) {
+                    continue;
+                }
+                out.push(flake.s);
+            }
+            return Ok(out);
+        }
         let mut frontier = vec![node.clone()];
         for step in self.pattern.sequence_steps.iter().rev() {
             frontier = self
@@ -274,6 +350,75 @@ impl PropertyPathOperator {
             .await
     }
 
+    /// Layered BFS for a **bounded** path (`max_hops` set). Tracks visited per
+    /// `(node, depth)` rather than per node, so a node first reached below
+    /// `min_hops` can still be reached on a longer in-range path — the correct
+    /// `*2..3` semantics (a plain node-visited set would suppress it, and then
+    /// disagree with the bound-bound `path_exists` form). Output is de-duped.
+    /// Termination is guaranteed by the finite depth cap. Only untyped paths
+    /// reach the operator with bounds (typed bounded ranges lower to a UNION of
+    /// fixed-length chains), so this never runs for SPARQL/typed paths.
+    async fn traverse_bounded(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        anchor: &Sid,
+        forward: bool,
+        stop_at: Option<&Sid>,
+    ) -> Result<Vec<Sid>> {
+        let max = self
+            .pattern
+            .max_hops
+            .expect("bounded traversal needs max_hops");
+        let mut frontier: Vec<Sid> = vec![anchor.clone()];
+        let mut seen_at_depth: HashSet<(Sid, u32)> = HashSet::new();
+        seen_at_depth.insert((anchor.clone(), 0));
+        let mut emitted: Vec<Sid> = Vec::new();
+        let mut emitted_set: HashSet<Sid> = HashSet::new();
+        if self.emit_at_depth(0) {
+            emitted.push(anchor.clone());
+            emitted_set.insert(anchor.clone());
+            // Existence probe: stop as soon as the target is reached in range,
+            // instead of enumerating the whole bounded frontier.
+            if stop_at == Some(anchor) {
+                return Ok(emitted);
+            }
+        }
+
+        let mut depth = 0u32;
+        while depth < max && !frontier.is_empty() {
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            if seen_at_depth.len() >= self.max_visited {
+                return Err(QueryError::ResourceLimit(format!(
+                    "Property path exceeded max visited nodes ({})",
+                    self.max_visited
+                )));
+            }
+            let next_depth = depth + 1;
+            let mut next_frontier: Vec<Sid> = Vec::new();
+            for node in &frontier {
+                let neighbors = if forward {
+                    self.forward_step(ctx, node).await?
+                } else {
+                    self.backward_step(ctx, node).await?
+                };
+                for nb in neighbors {
+                    if self.emit_at_depth(next_depth) && emitted_set.insert(nb.clone()) {
+                        emitted.push(nb.clone());
+                        if stop_at == Some(&nb) {
+                            return Ok(emitted);
+                        }
+                    }
+                    if seen_at_depth.insert((nb.clone(), next_depth)) {
+                        next_frontier.push(nb);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            depth = next_depth;
+        }
+        Ok(emitted)
+    }
+
     /// Traverse forward from a starting node (subject bound)
     ///
     /// Uses SPOT index: (subject=start, predicate=path_pred)
@@ -291,24 +436,24 @@ impl PropertyPathOperator {
             }
             return Ok(results);
         }
-
+        if self.pattern.max_hops.is_some() {
+            return self.traverse_bounded(ctx, start, true, None).await;
+        }
         let mut visited: HashSet<Sid> = HashSet::new();
-        let mut queue: VecDeque<Sid> = VecDeque::new();
+        let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
         let mut added_start_via_cycle = false;
 
-        // ZeroOrMore includes starting node
-        if self.pattern.modifier == PathModifier::ZeroOrMore {
+        // Depth-0 start: emit only when in bounds (`*` / `*0..` include it).
+        if self.pattern.modifier == PathModifier::ZeroOrMore && self.emit_at_depth(0) {
             results.push(start.clone());
-            visited.insert(start.clone());
+        }
+        visited.insert(start.clone());
+        if self.can_expand(0) {
+            queue.push_back((start.clone(), 0));
         }
 
-        queue.push_back(start.clone());
-        if self.pattern.modifier == PathModifier::OneOrMore {
-            visited.insert(start.clone());
-        }
-
-        while let Some(current) = queue.pop_front() {
+        while let Some((current, depth)) = queue.pop_front() {
             crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             // Safety bound check
             if visited.len() >= self.max_visited {
@@ -317,6 +462,7 @@ impl PropertyPathOperator {
                     self.max_visited
                 )));
             }
+            let next_depth = depth + 1;
 
             // Union of one forward hop over every traversed predicate. In
             // dataset mode this runs against a single active graph (there is no
@@ -328,13 +474,19 @@ impl PropertyPathOperator {
                     && !added_start_via_cycle
                     && &obj_sid == start
                 {
-                    results.push(obj_sid.clone());
+                    if self.emit_at_depth(next_depth) {
+                        results.push(obj_sid.clone());
+                    }
                     added_start_via_cycle = true;
                     continue;
                 }
                 if visited.insert(obj_sid.clone()) {
-                    results.push(obj_sid.clone());
-                    queue.push_back(obj_sid);
+                    if self.emit_at_depth(next_depth) {
+                        results.push(obj_sid.clone());
+                    }
+                    if self.can_expand(next_depth) {
+                        queue.push_back((obj_sid, next_depth));
+                    }
                 }
             }
         }
@@ -363,24 +515,24 @@ impl PropertyPathOperator {
             }
             return Ok(results);
         }
-
+        if self.pattern.max_hops.is_some() {
+            return self.traverse_bounded(ctx, target, false, None).await;
+        }
         let mut visited: HashSet<Sid> = HashSet::new();
-        let mut queue: VecDeque<Sid> = VecDeque::new();
+        let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
         let mut results: Vec<Sid> = Vec::new();
         let mut added_target_via_cycle = false;
 
-        // ZeroOrMore includes target node as a source
-        if self.pattern.modifier == PathModifier::ZeroOrMore {
+        // Depth-0 target as its own source: emit only when in bounds.
+        if self.pattern.modifier == PathModifier::ZeroOrMore && self.emit_at_depth(0) {
             results.push(target.clone());
-            visited.insert(target.clone());
+        }
+        visited.insert(target.clone());
+        if self.can_expand(0) {
+            queue.push_back((target.clone(), 0));
         }
 
-        queue.push_back(target.clone());
-        if self.pattern.modifier == PathModifier::OneOrMore {
-            visited.insert(target.clone());
-        }
-
-        while let Some(current) = queue.pop_front() {
+        while let Some((current, depth)) = queue.pop_front() {
             crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             // Safety bound check
             if visited.len() >= self.max_visited {
@@ -389,6 +541,7 @@ impl PropertyPathOperator {
                     self.max_visited
                 )));
             }
+            let next_depth = depth + 1;
 
             // Union of one backward hop over every traversed predicate.
             for src_sid in self.backward_step(ctx, &current).await? {
@@ -396,13 +549,19 @@ impl PropertyPathOperator {
                     && !added_target_via_cycle
                     && &src_sid == target
                 {
-                    results.push(src_sid.clone());
+                    if self.emit_at_depth(next_depth) {
+                        results.push(src_sid.clone());
+                    }
                     added_target_via_cycle = true;
                     continue;
                 }
                 if visited.insert(src_sid.clone()) {
-                    results.push(src_sid.clone());
-                    queue.push_back(src_sid);
+                    if self.emit_at_depth(next_depth) {
+                        results.push(src_sid.clone());
+                    }
+                    if self.can_expand(next_depth) {
+                        queue.push_back((src_sid, next_depth));
+                    }
                 }
             }
         }
@@ -455,24 +614,48 @@ impl PropertyPathOperator {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
         let mut adj: std::collections::HashMap<Sid, Vec<Sid>> = std::collections::HashMap::new();
         let mut nodes: HashSet<Sid> = HashSet::new();
-        for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::predicate(pred.clone());
+        let mut ingest = |flake: fluree_db_core::Flake| {
+            if let FlakeValue::Ref(o) = flake.o {
+                nodes.insert(flake.s.clone());
+                nodes.insert(o.clone());
+                adj.entry(flake.s).or_default().push(o);
+            }
+        };
+        if self.pattern.wildcard {
+            // Wildcard closure: every node→node edge except the reserved ones.
+            // A full PSOT scan (no predicate bound) over the active graph.
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
                 overlay,
                 IndexType::Psot,
                 RangeTest::Eq,
-                range_match,
+                RangeMatch::new(),
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
             let flakes = self.filter_edges(ctx, flakes).await?;
             for flake in flakes {
-                if let FlakeValue::Ref(o) = flake.o {
-                    nodes.insert(flake.s.clone());
-                    nodes.insert(o.clone());
-                    adj.entry(flake.s).or_default().push(o);
+                if !is_reserved_edge_predicate(&flake.p) {
+                    ingest(flake);
+                }
+            }
+        } else {
+            for pred in &self.pattern.predicates {
+                let range_match = RangeMatch::predicate(pred.clone());
+                let flakes = range_with_overlay(
+                    db,
+                    ctx.binary_g_id,
+                    overlay,
+                    IndexType::Psot,
+                    RangeTest::Eq,
+                    range_match,
+                    RangeOptions::new().with_to_t(to_t),
+                )
+                .await?;
+                let flakes = self.filter_edges(ctx, flakes).await?;
+                for flake in flakes {
+                    ingest(flake);
                 }
             }
         }
@@ -497,23 +680,66 @@ impl PropertyPathOperator {
         }
 
         for start in &nodes {
-            // BFS from start using adjacency only (no DB calls).
-            let mut visited: HashSet<Sid> = HashSet::new();
-            let mut queue: VecDeque<Sid> = VecDeque::new();
-
-            if self.pattern.modifier == PathModifier::ZeroOrMore {
-                out.push((start.clone(), start.clone()));
-                visited.insert(start.clone());
+            // Poll cancellation per start node: a both-vars-unbound closure over a
+            // dense graph runs `nodes × edges × depth` work, and the bounded
+            // branch below would otherwise be uninterruptible (only the unbounded
+            // branch polls per dequeue).
+            crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+            // Bounded path: layered (node, depth) BFS over the adjacency map, so
+            // a node first reached below `min_hops` can still be reached on a
+            // longer in-range path (matches `traverse_bounded`).
+            if let Some(max) = self.pattern.max_hops {
+                let mut frontier: Vec<Sid> = vec![start.clone()];
+                let mut seen_at_depth: HashSet<(Sid, u32)> = HashSet::new();
+                seen_at_depth.insert((start.clone(), 0));
+                let mut emitted: HashSet<Sid> = HashSet::new();
+                if self.emit_at_depth(0) {
+                    out.push((start.clone(), start.clone()));
+                    emitted.insert(start.clone());
+                }
+                let mut depth = 0u32;
+                while depth < max && !frontier.is_empty() {
+                    crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
+                    if seen_at_depth.len() >= self.max_visited {
+                        return Err(QueryError::ResourceLimit(format!(
+                            "Property path exceeded max visited nodes ({})",
+                            self.max_visited
+                        )));
+                    }
+                    let next_depth = depth + 1;
+                    let mut next_frontier: Vec<Sid> = Vec::new();
+                    for node in &frontier {
+                        if let Some(nexts) = adj.get(node) {
+                            for n in nexts {
+                                if self.emit_at_depth(next_depth) && emitted.insert(n.clone()) {
+                                    out.push((start.clone(), n.clone()));
+                                }
+                                if seen_at_depth.insert((n.clone(), next_depth)) {
+                                    next_frontier.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                    frontier = next_frontier;
+                    depth = next_depth;
+                }
+                continue;
             }
 
-            queue.push_back(start.clone());
-            if self.pattern.modifier == PathModifier::OneOrMore {
-                // Mark visited for cycle detection; still allow emitting (start,start) once via a cycle.
-                visited.insert(start.clone());
+            // BFS from start using adjacency only (no DB calls).
+            let mut visited: HashSet<Sid> = HashSet::new();
+            let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
+
+            if self.pattern.modifier == PathModifier::ZeroOrMore && self.emit_at_depth(0) {
+                out.push((start.clone(), start.clone()));
+            }
+            visited.insert(start.clone());
+            if self.can_expand(0) {
+                queue.push_back((start.clone(), 0));
             }
 
             let mut added_self_via_cycle = false;
-            while let Some(cur) = queue.pop_front() {
+            while let Some((cur, depth)) = queue.pop_front() {
                 crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
                 if visited.len() >= self.max_visited {
                     return Err(QueryError::ResourceLimit(format!(
@@ -521,19 +747,26 @@ impl PropertyPathOperator {
                         self.max_visited
                     )));
                 }
+                let next_depth = depth + 1;
                 if let Some(nexts) = adj.get(&cur) {
                     for n in nexts {
                         if self.pattern.modifier == PathModifier::OneOrMore
                             && !added_self_via_cycle
                             && n == start
                         {
-                            out.push((start.clone(), start.clone()));
+                            if self.emit_at_depth(next_depth) {
+                                out.push((start.clone(), start.clone()));
+                            }
                             added_self_via_cycle = true;
                             continue;
                         }
                         if visited.insert(n.clone()) {
-                            out.push((start.clone(), n.clone()));
-                            queue.push_back(n.clone());
+                            if self.emit_at_depth(next_depth) {
+                                out.push((start.clone(), n.clone()));
+                            }
+                            if self.can_expand(next_depth) {
+                                queue.push_back((n.clone(), next_depth));
+                            }
                         }
                     }
                 }
@@ -628,8 +861,23 @@ impl PropertyPathOperator {
         start: &Sid,
         target: &Sid,
     ) -> Result<bool> {
-        // ZeroOrMore includes the zero-length path.
-        if self.pattern.modifier == PathModifier::ZeroOrMore && start == target {
+        // Bounded path: reuse the exact layered (node, depth) traversal the
+        // bound-unbound form uses, so the two never disagree — a node-only
+        // visited set here would suppress an intermediate that must be revisited
+        // at a later depth (e.g. A→B, A→C→B, B→D; `A-[*3..3]->D` via A-C-B-D).
+        if self.pattern.max_hops.is_some() {
+            return Ok(self
+                .traverse_bounded(ctx, start, true, Some(target))
+                .await?
+                .iter()
+                .any(|reached| reached == target));
+        }
+
+        // Zero-length path — only when the bounds admit depth 0.
+        if self.pattern.modifier == PathModifier::ZeroOrMore
+            && start == target
+            && self.emit_at_depth(0)
+        {
             return Ok(true);
         }
 
@@ -646,12 +894,14 @@ impl PropertyPathOperator {
         }
 
         let mut visited: HashSet<Sid> = HashSet::new();
-        let mut queue: VecDeque<Sid> = VecDeque::new();
+        let mut queue: VecDeque<(Sid, u32)> = VecDeque::new();
 
-        queue.push_back(start.clone());
         visited.insert(start.clone());
+        if self.can_expand(0) {
+            queue.push_back((start.clone(), 0));
+        }
 
-        while let Some(current) = queue.pop_front() {
+        while let Some((current, depth)) = queue.pop_front() {
             crate::fast_path_common::bail_if_cancelled(&ctx.cancellation)?;
             if visited.len() >= self.max_visited {
                 return Err(QueryError::ResourceLimit(format!(
@@ -659,16 +909,19 @@ impl PropertyPathOperator {
                     self.max_visited
                 )));
             }
+            let next_depth = depth + 1;
 
             for obj_sid in self.forward_step(ctx, &current).await? {
-                // This is a non-zero-length path, so it satisfies OneOrMore
-                // even when the target is the start node reached via a cycle.
-                if &obj_sid == target {
+                // Reaching the target at an in-bounds depth proves a path. The
+                // check runs on every encounter (before the visited gate), so a
+                // target first seen below `min_hops` can still match at a deeper,
+                // in-range depth.
+                if &obj_sid == target && self.emit_at_depth(next_depth) {
                     return Ok(true);
                 }
 
-                if visited.insert(obj_sid.clone()) {
-                    queue.push_back(obj_sid);
+                if visited.insert(obj_sid.clone()) && self.can_expand(next_depth) {
+                    queue.push_back((obj_sid, next_depth));
                 }
             }
         }

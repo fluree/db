@@ -8,8 +8,14 @@ description = "Iceberg REST catalog support for Fluree DB graph sources"
 
 [features]
 default = []
-# AWS SDK integration (credential provider + S3 storage)
-aws = ["dep:aws-credential-types", "dep:aws-sdk-s3", "dep:aws-config"]
+# AWS SDK integration (credential provider + S3 storage). Enables the shared
+# native disk cache (read-through for S3 data files).
+aws = [
+    "dep:aws-credential-types",
+    "dep:aws-sdk-s3",
+    "dep:aws-config",
+    "fluree-db-core/native",
+]
 # Arrow columnar output (OFF by default for Lambda size)
 arrow = ["dep:arrow", "parquet/arrow"]
 
@@ -17,6 +23,9 @@ arrow = ["dep:arrow", "parquet/arrow"]
 # Core dependencies
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
+
+# Deterministic hashing for disk-cache filenames (immutable source paths).
+xxhash-rust = { workspace = true }
 
 # Async runtime
 async-trait.workspace = true
