@@ -247,13 +247,6 @@ fn inject_policy_into_envelope(
     if !policy.is_set() {
         return Ok(());
     }
-
-    // Pre-resolve --policy / --policy-file and --policy-values /
-    // --policy-values-file from the typed PolicyArgs so we don't have to
-    // re-parse them. Same accessors single-query reuses.
-    let resolved_policy = policy.resolve_policy().map_err(CliError::Input)?;
-    let resolved_values = policy.resolve_policy_values().map_err(CliError::Input)?;
-
     let mut opts = envelope
         .opts
         .take()
@@ -261,54 +254,7 @@ fn inject_policy_into_envelope(
     let obj = opts
         .as_object_mut()
         .ok_or_else(|| CliError::Input("envelope opts must be a JSON object".to_string()))?;
-
-    // Default-vs-override rule (matches FlureeHeaders::inject_into_opts
-    // server-side): each CLI flag injects ONLY when the envelope's opts
-    // doesn't already carry that key, so explicit envelope opts always
-    // win over CLI flags.
-
-    if let Some(id) = policy.identity.as_ref() {
-        obj.entry("identity")
-            .or_insert_with(|| JsonValue::String(id.clone()));
-    }
-
-    // policy-class is ALWAYS an array — typed Vec<String> from the
-    // PolicyArgs flag keeps every value, matching the server-side
-    // `FlureeHeaders.policy_class` shape. The previous code went
-    // through `policy_headers`, which flattened the Vec into one
-    // tuple per class and the dedup loop dropped all but the first.
-    if !policy.policy_class.is_empty() && !obj.contains_key("policy-class") {
-        obj.insert(
-            "policy-class".to_string(),
-            JsonValue::Array(
-                policy
-                    .policy_class
-                    .iter()
-                    .cloned()
-                    .map(JsonValue::String)
-                    .collect(),
-            ),
-        );
-    }
-
-    if let Some(p) = resolved_policy {
-        obj.entry("policy").or_insert(p);
-    }
-
-    if let Some(values_map) = resolved_values {
-        let as_object: serde_json::Map<String, JsonValue> = values_map.into_iter().collect();
-        obj.entry("policy-values")
-            .or_insert_with(|| JsonValue::Object(as_object));
-    }
-
-    if policy.default_allow
-        && !obj.contains_key("default-allow")
-        && !obj.contains_key("default_allow")
-        && !obj.contains_key("defaultAllow")
-    {
-        obj.insert("default-allow".to_string(), JsonValue::Bool(true));
-    }
-
+    policy.inject_into_opts(obj).map_err(CliError::Input)?;
     envelope.opts = Some(opts);
     Ok(())
 }
