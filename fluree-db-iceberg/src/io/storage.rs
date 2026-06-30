@@ -86,10 +86,13 @@ impl S3IcebergStorage {
     /// Resolve effective region/endpoint/path-style from vended credentials plus
     /// caller-supplied overrides.
     ///
-    /// Precedence: the value vended by the catalog wins, then the override, then
-    /// none. Region/endpoint stay `None` when neither source supplies one (so the
-    /// AWS SDK default chain applies); path-style is enabled if either the vended
-    /// creds or the override request it.
+    /// Precedence differs by field. Region/endpoint follow "vended wins, then
+    /// override, then none": they stay `None` when neither source supplies one (so
+    /// the AWS SDK default chain applies). Path-style is the logical OR of the
+    /// vended and override flags — *not* "vended wins" — so an override can only
+    /// force it on, never back to `false`. (That asymmetry is intentional: once
+    /// either source requires path-style addressing it must stay enabled, which is
+    /// the only sensible resolution for a bool.)
     ///
     /// Returned as plain owned values so the precedence logic is unit-testable
     /// without touching SDK internals (the built `aws_sdk_s3::Config` exposes only
@@ -114,12 +117,16 @@ impl S3IcebergStorage {
 
     /// Create a new S3 storage from vended credentials.
     ///
-    /// Region/endpoint/path-style precedence (mirrors [`from_default_chain`] for the
-    /// override sources): the value vended by the catalog wins, then the caller-supplied
-    /// override (typically `io.s3_region` / `io.s3_endpoint` / `io.s3_path_style`), then
-    /// the AWS SDK default chain. Leaving region `None` (vended absent *and* no override)
+    /// Region/endpoint precedence (mirrors [`from_default_chain`] for the override
+    /// sources): the value vended by the catalog wins, then the caller-supplied
+    /// override (typically `io.s3_region` / `io.s3_endpoint`), then the AWS SDK
+    /// default chain. Leaving region `None` (vended absent *and* no override)
     /// preserves the SDK-default behavior (e.g. `us-east-1` / `AWS_REGION`) so the
     /// previously-working us-east-1 path does not regress.
+    ///
+    /// Path-style (`io.s3_path_style`) is the exception: it is the logical OR of the
+    /// vended and override flags, so an override can only force it on, never back to
+    /// `false`. See [`resolve_io`](Self::resolve_io).
     ///
     /// [`from_default_chain`]: Self::from_default_chain
     pub async fn from_vended_credentials(
