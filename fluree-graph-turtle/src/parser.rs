@@ -855,17 +855,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         Ok(first_node)
     }
 
-    /// Resolve a potentially relative IRI against the base (RFC3986).
+    /// Resolve a potentially relative IRI against the base (RFC 3986 §5).
     fn resolve_iri(&self, reference: &str) -> Result<String> {
-        if reference.is_empty() {
-            return match &self.base {
-                Some(base) => Ok(base.clone()),
-                None => Err(TurtleError::IriResolution(
-                    "empty IRI reference without base".to_string(),
-                )),
-            };
-        }
-
+        // Absolute IRI reference (carries a valid scheme) — returned verbatim,
+        // fragment included; resolution does not apply.
         if let Some(colon_pos) = reference.find(':') {
             let potential_scheme = &reference[..colon_pos];
             if !potential_scheme.is_empty()
@@ -891,9 +884,31 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
         };
 
-        let (base_scheme, base_authority, base_path, _base_query) = parse_iri_components(base);
+        // RFC 3986 §5.2.1: split the reference into its fragment and everything
+        // before it. The fragment is the portion after the FIRST `#`. Per
+        // §5.2.2 the resolved fragment is ALWAYS the reference's fragment and is
+        // never inherited from the base, so scheme/authority/path/query are
+        // resolved against the fragment-less portion and the reference fragment
+        // is re-attached during recomposition (§5.3).
+        let (ref_no_fragment, ref_fragment) = match reference.find('#') {
+            Some(pos) => (&reference[..pos], Some(&reference[pos + 1..])),
+            None => (reference, None),
+        };
 
-        let (scheme, authority, path, query) = if let Some(rest) = reference.strip_prefix("//") {
+        let (base_scheme, base_authority, base_path, base_query) = parse_iri_components(base);
+
+        let (scheme, authority, path, query) = if ref_no_fragment.is_empty() {
+            // Same-document reference (`<>` or `<#frag>`): the reference has an
+            // empty path and no query, so the target inherits the base path and
+            // query (RFC 3986 §5.2.2). The base's own fragment is dropped because
+            // `parse_iri_components` never returns it.
+            (
+                base_scheme.to_string(),
+                base_authority.map(std::string::ToString::to_string),
+                base_path.to_string(),
+                base_query.map(std::string::ToString::to_string),
+            )
+        } else if let Some(rest) = ref_no_fragment.strip_prefix("//") {
             let (ref_authority, ref_path, ref_query) = parse_hier_part(rest);
             (
                 base_scheme.to_string(),
@@ -901,30 +916,23 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 remove_dot_segments(&ref_path),
                 ref_query,
             )
-        } else if reference.starts_with('/') {
-            let (ref_path, ref_query) = split_path_query(reference);
+        } else if ref_no_fragment.starts_with('/') {
+            let (ref_path, ref_query) = split_path_query(ref_no_fragment);
             (
                 base_scheme.to_string(),
                 base_authority.map(std::string::ToString::to_string),
                 remove_dot_segments(ref_path),
                 ref_query.map(std::string::ToString::to_string),
             )
-        } else if let Some(query_rest) = reference.strip_prefix('?') {
+        } else if let Some(query_rest) = ref_no_fragment.strip_prefix('?') {
             (
                 base_scheme.to_string(),
                 base_authority.map(std::string::ToString::to_string),
                 base_path.to_string(),
                 Some(query_rest.to_string()),
             )
-        } else if reference.starts_with('#') {
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                base_path.to_string(),
-                None,
-            )
         } else {
-            let (ref_path, ref_query) = split_path_query(reference);
+            let (ref_path, ref_query) = split_path_query(ref_no_fragment);
             let merged = if base_authority.is_some() && base_path.is_empty() {
                 format!("/{ref_path}")
             } else {
@@ -952,6 +960,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         if let Some(q) = query {
             result.push('?');
             result.push_str(&q);
+        }
+        if let Some(fragment) = ref_fragment {
+            result.push('#');
+            result.push_str(fragment);
         }
 
         Ok(result)
@@ -1406,5 +1418,119 @@ mod tests {
         assert_eq!(graph.len(), 1);
         let triple = graph.iter().next().unwrap();
         assert!(matches!(&triple.s, Term::Iri(iri) if iri.as_ref() == "http://example.org/doc"));
+    }
+
+    /// Collect every subject IRI in document order.
+    fn subject_iris(input: &str) -> Vec<String> {
+        let graph = parse_to_graph(input).unwrap();
+        graph
+            .iter()
+            .filter_map(|t| match &t.s {
+                Term::Iri(iri) => Some(iri.as_ref().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression guard for issue #1395: `<#A>` and `<#B>` resolved against the
+    /// same `@base` MUST yield two DISTINCT IRIs. The old `resolve_iri` dropped
+    /// the fragment, collapsing every `<#Name>` to the bare base IRI (which in
+    /// turn collapsed multi-`TriplesMap` R2RML mappings to one table).
+    #[test]
+    fn test_base_fragment_refs_resolve_to_distinct_iris() {
+        let input = r#"
+            @base <http://example.org/edw> .
+            <#A> <p> "a" .
+            <#B> <p> "b" .
+        "#;
+        let subjects = subject_iris(input);
+        assert!(
+            subjects.contains(&"http://example.org/edw#A".to_string()),
+            "expected http://example.org/edw#A, got {subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"http://example.org/edw#B".to_string()),
+            "expected http://example.org/edw#B, got {subjects:?}"
+        );
+        // The two references must NOT collapse to the same IRI.
+        assert_ne!(subjects[0], subjects[1]);
+    }
+
+    /// A relative path reference that also carries a fragment: both the merged
+    /// path and the reference fragment must survive (`<rel#frag>`).
+    #[test]
+    fn test_base_relative_path_with_fragment() {
+        let input = r#"
+            @base <http://example.org/edw> .
+            <DimDate#col> <p> "x" .
+        "#;
+        let subjects = subject_iris(input);
+        assert_eq!(subjects, vec!["http://example.org/DimDate#col".to_string()]);
+    }
+
+    /// When the base itself carries a fragment, a `<#frag>` reference replaces
+    /// it (RFC 3986 §5.2.2: the resolved fragment is always the reference's).
+    #[test]
+    fn test_fragment_ref_against_base_with_fragment() {
+        let input = r#"
+            @base <http://example.org/path#oldfrag> .
+            <#new> <p> "x" .
+            <other#f> <p> "y" .
+        "#;
+        let subjects = subject_iris(input);
+        assert!(
+            subjects.contains(&"http://example.org/path#new".to_string()),
+            "expected http://example.org/path#new, got {subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"http://example.org/other#f".to_string()),
+            "expected http://example.org/other#f, got {subjects:?}"
+        );
+    }
+
+    /// `<>` against a fragmented base resolves to the base MINUS its fragment.
+    #[test]
+    fn test_empty_ref_against_fragmented_base_drops_fragment() {
+        let input = r#"
+            @base <http://example.org/path#oldfrag> .
+            <> <p> "x" .
+        "#;
+        let subjects = subject_iris(input);
+        assert_eq!(subjects, vec!["http://example.org/path".to_string()]);
+    }
+
+    /// A reference with no fragment of its own must NOT inherit the base's
+    /// fragment.
+    #[test]
+    fn test_ref_without_fragment_does_not_inherit_base_fragment() {
+        let input = r#"
+            @base <http://example.org/path#oldfrag> .
+            <other> <p> "x" .
+        "#;
+        let subjects = subject_iris(input);
+        assert_eq!(subjects, vec!["http://example.org/other".to_string()]);
+    }
+
+    /// RFC 3986 §5.4.1 examples covering query + fragment recomposition against
+    /// a base that has both a query and (implicitly) no fragment.
+    #[test]
+    fn test_query_and_fragment_resolution_rfc3986() {
+        // base = http://a/b/c/d;p?q  (path "/b/c/d;p", query "q")
+        let cases = [
+            ("<#s>", "http://a/b/c/d;p?q#s"),
+            ("<?y#s>", "http://a/b/c/d;p?y#s"),
+            ("<g#s>", "http://a/b/c/g#s"),
+            ("<g?y#s>", "http://a/b/c/g?y#s"),
+            ("<>", "http://a/b/c/d;p?q"),
+        ];
+        for (reference, expected) in cases {
+            let input = format!("@base <http://a/b/c/d;p?q> .\n{reference} <p> \"v\" .\n");
+            let subjects = subject_iris(&input);
+            assert_eq!(
+                subjects,
+                vec![expected.to_string()],
+                "reference {reference} should resolve to {expected}"
+            );
+        }
     }
 }
