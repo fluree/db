@@ -911,9 +911,21 @@ impl R2rmlCreateConfig {
     /// `mapping_address` is the CAS address where the mapping was stored.
     pub fn to_iceberg_gs_config(&self, mapping_address: &str) -> IcebergGsConfig {
         let mut config = self.iceberg.to_iceberg_gs_config();
+        // Persist a concrete, resolved media type so the query path reuses it
+        // instead of re-defaulting a `null` to JSON-LD (issue #1397). An explicit
+        // media type is kept verbatim; an omitted one is filled with the resolved
+        // default (Turtle for inline/CID mappings). This needs no migration:
+        // `MappingSource::media_type` is already `Option<String>` with serde
+        // `default`, so pre-existing `null` records still deserialize and are
+        // fixed in place by the query-side default.
+        let media_type = self.mapping_media_type.clone().unwrap_or_else(|| {
+            fluree_db_r2rml::loader::MappingFormat::resolve(None, mapping_address)
+                .media_type()
+                .to_string()
+        });
         config.mapping = Some(fluree_db_iceberg::config::MappingSource {
             source: mapping_address.to_string(),
-            media_type: self.mapping_media_type.clone(),
+            media_type: Some(media_type),
         });
         config
     }
@@ -1159,5 +1171,46 @@ mod tests {
             }
             other => panic!("expected OAuth2 auth, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_r2rml_persists_resolved_media_type_no_migration() {
+        // Issue #1397: an omitted media type must be persisted as a concrete
+        // `text/turtle` (not `null`) so the query path reuses it; an explicit
+        // media type is preserved verbatim. The value survives the
+        // to_iceberg_gs_config -> serialize -> deserialize round-trip with no
+        // schema migration (`MappingSource::media_type` is `Option` + serde
+        // `default`).
+        let cid = "bagiibqexampleciddoesnotendwithanextension";
+        let mapping = "@prefix rr: <http://www.w3.org/ns/r2rml#> .";
+
+        // No explicit media type -> the resolved Turtle default is persisted.
+        let config = R2rmlCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl", mapping);
+        let gs = config.to_iceberg_gs_config(cid);
+        assert_eq!(
+            gs.mapping.as_ref().and_then(|m| m.media_type.as_deref()),
+            Some("text/turtle"),
+            "an omitted media type must be filled with the resolved Turtle default"
+        );
+
+        // ...and survives serialize -> deserialize unchanged (no migration).
+        let serialized = serde_json::to_string(&gs).unwrap();
+        let back: IcebergGsConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            back.mapping.as_ref().and_then(|m| m.media_type.as_deref()),
+            Some("text/turtle")
+        );
+
+        // An explicit media type is preserved verbatim.
+        let explicit =
+            R2rmlCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl", mapping)
+                .with_mapping_media_type("application/ld+json");
+        let gs = explicit.to_iceberg_gs_config(cid);
+        assert_eq!(
+            gs.mapping.as_ref().and_then(|m| m.media_type.as_deref()),
+            Some("application/ld+json"),
+            "an explicit media type must be preserved"
+        );
     }
 }
