@@ -1,6 +1,6 @@
 # Quickstart: Query Data
 
-This guide introduces you to querying data in Fluree using both JSON-LD Query and SPARQL.
+This guide introduces you to querying data in Fluree using JSON-LD Query, SPARQL, and Cypher.
 
 ## Prerequisites
 
@@ -9,12 +9,13 @@ This guide introduces you to querying data in Fluree using both JSON-LD Query an
 
 ## Query Languages
 
-Fluree supports two query languages:
+Fluree supports three query languages:
 
 - **JSON-LD Query**: Fluree's native JSON-based query language
 - **SPARQL**: W3C standard RDF query language
+- **Cypher**: openCypher for property-graph reads and writes
 
-Both provide access to the same data and features.
+All three run against the same data and engine. This guide focuses on JSON-LD Query and SPARQL; see [Cypher](#cypher) below and the [Cypher reference](../query/cypher.md) for the property-graph surface.
 
 ## JSON-LD Query
 
@@ -219,6 +220,23 @@ curl -X POST http://localhost:8090/v1/fluree/query \
     }
   '
 ```
+
+## Cypher
+
+Cypher targets a ledger directly (no `FROM`/dataset clause) — send the statement
+with `Content-Type: application/cypher` to the ledger-scoped query endpoint:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query/mydb/main \
+  -H "Content-Type: application/cypher" \
+  --data 'MATCH (person:Person) RETURN person.name'
+```
+
+Results default to `cypher-json` (a Neo4j-compatible tabular envelope); request
+RDF JSON-LD with `Accept: application/ld+json`. Cypher is read/write — `CREATE` /
+`MERGE` / `SET` / `DELETE` statements go to the ledger-scoped `/update` endpoint.
+See the [Cypher reference](../query/cypher.md) and the
+[Cypher cookbook](../guides/cookbook-cypher.md) for the full surface.
 
 ## Time Travel Queries
 
@@ -638,7 +656,7 @@ Empty result set (not an error):
 
 Now that you can query data:
 
-1. **Learn Advanced Queries**: Explore [JSON-LD Query](../query/jsonld-query.md) and [SPARQL](../query/sparql.md) documentation
+1. **Learn Advanced Queries**: Explore [JSON-LD Query](../query/jsonld-query.md), [SPARQL](../query/sparql.md), and [Cypher](../query/cypher.md) documentation
 2. **Understand Time Travel**: Deep dive into [Time Travel](../concepts/time-travel.md)
 3. **Optimize Queries**: Read about [Explain Plans](../query/explain.md)
 4. **Multi-Graph Queries**: Learn about [Datasets](../query/datasets.md)
@@ -647,6 +665,7 @@ Now that you can query data:
 
 - [JSON-LD Query](../query/jsonld-query.md) - Complete JSON-LD query reference
 - [SPARQL](../query/sparql.md) - Complete SPARQL reference
+- [Cypher](../query/cypher.md) - openCypher reads and writes
 - [Output Formats](../query/output-formats.md) - Result format options
 - [Time Travel](../concepts/time-travel.md) - Historical queries
 - [Graph Crawl](../query/graph-crawl.md) - Graph traversal

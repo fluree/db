@@ -78,7 +78,7 @@ Fluree combines several architectural concepts:
 - **Temporal Database**: Every transaction is timestamped, enabling complete historical access
 - **Multi-Graph Support**: Data can be partitioned across named graphs
 - **JSON-LD Integration**: Native support for JSON-LD with full IRI expansion/compaction
-- **SPARQL & JSON-LD Query**: Support for both SPARQL and Fluree's native JSON-LD Query language
+- **SPARQL, JSON-LD Query & Cypher**: Query the same data through SPARQL, Fluree's native JSON-LD Query, or openCypher
 
 ## Key Differentiators
 

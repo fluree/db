@@ -11,6 +11,8 @@ This guide shows you how to write data to Fluree using three main patterns: inse
 
 Fluree stores data as RDF triples (subject-predicate-object). Transactions are submitted as JSON-LD documents that get converted to triples internally.
 
+This guide uses JSON-LD. The same writes can also be expressed in **SPARQL UPDATE** or **openCypher** (`CREATE`/`MERGE`/`SET`/`DELETE`) — all three land in the same ledger. See the [Cypher reference](../query/cypher.md) for the property-graph write surface.
+
 ### Basic Transaction Structure
 
 ```json
@@ -480,4 +482,5 @@ Now that you can write data:
 - [Insert](../transactions/insert.md) - Detailed insert documentation
 - [Upsert](../transactions/upsert.md) - Detailed upsert documentation
 - [Update](../transactions/update-where-delete-insert.md) - Detailed update documentation
+- [Cypher](../query/cypher.md) - openCypher reads and writes
 - [Data Types](../concepts/datatypes.md) - Comprehensive type system guide

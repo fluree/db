@@ -1,6 +1,6 @@
 # Query
 
-Fluree supports two powerful query languages for querying graph data: **JSON-LD Query** (Fluree's native query language) and **SPARQL** (the W3C standard). Both languages provide access to Fluree's unique features including time travel, graph sources, and policy enforcement.
+Fluree supports three query languages over the same graph data: **JSON-LD Query** (Fluree's native query language), **SPARQL** (the W3C standard), and **Cypher** (openCypher). All three run against one underlying store — data written through any surface is immediately visible to the others — and each provides access to Fluree's unique features including time travel, graph sources, and policy enforcement.
 
 ## Query Languages
 
@@ -25,6 +25,20 @@ Industry-standard SPARQL 1.1 query language. Fluree provides full SPARQL support
 - CONSTRUCT queries
 - Time travel support (planned)
 - Standard SPARQL functions
+
+### [Cypher](cypher.md)
+
+[openCypher 9][opencypher] for property-graph queries and writes. Cypher relationships-with-properties map directly to Fluree's edge-annotation primitive, so the same database is queryable through JSON-LD, SPARQL, and Cypher at once.
+
+**Key Features:**
+- `MATCH` / `RETURN` reads and `CREATE` / `MERGE` / `SET` / `DELETE` writes
+- Property-graph edges via edge annotations
+- Neo4j-compatible `cypher-json` output (or RDF JSON-LD)
+- Auto-detected by the CLI; `Content-Type: application/cypher` over HTTP
+
+See the [openCypher support matrix](../reference/cypher-support-matrix.md) for a feature-by-feature status view.
+
+[opencypher]: https://opencypher.org/resources/
 
 ## Query Features
 
@@ -170,6 +184,13 @@ SELECT ?name
 WHERE {
   ?person ex:name ?name .
 }
+```
+
+### Basic Cypher Query
+
+```cypher
+MATCH (person:Person)
+RETURN person.name
 ```
 
 ### Query with Time Travel

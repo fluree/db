@@ -299,5 +299,5 @@ This is the standard service-account pattern: register your CLI/app-server ident
 - [Cross-ledger policy](cross-ledger-policy.md) — query-time engagement under cross-ledger `f:policySource`
 - [Cookbook: Access control policies](../guides/cookbook-policies.md) — worked patterns
 - [Programmatic policy API (Rust)](programmatic-policy.md) — building `PolicyContext` in code
-- [Query reference](../query/README.md) — SPARQL and JSON-LD syntax
+- [Query reference](../query/README.md) — SPARQL, JSON-LD, and Cypher syntax
 - [Explain plans](../query/explain.md) — diagnosing policy filter overhead
