@@ -1,31 +1,20 @@
-# Cypher (openCypher 9 subset)
+# Cypher
 
-Fluree accepts a subset of [openCypher 9][opencypher] on top of the same query
-IR and transaction pipeline as JSON-LD and SPARQL — the planner, executor, and
-result formatter are shared across all three surfaces. A Cypher
+Fluree supports [openCypher 9][opencypher] queries. A Cypher
 relationship-with-properties — `(a)-[:WORKS_FOR {role: "..."}]->(b)` — maps to
 Fluree's edge-annotation primitive ([concept](../concepts/edge-annotations.md),
 [internals](../design/edge-annotations.md)), so property-graph edges and RDF
 quoted-triple annotations are the same data read from two angles.
 
-It is a *subset*: the constructs Fluree does not yet accept are listed under
-[Not yet supported](#not-yet-supported), and each produces a clear error rather
-than silently misbehaving. For a feature-by-feature status view — supported,
-divergent-by-design, or deferred — see the
+The same database is queryable through JSON-LD, SPARQL, and Cypher at once — one
+underlying store, no separate copy or sync step, so data written through any
+surface is immediately visible to the others. Because each surface is its own
+query language over that shared data, there are some subtle differences to be
+aware of. For a feature-by-feature
+status view — supported, divergent-by-design, or deferred — see the
 [openCypher support matrix](../reference/cypher-support-matrix.md).
 
 [opencypher]: https://opencypher.org/resources/
-
-## Why Cypher in an RDF database?
-
-- **LPG ergonomics for property-graph users.** No need to model
-  relationship properties by hand with intermediate nodes.
-- **One query engine.** SPARQL, JSON-LD, and Cypher all lower to the
-  same `Query` IR — the planner, executor, and result formatter are
-  shared.
-- **Round-trip with the other surfaces.** Data inserted via JSON-LD
-  `@annotation` or SPARQL `{| ... |}` is visible to Cypher reads, and
-  vice versa.
 
 ## Quick start
 
@@ -81,60 +70,6 @@ curl -X POST http://localhost:8090/v1/fluree/update/my/ledger \
 The body may be raw Cypher, or a JSON envelope `{"cypher": "...", "params": {...}}`
 (the Neo4j-HTTP shape). Responses are cypher-json; request RDF JSON-LD with
 `Accept: application/ld+json`.
-
-## How Cypher maps to RDF
-
-| Cypher concept | Fluree representation |
-|---|---|
-| Node `(n:Label)` | Subject with `rdf:type <Label>`. |
-| Multiple labels `(n:L1:L2)` | Multiple `rdf:type` triples about `n`. |
-| Node properties `(n {key: val})` | Ordinary triples about `n`. |
-| Relationship `(a)-[:TYPE]->(b)` | Base triple `(a, <TYPE>, b)`. |
-| Relationship with `var` `(a)-[r:TYPE]->(b)` | Base triple + an `f:reifies*` reifier bundle; `r` binds the reifier subject. |
-| Relationship properties `[:T {p:v}]` | Reifier bundle plus an annotation-body triple `(_:r, p, v)`. |
-| Parallel relationships | Multiple reifier subjects attached to the same base edge. |
-
-### IRI mapping for bare identifiers
-
-Cypher uses bare names like `Person`, `WORKS_FOR`, `name`. Fluree
-resolves them via:
-
-1. **The ledger's default `@context`** (the same context that applies
-   to JSON-LD queries against the same ledger).
-   - `@vocab` supplies the fallback namespace.
-   - Full-term mappings (e.g. `"Person": "http://example.org/Person"`)
-     act as overrides.
-2. **Fallback default:** `http://example.org/` when no context is
-   configured. Useful in tests; not appropriate for production data.
-
-The mapping is **case-preserving**: `WORKS_FOR` becomes
-`<vocab>WORKS_FOR`, not `<vocab>worksFor`. Put any case-normalizing
-aliases in the context.
-
-## Relationship lowering — three shapes, three behaviors
-
-The Cypher → IR rule depends on whether you bind the relationship and
-whether you filter on relationship properties.
-
-| Pattern | Lowers to | Cardinality | Sees plain RDF? |
-|---|---|---|---|
-| `(a)-[:T]->(b)` | Plain triple `(a, <T>, b)` | Set | Yes |
-| `(a)-[r:T]->(b)` | `EdgeAnnotation { edge, annotation: ?r, body: [] }` | Bag | No — only reifier-bundled edges |
-| `(a)-[:T {p:v}]->(b)` | `EdgeAnnotation { edge, annotation: ?#__anon, body: [(?#__anon, p, v)] }` | Bag | No |
-
-**Consequence.** If your data was loaded via JSON-LD without
-`@annotation` (or any other path that doesn't produce reifier
-bundles), `MATCH (a)-[r:T]->(b)` returns zero rows even though the
-base triples exist. Drop the `r` to get plain-RDF-visible set
-semantics:
-
-```cypher
--- bag semantics, requires reifier bundles
-MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r, o
-
--- set semantics, sees all base edges
-MATCH (a:Person)-[:WORKS_FOR]->(o:Organization) RETURN a, o
-```
 
 ## Cardinality
 
@@ -421,51 +356,64 @@ Writes default to LPG mode, where every relationship reifies (carries an
 annotation identity). See [Edge annotations](../concepts/edge-annotations.md) for the RDF
 vs. LPG modes and the retraction semantics that follow from them.
 
-## Not yet supported
+## How Cypher maps to RDF
 
-These constructs are part of openCypher but Fluree does not yet accept them; each
-produces a clear error rather than a silent wrong answer.
+You don't need this to write Cypher — it's here for when you want to see how a
+statement lands in Fluree's store, or cross-reference data written through
+JSON-LD or SPARQL.
 
-**Patterns and paths**
+| Cypher concept | Fluree representation |
+|---|---|
+| Node `(n:Label)` | Subject with `rdf:type <Label>`. |
+| Multiple labels `(n:L1:L2)` | Multiple `rdf:type` triples about `n`. |
+| Node properties `(n {key: val})` | Ordinary triples about `n`. |
+| Relationship `(a)-[:TYPE]->(b)` | Base triple `(a, <TYPE>, b)`. |
+| Relationship with `var` `(a)-[r:TYPE]->(b)` | Base triple + an `f:reifies*` reifier bundle; `r` binds the reifier subject. |
+| Relationship properties `[:T {p:v}]` | Reifier bundle plus an annotation-body triple `(_:r, p, v)`. |
+| Parallel relationships | Multiple reifier subjects attached to the same base edge. |
 
-- Bare `MATCH (n)` — a node must be constrained by a label, a property, or a
-  relationship.
-- Free path values `MATCH p = (...)` without a `shortestPath` /
-  `allShortestPaths` wrapper.
-- Binding a relationship variable to a variable-length path (`-[r:T*]->`).
-- Undirected untyped variable-length paths (`-[*m..n]-` — give a direction);
-  unbounded untyped paths with a lower bound above 1 (`-[*2..]->` — add an upper
-  bound or name a type); zero-length *typed* bounded paths (`-[:T*0..M]->` — use
-  `*1..M`); bounded type alternation (`-[:A|B*1..3]->` — use the unbounded form);
-  property filters on a variable-length or shortestPath relationship.
+### Relationship lowering — three shapes, three behaviors
 
-**Functions**
+How a relationship lowers depends on whether you bind it and whether you filter
+on its properties — which in turn decides the cardinality and whether plain
+(un-annotated) base edges are visible.
 
-- `point`, `distance`.
-  (`labels(n)`, `type(r)`, `startNode(r)`, `endNode(r)`, `nodes(p)`,
-  `relationships(p)`, `pathPairs(p)`, `keys(n)`, `properties(n)`, `id(x)` /
-  `elementId(x)`, map literals (`{k: v}`), object `$params`, and the list
-  functions *are* supported — see above.)
+| Pattern | Lowers to | Cardinality | Sees plain RDF? |
+|---|---|---|---|
+| `(a)-[:T]->(b)` | Plain triple `(a, <T>, b)` | Set | Yes |
+| `(a)-[r:T]->(b)` | `EdgeAnnotation { edge, annotation: ?r, body: [] }` | Bag | No — only reifier-bundled edges |
+| `(a)-[:T {p:v}]->(b)` | `EdgeAnnotation { edge, annotation: ?#__anon, body: [(?#__anon, p, v)] }` | Bag | No |
 
-**Expressions**
+**Consequence.** If your data was loaded via JSON-LD without
+`@annotation` (or any other path that doesn't produce reifier
+bundles), `MATCH (a)-[r:T]->(b)` returns zero rows even though the
+base triples exist. Drop the `r` to get plain-RDF-visible set
+semantics:
 
-- Chained property accessors (`n.a.b` — bind an intermediate via `WITH`).
-- `NULL` literals; aggregates inside `CASE` / `EXISTS`.
+```cypher
+-- bag semantics, requires reifier bundles
+MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r, o
 
-**Clauses and structure**
+-- set semantics, sees all base edges
+MATCH (a:Person)-[:WORKS_FOR]->(o:Organization) RETURN a, o
+```
 
-- Non-literal `SKIP`/`LIMIT`; `ORDER BY` on a `collect()` list.
-- `CASE` / `EXISTS` inside a write-statement `MATCH ... WHERE`. Aggregation,
-  `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` on a `WITH` before a write clause,
-  and `WITH` before `DELETE` (the pass-through / rename / computed-alias / filter
-  subset before `CREATE` / `SET` / `REMOVE` *is* supported — see above).
-- `MERGE` on a property-bearing relationship (`-[:KNOWS {since: 2020}]->`),
-  multi-hop or multi-part (comma-separated) `MERGE`, multiple `MERGE` clauses,
-  `ON MATCH SET` on a relationship `MERGE`, and `MERGE` combined with another
-  write clause in the same statement.
-- `CALL proc(...)` stored/builtin procedures (the `CALL { … }` read subquery
-  *is* supported — see above), `LOAD CSV`, `FOREACH`, schema DDL.
-- Multi-statement scripts — submit one statement per request.
+### IRI mapping for bare identifiers
+
+Cypher uses bare names like `Person`, `WORKS_FOR`, `name`. Fluree
+resolves them via:
+
+1. **The ledger's default `@context`** (the same context that applies
+   to JSON-LD queries against the same ledger).
+   - `@vocab` supplies the fallback namespace.
+   - Full-term mappings (e.g. `"Person": "http://example.org/Person"`)
+     act as overrides.
+2. **Fallback default:** `http://example.org/` when no context is
+   configured. Useful in tests; not appropriate for production data.
+
+The mapping is **case-preserving**: `WORKS_FOR` becomes
+`<vocab>WORKS_FOR`, not `<vocab>worksFor`. Put any case-normalizing
+aliases in the context.
 
 ## See also
 

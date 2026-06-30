@@ -26,7 +26,9 @@ pub const DEFAULT_QUERY_REFRESH_TTL_MS: u64 = 1000;
 // ── Indexing ────────────────────────────────────────────────────────
 
 pub const DEFAULT_INDEXING_ENABLED: bool = true;
-pub const DEFAULT_REINDEX_MIN_BYTES: usize = 100_000;
+// 100 bytes — effectively reindex after every commit (any commit's novelty
+// exceeds this), so the persisted index tracks the head with minimal lag.
+pub const DEFAULT_REINDEX_MIN_BYTES: usize = 100;
 
 /// Fallback hard-threshold when RAM detection is unavailable (WASM, sandbox).
 ///
@@ -386,7 +388,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 
 # [server.indexing]
 # enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage
-# reindex_min_bytes = {reindex_min_bytes}         # {reindex_min_kb} KB — triggers background reindexing
+# reindex_min_bytes = {reindex_min_bytes}         # bytes of novelty before a background reindex (default ≈ every commit)
 # reindex_max_bytes = {reindex_max_bytes}      # {reindex_max_mb} MB (default: 20% of system RAM) — blocks commits until reindexed
 
 # [server.auth.events]
@@ -466,7 +468,6 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         query_refresh_ttl_ms = DEFAULT_QUERY_REFRESH_TTL_MS,
         indexing_enabled = DEFAULT_INDEXING_ENABLED,
         reindex_min_bytes = DEFAULT_REINDEX_MIN_BYTES,
-        reindex_min_kb = DEFAULT_REINDEX_MIN_BYTES / 1000,
         reindex_max_bytes = default_reindex_max_bytes(),
         reindex_max_mb = default_reindex_max_bytes() / (1024 * 1024),
         auth_mode = DEFAULT_AUTH_MODE,

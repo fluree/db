@@ -2,7 +2,7 @@
 
 Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
 
-RDF 1.1 / 1.2, SPARQL, JSON-LD, and [openCypher](docs/query/cypher.md) query (includes history query and other Fluree feature extensions).
+RDF 1.1 / 1.2, [SPARQL](docs/guides/cookbook-sparql.md), [JSON-LD](docs/guides/cookbook-query-patterns.md), and [openCypher](docs/guides/cookbook-cypher.md) query (includes history query and other Fluree feature extensions).
 
 Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. [Benchmark leader](https://labs.flur.ee), 10.4x faster than next  database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.
 
@@ -92,7 +92,17 @@ fluree query --jsonld '{
 }'
 ```
 
-Both languages access the same engine — same features, same performance.
+And in Cypher — bare labels and properties resolve through the ledger's default `@context`, so point it at schema.org first:
+
+```bash
+fluree context set movies -e '{"@vocab": "http://schema.org/"}'
+
+fluree query --cypher -e 'MATCH (m:Movie)
+  RETURN m.name AS title, m.dateCreated AS date
+  ORDER BY date'
+```
+
+All three compile to the same engine — same features, same performance.
 
 Now update the data and query the past:
 

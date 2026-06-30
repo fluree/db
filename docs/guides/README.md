@@ -14,6 +14,10 @@ Recipes for the list-value and path operators: dense / gap-filled series with `u
 
 Querying and writing with openCypher: modeling a property graph, querying relationships, `MERGE` find-or-create, updates and deletes, paths and shortest path, aggregation, and cross-surface round-trips with JSON-LD/SPARQL.
 
+### [SPARQL](cookbook-sparql.md)
+
+The Fluree-specific SPARQL surface (the 1.1 basics assumed): time travel with `FROM @t:`, fact history via `<< s p o >> f:t/f:op`, RDF 1.2 edge annotations (`{| |}`, `~`, `rdf:reifies`), cross-ledger `FROM`/`GRAPH` queries, and cross-surface round-trips.
+
 ### [Full-Text and Vector Search](cookbook-search.md)
 
 Set up BM25 full-text search and vector similarity. Insert searchable data, write relevance-ranked queries, combine search with graph patterns, and build hybrid text+vector search.

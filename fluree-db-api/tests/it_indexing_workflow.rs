@@ -16,7 +16,11 @@ use serde_json::json;
 #[tokio::test]
 async fn indexing_disabled_transaction_exposes_indexing_status_hints() {
     // Scenario: `manual-indexing-test` (transaction metadata)
-    let fluree = FlureeBuilder::memory().build_memory();
+    // Pin a high soft threshold so this small novelty stays below it; the
+    // compiled default (~every commit) would otherwise mark reindex `needed`.
+    let fluree = FlureeBuilder::memory()
+        .with_novelty_thresholds(100_000, 1_000_000_000)
+        .build_memory();
     let ledger_id = "it/indexing-disabled-metadata:main";
 
     let db0 = LedgerSnapshot::genesis(ledger_id);
