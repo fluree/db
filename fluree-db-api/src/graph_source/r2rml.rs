@@ -663,12 +663,24 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 );
 
                 let storage = if let Some(ref credentials) = load_response.credentials {
-                    info!("Using vended credentials from catalog");
-                    S3IcebergStorage::from_vended_credentials(credentials)
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?
+                    info!(
+                        region = ?iceberg_config.io.s3_region,
+                        endpoint = ?iceberg_config.io.s3_endpoint,
+                        "Using vended credentials from catalog"
+                    );
+                    // Thread the io overrides so a catalog that omits the region (or where
+                    // we want an operator-configured endpoint/path-style) still resolves
+                    // correctly. Precedence inside the call: vended > these overrides > SDK.
+                    S3IcebergStorage::from_vended_credentials(
+                        credentials,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
                 } else {
                     info!(
                         region = ?iceberg_config.io.s3_region,

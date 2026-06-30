@@ -83,9 +83,57 @@ impl Debug for S3IcebergStorage {
 
 #[cfg(feature = "aws")]
 impl S3IcebergStorage {
+    /// Resolve effective region/endpoint/path-style from vended credentials plus
+    /// caller-supplied overrides.
+    ///
+    /// Precedence differs by field. Region/endpoint follow "vended wins, then
+    /// override, then none": they stay `None` when neither source supplies one (so
+    /// the AWS SDK default chain applies). Path-style is the logical OR of the
+    /// vended and override flags — *not* "vended wins" — so an override can only
+    /// force it on, never back to `false`. (That asymmetry is intentional: once
+    /// either source requires path-style addressing it must stay enabled, which is
+    /// the only sensible resolution for a bool.)
+    ///
+    /// Returned as plain owned values so the precedence logic is unit-testable
+    /// without touching SDK internals (the built `aws_sdk_s3::Config` exposes only
+    /// `region()`, not endpoint/path-style).
+    fn resolve_io(
+        creds: &crate::credential::VendedCredentials,
+        region_override: Option<&str>,
+        endpoint_override: Option<&str>,
+        path_style_override: bool,
+    ) -> (Option<String>, Option<String>, bool) {
+        let region = creds
+            .region
+            .clone()
+            .or_else(|| region_override.map(std::string::ToString::to_string));
+        let endpoint = creds
+            .endpoint
+            .clone()
+            .or_else(|| endpoint_override.map(std::string::ToString::to_string));
+        let path_style = creds.path_style || path_style_override;
+        (region, endpoint, path_style)
+    }
+
     /// Create a new S3 storage from vended credentials.
+    ///
+    /// Region/endpoint precedence (mirrors [`from_default_chain`] for the override
+    /// sources): the value vended by the catalog wins, then the caller-supplied
+    /// override (typically `io.s3_region` / `io.s3_endpoint`), then the AWS SDK
+    /// default chain. Leaving region `None` (vended absent *and* no override)
+    /// preserves the SDK-default behavior (e.g. `us-east-1` / `AWS_REGION`) so the
+    /// previously-working us-east-1 path does not regress.
+    ///
+    /// Path-style (`io.s3_path_style`) is the exception: it is the logical OR of the
+    /// vended and override flags, so an override can only force it on, never back to
+    /// `false`. See [`resolve_io`](Self::resolve_io).
+    ///
+    /// [`from_default_chain`]: Self::from_default_chain
     pub async fn from_vended_credentials(
         creds: &crate::credential::VendedCredentials,
+        region_override: Option<&str>,
+        endpoint_override: Option<&str>,
+        path_style_override: bool,
     ) -> Result<Self> {
         use aws_credential_types::Credentials;
 
@@ -101,12 +149,20 @@ impl S3IcebergStorage {
             "vended-credentials",
         );
 
+        // Resolve region/endpoint/path-style precedence (vended > override > none).
+        let (region, endpoint, path_style) = Self::resolve_io(
+            creds,
+            region_override,
+            endpoint_override,
+            path_style_override,
+        );
+
         // Build config with vended credentials
         let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
             .credentials_provider(aws_creds);
 
-        // Set region if provided
-        if let Some(region) = &creds.region {
+        // Set region only when resolved; leaving it None preserves SDK default resolution.
+        if let Some(region) = &region {
             config_loader = config_loader.region(aws_config::Region::new(region.clone()));
         }
 
@@ -115,11 +171,11 @@ impl S3IcebergStorage {
         // Build S3 client, optionally with endpoint override
         let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
 
-        if let Some(endpoint) = &creds.endpoint {
+        if let Some(endpoint) = &endpoint {
             s3_config = s3_config.endpoint_url(endpoint);
         }
 
-        if creds.path_style {
+        if path_style {
             s3_config = s3_config.force_path_style(true);
         }
 
@@ -499,6 +555,108 @@ mod tests {
         assert!(S3IcebergStorage::parse_s3_uri("http://bucket/key").is_err());
         assert!(S3IcebergStorage::parse_s3_uri("s3://bucket").is_err());
         assert!(S3IcebergStorage::parse_s3_uri("s3:///key").is_err());
+    }
+
+    #[cfg(feature = "aws")]
+    fn vended_creds(region: Option<&str>) -> crate::credential::VendedCredentials {
+        crate::credential::VendedCredentials {
+            access_key_id: "AKIATEST".to_string(),
+            secret_access_key: "secret123".to_string(),
+            session_token: Some("session456".to_string()),
+            expires_at: None,
+            endpoint: None,
+            region: region.map(std::string::ToString::to_string),
+            path_style: false,
+        }
+    }
+
+    #[cfg(feature = "aws")]
+    fn client_region(storage: &S3IcebergStorage) -> Option<String> {
+        storage
+            .client
+            .config()
+            .region()
+            .map(|r| r.as_ref().to_string())
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn test_vended_region_applied_to_client() {
+        // The region vended by the catalog must reach the S3 client (so it signs
+        // for the bucket's actual region rather than the SDK us-east-1 default).
+        let creds = vended_creds(Some("us-east-2"));
+        let storage = S3IcebergStorage::from_vended_credentials(&creds, None, None, false)
+            .await
+            .unwrap();
+        assert_eq!(client_region(&storage), Some("us-east-2".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn test_vended_region_beats_override() {
+        // Precedence: the vended region wins over the io.s3_region override.
+        let creds = vended_creds(Some("us-east-2"));
+        let storage =
+            S3IcebergStorage::from_vended_credentials(&creds, Some("eu-west-1"), None, false)
+                .await
+                .unwrap();
+        assert_eq!(client_region(&storage), Some("us-east-2".to_string()));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn test_override_region_used_when_vended_absent() {
+        // When the catalog vends no region, the io.s3_region override is applied.
+        let creds = vended_creds(None);
+        let storage =
+            S3IcebergStorage::from_vended_credentials(&creds, Some("eu-west-1"), None, false)
+                .await
+                .unwrap();
+        assert_eq!(client_region(&storage), Some("eu-west-1".to_string()));
+    }
+
+    // Endpoint and path-style cannot be read back off the built aws-sdk-s3 `Config`
+    // in this SDK version (only `region()` is exposed; endpoint/path-style live in a
+    // crate-private config bag with no public getter). We therefore assert the
+    // override precedence at the `resolve_io` layer, which is exactly the value
+    // `from_vended_credentials` feeds into the S3 config builder. Region precedence is
+    // additionally proven end-to-end at the client level by the tests above.
+
+    #[test]
+    #[cfg(feature = "aws")]
+    fn test_resolve_io_endpoint_override_used_when_vended_absent() {
+        // When the catalog vends no endpoint, the io.s3_endpoint override is used
+        // (e.g. MinIO-via-vended setups).
+        let creds = vended_creds(Some("us-east-1")); // endpoint absent, path_style false
+        let (region, endpoint, path_style) =
+            S3IcebergStorage::resolve_io(&creds, None, Some("http://minio.test:9000"), false);
+        assert_eq!(region.as_deref(), Some("us-east-1"));
+        assert_eq!(endpoint.as_deref(), Some("http://minio.test:9000"));
+        assert!(!path_style);
+    }
+
+    #[test]
+    #[cfg(feature = "aws")]
+    fn test_resolve_io_path_style_override_forces_true() {
+        // path_style_override = true forces path-style even when the vended creds
+        // default it to false.
+        let creds = vended_creds(Some("us-east-1")); // path_style false
+        let (_, _, path_style) = S3IcebergStorage::resolve_io(&creds, None, None, true);
+        assert!(path_style);
+    }
+
+    #[test]
+    #[cfg(feature = "aws")]
+    fn test_resolve_io_vended_endpoint_and_path_style_beat_override() {
+        // Precedence: a vended endpoint wins over the override, and a vended
+        // path-style of true holds even when the override requests false.
+        let mut creds = vended_creds(None);
+        creds.endpoint = Some("http://vended.minio:9000".to_string());
+        creds.path_style = true;
+        let (_, endpoint, path_style) =
+            S3IcebergStorage::resolve_io(&creds, None, Some("http://override.minio:9000"), false);
+        assert_eq!(endpoint.as_deref(), Some("http://vended.minio:9000"));
+        assert!(path_style);
     }
 
     #[tokio::test]
