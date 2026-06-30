@@ -1752,7 +1752,7 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
 /// Issue #1329: JSON-LD decimal rendering must be consistent regardless of
 /// whether the value is served from the binary index (arena-decoded) or from
 /// novelty (raw flake merge). The reported bug rendered index-served decimals
-/// as `{"@value": "19.99", "@type": ""}` (empty type) and novelty-served ones
+/// as `{"@value": "19.90", "@type": ""}` (empty type) and novelty-served ones
 /// as a bare string with no `@type`.
 #[tokio::test]
 async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
@@ -1774,13 +1774,15 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
         .run_until(async move {
             let ledger = genesis_ledger(&fluree, ledger_id);
 
-            // Indexed base: ex:a is arena-backed after the index build.
+            // Indexed base: ex:a is arena-backed after the index build. The
+            // trailing zero (19.90) exercises canonicalization on the indexed
+            // path — the inline decimal code strips it, so it renders as 19.9.
             let result = run_sparql_update(
                 &fluree,
                 ledger,
                 r"
                 PREFIX ex: <http://example.org/>
-                INSERT DATA { ex:a ex:price 19.99 . }
+                INSERT DATA { ex:a ex:price 19.90 . }
                 ",
             )
             .await;
@@ -1817,8 +1819,8 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
 
             // Both the arena-served (indexed) and novelty-served decimals must
             // render in the SAME shape. Before the fix the indexed copy lost its
-            // datatype and rendered as `{"@value":"19.99","@type":""}` while the
-            // novelty copy rendered as the bare string `"24.50"` (issue #1329).
+            // datatype and rendered as `{"@value":"19.90","@type":""}` while the
+            // novelty copy rendered as a bare string (issue #1329).
             let mut by_id = std::collections::HashMap::new();
             for node in rows {
                 let id = node["@id"].as_str().expect("@id").to_string();
@@ -1839,7 +1841,10 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
             }
 
             // Consistency: identical JSON shape across the two paths (xsd:decimal
-            // is an inferable datatype, so both render as the exact bare string).
+            // is an inferable datatype, so both render as a bare string). The
+            // inline decimal code is canonical (order-preserving, trailing zeros
+            // stripped), so both paths drop the trailing zero — 19.90 → 19.9 and
+            // 24.50 → 24.5 — matching the XSD canonical form of xsd:decimal.
             assert_eq!(
                 indexed.is_object(),
                 novel.is_object(),
@@ -1848,12 +1853,12 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
             );
             assert_eq!(
                 indexed,
-                &JsonValue::String("19.99".to_string()),
+                &JsonValue::String("19.9".to_string()),
                 "indexed decimal"
             );
             assert_eq!(
                 novel,
-                &JsonValue::String("24.50".to_string()),
+                &JsonValue::String("24.5".to_string()),
                 "novelty decimal"
             );
 
