@@ -333,22 +333,27 @@ async fn run_iceberg_map_remote(
     Ok(())
 }
 
-/// Convert CLI args to a JSON body for the server endpoint.
 /// Infer an R2RML mapping media type from a file extension.
 ///
-/// `.ttl`/`.turtle` → `text/turtle`, `.jsonld`/`.json` → `application/ld+json`
-/// (case-insensitive). Returns `None` for unrecognized extensions so the caller
-/// falls back to the server-side default (Turtle, per issue #1397). This makes
-/// the `--r2rml-type` flag's documented "inferred from extension" behavior real.
+/// Delegates to the shared [`fluree_db_r2rml::loader::MappingFormat`] resolver so
+/// the CLI and the server share one ext→format table and cannot drift (issue
+/// #1397): `.jsonld`/`.json` → `application/ld+json`, any other extension →
+/// `text/turtle` (the resolver's default), case-insensitively. Returns `None`
+/// only when the path has no extension at all, leaving the server to apply the
+/// same default. An explicit `--r2rml-type` still overrides this at the call site.
 fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "ttl" | "turtle" => Some("text/turtle".to_string()),
-        "jsonld" | "json" => Some("application/ld+json".to_string()),
-        _ => None,
-    }
+    use fluree_db_r2rml::loader::MappingFormat;
+    // No extension means no signal to infer from — defer to the server default.
+    path.extension()?;
+    let source = path.to_str()?;
+    Some(
+        MappingFormat::resolve(None, source)
+            .media_type()
+            .to_string(),
+    )
 }
 
+/// Convert CLI args to a JSON body for the server endpoint.
 fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
         "name": args.name,
@@ -907,8 +912,14 @@ mod tests {
             infer_mapping_media_type(Path::new("MAPPING.TTL")).as_deref(),
             Some("text/turtle")
         );
-        // Unknown or missing extension -> None (caller uses the server default).
-        assert_eq!(infer_mapping_media_type(Path::new("mapping.rdf")), None);
+        // An unrecognized extension defers to the shared resolver's default
+        // (Turtle) — the same decision the server makes, so the two never drift.
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.rdf")).as_deref(),
+            Some("text/turtle")
+        );
+        // No extension at all -> None, so the caller leaves the type unset and the
+        // server applies the same default.
         assert_eq!(infer_mapping_media_type(Path::new("mapping")), None);
     }
 
