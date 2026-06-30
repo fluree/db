@@ -4,8 +4,7 @@
 //! detection, the `revertable` verdict for each strategy, the no-mutation
 //! guarantee, and the cap/include flags on `RevertPreviewOpts`.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{CommitRef, ConflictStrategy, FlureeBuilder, RevertPreviewOpts};
 use serde_json::json;
 

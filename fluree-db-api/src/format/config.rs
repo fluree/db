@@ -95,6 +95,22 @@ pub enum OutputFormat {
     /// }
     /// ```
     AgentJson,
+
+    /// Cypher JSON — a Neo4j-compatible tabular envelope with **native scalar**
+    /// values (NOT RDF-faithful JSON-LD). For openCypher / LDBC tooling, where
+    /// `xsd:date` must be a bare ISO string and longs bare numbers rather than
+    /// `{"@value": …, "@type": …}` value-objects.
+    /// ```json
+    /// {
+    ///   "results": [{
+    ///     "columns": ["firstName", "birthday"],
+    ///     "data": [{ "row": ["Alice", "1990-11-23"], "meta": [null, null] }]
+    ///   }]
+    /// }
+    /// ```
+    /// Not the "openCypher standard" (there is none) — this is Fluree's
+    /// Neo4j-compatible profile.
+    CypherJson,
 }
 
 /// Additional context for AgentJson formatting (resume query, timestamps)
@@ -217,6 +233,14 @@ impl FormatterConfig {
     pub fn agent_json() -> Self {
         Self {
             format: OutputFormat::AgentJson,
+            ..Default::default()
+        }
+    }
+
+    /// Create a CypherJson config (Neo4j-compatible tabular, native scalars)
+    pub fn cypher_json() -> Self {
+        Self {
+            format: OutputFormat::CypherJson,
             ..Default::default()
         }
     }

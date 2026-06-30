@@ -38,6 +38,7 @@ pub mod error;
 pub mod flake_sink;
 pub mod generate;
 pub mod ir;
+pub mod lower_cypher_update;
 pub mod lower_sparql_update;
 pub mod namespace;
 pub mod parse;
@@ -54,7 +55,10 @@ pub use fluree_graph_turtle::splitter as turtle_splitter;
 
 // Re-exports
 pub use address::parse_commit_id;
-pub use commit::{commit, CommitOpts, CommitReceipt};
+pub use commit::{
+    build_commit, commit, release_raw_txn_after_build_err, CommitOpts, CommitOptsRequest,
+    CommitReceipt, StagedCommit,
+};
 pub use commit_flakes::generate_commit_flakes;
 pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;

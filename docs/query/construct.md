@@ -27,6 +27,22 @@ WHERE {
 
 This generates a new graph with `ex:displayName` properties from `ex:name` values.
 
+### Shorthand Form (`CONSTRUCT WHERE`)
+
+When the template is identical to the WHERE pattern, omit the template:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+CONSTRUCT WHERE { ?s ex:name ?o }
+```
+
+Per the SPARQL 1.1 grammar, the shorthand WHERE block is a **basic graph
+pattern of triple patterns only**. `FILTER`, `GRAPH`, `OPTIONAL`, `BIND`,
+`UNION`, and sub-`SELECT` are rejected as syntax errors in this position — use
+the explicit-template form (`CONSTRUCT { ... } WHERE { ... }`) when you need
+them.
+
 ### Multiple Triples
 
 Construct multiple triples per solution:
@@ -158,6 +174,13 @@ WHERE {
 2. **Filter Early**: Apply filters in WHERE clause, not CONSTRUCT
 3. **Avoid Duplicates**: Use DISTINCT if needed
 4. **Performance**: CONSTRUCT can be expensive for large result sets
+
+## Current Limitations
+
+- **RDF collection syntax** (`( ?a ?b )`) is not yet supported in CONSTRUCT
+  templates — list the `rdf:first`/`rdf:rest`/`rdf:nil` triples explicitly.
+- **No annotations in CONSTRUCT templates** (the template output form is
+  deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
 
 ## Related Documentation
 

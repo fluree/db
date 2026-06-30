@@ -8,11 +8,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{genesis_ledger, normalize_rows};
 
 fn config_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")

@@ -60,7 +60,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         // for the outer WHERE group itself.  See parse_group_graph_pattern().
                         let inner = self.lower_graph_pattern(p)?;
                         let vars = collect_bound_variables(&inner);
-                        result.push(Pattern::Subquery(SubqueryPattern::new(vars, inner)));
+                        result.push(Pattern::Subquery(
+                            SubqueryPattern::new(vars, inner).with_uncorrelated(),
+                        ));
                     } else {
                         let lowered = self.lower_graph_pattern(p)?;
                         result.extend(lowered);

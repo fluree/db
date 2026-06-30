@@ -253,13 +253,13 @@ pub fn count_rows_numeric_compare_operator(
 /// comparison holds (true→1, false→0), so this reuses the directory-skipping
 /// numeric-compare count.
 ///
-/// SEMANTICS GUARD: `SUM` over an empty multiset is **Unbound** (SPARQL), whereas
-/// `COUNT` would be `0`. The two diverge only when the predicate feeds the
-/// aggregate *no rows at all* (absent predicate, or every row retracted). In that
-/// case we return `Ok(None)` to defer to the general aggregate pipeline, which
-/// emits the correct Unbound result. When at least one row exists, `SUM(?o cmp K)`
-/// == `COUNT(rows where ?o cmp K)` exactly (a non-empty input with zero matches
-/// sums to bound `0`, which `COUNT` also yields).
+/// SEMANTICS: `SUM` over an empty multiset is the identity `"0"^^xsd:integer`
+/// (SPARQL 1.1 §18.5.1.3) — the same value `COUNT` yields — so `SUM(?o cmp K)`
+/// equals `COUNT(rows where ?o cmp K)` for *every* input, including the empty and
+/// no-match cases. The empty / absent-predicate branches below still return
+/// `Ok(None)` to defer to the general aggregate pipeline; that is now a
+/// conservative choice (the fallback yields the same `0`), not a correctness
+/// requirement.
 pub fn sum_compare_as_count_operator(
     predicate: Ref,
     compare: NumericCompareOp,
@@ -272,8 +272,8 @@ pub fn sum_compare_as_count_operator(
         move |ctx| {
             // O1: keep the fast path when the scanned predicate is provably
             // uncovered. An uncovered default-deny predicate feeds the aggregate
-            // *no rows*, so SUM is Unbound (not 0) — defer to the fallback, which
-            // emits Unbound; this matches the absent/empty-input handling below.
+            // *no rows* (empty SUM = identity 0) — defer to the fallback, which
+            // emits that 0; this matches the absent/empty-input handling below.
             if let Some(store) = ctx.binary_store.as_ref() {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
                 match cursor_fast_path_for_predicate(ctx, &pred_sid) {
@@ -285,10 +285,10 @@ pub fn sum_compare_as_count_operator(
             if let Some(store) = fast_path_store_policy_cleared(ctx) {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                    // Absent predicate => empty input => SUM is Unbound (not 0).
+                    // Absent predicate => empty input => SUM is identity 0; defer.
                     return Ok(None);
                 };
-                // Empty input (all rows retracted) => SUM is Unbound; defer to fallback.
+                // Empty input (all rows retracted) => SUM is identity 0; defer.
                 let total = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 if total == 0 {
                     return Ok(None);
@@ -309,9 +309,8 @@ pub fn sum_compare_as_count_operator(
                 };
             }
             // Overlay / time-travel lane: the merged cursor count gives both the
-            // matches and the total rows; an empty (base+novelty) input is SUM
-            // Unbound, so defer to the fallback which emits Unbound. The O1 gate
-            // above already cleared single-ledger / no-from_t / policy.
+            // matches and the total rows. The O1 gate above already cleared
+            // single-ledger / no-from_t / policy.
             if let Some(store) = ctx.binary_store.as_ref() {
                 let pred_sid = normalize_pred_sid(store, &predicate)?;
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
@@ -327,9 +326,9 @@ pub fn sum_compare_as_count_operator(
                     &threshold,
                 )? {
                     // matches > 0 ⇒ the input is non-empty ⇒ SUM is the bound
-                    // count. matches == 0 can't distinguish empty (Unbound) from
-                    // non-empty-with-no-matches (bound 0), so defer to the
-                    // fallback, which resolves the SPARQL semantics correctly.
+                    // count. matches == 0 is the empty-or-no-match case (both now
+                    // sum to 0); defer to the fallback rather than special-casing
+                    // it here.
                     if matches > 0 {
                         return Ok(Some(build_count_batch(
                             out_var,

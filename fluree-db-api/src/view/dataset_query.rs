@@ -744,7 +744,9 @@ impl Fluree {
             english_lang_id,
             remote_service: self.remote_service_executor(),
             from_t,
-            strict_bind_errors: true,
+            // SPARQL 1.1 §18.5 Extend: projection/BIND/ORDER-BY expression
+            // errors leave the variable unbound, not fail the query.
+            strict_bind_errors: false,
             include_system_facts: executable.query.include_system_facts,
             ..Default::default()
         };
@@ -873,7 +875,9 @@ impl Fluree {
             english_lang_id,
             remote_service: self.remote_service_executor(),
             from_t,
-            strict_bind_errors: true,
+            // SPARQL 1.1 §18.5 Extend: projection/BIND/ORDER-BY expression
+            // errors leave the variable unbound, not fail the query.
+            strict_bind_errors: false,
             include_system_facts: executable.query.include_system_facts,
             ..Default::default()
         };

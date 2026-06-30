@@ -14,15 +14,12 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::{
     ExportCommitsRequest, FlureeBuilder, GovernanceOptions, IndexConfig, LedgerManagerConfig,
     PushCommitsRequest,
 };
 use serde_json::json;
-use support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
 
 /// Regression: rdf:type in graph A is invisible when querying graph B.
 ///
@@ -45,7 +42,10 @@ async fn rdf_type_isolated_across_named_graphs() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -154,7 +154,10 @@ async fn subject_properties_isolated_per_graph() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -268,7 +271,10 @@ async fn type_filter_query_respects_graph_boundaries() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -369,7 +375,10 @@ async fn pre_index_upsert_isolates_named_graphs() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -527,7 +536,10 @@ async fn push_roundtrip_named_graph_retractions() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

@@ -2,8 +2,7 @@
 //!
 //! These tests focus on the *tracking* surfaces (policy stats + fuel).
 
-mod support;
-
+use crate::support::{assert_index_defaults, genesis_ledger};
 use fluree_db_api::policy_builder;
 use fluree_db_api::{
     CommitOpts, FlureeBuilder, GovernanceOptions, IndexConfig, TrackedTransactionInput, TxnOpts,
@@ -11,7 +10,6 @@ use fluree_db_api::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use support::{assert_index_defaults, genesis_ledger};
 
 #[tokio::test]
 async fn transact_policy_denied_includes_policy_and_fuel_tracking() {

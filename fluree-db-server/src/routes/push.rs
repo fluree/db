@@ -12,7 +12,7 @@ use crate::state::AppState;
 use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use fluree_db_api::{GovernanceOptions, PushCommitsRequest, PushCommitsResponse, PushedHead};
-use fluree_db_consensus::{Committer, PushRequest};
+use fluree_db_consensus::PushRequest;
 use std::sync::Arc;
 
 /// Push commits to a ledger (ledger in path tail).
@@ -98,7 +98,7 @@ async fn push_ledger_local(
     };
 
     let receipt = state
-        .consensus
+        .committer
         .push(req)
         .await
         .map_err(submission_error_to_server_error)?;

@@ -131,6 +131,17 @@ pub fn sort_overlay_ops(ops: &mut [OverlayOp], order: RunSortOrder) {
     ops.sort_unstable_by(|a, b| cmp_overlay_v3(a, b, order));
 }
 
+/// Stable, run-adaptive variant of [`sort_overlay_ops`].
+///
+/// Rust's stable sort detects already-sorted input runs and merges them in
+/// ~O(n log k) rather than re-sorting from scratch. Use this when the input is
+/// a **concatenation of K already-sorted runs** (e.g. per-segment translated op
+/// runs assembled by the segment-aware overlay path): here it acts as a k-way
+/// merge of those runs, not a full re-sort.
+pub fn sort_overlay_ops_stable(ops: &mut [OverlayOp], order: RunSortOrder) {
+    ops.sort_by(|a, b| cmp_overlay_v3(a, b, order));
+}
+
 /// Resolve assert/retract lifecycles within overlay ops.
 ///
 /// When the same fact (same `FactKeyV3`) has both an assertion and a retraction
@@ -158,7 +169,15 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
         let key = ops[read].fact_key();
         read += 1;
         while read < ops.len() && ops[read].fact_key() == key {
-            if ops[read].t > ops[best].t {
+            // Keep the highest-t op; on a same-t tie prefer the retract, so an
+            // assert+retract of the same fact in one commit resolves to absent
+            // (consistent with the per-commit apply path). The accumulator dedups
+            // within a txn so the tie is currently unreachable, but the
+            // segment-aware assembly merges runs across segments — keep it
+            // deterministic rather than dependent on sort position.
+            let better = ops[read].t > ops[best].t
+                || (ops[read].t == ops[best].t && !ops[read].op && ops[best].op);
+            if better {
                 best = read;
             }
             read += 1;

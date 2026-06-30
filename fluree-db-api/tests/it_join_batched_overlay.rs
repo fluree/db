@@ -18,11 +18,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::{genesis_ledger_for_fluree, normalize_rows, span_capture};
 use fluree_db_api::{FlureeBuilder, QueryInput, ReindexOptions};
 use serde_json::json;
-use support::{genesis_ledger_for_fluree, normalize_rows, span_capture};
 
 fn ctx() -> serde_json::Value {
     json!({"ex": "http://example.org/ns/"})
@@ -654,10 +652,7 @@ async fn batched_join_decimal_novelty() {
         ),
     ];
 
-    let view = fluree
-        .db_at_t(ledger_id, receipt.ledger.t())
-        .await
-        .expect("phase A view");
+    let view = fluree.db(ledger_id).await.expect("phase A view");
     let mut results_a = Vec::new();
     for (name, query, expected_len) in phase_a {
         let (spans, guard) = span_capture::init_test_tracing();
@@ -692,12 +687,9 @@ async fn batched_join_decimal_novelty() {
         .await
         .expect("novelty-new decimal");
 
-    // Second view fetch after more commits: pin the post-commit t (a cached
-    // pre-commit view can otherwise serve).
-    let view = fluree
-        .db_at_t(ledger_id, _receipt.ledger.t())
-        .await
-        .expect("phase B view");
+    // Second view fetch after more commits: db() must reflect the latest
+    // commit (read-your-writes), even with a handle cached from phase A.
+    let view = fluree.db(ledger_id).await.expect("phase B view");
     let alice_q = r"PREFIX ex: <http://example.org/ns/>
         SELECT ?v WHERE { ex:alice ex:knows ?b . ?b ex:budget ?v } ORDER BY ?v";
     let rows_b = run_query(&fluree, &view, alice_q).await;
@@ -708,10 +700,7 @@ async fn batched_join_decimal_novelty() {
         .reindex(ledger_id, ReindexOptions::default())
         .await
         .expect("reindex ground truth");
-    let view = fluree
-        .db_at_t(ledger_id, _receipt.ledger.t())
-        .await
-        .expect("indexed view");
+    let view = fluree.db(ledger_id).await.expect("indexed view");
     // Decimal rendering differs between raw-flake-served values (plain
     // string) and arena-decoded ones (`{"@value": …}`) — a pre-existing
     // formatter discrepancy — so compare extracted decimal values rather

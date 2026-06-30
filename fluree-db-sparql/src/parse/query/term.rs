@@ -409,30 +409,75 @@ impl super::Parser<'_> {
                 let start = self.stream.current_span();
                 self.stream.advance(); // consume [
 
-                // For now, just handle empty [] - property list notation is Phase 3
+                // Empty `[]` is just an anonymous blank node.
                 if self.stream.match_token(&TokenKind::RBracket) {
                     let span = start.union(self.stream.previous_span());
                     return Some(BlankNode::anon(span));
                 }
 
-                // Non-empty blank node syntax - placeholder
-                // Skip to ]
-                let mut depth = 1;
-                while depth > 0 && !self.stream.is_eof() {
-                    match &self.stream.peek().kind {
-                        TokenKind::LBracket => depth += 1,
-                        TokenKind::RBracket => depth -= 1,
-                        _ => {}
-                    }
-                    self.stream.advance();
-                }
-                let span = start.union(self.stream.previous_span());
-                return Some(BlankNode::anon(span));
+                // Non-empty `[ propertyListNotEmpty ]` (SPARQL 1.1 grammar rule
+                // 160, BlankNodePropertyList): desugar to a fresh labeled blank
+                // node and emit its inner predicate-object list as triples.
+                return self.parse_blank_node_property_list(start);
             }
             _ => {}
         }
 
         None
+    }
+
+    /// Parse the body of a non-empty blank-node property list `[ … ]` (the
+    /// opening `[` has already been consumed; `start` is its span).
+    ///
+    /// Desugars `[ p1 o1 ; p2 o2 ]` to a fresh labeled blank node `_b` plus the
+    /// triples `_b p1 o1 . _b p2 o2 .` (SPARQL 1.1 §4.1.4). The triples are
+    /// appended to `pending_bnpl_triples` for the enclosing object-list /
+    /// triples-block parser to fold into its BGP; the blank node itself is
+    /// returned as this term (usable in object or subject position). Nested
+    /// `[ … ]` lists recurse through `parse_object` → here.
+    fn parse_blank_node_property_list(&mut self, start: SourceSpan) -> Option<BlankNode> {
+        // `#` is not a valid blank-node-label character (it is outside PN_CHARS),
+        // so the lexer can never produce this label — a user-written `_:…` can
+        // never collide with it and be accidentally joined to the synthetic node.
+        let label = format!("#bnpl{}", self.bnode_counter);
+        self.bnode_counter += 1;
+        let subject = SubjectTerm::BlankNode(BlankNode::labeled(&label, start));
+
+        let mut triples: Vec<TriplePattern> = Vec::new();
+        let mut bgp_start: Option<SourceSpan> = None;
+        loop {
+            match self.parse_verb()? {
+                Verb::Simple(predicate) => {
+                    self.parse_object_list(&subject, &predicate, &mut triples, &mut bgp_start)?;
+                }
+                Verb::Path(_) => {
+                    self.stream.error_at_current(
+                        "property paths inside a blank-node property list \
+                         ('[ path obj ]') are not yet supported",
+                    );
+                    return None;
+                }
+            }
+
+            // `;`-separated predicate-object pairs; a trailing `;` is allowed.
+            if !self.stream.match_token(&TokenKind::Semicolon) {
+                break;
+            }
+            if !self.is_verb_start() {
+                break;
+            }
+        }
+
+        if !self.stream.match_token(&TokenKind::RBracket) {
+            self.stream
+                .error_at_current("expected ']' to close blank node property list");
+            return None;
+        }
+
+        // Surface the nested triples to the enclosing BGP and return the node.
+        self.pending_bnpl_triples.append(&mut triples);
+        let span = start.union(self.stream.previous_span());
+        Some(BlankNode::labeled(&label, span))
     }
 
     /// Skip an RDF collection (list) in the token stream.
@@ -482,13 +527,28 @@ impl super::Parser<'_> {
         // Parse subject
         let subject = self.parse_subject()?;
 
-        // Parse predicate-object list, collecting patterns
-        self.parse_predicate_object_list_with_paths(
-            &subject,
-            &mut triples,
-            &mut patterns,
-            &mut bgp_start,
-        )?;
+        // A blank-node property-list subject (`[ :p ?o ] …`) emitted its inner
+        // triples; fold them in before the (optional) predicate-object list.
+        let had_bnpl_subject = !self.pending_bnpl_triples.is_empty();
+        if had_bnpl_subject {
+            if bgp_start.is_none() {
+                bgp_start = Some(subject.span());
+            }
+            triples.append(&mut self.pending_bnpl_triples);
+        }
+
+        // Parse predicate-object list, collecting patterns. It is optional only
+        // for a bare blank-node property-list subject (`[ :p ?o ] .`), which has
+        // already produced its triples above; any other subject requires a verb
+        // (and the normal error path reports a missing one).
+        if self.is_verb_start() || !had_bnpl_subject {
+            self.parse_predicate_object_list_with_paths(
+                &subject,
+                &mut triples,
+                &mut patterns,
+                &mut bgp_start,
+            )?;
+        }
 
         // Flush any remaining triples to a BGP
         if !triples.is_empty() {
@@ -613,6 +673,10 @@ impl super::Parser<'_> {
                 None => TriplePattern::new(subject.clone(), predicate.clone(), object, span),
             };
             triples.push(triple);
+
+            // A blank-node property-list object (`[ :p ?o ]`) emitted its inner
+            // triples into `pending_bnpl_triples`; fold them into this BGP.
+            triples.append(&mut self.pending_bnpl_triples);
 
             // Check for comma (more objects)
             if !self.stream.match_token(&TokenKind::Comma) {
@@ -879,6 +943,14 @@ impl super::Parser<'_> {
                 span,
             });
 
+            // A blank-node property-list object emitted its inner triples; flush
+            // them as their own BGP alongside the path pattern.
+            if !self.pending_bnpl_triples.is_empty() {
+                let triples = std::mem::take(&mut self.pending_bnpl_triples);
+                let bgp_span = super::span_of_triples(&triples);
+                patterns.push(GraphPattern::bgp(triples, bgp_span));
+            }
+
             // Check for comma (more objects)
             if !self.stream.match_token(&TokenKind::Comma) {
                 break;
@@ -1016,6 +1088,12 @@ impl super::Parser<'_> {
                 };
                 triples.push(triple);
 
+                // A blank-node property-list object (`[ :p ?o ]`) in a CONSTRUCT /
+                // INSERT/DELETE template emitted its inner triples into
+                // `pending_bnpl_triples`; fold them into this template so they are
+                // not dropped (and cannot leak into a later WHERE BGP).
+                triples.append(&mut self.pending_bnpl_triples);
+
                 if !self.stream.match_token(&TokenKind::Comma) {
                     break;
                 }
@@ -1032,6 +1110,29 @@ impl super::Parser<'_> {
             }
         }
 
+        Some(())
+    }
+
+    /// Parse one template `subject predicate-object-list` group, folding in any
+    /// blank-node property-list triples the subject itself produced. The
+    /// predicate-object list is optional only for a bare blank-node
+    /// property-list subject (`[ :p ?o ]`), which already emitted its triples.
+    /// Shared by the CONSTRUCT template and the INSERT/DELETE template parsers.
+    pub(super) fn parse_template_triples_for_subject(
+        &mut self,
+        subject: &SubjectTerm,
+        triples: &mut Vec<TriplePattern>,
+    ) -> Option<()> {
+        let had_bnpl_subject = !self.pending_bnpl_triples.is_empty();
+        if had_bnpl_subject {
+            triples.append(&mut self.pending_bnpl_triples);
+        }
+        if self.stream.is_term_start()
+            || self.stream.check_keyword(TokenKind::KwA)
+            || !had_bnpl_subject
+        {
+            self.parse_construct_predicate_object_list(subject, triples)?;
+        }
         Some(())
     }
 }

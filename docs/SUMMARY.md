@@ -9,6 +9,7 @@
   - [list](cli/list.md)
   - [info](cli/info.md)
   - [branch](cli/branch.md)
+  - [cluster](cli/cluster.md)
   - [drop](cli/drop.md)
   - [graph](cli/graph.md)
   - [insert](cli/insert.md)
@@ -38,6 +39,7 @@
   - [server](cli/server.md)
   - [memory](cli/memory.md)
   - [mcp](cli/mcp.md)
+  - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
   - [completions](cli/completions.md)
 
@@ -64,6 +66,8 @@
 
 - [Guides (cookbooks)](guides/README.md)
   - [Query patterns](guides/cookbook-query-patterns.md)
+  - [Cypher](guides/cookbook-cypher.md)
+  - [SPARQL](guides/cookbook-sparql.md)
   - [Full-text and vector search](guides/cookbook-search.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
   - [Branching and merging](guides/cookbook-branching.md)
@@ -85,6 +89,7 @@
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)
   - [Cross-ledger model enforcement](design/cross-ledger-model-enforcement.md)
   - [Storage traits](design/storage-traits.md)
+  - [Raft command queue and replicated state machine](design/raft-command-queue.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)
@@ -98,6 +103,7 @@
 - [Query](query/README.md)
   - [JSON-LD Query](query/jsonld-query.md)
   - [SPARQL](query/sparql.md)
+  - [Cypher (openCypher subset)](query/cypher.md)
   - [Output formats (JSON-LD / SPARQL JSON / typed JSON / Agent JSON)](query/output-formats.md)
   - [Datasets, FROM/FROM NAMED, and multi-graph execution](query/datasets.md)
   - [CONSTRUCT](query/construct.md)
@@ -195,6 +201,7 @@
   - [IPFS storage](operations/ipfs-storage.md)
   - [DynamoDB nameservice](operations/dynamodb-guide.md)
   - [Query peers and replication](operations/query-peers.md)
+  - [Raft clusters (replicated writes)](operations/raft-clusters.md)
   - [Telemetry and logging](operations/telemetry.md)
   - [Distributed tracing integration](operations/distributed-tracing.md)
   - [Pack format: archive and restore](operations/pack-archive-restore.md)
@@ -212,6 +219,7 @@
   - [Standards and feature flags](reference/compatibility.md)
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
+  - [openCypher support matrix](reference/cypher-support-matrix.md)
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)

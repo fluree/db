@@ -2,14 +2,14 @@
 //!
 //! We prioritize query semantics; some scenarios are intentionally out of scope here.
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{
+    context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger,
+};
+#[cfg(feature = "native")]
+use crate::support::{start_background_indexer_local, trigger_index_and_wait};
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::{context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
-#[cfg(feature = "native")]
-use support::{start_background_indexer_local, trigger_index_and_wait};
 
 async fn seed_three_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
@@ -915,7 +915,10 @@ async fn indexed_untyped_value_matching_parity() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1323,4 +1326,48 @@ async fn union_passthrough_variables() {
     ]);
 
     assert_eq!(normalize_rows(&rows), normalize_rows(&expected));
+}
+
+#[tokio::test]
+async fn projection_expression_error_leaves_var_unbound() {
+    // SPARQL↔JSON-LD parity (#1374 review): a value error in a SELECT/BIND
+    // projection expression leaves that one cell UNBOUND for the row instead of
+    // failing the whole query (or returning HTTP 400). Mirrors the SPARQL
+    // surface test `sparql_projection_expression_error_leaves_var_unbound`;
+    // both surfaces share the Extend (§18.5) execution path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprerr-jsonld:main");
+    let insert = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "@graph": [
+            {"@id": "ex:s1", "ex:p": "abc"},
+            {"@id": "ex:s2", "ex:p": {"@value": "2", "@type": "xsd:integer"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?v", "(as (+ ?v 1) ?plus)"],
+        "where": { "@id": "?s", "ex:p": "?v" },
+        "orderBy": ["?v"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("expression error must not fail the whole query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let rows = rows.as_array().expect("rows array");
+    assert_eq!(rows.len(), 2, "both rows must be returned: {rows:?}");
+
+    // The string row ("abc" + 1) errors → ?plus is null (unbound). The integer
+    // row (2 + 1) yields 3. Order-independent so formatting can't flake the test.
+    let has_error_row = rows
+        .iter()
+        .any(|r| r[0] == json!("abc") && r[1] == json!(null));
+    let has_ok_row = rows.iter().any(|r| r[1] == json!(3));
+    assert!(
+        has_error_row,
+        "errored ?plus must be unbound (null) on the string row: {rows:?}"
+    );
+    assert!(has_ok_row, "?plus must be 3 on the integer row: {rows:?}");
 }

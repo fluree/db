@@ -27,14 +27,11 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
-use std::sync::Arc;
-
+use crate::support;
+use crate::support::genesis_ledger;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_indexer::IndexerConfig;
 use serde_json::{json, Value as JsonValue};
-use support::genesis_ledger;
 
 fn ctx() -> JsonValue {
     json!({
@@ -223,7 +220,10 @@ async fn full_rebuild_without_authoritative_falls_back_to_scan() {
     // harness that intentionally exercises the scan-fallback path.
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         IndexerConfig::small(),
     );
 
@@ -335,7 +335,10 @@ async fn post_defensive_drop_stays_in_scan_fallback() {
             // wiring between passes.
             let (local_b, handle_b) = support::start_background_indexer_local(
                 fluree.backend().clone(),
-                Arc::new(fluree.nameservice_mode().clone()),
+                fluree
+                    .nameservice_mode()
+                    .publisher_arc()
+                    .expect("test setup requires ReadWrite nameservice mode"),
                 IndexerConfig::small(),
             );
             local_b
@@ -488,7 +491,10 @@ async fn had_annotation_arena_sticky_survives_defensive_drop() {
 
             let (local_b, handle_b) = support::start_background_indexer_local(
                 fluree.backend().clone(),
-                Arc::new(fluree.nameservice_mode().clone()),
+                fluree
+                    .nameservice_mode()
+                    .publisher_arc()
+                    .expect("test setup requires ReadWrite nameservice mode"),
                 IndexerConfig::small(),
             );
             local_b
@@ -564,7 +570,10 @@ async fn indexer_pass_without_provider_marks_arena_history_owned() {
     // arena handling.
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         IndexerConfig::small(),
     );
 
@@ -832,7 +841,7 @@ async fn explain_tags_annotation_role_and_uses_arena_stats() {
     // is observable, and (c) report stats as available when the
     // annotation arena is sealed even if no other property stats
     // exist yet.
-    use support::graphdb_from_ledger;
+    use crate::support::graphdb_from_ledger;
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())

@@ -5,16 +5,30 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{
+    genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait,
+};
 use fluree_db_api::{
-    ledger_manager::{LedgerManagerConfig, NotifyResult, NsNotify},
+    ledger_manager::{LedgerManager, LedgerManagerConfig, NotifyResult, NsNotify},
     FlureeBuilder, IndexConfig,
 };
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{genesis_ledger_for_fluree, start_background_indexer_local, trigger_index_and_wait};
+
+/// A second ledger-manager over the same backend + nameservice as `fluree`,
+/// simulating a separate node whose cache can fall behind when another writer
+/// (here, `fluree` itself) advances the shared nameservice head. This is the
+/// scenario `notify` catch-up exists for: a writer in this process keeps its
+/// own cache current ([read-your-writes], issue #1330), so an in-process commit
+/// no longer leaves the *writer's* cache stale — only a peer's does.
+fn peer_manager(fluree: &support::MemoryFluree) -> LedgerManager {
+    LedgerManager::new(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().clone(),
+        LedgerManagerConfig::default(),
+    )
+}
 
 /// Helper: transact one insert and return the committed ledger state.
 async fn insert_data(
@@ -50,9 +64,7 @@ async fn insert_data(
 async fn notify_single_commit_uses_incremental_path() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/notify-incremental:main";
-    let manager = fluree
-        .ledger_manager()
-        .expect("ledger_manager should be present");
+    let manager = peer_manager(&fluree);
 
     // Create ledger and insert initial data
     let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
@@ -109,9 +121,7 @@ async fn notify_single_commit_uses_incremental_path() {
 async fn notify_small_gap_uses_incremental_path() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/notify-gap:main";
-    let manager = fluree
-        .ledger_manager()
-        .expect("ledger_manager should be present");
+    let manager = peer_manager(&fluree);
 
     // Create and commit initial data
     let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
@@ -150,9 +160,7 @@ async fn notify_small_gap_uses_incremental_path() {
 async fn notify_large_gap_falls_back_to_reload() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/notify-reload:main";
-    let manager = fluree
-        .ledger_manager()
-        .expect("ledger_manager should be present");
+    let manager = peer_manager(&fluree);
 
     // Create and commit initial data
     let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
@@ -195,7 +203,10 @@ async fn notify_index_only_trims_novelty() {
     // Start a background indexer
     let (local, indexer_handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -284,9 +295,7 @@ async fn notify_branch_catch_up_resolves_pre_fork_parent() {
     let ledger_name = "it/notify-branch";
     let main_id = "it/notify-branch:main";
     let dev_id = "it/notify-branch:dev";
-    let manager = fluree
-        .ledger_manager()
-        .expect("ledger_manager should be present");
+    let manager = peer_manager(&fluree);
 
     // 1. Create main and seed one commit so commit_head_id is set
     //    (create_branch uses the source branch's commit head).

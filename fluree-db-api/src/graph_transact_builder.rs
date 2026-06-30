@@ -8,7 +8,7 @@ use serde_json::Value as JsonValue;
 use crate::error::BuilderErrors;
 use crate::graph::Graph;
 use crate::graph_query_builder::GraphSnapshotQueryBuilder;
-use crate::tx_builder::{Staged, TransactCore, TransactOperation};
+use crate::tx_builder::{parse_and_lower_sparql_update, Staged, TransactCore, TransactOperation};
 use crate::view::GraphDb;
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
@@ -89,6 +89,17 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     pub fn upsert_turtle(mut self, turtle: &'g str) -> Self {
         self.core
             .set_operation(TransactOperation::UpsertTurtle(turtle));
+        self
+    }
+
+    /// Set the operation to a SPARQL UPDATE.
+    ///
+    /// The query is parsed and lowered during `commit()` under the ledger
+    /// write lock — so its namespace allocation and staging share one
+    /// registry. This avoids the namespace-conflict retry that pre-lowering
+    /// against an unlocked snapshot would require.
+    pub fn sparql_update(mut self, sparql: &'g str) -> Self {
+        self.core.set_sparql_update(sparql);
         self
     }
 
@@ -177,15 +188,10 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     pub async fn stage(self) -> Result<StagedGraph<'a>> {
         self.core.validate().map_err(ApiError::Builder)?;
 
-        let op = self.core.operation.unwrap();
-        let txn_type = op.txn_type();
-        // Parse transaction, extracting TriG metadata for Turtle inputs
-        let parsed = op.to_json_with_trig_meta()?;
-        let txn_json = parsed.json;
-        let trig_meta = parsed.trig_meta;
         let index_config = self
             .core
             .index_config
+            .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
 
         // Load the current ledger state
@@ -193,37 +199,64 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
 
         // Stage
         // TODO: Add trig_meta support to tracked+policy path
-        let stage_result = if let Some(policy) = &self.core.policy {
-            let tracker = Tracker::new(self.core.tracking.unwrap_or(TrackingOptions {
-                track_time: true,
-                track_fuel: true,
-                track_policy: true,
-                max_fuel: None,
-            }));
-            let input =
-                TrackedTransactionInput::new(txn_type, &txn_json, self.core.txn_opts, policy);
+        let stage_result = if let Some(sparql) = self.core.pending_sparql {
+            let txn =
+                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, self.core.txn_opts)?;
+            let tracker = self
+                .core
+                .tracking
+                .map(Tracker::new)
+                .unwrap_or_else(Tracker::disabled);
             self.graph
                 .fluree
-                .stage_transaction_tracked_with_policy(
+                .stage_transaction_from_txn(
                     ledger_state,
-                    input,
+                    txn,
                     Some(&index_config),
-                    &tracker,
-                )
-                .await
-                .map_err(|e: TrackedErrorResponse| ApiError::http(e.status, e.error))?
-        } else {
-            self.graph
-                .fluree
-                .stage_transaction_with_trig_meta(
-                    ledger_state,
-                    txn_type,
-                    &txn_json,
-                    self.core.txn_opts,
-                    Some(&index_config),
-                    trig_meta.as_ref(),
+                    self.core.policy.as_ref(),
+                    Some(&tracker),
                 )
                 .await?
+        } else {
+            let op = self.core.operation.unwrap();
+            let txn_type = op.txn_type();
+            // Parse transaction, extracting TriG metadata for Turtle inputs
+            let parsed = op.to_json_with_trig_meta()?;
+            let txn_json = parsed.json;
+            let trig_meta = parsed.trig_meta;
+
+            if let Some(policy) = &self.core.policy {
+                let tracker = Tracker::new(self.core.tracking.unwrap_or(TrackingOptions {
+                    track_time: true,
+                    track_fuel: true,
+                    track_policy: true,
+                    max_fuel: None,
+                }));
+                let input =
+                    TrackedTransactionInput::new(txn_type, &txn_json, self.core.txn_opts, policy);
+                self.graph
+                    .fluree
+                    .stage_transaction_tracked_with_policy(
+                        ledger_state,
+                        input,
+                        Some(&index_config),
+                        &tracker,
+                    )
+                    .await
+                    .map_err(|e: TrackedErrorResponse| ApiError::http(e.status, e.error))?
+            } else {
+                self.graph
+                    .fluree
+                    .stage_transaction_with_trig_meta(
+                        ledger_state,
+                        txn_type,
+                        &txn_json,
+                        self.core.txn_opts,
+                        Some(&index_config),
+                        trig_meta.as_ref(),
+                    )
+                    .await?
+            }
         };
 
         // Pre-build the GraphDb from staged so query() can borrow it

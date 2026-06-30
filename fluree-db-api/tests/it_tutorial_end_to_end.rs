@@ -6,8 +6,7 @@
 //! Covers: insert (JSON-LD + Turtle), SPARQL queries, JSON-LD queries,
 //! fulltext search, time travel, branching, merge, and update transactions.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder};
 use serde_json::{json, Value as JsonValue};
 

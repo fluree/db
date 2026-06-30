@@ -611,6 +611,11 @@ async fn run_operator_into<S: BatchSink>(
 ///
 /// Specifies the optional components to add to the execution context.
 /// This is the unified knob for all query execution paths.
+///
+/// The default is the spec-compliant query configuration: every component
+/// absent and `strict_bind_errors` off (Extend demotes expression errors to
+/// unbound). Transactions opt into strict mode via `execute_where_streaming`.
+#[derive(Default)]
 pub struct ContextConfig<'a, 'b> {
     pub tracker: Option<&'a Tracker>,
     /// Cooperative cancellation handle for execution.
@@ -636,7 +641,16 @@ pub struct ContextConfig<'a, 'b> {
     /// Optional lower time bound for history/range queries.
     /// Defaults to None (no lower bound).
     pub from_t: Option<i64>,
-    /// When true, bind evaluation errors become query errors.
+    /// When true, a demotable expression error (arithmetic/type-mismatch/etc.)
+    /// in a BIND / SELECT-projection / ORDER-BY expression aborts the whole
+    /// query instead of leaving that variable unbound for the solution.
+    ///
+    /// Defaults to `false` — SPARQL 1.1 §18.5 `Extend` semantics: an expression
+    /// error demotes to an unbound value for that solution and evaluation
+    /// continues (fatal infrastructure errors, e.g. dictionary lookup, still
+    /// propagate). Transactions opt INTO strict mode (via
+    /// `execute_where_streaming`) so a computed WHERE value cannot silently
+    /// become unbound before it is written.
     pub strict_bind_errors: bool,
     /// When true, scan operators bypass the variable-predicate filter
     /// for Fluree-system predicates. Surfaced via
@@ -664,30 +678,6 @@ pub struct ContextConfig<'a, 'b> {
     pub english_lang_id: Option<u16>,
     /// Remote SERVICE executor for `fluree:remote:` endpoints.
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
-}
-
-impl Default for ContextConfig<'_, '_> {
-    fn default() -> Self {
-        Self {
-            tracker: None,
-            cancellation: None,
-            policy_enforcer: None,
-            dataset: None,
-            r2rml: None,
-            bm25_provider: None,
-            vector_provider: None,
-            from_t: None,
-            strict_bind_errors: true,
-            include_system_facts: false,
-            binary_store: None,
-            binary_g_id: 0,
-            dict_novelty: None,
-            spatial_providers: None,
-            fulltext_providers: None,
-            english_lang_id: None,
-            remote_service: None,
-        }
-    }
 }
 
 /// Execute a prepared query with configurable context options

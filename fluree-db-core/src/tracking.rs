@@ -88,7 +88,7 @@ pub mod schedule {
 }
 
 /// Tracking options parsed from query `opts`
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrackingOptions {
     pub track_time: bool,
     pub track_fuel: bool,
@@ -157,7 +157,7 @@ impl TrackingOptions {
 }
 
 /// Policy execution statistics: `{:executed N :allowed M}`
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyStats {
     pub executed: u64,
     pub allowed: u64,
@@ -366,7 +366,7 @@ impl Tracker {
 }
 
 /// Tracking tally returned on completion.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackingTally {
     /// Formatted time string like `"12.34ms"`
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -387,7 +387,7 @@ pub struct TrackingTally {
 /// `capped: true` means the closure hit its budget before reaching fixpoint —
 /// query results may be missing entailments. Clients should treat capped
 /// results as incomplete, not merely slow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningTally {
     /// Whether materialization was capped before reaching fixpoint.
     pub capped: bool,

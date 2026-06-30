@@ -7,7 +7,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
+use crate::support;
 
 use async_trait::async_trait;
 use fluree_db_api::{FlureeBuilder, RemoteObject, RemoteSource};

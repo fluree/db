@@ -95,8 +95,10 @@ impl super::Parser<'_> {
 
     /// Parse a single GROUP BY condition.
     ///
-    /// For MVP, we only support simple variable references.
-    /// Expression forms like (expr AS ?var) will be rejected during lowering.
+    /// GroupCondition ::= BuiltInCall | FunctionCall | '(' Expression ( 'AS' Var )? ')' | Var
+    ///
+    /// The bare `BuiltInCall`/`FunctionCall` forms (e.g. `GROUP BY DATATYPE(?v)`)
+    /// carry no `AS` alias — only the parenthesized form does.
     fn parse_group_condition(&mut self) -> Option<GroupCondition> {
         // Check for a bare variable
         if let Some((name, span)) = self.stream.consume_var() {
@@ -137,8 +139,29 @@ impl super::Parser<'_> {
             }
         }
 
-        // Not a valid group condition
-        None
+        // Bare BuiltInCall / FunctionCall, e.g. `GROUP BY DATATYPE(?v)` or
+        // `GROUP BY STR(?x)` — no surrounding parentheses, no AS alias. The
+        // function call is self-delimiting, so `parse_expression` stops at the
+        // next condition or solution-modifier keyword. A non-expression token
+        // (HAVING / ORDER / LIMIT / OFFSET, or end of group) ends the GROUP BY
+        // condition loop; restore the stream on failure so a *partial* parse
+        // never leaves tokens consumed (which would desync the outer parser).
+        let pos = self.stream.position();
+        let start = self.stream.current_span();
+        match parse_expression(self.stream) {
+            Ok(expr) => {
+                let span = start.union(self.stream.previous_span());
+                Some(GroupCondition::Expr {
+                    expr,
+                    alias: None,
+                    span,
+                })
+            }
+            Err(_) => {
+                self.stream.restore(pos);
+                None
+            }
+        }
     }
 
     /// Parse HAVING clause.

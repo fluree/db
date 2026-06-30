@@ -24,9 +24,13 @@
 //! - Subject-bound patterns (`ex:subject ex:name ?o`) are not optimized
 //! - Filter patterns are preserved and applied post-R2RML scan
 
+use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{Pattern, R2rmlPattern};
-use fluree_db_core::LedgerSnapshot;
+use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
+use crate::r2rml::{ScanCmpOp, ScanValue};
+use crate::var_registry::VarId;
+use fluree_db_core::{FlakeValue, LedgerSnapshot};
+use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
 #[derive(Debug)]
@@ -63,13 +67,30 @@ pub fn rewrite_patterns_for_r2rml(
     let mut converted = 0;
     let mut unconverted = 0;
 
+    // Same-subject star grouping: accumulate regular-predicate R2RML patterns
+    // (const predicate + fresh object var) by subject so they can be merged into
+    // a single scan, eliminating the O(N^2) self-join. First-seen order preserved.
+    let mut star_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
+
     for pattern in patterns {
         match pattern {
             Pattern::Triple(tp) => {
                 if let Some(r2rml_pattern) = convert_triple_to_r2rml(tp, graph_source_id, snapshot)
                 {
-                    result_patterns.push(Pattern::R2rml(r2rml_pattern));
                     converted += 1;
+                    if is_star_eligible(&r2rml_pattern) {
+                        match star_groups
+                            .iter_mut()
+                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
+                        {
+                            Some((_, members)) => members.push(r2rml_pattern),
+                            None => {
+                                star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                            }
+                        }
+                    } else {
+                        result_patterns.push(Pattern::R2rml(r2rml_pattern));
+                    }
                 } else {
                     // Keep original pattern if conversion fails
                     result_patterns.push(pattern.clone());
@@ -115,11 +136,151 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
+    // Emit star groups. Single-member groups stay on the normal single-object
+    // path; multi-member groups with distinct object vars merge into one scan.
+    for (_subject, mut members) in star_groups {
+        if members.len() == 1 {
+            result_patterns.push(Pattern::R2rml(members.pop().unwrap()));
+            continue;
+        }
+        let mut seen_obj = HashSet::new();
+        let distinct = members
+            .iter()
+            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
+        if !distinct {
+            // Shared object var implies a self-join constraint; keep separate.
+            for m in members {
+                result_patterns.push(Pattern::R2rml(m));
+            }
+            continue;
+        }
+        let mut base = members.remove(0);
+        base.star_bindings = members
+            .into_iter()
+            .map(|m| {
+                (
+                    m.predicate_filter.expect("star-eligible has predicate"),
+                    m.object_var.expect("star-eligible has object var"),
+                )
+            })
+            .collect();
+        result_patterns.push(Pattern::R2rml(base));
+    }
+
+    // Attach pushable FILTER comparisons to the R2RML pattern that produces
+    // each compared variable, for Iceberg file pruning. The FILTER pattern is
+    // left in place (residual), so this only ever skips data files.
+    let mut pushdowns: Vec<(VarId, ScanCmpOp, ScanValue)> = Vec::new();
+    for p in &result_patterns {
+        if let Pattern::Filter(expr) = p {
+            collect_pushdowns(expr, &mut pushdowns);
+        }
+    }
+    if !pushdowns.is_empty() {
+        for p in &mut result_patterns {
+            if let Pattern::R2rml(rp) = p {
+                let produced = rp.produced_vars();
+                for (var, op, value) in &pushdowns {
+                    // Only object-position vars map to columns (the subject is an
+                    // IRI template, not a scannable column).
+                    if *var != rp.subject_var && produced.contains(var) {
+                        rp.scan_filters.push(ScanPushdown {
+                            var: *var,
+                            op: *op,
+                            value: value.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     R2rmlRewriteResult {
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
     }
+}
+
+/// Collect conjunctive `?var <op> const` comparisons that prune safely against
+/// Iceberg column min/max bounds (date/int/bool only). `!=` and non-prunable
+/// literal types are skipped — they stay with the in-engine FILTER.
+fn collect_pushdowns(expr: &Expression, out: &mut Vec<(VarId, ScanCmpOp, ScanValue)>) {
+    let Expression::Call { func, args } = expr else {
+        return;
+    };
+    if matches!(func, Function::And) {
+        for a in args {
+            collect_pushdowns(a, out);
+        }
+        return;
+    }
+    if args.len() != 2 {
+        return;
+    }
+    // Normalize to (var, op, const), reversing the operator if the constant is
+    // on the left.
+    let (var, value, reversed) = match (&args[0], &args[1]) {
+        (Expression::Var(v), Expression::Const(c)) => (*v, c, false),
+        (Expression::Const(c), Expression::Var(v)) => (*v, c, true),
+        _ => return,
+    };
+    let Some(op) = cmp_op(func, reversed) else {
+        return;
+    };
+    if let Some(sv) = to_scan_value(value) {
+        out.push((var, op, sv));
+    }
+}
+
+/// Map a comparison `Function` to a pushable `ScanCmpOp`, reversing operand
+/// order when the constant was on the left. Returns None for non-prunable ops.
+fn cmp_op(func: &Function, reversed: bool) -> Option<ScanCmpOp> {
+    let op = match func {
+        Function::Eq => ScanCmpOp::Eq,
+        Function::Lt => ScanCmpOp::Lt,
+        Function::Le => ScanCmpOp::LtEq,
+        Function::Gt => ScanCmpOp::Gt,
+        Function::Ge => ScanCmpOp::GtEq,
+        // `!=` cannot prune via min/max bounds; leave it to the FILTER.
+        _ => return None,
+    };
+    Some(if reversed {
+        match op {
+            ScanCmpOp::Lt => ScanCmpOp::Gt,
+            ScanCmpOp::LtEq => ScanCmpOp::GtEq,
+            ScanCmpOp::Gt => ScanCmpOp::Lt,
+            ScanCmpOp::GtEq => ScanCmpOp::LtEq,
+            other => other, // Eq is symmetric
+        }
+    } else {
+        op
+    })
+}
+
+/// Convert a constant literal to a prunable `ScanValue`. Only date, integer and
+/// boolean are pushed; everything else stays with the in-engine FILTER.
+fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+    match value {
+        FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
+        FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
+        FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
+        _ => None,
+    }
+}
+
+/// A regular-predicate R2RML pattern that can join via the subject: constant
+/// predicate, a fresh object var distinct from the subject, no class/TM filter.
+/// These are the patterns that can be merged into a same-subject star scan.
+fn is_star_eligible(p: &R2rmlPattern) -> bool {
+    p.predicate_filter.is_some()
+        && p.class_filter.is_none()
+        && p.triples_map_iri.is_none()
+        && p.star_bindings.is_empty()
+        && match p.object_var {
+            Some(obj) => obj != p.subject_var,
+            None => false,
+        }
 }
 
 /// Convert a triple pattern to an R2RML pattern.

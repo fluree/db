@@ -174,6 +174,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::branch::run(action, &fluree_dir, direct).await
         }
 
+        #[cfg(feature = "server")]
+        Commands::Cluster { action } => commands::cluster::run(action).await,
+
         Commands::Drop {
             name,
             force,
@@ -190,6 +193,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Insert {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -199,6 +203,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::insert::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 format.as_deref(),
@@ -212,6 +217,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Update {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -221,6 +227,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::update::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 format.as_deref(),
@@ -234,6 +241,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Upsert {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -243,6 +251,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::upsert::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 format.as_deref(),
@@ -256,6 +265,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
 
         Commands::Query {
             args,
+            ledger,
             expr,
             file,
             format,
@@ -265,6 +275,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             explain,
             sparql,
             jsonld,
+            cypher,
             at,
             remote,
             track,
@@ -277,6 +288,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::query::run(
                 &args,
+                ledger.as_deref(),
                 expr.as_deref(),
                 file.as_deref(),
                 &format,
@@ -286,6 +298,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 explain,
                 sparql,
                 jsonld,
+                cypher,
                 at.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
@@ -624,50 +637,68 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             }
         }
 
-        Commands::Mcp { action } => {
-            // IDEs may spawn `fluree mcp serve` from a cwd that is not inside a
-            // project with a local `.fluree/` directory. In that case, fall back
-            // to global directories (creating them if needed) so the MCP server
-            // can still start and expose tools.
-            //
-            // IMPORTANT: This must not print to stdout/stderr (stdio transport
-            // uses stdout for JSON-RPC).
-            let fluree_dir = if let Some(p) = config_path {
-                config::require_fluree_dir(Some(p))?
-            } else if let Some(local) = config::find_fluree_dir() {
-                local
-            } else {
-                let global = FlureeDir::global().ok_or_else(|| {
-                    error::CliError::Config("cannot determine global directories".into())
-                })?;
+        Commands::Mcp { action } => match action {
+            cli::McpAction::Serve {
+                transport,
+                toolsets,
+            } => {
+                let toolsets = commands::mcp::parse_toolsets(&toolsets)?;
 
-                // For split global dirs, use an absolute data-dir storage path
-                // so the server finds the right directory regardless of cwd.
-                let storage_override = if !global.is_unified() {
-                    let path = global.data_dir().join("storage");
-                    let path_str = path.to_str().ok_or_else(|| {
-                        error::CliError::Config(format!(
-                            "data directory path is not valid UTF-8: {}",
-                            path.display()
-                        ))
-                    })?;
-                    Some(path_str.to_owned())
+                // Only resolve (and, if needed, create) a Fluree directory when
+                // the memory toolset is enabled — a docs-only server is stateless
+                // and must not require or create a `.fluree/` directory.
+                //
+                // IMPORTANT: this must not print to stdout/stderr (stdio
+                // transport uses stdout for JSON-RPC).
+                let fluree_dir = if toolsets.contains(&fluree_db_mcp::Toolset::Memory) {
+                    Some(resolve_mcp_fluree_dir(config_path)?)
                 } else {
                     None
                 };
-
-                let template =
-                    generate_config_template_for(ConfigFormat::Toml, storage_override.as_deref());
-
-                // Create minimal directory structure if missing.
-                config::init_fluree_dir(&global, &template, ConfigFormat::Toml.filename())?;
-                global
-            };
-            match action {
-                cli::McpAction::Serve { transport } => {
-                    commands::mcp_serve::run(&transport, &fluree_dir).await
-                }
+                commands::mcp::serve::run(&transport, &toolsets, fluree_dir.as_ref()).await
             }
-        }
+            // init/install need no project directory — the server lazy-inits its
+            // store and the docs toolset is stateless.
+            cli::McpAction::Init { ide, toolsets } | cli::McpAction::Install { ide, toolsets } => {
+                commands::mcp::init(ide.as_deref(), &toolsets)
+            }
+            cli::McpAction::Status => commands::mcp::status(),
+        },
+
+        // Docs are embedded in the binary — no project directory needed.
+        Commands::Docs { action } => commands::docs::run(action),
     }
+}
+
+/// Resolve the Fluree directory for an MCP server that includes the memory
+/// toolset. IDEs may spawn `fluree mcp serve` from a cwd outside a project with
+/// a local `.fluree/`, so fall back to (and create) global directories.
+fn resolve_mcp_fluree_dir(config_path: Option<&std::path::Path>) -> error::CliResult<FlureeDir> {
+    if let Some(p) = config_path {
+        return config::require_fluree_dir(Some(p));
+    }
+    if let Some(local) = config::find_fluree_dir() {
+        return Ok(local);
+    }
+    let global = FlureeDir::global()
+        .ok_or_else(|| error::CliError::Config("cannot determine global directories".into()))?;
+
+    // For split global dirs, use an absolute data-dir storage path so the server
+    // finds the right directory regardless of cwd.
+    let storage_override = if !global.is_unified() {
+        let path = global.data_dir().join("storage");
+        let path_str = path.to_str().ok_or_else(|| {
+            error::CliError::Config(format!(
+                "data directory path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        Some(path_str.to_owned())
+    } else {
+        None
+    };
+
+    let template = generate_config_template_for(ConfigFormat::Toml, storage_override.as_deref());
+    config::init_fluree_dir(&global, &template, ConfigFormat::Toml.filename())?;
+    Ok(global)
 }

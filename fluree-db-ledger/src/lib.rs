@@ -37,7 +37,7 @@ use fluree_db_core::{
     BranchedContentStore, ContentId, ContentStore, DictNovelty, Flake, GraphDbRef, GraphId,
     LedgerSnapshot, RuntimeSmallDicts, StorageBackend, TXN_META_GRAPH_ID,
 };
-use fluree_db_nameservice::{NameService, NsRecord};
+use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
     generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Commit, Novelty,
 };
@@ -130,7 +130,7 @@ impl LedgerState {
     /// This is resilient to missing index - if the nameservice has commits
     /// but no index yet, it creates a genesis LedgerSnapshot and loads all commits as novelty.
     pub async fn load(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         ledger_id: &str,
         backend: &StorageBackend,
     ) -> Result<Self> {
@@ -159,7 +159,7 @@ impl LedgerState {
     /// same logic via the nameservice helpers without taking on a
     /// `fluree-db-ledger` dependency.
     pub async fn build_branched_store(
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         record: &NsRecord,
         backend: &StorageBackend,
     ) -> Result<BranchedContentStore> {
@@ -220,9 +220,7 @@ impl LedgerState {
                 let head_index_id = record.index_head_id.clone();
                 let mut runtime_small_dicts = RuntimeSmallDicts::new();
                 runtime_small_dicts.populate_from_flakes_iter(
-                    novelty_overlay
-                        .iter_index(fluree_db_core::IndexType::Post)
-                        .map(|id| novelty_overlay.get_flake(id)),
+                    novelty_overlay.iter_flakes(fluree_db_core::IndexType::Post),
                 );
                 return Ok(Self {
                     snapshot: Arc::new(snapshot),
@@ -367,11 +365,8 @@ impl LedgerState {
             snapshot.string_watermark,
         );
         let mut runtime_small_dicts = RuntimeSmallDicts::new();
-        runtime_small_dicts.populate_from_flakes_iter(
-            novelty
-                .iter_index(fluree_db_core::IndexType::Post)
-                .map(|id| novelty.get_flake(id)),
-        );
+        runtime_small_dicts
+            .populate_from_flakes_iter(novelty.iter_flakes(fluree_db_core::IndexType::Post));
         Self {
             snapshot: Arc::new(snapshot),
             novelty: Arc::new(novelty),
@@ -504,18 +499,14 @@ impl LedgerState {
         let has_remaining_novelty = new_novelty.size > 0;
         if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
         if has_remaining_novelty {
             new_runtime_small_dicts.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
@@ -583,18 +574,14 @@ impl LedgerState {
         let has_remaining_novelty = new_novelty.size > 0;
         if has_remaining_novelty {
             new_dict_novelty.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
         let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
         if has_remaining_novelty {
             new_runtime_small_dicts.populate_from_flakes_iter(
-                new_novelty
-                    .iter_index(fluree_db_core::IndexType::Post)
-                    .map(|id| new_novelty.get_flake(id)),
+                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
             );
         }
 
@@ -707,6 +694,20 @@ impl LedgerState {
         // semantics the previous clone-then-swap provided — without the clone.
         self.novelty.can_apply(&all_flakes, &reverse_graph)?;
 
+        // Ownership probe: if a range provider is still attached it co-holds Arc
+        // clones of these dicts (strong_count >= 2) and the `make_mut` below
+        // deep-clones them every commit — the O(novelty) post-reindex regression.
+        // The caller (LedgerManager commit loop) detaches the provider before this
+        // runs, so the steady-state count should be 1. Debug-level + dedicated
+        // target (`RUST_LOG=fluree::cow_probe=debug`) so it stays silent otherwise.
+        tracing::debug!(
+            target: "fluree::cow_probe",
+            dict_novelty_strong = Arc::strong_count(&self.dict_novelty),
+            runtime_small_dicts_strong = Arc::strong_count(&self.runtime_small_dicts),
+            provider_attached = self.snapshot.range_provider.is_some(),
+            "apply_single_commit dict ownership before make_mut"
+        );
+
         // Extend dict_novelty / small dicts / novelty in place when this state
         // uniquely owns them (Arc::make_mut), copy-on-write only when a reader or
         // cache still holds the prior Arc. Matches the snapshot handling above and
@@ -738,7 +739,7 @@ impl LedgerState {
     /// - Other errors from `apply_index`
     pub async fn maybe_apply_newer_index(
         &mut self,
-        ns: &dyn NameService,
+        ns: &dyn NameServiceLookup,
         cs: &dyn ContentStore,
     ) -> Result<bool> {
         let record = ns

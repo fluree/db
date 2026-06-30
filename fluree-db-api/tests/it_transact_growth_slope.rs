@@ -18,7 +18,7 @@
 //! so this test PRINTS it rather than hard-asserting a hardware-specific bound.
 //!
 //! Manual run (release matters for absolute numbers; the slope is the signal):
-//!   cargo test -p fluree-db-api --test it_transact_growth_slope --features native \
+//!   cargo test -p fluree-db-api --test grp_transact it_transact_growth_slope --features native \
 //!     --release -- --ignored --nocapture
 //!
 //! Knobs: GROWTH_TEST_COMMITS (default 3000), GROWTH_TEST_NPC (default 10),

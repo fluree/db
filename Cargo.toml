@@ -11,6 +11,7 @@ members = [
     "fluree-db-connection",
     "fluree-db-query",
     "fluree-db-sparql",
+    "fluree-db-cypher",
     "fluree-db-nameservice",
     "fluree-db-novelty",
     "fluree-db-ledger",
@@ -37,13 +38,15 @@ members = [
     "fluree-search-httpd",
     "fluree-db-cli",
     "fluree-db-memory",
+    "fluree-db-docs",
+    "fluree-db-mcp",
     "fluree-bench-support",
     "fluree-db-consensus",
 ]
 exclude = ["testsuite-sparql"]
 
 [workspace.package]
-version = "4.1.0"
+version = "4.1.1"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"

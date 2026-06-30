@@ -11,8 +11,7 @@
 //! - Cascading / dependent updates (graph traversal)
 //! - Batch conditional updates (multi-entity)
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState, Novelty};
 use fluree_db_core::LedgerSnapshot;
 use serde_json::{json, Value as JsonValue};

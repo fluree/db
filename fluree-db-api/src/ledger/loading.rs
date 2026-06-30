@@ -21,13 +21,20 @@ impl Fluree {
         Ok(())
     }
 
-    /// Reattach the binary index store when the snapshot has namespaces the
-    /// store wasn't built with. Intended for use after a commit that may
-    /// have introduced new namespaces; a no-op when the store already
-    /// covers every namespace in the snapshot.
+    /// Refresh binary-index attachments after a commit.
+    ///
+    /// Namespace-only deltas do **not** require reloading the binary store: the
+    /// post-commit state rebuilds its [`BinaryRangeProvider`] with the updated
+    /// snapshot namespace table as a fallback, which lets novelty SIDs decode
+    /// correctly while preserving the existing store/cache identity. Reloading
+    /// here makes every namespace-introducing commit pay O(index-size) even
+    /// though the indexed root has not changed.
     pub(crate) async fn refresh_index(&self, state: &mut LedgerState) -> Result<()> {
         if crate::ns_helpers::binary_store_missing_snapshot_namespaces(state) {
-            self.attach_index(state).await?;
+            tracing::debug!(
+                ledger_id = state.ledger_id(),
+                "binary store predates snapshot namespaces; keeping existing store with snapshot namespace fallback"
+            );
         }
         Ok(())
     }
@@ -121,8 +128,10 @@ impl Fluree {
         let ledger_id = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
         info!(ledger_id = %ledger_id, "Creating ledger");
 
-        // 2. Register in nameservice via Publisher (fails if already exists)
-        match self.publisher()?.publish_ledger_init(&ledger_id).await {
+        // 2. Register in nameservice via the ledger-admin surface
+        //    (fails if already exists). Works for both ReadWrite and
+        //    Replicated nameservices; the latter goes through Raft.
+        match self.ledger_admin()?.init(&ledger_id).await {
             Ok(()) => {}
             Err(NameServiceError::LedgerAlreadyExists(a)) => {
                 return Err(ApiError::ledger_exists(a));
@@ -221,7 +230,7 @@ impl Fluree {
 
         let is_historical = at_commit.is_some();
 
-        self.nameservice()
+        self.branch_admin()?
             .create_branch(ledger_name, new_branch, source, at_commit)
             .await
             .map_err(|e| match e {
@@ -244,7 +253,7 @@ impl Fluree {
                         "failed to copy index to branch; branch will replay from genesis"
                     );
                 } else {
-                    self.publisher()?
+                    self.index_publisher()?
                         .publish_index(&new_id, source_record.index_t, index_cid)
                         .await?;
                 }

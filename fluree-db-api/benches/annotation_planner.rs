@@ -41,8 +41,6 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fluree_db_api::FlureeBuilder;
 use fluree_db_indexer::IndexerConfig;
@@ -96,7 +94,10 @@ mod support {
 
         let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
             fluree.backend().clone(),
-            Arc::new(fluree.nameservice_mode().clone()),
+            fluree
+                .nameservice_mode()
+                .publisher_arc()
+                .expect("test setup requires ReadWrite nameservice mode"),
             config,
         );
         let local = LocalSet::new();
@@ -282,7 +283,10 @@ async fn seed_ledger_and_optionally_seal(n: usize, seal: bool) -> (fluree_db_api
     } else {
         let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
             fluree.backend().clone(),
-            Arc::new(fluree.nameservice_mode().clone()),
+            fluree
+                .nameservice_mode()
+                .publisher_arc()
+                .expect("test setup requires ReadWrite nameservice mode"),
             IndexerConfig::small(),
         );
         let local = tokio::task::LocalSet::new();

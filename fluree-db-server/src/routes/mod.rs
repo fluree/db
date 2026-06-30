@@ -1,7 +1,7 @@
 //! HTTP route handlers and router configuration
 
 mod admin;
-mod admin_auth;
+pub(crate) mod admin_auth;
 mod commits;
 mod context;
 mod events;
@@ -32,6 +32,35 @@ use axum::{
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+/// Apply the Raft follower-forward middleware to a leader-only
+/// subrouter when the server was constructed with a Raft handle.
+/// Single-node and peer-mode deployments pass through unchanged.
+///
+/// Generic over the router's state type so it composes both before
+/// and after a downstream `.with_state(...)` call.
+#[cfg(feature = "raft")]
+fn apply_leader_forward<S>(router: Router<S>, state: &Arc<AppState>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if let Some(integration) = &state.raft {
+        router.layer(middleware::from_fn_with_state(
+            Arc::clone(&integration.forwarder),
+            fluree_db_consensus::raft::forward::forward_to_leader,
+        ))
+    } else {
+        router
+    }
+}
+
+#[cfg(not(feature = "raft"))]
+fn apply_leader_forward<S>(router: Router<S>, _state: &Arc<AppState>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+}
+
 /// Build the main application router
 pub fn build_router(state: Arc<AppState>) -> Router {
     // v1 API (versioned base path).
@@ -39,8 +68,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // Ledger names may contain `/`, so ledger-scoped routes use `*ledger`
     // (greedy tail) with the operation first (e.g. `/v1/fluree/query/<ledger...>`).
 
-    // Admin-protected routes (create, drop) - require admin token when configured
-    let v1_admin_protected_routes = Router::new()
+    // Admin-protected leader-coordinated writes — need to run on the
+    // current Raft leader so the state-machine proposal originates
+    // there. Followers transparently HTTP-forward via the layer
+    // applied below.
+    let v1_admin_protected_writes = Router::new()
         .route("/create", post(ledger::create))
         .route("/drop", post(ledger::drop))
         .route("/reindex", post(ledger::reindex))
@@ -50,31 +82,104 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/rebase", post(ledger::rebase))
         .route("/merge", post(ledger::merge))
         .route("/revert", post(ledger::revert))
-        // RDF export bypasses per-flake policy filtering today, so it lives in
-        // the admin-protected bracket alongside other root-level operations.
-        .route("/export/*ledger", post(export::export_ledger_tail))
         // Wholesale .flpack restore: creates a new ledger from a trusted
         // archive. Writes prebuilt index artifacts, so admin-gated.
         .route("/import/*ledger", post(import::import_ledger_tail))
-        // Negotiated upload flow for size-capped clients (mint/complete/status
-        // are admin-gated; the blob PUT below is token-authorized).
+        // Negotiated upload flow for size-capped clients (mint/complete
+        // are admin-gated; the blob PUT below is token-authorized;
+        // status is read-only and sits in the reads block).
         .route("/import-upload", post(import::mint_upload))
         .route(
             "/import-upload/:import_id/complete",
             post(import::complete_upload),
-        )
-        .route("/import-upload/:import_id", get(import::import_status));
+        );
 
     #[cfg(feature = "iceberg")]
-    let v1_admin_protected_routes =
-        v1_admin_protected_routes.route("/iceberg/map", post(iceberg::iceberg_map));
+    let v1_admin_protected_writes =
+        v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
 
-    let v1_admin_protected_routes = v1_admin_protected_routes
+    // Forward to the Raft leader (when running in Raft mode) before
+    // admin-token auth: an out-of-date follower with stale credentials
+    // shouldn't reject a request the leader would accept.
+    let v1_admin_protected_writes = apply_leader_forward(v1_admin_protected_writes, &state);
+
+    let v1_admin_protected_writes = v1_admin_protected_writes
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth::require_admin_token,
         ))
         .with_state(state.clone());
+
+    // Admin-protected reads — same admin-token bracket but no
+    // leader-forward. These either read ledger data (any node has it
+    // via replicated commit log + storage) or per-node ephemeral
+    // state. Leader-forwarding them would either burn an extra hop
+    // for no functional gain (export) or actively misroute the
+    // request away from the node that owns the state (import status,
+    // which lives in this node's `import_jobs` map).
+    let v1_admin_protected_reads = Router::new()
+        // RDF export — pure read; bypasses per-flake policy filtering
+        // today, hence admin-gated.
+        .route("/export/*ledger", post(export::export_ledger_tail))
+        // Status of a negotiated upload — reads this node's
+        // `state.import_jobs` map (each node owns the jobs it minted).
+        .route("/import-upload/:import_id", get(import::import_status));
+
+    let v1_admin_protected_reads = v1_admin_protected_reads
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth::require_admin_token,
+        ))
+        .with_state(state.clone());
+
+    // Leader-only writes outside the admin-token bracket: transactions,
+    // precomputed-commit push, and nameservice ref advances. Under
+    // Raft these all propose state-machine commands and must run on
+    // the current leader; followers transparently HTTP-forward via
+    // the layer below.
+    let v1_leader_only_routes = Router::new()
+        // Transaction endpoints
+        .route("/update", post(transact::update))
+        .route("/update/*ledger", post(transact::update_ledger_tail))
+        .route("/insert", post(transact::insert))
+        .route("/insert/*ledger", post(transact::insert_ledger_tail))
+        .route("/upsert", post(transact::upsert))
+        .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
+        // Commit-push endpoint (precomputed commits)
+        .route("/push/*ledger", post(push::push_ledger_tail))
+        // Nameservice ref endpoints (for remote sync)
+        .route(
+            "/nameservice/refs/:alias/commit",
+            post(nameservice_refs::push_commit_head),
+        )
+        .route(
+            "/nameservice/refs/:alias/index",
+            post(nameservice_refs::push_index_head),
+        )
+        .route(
+            "/nameservice/refs/:alias/init",
+            post(nameservice_refs::init_ledger),
+        );
+    let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
+
+    // Read-only routes that nonetheless need leader-forward because
+    // their backing state lives in the leader's per-process caches.
+    // Today: submission status, which reads from the
+    // [`CachingCommitter`]'s in-process idempotency cache. A follower
+    // serving this locally returns `Unknown` for a key the leader
+    // accepted (the cache is per-process) — leader-forward closes
+    // that hole. Note that this still has a known gap across leader
+    // transitions: the new leader's cache won't carry entries the
+    // old leader served; clients hitting that gap need to re-issue
+    // (idempotency dedups the actual write) or verify via the commit
+    // log endpoint. Serving from replicated idempotency state would
+    // close the gap entirely but requires adding op-type metadata to
+    // the persisted `ApplyRecord` — tracked as a follow-up.
+    let v1_leader_forwarded_reads = Router::new().route(
+        "/submissions/:key/*ledger",
+        get(submissions::submission_status),
+    );
+    let v1_leader_forwarded_reads = apply_leader_forward(v1_leader_forwarded_reads, &state);
 
     let v1 = Router::new()
         // Admin endpoints (stats and whoami are read-only, no auth required)
@@ -87,8 +192,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/branch/*ledger", get(ledger::list_branches))
         .route("/merge-preview/*ledger", get(ledger::merge_preview))
         .route("/revert-preview/*ledger", get(ledger::revert_preview))
-        // Merge admin-protected routes
-        .merge(v1_admin_protected_routes)
+        // Merge admin-protected leader-coordinated writes
+        .merge(v1_admin_protected_writes)
+        // Merge admin-protected local reads
+        .merge(v1_admin_protected_reads)
+        // Merge leader-only routes (Raft-forwarded when applicable)
+        .merge(v1_leader_only_routes)
         // Query endpoints
         .route("/query", get(query::query).post(query::query))
         .route(
@@ -109,25 +218,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/explain/*ledger",
             get(query::explain_ledger_tail).post(query::explain_ledger_tail),
         )
-        // Transaction endpoints
-        .route("/update", post(transact::update))
-        .route("/update/*ledger", post(transact::update_ledger_tail))
-        .route("/insert", post(transact::insert))
-        .route("/insert/*ledger", post(transact::insert_ledger_tail))
-        .route("/upsert", post(transact::upsert))
-        .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
-        // Submission status lookup (by idempotency key)
-        .route(
-            "/submissions/:key/*ledger",
-            get(submissions::submission_status),
-        )
+        // Submission status lookup (by idempotency key). Mounted as
+        // a leader-forwarded sub-router above so a follower doesn't
+        // answer from its empty per-process cache.
+        .merge(v1_leader_forwarded_reads)
         // Default context management
         .route(
             "/context/*ledger",
             get(context::get_context).put(context::set_context),
         )
-        // Commit-push endpoint (precomputed commits)
-        .route("/push/*ledger", post(push::push_ledger_tail))
         // Commit show endpoint (decoded commit with resolved IRIs)
         .route("/show/*ledger", get(show::show_ledger_tail))
         // Commit log endpoint (lightweight per-commit summaries)
@@ -156,19 +255,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/storage/objects/:cid",
             get(storage_proxy::get_object_by_cid),
-        )
-        // Nameservice ref endpoints (for remote sync)
-        .route(
-            "/nameservice/refs/:alias/commit",
-            post(nameservice_refs::push_commit_head),
-        )
-        .route(
-            "/nameservice/refs/:alias/index",
-            post(nameservice_refs::push_index_head),
-        )
-        .route(
-            "/nameservice/refs/:alias/init",
-            post(nameservice_refs::init_ledger),
         )
         .route("/nameservice/snapshot", get(nameservice_refs::snapshot))
         // Stub endpoints (not yet implemented)

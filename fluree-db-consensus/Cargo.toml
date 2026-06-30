@@ -6,23 +6,77 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Enables the Raft-replicated `Committer` implementation. Off by default
+# so that monolithic users don't compile (or link) openraft and its
+# transitive dependencies.
+raft = ["dep:openraft", "dep:postcard", "dep:reqwest", "dep:axum", "dep:futures", "dep:xxhash-rust", "dep:tokio-util"]
+
 [dependencies]
 fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-transact = { path = "../fluree-db-transact" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 
 async-trait = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-dashmap = { workspace = true }
-moka = { workspace = true, features = ["future"] }
 tracing = { workspace = true }
+moka = { workspace = true, features = ["future"] }
+
+# Optional, gated behind the `raft` feature. Pinned to a current
+# release line — bumping should be tracked alongside any state-machine
+# / storage-format changes.
+openraft = { version = "0.9", optional = true, features = [
+    "serde",
+    "storage-v2",
+    "single-term-leader",
+] }
+
+# Used by Raft storage backends for compact serialization of log
+# entries, vote, and snapshot metadata. Gated behind `raft` because
+# only the storage impls reach for it.
+postcard = { workspace = true, optional = true }
+
+# HTTP client for the inter-node Raft RPC layer. Gated behind `raft`
+# because only the network impl reaches for it.
+reqwest = { workspace = true, optional = true }
+
+# HTTP server for the inter-node Raft RPC layer; consumers nest the
+# returned `axum::Router` under whatever path they want. Gated behind
+# `raft` because only the network impl reaches for it.
+axum = { workspace = true, optional = true }
+
+# `FutureExt::catch_unwind` for the per-entry panic boundary in the
+# commit worker. Gated behind `raft` because only that path needs it.
+futures = { workspace = true, optional = true }
+
+# Deterministic, fast hash for the worker-ownership rendezvous function.
+# Every node must agree on hash values for cluster-wide consistency, so
+# we use xxh64 (stable across versions) rather than std's randomly-seeded
+# DefaultHasher. Gated behind `raft` because only the worker supervisor
+# reaches for it.
+xxhash-rust = { workspace = true, features = ["xxh64"], optional = true }
+
+# `CancellationToken` for graceful shutdown of the worker supervisor's
+# select loop. Gated behind `raft` because only that lifecycle path
+# uses it.
+tokio-util = { version = "0.7", optional = true }
+
+# In-memory concurrent map for the per-process WaiterMap: queue_id →
+# oneshot::Sender. Gated behind `raft` because only the queue-mediated
+# committer / state machine adapter reach for it.
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tempfile = "3.19"
 
 [lints]
 workspace = true

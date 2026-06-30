@@ -11,8 +11,8 @@ use super::value::ComparableValue;
 use crate::ir::{ArithmeticOp, CompareOp};
 
 use super::{
-    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, list, logical, numeric,
-    path, rdf, string, types, uuid, vector,
+    arithmetic, cast, conditional, datetime, fluree, fulltext, geo, hash, list, logical, metadata,
+    numeric, path, rdf, string, types, uuid, vector,
 };
 
 impl Function {
@@ -43,12 +43,14 @@ impl Function {
             Function::Sub => ArithmeticOp::Sub.eval(args, row, ctx),
             Function::Mul => ArithmeticOp::Mul.eval(args, row, ctx),
             Function::Div => ArithmeticOp::Div.eval(args, row, ctx),
+            Function::Mod => ArithmeticOp::Mod.eval(args, row, ctx),
             Function::Negate => arithmetic::eval_negate(args, row, ctx),
 
             // Logical operators
             Function::And => logical::eval_and(args, row, ctx),
             Function::Or => logical::eval_or(args, row, ctx),
             Function::Not => logical::eval_not(args, row, ctx),
+            Function::Xor => logical::eval_xor(args, row, ctx),
             Function::In => logical::eval_in(args, row, ctx),
             Function::NotIn => logical::eval_not_in(args, row, ctx),
 
@@ -66,6 +68,12 @@ impl Function {
             Function::StrBefore => string::eval_str_before(args, row, ctx),
             Function::StrAfter => string::eval_str_after(args, row, ctx),
             Function::Replace => string::eval_replace(args, row, ctx),
+            Function::ReplaceAll => string::eval_replace_all(args, row, ctx),
+            Function::Trim => string::eval_trim(args, row, ctx, string::TrimSide::Both),
+            Function::LTrim => string::eval_trim(args, row, ctx, string::TrimSide::Left),
+            Function::RTrim => string::eval_trim(args, row, ctx, string::TrimSide::Right),
+            Function::Left => string::eval_left_right(args, row, ctx, true),
+            Function::Right => string::eval_left_right(args, row, ctx, false),
             Function::Substr => string::eval_substr(args, row, ctx),
             Function::EncodeForUri => string::eval_encode_for_uri(args, row, ctx),
             Function::StrDt => string::eval_str_dt(args, row, ctx),
@@ -77,6 +85,10 @@ impl Function {
             Function::Ceil => numeric::eval_ceil(args, row, ctx),
             Function::Floor => numeric::eval_floor(args, row, ctx),
             Function::Rand => numeric::eval_rand(args),
+            Function::Sqrt => numeric::eval_sqrt(args, row, ctx),
+            Function::Sign => numeric::eval_sign(args, row, ctx),
+            Function::Ln => numeric::eval_ln(args, row, ctx),
+            Function::Pow => numeric::eval_pow(args, row, ctx),
 
             // DateTime functions
             Function::Now => datetime::eval_now(args),
@@ -187,13 +199,23 @@ impl Function {
             Function::Last => list::eval_last(args, row, ctx),
             Function::Reverse => list::eval_reverse_string(args, row, ctx),
             Function::ListIndex => list::eval_list_index(args, row, ctx),
+            Function::RelType => metadata::eval_rel_type(args, row, ctx),
+            Function::StartNode => metadata::eval_start_node(args, row, ctx),
+            Function::EndNode => metadata::eval_end_node(args, row, ctx),
             // List-returning only; no scalar value (handled by the
             // binding-producing path in `try_eval_to_binding`).
             Function::Tail
             | Function::MakeList
             | Function::Nodes
             | Function::Range
-            | Function::PathPairs => Ok(None),
+            | Function::PathPairs
+            | Function::Relationships
+            | Function::MakeRel
+            | Function::MakePath
+            | Function::Split
+            | Function::Labels
+            | Function::Keys
+            | Function::Properties => Ok(None),
 
             // Unknown function
             Function::Custom(name) => Err(QueryError::InvalidFilter(format!(

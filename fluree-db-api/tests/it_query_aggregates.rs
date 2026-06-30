@@ -8,11 +8,12 @@
 //! - `(count *)` - count all rows in group
 //! - `(groupconcat ?x ", ")` - separator as second argument
 
-mod support;
-
+use crate::support;
+use crate::support::{
+    context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger,
+};
 use fluree_db_api::FlureeBuilder;
 use serde_json::{json, Value as JsonValue};
-use support::{context_ex_schema, genesis_ledger, normalize_rows, MemoryFluree, MemoryLedger};
 
 async fn seed_people(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
@@ -213,6 +214,42 @@ async fn aggregates_min_implicit_grouping() {
         .expect("query");
     let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
     assert_eq!(json_rows, json!([5]));
+}
+
+#[tokio::test]
+async fn aggregates_sum_avg_over_empty_match_is_zero() {
+    // SPARQL↔JSON-LD parity (#1374 review): implicit-single-group SUM/AVG over
+    // an empty match return `0` (matching COUNT), not an unbound cell. The
+    // SPARQL surface is covered in it_query_sparql_indexed.rs; both surfaces
+    // share the aggregate IR, so this guards against them diverging.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "query/aggregate-empty:main").await;
+    let ctx = context_ex_schema();
+
+    // `ex:doesNotExist` is never asserted → the match is empty.
+    let sum_q = json!({
+        "@context": ctx,
+        "select": "(sum ?x)",
+        "where": { "ex:doesNotExist": "?x" }
+    });
+    let sum = support::query_jsonld(&fluree, &ledger, &sum_q)
+        .await
+        .expect("sum query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    assert_eq!(sum, json!([0]), "SUM over an empty match should be 0");
+
+    let avg_q = json!({
+        "@context": ctx,
+        "select": "(avg ?x)",
+        "where": { "ex:doesNotExist": "?x" }
+    });
+    let avg = support::query_jsonld(&fluree, &ledger, &avg_q)
+        .await
+        .expect("avg query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld");
+    assert_eq!(avg, json!([0]), "AVG over an empty match should be 0");
 }
 
 #[tokio::test]

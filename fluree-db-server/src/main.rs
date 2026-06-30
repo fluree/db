@@ -2,11 +2,17 @@
 //!
 //! Run with: `cargo run -p fluree-db-server -- --help`
 
+// Opt-in global allocator (see the `mimalloc` feature). Kept in the binary, not
+// the library, so embedders of `fluree_db_server` keep their own allocator.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{CommandFactory, FromArgMatches};
 use fluree_db_server::{
     config_file::{config_error_is_fatal, load_and_merge_config},
     telemetry::{init_logging, shutdown_tracer, TelemetryConfig},
-    FlureeServer, ServerConfig,
+    FlureeServerBuilder, ServerConfig,
 };
 
 #[tokio::main]
@@ -53,8 +59,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Starting Fluree server"
     );
 
-    // Create and run server
-    let server = FlureeServer::new(config).await?;
+    // Bootstrap the Raft integration when raft mode is enabled in
+    // config. Validation guarantees node_id / storage_path /
+    // listen_addr are all set if we get here with raft_enabled.
+    #[allow(unused_mut)]
+    let mut builder = FlureeServerBuilder::for_config(config.clone());
+    #[cfg(feature = "raft")]
+    if config.raft_enabled {
+        use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
+        use std::sync::Arc;
+
+        let bootstrap = RaftBootstrapConfig::new(
+            config.raft_node_id.expect("validated"),
+            config.raft_storage_path.clone().expect("validated"),
+        );
+        let raft_listen = config.raft_listen_addr.expect("validated");
+        tracing::info!(
+            node_id = config.raft_node_id.unwrap(),
+            raft_listen = %raft_listen,
+            storage = %bootstrap.storage_path.display(),
+            "Bootstrapping Raft integration"
+        );
+        let integration = Arc::new(RaftIntegration::bootstrap(bootstrap).await?);
+        builder = builder.with_raft(integration, raft_listen);
+    }
+
+    let server = builder.build().await?;
     let result = server.run().await;
 
     // Graceful shutdown of telemetry

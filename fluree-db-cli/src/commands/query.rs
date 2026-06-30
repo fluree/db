@@ -1,5 +1,5 @@
 use crate::cli::PolicyArgs;
-use crate::commands::insert::resolve_positional_args;
+use crate::commands::insert::resolve_inputs;
 use crate::commands::query_stream::{self, NdjsonConsumer};
 use crate::context::{self, LedgerMode};
 use crate::detect;
@@ -213,6 +213,7 @@ fn inject_sparql_from_before_where(sparql: &str, from_iri: &str) -> Option<Strin
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     args: &[String],
+    ledger_flag: Option<&str>,
     expr: Option<&str>,
     file_flag: Option<&Path>,
     format_str: &str,
@@ -222,6 +223,7 @@ pub async fn run(
     explain: bool,
     sparql_flag: bool,
     fql_flag: bool,
+    cypher_flag: bool,
     at: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
@@ -232,7 +234,7 @@ pub async fn run(
     const BENCH_ROWS: usize = 5;
     const DEFAULT_TABLE_PREVIEW_ROWS: usize = 200;
     let limit = if bench { Some(BENCH_ROWS) } else { None };
-    let (explicit_ledger, positional_inline, positional_file) = resolve_positional_args(args)?;
+    let (explicit_ledger, positional_inline, positional_file) = resolve_inputs(ledger_flag, args)?;
 
     // Resolve input: -e > positional inline > -f > positional file > stdin
     let source = input::resolve_input(
@@ -245,12 +247,20 @@ pub async fn run(
 
     // For format detection, prefer the -f path, then positional file
     let detect_path = file_flag.or(positional_file.as_deref());
-    let query_format = detect::detect_query_format(detect_path, &content, sparql_flag, fql_flag)?;
+    // Cypher is dispatched out-of-band (separate API method + result shape);
+    // the placeholder format is never used because that path returns early.
+    let is_cypher = detect::detect_is_cypher(detect_path, &content, cypher_flag);
+    let query_format = if is_cypher {
+        detect::QueryFormat::JsonLd
+    } else {
+        detect::detect_query_format(detect_path, &content, sparql_flag, fql_flag)?
+    };
 
     // Parse output format
     let output_format = match format_str.to_lowercase().as_str() {
         "json" | "jsonld" | "json-ld" => OutputFormatKind::Json,
         "typed-json" | "typed_json" | "typedjson" => OutputFormatKind::TypedJson,
+        "cypher-json" | "cypher_json" | "cypherjson" => OutputFormatKind::CypherJson,
         "table" => OutputFormatKind::Table,
         "csv" => OutputFormatKind::Csv,
         "tsv" => OutputFormatKind::Tsv,
@@ -258,7 +268,7 @@ pub async fn run(
         other => {
             return Err(CliError::Usage(format!(
                 "unknown output format '{other}'; valid formats: json, jsonld, typed-json, \
-                 table, csv, tsv, ndjson"
+                 cypher-json, table, csv, tsv, ndjson"
             )));
         }
     };
@@ -333,6 +343,20 @@ pub async fn run(
             context::try_server_route(mode, dirs)
         }
     };
+
+    if is_cypher {
+        return run_cypher_query(
+            mode,
+            &content,
+            output_format,
+            explain,
+            bench,
+            &tracking,
+            at,
+            policy,
+        )
+        .await;
+    }
 
     match mode {
         LedgerMode::Tracked {
@@ -1033,12 +1057,13 @@ fn inject_remote_time_travel_sparql(
 
 /// Stream a SELECT query against a local ledger as NDJSON.
 ///
-/// Mirrors the server's single-ledger `/stream/query/<ledger>` shape: streams
-/// against the current head with no per-request policy or time travel (those
-/// route through the server's dataset path, which the in-process producer does
-/// not build here). The producer ([`Fluree::run_stream_query`]) and the stdout
-/// consumer run concurrently on this task via `join!`, with the bounded channel
-/// providing backpressure.
+/// Mirrors the server's `/stream/query/<ledger>` routing: plain head-time
+/// queries with no policy take the lean single-ledger producer
+/// ([`Fluree::run_stream_query`]); `--at` and/or `--policy*` route through the
+/// dataset producer ([`Fluree::run_stream_query_dataset`]) so time travel and
+/// per-request policy enforcement run exactly like the buffered local path.
+/// The producer and the stdout consumer run concurrently on this task via
+/// `join!`, with the bounded channel providing backpressure.
 #[allow(clippy::too_many_arguments)]
 async fn run_local_ndjson_stream(
     fluree: &fluree_db_api::Fluree,
@@ -1050,48 +1075,165 @@ async fn run_local_ndjson_stream(
     envelope: bool,
     tracking: TrackingFlags,
 ) -> CliResult<()> {
-    if at.is_some() {
-        return Err(CliError::Usage(
-            "time travel (--at) is not supported with --format ndjson on local ledgers; \
-             use --remote or a buffered --format"
-                .to_string(),
-        ));
-    }
-    if policy.is_set() {
-        return Err(CliError::Usage(
-            "per-request policy (--policy*) is not supported with --format ndjson on local \
-             ledgers; use --remote or a buffered --format"
-                .to_string(),
-        ));
-    }
-
-    let input = match query_format {
-        detect::QueryFormat::Sparql => OwnedStreamQuery::Sparql(content.to_string()),
-        detect::QueryFormat::JsonLd => OwnedStreamQuery::JsonLd(serde_json::from_str(content)?),
-    };
-
-    // Owned ledger state for the producer; a planning view carrying the
-    // ledger's default context so PREFIX/@context-less queries still resolve
-    // prefixes (parity with the buffered local path's db_with_default_context).
-    let ledger_state = fluree.ledger(alias).await?;
-    let planning_view = GraphDb::from_ledger_state(&ledger_state)
-        .with_default_context(fluree.get_default_context(alias).await?);
-    let plan = fluree.plan_stream_query(&planning_view, &input).await?;
-
     let tracker = Tracker::new(tracking.as_options().unwrap_or_default());
     let exec_opts = QueryExecutionOptions::default();
-
     let (tx, rx) = mpsc::channel::<bytes::Bytes>(STREAM_CHANNEL_DEPTH);
     let mut consumer = NdjsonConsumer::new(BufWriter::new(std::io::stdout()), envelope);
-
     let timer = Instant::now();
-    let producer = fluree.run_stream_query(ledger_state, plan, tracker, exec_opts, tx);
-    let driver = query_stream::drive_channel(rx, &mut consumer);
-    let ((), drive_res) = tokio::join!(producer, driver);
-    drive_res?;
+
+    if at.is_some() || policy.is_set() {
+        run_local_ndjson_stream_dataset(
+            fluree,
+            alias,
+            content,
+            query_format,
+            at,
+            policy,
+            tracker,
+            exec_opts,
+            tx,
+            &mut consumer,
+            rx,
+        )
+        .await?;
+    } else {
+        let input = match query_format {
+            detect::QueryFormat::Sparql => OwnedStreamQuery::Sparql(content.to_string()),
+            detect::QueryFormat::JsonLd => OwnedStreamQuery::JsonLd(serde_json::from_str(content)?),
+        };
+
+        // Owned ledger state for the producer; a planning view carrying the
+        // ledger's default context so PREFIX/@context-less queries still resolve
+        // prefixes (parity with the buffered local path's db_with_default_context).
+        let ledger_state = fluree.ledger(alias).await?;
+        let planning_view = GraphDb::from_ledger_state(&ledger_state)
+            .with_default_context(fluree.get_default_context(alias).await?);
+        let plan = fluree.plan_stream_query(&planning_view, &input).await?;
+
+        let producer = fluree.run_stream_query(ledger_state, plan, tracker, exec_opts, tx);
+        let driver = query_stream::drive_channel(rx, &mut consumer);
+        let ((), drive_res) = tokio::join!(producer, driver);
+        drive_res?;
+    }
+
     let outcome = consumer.finish()?;
     print_stream_footer(&outcome, timer.elapsed());
     Ok(())
+}
+
+/// Dataset variant of [`run_local_ndjson_stream`]: builds a single-ledger
+/// `DataSetDb` carrying the time-travel spec and policy options, then streams
+/// through [`Fluree::run_stream_query_dataset`]. Same wire protocol as the
+/// single-ledger path; required for `--at` (historical snapshot loading) and
+/// `--policy*` (per-source policy enforcement).
+#[allow(clippy::too_many_arguments)]
+async fn run_local_ndjson_stream_dataset(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    content: &str,
+    query_format: detect::QueryFormat,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+    tracker: Tracker,
+    exec_opts: QueryExecutionOptions,
+    tx: mpsc::Sender<bytes::Bytes>,
+    consumer: &mut NdjsonConsumer<BufWriter<std::io::Stdout>>,
+    rx: mpsc::Receiver<bytes::Bytes>,
+) -> CliResult<()> {
+    let qc_opts = if policy.is_set() {
+        policy.to_options().map_err(CliError::Usage)?
+    } else {
+        fluree_db_api::GovernanceOptions::default()
+    };
+    let time_spec = at.map(parse_time_spec);
+
+    let (mut dataset, input) = match query_format {
+        detect::QueryFormat::Sparql => {
+            // Local time-travel + SPARQL via FROM is encoded directly in the
+            // dataset spec (no SPARQL string rewrite needed). Reject queries
+            // that already carry their own FROM/FROM NAMED — the dataset
+            // spec we'd build would conflict with the in-query clauses, and
+            // the remote `--at` path makes the same call.
+            if at.is_some()
+                && fluree_db_api::sparql_dataset_ledger_ids(content)
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+            {
+                return Err(CliError::Usage(
+                    "SPARQL query already contains FROM/FROM NAMED; \
+                     for time travel, encode it in the FROM IRI \
+                     (e.g., FROM <ledger@t:1>) instead of using --at"
+                        .to_string(),
+                ));
+            }
+            let mut source = fluree_db_api::GraphSource::new(alias);
+            if let Some(spec) = time_spec {
+                source = source.with_time(spec);
+            }
+            let mut dataset_spec = fluree_db_api::DatasetSpec::new();
+            dataset_spec.default_graphs.push(source);
+            let dataset = fluree
+                .build_stream_dataset_from_spec(&dataset_spec, &qc_opts)
+                .await?;
+            (dataset, OwnedStreamQuery::Sparql(content.to_string()))
+        }
+        detect::QueryFormat::JsonLd => {
+            let mut json_query: serde_json::Value = serde_json::from_str(content)?;
+            let obj = json_query.as_object_mut().ok_or_else(|| {
+                CliError::Input("JSON-LD query must be a JSON object".to_string())
+            })?;
+
+            let from_id = match time_spec {
+                Some(spec) => {
+                    attach_time_suffix_preserving_fragment(alias, &time_spec_to_suffix(&spec))
+                }
+                None => alias.to_string(),
+            };
+            obj.insert("from".to_string(), serde_json::Value::String(from_id));
+
+            inject_policy_into_jsonld_opts(obj, policy)?;
+            let dataset = fluree.build_stream_dataset(&json_query).await?;
+            (dataset, OwnedStreamQuery::JsonLd(json_query))
+        }
+    };
+
+    // Parity with the lean ndjson path and the buffered local path: attach the
+    // ledger's stored default context to the primary view if the dataset
+    // builder didn't load it (it doesn't, today — `load_view_from_source`
+    // routes through `db()` / `db_at()`, not the `_with_default_context`
+    // variants). Without this, PREFIX-less SPARQL and @context-less JSON-LD
+    // queries silently return empty rows on the streaming dataset path.
+    if let Some(primary) = dataset.primary_mut() {
+        if primary.default_context.is_none() {
+            primary.default_context = fluree.get_default_context(alias).await?;
+        }
+    }
+
+    let plan = fluree.plan_stream_query_dataset(&dataset, &input).await?;
+    let producer = fluree.run_stream_query_dataset(dataset, plan, tracker, exec_opts, tx);
+    let driver = query_stream::drive_channel(rx, consumer);
+    let ((), drive_res) = tokio::join!(producer, driver);
+    drive_res?;
+    Ok(())
+}
+
+/// Fold CLI `--policy*` flags into a JSON-LD query body's `opts` map. Mirrors
+/// the server-side header injection: explicit body opts always win over CLI
+/// flags.
+fn inject_policy_into_jsonld_opts(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    policy: &PolicyArgs,
+) -> CliResult<()> {
+    if !policy.is_set() {
+        return Ok(());
+    }
+    let opts = body
+        .entry("opts".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let opts_obj = opts
+        .as_object_mut()
+        .ok_or_else(|| CliError::Input("query 'opts' must be a JSON object".to_string()))?;
+    policy.inject_into_opts(opts_obj).map_err(CliError::Input)
 }
 
 /// Print the NDJSON streaming footer to stderr: row count, wall-clock time, and
@@ -1109,6 +1251,135 @@ fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time
         parts.push(format!("fuel {fuel}"));
     }
     eprintln!("({})", parts.join(", "));
+}
+
+/// Execute a Cypher read query against a local ledger view.
+///
+/// Cypher rides a separate API method (`query_cypher`) and renders its
+/// SELECT-shaped results as JSON-LD (the documented default). Remote/HTTP
+/// execution is not yet available, so a server-routed ledger errors with a
+/// pointer to `--direct`.
+#[allow(clippy::too_many_arguments)]
+async fn run_cypher_query(
+    mode: LedgerMode,
+    content: &str,
+    output_format: OutputFormatKind,
+    explain: bool,
+    bench: bool,
+    tracking: &TrackingFlags,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+) -> CliResult<()> {
+    if explain {
+        return Err(CliError::Usage(
+            "--explain is not yet supported for Cypher queries".to_string(),
+        ));
+    }
+    if bench {
+        return Err(CliError::Usage(
+            "--bench is not yet supported for Cypher queries".to_string(),
+        ));
+    }
+    if tracking.any() {
+        return Err(CliError::Usage(
+            "--track* / --max-fuel are not yet supported for Cypher queries".to_string(),
+        ));
+    }
+    // Cypher results render as a single cypher-json document, not a row stream,
+    // so the NDJSON path (and its `--envelope` shaping) does not apply. Reject it
+    // explicitly rather than silently emitting cypher-json — which would make
+    // `--envelope` look honored when it is not.
+    if output_format == OutputFormatKind::Ndjson {
+        return Err(CliError::Usage(
+            "--format ndjson is not supported for Cypher queries; Cypher renders as \
+             cypher-json (use --format json | typed-json | csv | tsv)"
+                .to_string(),
+        ));
+    }
+
+    let (fluree, alias) = match mode {
+        LedgerMode::Local { fluree, alias } => (fluree, alias),
+        LedgerMode::Tracked { .. } => {
+            return Err(CliError::Usage(
+                "Cypher queries are only supported on local ledgers; the HTTP Cypher \
+                 endpoint is not yet available.\n  \
+                 Retry with --direct to bypass the server route."
+                    .to_string(),
+            ));
+        }
+    };
+
+    let view = match at {
+        Some(at_str) => {
+            let spec = parse_time_spec(at_str);
+            fluree.db_at_with_default_context(&alias, spec).await?
+        }
+        None => fluree.db_with_default_context(&alias).await?,
+    };
+    let view = if policy.is_set() {
+        let opts = policy.to_options().map_err(CliError::Usage)?;
+        fluree.wrap_policy(view, &opts, None).await?
+    } else {
+        view
+    };
+
+    // Accept either raw Cypher or a `{"cypher": "...", "params": {...}}`
+    // envelope (the latter carries parameters).
+    let (cypher, params) = fluree_db_api::extract_cypher_envelope(content);
+    let timer = Instant::now();
+    let result = fluree
+        .query_cypher_with_params(&view, &cypher, params.as_ref())
+        .await?;
+    let elapsed = timer.elapsed();
+
+    // Delimited fast path mirrors the SPARQL/JSON-LD handler.
+    if matches!(output_format, OutputFormatKind::Tsv | OutputFormatKind::Csv) {
+        let total_rows = result.row_count();
+        let bytes = if output_format == OutputFormatKind::Tsv {
+            result.to_tsv_bytes(&view.snapshot)?
+        } else {
+            result.to_csv_bytes(&view.snapshot)?
+        };
+        use std::io::Write;
+        std::io::stdout().write_all(&bytes)?;
+        eprintln!(
+            "({} rows, {})",
+            format_count(total_rows),
+            format_duration(elapsed)
+        );
+        return Ok(());
+    }
+
+    // Cypher defaults to cypher-json (Neo4j-compatible, native scalars).
+    // `--format json|jsonld` gives RDF JSON-LD; `--format typed-json` the typed
+    // form. The default global `--format table` (and csv/tsv) → cypher-json,
+    // since Cypher has no tabular renderer of its own.
+    let (formatted_json, display_format) = match output_format {
+        OutputFormatKind::Json => (
+            result.to_jsonld_async(view.as_graph_db_ref()).await?,
+            OutputFormatKind::Json,
+        ),
+        OutputFormatKind::TypedJson => {
+            let config = fluree_db_api::FormatterConfig::typed_json();
+            (
+                result.format_async(view.as_graph_db_ref(), &config).await?,
+                OutputFormatKind::TypedJson,
+            )
+        }
+        _ => (
+            result.to_cypher_json_async(view.as_graph_db_ref()).await?,
+            OutputFormatKind::CypherJson,
+        ),
+    };
+    let output = output::format_result(
+        &formatted_json,
+        display_format,
+        detect::QueryFormat::JsonLd,
+        None,
+    )?;
+    println!("{}", output.text);
+    print_footer(output.total_rows, None, elapsed);
+    Ok(())
 }
 
 /// Print the timing/row-count footer line to stderr.

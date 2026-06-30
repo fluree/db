@@ -20,7 +20,7 @@ fluree graph list [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger identifier (e.g. `mydb` or `mydb:feature-x`). Defaults to the active ledger. |
+| `-l, --ledger <LEDGER>` | Ledger identifier (e.g. `mydb` or `mydb:feature-x`). Defaults to the active ledger. |
 | `--remote <REMOTE>` | List graphs on a remote server by remote name (e.g. `origin`). |
 | `--json` | Emit the filtered `named-graphs` JSON array instead of a table. |
 | `--include-system` | Include the default graph and the system `txn-meta` / `config` graphs. Off by default. |
@@ -69,7 +69,7 @@ fluree graph drop <IRI> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--ledger <LEDGER>` | Ledger identifier. Defaults to the active ledger. |
+| `-l, --ledger <LEDGER>` | Ledger identifier. Defaults to the active ledger. |
 | `--remote <REMOTE>` | Execute against a remote server by remote name. |
 
 **Description:**

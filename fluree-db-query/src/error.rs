@@ -121,6 +121,21 @@ impl QueryError {
         )
     }
 
+    /// Returns true when an expression error should leave the variable UNBOUND
+    /// for a SELECT/BIND/ORDER-BY solution (SPARQL 1.1 §18.5 `Extend`) instead
+    /// of aborting the query.
+    ///
+    /// Narrower than [`Self::can_demote_in_expression`]: only *dynamic value*
+    /// errors (arithmetic on incompatible operands, comparison errors) demote.
+    /// *Structural* errors — a built-in called with the wrong arity, an unknown
+    /// datatype IRI ([`Self::InvalidExpression`]), or a malformed filter
+    /// ([`Self::InvalidFilter`]) — describe a malformed query, not dirty data, so
+    /// they still surface as a query error. (Dynamic type mismatches already
+    /// evaluate to `Ok(None)` → unbound without raising an error at all.)
+    pub fn demotes_to_unbound_in_extend(&self) -> bool {
+        matches!(self, Self::Arithmetic(_) | Self::Comparison(_))
+    }
+
     /// Create an execution error (runtime configuration/environment issue).
     pub fn execution(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
@@ -156,5 +171,25 @@ mod tests {
                 .can_demote_in_expression()
         );
         assert!(!QueryError::Internal("runtime failure".into()).can_demote_in_expression());
+    }
+
+    #[test]
+    fn extend_demotes_only_dynamic_value_errors() {
+        // §18.5 Extend: dynamic value errors leave the variable unbound.
+        assert!(
+            QueryError::Arithmetic(crate::eval::ArithmeticError::TypeMismatch)
+                .demotes_to_unbound_in_extend()
+        );
+        // Structural errors (arity, unknown datatype IRI) stay query errors.
+        assert!(
+            !QueryError::InvalidExpression("IRI requires exactly 1 argument".into())
+                .demotes_to_unbound_in_extend()
+        );
+        assert!(!QueryError::InvalidFilter("bad regex".into()).demotes_to_unbound_in_extend());
+        // Fatal infrastructure errors always propagate.
+        assert!(
+            !QueryError::dictionary_lookup("missing string id".to_string())
+                .demotes_to_unbound_in_extend()
+        );
     }
 }

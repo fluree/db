@@ -5,7 +5,7 @@
 //! credentials.
 
 use async_trait::async_trait;
-use fluree_db_nameservice::{NameService, NameServiceError, NsRecord, Result};
+use fluree_db_nameservice::{NameServiceError, NsRecord, Result};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::fmt::Debug;
@@ -47,6 +47,17 @@ struct NsRecordResponse {
     retracted: bool,
     #[serde(default)]
     config_id: Option<String>,
+    /// Parent branch this branch was forked from. Required for
+    /// peers to build the `BranchedContentStore` that resolves
+    /// commits inherited from the source branch — without it, all
+    /// reads of inherited commits 404 even when the ledger is
+    /// reachable.
+    #[serde(default)]
+    source_branch: Option<String>,
+    /// Number of child branches forked from this one. Defaults to
+    /// 0 when an older server omits the field.
+    #[serde(default)]
+    branches: u32,
 }
 
 impl NsRecordResponse {
@@ -81,8 +92,8 @@ impl NsRecordResponse {
                 .default_context
                 .and_then(|s| s.parse::<ContentId>().ok()),
             retracted: self.retracted,
-            source_branch: None,
-            branches: 0,
+            source_branch: self.source_branch,
+            branches: self.branches,
         }
     }
 }
@@ -158,7 +169,7 @@ impl fluree_db_nameservice::ConfigLookup for ProxyNameService {
 }
 
 #[async_trait]
-impl NameService for ProxyNameService {
+impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
         let url = self.ns_url(ledger_id);
 
@@ -201,37 +212,12 @@ impl NameService for ProxyNameService {
         // The peer maintains its own view of known ledgers via SSE events
         Ok(Vec::new())
     }
-
-    async fn create_branch(
-        &self,
-        _ledger_name: &str,
-        _new_branch: &str,
-        _source_branch: &str,
-        _at_commit: Option<(fluree_db_core::ContentId, i64)>,
-    ) -> Result<()> {
-        // Proxy peers forward branch creation to the tx server via HTTP
-        Err(NameServiceError::storage(
-            "create_branch not supported in proxy mode".to_string(),
-        ))
-    }
-
-    async fn drop_branch(&self, _ledger_id: &str) -> Result<Option<u32>> {
-        // Proxy peers forward branch deletion to the tx server via HTTP
-        Err(NameServiceError::storage(
-            "drop_branch not supported in proxy mode".to_string(),
-        ))
-    }
-
-    async fn reset_head(
-        &self,
-        _ledger_id: &str,
-        _snapshot: fluree_db_nameservice::NsRecordSnapshot,
-    ) -> Result<()> {
-        Err(NameServiceError::storage(
-            "reset_head not supported in proxy mode".to_string(),
-        ))
-    }
 }
+
+// No `BranchLifecycle` impl for `ProxyNameService`: peer mode has no
+// authority to mutate the nameservice. Branch lifecycle requests are
+// served by the upstream transaction server (via its own HTTP routes,
+// not through this trait).
 
 #[async_trait]
 impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
@@ -242,11 +228,18 @@ impl fluree_db_nameservice::GraphSourceLookup for ProxyNameService {
         Ok(None) // Proxy doesn't have local graph source records
     }
 
-    async fn lookup_any(
-        &self,
-        _resource_id: &str,
-    ) -> Result<fluree_db_nameservice::NsLookupResult> {
-        Ok(fluree_db_nameservice::NsLookupResult::NotFound)
+    async fn lookup_any(&self, resource_id: &str) -> Result<fluree_db_nameservice::NsLookupResult> {
+        // Delegate to the ledger lookup endpoint. Graph-source
+        // discovery isn't exposed through the storage proxy today,
+        // so a non-ledger resource still reports NotFound — but a
+        // real ledger record now resolves correctly instead of
+        // always returning NotFound and breaking every caller that
+        // routes through `GraphSourceLookup::lookup_any`.
+        use fluree_db_nameservice::{NameServiceLookup, NsLookupResult};
+        match self.lookup(resource_id).await? {
+            Some(record) => Ok(NsLookupResult::Ledger(record)),
+            None => Ok(NsLookupResult::NotFound),
+        }
     }
 
     async fn all_graph_source_records(
@@ -310,6 +303,8 @@ mod tests {
             default_context: None,
             retracted: false,
             config_id: None,
+            source_branch: None,
+            branches: 0,
         };
 
         // Use the lookup key as ledger_id (simulating lookup("books"))
@@ -325,6 +320,52 @@ mod tests {
         assert!(record.default_context.is_none());
     }
 
+    /// Regression for finding #11: `source_branch` and `branches`
+    /// must round-trip through the proxy so peers can build the
+    /// `BranchedContentStore` for forked branches. Earlier code
+    /// hardcoded `source_branch: None` regardless of what the
+    /// server sent, breaking every read of an inherited commit.
+    #[test]
+    fn ns_record_conversion_preserves_branch_lineage() {
+        let response = NsRecordResponse {
+            name: Some("books".to_string()),
+            branch: "feature".to_string(),
+            commit_head_id: None,
+            commit_t: 7,
+            index_head_id: None,
+            index_t: 5,
+            default_context: None,
+            retracted: false,
+            config_id: None,
+            source_branch: Some("main".to_string()),
+            branches: 3,
+        };
+
+        let record = response.into_ns_record("books:feature");
+        assert_eq!(record.source_branch.as_deref(), Some("main"));
+        assert_eq!(record.branches, 3);
+    }
+
+    /// Old-server compatibility: when the wire response omits
+    /// `source_branch`/`branches`, deserialization defaults them
+    /// to `None`/`0` rather than failing.
+    #[test]
+    fn ns_record_response_deserializes_without_lineage_fields() {
+        let json = r#"{
+            "name": "books",
+            "branch": "main",
+            "commit_head_id": null,
+            "commit_t": 0,
+            "index_head_id": null,
+            "index_t": 0,
+            "retracted": false
+        }"#;
+        let response: NsRecordResponse =
+            serde_json::from_str(json).expect("response without lineage fields parses");
+        assert!(response.source_branch.is_none());
+        assert_eq!(response.branches, 0);
+    }
+
     #[test]
     fn test_ns_record_name_derived_from_lookup_key() {
         // When server omits `name`, derive it by splitting lookup_key on ':'
@@ -338,6 +379,8 @@ mod tests {
             default_context: None,
             retracted: false,
             config_id: None,
+            source_branch: None,
+            branches: 0,
         };
 
         let record = response.into_ns_record("books:main");
@@ -359,6 +402,8 @@ mod tests {
             default_context: None,
             retracted: false,
             config_id: None,
+            source_branch: None,
+            branches: 0,
         };
 
         let record = response.into_ns_record("books");

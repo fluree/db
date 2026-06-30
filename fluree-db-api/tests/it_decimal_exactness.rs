@@ -4,15 +4,13 @@
 //! ingestion and output: query constants, SPARQL UPDATE templates, and
 //! stored values all carry exact BigDecimal representations.
 
-mod support;
-
-use fluree_db_api::FlureeBuilder;
-use serde_json::Value as JsonValue;
-use std::sync::Arc;
-use support::{
+use crate::support;
+use crate::support::{
     assert_index_defaults, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
     MemoryFluree,
 };
+use fluree_db_api::FlureeBuilder;
+use serde_json::Value as JsonValue;
 
 async fn run_sparql_update(
     fluree: &fluree_db_api::Fluree,
@@ -463,6 +461,66 @@ async fn integer_beyond_i64_round_trips_exactly() {
 }
 
 #[tokio::test]
+async fn indexed_overflow_integer_reports_xsd_integer_not_decimal() {
+    // BigInt (overflow xsd:integer) and BigDecimal share the NUM_BIG arena and
+    // the same late-materialized EncodedLit, whose dt_id is hardcoded to
+    // decimal. Materialization must recover the datatype from the decoded value,
+    // else an indexed > i64 integer is mislabeled xsd:decimal (#1329 sibling).
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/bigint-indexed:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+            let big = "123456789012345678901234567890";
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                &format!(
+                    r#"
+                    PREFIX ex: <http://example.org/>
+                    PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                    INSERT DATA {{ ex:item ex:serial "{big}"^^xsd:integer . }}
+                    "#
+                ),
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            let result = support::query_sparql(
+                &fluree,
+                &ledger,
+                "PREFIX ex: <http://example.org/>
+                 SELECT ?serial WHERE { ex:item ex:serial ?serial . }",
+            )
+            .await
+            .expect("query indexed bigint");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            assert_eq!(binding_values(&sparql_json, "serial"), vec![big]);
+            assert_eq!(
+                binding_datatypes(&sparql_json, "serial"),
+                vec!["http://www.w3.org/2001/XMLSchema#integer".to_string()],
+                "indexed overflow integer must report xsd:integer, not xsd:decimal"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn sum_avg_over_indexed_decimals_is_exact() {
     // Indexed decimals are arena-backed (NUM_BIG encoded). SUM/AVG must
     // decode and accumulate them exactly — they previously contributed
@@ -474,7 +532,10 @@ async fn sum_avg_over_indexed_decimals_is_exact() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -546,7 +607,10 @@ async fn count_with_numeric_filter_over_decimal_rows_is_correct() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -637,7 +701,10 @@ async fn scale_variant_decimal_retracts_indexed_fact() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -718,7 +785,10 @@ async fn group_by_and_distinct_unify_decimals_across_index_and_novelty() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -814,7 +884,10 @@ async fn named_graph_decimal_decodes_against_its_own_arena() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1586,7 +1659,10 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has indexing nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1669,6 +1745,176 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
                     "{subject}: datatype must stay xsd:double"
                 );
             }
+        })
+        .await;
+}
+
+/// Issue #1329: JSON-LD decimal rendering must be consistent regardless of
+/// whether the value is served from the binary index (arena-decoded) or from
+/// novelty (raw flake merge). The reported bug rendered index-served decimals
+/// as `{"@value": "19.99", "@type": ""}` (empty type) and novelty-served ones
+/// as a bare string with no `@type`.
+#[tokio::test]
+async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "decimal/jsonld-render:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // Indexed base: ex:a is arena-backed after the index build.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r"
+                PREFIX ex: <http://example.org/>
+                INSERT DATA { ex:a ex:price 19.99 . }
+                ",
+            )
+            .await;
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+
+            // Novelty overlay: ex:c served from the raw-merge path.
+            let result = run_sparql_update(
+                &fluree,
+                ledger,
+                r"
+                PREFIX ex: <http://example.org/>
+                INSERT DATA { ex:c ex:price 24.50 . }
+                ",
+            )
+            .await;
+            let ledger = result.ledger;
+
+            // Graph crawl over both subjects: each ex:price must render as a
+            // value object with @type == xsd:decimal.
+            let query = serde_json::json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#"
+                },
+                "select": {"?s": ["*"]},
+                "where": [{"@id": "?s", "ex:price": "?price"}]
+            });
+            let nodes = support::query_jsonld_formatted(&fluree, &ledger, &query)
+                .await
+                .expect("jsonld crawl query");
+            let rows = nodes.as_array().expect("array of nodes");
+            assert_eq!(rows.len(), 2, "two priced subjects: {rows:?}");
+
+            // Both the arena-served (indexed) and novelty-served decimals must
+            // render in the SAME shape. Before the fix the indexed copy lost its
+            // datatype and rendered as `{"@value":"19.99","@type":""}` while the
+            // novelty copy rendered as the bare string `"24.50"` (issue #1329).
+            let mut by_id = std::collections::HashMap::new();
+            for node in rows {
+                let id = node["@id"].as_str().expect("@id").to_string();
+                by_id.insert(id, node["ex:price"].clone());
+            }
+            let indexed = &by_id["ex:a"];
+            let novel = &by_id["ex:c"];
+
+            // No empty @type may leak through any serving path.
+            for (label, price) in [("indexed ex:a", indexed), ("novelty ex:c", novel)] {
+                if let Some(obj) = price.as_object() {
+                    assert_ne!(
+                        obj.get("@type").and_then(JsonValue::as_str),
+                        Some(""),
+                        "{label}: decimal rendered with an empty @type: {price}"
+                    );
+                }
+            }
+
+            // Consistency: identical JSON shape across the two paths (xsd:decimal
+            // is an inferable datatype, so both render as the exact bare string).
+            assert_eq!(
+                indexed.is_object(),
+                novel.is_object(),
+                "decimal must render in one consistent shape across index/novelty: \
+                 indexed={indexed}, novelty={novel}"
+            );
+            assert_eq!(
+                indexed,
+                &JsonValue::String("19.99".to_string()),
+                "indexed decimal"
+            );
+            assert_eq!(
+                novel,
+                &JsonValue::String("24.50".to_string()),
+                "novelty decimal"
+            );
+
+            // Tabular SPARQL lane (object_binding): both the arena- and
+            // novelty-served decimals must report xsd:decimal, not an empty
+            // datatype, in the SPARQL JSON results.
+            let result = support::query_sparql(
+                &fluree,
+                &ledger,
+                "PREFIX ex: <http://example.org/>
+                 SELECT ?price WHERE { ?s ex:price ?price . }",
+            )
+            .await
+            .expect("tabular decimal query");
+            let sparql_json = result
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json");
+            let dts = binding_datatypes(&sparql_json, "price");
+            assert_eq!(
+                dts,
+                vec![
+                    "http://www.w3.org/2001/XMLSchema#decimal".to_string(),
+                    "http://www.w3.org/2001/XMLSchema#decimal".to_string(),
+                ],
+                "both index- and novelty-served decimals must appear and report \
+                 xsd:decimal (two rows): {sparql_json}"
+            );
+
+            // Datatype-constrained pattern (`{"@value":"?price","@type":"xsd:decimal"}`)
+            // sets the binary-scan datatype filter, which runs BEFORE object decode.
+            // NUM_BIG_OVERFLOW names no datatype from o_type alone, so the indexed
+            // decimal was dropped pre-decode while the novelty copy passed via the
+            // raw-flake path (issue #1329).
+            let constrained = serde_json::json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#"
+                },
+                "select": "?s",
+                "where": [{
+                    "@id": "?s",
+                    "ex:price": {"@value": "?price", "@type": "xsd:decimal"}
+                }]
+            });
+            let result = support::query_jsonld(&fluree, &ledger, &constrained)
+                .await
+                .expect("datatype-constrained query");
+            let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+            let mut subjects: Vec<String> = rows
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|v| v.as_str().expect("subject iri").to_string())
+                .collect();
+            subjects.sort();
+            assert_eq!(
+                subjects,
+                vec!["ex:a".to_string(), "ex:c".to_string()],
+                "xsd:decimal-constrained pattern must match BOTH the indexed (ex:a) \
+                 and novelty (ex:c) decimals"
+            );
         })
         .await;
 }

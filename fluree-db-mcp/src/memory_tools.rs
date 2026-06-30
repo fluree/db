@@ -1,19 +1,20 @@
-//! MCP tool service for the developer memory layer.
+//! The `memory` toolset: `memory_add` / `memory_recall` / `memory_update` /
+//! `memory_forget` / `memory_status` / `kg_query` over the developer-memory
+//! store in `fluree-db-memory`.
 //!
-//! Provides `MemoryToolService` with tools for storing, recalling, updating,
-//! and forgetting memories. Designed for IDE agent integration via stdio transport.
+//! The tool bodies delegate to [`MemoryStore`]; this module is the rmcp surface.
+//! The store is created lazily — `ensure_initialized` runs in every handler, so
+//! `serve` never requires `init` to have run first.
 
-use crate::format::{
-    format_context_paged, format_json, format_related_memories, format_status_text,
+use crate::service::FlureeMcpService;
+use fluree_db_memory::{
+    detect_git_branch_from, format_context_paged, format_json, format_related_memories,
+    format_status_text, MemoryFilter, MemoryInput, MemoryKind, MemoryStore, MemoryUpdate,
+    RecallEngine, Scope, SecretDetector, Severity, MAX_CONTENT_LENGTH,
 };
-use crate::recall::RecallEngine;
-use crate::secrets::SecretDetector;
-use crate::store::MemoryStore;
-use crate::types::{MemoryFilter, MemoryInput, MemoryKind, MemoryUpdate, Scope, Severity};
-use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
-use rmcp::{tool, tool_handler, tool_router, RoleServer, ServerHandler};
+use rmcp::{tool, tool_router, RoleServer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
@@ -126,8 +127,8 @@ pub struct MemoryForgetRequest {
 
 /// Empty request parameters for `memory_status` (no inputs needed).
 ///
-/// Exists to ensure rmcp generates a valid `{"type": "object"}` JSON Schema
-/// for the tool's `inputSchema`. An empty schema `{}` causes some MCP clients
+/// Exists to ensure rmcp generates a valid `{"type": "object"}` JSON Schema for
+/// the tool's `inputSchema`. An empty schema `{}` causes some MCP clients
 /// (including Claude Code) to fail tool registration.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryStatusRequest {}
@@ -142,35 +143,9 @@ pub struct KgQueryRequest {
     pub query: String,
 }
 
-/// MCP tool service for Fluree developer memory.
-///
-/// Provides tools for:
-/// - `memory_add`: Store a new memory (fact, decision, constraint)
-/// - `memory_recall`: Search and retrieve relevant memories
-/// - `memory_update`: Patch an existing memory in place
-/// - `memory_forget`: Delete a memory
-/// - `memory_status`: Show memory store status
-/// - `kg_query`: Execute raw SPARQL queries against the memory graph
-#[derive(Clone)]
-pub struct MemoryToolService {
-    store: std::sync::Arc<MemoryStore>,
-    tool_router: ToolRouter<MemoryToolService>,
-}
-
-#[tool_router]
-impl MemoryToolService {
-    /// Create a new MemoryToolService wrapping a MemoryStore.
-    pub fn new(store: MemoryStore) -> Self {
-        Self {
-            store: std::sync::Arc::new(store),
-            tool_router: Self::tool_router(),
-        }
-    }
-
+#[tool_router(router = memory_router, vis = "pub(crate)")]
+impl FlureeMcpService {
     /// Store a new memory (fact, decision, or constraint).
-    ///
-    /// Memories persist across sessions and are used to maintain project context.
-    /// Secrets (API keys, passwords, tokens) are automatically detected and redacted.
     #[tool(
         description = "Store ONE insight that persists across sessions. REQUIRED fields: kind, content, tags (at least one). Content is capped at 750 chars — aim for 1-3 sentences. One insight per memory; use multiple memory_add calls for multiple insights. Put file paths in `refs`, not embedded in content. Use `rationale` to explain why. DO store: invariants, gotchas, design decisions, rules. DO NOT store: implementation walkthroughs, architecture summaries, session progress, plans, or anything grep/git-log could answer. Secrets are auto-redacted."
     )]
@@ -179,11 +154,11 @@ impl MemoryToolService {
         Parameters(req): Parameters<MemoryAddRequest>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        // Auto-initialize if needed
-        if let Err(e) = self.ensure_initialized().await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to initialize memory store: {e}"
-            ))]));
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
         }
 
         let kind = MemoryKind::parse(&req.kind).ok_or_else(|| {
@@ -228,14 +203,14 @@ impl MemoryToolService {
         };
 
         // Enforce content length limit
-        if content.len() > crate::types::MAX_CONTENT_LENGTH {
+        if content.len() > MAX_CONTENT_LENGTH {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Memory content is {} characters (max {}). Shorten to a single insight per memory \
                  and add multiple memories for multiple insights. Lead with the key point, use \
                  rationale/alternatives fields for supporting detail, and use refs for file paths \
                  instead of embedding them in content.",
                 content.len(),
-                crate::types::MAX_CONTENT_LENGTH,
+                MAX_CONTENT_LENGTH,
             ))]));
         }
 
@@ -253,7 +228,7 @@ impl MemoryToolService {
             .transpose()?
             .unwrap_or_default();
 
-        let branch = crate::detect_git_branch_from(self.store.memory_dir());
+        let branch = detect_git_branch_from(store.memory_dir());
 
         // Capture preview and recall query before content is moved into MemoryInput
         let preview: String = content
@@ -283,7 +258,7 @@ impl MemoryToolService {
             alternatives: req.alternatives,
         };
 
-        match self.store.add(input).await {
+        match store.add(input).await {
             Ok(id) => {
                 info!(id = %id, kind = %req.kind, "Memory added");
 
@@ -294,7 +269,7 @@ impl MemoryToolService {
                 }
 
                 // Surface related memories for housekeeping
-                if let Some(related_text) = self.find_related_memories(&id, &recall_query).await {
+                if let Some(related_text) = find_related_memories(store, &id, &recall_query).await {
                     text.push_str(&related_text);
                 }
 
@@ -310,9 +285,6 @@ impl MemoryToolService {
     }
 
     /// Search and retrieve relevant memories for a query.
-    ///
-    /// Returns memories ranked by relevance, formatted as XML context blocks
-    /// suitable for LLM consumption.
     #[tool(
         description = "BM25 keyword search over stored memories. Call at the start of non-trivial tasks. Use specific topic words from the task ('error handling', 'index pipeline', 'sparql federation') — generic queries return nothing. If unsure what's stored, call memory_status first."
     )]
@@ -321,10 +293,11 @@ impl MemoryToolService {
         Parameters(req): Parameters<MemoryRecallRequest>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Err(e) = self.ensure_initialized().await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to initialize memory store: {e}"
-            ))]));
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
         }
 
         let kind_filter = req
@@ -360,7 +333,7 @@ impl MemoryToolService {
         let limit = req.limit.unwrap_or(3);
         let offset = req.offset.unwrap_or(0);
         // Only apply smart score-based filtering when the caller did not explicitly
-        // request a specific limit or a non-zero offset.  Explicit pagination means
+        // request a specific limit or a non-zero offset. Explicit pagination means
         // the caller already knows what it wants.
         let use_smart_filter = req.limit.is_none() && offset == 0;
         // Fetch one extra beyond what we need so we can always report the score of
@@ -370,7 +343,7 @@ impl MemoryToolService {
         debug!(query = %req.query, limit = limit, offset = offset, use_smart_filter, "Memory recall request");
 
         // BM25 fulltext search for content relevance
-        let bm25_hits = match self.store.recall_fulltext(&req.query, fetch_n).await {
+        let bm25_hits = match store.recall_fulltext(&req.query, fetch_n).await {
             Ok(hits) => {
                 debug!(hits = hits.len(), "BM25 search complete");
                 hits
@@ -384,13 +357,13 @@ impl MemoryToolService {
         };
 
         // Load full memory objects for metadata re-ranking
-        match self.store.current_memories(&filter).await {
+        match store.current_memories(&filter).await {
             Ok(all) => {
                 debug!(
                     total_current = all.len(),
                     "Loaded current memories for re-ranking"
                 );
-                let branch = crate::detect_git_branch_from(self.store.memory_dir());
+                let branch = detect_git_branch_from(store.memory_dir());
                 let scored = if bm25_hits.is_empty() {
                     RecallEngine::recall_metadata_only(
                         &req.query,
@@ -424,7 +397,7 @@ impl MemoryToolService {
 
                 // Smart score-based trimming: when the caller did not request an
                 // explicit limit, drop results whose score is less than 50% of the
-                // top score.  This keeps only clearly relevant hits and avoids
+                // top score. This keeps only clearly relevant hits and avoids
                 // feeding the LLM noisy low-confidence memories.
                 let next_score = if use_smart_filter && !page.is_empty() {
                     let top = page[0].score;
@@ -466,9 +439,6 @@ impl MemoryToolService {
     }
 
     /// Update an existing memory in place.
-    ///
-    /// Modifies the memory with the given ID, changing only the fields you provide.
-    /// The ID stays the same. History is tracked via git.
     #[tool(
         description = "Patch an existing memory in place. Pass only the fields you want to change (content, tags, refs, rationale, alternatives) — omitted fields stay as-is. The memory keeps its ID. Git tracks history."
     )]
@@ -477,10 +447,11 @@ impl MemoryToolService {
         Parameters(req): Parameters<MemoryUpdateRequest>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Err(e) = self.ensure_initialized().await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to initialize memory store: {e}"
-            ))]));
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
         }
 
         // Check for secrets in new content
@@ -501,10 +472,10 @@ impl MemoryToolService {
             alternatives: req.alternatives,
         };
 
-        match self.store.update(&req.id, update).await {
+        match store.update(&req.id, update).await {
             Ok(id) => {
                 let mut text = format!("Updated: {id}");
-                if let Ok(Some(mem)) = self.store.get(&id).await {
+                if let Ok(Some(mem)) = store.get(&id).await {
                     text = serde_json::to_string_pretty(&format_json(&mem)).unwrap_or(text);
                 }
                 Ok(CallToolResult::success(vec![Content::text(text)]))
@@ -524,13 +495,14 @@ impl MemoryToolService {
         Parameters(req): Parameters<MemoryForgetRequest>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Err(e) = self.ensure_initialized().await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to initialize memory store: {e}"
-            ))]));
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
         }
 
-        match self.store.forget(&req.id).await {
+        match store.forget(&req.id).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Forgotten: {}",
                 req.id
@@ -550,13 +522,14 @@ impl MemoryToolService {
         Parameters(_req): Parameters<MemoryStatusRequest>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Err(e) = self.ensure_initialized().await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to initialize memory store: {e}"
-            ))]));
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
         }
 
-        match self.store.status().await {
+        match store.status().await {
             Ok(status) => {
                 debug!(total = status.total_memories, "Memory status requested");
                 let text = format_status_text(&status);
@@ -580,14 +553,15 @@ impl MemoryToolService {
         Parameters(req): Parameters<KgQueryRequest>,
         _context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        if let Err(e) = self.ensure_initialized().await {
-            return Ok(CallToolResult::error(vec![Content::text(format!(
-                "Failed to initialize memory store: {e}"
-            ))]));
+        let Some(store) = self.memory() else {
+            return Ok(memory_disabled());
+        };
+        if let Err(e) = ensure_initialized(store).await {
+            return Ok(init_error(&e));
         }
 
         debug!(query = %req.query, "SPARQL query requested");
-        match self.store.query_sparql(&req.query).await {
+        match store.query_sparql(&req.query).await {
             Ok(result) => {
                 let text =
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
@@ -603,73 +577,70 @@ impl MemoryToolService {
     }
 }
 
-impl MemoryToolService {
-    /// Find existing memories related to a just-stored memory.
-    ///
-    /// Returns `None` if no related memories score above threshold.
-    async fn find_related_memories(&self, new_id: &str, content: &str) -> Option<String> {
-        // fetch_n = 2 (LIMIT) + 2: one extra for the self-match that gets
-        // filtered out, one extra for the score cliff peek-ahead.
-        let bm25_hits = self.store.recall_fulltext(content, 4).await.ok()?;
-        let filter = MemoryFilter::default();
-        let all = self.store.current_memories(&filter).await.ok()?;
-        let branch = crate::detect_git_branch_from(self.store.memory_dir());
+/// Error result when a memory tool is somehow reached without the memory
+/// toolset enabled. In practice the router only carries memory tools when the
+/// store is present, so this is a defensive fallback.
+fn memory_disabled() -> CallToolResult {
+    CallToolResult::error(vec![Content::text(
+        "The memory toolset is not enabled on this server.".to_string(),
+    )])
+}
 
-        let candidates =
-            RecallEngine::find_related(new_id, content, &bm25_hits, &all, branch.as_deref());
+/// Error result for a store-initialization failure.
+fn init_error(e: &str) -> CallToolResult {
+    CallToolResult::error(vec![Content::text(format!(
+        "Failed to initialize memory store: {e}"
+    ))])
+}
 
-        if candidates.is_empty() {
-            return None;
-        }
+/// Find existing memories related to a just-stored memory.
+///
+/// Returns `None` if no related memories score above threshold.
+async fn find_related_memories(store: &MemoryStore, new_id: &str, content: &str) -> Option<String> {
+    // fetch_n = 2 (LIMIT) + 2: one extra for the self-match that gets filtered
+    // out, one extra for the score cliff peek-ahead.
+    let bm25_hits = store.recall_fulltext(content, 4).await.ok()?;
+    let filter = MemoryFilter::default();
+    let all = store.current_memories(&filter).await.ok()?;
+    let branch = detect_git_branch_from(store.memory_dir());
 
-        debug!(new_id = %new_id, related = candidates.len(), "Found related memories after add");
-        Some(format_related_memories(&candidates))
+    let candidates =
+        RecallEngine::find_related(new_id, content, &bm25_hits, &all, branch.as_deref());
+
+    if candidates.is_empty() {
+        return None;
     }
 
-    /// Auto-initialize the memory store if not already initialized.
-    async fn ensure_initialized(&self) -> std::result::Result<(), String> {
-        if !self.store.is_initialized().await.unwrap_or(false) {
-            info!("Memory store not initialized, initializing");
-            self.store.initialize().await.map_err(|e| {
-                error!(error = %e, "Memory initialization failed");
-                format!("initialization failed: {e}")
-            })?;
-            info!("Memory store initialized");
-        }
-        // Rebuild ledger from .ttl files if they've changed (e.g. git pull)
-        self.store.ensure_synced().await.map_err(|e| {
-            error!(error = %e, "File sync failed");
-            format!("file sync failed: {e}")
+    debug!(new_id = %new_id, related = candidates.len(), "Found related memories after add");
+    Some(format_related_memories(&candidates))
+}
+
+/// Auto-initialize the memory store if not already initialized, then sync from
+/// any on-disk `.ttl` files (e.g. after a `git pull`).
+async fn ensure_initialized(store: &MemoryStore) -> std::result::Result<(), String> {
+    if !store.is_initialized().await.unwrap_or(false) {
+        info!("Memory store not initialized, initializing");
+        store.initialize().await.map_err(|e| {
+            error!(error = %e, "Memory initialization failed");
+            format!("initialization failed: {e}")
         })?;
-        Ok(())
+        info!("Memory store initialized");
     }
+    // Rebuild ledger from .ttl files if they've changed (e.g. git pull)
+    store.ensure_synced().await.map_err(|e| {
+        error!(error = %e, "File sync failed");
+        format!("file sync failed: {e}")
+    })?;
+    Ok(())
 }
 
-#[tool_handler]
-impl ServerHandler for MemoryToolService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation {
-                name: "fluree-memory".to_string(),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                title: Some("Fluree Developer Memory".to_string()),
-                icons: None,
-                website_url: Some("https://flur.ee".to_string()),
-            },
-            instructions: Some(
-                "Fluree Developer Memory — persistent project knowledge across sessions.\n\n\
-                 WHEN TO USE:\n\
-                 - Start of a non-trivial task: call memory_recall with specific keywords \
-                   from the task (e.g. 'indexer leaflet cache', 'sparql federation'). \
-                   Use memory_status first if you don't know what topics are stored.\n\
-                 - End of a task, when you learned something non-obvious: call memory_add. \
-                   See that tool's description for what qualifies.\n\n\
-                 RECALL QUERIES must use specific topic words. Generic queries \
-                 ('all', 'everything', 'memory') return nothing — BM25 needs content terms."
-                    .to_string(),
-            ),
-        }
-    }
-}
+/// Per-toolset guidance fragment, merged into the unified server's `get_info`
+/// instructions when the `memory` toolset is enabled.
+pub(crate) const MEMORY_INSTRUCTIONS: &str =
+    "MEMORY (persistent project knowledge across sessions):\n\
+     - Start of a non-trivial task: call memory_recall with specific keywords from the task \
+       (e.g. 'indexer leaflet cache', 'sparql federation'). Use memory_status first if you don't \
+       know what topics are stored.\n\
+     - End of a task, when you learned something non-obvious: call memory_add.\n\
+     RECALL QUERIES must use specific topic words. Generic queries ('all', 'everything') return \
+     nothing — BM25 needs content terms.";

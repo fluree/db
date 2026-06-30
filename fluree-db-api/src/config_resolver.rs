@@ -29,6 +29,7 @@ use fluree_db_core::ledger_config::{
     RollbackGuard, ShaclDefaults, TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
+use fluree_db_novelty::Novelty;
 use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::config_iris;
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
@@ -53,6 +54,34 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    // Cheap guard: if the config graph (CONFIG_GRAPH_ID) holds no data in either
+    // the novelty overlay or the base index, there can be no `f:LedgerConfig` —
+    // skip the type scan entirely. Without this, the `?s rdf:type f:LedgerConfig`
+    // lookup below resolves an object IRI that is absent from the dictionary,
+    // which drops the bound-object filter and full-scans the rdf:type predicate
+    // over the (growing) novelty overlay on EVERY transaction and query —
+    // O(novelty) per call once an index is attached. The overlay check only
+    // applies when the overlay is a `Novelty`; for other overlay types we fall
+    // through and run the scan (correctness over speed).
+    let overlay_has_config_graph = overlay
+        .as_any()
+        .downcast_ref::<Novelty>()
+        .is_none_or(|novelty| novelty.segment_count(CONFIG_GRAPH_ID) > 0);
+    // Base index has config-graph data only if per-graph stats report flakes for
+    // CONFIG_GRAPH_ID. NOTE: `graph_registry` always *registers* the reserved
+    // config graph (via `new_for_ledger`), so registry presence is NOT a data
+    // signal. When per-graph stats are absent (old/pre-index root) we
+    // conservatively assume config may exist and run the scan.
+    let base_has_config_graph = match snapshot.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
+        Some(graphs) => graphs
+            .iter()
+            .any(|g| g.g_id == CONFIG_GRAPH_ID && g.flakes > 0),
+        None => true,
+    };
+    if !overlay_has_config_graph && !base_has_config_graph {
+        return Ok(None);
+    }
+
     // Encode rdf:type (namespace code 3) and f:LedgerConfig (namespace code 7).
     // Both namespaces are always in default_namespace_codes().
     let rdf_type_sid = match snapshot.encode_iri(RDF_TYPE_IRI) {

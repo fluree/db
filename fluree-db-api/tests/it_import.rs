@@ -5,8 +5,7 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support;
 use fluree_db_api::FlureeBuilder;
 use fluree_db_core::{LedgerSnapshot, Sid};
 use serde_json::json;

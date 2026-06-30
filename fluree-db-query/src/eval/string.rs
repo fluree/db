@@ -325,22 +325,81 @@ pub fn eval_concat<R: RowAccess>(
     Ok(Some(string_with_lang(&result, lang)))
 }
 
+/// Extract the `(string content, language tag)` of a STRBEFORE/STRAFTER argument.
+///
+/// Returns `None` when the argument is unbound or not a string-typed literal
+/// (e.g. a number or IRI) — both cases make the function raise a type error,
+/// which demotes to an unbound result. The language tag comes from a
+/// language-tagged `TypedLiteral` value (constants) or, for variable bindings
+/// that materialize as a plain string, from [`extract_lang_tag`].
+fn str_arg_and_lang<R: RowAccess>(
+    expr: &Expression,
+    value: Option<ComparableValue>,
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<(Arc<str>, Option<Arc<str>>)> {
+    match value? {
+        // Common case: a variable-bound string already holds an `Arc<str>`,
+        // so this is a zero-copy move.
+        ComparableValue::String(s) => Some((s, extract_lang_tag(expr, row, ctx))),
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            dtc,
+        } => match dtc {
+            Some(UnresolvedDatatypeConstraint::LangTag(tag)) => Some((Arc::from(s), Some(tag))),
+            // A non-string custom datatype (e.g. `STRDT("x","ex:dt")`) is not a
+            // valid STRBEFORE/STRAFTER argument per SPARQL 1.1 — raise a type
+            // error (→ unbound) rather than treating it as a plain string.
+            Some(UnresolvedDatatypeConstraint::Explicit(iri))
+                if iri.as_ref() != fluree_vocab::xsd::STRING =>
+            {
+                None
+            }
+            // Simple literal (no dtc) or explicit `xsd:string`: no language tag.
+            _ => Some((Arc::from(s), extract_lang_tag(expr, row, ctx))),
+        },
+        _ => None,
+    }
+}
+
+/// SPARQL 1.1 §17.4.3.5 argument compatibility for STRBEFORE/STRAFTER.
+///
+/// The search string (`arg2`) is compatible when it is a simple literal /
+/// `xsd:string` (no language tag), or when it shares `arg1`'s language tag.
+/// An incompatible pair raises a type error (→ unbound).
+fn args_compatible(lang1: &Option<Arc<str>>, lang2: &Option<Arc<str>>) -> bool {
+    match lang2 {
+        None => true,
+        // RDF 1.1 language tags compare case-insensitively (`@en` == `@EN`).
+        Some(l2) => lang1
+            .as_deref()
+            .is_some_and(|l1| l1.eq_ignore_ascii_case(l2)),
+    }
+}
+
 pub fn eval_str_before<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 2, "STRBEFORE")?;
-    let lang = extract_lang_tag(&args[0], row, ctx);
     let arg1 = args[0].eval_to_comparable(row, ctx)?;
     let arg2 = args[1].eval_to_comparable(row, ctx)?;
-    match (arg1, arg2) {
-        (Some(ComparableValue::String(s)), Some(ComparableValue::String(d))) => {
-            let result = s.find(d.as_ref()).map(|pos| &s[..pos]).unwrap_or("");
-            Ok(Some(string_with_lang(result, lang)))
-        }
-        (None, _) | (_, None) => Ok(None),
-        _ => Ok(None),
+    let (Some((s, lang1)), Some((sub, lang2))) = (
+        str_arg_and_lang(&args[0], arg1, row, ctx),
+        str_arg_and_lang(&args[1], arg2, row, ctx),
+    ) else {
+        return Ok(None);
+    };
+    if !args_compatible(&lang1, &lang2) {
+        return Ok(None);
+    }
+    match s.find(sub.as_ref()) {
+        // Found (including the empty search string, found at position 0):
+        // the result carries arg1's language tag.
+        Some(pos) => Ok(Some(string_with_lang(&s[..pos], lang1))),
+        // Not found: a plain empty simple literal (no language tag).
+        None => Ok(Some(ComparableValue::String(Arc::from("")))),
     }
 }
 
@@ -350,19 +409,23 @@ pub fn eval_str_after<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 2, "STRAFTER")?;
-    let lang = extract_lang_tag(&args[0], row, ctx);
     let arg1 = args[0].eval_to_comparable(row, ctx)?;
     let arg2 = args[1].eval_to_comparable(row, ctx)?;
-    match (arg1, arg2) {
-        (Some(ComparableValue::String(s)), Some(ComparableValue::String(d))) => {
-            let result = s
-                .find(d.as_ref())
-                .map(|pos| &s[pos + d.len()..])
-                .unwrap_or("");
-            Ok(Some(string_with_lang(result, lang)))
-        }
-        (None, _) | (_, None) => Ok(None),
-        _ => Ok(None),
+    let (Some((s, lang1)), Some((sub, lang2))) = (
+        str_arg_and_lang(&args[0], arg1, row, ctx),
+        str_arg_and_lang(&args[1], arg2, row, ctx),
+    ) else {
+        return Ok(None);
+    };
+    if !args_compatible(&lang1, &lang2) {
+        return Ok(None);
+    }
+    match s.find(sub.as_ref()) {
+        // Found (the empty search string matches at 0 → the whole string):
+        // the result carries arg1's language tag.
+        Some(pos) => Ok(Some(string_with_lang(&s[pos + sub.len()..], lang1))),
+        // Not found: a plain empty simple literal (no language tag).
+        None => Ok(Some(ComparableValue::String(Arc::from("")))),
     }
 }
 
@@ -583,10 +646,136 @@ pub fn eval_str_lang<R: RowAccess>(
     }
 }
 
+/// Cypher `replace(original, search, replacement)` — LITERAL (non-regex)
+/// replace-all of every occurrence of `search`.
+pub fn eval_replace_all<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 3, "replace")?;
+    let lang = extract_lang_tag(&args[0], row, ctx);
+    let input = args[0].eval_to_comparable(row, ctx)?;
+    let search = args[1].eval_to_comparable(row, ctx)?;
+    let replacement = args[2].eval_to_comparable(row, ctx)?;
+    match (
+        input.as_ref().and_then(ComparableValue::as_str),
+        search.as_ref().and_then(ComparableValue::as_str),
+        replacement.as_ref().and_then(ComparableValue::as_str),
+    ) {
+        (Some(s), Some(from), Some(to)) => {
+            if let Some(ctx) = ctx {
+                ctx.tracker.consume_fuel(1)?;
+            }
+            // Empty search would loop forever in some implementations; std's
+            // replace handles it (inserts between chars), but Cypher returns the
+            // input unchanged for an empty search.
+            let out = if from.is_empty() {
+                s.to_string()
+            } else {
+                s.replace(from, to)
+            };
+            Ok(Some(string_with_lang(&out, lang)))
+        }
+        _ if input.is_none() || search.is_none() || replacement.is_none() => Ok(None),
+        _ => Err(QueryError::InvalidFilter(
+            "replace() requires string arguments".to_string(),
+        )),
+    }
+}
+
+/// Cypher `trim` / `ltrim` / `rtrim` — strip surrounding whitespace.
+pub fn eval_trim<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    side: TrimSide,
+) -> Result<Option<ComparableValue>> {
+    let name = side.fn_name();
+    check_arity(args, 1, name)?;
+    let lang = extract_lang_tag(&args[0], row, ctx);
+    match args[0].eval_to_comparable(row, ctx)? {
+        Some(v) => match v.as_str() {
+            Some(s) => {
+                let trimmed = match side {
+                    TrimSide::Both => s.trim(),
+                    TrimSide::Left => s.trim_start(),
+                    TrimSide::Right => s.trim_end(),
+                };
+                Ok(Some(string_with_lang(trimmed, lang)))
+            }
+            None => Err(QueryError::InvalidFilter(format!(
+                "{name}() requires a string argument"
+            ))),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Cypher `left(s, n)` / `right(s, n)` — first / last `n` characters
+/// (character-based; clamps when `n` exceeds the length, returns empty for
+/// `n <= 0`).
+pub fn eval_left_right<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+    from_left: bool,
+) -> Result<Option<ComparableValue>> {
+    let name = if from_left { "left" } else { "right" };
+    check_arity(args, 2, name)?;
+    let lang = extract_lang_tag(&args[0], row, ctx);
+    let s = args[0].eval_to_comparable(row, ctx)?;
+    let n = args[1].eval_to_comparable(row, ctx)?;
+    let (s, n) = match (s, n) {
+        (Some(s), Some(n)) => (s, n),
+        _ => return Ok(None),
+    };
+    let Some(s) = s.as_str() else {
+        return Err(QueryError::InvalidFilter(format!(
+            "{name}() requires a string first argument"
+        )));
+    };
+    let n = match n {
+        ComparableValue::Long(n) => n.max(0) as usize,
+        _ => {
+            return Err(QueryError::InvalidFilter(format!(
+                "{name}() requires an integer length"
+            )))
+        }
+    };
+    let total = s.chars().count();
+    let take = n.min(total);
+    let out: String = if from_left {
+        s.chars().take(take).collect()
+    } else {
+        s.chars().skip(total - take).collect()
+    };
+    Ok(Some(string_with_lang(&out, lang)))
+}
+
+/// Which side(s) a [`eval_trim`] call strips.
+#[derive(Clone, Copy)]
+pub enum TrimSide {
+    Both,
+    Left,
+    Right,
+}
+
+impl TrimSide {
+    fn fn_name(self) -> &'static str {
+        match self {
+            TrimSide::Both => "trim",
+            TrimSide::Left => "ltrim",
+            TrimSide::Right => "rtrim",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::binding::Batch;
+    use crate::ir::Function;
     use crate::var_registry::VarId;
     use fluree_db_core::value::FlakeValue;
     use fluree_db_core::Sid;
@@ -656,5 +845,156 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Some(ComparableValue::Bool(true)));
+    }
+
+    // STRBEFORE / STRAFTER — SPARQL 1.1 §17.4.3.7/8 datatyping rules.
+
+    fn lang_batch(value: &str, lang: &str) -> Batch {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let col = vec![Binding::lit_lang(
+            FlakeValue::String(value.to_string()),
+            lang,
+        )];
+        Batch::new(schema, vec![col]).unwrap()
+    }
+
+    fn lang_const(value: &str, lang: &str) -> Expression {
+        // `"value"@lang` in expression position lowers to STRLANG(value, lang).
+        Expression::Call {
+            func: Function::StrLang,
+            args: vec![
+                Expression::Const(FlakeValue::String(value.to_string())),
+                Expression::Const(FlakeValue::String(lang.to_string())),
+            ],
+        }
+    }
+
+    fn s_const(value: &str) -> Expression {
+        Expression::Const(FlakeValue::String(value.to_string()))
+    }
+
+    #[test]
+    fn test_strbefore_found_preserves_lang() {
+        let batch = lang_batch("english", "en");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_str_before::<_>(&[Expression::Var(VarId(0)), s_const("s")], &row, None).unwrap();
+        assert_eq!(r, Some(string_with_lang("engli", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_no_match_is_plain_empty() {
+        // No match must drop arg1's language tag → plain "".
+        let batch = lang_batch("日本語", "ja");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_str_before::<_>(&[Expression::Var(VarId(0)), s_const("s")], &row, None).unwrap();
+        assert_eq!(r, Some(ComparableValue::String(Arc::from(""))));
+    }
+
+    #[test]
+    fn test_strafter_empty_substring_returns_whole_with_lang() {
+        let batch = lang_batch("abc", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_after::<_>(&[Expression::Var(VarId(0)), s_const("")], &row, None).unwrap();
+        assert_eq!(r, Some(string_with_lang("abc", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_empty_substring_returns_empty_with_lang() {
+        let batch = lang_batch("abc", "en");
+        let row = batch.row_view(0).unwrap();
+        let r =
+            eval_str_before::<_>(&[Expression::Var(VarId(0)), s_const("")], &row, None).unwrap();
+        assert_eq!(r, Some(string_with_lang("", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_incompatible_lang_is_unbound() {
+        // arg1 @en, arg2 @cy → incompatible → type error → unbound.
+        let batch = lang_batch("abc", "en");
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[Expression::Var(VarId(0)), lang_const("b", "cy")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, None);
+
+        // Same lang → compatible.
+        let r2 = eval_str_before::<_>(
+            &[Expression::Var(VarId(0)), lang_const("b", "en")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2, Some(string_with_lang("a", Some(Arc::from("en")))));
+    }
+
+    #[test]
+    fn test_strbefore_simple_arg1_with_lang_arg2_is_unbound() {
+        // arg1 simple (no lang), arg2 @en → incompatible.
+        let batch = make_string_batch(); // "Hello World", no lang
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[Expression::Var(VarId(0)), lang_const("World", "en")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, None);
+    }
+
+    fn strdt_const(value: &str, dt_iri: &str) -> Expression {
+        Expression::Call {
+            func: Function::StrDt,
+            args: vec![
+                Expression::Const(FlakeValue::String(value.to_string())),
+                Expression::Const(FlakeValue::String(dt_iri.to_string())),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_strbefore_custom_datatype_arg_is_unbound() {
+        // A string with a custom (non-xsd:string) datatype is not a valid
+        // STRBEFORE argument per SPARQL 1.1 → type error → unbound.
+        let batch = make_string_batch();
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[strdt_const("hello", "http://example.org/dt"), s_const("l")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, None);
+
+        // An explicit `xsd:string` datatype IS valid (behaves like a simple literal).
+        let r2 = eval_str_before::<_>(
+            &[
+                strdt_const("hello", "http://www.w3.org/2001/XMLSchema#string"),
+                s_const("l"),
+            ],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r2, Some(ComparableValue::String(Arc::from("he"))));
+    }
+
+    #[test]
+    fn test_strbefore_lang_tags_compare_case_insensitively() {
+        // RDF 1.1 language tags are case-insensitive: arg1 @EN, arg2 @en are
+        // compatible, and the result preserves arg1's tag verbatim.
+        let batch = make_string_batch();
+        let row = batch.row_view(0).unwrap();
+        let r = eval_str_before::<_>(
+            &[lang_const("english", "EN"), lang_const("s", "en")],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, Some(string_with_lang("engli", Some(Arc::from("EN")))));
     }
 }

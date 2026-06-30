@@ -43,6 +43,7 @@ pub mod config_resolver;
 pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
+pub mod cypher_write;
 pub mod dataset;
 mod error;
 pub mod explain;
@@ -114,7 +115,7 @@ pub use block_fetch::{
 };
 pub use commit_transfer::{
     Base64Bytes, BulkImportResult, CommitImportResult, ExportCommitsRequest, ExportCommitsResponse,
-    PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult,
+    PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
 };
 pub use dataset::{
     sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
@@ -122,6 +123,7 @@ pub use dataset::{
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result};
 pub use fluree_db_core::ledger_id::format_ledger_id;
+pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
@@ -144,13 +146,14 @@ pub use import::{
     ImportSummary, RemoteSource,
 };
 pub use ledger_info::LedgerInfoBuilder;
+pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
     UpdatePlan,
 };
 pub use ledger_view::{CommitRef, LedgerView};
-pub use merge::MergeReport;
+pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
     MergePreview, MergePreviewOpts,
@@ -169,8 +172,10 @@ pub use query::builder::{
 };
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
-pub use rebase::{ConflictStrategy, RebaseConflict, RebaseFailure, RebaseReport};
-pub use revert::{RevertReport, RevertSelection};
+pub use rebase::{
+    ConflictStrategy, PendingReplay, RebaseConflict, RebaseFailure, RebaseReport, StagedRebase,
+};
+pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
@@ -227,8 +232,9 @@ pub use fluree_db_ledger::{
     HistoricalLedgerView, IndexConfig, LedgerState, StagedLedger, TypeErasedStore,
 };
 pub use fluree_db_nameservice::{
-    ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    GraphSourcePublisher, NameService, NsRecord, Publisher,
+    BranchLifecycle, ConfigCasResult, ConfigPayload, ConfigPublisher, ConfigValue,
+    GraphSourceLookup, GraphSourcePublisher, IndexPublisher, IndexingNameService, LedgerLifecycle,
+    NameServiceLookup, NsRecord, Publisher,
 };
 pub use fluree_db_novelty::Novelty;
 pub use fluree_db_query::{
@@ -241,8 +247,9 @@ pub use fluree_db_query::{Term, TriplePattern};
 pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
-    lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitReceipt,
-    LowerError as SparqlUpdateLowerError, NamespaceRegistry, TransactError, TxnOpts, TxnType,
+    build_commit, lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitOptsRequest,
+    CommitReceipt, LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit,
+    TransactError, Txn, TxnOpts, TxnType,
 };
 
 // Re-export SPARQL types (product feature; always enabled)
@@ -253,6 +260,38 @@ pub use fluree_db_sparql::{
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,
 };
+
+// Re-export Cypher types (product feature; always enabled).
+pub use fluree_db_cypher::{
+    lower_cypher, parse_cypher, CypherAst, DiagCode as CypherDiagCode,
+    Diagnostic as CypherDiagnostic, LowerError as CypherLowerError, ParamMap as CypherParamMap,
+    ParseOutput as CypherParseOutput, Severity as CypherSeverity, SourceSpan as CypherSourceSpan,
+};
+pub use fluree_db_transact::lower_cypher_update::{
+    lower_cypher_update, CypherLowerOpts, LowerCypherError,
+};
+
+/// Split a Cypher request body into its statement and optional parameters.
+///
+/// Accepts either a raw Cypher string, or a JSON envelope
+/// `{"cypher": "...", "params": {...}}` (the Neo4j-HTTP-style shape). A body
+/// that doesn't parse as a JSON object with a `cypher` key is returned
+/// verbatim as the statement with no params, so plain-text Cypher still works.
+/// Shared by the HTTP routes and the CLI so both accept the same two shapes.
+pub fn extract_cypher_envelope(body: &str) -> (String, Option<CypherParamMap>) {
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') {
+        if let Ok(serde_json::Value::Object(obj)) =
+            serde_json::from_str::<serde_json::Value>(trimmed)
+        {
+            if let Some(cypher) = obj.get("cypher").and_then(|v| v.as_str()) {
+                let params = obj.get("params").and_then(|v| v.as_object()).cloned();
+                return (cypher.to_string(), params);
+            }
+        }
+    }
+    (body.to_string(), None)
+}
 
 // Re-export policy types for access control
 pub use fluree_db_policy::{
@@ -299,17 +338,21 @@ pub use fluree_db_nameservice::NameServicePublisher;
 
 /// Runtime nameservice selection.
 ///
-/// Encodes whether this Fluree instance has full read-write nameservice access
-/// or is a read-only proxy that forwards writes to a remote transaction server.
+/// Encodes whether this Fluree instance has full read-write
+/// nameservice access (file/memory/S3/DynamoDB *or* the
+/// Raft-replicated nameservice) or is a read-only proxy that
+/// forwards writes to a remote transaction server.
 ///
 /// Analogous to [`StorageBackend`] for storage.
 #[derive(Clone)]
 pub enum NameServiceMode {
-    /// Full read-write nameservice (File, Memory, S3, DynamoDB).
+    /// Full read-write nameservice. Every backend that satisfies
+    /// [`NameServicePublisher`] lives here — file, memory, S3,
+    /// DynamoDB, and the Raft-replicated nameservice.
     ReadWrite(Arc<dyn NameServicePublisher>),
-    /// Read-only proxy nameservice.
-    /// Writes are forwarded to the remote transaction server via HTTP.
-    ReadOnly(Arc<dyn NameService>),
+    /// Read-only proxy nameservice. Writes are forwarded to the
+    /// remote transaction server via HTTP.
+    ReadOnly(Arc<dyn NameServiceLookup>),
 }
 
 impl std::fmt::Debug for NameServiceMode {
@@ -323,24 +366,28 @@ impl std::fmt::Debug for NameServiceMode {
 
 impl NameServiceMode {
     /// Get read-only nameservice access (always available).
-    pub fn reader(&self) -> &dyn NameService {
+    pub fn reader(&self) -> &dyn NameServiceLookup {
         match self {
             Self::ReadWrite(ns) => ns.as_ref(),
             Self::ReadOnly(ns) => ns.as_ref(),
         }
     }
 
-    /// Owned `Arc<dyn NameService>` view, for handing off to long-lived
+    /// Owned `Arc<dyn NameServiceLookup>` view, for handing off to long-lived
     /// subsystems (e.g. the indexer's full-text config provider) that
     /// need to outlive a single borrow of the mode enum.
-    pub fn as_arc_reader(&self) -> Arc<dyn NameService> {
+    pub fn as_arc_reader(&self) -> Arc<dyn NameServiceLookup> {
         match self {
-            Self::ReadWrite(ns) => Arc::clone(ns) as Arc<dyn NameService>,
+            Self::ReadWrite(ns) => {
+                let cloned: Arc<dyn NameServicePublisher> = Arc::clone(ns);
+                cloned
+            }
             Self::ReadOnly(ns) => Arc::clone(ns),
         }
     }
 
-    /// Get read-write nameservice access (only for ReadWrite mode).
+    /// Get the full read-write nameservice surface. `None` for
+    /// [`Self::ReadOnly`].
     pub fn publisher(&self) -> Option<&dyn NameServicePublisher> {
         match self {
             Self::ReadWrite(ns) => Some(ns.as_ref()),
@@ -359,6 +406,47 @@ impl NameServiceMode {
         }
     }
 
+    /// Get the ledger-admin surface ([`LedgerLifecycle`] — init,
+    /// retract, purge). `None` for [`Self::ReadOnly`].
+    pub fn ledger_admin(&self) -> Option<&dyn LedgerLifecycle> {
+        match self {
+            Self::ReadWrite(ns) => Some(ns.as_ref()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    /// Get the branch-admin surface ([`BranchLifecycle`] —
+    /// create_branch, drop_branch, reset_head). `None` for
+    /// [`Self::ReadOnly`].
+    pub fn branch_admin(&self) -> Option<&dyn BranchLifecycle> {
+        match self {
+            Self::ReadWrite(ns) => Some(ns.as_ref()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    /// Get a cloned `Arc<dyn IndexingNameService>` covering this mode's
+    /// indexing surface (`NameServiceLookup + IndexPublisher +
+    /// BranchLifecycle`). `None` for [`Self::ReadOnly`].
+    pub fn as_arc_indexing_nameservice(&self) -> Option<Arc<dyn IndexingNameService>> {
+        match self {
+            Self::ReadWrite(ns) => {
+                let cloned: Arc<dyn NameServicePublisher> = Arc::clone(ns);
+                Some(cloned)
+            }
+            Self::ReadOnly(_) => None,
+        }
+    }
+
+    /// Get the [`IndexPublisher`] surface. `None` for
+    /// [`Self::ReadOnly`].
+    pub fn index_publisher(&self) -> Option<&dyn IndexPublisher> {
+        match self {
+            Self::ReadWrite(ns) => Some(ns.as_ref()),
+            Self::ReadOnly(_) => None,
+        }
+    }
+
     /// Whether this is a read-only (proxy) instance.
     pub fn is_read_only(&self) -> bool {
         matches!(self, Self::ReadOnly(_))
@@ -366,7 +454,7 @@ impl NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::NameService for NameServiceMode {
+impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
     async fn lookup(
         &self,
         ledger_id: &str,
@@ -385,53 +473,11 @@ impl fluree_db_nameservice::NameService for NameServiceMode {
     > {
         self.reader().all_records().await
     }
-
-    async fn create_branch(
-        &self,
-        ledger_name: &str,
-        new_branch: &str,
-        source_branch: &str,
-        at_commit: Option<(fluree_db_core::ContentId, i64)>,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        self.reader()
-            .create_branch(ledger_name, new_branch, source_branch, at_commit)
-            .await
-    }
-
-    async fn drop_branch(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<Option<u32>, fluree_db_nameservice::NameServiceError> {
-        self.reader().drop_branch(ledger_id).await
-    }
-
-    async fn reset_head(
-        &self,
-        ledger_id: &str,
-        snapshot: fluree_db_nameservice::NsRecordSnapshot,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        self.reader().reset_head(ledger_id, snapshot).await
-    }
-
-    async fn pending_commit_cids(
-        &self,
-        ledger_id: &str,
-        since_t: i64,
-    ) -> std::result::Result<
-        Option<Vec<(i64, fluree_db_core::ContentId)>>,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        self.reader().pending_commit_cids(ledger_id, since_t).await
-    }
-
-    async fn prune_commit_index(
-        &self,
-        ledger_id: &str,
-        up_to_t: i64,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        self.reader().prune_commit_index(ledger_id, up_to_t).await
-    }
 }
+
+// No `BranchLifecycle` impl for `NameServiceMode`: read-only modes can't
+// honestly fulfill branch writes. Callers needing branch lifecycle access
+// go through `publisher()` (Some only for `ReadWrite` mode).
 
 #[async_trait]
 impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
@@ -466,78 +512,21 @@ impl fluree_db_nameservice::GraphSourceLookup for NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::GraphSourcePublisher for NameServiceMode {
-    async fn publish_graph_source(
-        &self,
-        name: &str,
-        branch: &str,
-        source_type: fluree_db_nameservice::GraphSourceType,
-        config: &str,
-        dependencies: &[String],
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => {
-                ns.publish_graph_source(name, branch, source_type, config, dependencies)
-                    .await
-            }
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_graph_source not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn publish_graph_source_index(
-        &self,
-        name: &str,
-        branch: &str,
-        index_id: &fluree_db_core::ContentId,
-        index_t: i64,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => {
-                ns.publish_graph_source_index(name, branch, index_id, index_t)
-                    .await
-            }
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_graph_source_index not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn retract_graph_source(
-        &self,
-        name: &str,
-        branch: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.retract_graph_source(name, branch).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "retract_graph_source not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::AdminPublisher for NameServiceMode {
-    async fn publish_index_allow_equal(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => {
-                ns.publish_index_allow_equal(ledger_id, index_t, index_id)
-                    .await
-            }
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_index_allow_equal not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
+// NOTE: `NameServiceMode` deliberately does NOT implement any of the
+// write traits (`GraphSourcePublisher`, `AdminPublisher`,
+// `ConfigPublisher`, `StatusPublisher`, `RefPublisher`,
+// `LedgerLifecycle`, `CommitPublisher`, `IndexPublisher`). The
+// `ReadOnly` variant has no writer to call, so any such impl would
+// have to fake the contract by returning an error on every call —
+// a runtime check for what is a compile-time guarantee, and a
+// violation of the "no trait-method stubs returning errors" rule.
+//
+// Callers that need write access go through `Self::publisher()` or
+// `Self::publisher_arc()` (or `Fluree::publisher()` for an
+// error-coordinated `Result`). Those return the inner
+// `Arc<dyn NameServicePublisher>` from `ReadWrite` and `None` /
+// `Err(...)` from `ReadOnly` — the variant check happens once at
+// the boundary, and from there the caller has an honest writer.
 #[async_trait]
 impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
     async fn get_config(
@@ -548,26 +537,6 @@ impl fluree_db_nameservice::ConfigLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().get_config(ledger_id).await
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::ConfigPublisher for NameServiceMode {
-    async fn push_config(
-        &self,
-        ledger_id: &str,
-        expected: Option<&fluree_db_nameservice::ConfigValue>,
-        new: &fluree_db_nameservice::ConfigValue,
-    ) -> std::result::Result<
-        fluree_db_nameservice::ConfigCasResult,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        match self {
-            Self::ReadWrite(ns) => ns.push_config(ledger_id, expected, new).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "push_config not available on read-only nameservice".into(),
-            )),
-        }
     }
 }
 
@@ -585,26 +554,6 @@ impl fluree_db_nameservice::StatusLookup for NameServiceMode {
 }
 
 #[async_trait]
-impl fluree_db_nameservice::StatusPublisher for NameServiceMode {
-    async fn push_status(
-        &self,
-        ledger_id: &str,
-        expected: Option<&fluree_db_nameservice::StatusValue>,
-        new: &fluree_db_nameservice::StatusValue,
-    ) -> std::result::Result<
-        fluree_db_nameservice::StatusCasResult,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        match self {
-            Self::ReadWrite(ns) => ns.push_status(ledger_id, expected, new).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "push_status not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
 impl fluree_db_nameservice::RefLookup for NameServiceMode {
     async fn get_ref(
         &self,
@@ -615,101 +564,6 @@ impl fluree_db_nameservice::RefLookup for NameServiceMode {
         fluree_db_nameservice::NameServiceError,
     > {
         self.reader().get_ref(ledger_id, kind).await
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::RefPublisher for NameServiceMode {
-    async fn compare_and_set_ref(
-        &self,
-        ledger_id: &str,
-        kind: fluree_db_nameservice::RefKind,
-        expected: Option<&fluree_db_nameservice::RefValue>,
-        new: &fluree_db_nameservice::RefValue,
-    ) -> std::result::Result<
-        fluree_db_nameservice::CasResult,
-        fluree_db_nameservice::NameServiceError,
-    > {
-        match self {
-            Self::ReadWrite(ns) => ns.compare_and_set_ref(ledger_id, kind, expected, new).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "compare_and_set_ref not available on read-only nameservice".into(),
-            )),
-        }
-    }
-}
-
-#[async_trait]
-impl fluree_db_nameservice::Publisher for NameServiceMode {
-    async fn publish_ledger_init(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_ledger_init(ledger_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_ledger_init not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn publish_commit(
-        &self,
-        ledger_id: &str,
-        commit_t: i64,
-        commit_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_commit(ledger_id, commit_t, commit_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_commit not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn publish_index(
-        &self,
-        ledger_id: &str,
-        index_t: i64,
-        index_id: &fluree_db_core::ContentId,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.publish_index(ledger_id, index_t, index_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "publish_index not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn retract(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.retract(ledger_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "retract not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    async fn purge(
-        &self,
-        ledger_id: &str,
-    ) -> std::result::Result<(), fluree_db_nameservice::NameServiceError> {
-        match self {
-            Self::ReadWrite(ns) => ns.purge(ledger_id).await,
-            Self::ReadOnly(_) => Err(fluree_db_nameservice::NameServiceError::Storage(
-                "purge not available on read-only nameservice".into(),
-            )),
-        }
-    }
-
-    fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
-        match self {
-            Self::ReadWrite(ns) => ns.publishing_ledger_id(ledger_id),
-            Self::ReadOnly(_) => None,
-        }
     }
 }
 
@@ -1363,7 +1217,17 @@ struct RuntimeParts {
     attachment_provider_cell: indexer_attachment_provider::LedgerManagerCell,
 }
 
-fn spawn_local_cache_event_listener(
+/// Spawn a background task that subscribes to `event_bus` and refreshes
+/// `ledger_manager` on every commit / index publish; drops loaded
+/// ledgers on retract.
+///
+/// `FlureeBuilder::build` calls this with Fluree's internal bus when
+/// indexing is enabled. Deployments that publish commit events on a
+/// separate bus (e.g. raft's `LedgerEventBus`) should call this again
+/// with that bus so cache reconciliation also fires on those events —
+/// otherwise follower nodes only refresh on initial load, and writes
+/// that land between the initial load and the next reload are invisible.
+pub fn spawn_local_cache_event_listener(
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     ledger_manager: Arc<LedgerManager>,
 ) {
@@ -1373,32 +1237,25 @@ fn spawn_local_cache_event_listener(
 
         loop {
             match subscription.receiver.recv().await {
-                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                    ledger_id,
-                    ..
-                }) => {
-                    match ledger_manager
-                        .notify(NsNotify {
-                            ledger_id: ledger_id.clone(),
-                            record: None,
-                        })
-                        .await
-                    {
-                        Ok(result) => {
-                            tracing::debug!(
-                                alias = %ledger_id,
-                                ?result,
-                                "local cache event listener reconciled ledger"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                alias = %ledger_id,
-                                error = %error,
-                                "local cache event listener failed to reconcile ledger"
-                            );
-                        }
+                // A new commit OR a new index head both move the ledger
+                // forward relative to a cached follower view. Reconcile
+                // on either: without the commit arm, a follower's cache
+                // only advances when an index publish happens to follow,
+                // leaving committed-but-unindexed writes invisible to
+                // reads served by that node (the exact failure exercised
+                // by raft failover — a write lands, replicates, applies
+                // on every node, yet only the staging node's cache shows
+                // it).
+                Ok(
+                    fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                        ledger_id, ..
                     }
+                    | fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                        ledger_id,
+                        ..
+                    },
+                ) => {
+                    reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
                     ledger_manager.disconnect(&ledger_id).await;
@@ -1409,10 +1266,30 @@ fn spawn_local_cache_event_listener(
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The channel overflowed and dropped events. With
+                    // commit publishes on the bus this is the only
+                    // notice some ledger gets, so a bare log would leave
+                    // its cache stale until the next event happens to
+                    // land. Fall back to a catch-up sweep: re-reconcile
+                    // every currently-loaded ledger against the
+                    // nameservice head (a no-op for any already current).
+                    //
+                    // The sweep runs inline in this receive loop, so it
+                    // does not drain the channel while it executes. If a
+                    // future workload makes reconciles slow enough that
+                    // the sweep itself keeps the receiver from draining,
+                    // this could re-trigger Lagged. Not observed in
+                    // practice; revisit with a bound or a provably-behind
+                    // scope only if it proves to arise.
+                    let aliases = ledger_manager.cached_aliases().await;
                     tracing::warn!(
                         skipped,
-                        "local cache event listener lagged behind nameservice events"
+                        ledgers = aliases.len(),
+                        "local cache event listener lagged; sweeping loaded ledgers"
                     );
+                    for alias in aliases {
+                        reconcile_cached_ledger(&ledger_manager, &alias).await;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::debug!("local cache event listener stopped");
@@ -1421,6 +1298,34 @@ fn spawn_local_cache_event_listener(
             }
         }
     });
+}
+
+/// Reconcile one cached ledger against the current nameservice head.
+/// A no-op when the cache is already current or the ledger isn't
+/// loaded. Shared by the per-event path and the lag catch-up sweep.
+async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &str) {
+    match ledger_manager
+        .notify(NsNotify {
+            ledger_id: ledger_id.to_string(),
+            record: None,
+        })
+        .await
+    {
+        Ok(result) => {
+            tracing::debug!(
+                alias = %ledger_id,
+                ?result,
+                "local cache event listener reconciled ledger"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                alias = %ledger_id,
+                error = %error,
+                "local cache event listener failed to reconcile ledger"
+            );
+        }
+    }
 }
 
 impl FlureeBuilder {
@@ -1752,6 +1657,21 @@ impl FlureeBuilder {
     /// available system memory. Use this method to override with a specific MB limit.
     pub fn cache_max_mb(mut self, max_mb: usize) -> Self {
         self.config.cache = fluree_db_connection::CacheConfig::with_max_mb(max_mb);
+        self
+    }
+
+    /// Set the maximum **on-disk** cache budget in MB, shared globally across
+    /// Fluree's object storage and Iceberg data files.
+    ///
+    /// By default the disk budget auto-detects from available disk space. This
+    /// sets a process-global default for caches created afterwards; the
+    /// `FLUREE_DISK_CACHE_BUDGET_BYTES` env var still overrides it, and `0`
+    /// disables disk caching. No effect without the `native` feature.
+    pub fn disk_cache_max_mb(self, max_mb: usize) -> Self {
+        #[cfg(feature = "native")]
+        fluree_db_core::disk_cache::set_configured_budget_bytes((max_mb as u64) << 20);
+        #[cfg(not(feature = "native"))]
+        let _ = max_mb;
         self
     }
 
@@ -2448,7 +2368,7 @@ impl FlureeBuilder {
         attachment_provider_cell: &indexer_attachment_provider::LedgerManagerCell,
     ) -> tx::IndexingMode
     where
-        N: NameService + fluree_db_nameservice::Publisher + Clone + 'static,
+        N: NameServiceLookup + BranchLifecycle + fluree_db_nameservice::Publisher + Clone + 'static,
     {
         self.start_background_indexing_dyn(
             backend,
@@ -2481,7 +2401,7 @@ impl FlureeBuilder {
             // runs would silently drop configured plain-string values
             // committed after the connection started. 64MB cache matches
             // the default `LeafletCache` budget in `load_per_graph_arenas`.
-            let ns_for_provider: Arc<dyn fluree_db_nameservice::NameService> =
+            let ns_for_provider: Arc<dyn fluree_db_nameservice::NameServiceLookup> =
                 Arc::clone(&nameservice) as _;
             let provider = Arc::new(
                 crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
@@ -2512,6 +2432,12 @@ impl FlureeBuilder {
                 .clone()
                 .with_fulltext_config_provider(provider)
                 .with_attachment_events_provider(ann_provider);
+            // BackgroundIndexerWorker takes an
+            // `Arc<dyn IndexingNameService>` — the combined lookup
+            // + index-publish surface. `ReadWriteNameService`
+            // declares `IndexingNameService` as a supertrait, so
+            // `Arc<dyn ReadWriteNameService>` upcasts directly.
+            let nameservice: Arc<dyn fluree_db_nameservice::IndexingNameService> = nameservice;
             let (worker, handle) =
                 BackgroundIndexerWorker::new(backend.clone(), nameservice, indexer_config);
             tokio::spawn(worker.run());
@@ -2603,16 +2529,44 @@ impl FlureeBuilder {
     /// JSON-LD config). For compile-time-known backends, prefer the typed build
     /// methods for better type safety.
     pub async fn build_client(self) -> Result<FlureeClient> {
+        self.dispatch_build_client(None).await
+    }
+
+    /// Build a type-erased `FlureeClient` whose nameservice is the
+    /// supplied `nameservice` rather than the backend-implied default.
+    ///
+    /// Intended for replicated read-paths — most notably the Raft
+    /// state machine, where every node must serve reads against
+    /// committed log state rather than its local backend.
+    ///
+    /// The supplied nameservice fully replaces the per-backend
+    /// nameservice the default `build_client` path would build:
+    /// `NotifyingNameService` wrapping and the background indexer
+    /// are both skipped, because both presume a backend-owned
+    /// `ReadWrite` nameservice that the embedder controls.
+    pub async fn build_client_with_nameservice(
+        self,
+        nameservice: NameServiceMode,
+    ) -> Result<FlureeClient> {
+        self.dispatch_build_client(Some(nameservice)).await
+    }
+
+    /// Internal dispatcher that backs both [`build_client`](Self::build_client)
+    /// and [`build_client_with_nameservice`](Self::build_client_with_nameservice).
+    async fn dispatch_build_client(
+        self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
         // --- S3 / AWS path (async-only) ---
         #[cfg(feature = "aws")]
         if matches!(self.config.index_storage.storage_type, StorageType::S3(_)) {
-            return self.build_client_s3().await;
+            return self.build_client_s3(nameservice).await;
         }
 
         // --- Local (memory/filesystem) ---
         match &self.config.index_storage.storage_type {
-            StorageType::Memory => self.build_client_memory(),
-            StorageType::File => self.build_client_file(),
+            StorageType::Memory => self.build_client_memory(nameservice),
+            StorageType::File => self.build_client_file(nameservice),
             StorageType::S3(_) => Err(ApiError::config(
                 "S3 storage requires the 'aws' feature on fluree-db-api",
             )),
@@ -2622,24 +2576,34 @@ impl FlureeBuilder {
         }
     }
 
-    /// Build a type-erased memory-backed client.
-    fn build_client_memory(self) -> Result<FlureeClient> {
+    /// Build a type-erased memory-backed client. When `nameservice`
+    /// is `Some`, it replaces the default `MemoryNameService` (and
+    /// the notifying wrapper + background indexer that ride along
+    /// with it).
+    fn build_client_memory(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         let base_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
 
         // Wrap with address identifier routing if configured
         let storage = self.wrap_address_identifiers(base_storage)?;
-
-        let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-
-        let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let index_config = self.derive_indexing();
         let attachment_provider_cell = Self::new_attachment_provider_cell();
-        let indexing_mode =
-            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
+
+        let (ns_mode, indexing_mode) = match nameservice {
+            Some(ns) => (ns, tx::IndexingMode::Disabled),
+            None => {
+                let ns = MemoryNameService::new();
+                let notifying =
+                    fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
+                let indexing_mode =
+                    self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
+                (
+                    NameServiceMode::ReadWrite(Arc::new(notifying)),
+                    indexing_mode,
+                )
+            }
+        };
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
@@ -2655,10 +2619,14 @@ impl FlureeBuilder {
         ))
     }
 
-    /// Build a type-erased file-backed client.
-    fn build_client_file(self) -> Result<FlureeClient> {
+    /// Build a type-erased file-backed client. When `nameservice`
+    /// is `Some`, it replaces the default `FileNameService` (and
+    /// the notifying wrapper + background indexer that ride along
+    /// with it).
+    fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         #[cfg(not(feature = "native"))]
         {
+            let _ = nameservice;
             Err(ApiError::config(
                 "Filesystem storage requires the 'native' feature",
             ))
@@ -2684,18 +2652,28 @@ impl FlureeBuilder {
 
             // Wrap with address identifier routing if configured
             let storage = self.wrap_address_identifiers(base_storage)?;
-
-            let nameservice = FileNameService::new(path.as_ref());
-            let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-            let notifying =
-                fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-            let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-
-            let index_config = self.derive_indexing();
             let backend = StorageBackend::Managed(storage);
+            let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+            let index_config = self.derive_indexing();
             let attachment_provider_cell = Self::new_attachment_provider_cell();
-            let indexing_mode =
-                self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
+
+            let (ns_mode, indexing_mode) = match nameservice {
+                Some(ns) => (ns, tx::IndexingMode::Disabled),
+                None => {
+                    let ns = FileNameService::new(path.as_ref());
+                    let notifying =
+                        fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
+                    let indexing_mode = self.start_background_indexing(
+                        &backend,
+                        &notifying,
+                        &attachment_provider_cell,
+                    );
+                    (
+                        NameServiceMode::ReadWrite(Arc::new(notifying)),
+                        indexing_mode,
+                    )
+                }
+            };
             Ok(Self::finalize_with_backend(
                 self.ledger_cache_config,
                 self.config,
@@ -2712,9 +2690,11 @@ impl FlureeBuilder {
         }
     }
 
-    /// Build a type-erased S3-backed client.
+    /// Build a type-erased S3-backed client. When `nameservice` is
+    /// `Some`, it replaces the AWS-managed nameservice (and the
+    /// background indexer that rides along with it).
     #[cfg(feature = "aws")]
-    async fn build_client_s3(self) -> Result<FlureeClient> {
+    async fn build_client_s3(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         // Delegate to fluree_db_connection for AWS SDK init,
         // storage registry sharing, and nameservice creation.
         let handle = fluree_db_connection::connect_from_config(self.config.clone()).await?;
@@ -2738,19 +2718,22 @@ impl FlureeBuilder {
         let storage = self
             .wrap_address_identifiers_aws(base_storage, aws_handle.config())
             .await?;
-
-        let ns_arc = aws_handle.nameservice_arc().clone();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
-        let notifying = fluree_db_nameservice::NotifyingNameService::new(ns_arc, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-
-        let index_config = self.derive_indexing();
         let backend = StorageBackend::Managed(storage);
-        let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
-            Arc::new(notifying.clone());
+        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let index_config = self.derive_indexing();
         let attachment_provider_cell = Self::new_attachment_provider_cell();
-        let indexing_mode =
-            self.start_background_indexing_dyn(&backend, ns_rw, &attachment_provider_cell);
+
+        let (ns_mode, indexing_mode) = match nameservice {
+            Some(ns) => (ns, tx::IndexingMode::Disabled),
+            None => {
+                let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
+                let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
+                    aws_handle.nameservice_arc().clone();
+                let indexing_mode =
+                    self.start_background_indexing_dyn(&backend, ns_rw, &attachment_provider_cell);
+                (NameServiceMode::ReadWrite(ns_arc), indexing_mode)
+            }
+        };
         Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             aws_handle.config().clone(),
@@ -2955,15 +2938,49 @@ impl Fluree {
     }
 
     /// Get read-only nameservice access (always available).
-    pub fn nameservice(&self) -> &dyn NameService {
+    pub fn nameservice(&self) -> &dyn NameServiceLookup {
         self.nameservice_mode.reader()
     }
 
     /// Get read-write nameservice access, or error if read-only.
+    ///
+    /// Returns the full [`NameServicePublisher`] surface — only available
+    /// from [`NameServiceMode::ReadWrite`]. In replicated (Raft) mode,
+    /// callers should use the narrower capability accessors
+    /// ([`ledger_admin`](Self::ledger_admin),
+    /// [`branch_admin`](Self::branch_admin),
+    /// [`index_publisher`](Self::index_publisher)) — those are
+    /// supported in both `ReadWrite` and `Replicated` modes.
     pub fn publisher(&self) -> Result<&dyn NameServicePublisher> {
         self.nameservice_mode
             .publisher()
             .ok_or_else(|| ApiError::internal("write operations require a read-write nameservice"))
+    }
+
+    /// Get the ledger-admin write surface ([`LedgerLifecycle`] —
+    /// init, retract, purge). Available from both `ReadWrite` and
+    /// `Replicated` nameservices; errors only from `ReadOnly` proxies.
+    pub fn ledger_admin(&self) -> Result<&dyn LedgerLifecycle> {
+        self.nameservice_mode
+            .ledger_admin()
+            .ok_or_else(|| ApiError::internal("ledger admin requires a writable nameservice"))
+    }
+
+    /// Get the branch-admin write surface ([`BranchLifecycle`] —
+    /// create_branch, drop_branch, reset_head). Available from both
+    /// `ReadWrite` and `Replicated` nameservices.
+    pub fn branch_admin(&self) -> Result<&dyn BranchLifecycle> {
+        self.nameservice_mode
+            .branch_admin()
+            .ok_or_else(|| ApiError::internal("branch admin requires a writable nameservice"))
+    }
+
+    /// Get the [`IndexPublisher`] write surface. Available from both
+    /// `ReadWrite` and `Replicated` nameservices.
+    pub fn index_publisher(&self) -> Result<&dyn IndexPublisher> {
+        self.nameservice_mode
+            .index_publisher()
+            .ok_or_else(|| ApiError::internal("index publishing requires a writable nameservice"))
     }
 
     /// Get the raw nameservice mode (for mode checks or `publisher_arc()`).
@@ -3278,6 +3295,417 @@ impl Fluree {
         OwnedTransactBuilder::new(self, ledger)
     }
 
+    /// Stage a Cypher write statement.
+    ///
+    /// The Cypher parser produces a Txn that mirrors what the JSON-LD
+    /// `@annotation` lowering produces: base triples plus an
+    /// `f:reifies*` reifier bundle for every directed typed
+    /// relationship (LPG-mode default).
+    ///
+    /// v1 supports CREATE only. SET / REMOVE / DELETE / DETACH
+    /// DELETE / MERGE return clear deferred-feature errors. See
+    /// `docs/concepts/cypher.md` for the surface.
+    ///
+    /// Context resolution: the ledger's configured `default_context`
+    /// (if any) supplies `@vocab` and bare-identifier overrides.
+    /// A CAS read or parse failure on a configured context
+    /// propagates as an error — writes never silently fall back to
+    /// the built-in vocab when a custom context was specified.
+    /// The built-in fallback (`http://example.org/`) applies only
+    /// when (a) the ledger has no nameservice record yet
+    /// (genesis / pre-commit), or (b) the record exists but no
+    /// `default_context` CID is configured.
+    pub async fn transact_cypher(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+    ) -> Result<TransactResult> {
+        self.transact_cypher_with_params(ledger, cypher, None).await
+    }
+
+    /// Like [`transact_cypher`](Self::transact_cypher) but substitutes
+    /// `$param` references from `params` before lowering.
+    ///
+    /// This convenience method carries no [`PolicyContext`], so a conditional
+    /// `MERGE` here probes an UNWRAPPED view — correct precisely because there is
+    /// no policy to enforce. A policy-gated caller must NOT route through here:
+    /// it would choose the match-vs-create branch against unfiltered data. The
+    /// consensus write path wraps the probe instead (see
+    /// `fluree-db-consensus/src/local.rs`), and any future policy-aware variant
+    /// of this method must do the same before calling
+    /// [`resolve_conditional_cypher`](Self::resolve_conditional_cypher).
+    pub async fn transact_cypher_with_params(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<TransactResult> {
+        let plan = self
+            .cypher_write_plan(cypher, params, ledger.ledger_id(), &ledger.snapshot)
+            .await?;
+        let txn = match plan {
+            crate::cypher_write::WritePlan::Single(txn) => *txn,
+            crate::cypher_write::WritePlan::Conditional(cw) => {
+                // Unwrapped probe: this method has no policy. See the method doc.
+                let probe = GraphDb::from_ledger_state(&ledger);
+                self.resolve_conditional_cypher(&cw, probe, ledger.ledger_id(), &ledger.snapshot)
+                    .await?
+            }
+        };
+        self.stage_owned(ledger).txn(txn).execute().await
+    }
+
+    /// Parse + param-substitute a Cypher write and classify it as a single
+    /// `Txn` or a conditional write needing a pre-write probe.
+    pub async fn cypher_write_plan(
+        &self,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<crate::cypher_write::WritePlan> {
+        let out = fluree_db_cypher::parse_cypher(cypher);
+        if out.has_errors() {
+            let msg = out
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::cypher(msg, out.diagnostics));
+        }
+        let mut ast = out
+            .ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+        let empty = fluree_db_cypher::ParamMap::new();
+        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+
+        if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
+            return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
+        }
+        let txn = self
+            .lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+            .await?;
+        Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
+    }
+
+    /// Resolve a conditional Cypher write by probing the writer view, then
+    /// lowering the chosen branch to a concrete `Txn`. The probe view must
+    /// represent the same pre-write state the resulting `Txn` will commit
+    /// against.
+    ///
+    /// POLICY CONTRACT: `probe_view` must already be policy-wrapped to match the
+    /// write's governance. This method does not (and cannot) wrap it — it has no
+    /// `PolicyContext` — so passing an unwrapped view under an active policy
+    /// would select the `MERGE` match-vs-create branch against unfiltered data,
+    /// leaking existence. Callers under policy wrap first (see
+    /// `fluree-db-consensus/src/local.rs`, which wraps when the governance has
+    /// any policy inputs).
+    pub async fn resolve_conditional_cypher(
+        &self,
+        cw: &crate::cypher_write::ConditionalCypherWrite,
+        probe_view: GraphDb,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<fluree_db_transact::ir::Txn> {
+        use crate::cypher_write::ConditionalCypherWrite;
+        // Attach the ledger's default context so the probe resolves bare
+        // identifiers the same way the write does.
+        let default_context = match self.get_default_context(ledger_id).await {
+            Ok(ctx) => ctx,
+            Err(ApiError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let probe_view = probe_view.with_default_context(default_context);
+
+        match cw {
+            ConditionalCypherWrite::MergeOnMatch(merge) => {
+                let node = &merge.pattern.parts[0].head;
+                // ON MATCH SET references the MERGE variable, so the node needs one.
+                if node.var.is_none() {
+                    return Err(ApiError::cypher(
+                        "MERGE … ON MATCH SET requires a node variable".to_string(),
+                        Vec::new(),
+                    ));
+                }
+                let probe = crate::cypher_write::build_merge_probe_ast(node);
+                let exists = self
+                    .query_cypher_ast(&probe_view, &probe)
+                    .await?
+                    .row_count()
+                    > 0;
+                let ast = if exists {
+                    crate::cypher_write::build_on_match_ast(merge)
+                } else {
+                    crate::cypher_write::build_create_ast(merge)
+                };
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+            ConditionalCypherWrite::DeleteNode(update) => {
+                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
+                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
+                })?;
+                // Cypher requires bare DELETE to fail when a target still has
+                // relationships. Probe each target in both directions.
+                for target in &delete.targets {
+                    // Only mandatorily-bound targets are well-defined here. An
+                    // OPTIONAL-only binding can leave `target` unbound on some
+                    // rows, where the appended relationship hop would bind an
+                    // unrelated node and false-trigger the guard.
+                    if !crate::cypher_write::bound_by_mandatory_match(update, &target.name) {
+                        return Err(ApiError::cypher(
+                            format!(
+                                "DELETE of `{}` requires the node to be bound by a \
+                                 mandatory MATCH (not only OPTIONAL MATCH)",
+                                target.name
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                    for inbound in [false, true] {
+                        if self
+                            .delete_target_has_relationship(&probe_view, update, target, inbound)
+                            .await?
+                        {
+                            return Err(ApiError::cypher(
+                                format!(
+                                    "DELETE of `{}` failed: the node still has relationships; \
+                                     use DETACH DELETE to remove it together with its relationships",
+                                    target.name
+                                ),
+                                Vec::new(),
+                            ));
+                        }
+                    }
+                }
+                // No relationships → the node retraction is identical to
+                // DETACH DELETE.
+                let ast = crate::cypher_write::build_detach_delete_ast(update);
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+            ConditionalCypherWrite::DeleteRel(update) => {
+                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
+                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
+                })?;
+                // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
+                // triple, whose `f:reifies*` cascade removes the bundle. If the
+                // base edge backs a parallel sibling, that retraction would
+                // disturb the sibling — reject. The endpoints must be named so
+                // the probe can group by them.
+                for target in &delete.targets {
+                    let (a, b) = crate::cypher_write::rel_endpoint_vars(update, &target.name)
+                        .ok_or_else(|| {
+                            ApiError::cypher(
+                                format!(
+                                    "DELETE of relationship `{}` requires both endpoint \
+                                     nodes to be named (e.g. `(a)-[{}]->(b)`)",
+                                    target.name, target.name
+                                ),
+                                Vec::new(),
+                            )
+                        })?;
+                    let probe_ast = crate::cypher_write::build_parallel_probe_ast(
+                        &update.read_clauses,
+                        &a,
+                        &b,
+                        &target.name,
+                    );
+                    if self
+                        .query_cypher_ast(&probe_view, &probe_ast)
+                        .await?
+                        .row_count()
+                        > 0
+                    {
+                        return Err(ApiError::cypher(
+                            format!(
+                                "DELETE of relationship `{}` failed: parallel relationships \
+                                 share its underlying edge, so deleting one would affect the \
+                                 others. Per-occurrence DELETE of a parallel relationship is \
+                                 not yet supported.",
+                                target.name
+                            ),
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // No parallel siblings → retracting each base edge removes only
+                // its own reifier bundle. Lower the original DELETE directly.
+                let ast = fluree_db_cypher::CypherAst {
+                    statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
+                    span: update.span,
+                };
+                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                    .await
+            }
+        }
+    }
+
+    async fn delete_target_has_relationship(
+        &self,
+        probe_view: &GraphDb,
+        update: &fluree_db_cypher::ast::Update,
+        target: &fluree_db_cypher::ast::Variable,
+        inbound: bool,
+    ) -> Result<bool> {
+        use fluree_db_query::ir::{Pattern, QueryOutput, Ref, Term, TriplePattern};
+
+        let probe_ast =
+            crate::cypher_write::build_delete_target_probe_ast(&update.read_clauses, target);
+        let (mut vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
+            &probe_ast,
+            &probe_view.snapshot,
+            probe_view.default_context.as_ref(),
+        )?;
+
+        let target_var = vars.get(&target.name).ok_or_else(|| {
+            ApiError::cypher(
+                format!("DELETE probe could not resolve target `{}`", target.name),
+                Vec::new(),
+            )
+        })?;
+        let pred_var = vars.get_or_insert("?#__cydel_p");
+        let other_var = vars.get_or_insert(if inbound {
+            "?#__cydel_s"
+        } else {
+            "?#__cydel_o"
+        });
+
+        let triple = if inbound {
+            TriplePattern::new(
+                Ref::Var(other_var),
+                Ref::Var(pred_var),
+                Term::Var(target_var),
+            )
+        } else {
+            TriplePattern::new(
+                Ref::Var(target_var),
+                Ref::Var(pred_var),
+                Term::Var(other_var),
+            )
+        };
+        parsed.patterns.push(Pattern::Triple(triple));
+        parsed.output = if inbound {
+            QueryOutput::select_all(vec![pred_var])
+        } else {
+            QueryOutput::select_all(vec![pred_var, other_var])
+        };
+        parsed.limit = None;
+
+        let executable = self.build_executable_for_view(probe_view, &parsed).await?;
+        let batches = self
+            .execute_view_internal(
+                probe_view,
+                &vars,
+                &executable,
+                &fluree_db_core::Tracker::disabled(),
+                &QueryExecutionOptions::default(),
+            )
+            .await?;
+        let binary_graph = probe_view.binary_graph();
+
+        for batch in &batches {
+            for row in 0..batch.len() {
+                let Some(pred) = batch.get(row, pred_var) else {
+                    continue;
+                };
+                if !cypher_delete_predicate_is_relationship(pred, binary_graph.as_ref())? {
+                    continue;
+                }
+                if inbound {
+                    return Ok(true);
+                }
+                let Some(object) = batch.get(row, other_var) else {
+                    continue;
+                };
+                if binding_is_node_ref(object) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Parse and lower a Cypher write statement to a `Txn`, resolving bare
+    /// identifiers against the ledger's default context (so writes match the
+    /// read path's IRI mapping). The returned `Txn` carries its own
+    /// `namespace_delta`, so it can be staged against any builder
+    /// (`stage_owned` for the owned-ledger path, or `stage(&handle)` for the
+    /// server's cached-handle path, which keeps the in-memory cache current).
+    pub async fn lower_cypher_to_txn(
+        &self,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<fluree_db_transact::ir::Txn> {
+        let out = fluree_db_cypher::parse_cypher(cypher);
+        if out.has_errors() {
+            let msg = out
+                .diagnostics
+                .iter()
+                .map(|d| format!("{}: {}", d.code, d.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ApiError::cypher(msg, out.diagnostics));
+        }
+        let mut ast = out
+            .ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+
+        // Substitute `$param` references before lowering. Always run (empty
+        // map when no params were supplied) so an unfilled `$param` reports a
+        // clear missing-parameter error.
+        let empty = fluree_db_cypher::ParamMap::new();
+        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
+            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+
+        self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+            .await
+    }
+
+    /// Lower an already-parsed, param-substituted Cypher AST to a `Txn`,
+    /// resolving bare identifiers against the ledger's default context. The
+    /// conditional-write path uses this to lower the constructed branch ASTs
+    /// (create vs on-match) it derives from a probe.
+    pub async fn lower_cypher_ast_to_txn(
+        &self,
+        ast: &fluree_db_cypher::CypherAst,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<fluree_db_transact::ir::Txn> {
+        // Pull @vocab and term overrides out of the ledger's default context so
+        // write Cypher resolves bare identifiers the same way `query_cypher`
+        // does. `Ok(None)` (no default_context configured) and
+        // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
+        // context"; every other error propagates so writes never silently land
+        // under the built-in vocab when a custom context couldn't be loaded.
+        let default_context = match self.get_default_context(ledger_id).await {
+            Ok(ctx) => ctx,
+            Err(ApiError::NotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let (vocab, overrides) =
+            crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
+        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
+            vocab: Some(vocab),
+            overrides,
+        };
+
+        let mut ns = NamespaceRegistry::from_db(snapshot);
+        Ok(
+            fluree_db_transact::lower_cypher_update::lower_cypher_update(
+                ast,
+                &mut ns,
+                TxnOpts::default(),
+                cypher_opts,
+            )?,
+        )
+    }
+
     /// Create a FROM-driven query builder.
     ///
     /// Use this when the query body itself specifies which ledgers to target
@@ -3572,6 +4000,45 @@ impl Fluree {
     }
 }
 
+fn binding_is_node_ref(binding: &fluree_db_query::Binding) -> bool {
+    matches!(
+        binding,
+        fluree_db_query::Binding::Sid { .. }
+            | fluree_db_query::Binding::IriMatch { .. }
+            | fluree_db_query::Binding::Iri(_)
+            | fluree_db_query::Binding::EncodedSid { .. }
+    )
+}
+
+fn cypher_delete_predicate_is_relationship(
+    binding: &fluree_db_query::Binding,
+    binary_graph: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<bool> {
+    let sid = match binding {
+        fluree_db_query::Binding::Sid { sid, .. } => sid.clone(),
+        fluree_db_query::Binding::IriMatch { primary_sid, .. } => primary_sid.clone(),
+        fluree_db_query::Binding::EncodedPid { p_id } => {
+            let gv = binary_graph.ok_or_else(|| {
+                ApiError::query(
+                    "DELETE relationship probe returned an encoded predicate without a binary graph",
+                )
+            })?;
+            let iri = gv.store().resolve_predicate_iri(*p_id).ok_or_else(|| {
+                ApiError::query(format!(
+                    "DELETE relationship probe could not resolve predicate id {p_id}"
+                ))
+            })?;
+            gv.store().encode_iri(iri)
+        }
+        fluree_db_query::Binding::Iri(iri) => {
+            return Ok(iri.as_ref() != fluree_vocab::rdf::TYPE);
+        }
+        _ => return Ok(false),
+    };
+
+    Ok(!fluree_db_core::is_rdf_type(&sid) && !fluree_db_core::is_reserved_reifies_predicate(&sid))
+}
+
 // ============================================================================
 // Default context management
 // ============================================================================
@@ -3860,7 +4327,7 @@ impl Fluree {
             let new_config = ConfigValue::new(new_v, Some(new_payload));
 
             match self
-                .nameservice_mode
+                .publisher()?
                 .push_config(canonical_id, current_config.as_ref(), &new_config)
                 .await?
             {

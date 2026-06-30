@@ -38,6 +38,10 @@ pub mod datatype_constraint;
 pub mod datatypes;
 pub mod db;
 pub mod dict_novelty;
+/// Shared LRU disk cache for content-addressed blobs (index artifacts, Iceberg
+/// data files), with a single global byte budget. Native (filesystem) only.
+#[cfg(feature = "native")]
+pub mod disk_cache;
 pub mod edge;
 pub mod error;
 pub mod flake;
@@ -146,7 +150,7 @@ pub use ns_encoding::{
 };
 pub use o_type::{DecodeKind, OType};
 pub use o_type_registry::OTypeRegistry;
-pub use overlay::{NoOverlay, OverlayProvider};
+pub use overlay::{NoOverlay, OverlayProvider, OverlaySegmentMeta};
 pub use prefix_trie::PrefixTrie;
 pub use range::{
     flake_matches_range_eq, range, range_bounded_with_overlay, range_with_overlay, ObjectBounds,

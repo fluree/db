@@ -35,6 +35,8 @@ pub mod jwks;
 pub mod mcp;
 pub mod peer;
 pub(crate) mod query_control;
+#[cfg(feature = "raft")]
+pub mod raft;
 pub mod registry;
 pub mod routes;
 pub mod serde;
@@ -54,52 +56,78 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
+#[cfg(feature = "raft")]
+use fluree_db_consensus::raft::commit_worker::{
+    PublishingChannel, QueuePoisonPublisher, StagingContext, WorkerSupervisor,
+};
+
+/// Private listener config for the Raft inter-node RPC + admin
+/// routers. Only populated when the server is constructed with a
+/// Raft handle via [`FlureeServer::new_with_raft`].
+#[cfg(feature = "raft")]
+struct RaftListener {
+    /// Routed under `/raft` (inter-node RPC, peer-trusted) and
+    /// `/cluster` (admin, gated by `routes::admin_auth::require_admin_token`
+    /// against the active `admin_auth` config; pass-through when the
+    /// mode is `None`).
+    private_router: Router,
+    /// Address for the VPC-internal listener. Distinct from the
+    /// public client-facing listener at `config.listen_addr`.
+    listen_addr: std::net::SocketAddr,
+}
+
 /// Fluree HTTP Server
 pub struct FlureeServer {
     /// Application state
     state: Arc<AppState>,
     /// Configured router
     router: Router,
+    /// Optional private Raft listener (consensus + admin).
+    #[cfg(feature = "raft")]
+    raft_listener: Option<RaftListener>,
+    /// Leader-aware watcher driving every leader-only background
+    /// task (indexer, idempotency evictor). `Some` when raft mode is
+    /// on. Aborted on shutdown so the spawned tasks tear down with
+    /// the rest of the server.
+    #[cfg(feature = "raft")]
+    raft_leader_watcher: Option<crate::raft::CancellableTaskHandle>,
+    /// Per-node worker supervisor. Runs on every node (independent
+    /// of leadership) and drives per-branch [`Worker`] tasks for
+    /// branches this node owns under rendezvous assignment. Shut
+    /// down gracefully so in-flight workers stop before the runtime
+    /// goes away.
+    ///
+    /// [`Worker`]: fluree_db_consensus::raft::commit_worker::Worker
+    #[cfg(feature = "raft")]
+    raft_worker_supervisor: Option<crate::raft::CancellableTaskHandle>,
+    /// Per-node release task that drains the state-machine adapter's
+    /// CAS release channel. Runs on every node (not just the leader)
+    /// so admin-cleared queue entries and idempotency-evicted
+    /// envelopes don't orphan their bodies in the content store.
+    ///
+    /// Holds the task's `JoinHandle` and a `CancellationToken`.
+    /// Shutdown cancels the token, the task drains any messages
+    /// already buffered in the channel, then exits; the
+    /// `JoinHandle` is awaited so leftover releases land in the
+    /// content store before the process goes away. A naked
+    /// `task.abort()` here would drop in-flight releases and leak
+    /// the envelopes — the channel is `mpsc::unbounded`, so
+    /// whatever the adapter pushed between the last `recv` and the
+    /// abort is gone.
+    #[cfg(feature = "raft")]
+    raft_release_task: Option<(
+        tokio::task::JoinHandle<()>,
+        tokio_util::sync::CancellationToken,
+    )>,
 }
 
 impl FlureeServer {
-    /// Create a new server with the given configuration
+    /// Create a new server with the given configuration.
+    ///
+    /// Sugar for `FlureeServerBuilder` with no extras. For Raft
+    /// mode, use [`FlureeServerBuilder::with_raft`].
     pub async fn new(config: ServerConfig) -> std::result::Result<Self, fluree_db_api::ApiError> {
-        let telemetry_config = TelemetryConfig::with_server_config(&config);
-        let state = Arc::new(AppState::new(config, telemetry_config).await?);
-
-        // Warm JWKS cache (async — fetch keys from configured endpoints)
-        #[cfg(feature = "oidc")]
-        if let Some(jwks_cache) = &state.jwks_cache {
-            let warmed = jwks_cache.warm().await;
-            let total = jwks_cache.configured_issuer_count();
-            if warmed == 0 && total > 0 {
-                if state.config.data_auth_mode == crate::config::DataAuthMode::Required {
-                    tracing::error!(
-                        total_issuers = total,
-                        "No JWKS endpoints reachable at startup — \
-                         OIDC token verification will FAIL until endpoints become available"
-                    );
-                } else {
-                    tracing::warn!(
-                        total_issuers = total,
-                        "No JWKS endpoints reachable at startup — \
-                         OIDC tokens will be rejected until endpoints become available"
-                    );
-                }
-            }
-        }
-
-        // NOTE: ledger preloading + forward-dict warming is deliberately NOT
-        // done here. It runs as a background task spawned in `run()` AFTER the
-        // listener binds, so the server accepts requests immediately instead of
-        // blocking startup until every (potentially large) ledger is loaded.
-        // Preload is a pure latency optimization — a ledger not yet warmed is
-        // still served correctly via an on-demand cold load on first access.
-
-        let router = routes::build_router(state.clone());
-
-        Ok(Self { state, router })
+        FlureeServerBuilder::for_config(config).build().await
     }
 
     /// Pre-load non-retracted ledgers into the LRU cache and warm their
@@ -212,6 +240,17 @@ impl FlureeServer {
         let addr = self.state.config.listen_addr;
         let listener = TcpListener::bind(addr).await?;
 
+        // Bind the private Raft listener up front so a port-in-use
+        // failure surfaces before we've spawned any background tasks.
+        #[cfg(feature = "raft")]
+        let raft_listener_bound = match self.raft_listener {
+            Some(rl) => {
+                let l = TcpListener::bind(rl.listen_addr).await?;
+                Some((l, rl.private_router, rl.listen_addr))
+            }
+            None => None,
+        };
+
         // Start peer subscription/sync task if in peer mode
         let subscription_task = if self.state.config.is_peer_mode() {
             let peer_state = self
@@ -248,6 +287,19 @@ impl FlureeServer {
         // Start ledger manager maintenance task for idle eviction
         let ledger_maintenance_task = self.state.fluree.spawn_maintenance();
 
+        // Spawn the private Raft listener. Carries the inter-node
+        // RPC + cluster admin routers — mount on a VPC-internal
+        // interface (no auth on these endpoints by design).
+        #[cfg(feature = "raft")]
+        let raft_listener_task = raft_listener_bound.map(|(private_listener, router, addr)| {
+            info!(addr = %addr, "Raft private listener starting");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(private_listener, router).await {
+                    tracing::error!(error = %e, "Raft private listener exited");
+                }
+            })
+        });
+
         // Warm ledger caches + forward-dict pages in the BACKGROUND, after the
         // listener is bound, so the server accepts requests immediately rather
         // than blocking startup until every (potentially large) ledger loads.
@@ -275,6 +327,42 @@ impl FlureeServer {
         }
         if let Some(task) = ledger_maintenance_task {
             task.abort();
+        }
+        #[cfg(feature = "raft")]
+        if let Some(task) = raft_listener_task {
+            task.abort();
+        }
+        #[cfg(feature = "raft")]
+        if let Some(handle) = self.raft_worker_supervisor {
+            // Drain workers before the leader-only background tasks
+            // (indexer, evictor) shut down — they touch the same
+            // shared state the workers' final publishes go through,
+            // and ordering matters when this node is itself the
+            // leader. The supervisor aborts each per-branch worker
+            // and returns only after they've stopped.
+            handle.shutdown().await;
+        }
+        #[cfg(feature = "raft")]
+        if let Some(handle) = self.raft_leader_watcher {
+            // Cooperative shutdown: cancel the watcher's token, then
+            // await its `JoinHandle`. The watcher exits its select
+            // loop, abort-and-awaits every in-flight leader task,
+            // and only then returns — so this `await` resolves with
+            // a guarantee that every leader-only task (indexer,
+            // eviction scheduler) has actually stopped, not just
+            // been signalled.
+            handle.shutdown().await;
+        }
+        #[cfg(feature = "raft")]
+        if let Some((task, cancel)) = self.raft_release_task {
+            // Cooperative: cancel the recv loop, the task drains
+            // any messages still buffered in the unbounded channel,
+            // then exits. Awaiting the `JoinHandle` is what makes
+            // the drain actually happen before the process tears
+            // down — a bare `abort()` here would skip the drain
+            // and leak the envelopes.
+            cancel.cancel();
+            let _ = task.await;
         }
 
         result
@@ -314,13 +402,33 @@ impl FlureeServer {
 /// Builder for FlureeServer with fluent API
 pub struct FlureeServerBuilder {
     config: ServerConfig,
+    /// Optional Raft integration and the private listener address
+    /// for inter-node RPC + cluster admin. Set via
+    /// [`Self::with_raft`].
+    #[cfg(feature = "raft")]
+    raft: Option<(Arc<crate::raft::RaftIntegration>, std::net::SocketAddr)>,
+    /// Threshold tuning for the leader-only liveness monitor. Defaults
+    /// to [`LivenessConfig::default`]; tests override with sub-second
+    /// thresholds to keep runtimes short.
+    #[cfg(feature = "raft")]
+    liveness_config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig,
 }
 
 impl FlureeServerBuilder {
     /// Create a new builder with default config (memory storage)
     pub fn new() -> Self {
+        Self::for_config(ServerConfig::default())
+    }
+
+    /// Create a builder wrapping an already-built [`ServerConfig`].
+    /// Used by [`FlureeServer::new`] as the no-extras shortcut path.
+    pub fn for_config(config: ServerConfig) -> Self {
         Self {
-            config: ServerConfig::default(),
+            config,
+            #[cfg(feature = "raft")]
+            raft: None,
+            #[cfg(feature = "raft")]
+            liveness_config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig::default(),
         }
     }
 
@@ -361,14 +469,367 @@ impl FlureeServerBuilder {
         self
     }
 
-    /// Build the server
+    /// Set the global on-disk cache budget in MB (Fluree object storage + Iceberg)
+    pub fn disk_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.disk_cache_max_mb = Some(max_mb);
+        self
+    }
+
+    /// Attach a [`RaftIntegration`](crate::raft::RaftIntegration) and
+    /// the private listener address. The resulting server mounts the
+    /// leader-forward middleware over write routes and serves the
+    /// inter-node RPC + cluster admin routers on `listen_addr`.
+    /// `listen_addr` should be a VPC-internal interface — those
+    /// routers carry no auth of their own.
+    #[cfg(feature = "raft")]
+    pub fn with_raft(
+        mut self,
+        integration: Arc<crate::raft::RaftIntegration>,
+        listen_addr: std::net::SocketAddr,
+    ) -> Self {
+        self.raft = Some((integration, listen_addr));
+        self
+    }
+
+    /// Override the leader-only liveness monitor's threshold tuning.
+    /// Defaults are sane for production; tests use this hook to
+    /// shrink the unreachable / live windows so the demotion path
+    /// fires within a couple of seconds.
+    #[cfg(feature = "raft")]
+    pub fn with_liveness_config(
+        mut self,
+        config: fluree_db_consensus::raft::liveness_monitor::LivenessConfig,
+    ) -> Self {
+        self.liveness_config = config;
+        self
+    }
+
+    /// Build the server.
+    ///
+    /// Single construction path: pick the `Fluree` constructor
+    /// (default vs raft-replicated nameservice) based on whether
+    /// raft is attached, then build `AppState` around it, then warm
+    /// JWKS, preload ledgers, and build the router.
     pub async fn build(self) -> std::result::Result<FlureeServer, fluree_db_api::ApiError> {
-        FlureeServer::new(self.config).await
+        let telemetry_config = TelemetryConfig::with_server_config(&self.config);
+
+        // Construct `RaftNameService` once and reuse it for both the
+        // Fluree read path (downcast to `NameServiceLookup`) and the
+        // leader-aware indexer launcher (upcast to
+        // `IndexingNameService`). Keeping a single Arc keeps reads
+        // and the index publisher coherent — both observe the same
+        // shared state and propose through the same Raft handle.
+        // `RaftIntegration` owns the per-node `RaftNameService` (built
+        // in its constructor with the same shared state, staged
+        // receipts, and HTTP client that drive the rest of the
+        // integration). We borrow the same handle here so reads,
+        // publishes, and the inbound `apply_staged_commit` route all
+        // see one consistent picture.
+        #[cfg(feature = "raft")]
+        let raft_nameservice = self
+            .raft
+            .as_ref()
+            .map(|(integration, _)| integration.nameservice());
+
+        // Build `Fluree` with the right nameservice for the
+        // deployment mode. Raft mode wires `RaftNameService` so
+        // every node's reads observe replicated state; default mode
+        // uses whatever the storage backend implies.
+        #[cfg(feature = "raft")]
+        let (fluree, cache_stats_handle) = if let Some(raft_ns) = raft_nameservice.as_ref() {
+            // RaftNameService satisfies the full
+            // `NameServicePublisher` surface (refs, admin reindex,
+            // status / config push, graph-source publish / index /
+            // retract), so it slots directly into ReadWrite.
+            let publisher: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher> =
+                raft_ns.clone();
+            let ns_mode = fluree_db_api::NameServiceMode::ReadWrite(publisher);
+            state::build_fluree_with_nameservice(&self.config, ns_mode).await?
+        } else {
+            state::build_default_fluree(&self.config).await?
+        };
+        #[cfg(not(feature = "raft"))]
+        let (fluree, cache_stats_handle) = state::build_default_fluree(&self.config).await?;
+
+        #[allow(unused_mut)]
+        let mut state_inner =
+            AppState::with_fluree(self.config, telemetry_config, fluree, cache_stats_handle)
+                .await?;
+
+        #[cfg(feature = "raft")]
+        let raft_listener_parts = self.raft.as_ref().map(|(integration, listen_addr)| {
+            // Consensus-side committer stack: `QueuedTransactor`
+            // routes all five `Committer` methods through
+            // `EnqueueCommand` plus the per-process `WaiterMap` and
+            // `StagedReceiptMap`; `CachingCommitter` sits on top so
+            // keyed retries dedupe before the queue propose.
+            let queued = fluree_db_consensus::raft::queued_transactor::QueuedTransactor::new(
+                Arc::clone(&integration.raft),
+                Arc::clone(&state_inner.fluree),
+                Arc::clone(&integration.waiter_map),
+                integration.shared_state.clone(),
+            );
+            state_inner.committer =
+                Arc::new(fluree_db_consensus::CachingCommitter::wrapping(queued));
+            state_inner.raft = Some(Arc::clone(integration));
+            // The actual `RaftListener` is assembled after `state` is
+            // Arc-wrapped below so the admin-auth middleware can be
+            // layered onto the `/cluster` subtree with `Arc<AppState>`.
+            (Arc::clone(integration), *listen_addr)
+        });
+
+        // Per-node CAS release task. The state-machine adapter pushes
+        // `(ledger_id, request_cid)` pairs through the integration's
+        // release channel whenever an apply surfaces evictable
+        // envelopes (idempotency eviction, admin clears). Followers
+        // see the same applies as the leader, so running this task on
+        // every node keeps the content store consistent across the
+        // cluster.
+        #[cfg(feature = "raft")]
+        let raft_release_task = match self.raft.as_ref() {
+            Some((integration, _)) => {
+                let rx = integration.take_release_receiver().await;
+                rx.map(|mut rx| {
+                    let fluree = Arc::clone(&state_inner.fluree);
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    let cancel_for_task = cancel.clone();
+                    let join = tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                () = cancel_for_task.cancelled() => break,
+                                msg = rx.recv() => {
+                                    match msg {
+                                        Some((ledger_id, cid)) => {
+                                            release_one(&fluree, &ledger_id, &cid).await;
+                                        }
+                                        // Sender side closed (Raft adapter
+                                        // gone): no more releases possible.
+                                        None => return,
+                                    }
+                                }
+                            }
+                        }
+                        // Shutdown drain: between the last `recv` and the
+                        // cancel signal the adapter may have buffered
+                        // releases for evictions / admin clears applied
+                        // moments before stop. Drop them and the
+                        // envelopes leak in the content store with no
+                        // path to GC; pull whatever's buffered and
+                        // release it before the task exits.
+                        while let Ok((ledger_id, cid)) = rx.try_recv() {
+                            release_one(&fluree, &ledger_id, &cid).await;
+                        }
+                    });
+                    (join, cancel)
+                })
+            }
+            None => None,
+        };
+
+        // Subscribe Fluree's `LedgerManager` to the raft integration's
+        // event bus so commit / index applies reconcile cached state
+        // on every node, not just the one that staged the commit.
+        #[cfg(feature = "raft")]
+        if let Some(((integration, _), mgr)) =
+            self.raft.as_ref().zip(state_inner.fluree.ledger_manager())
+        {
+            fluree_db_api::spawn_local_cache_event_listener(
+                Arc::clone(&integration.event_bus),
+                Arc::clone(mgr),
+            );
+        }
+
+        // Per-node worker supervisor. Runs on every node (leader and
+        // followers alike) because distributed workers can land
+        // anywhere under rendezvous assignment. Spawned here so its
+        // lifecycle is independent of the leader watcher's; followers'
+        // workers ferry their apply through the leader via
+        // `RaftNameService::apply_staged_commit`.
+        #[cfg(feature = "raft")]
+        let raft_worker_supervisor = self.raft.as_ref().map(|(integration, _)| {
+            let raft_ns = std::sync::Arc::clone(
+                raft_nameservice
+                    .as_ref()
+                    .expect("raft_nameservice present whenever self.raft is Some"),
+            );
+            let commits: std::sync::Arc<dyn fluree_db_nameservice::CommitPublisher> =
+                std::sync::Arc::clone(&raft_ns) as _;
+            // Same `RaftNameService` Arc upcast a second time, this
+            // time to the queue-poison publisher trait so a follower-
+            // owned worker can ferry deterministic poisons to the
+            // leader instead of looping forever on `client_write`
+            // returning `ForwardToLeader`.
+            let poison: Arc<dyn QueuePoisonPublisher> = Arc::clone(&raft_ns) as _;
+            let supervisor = WorkerSupervisor::new(
+                integration.id,
+                Arc::clone(&integration.raft),
+                integration.shared_state.clone(),
+                PublishingChannel {
+                    commits,
+                    poison,
+                    staged_receipts: Arc::clone(&integration.staged_receipts),
+                },
+                StagingContext {
+                    fluree: Arc::clone(&state_inner.fluree),
+                    index_config: state_inner
+                        .index_config
+                        .clone()
+                        .expect("index_config set by AppState::new"),
+                },
+            );
+            crate::raft::spawn_worker_supervisor(supervisor)
+        });
+
+        // Wire the leader-aware launcher. Bundles the background
+        // indexer and the periodic idempotency evictor — both
+        // leader-only tasks. The worker supervisor lives at node
+        // scope (above) and is *not* in this set.
+        #[cfg(feature = "raft")]
+        let raft_leader_watcher = self.raft.as_ref().map(|(integration, _)| {
+            let raft_ns = std::sync::Arc::clone(
+                raft_nameservice
+                    .as_ref()
+                    .expect("raft_nameservice present whenever self.raft is Some"),
+            );
+            let backend = state_inner.fluree.backend().clone();
+            let indexer_config = fluree_db_indexer::IndexerConfig::default();
+            let event_bus = Arc::clone(&integration.event_bus);
+            let eviction_scheduler =
+                fluree_db_consensus::raft::eviction_scheduler::EvictionScheduler::new(Arc::clone(
+                    &integration.raft,
+                ));
+            let liveness_monitor =
+                fluree_db_consensus::raft::liveness_monitor::LivenessMonitor::new(
+                    Arc::clone(&integration.raft),
+                    integration.shared_state.clone(),
+                )
+                .with_config(self.liveness_config.clone());
+            let spawn_leader_tasks = move || {
+                let nameservice: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
+                    raft_ns.clone();
+                let (worker, _handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+                    backend.clone(),
+                    nameservice,
+                    indexer_config.clone(),
+                );
+                let worker = worker.with_event_bus(Arc::clone(&event_bus));
+                vec![
+                    tokio::spawn(worker.run()),
+                    tokio::spawn(eviction_scheduler.clone().run()),
+                    tokio::spawn(liveness_monitor.clone().run()),
+                ]
+            };
+            crate::raft::spawn_leader_watcher(
+                Arc::clone(&integration.raft),
+                integration.id,
+                spawn_leader_tasks,
+            )
+        });
+
+        // The raft tuple is no longer needed beyond this point —
+        // both raft_listener and raft_leader_watcher captured what
+        // they need. Drop the rest.
+        #[cfg(feature = "raft")]
+        drop(self.raft);
+        #[cfg(feature = "raft")]
+        drop(raft_nameservice);
+
+        let state = Arc::new(state_inner);
+
+        // Assemble the private-listener router now that `state` is an
+        // `Arc<AppState>` — `require_admin_token` needs that shape. The
+        // `/cluster` admin subtree is gated against the configured
+        // `admin_auth` mode (pass-through when `None`); `/raft` peer
+        // RPC stays unauthenticated and relies on network trust.
+        #[cfg(feature = "raft")]
+        let raft_listener = raft_listener_parts.map(|(integration, listen_addr)| {
+            let cluster_admin =
+                integration
+                    .cluster_admin_router()
+                    .layer(axum::middleware::from_fn_with_state(
+                        Arc::clone(&state),
+                        crate::routes::admin_auth::require_admin_token,
+                    ));
+            // `raft_rpc_router` includes the openraft RPCs plus the
+            // cross-node `apply_staged_commit` endpoint — intra-cluster
+            // trusted, no auth layer.
+            let private_router = Router::new()
+                .nest("/raft", integration.raft_rpc_router())
+                .nest("/cluster", cluster_admin);
+            RaftListener {
+                private_router,
+                listen_addr,
+            }
+        });
+
+        // Warm JWKS cache (async — fetch keys from configured endpoints).
+        #[cfg(feature = "oidc")]
+        if let Some(jwks_cache) = &state.jwks_cache {
+            let warmed = jwks_cache.warm().await;
+            let total = jwks_cache.configured_issuer_count();
+            if warmed == 0 && total > 0 {
+                if state.config.data_auth_mode == crate::config::DataAuthMode::Required {
+                    tracing::error!(
+                        total_issuers = total,
+                        "No JWKS endpoints reachable at startup — \
+                         OIDC token verification will FAIL until endpoints become available"
+                    );
+                } else {
+                    tracing::warn!(
+                        total_issuers = total,
+                        "No JWKS endpoints reachable at startup — \
+                         OIDC tokens will be rejected until endpoints become available"
+                    );
+                }
+            }
+        }
+
+        // NOTE: ledger preloading + forward-dict warming is deliberately NOT
+        // done here. It runs as a background task spawned in `run()` AFTER the
+        // listener binds, so the server accepts requests immediately instead of
+        // blocking startup until every (potentially large) ledger is loaded.
+        // Preload is a pure latency optimization — a ledger not yet warmed is
+        // still served correctly via an on-demand cold load on first access.
+
+        let router = routes::build_router(state.clone());
+
+        Ok(FlureeServer {
+            state,
+            router,
+            #[cfg(feature = "raft")]
+            raft_listener,
+            #[cfg(feature = "raft")]
+            raft_leader_watcher,
+            #[cfg(feature = "raft")]
+            raft_worker_supervisor,
+            #[cfg(feature = "raft")]
+            raft_release_task,
+        })
     }
 }
 
 impl Default for FlureeServerBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// One-shot release of a `(ledger_id, content_id)` pair from the
+/// content store. Pulled out so the steady-state release loop and
+/// the shutdown drain don't drift apart on error handling.
+#[cfg(feature = "raft")]
+async fn release_one(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    cid: &fluree_db_core::ContentId,
+) {
+    if let Err(err) = fluree.content_store(ledger_id).release(cid).await {
+        tracing::warn!(
+            %ledger_id,
+            %cid,
+            error = %err,
+            "failed to release envelope from content store"
+        );
     }
 }

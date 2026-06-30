@@ -5,8 +5,7 @@
 //! Note: Internal parsing tests are marked as ignored since they test transaction parser
 //! internals that may not be exposed in the public Rust API.
 
-mod support;
-
+use crate::support;
 use fluree_db_api::{FlureeBuilder, TxnOpts};
 use serde_json::json;
 

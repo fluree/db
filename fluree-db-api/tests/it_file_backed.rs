@@ -25,7 +25,7 @@ fn get_test_db_path() -> Option<PathBuf> {
 /// End-to-end test using the fluree-db-api with a real file-backed database.
 ///
 /// Run with:
-/// `cargo test -p fluree-db-api --test it_file_backed -- --ignored --nocapture`
+/// `cargo test -p fluree-db-api --test grp_misc it_file_backed -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "Requires external test-database/ directory"]
 async fn file_backed_query_smoke_test() {
@@ -55,7 +55,7 @@ async fn file_backed_query_smoke_test() {
 /// Benchmark-style test.
 ///
 /// Run with:
-/// `cargo test -p fluree-db-api --test it_file_backed -- --ignored --nocapture`
+/// `cargo test -p fluree-db-api --test grp_misc it_file_backed -- --ignored --nocapture`
 #[tokio::test]
 #[ignore = "Benchmark: requires external test-database/ directory"]
 async fn file_backed_query_benchmark() {

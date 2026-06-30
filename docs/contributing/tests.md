@@ -50,6 +50,47 @@ fn test_query_workflow() {
 }
 ```
 
+#### Grouped integration binaries (`fluree-db-api`)
+
+Every top-level `tests/*.rs` file is a **separate test binary** that links the
+entire crate dependency graph. With ~160 integration files that meant ~160 full
+link steps per `cargo test` — the dominant cost of building the test suite.
+
+`fluree-db-api` therefore **groups** its integration files into a handful of
+binaries by domain (`grp_query`, `grp_policy`, `grp_import`, `grp_index`,
+`grp_transact`, `grp_ledger`, `grp_graphsource`, `grp_reasoning`, `grp_misc`,
+…). The crate sets `autotests = false` and declares each binary explicitly via
+`[[test]]` in `Cargo.toml`. Each case file is included as a module:
+
+```rust
+// tests/grp_query.rs
+#[path = "support/mod.rs"]
+mod support;            // shared harness, compiled once per binary
+
+#[path = "it_query_jsonld.rs"]
+mod it_query_jsonld;
+#[path = "it_query_sparql.rs"]
+mod it_query_sparql;
+// …
+```
+
+Within a case file, refer to the shared harness as `crate::support` (not
+`mod support;`). Each file becomes its own module, so item names never collide
+across files.
+
+To **add a new integration test**: create `tests/it_<name>.rs`, then add a
+`#[path = "it_<name>.rs"] mod it_<name>;` line to the appropriate `grp_*.rs`
+binary. No new `[[test]]` entry is needed unless you are creating a new group.
+
+**Kept standalone** (their own `[[test]]` binary, *not* grouped):
+- Feature-gated suites (`credential`, `iceberg`, `aws-testcontainers`, `vector`)
+  — declared with `required-features`.
+- Tests that mutate **process-global env vars** (e.g. `FLUREE_*` toggles). A
+  grouped binary runs its tests as threads in one process under plain
+  `cargo test`, so env mutation must stay in a dedicated binary to remain
+  isolated. (Under `cargo nextest`, every test already runs in its own process,
+  so this only matters for bare `cargo test`.)
+
 ### Example Tests
 
 Tests in `examples/`:

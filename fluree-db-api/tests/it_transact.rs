@@ -2,11 +2,10 @@
 //!
 //! Tests core transaction functionality including validation, data types, and API behavior.
 
-mod support;
-
+use crate::support;
+use crate::support::normalize_rows;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::normalize_rows;
 
 // Helper function to create a standard context
 fn default_context() -> serde_json::Value {

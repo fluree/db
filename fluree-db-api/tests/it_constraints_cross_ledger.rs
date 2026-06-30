@@ -9,11 +9,9 @@
 
 #![cfg(feature = "native")]
 
-mod support;
-
+use crate::support::genesis_ledger;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::genesis_ledger;
 
 fn config_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#config")

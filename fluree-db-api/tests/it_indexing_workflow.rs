@@ -3,9 +3,8 @@
 
 #![cfg(feature = "native")]
 
-use std::sync::Arc;
-mod support;
-
+use crate::support;
+use crate::support::{assert_index_defaults, normalize_rows, start_background_indexer_local};
 use fluree_db_api::{
     Fluree, FlureeBuilder, IndexConfig, IndexingMode, LedgerState, Novelty, ReindexOptions,
     TriggerIndexOptions,
@@ -13,12 +12,15 @@ use fluree_db_api::{
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
-use support::{assert_index_defaults, normalize_rows, start_background_indexer_local};
 
 #[tokio::test]
 async fn indexing_disabled_transaction_exposes_indexing_status_hints() {
     // Scenario: `manual-indexing-test` (transaction metadata)
-    let fluree = FlureeBuilder::memory().build_memory();
+    // Pin a high soft threshold so this small novelty stays below it; the
+    // compiled default (~every commit) would otherwise mark reindex `needed`.
+    let fluree = FlureeBuilder::memory()
+        .with_novelty_thresholds(100_000, 1_000_000_000)
+        .build_memory();
     let ledger_id = "it/indexing-disabled-metadata:main";
 
     let db0 = LedgerSnapshot::genesis(ledger_id);
@@ -55,7 +57,10 @@ async fn indexing_disabled_transaction_exposes_indexing_status_hints() {
     // Scenario: "Trigger index API can be called" (trigger+wait succeeds).
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     local
@@ -78,7 +83,10 @@ async fn manual_indexing_disabled_mode_then_trigger_updates_nameservice_and_load
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -178,7 +186,10 @@ async fn indexing_coalesces_multiple_commits_and_latest_root_is_queryable() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
@@ -292,7 +303,10 @@ async fn file_based_indexing_then_new_connection_loads_and_queries() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -474,7 +488,10 @@ async fn trigger_index_no_commit_ledger_returns_index_t_zero() {
     // Enable background indexer
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle));
@@ -509,7 +526,10 @@ async fn trigger_index_builds_index_to_current_commit_t() {
     // Enable background indexer
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle));
@@ -546,7 +566,10 @@ async fn trigger_index_times_out_if_worker_not_running() {
     // Create a background handle but do NOT run the LocalSet.
     let (_local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle));
@@ -734,7 +757,10 @@ async fn reindex_with_existing_index_completes_successfully() {
     // Enable background indexer to create initial index
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle));
@@ -1044,7 +1070,10 @@ async fn expansion_select_works_after_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1172,7 +1201,10 @@ async fn construct_works_after_indexing() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
@@ -1265,7 +1297,10 @@ async fn new_namespace_after_indexing_is_queryable() {
 
     let (local, handle) = start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 

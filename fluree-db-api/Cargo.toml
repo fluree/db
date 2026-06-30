@@ -1,5 +1,6 @@
 [package]
 name = "fluree-db-api"
+autotests = false
 description = "High-level API for Fluree DB operations"
 version.workspace = true
 edition.workspace = true
@@ -50,6 +51,7 @@ fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
 fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
+fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
@@ -128,9 +130,72 @@ rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 
 [[test]]
-name = "it_graph_source_r2rml"
-path = "tests/it_graph_source_r2rml.rs"
-required-features = ["iceberg"]
+name = "grp_graphsource"
+path = "tests/grp_graphsource.rs"
+
+[[test]]
+name = "grp_import"
+path = "tests/grp_import.rs"
+
+[[test]]
+name = "grp_index"
+path = "tests/grp_index.rs"
+
+[[test]]
+name = "grp_ledger"
+path = "tests/grp_ledger.rs"
+
+[[test]]
+name = "grp_misc"
+path = "tests/grp_misc.rs"
+
+[[test]]
+name = "grp_policy"
+path = "tests/grp_policy.rs"
+
+[[test]]
+name = "grp_query"
+path = "tests/grp_query.rs"
+
+[[test]]
+name = "grp_query_history"
+path = "tests/grp_query_history.rs"
+
+[[test]]
+name = "grp_query_reason"
+path = "tests/grp_query_reason.rs"
+
+[[test]]
+name = "grp_query_sparql"
+path = "tests/grp_query_sparql.rs"
+
+[[test]]
+name = "grp_reasoning"
+path = "tests/grp_reasoning.rs"
+
+[[test]]
+name = "grp_transact"
+path = "tests/grp_transact.rs"
+
+[[test]]
+name = "it_cyclic_bgp_novelty_pred"
+path = "tests/it_cyclic_bgp_novelty_pred.rs"
+
+[[test]]
+name = "it_cyclic_bgp_probe"
+path = "tests/it_cyclic_bgp_probe.rs"
+
+[[test]]
+name = "it_query_explain"
+path = "tests/it_query_explain.rs"
+
+[[test]]
+name = "it_query_sparql_indexed"
+path = "tests/it_query_sparql_indexed.rs"
+
+[[test]]
+name = "it_rebuild_fetch_counts"
+path = "tests/it_rebuild_fetch_counts.rs"
 
 [[test]]
 name = "it_credential"
@@ -138,14 +203,29 @@ path = "tests/it_credential.rs"
 required-features = ["credential"]
 
 [[test]]
-name = "it_storage_s3_testcontainers"
-path = "tests/it_storage_s3_testcontainers.rs"
-required-features = ["aws-testcontainers"]
+name = "it_graph_source_r2rml"
+path = "tests/it_graph_source_r2rml.rs"
+required-features = ["iceberg"]
 
 [[test]]
 name = "it_iceberg_direct"
 path = "tests/it_iceberg_direct.rs"
 required-features = ["iceberg", "aws-testcontainers"]
+
+[[test]]
+name = "it_storage_s3_testcontainers"
+path = "tests/it_storage_s3_testcontainers.rs"
+required-features = ["aws-testcontainers"]
+
+[[test]]
+name = "it_graph_source_vector"
+path = "tests/it_graph_source_vector.rs"
+required-features = ["vector"]
+
+[[test]]
+name = "it_vector_flatrank"
+path = "tests/it_vector_flatrank.rs"
+required-features = ["vector"]
 
 [[bench]]
 name = "vector_query"

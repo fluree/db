@@ -1024,7 +1024,10 @@ impl<'a> FromQueryBuilder<'a> {
                 .first()
                 .or_else(|| spec.named_graphs.first())
             {
-                let view = self.fluree.db(alias.identifier.as_str()).await?;
+                let view = self
+                    .fluree
+                    .db_or_graph_source(alias.identifier.as_str())
+                    .await?;
                 Ok(result
                     .format_async(view.as_graph_db_ref(), &format_config)
                     .await?)
@@ -1064,7 +1067,10 @@ impl<'a> FromQueryBuilder<'a> {
                             .first()
                             .or_else(|| spec.named_graphs.first())
                             .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self.fluree.db(alias.identifier.as_str()).await?;
+                        let view = self
+                            .fluree
+                            .db_or_graph_source(alias.identifier.as_str())
+                            .await?;
                         Ok(result
                             .format_async(view.as_graph_db_ref(), &format_config)
                             .await?)
@@ -1120,7 +1126,10 @@ impl<'a> FromQueryBuilder<'a> {
                     .first()
                     .or_else(|| spec.named_graphs.first())
                 {
-                    let view = self.fluree.db(alias.identifier.as_str()).await?;
+                    let view = self
+                        .fluree
+                        .db_or_graph_source(alias.identifier.as_str())
+                        .await?;
                     Ok(result
                         .format_async(view.as_graph_db_ref(), &format_config)
                         .await?)
@@ -1165,7 +1174,10 @@ impl<'a> FromQueryBuilder<'a> {
                 .first()
                 .or_else(|| spec.named_graphs.first())
             {
-                let view = self.fluree.db(alias.identifier.as_str()).await?;
+                let view = self
+                    .fluree
+                    .db_or_graph_source(alias.identifier.as_str())
+                    .await?;
                 crate::format::format_results_string_async(
                     &result,
                     &result.context,
@@ -1211,7 +1223,10 @@ impl<'a> FromQueryBuilder<'a> {
                             .first()
                             .or_else(|| spec.named_graphs.first())
                             .ok_or_else(|| ApiError::query("No graph specified for formatting"))?;
-                        let view = self.fluree.db(alias.identifier.as_str()).await?;
+                        let view = self
+                            .fluree
+                            .db_or_graph_source(alias.identifier.as_str())
+                            .await?;
                         crate::format::format_results_string_async(
                             &result,
                             &result.context,
@@ -1273,7 +1288,10 @@ impl<'a> FromQueryBuilder<'a> {
                     .first()
                     .or_else(|| spec.named_graphs.first())
                 {
-                    let view = self.fluree.db(alias.identifier.as_str()).await?;
+                    let view = self
+                        .fluree
+                        .db_or_graph_source(alias.identifier.as_str())
+                        .await?;
                     crate::format::format_results_string_async(
                         &result,
                         &result.context,

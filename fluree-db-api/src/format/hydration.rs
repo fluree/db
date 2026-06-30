@@ -288,8 +288,10 @@ fn resolve_root_sid_from_binding(
         Some(
             Binding::Lit { .. }
             | Binding::Grouped(_)
-            | Binding::Path(_)
+            | Binding::Path { .. }
+            | Binding::Rel(_)
             | Binding::List(_)
+            | Binding::Map(_)
             | Binding::Iri(_)
             | Binding::EncodedLit { .. }
             | Binding::EncodedSid { .. }

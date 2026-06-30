@@ -402,7 +402,7 @@ pub(crate) fn materialized_object_binding(
                 Some(lang) => DatatypeConstraint::LangTag(lang),
                 None => DatatypeConstraint::Explicit(
                     store
-                        .resolve_datatype_sid(o_type)
+                        .resolve_datatype_sid_for_value(o_type, &other)
                         .unwrap_or_else(|| Sid::new(0, "")),
                 ),
             };

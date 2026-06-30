@@ -991,10 +991,13 @@ async fn main() -> Result<()> {
 
 #### Read-After-Write Consistency
 
-Fluree's query engine is **eventually consistent**: when one process writes data and
-another (or the same process on a warm cache) queries it, the query may not yet see
-the latest commit. The `t` value returned from a transaction is the key to bridging
-this gap.
+A writer always reads its own writes: a commit through the embedded API
+(`insert`/`update`/`transact`, or the `transact(...).execute()` builder) updates the
+in-process ledger cache, so a subsequent `fluree.db(...)` / `query(...)` in the same
+process sees it. Across processes, the engine is **eventually consistent**: when one
+process writes data and another queries it, that other process may not yet see the
+latest commit until its cache catches up. The `t` value returned from a transaction
+is the key to bridging this cross-process gap.
 
 Pass `RefreshOpts { min_t: Some(t) }` to `refresh()` to assert that the cached
 ledger has reached at least that transaction time. If it hasn't after pulling the

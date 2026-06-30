@@ -185,12 +185,30 @@ struct GraphIndex {
 // BinaryIndexStore
 // ============================================================================
 
+/// Process-global source of [`BinaryIndexStore`] instance ids. Stamped once at
+/// construction; every from-scratch load/rebuild (initial load, reindex swap,
+/// refresh-on-new-namespace, historical-view load) gets a new id, while ordinary
+/// commits reuse the same store `Arc` (so the id is stable across commits).
+///
+/// Used to key the per-segment overlay-translation cache: this id identifies the
+/// FROZEN dictionary id-assignment (predicate / string / subject / namespace)
+/// that translation reads. `max_t` (= `index_t`) does NOT, because a same-`index_t`
+/// rebuild (or a refresh-on-new-namespace) can re-rank dict ids at an unchanged
+/// `max_t`. INVARIANT: every from-scratch dict rebuild must construct a new store
+/// (true today — the only in-place dict mutation, novelty append via
+/// `apply_single_commit`, preserves existing ids). If that ever changes, this id
+/// must change with it, or the translation cache will serve stale ids.
+static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
 ///
 /// - Routing via `BranchManifest` (sidecar CIDs for history)
 /// - Value decoding via `o_type` table
 /// - Dict/arena infrastructure (same types, same loading)
 pub struct BinaryIndexStore {
+    /// Process-unique instance id (see [`NEXT_STORE_ID`]) — the identity of this
+    /// store's frozen dictionary id-assignment, for the per-segment cache key.
+    store_id: u64,
     dicts: DictionarySet,
     graph_indexes: HashMap<GraphId, GraphIndex>,
     /// o_type table: full list (for iteration / serialization).
@@ -332,6 +350,7 @@ impl BinaryIndexStore {
 
         let disk_cache = super::artifact_cache::DiskArtifactCache::for_dir(cache_dir);
         Ok(Self {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts,
             graph_indexes,
             o_type_table,
@@ -353,6 +372,13 @@ impl BinaryIndexStore {
     }
 
     // ── Public accessors ───────────────────────────────────────────
+
+    /// Process-unique store-instance id (see [`NEXT_STORE_ID`]). Identifies the
+    /// frozen dictionary id-assignment; stable across commits, changes on every
+    /// from-scratch store rebuild.
+    pub fn store_id(&self) -> u64 {
+        self.store_id
+    }
 
     pub fn max_t(&self) -> i64 {
         self.max_t
@@ -1407,6 +1433,22 @@ impl BinaryIndexStore {
             // return None so callers can either skip constraints or use a safe fallback.
             _ => None,
         }
+    }
+
+    /// Resolve the datatype Sid for a decoded value, disambiguating o_types
+    /// that name no single datatype.
+    ///
+    /// The `NUM_BIG_OVERFLOW` arena holds both overflow `xsd:integer` (BigInt)
+    /// and `xsd:decimal` (BigDecimal) values, so [`resolve_datatype_sid`] can't
+    /// name its type from `o_type` alone and returns `None`. Fall back to the
+    /// decoded value's variant so the datatype isn't lost — otherwise arena-
+    /// served big numerics render with an empty `@type` while their novelty
+    /// counterparts (still o_type-tagged) render correctly (issue #1329).
+    ///
+    /// [`resolve_datatype_sid`]: Self::resolve_datatype_sid
+    pub fn resolve_datatype_sid_for_value(&self, o_type: u16, val: &FlakeValue) -> Option<Sid> {
+        self.resolve_datatype_sid(o_type)
+            .or_else(|| val.overflow_numeric_datatype_sid())
     }
 
     /// Look up an o_type table entry by o_type value. O(1).
@@ -2806,6 +2848,7 @@ mod tests {
 
     fn empty_store(cs: Arc<dyn ContentStore>, cache_dir: PathBuf) -> BinaryIndexStore {
         BinaryIndexStore {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             dicts: DictionarySet {
                 predicates: PredicateDict::new(),
                 predicate_reverse: HashMap::new(),

@@ -86,6 +86,23 @@ You can give the annotation an IRI when you need stable identity — for updates
 
 Two inserts that target the same explicit `@id` reattach to the same annotation subject — idempotent. Two inserts with no explicit `@id` mint two distinct annotations on the same edge (see *Parallel annotations* below).
 
+### Minting an annotation in an update
+
+The same `@annotation` form works inside an update's `insert` clause, so you can annotate edges selected by a `WHERE` pattern. Variables bound in `WHERE` are usable as the edge subject/object, and each solution mints its own annotation:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "where":  { "@id": "?person", "ex:worksFor": "?org" },
+  "insert": {
+    "@id": "?person",
+    "ex:worksFor": { "@id": "?org", "@annotation": { "ex:role": "Staff" } }
+  }
+}
+```
+
+This is distinct from *editing* an existing annotation's metadata (below), which addresses the annotation subject directly by `@id`.
+
 ### Annotating literal-valued edges
 
 RDF 1.2 permits annotations on triples whose object is a literal — `:alice :name "Alice" {| :source :hr |}` in Turtle-star, equivalently:
@@ -517,10 +534,11 @@ Edge annotations are the storage primitive for the labeled-property-graph shape:
 - two relationships of the same type between the same endpoints become two parallel annotations (see *Parallel annotations* above),
 - *LPG mode* (`lpgEdgeLifecycle: true`) gives the "delete the relationship deletes its properties" lifecycle property graphs expect.
 
-A dedicated property-graph query/write language front-end is a separate surface and is not part of this release; the JSON-LD `@annotation` surface and the SPARQL 1.2 annotation tail are the supported ways to write and read this shape today.
+[Cypher](cypher.md) is the property-graph query/write front-end: a Cypher relationship `(a)-[r:T {p: v}]->(b)` lowers to exactly this annotated-edge shape, so property-graph users get LPG ergonomics while the data stays first-class RDF. The JSON-LD `@annotation` surface and the SPARQL 1.2 annotation tail read and write the same shape.
 
 ## See also
 
+- [Cypher](cypher.md) — the property-graph front-end; Cypher relationships map onto edge annotations.
 - [Edge annotations design](../design/edge-annotations.md) — storage internals (EdgeKey, sidecar arena, sticky-bit state machine, GC reachability).
 - [Datasets and named graphs](datasets-and-named-graphs.md) — annotations work in named graphs (via the JSON-LD `@annotation` surface) as well as the default graph; the SPARQL UPDATE surface is default-graph only.
 - [Time travel](time-travel.md) — annotation events live in history like every other fact.

@@ -11,7 +11,8 @@
 //! # Type Handling
 //!
 //! - Numeric aggregates (SUM, AVG, etc.) skip non-numeric values
-//! - Empty input → Unbound (except COUNT → 0)
+//! - Empty input → the aggregate's identity: COUNT/SUM/AVG → `0`^^xsd:integer
+//!   (SPARQL 1.1 §18.5.1); MIN/MAX/SAMPLE → Unbound (no identity element)
 //! - Mixed types → promote to double where possible
 //! - Unbound values are skipped
 
@@ -471,6 +472,33 @@ impl NumericAcc {
         }
     }
 
+    /// Build an accumulator from a pre-reduced exact (integer/decimal) total —
+    /// for fused fast paths that sum column values natively, then reuse this
+    /// accumulator's finalize semantics. `decimal` selects an xsd:decimal vs
+    /// xsd:integer result type (matching the column's declared datatype).
+    pub(crate) fn from_exact_total(big_sum: BigDecimal, count: u64, decimal: bool) -> Self {
+        Self {
+            kind: if decimal {
+                NumKind::Decimal
+            } else {
+                NumKind::Integer
+            },
+            big_sum,
+            dbl_sum: 0.0,
+            count,
+        }
+    }
+
+    /// Build an accumulator from a pre-reduced floating (xsd:double) total.
+    pub(crate) fn from_double_total(dbl_sum: f64, count: u64) -> Self {
+        Self {
+            kind: NumKind::Double,
+            big_sum: BigDecimal::zero(),
+            dbl_sum,
+            count,
+        }
+    }
+
     pub(crate) fn add(&mut self, v: NumericValue) {
         self.count += 1;
         match v {
@@ -502,7 +530,8 @@ impl NumericAcc {
         }
     }
 
-    /// Finalize as SPARQL SUM. Empty group returns `Unbound`.
+    /// Finalize as SPARQL SUM. The empty multiset sums to the additive identity
+    /// `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1.3; W3C agg-empty-group-sum).
     ///
     /// Result datatype follows the W3C arithmetic promotion lattice:
     ///   all integer  → xsd:integer (Long if it fits, else BigInt)
@@ -510,7 +539,7 @@ impl NumericAcc {
     ///   any double   → xsd:double
     pub(crate) fn finalize_sum(self) -> Binding {
         if self.count == 0 {
-            return Binding::Unbound;
+            return Binding::lit(FlakeValue::Long(0), xsd_integer());
         }
         match self.kind {
             NumKind::Integer => integer_binding_from_bigdecimal(self.big_sum),
@@ -521,7 +550,8 @@ impl NumericAcc {
         }
     }
 
-    /// Finalize as SPARQL AVG. Empty group returns `Unbound`.
+    /// Finalize as SPARQL AVG. The empty multiset averages to the identity
+    /// `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1.4; W3C agg-avg-03).
     ///
     /// AVG promotes xsd:integer inputs to xsd:decimal output (matches XPath
     /// `op:numeric-divide` of integers, which yields xsd:decimal).
@@ -532,7 +562,7 @@ impl NumericAcc {
     /// like `0.33333...` with 100 trailing digits.
     pub(crate) fn finalize_avg(self) -> Binding {
         if self.count == 0 {
-            return Binding::Unbound;
+            return Binding::lit(FlakeValue::Long(0), xsd_integer());
         }
         match self.kind {
             NumKind::Integer | NumKind::Decimal => {
@@ -956,9 +986,23 @@ mod tests {
 
     #[test]
     fn test_agg_sum_empty() {
+        // SPARQL 1.1 §18.5.1.3: SUM of the empty multiset is "0"^^xsd:integer.
         let values: Vec<Binding> = vec![];
         let result = agg_sum(&values);
-        assert!(matches!(result, Binding::Unbound));
+        let (val, dt) = result.as_lit().expect("empty SUM must be a literal 0");
+        assert_eq!(*val, FlakeValue::Long(0));
+        assert_eq!(dt.datatype(), &xsd_integer());
+    }
+
+    #[test]
+    fn test_agg_avg_empty() {
+        // SPARQL 1.1 §18.5.1.4 (W3C agg-avg-03): AVG of the empty multiset is
+        // "0"^^xsd:integer.
+        let values: Vec<Binding> = vec![];
+        let result = agg_avg(&values);
+        let (val, dt) = result.as_lit().expect("empty AVG must be a literal 0");
+        assert_eq!(*val, FlakeValue::Long(0));
+        assert_eq!(dt.datatype(), &xsd_integer());
     }
 
     #[test]

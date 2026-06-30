@@ -458,7 +458,7 @@ fn write_binding_cell(
             }
         }
         // A path: arrow-separated node IRIs for pragmatic consumption.
-        Binding::Path(nodes) => {
+        Binding::Path { nodes, .. } => {
             for (j, sid) in nodes.iter().enumerate() {
                 if j > 0 {
                     cell.extend_from_slice(b"->");
@@ -466,12 +466,31 @@ fn write_binding_cell(
                 write_compacted_sid(cell, compactor, sid)?;
             }
         }
+        // A relationship: `start-[type]->end` for pragmatic consumption.
+        Binding::Rel(rel) => {
+            write_compacted_sid(cell, compactor, &rel.start)?;
+            cell.extend_from_slice(b"-[");
+            write_compacted_sid(cell, compactor, &rel.predicate)?;
+            cell.extend_from_slice(b"]->");
+            write_compacted_sid(cell, compactor, &rel.end)?;
+        }
         // A list: semicolon-separated elements (mirrors Grouped).
         Binding::List(values) => {
             for (j, val) in values.iter().enumerate() {
                 if j > 0 {
                     cell.push(b';');
                 }
+                write_binding_cell(cell, val, compactor, gv)?;
+            }
+        }
+        // A map: semicolon-separated `key=value` pairs (flat CSV can't nest).
+        Binding::Map(entries) => {
+            for (j, (k, val)) in entries.iter().enumerate() {
+                if j > 0 {
+                    cell.push(b';');
+                }
+                cell.extend_from_slice(k.as_bytes());
+                cell.push(b'=');
                 write_binding_cell(cell, val, compactor, gv)?;
             }
         }

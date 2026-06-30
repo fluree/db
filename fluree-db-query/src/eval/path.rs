@@ -30,7 +30,7 @@ pub fn eval_path_length<R: RowAccess>(
         ));
     };
     match row.get(*var) {
-        Some(Binding::Path(nodes)) => {
+        Some(Binding::Path { nodes, .. }) => {
             // Hop count = edges = nodes - 1 (a single-node path has length 0).
             let hops = nodes.len().saturating_sub(1) as i64;
             Ok(Some(ComparableValue::Long(hops)))

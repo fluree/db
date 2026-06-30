@@ -200,6 +200,103 @@ fn seed_named_people(tmp: &TempDir, ledger: &str) {
 }
 
 #[test]
+fn query_and_insert_accept_ledger_flag() {
+    let tmp = TempDir::new().unwrap();
+    // Seed `streamdb`, then create `otherdb` so it becomes the active ledger.
+    seed_named_people(&tmp, "streamdb");
+    fluree_cmd(&tmp)
+        .args(["create", "otherdb"])
+        .assert()
+        .success();
+
+    // `query --ledger` targets a non-active ledger; the positional arg is the
+    // inline query (heuristic bypassed because the ledger is explicit).
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "--sparql",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+
+    // Short form `-l` plus `-e` behaves identically.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "-l",
+            "streamdb",
+            "--sparql",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"));
+
+    // `insert --ledger` writes to the named ledger regardless of the active one.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "--ledger",
+            "streamdb",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@id": "ex:carol", "ex:name": "Carol"}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "--sparql",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Carol"));
+}
+
+#[test]
+fn query_ledger_flag_rejects_extra_positional() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // With --ledger, a second positional (a stray ledger name) is ambiguous.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--ledger",
+            "streamdb",
+            "streamdb",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--ledger"));
+}
+
+#[test]
+fn insert_ledger_flag_rejects_missing_file_positional() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // With --ledger, a lone path-shaped positional that doesn't exist (a typo'd
+    // file path) is reported as a missing file rather than fed to the input
+    // reader as inline data, which would fail with a confusing parse error.
+    fluree_cmd(&tmp)
+        .args(["insert", "--ledger", "streamdb", "typo-data.jsonld"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such file"));
+}
+
+#[test]
 fn query_ndjson_bare_streams_row_objects() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");
@@ -291,7 +388,7 @@ fn query_ndjson_rejects_bench() {
 }
 
 #[test]
-fn query_ndjson_local_rejects_time_travel() {
+fn query_ndjson_local_time_travel_streams_historical_rows() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");
 
@@ -307,10 +404,133 @@ fn query_ndjson_local_rejects_time_travel() {
             "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
         ])
         .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
+fn query_ndjson_local_time_travel_jsonld_streams_historical_rows() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--format",
+            "ndjson",
+            "--at",
+            "1",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"},
+                "select": ["?name"],
+                "where": {"@id": "?s", "ex:name": "?name"}}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+}
+
+#[test]
+fn query_ndjson_local_sparql_at_rejects_inline_from() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--at",
+            "1",
+            "-e",
+            "SELECT ?name FROM <streamdb:main> WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "time travel (--at) is not supported",
+            "SPARQL query already contains FROM/FROM NAMED",
         ));
+}
+
+#[test]
+fn query_ndjson_local_with_default_allow_policy_streams() {
+    let tmp = TempDir::new().unwrap();
+    seed_named_people(&tmp, "streamdb");
+
+    // --default-allow is the cheapest --policy* flag to exercise: it routes the
+    // streaming query through the dataset producer (the only path that honors
+    // per-request policy) and asserts rows still flow when the policy is a
+    // no-op blanket allow.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--default-allow",
+            "-e",
+            "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
+}
+
+/// Regression for the dataset streaming path dropping the ledger's stored
+/// default context. The lean ndjson path attaches it via
+/// `with_default_context(...)`, and the buffered local path uses
+/// `db_with_default_context` — but the dataset path's `load_view_from_source`
+/// goes through `db()` / `db_at()`, which don't. A SPARQL query that omits
+/// `PREFIX ex:` relies on the stored context being attached to the dataset's
+/// primary view; without the attach step in `run_local_ndjson_stream_dataset`
+/// the query parses against an empty prefix table and returns no rows.
+#[test]
+fn query_ndjson_local_dataset_path_uses_stored_default_context() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "ctxdb"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["context", "set", "-e", r#"{"ex": "http://example.org/"}"#])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-e",
+            r#"{"@context": {"ex": "http://example.org/"}, "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice"},
+                {"@id": "ex:bob", "ex:name": "Bob"}
+            ]}"#,
+        ])
+        .assert()
+        .success();
+
+    // `--default-allow` is what routes us through the streaming dataset
+    // producer; the SPARQL body deliberately omits `PREFIX ex:` so the only
+    // way `ex:name` can resolve is through the ledger's stored default
+    // context. If the dataset path drops the context, the parse fails (or
+    // rows go to zero) and this assertion catches it.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--sparql",
+            "--format",
+            "ndjson",
+            "--default-allow",
+            "-e",
+            "SELECT ?name WHERE { ?s ex:name ?name }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Alice"))
+        .stdout(predicate::str::contains("Bob"));
 }
 
 #[test]
@@ -1362,6 +1582,27 @@ fn history_shows_changes() {
         .args(["history", "ex:alice", "--format", "json"])
         .assert()
         .success();
+
+    // Default (table) output must render the records, not blank `?` cells.
+    let assert = fluree_cmd(&tmp)
+        .args(["history", "ex:alice"])
+        .assert()
+        .success()
+        // Header + populated value cells.
+        .stdout(predicate::str::contains("predicate"))
+        .stdout(predicate::str::contains("Alice Smith"))
+        .stdout(predicate::str::contains("ex:name"));
+
+    // The pre-fix bug produced a `?` op column. comfy-table pads each cell to
+    // the column width, so the raw output is `| ?  |` (header "op" is 2 wide),
+    // never `| ? |` — asserting on the raw form would never catch a regression.
+    // Collapse whitespace first so a `?` op cell surfaces as `| ? |`.
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let normalized = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        !normalized.contains("| ? |"),
+        "op column should render +/- not `?`; got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -2253,12 +2494,11 @@ fn update_from_json_file() {
 }
 
 #[test]
-fn update_sparql_update_in_direct_mode_fails() {
+fn update_sparql_update_in_direct_mode_commits() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "spdb"]).assert().success();
 
-    // SPARQL UPDATE in direct local mode should give a helpful error
     fluree_cmd(&tmp)
         .args([
             "--direct",
@@ -2267,10 +2507,8 @@ fn update_sparql_update_in_direct_mode_fails() {
             "PREFIX ex: <http://example.org/> INSERT DATA { ex:x ex:val \"hello\" }",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "SPARQL UPDATE is not supported in direct local mode",
-        ));
+        .success()
+        .stdout(predicate::str::contains("Committed t=1"));
 }
 
 #[test]

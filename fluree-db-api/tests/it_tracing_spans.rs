@@ -9,11 +9,10 @@
 //! All tests use `current_thread` tokio flavor to ensure the thread-local
 //! `set_default()` subscriber captures spans from all async work.
 
-mod support;
-
+use crate::support;
+use crate::support::span_capture;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
-use support::span_capture;
 
 /// Seed a small dataset and return the ledger state.
 async fn seed_people(fluree: &support::MemoryFluree, ledger_id: &str) -> support::MemoryLedger {
@@ -995,7 +994,6 @@ async fn annotation_cascade_emits_cascade_reifies_bundle_span() {
 async fn ac9_cyclic_bgp_operator_spans() {
     use fluree_db_api::{IndexConfig, LedgerManagerConfig, QueryInput};
     use fluree_db_transact::{CommitOpts, TxnOpts};
-    use std::sync::Arc;
 
     let fluree = FlureeBuilder::memory()
         .with_ledger_cache_config(LedgerManagerConfig::default())
@@ -1004,7 +1002,10 @@ async fn ac9_cyclic_bgp_operator_spans() {
 
     let (local, handle) = support::start_background_indexer_local(
         fluree.backend().clone(),
-        Arc::new(fluree.nameservice_mode().clone()),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
         fluree_db_indexer::IndexerConfig::small(),
     );
 
