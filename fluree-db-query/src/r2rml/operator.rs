@@ -207,6 +207,18 @@ impl R2rmlScanOperator {
         preds
     }
 
+    /// True for a pure `rdf:type`/subject-only pattern: no object var, no
+    /// predicate filter, no star members. Such a pattern derives only the subject
+    /// (its `rr:class` constraint is enforced by TriplesMap selection), so it
+    /// needs only the subject columns and scans no RefObjectMap parents. A true
+    /// wildcard `?s ?p ?o` is excluded — it has `object_var = Some` and must
+    /// still materialize every POM/parent.
+    fn is_subject_only_pattern(&self) -> bool {
+        self.pattern.object_var.is_none()
+            && self.pattern.predicate_filter.is_none()
+            && self.pattern.star_bindings.is_empty()
+    }
+
     /// Resolve this pattern's pushdown predicates (keyed by query variable) to
     /// table columns for the given TriplesMap, producing scan filters. A
     /// variable maps to a column via its predicate IRI; predicates backed by a
@@ -414,11 +426,23 @@ impl R2rmlScanOperator {
             // union of columns needed for every star predicate so the whole star
             // is satisfied by one scan.
             let projection: Vec<String> = if self.pattern.star_bindings.is_empty() {
-                triples_map
-                    .columns_for_predicate(self.pattern.predicate_filter.as_deref())
-                    .into_iter()
-                    .map(std::string::ToString::to_string)
-                    .collect()
+                if self.is_subject_only_pattern() {
+                    // rdf:type / subject-only pattern: only the subject columns are
+                    // load-bearing. Projecting every POM column (the
+                    // `columns_for_predicate(None)` fallback) reads FK/value columns
+                    // that subject-only materialization never consults.
+                    triples_map
+                        .subject_columns()
+                        .into_iter()
+                        .map(std::string::ToString::to_string)
+                        .collect()
+                } else {
+                    triples_map
+                        .columns_for_predicate(self.pattern.predicate_filter.as_deref())
+                        .into_iter()
+                        .map(std::string::ToString::to_string)
+                        .collect()
+                }
             } else {
                 let mut cols: Vec<String> = Vec::new();
                 for pred in self.pattern_predicates() {
@@ -467,6 +491,13 @@ impl R2rmlScanOperator {
                             .is_some_and(|p| star_preds.contains(&p))
                     } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
                         pom.predicate_map.as_constant() == Some(pred_filter.as_str())
+                    } else if self.pattern.object_var.is_none() {
+                        // rdf:type / subject-only pattern: no POM is load-bearing
+                        // (the parent scans it would trigger are pure dead work, as
+                        // subject-only materialization never reads object/parent
+                        // values). The all-POMs branch below is for a TRUE wildcard
+                        // `?s ?p ?o`, where `?p`/`?o` range over every predicate.
+                        false
                     } else {
                         true
                     }

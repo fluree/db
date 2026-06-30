@@ -71,6 +71,11 @@ pub fn rewrite_patterns_for_r2rml(
     // (const predicate + fresh object var) by subject so they can be merged into
     // a single scan, eliminating the O(N^2) self-join. First-seen order preserved.
     let mut star_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
+    // Same-subject `rdf:type` patterns, by subject. A single class per subject is
+    // fused into that subject's star (constraining its TriplesMap resolution to
+    // the class and dropping a redundant correlated re-scan); a subject with no
+    // star members, or multiple classes, is emitted as a subject-only scan.
+    let mut class_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
 
     for pattern in patterns {
         match pattern {
@@ -86,6 +91,16 @@ pub fn rewrite_patterns_for_r2rml(
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
                                 star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                            }
+                        }
+                    } else if is_class_only(&r2rml_pattern) {
+                        match class_groups
+                            .iter_mut()
+                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
+                        {
+                            Some((_, members)) => members.push(r2rml_pattern),
+                            None => {
+                                class_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
                             }
                         }
                     } else {
@@ -138,9 +153,16 @@ pub fn rewrite_patterns_for_r2rml(
 
     // Emit star groups. Single-member groups stay on the normal single-object
     // path; multi-member groups with distinct object vars merge into one scan.
-    for (_subject, mut members) in star_groups {
+    // A same-subject `rdf:type` is fused into the base by setting its
+    // `class_filter`, which constrains TriplesMap resolution to the class and
+    // removes the separate class operator's correlated re-scan.
+    for (subject, mut members) in star_groups {
         if members.len() == 1 {
-            result_patterns.push(Pattern::R2rml(members.pop().unwrap()));
+            let mut base = members.pop().unwrap();
+            if let Some(class) = take_single_class(&mut class_groups, subject) {
+                base.class_filter = Some(class);
+            }
+            result_patterns.push(Pattern::R2rml(base));
             continue;
         }
         let mut seen_obj = HashSet::new();
@@ -149,12 +171,17 @@ pub fn rewrite_patterns_for_r2rml(
             .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
         if !distinct {
             // Shared object var implies a self-join constraint; keep separate.
+            // Leave any same-subject class pattern in `class_groups` so it is
+            // emitted as a subject-only scan below.
             for m in members {
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
         }
         let mut base = members.remove(0);
+        if let Some(class) = take_single_class(&mut class_groups, subject) {
+            base.class_filter = Some(class);
+        }
         base.star_bindings = members
             .into_iter()
             .map(|m| {
@@ -165,6 +192,15 @@ pub fn rewrite_patterns_for_r2rml(
             })
             .collect();
         result_patterns.push(Pattern::R2rml(base));
+    }
+
+    // Class patterns not fused into a star (no same-subject star members, or
+    // multiple classes on one subject) become subject-only scans: the operator
+    // projects only the subject columns and scans no RefObjectMap parents.
+    for (_subject, members) in class_groups {
+        for m in members {
+            result_patterns.push(Pattern::R2rml(m));
+        }
     }
 
     // Attach pushable FILTER comparisons to the R2RML pattern that produces
@@ -281,6 +317,33 @@ fn is_star_eligible(p: &R2rmlPattern) -> bool {
             Some(obj) => obj != p.subject_var,
             None => false,
         }
+}
+
+/// A pure `rdf:type` pattern (`?s a ex:Class`): a class filter, no object var, no
+/// predicate, no star members. These are candidates to fuse into a same-subject
+/// star (or, failing that, to run as a subject-only scan).
+fn is_class_only(p: &R2rmlPattern) -> bool {
+    p.class_filter.is_some()
+        && p.object_var.is_none()
+        && p.predicate_filter.is_none()
+        && p.triples_map_iri.is_none()
+        && p.star_bindings.is_empty()
+}
+
+/// Remove and return the lone class IRI for `subject` from `class_groups`, but
+/// only when that subject has exactly one `rdf:type` pattern. A subject with
+/// multiple classes is left in place (each emitted as its own subject-only scan)
+/// because `class_filter` holds a single class.
+fn take_single_class(
+    class_groups: &mut Vec<(VarId, Vec<R2rmlPattern>)>,
+    subject: VarId,
+) -> Option<String> {
+    let idx = class_groups.iter().position(|(s, _)| *s == subject)?;
+    if class_groups[idx].1.len() != 1 {
+        return None;
+    }
+    let (_, mut members) = class_groups.remove(idx);
+    members.pop().and_then(|p| p.class_filter)
 }
 
 /// Convert a triple pattern to an R2RML pattern.

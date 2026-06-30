@@ -2673,3 +2673,416 @@ async fn fused_fallback_applies_offset_once() {
         "3 groups with OFFSET 1 must yield 2 rows (offset applied once, not twice)"
     );
 }
+
+// =============================================================================
+// Scan-plan guardrails: rdf:type / class-pattern over-scan (Issue 1)
+// =============================================================================
+//
+// These lock the class/star planning behavior so future changes cannot
+// reintroduce the over-scan that made a 2-attribute query issue 6 Iceberg
+// scans (DIM_STORE ×4 + two unreferenced parent tables) against live Snowflake.
+//
+// Fixture: a 3-TriplesMap star schema where `ex:name` is shared by two maps
+// (Store and Employee) — the predicate fan-out that caused unrelated dimension
+// tables to be scanned — and Store has a RefObjectMap to Geography, so we can
+// assert parents are pruned for unreferenced predicates yet kept for referenced
+// ones (R2RML dangling-FK semantics are not weakened).
+
+const EDW_GUARD_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:storeId ; rr:objectMap [ rr:column "store_id" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:geography ;
+        rr:objectMap [
+            rr:parentTriplesMap <http://example.org/mapping#Geography> ;
+            rr:joinCondition [ rr:child "geo_key" ; rr:parent "geo_key" ]
+        ]
+    ] .
+
+<http://example.org/mapping#Geography> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.geography" ] ;
+    rr:subjectMap [ rr:template "http://example.org/geo/{geo_key}" ; rr:class ex:Geography ] ;
+    rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
+    rr:predicateObjectMap [ rr:predicate ex:region ; rr:objectMap [ rr:column "region" ] ] .
+
+<http://example.org/mapping#Employee> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.employee" ] ;
+    rr:subjectMap [ rr:template "http://example.org/emp/{emp_key}" ; rr:class ex:Employee ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "emp_name" ] ] .
+"#;
+
+fn edw_guard_mapping() -> CompiledR2rmlMapping {
+    R2rmlLoader::from_turtle(EDW_GUARD_MAPPING_TTL)
+        .expect("parse EDW guard mapping")
+        .compile()
+        .expect("compile EDW guard mapping")
+}
+
+fn col_i64(name: &str, field_id: i32, vals: Vec<Option<i64>>) -> (FieldInfo, Column) {
+    (
+        FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id,
+        },
+        Column::Int64(vals),
+    )
+}
+
+fn col_str(name: &str, field_id: i32, vals: &[&str]) -> (FieldInfo, Column) {
+    (
+        FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id,
+        },
+        Column::String(vals.iter().map(|s| Some((*s).to_string())).collect()),
+    )
+}
+
+fn batch_from(parts: Vec<(FieldInfo, Column)>) -> ColumnBatch {
+    let (fields, cols): (Vec<_>, Vec<_>) = parts.into_iter().unzip();
+    ColumnBatch::new(Arc::new(BatchSchema::new(fields)), cols).unwrap()
+}
+
+fn edw_store_batch() -> ColumnBatch {
+    batch_from(vec![
+        col_i64("store_key", 1, vec![Some(1), Some(2)]),
+        col_str("store_id", 2, &["STORE-1", "STORE-2"]),
+        col_str("store_name", 3, &["Store One", "Store Two"]),
+        col_i64("geo_key", 4, vec![Some(10), Some(20)]),
+    ])
+}
+
+fn edw_geography_batch() -> ColumnBatch {
+    batch_from(vec![
+        col_i64("geo_key", 1, vec![Some(10), Some(20)]),
+        col_str("city", 2, &["Akron", "Boston"]),
+        col_str("region", 3, &["Midwest", "Northeast"]),
+    ])
+}
+
+fn edw_employee_batch() -> ColumnBatch {
+    batch_from(vec![
+        col_i64("emp_key", 1, vec![Some(100), Some(200)]),
+        col_str("emp_name", 2, &["Ann", "Bob"]),
+    ])
+}
+
+/// Provider that records every `scan_table` call by table name and returns the
+/// per-table fixture batch, so a test can assert exactly which tables a query
+/// shape touches.
+#[derive(Debug)]
+struct CountingProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    batches_by_table: HashMap<String, Vec<ColumnBatch>>,
+    /// Every scan as `(table_name, sorted projection columns)`, in call order.
+    scans: Mutex<Vec<(String, Vec<String>)>>,
+}
+
+impl CountingProvider {
+    fn edw() -> Self {
+        let mut batches_by_table = HashMap::new();
+        batches_by_table.insert("dw.store".to_string(), vec![edw_store_batch()]);
+        batches_by_table.insert("dw.geography".to_string(), vec![edw_geography_batch()]);
+        batches_by_table.insert("dw.employee".to_string(), vec![edw_employee_batch()]);
+        Self {
+            mapping: Arc::new(edw_guard_mapping()),
+            batches_by_table,
+            scans: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Scan count per table name across the whole query.
+    fn scan_counts(&self) -> HashMap<String, usize> {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for (t, _) in self.scans.lock().unwrap().iter() {
+            *counts.entry(t.clone()).or_default() += 1;
+        }
+        counts
+    }
+
+    /// Sorted projection columns of the FIRST scan of `table` (every scan of a
+    /// given table in these fixtures uses the same projection). Panics if the
+    /// table was never scanned, so callers assert the scan happened first.
+    fn projection_of(&self, table: &str) -> Vec<String> {
+        self.scans
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(t, _)| t == table)
+            .unwrap_or_else(|| panic!("table {table} was never scanned"))
+            .1
+            .clone()
+    }
+}
+
+#[async_trait]
+impl R2rmlProvider for CountingProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
+        graph_source_id == "edw-gs:main"
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for CountingProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        _filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        let mut proj = projection.to_vec();
+        proj.sort();
+        self.scans
+            .lock()
+            .unwrap()
+            .push((table_name.to_string(), proj));
+        let batches = self
+            .batches_by_table
+            .get(table_name)
+            .cloned()
+            .unwrap_or_default();
+        Ok(vec_batch_stream(batches))
+    }
+}
+
+/// Build a memory ledger with the example.org namespace registered so subject
+/// templates and predicate IRIs encode/decode cleanly.
+fn edw_guard_ledger() -> (support::MemoryFluree, support::MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "edw-guard:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    (fluree, ledger)
+}
+
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// `?s a ex:<Class>` triple (class as a constant IRI, no object var).
+fn type_triple(subject: VarId, class_iri: &str) -> Pattern {
+    Pattern::Triple(TriplePattern::new(
+        Ref::Var(subject),
+        Ref::Iri(RDF_TYPE.into()),
+        Term::Iri(class_iri.into()),
+    ))
+}
+
+/// Run a GRAPH query against the `edw-gs:main` graph source and return the
+/// per-table scan counts plus the produced row total.
+async fn run_edw_guard(
+    provider: &CountingProvider,
+    ledger: &support::MemoryLedger,
+    vars: &VarRegistry,
+    inner: Vec<Pattern>,
+    select: Vec<VarId>,
+) -> (HashMap<String, usize>, usize) {
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(select);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("EDW guard query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    (provider.scan_counts(), rows)
+}
+
+/// `?s a ex:Store ; ex:storeId ?id ; ex:name ?name` must scan ONLY dw.store,
+/// exactly once: the class fuses into the same-subject star (no separate class
+/// scan, no per-batch re-scan), the shared `ex:name` predicate does NOT fan out
+/// to dw.employee, and the unreferenced `ex:geography` parent is not scanned.
+#[tokio::test]
+async fn guard_class_star_scans_only_store_once() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let id = vars.get_or_insert("?id");
+    let name = vars.get_or_insert("?name");
+    let p_store_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_store_id),
+            Term::Var(id),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_name),
+            Term::Var(name),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, id, name]).await;
+
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "Store must be scanned exactly once (class fused into star), got {counts:?}"
+    );
+    assert_eq!(
+        counts.get("dw.employee"),
+        None,
+        "shared ex:name must NOT fan out to dw.employee, got {counts:?}"
+    );
+    assert_eq!(
+        counts.get("dw.geography"),
+        None,
+        "unreferenced ex:geography parent must NOT be scanned, got {counts:?}"
+    );
+    // Fix A under fusion: the star projects exactly the subject key + the two
+    // queried predicate columns — NOT geo_key (the unreferenced RefObjectMap FK
+    // that the old `columns_for_predicate(None)` would have pulled in).
+    assert_eq!(
+        provider.projection_of("dw.store"),
+        vec![
+            "store_id".to_string(),
+            "store_key".to_string(),
+            "store_name".to_string()
+        ],
+        "fused star must project only subject key + storeId + name"
+    );
+    assert_eq!(rows, 2, "two store rows expected");
+}
+
+/// `?s a ex:Store` alone must scan ONLY dw.store once (subject-only): no POMs,
+/// no RefObjectMap parent, and the class filter keeps it off Employee/Geography.
+#[tokio::test]
+async fn guard_subject_only_type_pattern_scans_no_parents() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+
+    let inner = vec![type_triple(s, "http://example.org/Store")];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s]).await;
+
+    assert_eq!(counts.get("dw.store").copied(), Some(1), "got {counts:?}");
+    assert_eq!(
+        counts.len(),
+        1,
+        "subject-only type pattern scans only its own table, got {counts:?}"
+    );
+    // Fix A: a subject-only pattern projects ONLY the subject template column,
+    // never any POM/FK column. A regression to projecting all POMs would add
+    // store_id/store_name/geo_key here and this would catch it.
+    assert_eq!(
+        provider.projection_of("dw.store"),
+        vec!["store_key".to_string()],
+        "subject-only type pattern must project only the subject key column"
+    );
+    assert_eq!(rows, 2, "two store subjects expected");
+}
+
+/// A referenced RefObjectMap predicate keeps its parent scan: `?s a ex:Store ;
+/// ex:geography ?g` MUST still scan dw.geography (dangling-FK semantics are not
+/// weakened — Fixes A/B only prune parents for UNreferenced predicates).
+#[tokio::test]
+async fn guard_referenced_refobjectmap_still_scans_parent() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let g = vars.get_or_insert("?g");
+    let p_geo = ledger
+        .snapshot
+        .encode_iri("http://example.org/geography")
+        .unwrap();
+
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_geo),
+            Term::Var(g),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, g]).await;
+
+    // This shape is now optimal: one scan of the base table and exactly one scan
+    // of the referenced parent (no per-batch parent re-scan). Lock the exact
+    // counts so a regression reintroducing parent re-scans is caught.
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "Store scanned exactly once, got {counts:?}"
+    );
+    assert_eq!(
+        counts.get("dw.geography").copied(),
+        Some(1),
+        "referenced ex:geography parent scanned exactly once, got {counts:?}"
+    );
+    assert_eq!(counts.get("dw.employee"), None, "got {counts:?}");
+    assert_eq!(rows, 2, "two store→geography joins expected");
+}
+
+/// A true wildcard `?s ?p ?o` is unchanged: it still materializes every
+/// TriplesMap and RefObjectMap parent (the all-POMs branch fires only for
+/// `object_var = Some`, which a wildcard is).
+#[tokio::test]
+async fn guard_wildcard_still_scans_all_maps() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(s),
+        Ref::Var(p),
+        Term::Var(o),
+    ))];
+    let (counts, _rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, p, o]).await;
+
+    assert!(
+        counts.contains_key("dw.store"),
+        "wildcard scans Store, got {counts:?}"
+    );
+    assert!(
+        counts.contains_key("dw.geography"),
+        "wildcard still materializes Geography (TM and/or parent), got {counts:?}"
+    );
+    assert!(
+        counts.contains_key("dw.employee"),
+        "wildcard still scans Employee, got {counts:?}"
+    );
+}

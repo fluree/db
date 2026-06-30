@@ -163,6 +163,29 @@ impl TriplesMap {
         columns
     }
 
+    /// Columns needed to materialize only the subject IRI (subject template
+    /// columns plus an `rr:column` subject, if any).
+    ///
+    /// An `rdf:type`/subject-only triple pattern derives solely from the subject
+    /// map — no predicate-object map or RefObjectMap parent participates — so
+    /// reading any POM or parent column for it is wasted I/O. Use this instead of
+    /// `columns_for_predicate(None)` (which projects every POM column) when the
+    /// pattern has no object variable.
+    pub fn subject_columns(&self) -> Vec<&str> {
+        let mut columns: Vec<&str> = self
+            .subject_map
+            .template_columns
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+        columns.sort();
+        columns.dedup();
+        columns
+    }
+
     /// Get columns that must be non-null to produce triples for a pattern.
     ///
     /// This method returns the minimal set of columns where a NULL value would
