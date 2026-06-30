@@ -1711,7 +1711,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Drives the cgroup hard-cap repro (`scripts/import-memory-repro.sh`).
+    /// Cgroup hard-cap memory repro; run explicitly under a container `--memory` cap.
     ///
     /// `FLUREE_UPLOAD_TRUST=0` exercises the materialized path (full term-sized
     /// Vecs — the pre-fix behavior); `=1` exercises the streaming path. Under a
