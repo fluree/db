@@ -16,7 +16,8 @@ use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 // Additional imports for engine-level E2E tests
 use fluree_db_api::{
@@ -1975,6 +1976,268 @@ async fn engine_e2e_ref_object_map_join_execution() {
             }
         }
     }
+}
+
+// =============================================================================
+// Multi-table mapping in the idiomatic `@base` + `<#Name>` style (issue #1395)
+// =============================================================================
+
+/// A star-schema-style mapping written the way the W3C R2RML spec writes its
+/// own examples: a document `@base` plus relative `<#Name>` TriplesMap subjects.
+///
+/// Before the parser fix every `<#Name>` resolved to the same fragment-stripped
+/// IRI, collapsing all three TriplesMaps into one (single table, union of every
+/// column). With RFC 3986 §5.3 fragment resolution, `<#DimDate>`,
+/// `<#DimProduct>` and `<#FactSales>` resolve to three distinct IRIs and map
+/// three distinct tables.
+const BASE_FRAGMENT_MULTI_TABLE_TTL: &str = r#"
+@base <http://ex/edw> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<#DimDate> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_DATE" ] ;
+    rr:subjectMap [ rr:template "http://example.org/date/{DATE_KEY}" ; rr:class ex:Date ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:year ;
+        rr:objectMap [ rr:column "YEAR" ]
+    ] .
+
+<#DimProduct> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_PRODUCT" ] ;
+    rr:subjectMap [ rr:template "http://example.org/product/{PRODUCT_KEY}" ; rr:class ex:Product ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:productName ;
+        rr:objectMap [ rr:column "NAME" ]
+    ] .
+
+<#FactSales> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.FACT_SALES" ] ;
+    rr:subjectMap [ rr:template "http://example.org/sale/{SALE_ID}" ; rr:class ex:Sale ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:amount ;
+        rr:objectMap [ rr:column "AMOUNT" ]
+    ] .
+"#;
+
+/// Two `rr:TriplesMap` subjects that resolve to the same IRI. This is the
+/// post-collapse shape the (now-fixed) Turtle parser used to produce silently;
+/// the hardening guard must reject it loudly rather than first-wins/union-merge.
+const COLLIDING_TRIPLES_MAP_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#Collide> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_DATE" ] ;
+    rr:subjectMap [ rr:template "http://example.org/date/{DATE_KEY}" ; rr:class ex:Date ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:year ;
+        rr:objectMap [ rr:column "YEAR" ]
+    ] .
+
+<http://example.org/mapping#Collide> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "DW.DIM_PRODUCT" ] ;
+    rr:subjectMap [ rr:template "http://example.org/product/{PRODUCT_KEY}" ; rr:class ex:Product ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:productName ;
+        rr:objectMap [ rr:column "NAME" ]
+    ] .
+"#;
+
+/// Sample batch for the `DW.DIM_PRODUCT` table (subject key + name column).
+fn sample_product_batch() -> ColumnBatch {
+    let schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "PRODUCT_KEY".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "NAME".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let columns = vec![
+        Column::Int64(vec![Some(10), Some(20)]),
+        Column::String(vec![Some("Widget".to_string()), Some("Gadget".to_string())]),
+    ];
+    ColumnBatch::new(Arc::new(schema), columns).unwrap()
+}
+
+/// Mock provider that records which tables `scan_table` is asked to read, so a
+/// test can assert that a non-first TriplesMap scans its own table (and not the
+/// first map's table, which was the collapse symptom).
+#[derive(Debug)]
+struct RecordingTableProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    batches: HashMap<String, ColumnBatch>,
+    scanned: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl R2rmlProvider for RecordingTableProvider {
+    async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
+        true
+    }
+
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for RecordingTableProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scanned.lock().unwrap().push(table_name.to_string());
+        match self.batches.get(table_name) {
+            Some(batch) => Ok(vec_batch_stream(vec![batch.clone()])),
+            None => Ok(vec_batch_stream(vec![])),
+        }
+    }
+}
+
+/// Offline regression guard for issue #1395: an idiomatic `@base` + `<#Name>`
+/// multi-table mapping compiles to N distinct TriplesMaps over N distinct
+/// tables — not one merged map.
+#[test]
+fn test_base_fragment_multi_table_compiles_to_distinct_tables() {
+    let mapping = R2rmlLoader::from_turtle(BASE_FRAGMENT_MULTI_TABLE_TTL)
+        .expect("Failed to parse R2RML Turtle")
+        .compile()
+        .expect("Failed to compile R2RML mapping");
+
+    // Three TriplesMaps, not one collapsed map.
+    assert_eq!(mapping.triples_maps.len(), 3);
+
+    // Each `<#Name>` resolved to its own distinct IRI against `@base`.
+    assert!(mapping.get("http://ex/edw#DimDate").is_some());
+    assert!(mapping.get("http://ex/edw#DimProduct").is_some());
+    assert!(mapping.get("http://ex/edw#FactSales").is_some());
+
+    // Three distinct logical tables (the collapse produced exactly one).
+    let mut tables = mapping.table_names();
+    tables.sort_unstable();
+    assert_eq!(
+        tables,
+        vec!["DW.DIM_DATE", "DW.DIM_PRODUCT", "DW.FACT_SALES"]
+    );
+}
+
+/// Engine-level E2E for issue #1395: querying a predicate owned by a non-first
+/// TriplesMap scans that map's own table (`DW.DIM_PRODUCT`) and never the first
+/// map's table (`DW.DIM_DATE`). Pre-fix, every class scanned the first table.
+#[tokio::test]
+async fn engine_e2e_base_fragment_scans_non_first_table() {
+    let mapping = R2rmlLoader::from_turtle(BASE_FRAGMENT_MULTI_TABLE_TTL)
+        .expect("Failed to parse R2RML")
+        .compile()
+        .expect("Failed to compile");
+
+    let mut batches = HashMap::new();
+    batches.insert("DW.DIM_PRODUCT".to_string(), sample_product_batch());
+
+    let scanned = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingTableProvider {
+        mapping: Arc::new(mapping),
+        batches,
+        scanned: Arc::clone(&scanned),
+    };
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "edw-multi:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    // Query: SELECT ?p ?n WHERE { GRAPH <edw-gs:main> { ?p ex:productName ?n } }
+    // ex:productName is owned only by <#DimProduct> → only DW.DIM_PRODUCT.
+    let mut vars = VarRegistry::new();
+    let product_var = vars.get_or_insert("?p");
+    let name_var = vars.get_or_insert("?n");
+
+    let ex_product_name_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/productName")
+        .expect("example.org namespace should be registered for Sid encoding");
+
+    let inner_patterns = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(product_var),
+        Ref::Sid(ex_product_name_sid),
+        Term::Var(name_var),
+    ))];
+
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner_patterns,
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![product_var, name_var]);
+
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    let result_batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("Query execution should succeed");
+
+    let total_rows: usize = result_batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(total_rows, 2, "Should return the 2 DW.DIM_PRODUCT rows");
+
+    let scanned_tables = scanned.lock().unwrap().clone();
+    assert_eq!(
+        scanned_tables,
+        vec!["DW.DIM_PRODUCT".to_string()],
+        "Non-first TriplesMap must scan its own table only; scanned: {scanned_tables:?}"
+    );
+    assert!(
+        !scanned_tables.contains(&"DW.DIM_DATE".to_string()),
+        "The first map's table must not be scanned for a non-first predicate"
+    );
+}
+
+/// Phase-2 hardening for issue #1395: two `rr:TriplesMap` subjects that resolve
+/// to the same IRI must be a hard error, not a silent first-wins/union merge.
+#[test]
+fn test_colliding_triples_map_iris_error() {
+    let result = R2rmlLoader::from_turtle(COLLIDING_TRIPLES_MAP_TTL)
+        .expect("Turtle should parse")
+        .compile();
+
+    assert!(
+        result.is_err(),
+        "Two TriplesMap subjects colliding to one IRI should be rejected, got Ok"
+    );
+
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("Duplicate TriplesMap IRI"),
+        "Error should be a DuplicateTriplesMap, got: {msg}"
+    );
+    assert!(
+        msg.contains("http://example.org/mapping#Collide"),
+        "Error should name the colliding IRI, got: {msg}"
+    );
 }
 
 /// Test that composite join keys work correctly.

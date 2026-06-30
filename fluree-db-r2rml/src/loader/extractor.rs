@@ -2,7 +2,7 @@
 //!
 //! Extracts TriplesMap definitions from a Graph IR.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fluree_graph_ir::{Graph, Term, Triple};
 
@@ -41,6 +41,7 @@ impl<'a> MappingExtractor<'a> {
     /// Extract all TriplesMap definitions from the graph
     pub fn extract_all(&self) -> R2rmlResult<Vec<TriplesMap>> {
         let mut triples_maps = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
 
         // Find all subjects that are rdf:type rr:TriplesMap
         for triple in self.graph.iter() {
@@ -48,6 +49,23 @@ impl<'a> MappingExtractor<'a> {
                 && triple.o.as_iri() == Some(R2RML::TRIPLES_MAP)
             {
                 if let Some(subj_iri) = triple.s.as_iri() {
+                    // Each TriplesMap IRI is extracted exactly once. A repeated
+                    // `a rr:TriplesMap` triple for an already-extracted subject is
+                    // harmless redundancy and is skipped here.
+                    if !seen.insert(subj_iri) {
+                        continue;
+                    }
+
+                    // Hardening: a single TriplesMap IRI must carry exactly one
+                    // logical table and one subject map. More than one means two
+                    // or more `rr:TriplesMap` definitions collapsed onto the same
+                    // IRI (classically: idiomatic relative `<#fragment>` subjects
+                    // resolved against `@base` to the same IRI) and silently
+                    // merged into first-wins table/subject + union-of-POMs data.
+                    // Reject the collision loudly instead of returning
+                    // plausible-but-wrong triples.
+                    self.ensure_no_collision(subj_iri)?;
+
                     let tm = self.extract_triples_map(subj_iri)?;
                     triples_maps.push(tm);
                 }
@@ -55,6 +73,34 @@ impl<'a> MappingExtractor<'a> {
         }
 
         Ok(triples_maps)
+    }
+
+    /// Reject a TriplesMap IRI that carries more than one logical table or
+    /// subject map — the signature of two `rr:TriplesMap` subjects colliding to
+    /// the same IRI and being merged.
+    fn ensure_no_collision(&self, tm_iri: &str) -> R2rmlResult<()> {
+        let triples = self.get_triples_for_subject(tm_iri);
+
+        let table_count = triples
+            .iter()
+            .filter(|t| t.p.as_iri() == Some(R2RML::LOGICAL_TABLE))
+            .count();
+        let subject_count = triples
+            .iter()
+            .filter(|t| t.p.as_iri() == Some(R2RML::SUBJECT_MAP))
+            .count();
+
+        if table_count > 1 || subject_count > 1 {
+            return Err(R2rmlError::DuplicateTriplesMap(format!(
+                "{tm_iri} (found {table_count} rr:logicalTable and {subject_count} rr:subjectMap \
+                 definitions). Two or more rr:TriplesMap subjects resolve to this IRI and would be \
+                 silently merged (first-wins table/subject, union of predicate-object maps). Give \
+                 each TriplesMap a distinct subject IRI — a common cause is relative <#fragment> \
+                 references collapsing against @base."
+            )));
+        }
+
+        Ok(())
     }
 
     /// Extract a single TriplesMap by its IRI
