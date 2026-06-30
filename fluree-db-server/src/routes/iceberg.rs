@@ -77,6 +77,10 @@ pub struct IcebergMapResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub triples_map_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_names: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping_validated: Option<bool>,
 }
 
@@ -141,6 +145,8 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 connection_tested: result.connection_tested,
                 mapping_source: Some(result.mapping_source),
                 triples_map_count: Some(result.triples_map_count),
+                table_count: Some(result.table_count),
+                table_names: Some(result.table_names),
                 mapping_validated: Some(result.mapping_validated),
             }
         } else {
@@ -157,6 +163,8 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 connection_tested: result.connection_tested,
                 mapping_source: None,
                 triples_map_count: None,
+                table_count: None,
+                table_names: None,
                 mapping_validated: None,
             }
         };

@@ -282,6 +282,24 @@ async fn run_iceberg_map_remote(
         {
             println!("  TriplesMaps: {count}");
         }
+        if let Some(table_count) = result
+            .get("table_count")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let table_names: Vec<String> = result
+                .get("table_names")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!(
+                "  Tables:      {}",
+                format_table_summary(table_count as usize, &table_names)
+            );
+        }
         println!(
             "  Connection:  {}",
             if connection { "verified" } else { "not tested" }
@@ -626,6 +644,10 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
         println!("  R2RML:       {}", result.mapping_source);
         println!("  TriplesMaps: {}", result.triples_map_count);
         println!(
+            "  Tables:      {}",
+            format_table_summary(result.table_count, &result.table_names)
+        );
+        println!(
             "  Connection:  {}",
             if result.connection_tested {
                 "verified"
@@ -747,6 +769,16 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     }
 
     Ok(config)
+}
+
+/// Format the `Tables:` summary as `N (name1, name2, …)`, or just `N` when no
+/// table names are available (e.g. an unvalidated address-based mapping).
+fn format_table_summary(count: usize, names: &[String]) -> String {
+    if names.is_empty() {
+        count.to_string()
+    } else {
+        format!("{count} ({})", names.join(", "))
+    }
 }
 
 fn is_iceberg_family_source_type(st: &fluree_db_nameservice::GraphSourceType) -> bool {

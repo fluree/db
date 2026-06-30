@@ -185,7 +185,9 @@ impl crate::Fluree {
         config.validate()?;
 
         // Resolve mapping: validate and store to CAS if inline content
-        let (mapping_address, triples_map_count, mapping_validated) = match &config.mapping {
+        let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
+            .mapping
+        {
             R2rmlMappingInput::Content(content) => {
                 // Inline content has no filename to sniff; the shared resolver
                 // defaults a missing media type to Turtle (matching the eventual
@@ -193,6 +195,7 @@ impl crate::Fluree {
                 let compiled =
                     Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
                 let count = compiled.len();
+                let tables = Self::sorted_table_names(&compiled);
                 let gs_id = config.graph_source_id();
                 let cs = self.content_store(&gs_id);
                 let cid = cs
@@ -206,20 +209,21 @@ impl crate::Fluree {
                     })?;
                 let addr = cid.to_string();
                 info!(graph_source_id = %graph_source_id, mapping_cid = %addr, "R2RML mapping stored to CAS");
-                (addr, count, true)
+                (addr, count, tables, true)
             }
             R2rmlMappingInput::Address(address) => {
-                let (count, validated) = self
-                    .validate_r2rml_mapping_from_address(address, &config)
-                    .await
-                    .map(|c| (c, true))
-                    .unwrap_or_else(|e| {
-                        warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
-                        (0, false)
-                    });
-                (address.clone(), count, validated)
+                let (count, tables, validated) = self
+                        .validate_r2rml_mapping_from_address(address, &config)
+                        .await
+                        .map(|(c, t)| (c, t, true))
+                        .unwrap_or_else(|e| {
+                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
+                            (0, Vec::new(), false)
+                        });
+                (address.clone(), count, tables, validated)
             }
         };
+        let table_count = table_names.len();
 
         // Test catalog connection (REST mode only)
         let connection_tested = if config.iceberg.is_rest() {
@@ -252,6 +256,8 @@ impl crate::Fluree {
             catalog_uri: config.iceberg.catalog_uri_or_location().to_string(),
             mapping_source: mapping_address,
             triples_map_count,
+            table_count,
+            table_names,
             connection_tested,
             mapping_validated,
         })
@@ -331,11 +337,14 @@ impl crate::Fluree {
     }
 
     /// Validate an R2RML mapping from a pre-existing storage address.
+    ///
+    /// Returns the number of TriplesMap definitions and the sorted list of
+    /// distinct logical table names referenced by the mapping.
     async fn validate_r2rml_mapping_from_address(
         &self,
         address: &str,
         config: &R2rmlCreateConfig,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<String>)> {
         let storage = self.admin_storage().ok_or_else(|| {
             crate::ApiError::Config(format!(
                 "Cannot load R2RML mapping from address '{address}': address-based reads are not supported on this backend"
@@ -351,10 +360,21 @@ impl crate::Fluree {
         })?;
         // `address` may carry an extension (e.g. `.ttl`/`.jsonld`); pass it so the
         // resolver can infer the format when no explicit media type is set.
-        Ok(
-            Self::compile_r2rml_content(&content, config.mapping_media_type.as_deref(), address)?
-                .len(),
-        )
+        let compiled =
+            Self::compile_r2rml_content(&content, config.mapping_media_type.as_deref(), address)?;
+        Ok((compiled.len(), Self::sorted_table_names(&compiled)))
+    }
+
+    /// Collect the distinct logical table names referenced by a compiled
+    /// mapping, sorted for deterministic reporting.
+    fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
+        let mut names: Vec<String> = compiled
+            .table_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
     }
 }
 
@@ -675,12 +695,24 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 );
 
                 let storage = if let Some(ref credentials) = load_response.credentials {
-                    info!("Using vended credentials from catalog");
-                    S3IcebergStorage::from_vended_credentials(credentials)
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?
+                    info!(
+                        region = ?iceberg_config.io.s3_region,
+                        endpoint = ?iceberg_config.io.s3_endpoint,
+                        "Using vended credentials from catalog"
+                    );
+                    // Thread the io overrides so a catalog that omits the region (or where
+                    // we want an operator-configured endpoint/path-style) still resolves
+                    // correctly. Precedence inside the call: vended > these overrides > SDK.
+                    S3IcebergStorage::from_vended_credentials(
+                        credentials,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
                 } else {
                     info!(
                         region = ?iceberg_config.io.s3_region,
