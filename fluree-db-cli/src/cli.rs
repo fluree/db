@@ -609,6 +609,24 @@ pub enum Commands {
         #[arg(long)]
         remote: Option<String>,
 
+        /// Force the connection-scoped query path (server root `/query`, with the
+        /// dataset carried by the query's own `FROM` clause) instead of the
+        /// ledger-scoped path. Use this to query a registered Iceberg/R2RML graph
+        /// source by federating into it, or to run a cross-source `FROM` query.
+        ///
+        /// Optionally name a remote that hosts the connection
+        /// (`--connection=origin`); given with no value, the local connection (or
+        /// an auto-routed local server) is used. Queries that already reference a
+        /// non-endpoint source via `FROM` route here automatically.
+        #[arg(
+            long,
+            value_name = "REMOTE",
+            num_args = 0..=1,
+            default_missing_value = "",
+            require_equals = true
+        )]
+        connection: Option<String>,
+
         /// Report tracking tally (fuel + time + policy) to stderr after results.
         /// Shorthand for `--track-fuel --track-time --track-policy`.
         #[arg(long)]

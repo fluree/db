@@ -45,18 +45,41 @@ pub enum LedgerMode {
     },
 }
 
-/// Resolve which ledger to operate on and how (local vs tracked).
+/// A resolved `fluree query` target.
 ///
-/// Resolution precedence:
-/// 1. `--remote <name>` flag → temporary RemoteLedgerClient (caller provides this)
-/// 2. Compound `remote/ledger` syntax (e.g., "origin/mydb") → remote query
-/// 3. Local ledger with this alias exists → LedgerMode::Local
-/// 4. Tracked config for this alias exists → LedgerMode::Tracked
-/// 5. Error
-pub async fn resolve_ledger_mode(
+/// Extends [`LedgerMode`] with a graph-source arm: a name that isn't a native
+/// ledger (or tracked config) but *is* a locally-registered Iceberg/R2RML graph
+/// source resolves here instead of failing with `NotFound`. The query command
+/// runs it through the R2RML-aware single-target builder (`fluree.graph().query()`),
+/// which the standalone `db()` + `query()` snapshot path can't reach.
+pub enum QueryTarget {
+    /// A native ledger (local or tracked) — the traditional query path.
+    Ledger(LedgerMode),
+    /// A locally-registered graph source (Iceberg/R2RML). `alias` is normalized
+    /// to `<name>:main` for routing.
+    GraphSource { fluree: Box<Fluree>, alias: String },
+}
+
+/// Resolve a `fluree query` target, distinguishing native ledgers from
+/// registered graph sources.
+///
+/// Resolution precedence (first match wins):
+/// 1. Compound `remote/ledger` syntax (e.g., "origin/mydb") → tracked remote.
+/// 2. Local native ledger with this alias → [`LedgerMode::Local`].
+/// 3. Local graph source (Iceberg/R2RML) with this name → [`QueryTarget::GraphSource`].
+///    Graph sources live under a separate nameservice key than native ledgers,
+///    so the `ledger_exists` check (a `lookup`) never sees them; this probe is
+///    what lets `fluree query <graph-source>` resolve instead of returning
+///    NotFound.
+/// 4. Tracked config for this alias → [`LedgerMode::Tracked`].
+/// 5. Error (NotFound).
+///
+/// A locally-registered graph source wins over a tracked remote of the same
+/// name, mirroring the "local wins" rule already applied to native ledgers.
+pub async fn resolve_query_target(
     explicit: Option<&str>,
     dirs: &FlureeDir,
-) -> CliResult<LedgerMode> {
+) -> CliResult<QueryTarget> {
     let alias = resolve_ledger(explicit, dirs)?;
 
     // Strip `#fragment` (e.g., `#txn-meta`) for ledger resolution.
@@ -73,7 +96,7 @@ pub async fn resolve_ledger_mode(
         // For remote mode, pass through the full alias (with fragment) so the
         // server can resolve the graph. Currently remote doesn't support this,
         // but it avoids silently dropping the fragment.
-        return Ok(mode);
+        return Ok(QueryTarget::Ledger(mode));
     }
 
     let fluree = build_fluree(dirs)?;
@@ -81,22 +104,55 @@ pub async fn resolve_ledger_mode(
     // Check if local ledger exists (local wins)
     let ledger_id = to_ledger_id(ledger_part);
     if fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
-        return Ok(LedgerMode::Local {
+        return Ok(QueryTarget::Ledger(LedgerMode::Local {
             fluree: Box::new(fluree),
             alias,
-        });
+        }));
+    }
+
+    // Check if a graph source (Iceberg/R2RML) is registered under this name.
+    // Graph sources are keyed separately from native ledgers in the
+    // nameservice, so the `ledger_exists` check above never sees them — this is
+    // the fix for #1398 (`fluree query <graph-source>` → "ledger not found").
+    // A non-retracted local graph source wins over a tracked remote of the same
+    // name, consistent with the "local wins" rule for native ledgers.
+    //
+    // This probe now runs for every command that resolves a ledger (via the
+    // `resolve_ledger_mode` wrapper), so a graph-source-store *read error* must
+    // not break ledger resolution: treat any `Err` as "not a graph source" and
+    // fall through to the tracked-config / NotFound path exactly as before.
+    match fluree.nameservice().lookup_graph_source(&ledger_id).await {
+        Ok(Some(record)) if !record.retracted => {
+            return Ok(QueryTarget::GraphSource {
+                fluree: Box::new(fluree),
+                alias: ledger_id,
+            });
+        }
+        // Absent or retracted — not a queryable graph source; fall through.
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(
+                graph_source = %ledger_id,
+                error = ?e,
+                "graph-source probe failed; treating as not a graph source"
+            );
+        }
     }
 
     // Check tracked config
     let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
     if let Some(tracked) = store.get_tracked(ledger_part) {
-        return build_tracked_mode(&store, &tracked, ledger_part).await;
+        return Ok(QueryTarget::Ledger(
+            build_tracked_mode(&store, &tracked, ledger_part).await?,
+        ));
     }
 
     // Also try the normalized ledger_id (user might have typed "mydb" but tracked as "mydb:main")
     if ledger_part != ledger_id {
         if let Some(tracked) = store.get_tracked(&ledger_id) {
-            return build_tracked_mode(&store, &tracked, &ledger_id).await;
+            return Ok(QueryTarget::Ledger(
+                build_tracked_mode(&store, &tracked, &ledger_id).await?,
+            ));
         }
     }
 
@@ -105,7 +161,9 @@ pub async fn resolve_ledger_mode(
     if let Some(base) = ledger_part.split(':').next() {
         if base != ledger_part && base != ledger_id {
             if let Some(tracked) = store.get_tracked(base) {
-                return build_tracked_mode(&store, &tracked, ledger_part).await;
+                return Ok(QueryTarget::Ledger(
+                    build_tracked_mode(&store, &tracked, ledger_part).await?,
+                ));
             }
         }
     }
@@ -117,6 +175,31 @@ pub async fn resolve_ledger_mode(
          Use `fluree create {display}` to create locally, `fluree track add {display}` to track a remote,\n  \
          or use remote/ledger syntax (e.g., origin/{display})."
     )))
+}
+
+/// Resolve which ledger to operate on and how (local vs tracked).
+///
+/// This is the ledger-only view of [`resolve_query_target`]: every command
+/// except `query` operates on a native ledger, so a name that resolves to a
+/// graph source is reported here as a (clear) error pointing at `fluree query`.
+///
+/// Resolution precedence:
+/// 1. `--remote <name>` flag → temporary RemoteLedgerClient (caller provides this)
+/// 2. Compound `remote/ledger` syntax (e.g., "origin/mydb") → remote query
+/// 3. Local ledger with this alias exists → LedgerMode::Local
+/// 4. Tracked config for this alias exists → LedgerMode::Tracked
+/// 5. Error
+pub async fn resolve_ledger_mode(
+    explicit: Option<&str>,
+    dirs: &FlureeDir,
+) -> CliResult<LedgerMode> {
+    match resolve_query_target(explicit, dirs).await? {
+        QueryTarget::Ledger(mode) => Ok(mode),
+        QueryTarget::GraphSource { alias, .. } => Err(CliError::NotFound(format!(
+            "'{alias}' is a registered graph source, not a ledger.\n  \
+             Query it with `fluree query {alias}`, or inspect it with `fluree iceberg info {alias}`."
+        ))),
+    }
 }
 
 /// Try to parse `alias` as `remote_name/ledger_alias` compound syntax.
@@ -551,4 +634,87 @@ fn is_fluree_process(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn is_fluree_process(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_nameservice::GraphSourceType;
+
+    /// A fresh, isolated `FlureeDir` backed by a temp directory. `build_fluree`
+    /// falls back to `<dir>/storage`, so no `fluree init` is needed.
+    fn temp_dirs() -> (tempfile::TempDir, FlureeDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = FlureeDir::unified(tmp.path().to_path_buf());
+        (tmp, dirs)
+    }
+
+    /// Register a graph source directly through the publisher. This bypasses
+    /// `fluree iceberg map` (which needs a live catalog) so the resolution
+    /// branch can be tested in isolation.
+    async fn register_graph_source(dirs: &FlureeDir, name: &str) {
+        let fluree = build_fluree(dirs).unwrap();
+        fluree
+            .publisher()
+            .unwrap()
+            .publish_graph_source(name, "main", GraphSourceType::R2rml, "{}", &[])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolves_registered_graph_source_to_graph_source_target() {
+        let (_tmp, dirs) = temp_dirs();
+        register_graph_source(&dirs, "warehouse-orders").await;
+
+        // The query path resolves it as a graph source (normalized to :main),
+        // not as a missing ledger.
+        let target = resolve_query_target(Some("warehouse-orders"), &dirs)
+            .await
+            .unwrap();
+        match target {
+            QueryTarget::GraphSource { alias, .. } => {
+                assert_eq!(alias, "warehouse-orders:main");
+            }
+            QueryTarget::Ledger(_) => panic!("expected a GraphSource target, got a ledger"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ledger_only_resolution_reports_graph_source_as_clear_error() {
+        let (_tmp, dirs) = temp_dirs();
+        register_graph_source(&dirs, "warehouse-orders").await;
+
+        // Non-query commands resolve through `resolve_ledger_mode`, which must
+        // not treat the graph source as a ledger — it errors with a pointer to
+        // `fluree query` rather than the generic "not found" message.
+        // (`LedgerMode` isn't `Debug`, so match rather than `unwrap_err`.)
+        match resolve_ledger_mode(Some("warehouse-orders"), &dirs).await {
+            Err(CliError::NotFound(msg)) => {
+                assert!(msg.contains("graph source"), "unexpected message: {msg}");
+                assert!(msg.contains("fluree query"), "unexpected message: {msg}");
+            }
+            Ok(_) => panic!("expected an error, resolved as a ledger"),
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_target_still_reports_not_found() {
+        let (_tmp, dirs) = temp_dirs();
+
+        // A genuinely-missing name keeps the original, ledger-oriented message
+        // on both resolution paths (regression guard).
+        // (`QueryTarget` isn't `Debug`, so match rather than `unwrap_err`.)
+        match resolve_query_target(Some("nope"), &dirs).await {
+            Err(CliError::NotFound(msg)) => {
+                assert!(
+                    msg.contains("not found locally or in tracked config"),
+                    "unexpected message: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected NotFound for a missing target"),
+            Err(other) => panic!("expected NotFound, got {other:?}"),
+        }
+    }
 }

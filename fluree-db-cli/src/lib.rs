@@ -278,6 +278,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             cypher,
             at,
             remote,
+            connection,
             track,
             track_fuel,
             track_time,
@@ -302,6 +303,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 at.as_deref(),
                 &fluree_dir,
                 remote.as_deref(),
+                connection.as_deref(),
                 direct,
                 commands::query::TrackingFlags {
                     track,

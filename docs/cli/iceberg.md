@@ -154,10 +154,16 @@ Once mapped, the graph source appears in standard commands:
 fluree list
 
 # Inspect configuration
-fluree info warehouse-orders
+fluree iceberg info warehouse-orders
 
-# Query via SPARQL GRAPH pattern
-fluree query mydb 'SELECT ?id ?total FROM <mydb:main> WHERE { GRAPH <warehouse-orders:main> { ?o ex:id ?id ; ex:total ?total } }'
+# Query the graph source directly (single-target): name it as the target, with
+# no FROM. The CLI resolves it as a graph source and runs it through the
+# R2RML/Iceberg engine. Requires the `iceberg` feature.
+fluree query warehouse-orders 'SELECT ?id ?total WHERE { ?o ex:id ?id ; ex:total ?total }'
+
+# Federate into it: a query whose FROM names the source routes to the
+# connection-scoped path automatically (or force it with --connection).
+fluree query --connection 'SELECT ?id ?total FROM <warehouse-orders:main> WHERE { ?o ex:id ?id ; ex:total ?total }'
 
 # Remove the mapping
 fluree drop warehouse-orders --force

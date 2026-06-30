@@ -227,6 +227,7 @@ pub async fn run(
     at: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
+    connection: Option<&str>,
     direct: bool,
     tracking: TrackingFlags,
     policy: &PolicyArgs,
@@ -331,20 +332,59 @@ pub async fn run(
     let tracking_opts = tracking.as_options();
     let tracking_metrics = tracking.effective();
 
-    // Resolve ledger mode: --remote flag, local, tracked, or auto-route to local server
-    let mode = if let Some(remote_name) = remote_flag {
+    // `--connection [REMOTE]`: force the connection-scoped query path (server
+    // root `/query`, dataset in the body's FROM). An explicit REMOTE targets
+    // that remote's connection; an empty value (bare flag) uses the locally
+    // resolved transport.
+    let force_connection = connection.is_some();
+    let connection_remote = connection.filter(|c| !c.is_empty());
+
+    // Resolve the query target: --remote / --connection <remote> build a remote
+    // client; otherwise probe local ledgers, then graph sources, then tracked
+    // config, auto-routing to a local server unless --direct. A graph-source
+    // single target executes locally and is never auto-routed.
+    let target = if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(explicit_ledger, dirs)?;
-        context::build_remote_mode(remote_name, &alias, dirs).await?
+        context::QueryTarget::Ledger(context::build_remote_mode(remote_name, &alias, dirs).await?)
+    } else if let Some(conn_remote) = connection_remote {
+        // The connection path carries its dataset in the query's FROM clause, so
+        // no ledger alias is required; default to empty when none is given.
+        let alias = context::resolve_ledger(explicit_ledger, dirs).unwrap_or_default();
+        context::QueryTarget::Ledger(context::build_remote_mode(conn_remote, &alias, dirs).await?)
     } else {
-        let mode = context::resolve_ledger_mode(explicit_ledger, dirs).await?;
-        if direct {
-            mode
-        } else {
-            context::try_server_route(mode, dirs)
+        // Bare `--connection` (no remote, no ledger): a pure-federation query
+        // names its sources in its own FROM clause, so the local connection path
+        // needs only a `Fluree` handle — not an active ledger. When no ledger is
+        // active or provided, fall back to a bare local target instead of erroring
+        // with `NoActiveLedger` (symmetric with the `=REMOTE` arm above). A
+        // provided or active ledger still resolves normally.
+        match context::resolve_query_target(explicit_ledger, dirs).await {
+            Ok(context::QueryTarget::Ledger(mode)) => context::QueryTarget::Ledger(if direct {
+                mode
+            } else {
+                context::try_server_route(mode, dirs)
+            }),
+            Ok(gs) => gs,
+            Err(CliError::NoActiveLedger) if force_connection => {
+                context::QueryTarget::Ledger(LedgerMode::Local {
+                    fluree: Box::new(context::build_fluree(dirs)?),
+                    alias: String::new(),
+                })
+            }
+            Err(e) => return Err(e),
         }
     };
 
     if is_cypher {
+        // Cypher is local-only; it has no graph-source or connection form.
+        let mode = match target {
+            context::QueryTarget::Ledger(mode) => mode,
+            context::QueryTarget::GraphSource { .. } => {
+                return Err(CliError::Usage(
+                    "Cypher queries are not supported on graph source targets".to_string(),
+                ));
+            }
+        };
         return run_cypher_query(
             mode,
             &content,
@@ -357,6 +397,47 @@ pub async fn run(
         )
         .await;
     }
+
+    // Federation / connection-scoped routing: an explicit `--connection`, or a
+    // query body that targets a source other than the endpoint via FROM/from,
+    // routes to the connection-scoped path. A plain same-endpoint query is left
+    // on the single-target path below.
+    let endpoint_id = target_endpoint_id(&target);
+    let use_connection =
+        force_connection || query_targets_foreign_source(query_format, &content, &endpoint_id)?;
+    if use_connection {
+        return run_connection_query(
+            target,
+            query_format,
+            &content,
+            output_format,
+            normalize_arrays,
+            at,
+            explain,
+            limit,
+            dirs,
+        )
+        .await;
+    }
+
+    // A single graph-source target runs through the R2RML-aware local builder
+    // (subject to the same restrictions the server enforces for graph sources).
+    let mode = match target {
+        context::QueryTarget::GraphSource { fluree, alias } => {
+            reject_graph_source_unsupported(at, explain, output_format)?;
+            return run_graph_source_query(
+                &fluree,
+                &alias,
+                query_format,
+                &content,
+                output_format,
+                normalize_arrays,
+                limit,
+            )
+            .await;
+        }
+        context::QueryTarget::Ledger(mode) => mode,
+    };
 
     match mode {
         LedgerMode::Tracked {
@@ -1400,9 +1481,334 @@ fn print_footer(total_rows: usize, limit: Option<usize>, elapsed: std::time::Dur
     }
 }
 
+// ---------------------------------------------------------------------------
+// Graph-source / connection (federated) query routing
+// ---------------------------------------------------------------------------
+
+/// Strip the branch (`:branch`), time-travel (`@t:` / `@iso:` / `@commit:`), and
+/// named-graph fragment (`#…`) suffixes from a ledger / graph-source identifier,
+/// leaving the bare base name. Lets a query's `FROM` targets be compared to the
+/// endpoint regardless of how either is spelled (`mydb`, `mydb:main`,
+/// `mydb:main@t:3`, `mydb:main#g` all share the base `mydb`).
+fn base_ledger_id(id: &str) -> &str {
+    let id = id.split('#').next().unwrap_or(id);
+    let id = id.split('@').next().unwrap_or(id);
+    id.split(':').next().unwrap_or(id)
+}
+
+/// Extract the `from` targets declared in a JSON-LD query body (a string or an
+/// array of strings). Missing / non-string values yield an empty list.
+fn jsonld_from_targets(body: &serde_json::Value) -> Vec<String> {
+    match body.get("from") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether the query body targets a source *other than* the endpoint via
+/// `FROM`/`FROM NAMED` (SPARQL) or `from` (JSON-LD). This is the gate for
+/// auto-routing a federated query to the connection-scoped path: a plain
+/// same-endpoint query (no `FROM`, or `FROM <self>`) returns `false` and stays
+/// on the single-target path.
+fn query_targets_foreign_source(
+    query_format: detect::QueryFormat,
+    content: &str,
+    endpoint_id: &str,
+) -> CliResult<bool> {
+    let endpoint_base = base_ledger_id(endpoint_id);
+    let targets: Vec<String> = match query_format {
+        detect::QueryFormat::Sparql => {
+            fluree_db_api::sparql_dataset_ledger_ids(content).unwrap_or_default()
+        }
+        detect::QueryFormat::JsonLd => match serde_json::from_str::<serde_json::Value>(content) {
+            Ok(body) => jsonld_from_targets(&body),
+            // A body we can't parse here will fail later with a clearer error;
+            // don't divert it to the connection path on a parse hiccup.
+            Err(_) => Vec::new(),
+        },
+    };
+    Ok(targets.iter().any(|t| base_ledger_id(t) != endpoint_base))
+}
+
+/// The endpoint identifier a query is scoped to, used to decide whether the
+/// body's `FROM`/`from` references a *foreign* source. For a graph source it's
+/// the source alias; for a ledger it's the local alias (Local) or remote alias
+/// (Tracked).
+fn target_endpoint_id(target: &context::QueryTarget) -> String {
+    match target {
+        context::QueryTarget::GraphSource { alias, .. } => alias.clone(),
+        context::QueryTarget::Ledger(LedgerMode::Local { alias, .. }) => alias.clone(),
+        context::QueryTarget::Ledger(LedgerMode::Tracked { remote_alias, .. }) => {
+            remote_alias.clone()
+        }
+    }
+}
+
+/// Reject the flags the server also refuses for graph-source targets: time
+/// travel, explain plans, and the streaming / delimited output formats. A graph
+/// source is queried at its live source state and returns JSON only.
+fn reject_graph_source_unsupported(
+    at: Option<&str>,
+    explain: bool,
+    output_format: OutputFormatKind,
+) -> CliResult<()> {
+    if at.is_some() {
+        return Err(CliError::Usage(
+            "`--at` (time travel) is not supported for graph source targets; a graph source is \
+             queried at its live source state"
+                .to_string(),
+        ));
+    }
+    if explain {
+        return Err(CliError::Usage(
+            "`--explain` is not supported for graph source targets".to_string(),
+        ));
+    }
+    if matches!(
+        output_format,
+        OutputFormatKind::Ndjson | OutputFormatKind::Csv | OutputFormatKind::Tsv
+    ) {
+        return Err(CliError::Usage(format!(
+            "`--format {output_format}` is not supported for graph source targets; \
+             use json, typed-json, or table"
+        )));
+    }
+    Ok(())
+}
+
+/// Build the formatter config for the JSON-returning graph-source / connection
+/// paths from the requested output format.
+fn json_path_formatter_config(
+    query_format: detect::QueryFormat,
+    output_format: OutputFormatKind,
+    normalize_arrays: bool,
+) -> fluree_db_api::FormatterConfig {
+    match output_format {
+        OutputFormatKind::TypedJson => fluree_db_api::FormatterConfig::typed_json(),
+        _ => match query_format {
+            detect::QueryFormat::Sparql => fluree_db_api::FormatterConfig::sparql_json(),
+            detect::QueryFormat::JsonLd => {
+                let config = fluree_db_api::FormatterConfig::jsonld();
+                if normalize_arrays {
+                    config.with_normalize_arrays()
+                } else {
+                    config
+                }
+            }
+        },
+    }
+}
+
+/// Map the requested output format to the display format for a JSON-returning
+/// path (graph-source / connection). Mirrors the local ledger path: JSON-LD has
+/// no table renderer, so any non-typed format falls back to JSON for JSON-LD
+/// queries. (NDJSON/CSV/TSV are rejected up front by the guardrails.)
+fn json_path_display_format(
+    query_format: detect::QueryFormat,
+    output_format: OutputFormatKind,
+) -> OutputFormatKind {
+    match output_format {
+        OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
+        _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,
+        _ => output_format,
+    }
+}
+
+/// Render a formatted JSON result (graph-source or connection query) through the
+/// shared output pipeline and print the standard footer.
+fn render_json_path_result(
+    result_json: &serde_json::Value,
+    query_format: detect::QueryFormat,
+    output_format: OutputFormatKind,
+    limit: Option<usize>,
+    elapsed: std::time::Duration,
+) -> CliResult<()> {
+    let display_format = json_path_display_format(query_format, output_format);
+    let output = output::format_result(result_json, display_format, query_format, limit)?;
+    println!("{}", output.text);
+    print_footer(output.total_rows, limit, elapsed);
+    Ok(())
+}
+
+/// Execute a single-target query against a local Iceberg/R2RML graph source via
+/// the R2RML-aware `graph().query()` builder — the same path the server uses for
+/// `POST /query/<graph-source>`. Requires the `iceberg` feature.
+#[cfg(feature = "iceberg")]
+async fn run_graph_source_query(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    query_format: detect::QueryFormat,
+    content: &str,
+    output_format: OutputFormatKind,
+    normalize_arrays: bool,
+    limit: Option<usize>,
+) -> CliResult<()> {
+    let fmt = json_path_formatter_config(query_format, output_format, normalize_arrays);
+    let timer = Instant::now();
+    let result_json = match query_format {
+        detect::QueryFormat::Sparql => {
+            fluree
+                .graph(alias)
+                .query()
+                .sparql(content)
+                .format(fmt)
+                .execute_formatted()
+                .await?
+        }
+        detect::QueryFormat::JsonLd => {
+            let json: serde_json::Value = serde_json::from_str(content)?;
+            fluree
+                .graph(alias)
+                .query()
+                .jsonld(&json)
+                .format(fmt)
+                .execute_formatted()
+                .await?
+        }
+    };
+    let elapsed = timer.elapsed();
+    render_json_path_result(&result_json, query_format, output_format, limit, elapsed)
+}
+
+/// Without the `iceberg` feature the local R2RML/Iceberg engine isn't compiled,
+/// so a graph-source single-target query can't run locally. Resolution still
+/// succeeds (so the message is clear), but execution points the user at the fix.
+#[cfg(not(feature = "iceberg"))]
+async fn run_graph_source_query(
+    _fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    _query_format: detect::QueryFormat,
+    _content: &str,
+    _output_format: OutputFormatKind,
+    _normalize_arrays: bool,
+    _limit: Option<usize>,
+) -> CliResult<()> {
+    Err(CliError::Usage(format!(
+        "'{alias}' is a graph source, but this `fluree` build lacks Iceberg/R2RML support.\n  \
+         Rebuild with `--features iceberg`, or query it through a server with \
+         `fluree query --remote <name> {alias}`."
+    )))
+}
+
+/// Execute a query through the connection-scoped path: the dataset is selected
+/// by the query body's own `FROM`/`from`, not by a ledger in the request path.
+/// Local targets run `fluree.query_from()`; tracked/remote targets POST to the
+/// connection root (`/query`). This is how a federated query reaches an
+/// Iceberg/R2RML graph source.
+#[allow(clippy::too_many_arguments)]
+async fn run_connection_query(
+    target: context::QueryTarget,
+    query_format: detect::QueryFormat,
+    content: &str,
+    output_format: OutputFormatKind,
+    normalize_arrays: bool,
+    at: Option<&str>,
+    explain: bool,
+    limit: Option<usize>,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    // The connection path returns JSON and doesn't plumb time travel or explain.
+    if at.is_some() {
+        return Err(CliError::Usage(
+            "`--at` is not supported on the connection/federated query path; encode time travel \
+             in the FROM IRI (e.g. `FROM <ledger@t:1>`)"
+                .to_string(),
+        ));
+    }
+    if explain {
+        return Err(CliError::Usage(
+            "`--explain` is not supported on the connection/federated query path".to_string(),
+        ));
+    }
+    if matches!(
+        output_format,
+        OutputFormatKind::Ndjson | OutputFormatKind::Csv | OutputFormatKind::Tsv
+    ) {
+        return Err(CliError::Usage(format!(
+            "`--format {output_format}` is not supported on the connection/federated path; \
+             use json, typed-json, or table"
+        )));
+    }
+
+    let timer = Instant::now();
+    let result_json = match target {
+        context::QueryTarget::Ledger(LedgerMode::Tracked {
+            client,
+            remote_name,
+            ..
+        }) => {
+            let result = match query_format {
+                detect::QueryFormat::Sparql => client.query_connection_sparql(content).await?,
+                detect::QueryFormat::JsonLd => {
+                    let json: serde_json::Value = serde_json::from_str(content)?;
+                    client.query_connection_jsonld(&json).await?
+                }
+            };
+            context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
+            result
+        }
+        context::QueryTarget::Ledger(LedgerMode::Local { fluree, .. })
+        | context::QueryTarget::GraphSource { fluree, .. } => {
+            connection_query_local(
+                &fluree,
+                query_format,
+                content,
+                output_format,
+                normalize_arrays,
+            )
+            .await?
+        }
+    };
+    let elapsed = timer.elapsed();
+    render_json_path_result(&result_json, query_format, output_format, limit, elapsed)
+}
+
+/// Local connection query via `fluree.query_from()`. Under the `iceberg`
+/// feature this resolves R2RML/Iceberg graph sources referenced by `FROM`;
+/// without it, it still federates across native ledgers. Returns formatted JSON.
+async fn connection_query_local(
+    fluree: &fluree_db_api::Fluree,
+    query_format: detect::QueryFormat,
+    content: &str,
+    output_format: OutputFormatKind,
+    normalize_arrays: bool,
+) -> CliResult<serde_json::Value> {
+    let fmt = json_path_formatter_config(query_format, output_format, normalize_arrays);
+    let result = match query_format {
+        detect::QueryFormat::Sparql => {
+            fluree
+                .query_from()
+                .sparql(content)
+                .format(fmt)
+                .execute_formatted()
+                .await?
+        }
+        detect::QueryFormat::JsonLd => {
+            let json: serde_json::Value = serde_json::from_str(content)?;
+            fluree
+                .query_from()
+                .jsonld(&json)
+                .format(fmt)
+                .execute_formatted()
+                .await?
+        }
+    };
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{attach_time_suffix_preserving_fragment, inject_sparql_from_before_where};
+    use super::{
+        attach_time_suffix_preserving_fragment, base_ledger_id, inject_sparql_from_before_where,
+        json_path_display_format, jsonld_from_targets, query_targets_foreign_source,
+        reject_graph_source_unsupported,
+    };
+    use crate::detect::QueryFormat;
+    use crate::output::OutputFormatKind;
 
     #[test]
     fn attach_time_suffix_preserves_fragment() {
@@ -1421,5 +1827,120 @@ mod tests {
         let q = "SELECT * WHERE { ?s ?p ?o }";
         let out = inject_sparql_from_before_where(q, "myledger:main@t:1").unwrap();
         assert_eq!(out, "SELECT * FROM <myledger:main@t:1> WHERE { ?s ?p ?o }");
+    }
+
+    #[test]
+    fn base_ledger_id_strips_branch_time_and_fragment() {
+        assert_eq!(base_ledger_id("mydb"), "mydb");
+        assert_eq!(base_ledger_id("mydb:main"), "mydb");
+        assert_eq!(base_ledger_id("mydb:feature-x"), "mydb");
+        assert_eq!(base_ledger_id("mydb:main@t:3"), "mydb");
+        assert_eq!(base_ledger_id("mydb:main#txn-meta"), "mydb");
+        assert_eq!(base_ledger_id("warehouse-orders:main"), "warehouse-orders");
+    }
+
+    #[test]
+    fn jsonld_from_targets_handles_string_and_array() {
+        let s: serde_json::Value =
+            serde_json::from_str(r#"{"from":"mydb","select":["*"]}"#).unwrap();
+        assert_eq!(jsonld_from_targets(&s), vec!["mydb".to_string()]);
+
+        let a: serde_json::Value =
+            serde_json::from_str(r#"{"from":["a:main","b:main"],"select":["*"]}"#).unwrap();
+        assert_eq!(
+            jsonld_from_targets(&a),
+            vec!["a:main".to_string(), "b:main".to_string()]
+        );
+
+        let none: serde_json::Value = serde_json::from_str(r#"{"select":["*"]}"#).unwrap();
+        assert!(jsonld_from_targets(&none).is_empty());
+    }
+
+    #[test]
+    fn foreign_source_detection_sparql() {
+        // No FROM → same-endpoint single target.
+        assert!(!query_targets_foreign_source(
+            QueryFormat::Sparql,
+            "SELECT ?s WHERE { ?s ?p ?o }",
+            "mydb:main",
+        )
+        .unwrap());
+
+        // FROM the same ledger (any branch spelling) → not foreign.
+        assert!(!query_targets_foreign_source(
+            QueryFormat::Sparql,
+            "SELECT ?s FROM <mydb:main> WHERE { ?s ?p ?o }",
+            "mydb",
+        )
+        .unwrap());
+
+        // FROM a different source → foreign → connection path.
+        assert!(query_targets_foreign_source(
+            QueryFormat::Sparql,
+            "SELECT ?s FROM <warehouse-orders:main> WHERE { ?s ?p ?o }",
+            "mydb:main",
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn foreign_source_detection_jsonld() {
+        // `from` equal to the endpoint → not foreign.
+        assert!(!query_targets_foreign_source(
+            QueryFormat::JsonLd,
+            r#"{"from":"mydb:main","select":["*"],"where":{"@id":"?s"}}"#,
+            "mydb",
+        )
+        .unwrap());
+
+        // `from` a different source → foreign.
+        assert!(query_targets_foreign_source(
+            QueryFormat::JsonLd,
+            r#"{"from":"warehouse-orders:main","select":["*"],"where":{"@id":"?s"}}"#,
+            "mydb",
+        )
+        .unwrap());
+
+        // No `from` → not foreign.
+        assert!(!query_targets_foreign_source(
+            QueryFormat::JsonLd,
+            r#"{"select":["*"],"where":{"@id":"?s"}}"#,
+            "mydb",
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn graph_source_guardrails_reject_unsupported_flags() {
+        assert!(
+            reject_graph_source_unsupported(Some("3"), false, OutputFormatKind::Table).is_err()
+        );
+        assert!(reject_graph_source_unsupported(None, true, OutputFormatKind::Table).is_err());
+        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Ndjson).is_err());
+        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Csv).is_err());
+        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Tsv).is_err());
+        // Supported combinations pass.
+        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Json).is_ok());
+        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Table).is_ok());
+        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::TypedJson).is_ok());
+    }
+
+    #[test]
+    fn json_display_format_falls_back_for_jsonld() {
+        // SPARQL keeps its requested format.
+        assert_eq!(
+            json_path_display_format(QueryFormat::Sparql, OutputFormatKind::Table),
+            OutputFormatKind::Table
+        );
+        // JSON-LD has no table renderer → JSON.
+        assert_eq!(
+            json_path_display_format(QueryFormat::JsonLd, OutputFormatKind::Table),
+            OutputFormatKind::Json
+        );
+        // typed-json is preserved on both.
+        assert_eq!(
+            json_path_display_format(QueryFormat::JsonLd, OutputFormatKind::TypedJson),
+            OutputFormatKind::TypedJson
+        );
     }
 }
