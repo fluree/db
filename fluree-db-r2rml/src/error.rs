@@ -29,6 +29,10 @@ pub enum R2rmlError {
     #[error("Unknown TriplesMap: {0}")]
     UnknownTriplesMap(String),
 
+    /// Two or more rr:TriplesMap definitions resolve to the same subject IRI
+    #[error("Duplicate TriplesMap IRI: {0}")]
+    DuplicateTriplesMap(String),
+
     /// Column not found in table
     #[error("Column not found: {column} in table {table}")]
     ColumnNotFound { column: String, table: String },

@@ -230,6 +230,12 @@ pub struct R2rmlCreateResult {
     /// Number of TriplesMap definitions in the mapping
     pub triples_map_count: usize,
 
+    /// Number of distinct logical tables referenced by the mapping
+    pub table_count: usize,
+
+    /// Names of the distinct logical tables referenced by the mapping (sorted)
+    pub table_names: Vec<String>,
+
     /// Whether the catalog connection was tested successfully
     pub connection_tested: bool,
 
