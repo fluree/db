@@ -189,6 +189,284 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
     .await
 }
 
+/// Request body for `POST /v1/fluree/iceberg/materialize`
+#[derive(Deserialize)]
+pub struct IcebergMaterializeRequest {
+    /// Source graph source id (the R2RML/Iceberg source to read).
+    pub source: String,
+    /// Target native ledger to materialize into (created if absent).
+    pub target: String,
+    /// Force a full re-read, ignoring the watermark persisted in the target
+    /// ledger. Default `false`: resolve the watermark and refresh incrementally
+    /// (full only on the first run or a non-incremental-safe window).
+    #[serde(default)]
+    pub force_full: bool,
+}
+
+/// Response for `POST /v1/fluree/iceberg/materialize`
+#[derive(Serialize)]
+pub struct IcebergMaterializeResponse {
+    pub source: String,
+    pub target: String,
+    /// The watermark this pass started from (previously-materialized snapshot).
+    pub from_snapshot_id: Option<i64>,
+    /// The source snapshot now materialized (the persisted watermark).
+    pub to_snapshot_id: Option<i64>,
+    /// Whether an incremental (added-files-only) scan was used.
+    pub incremental: bool,
+    /// Whether anything was committed (false on a no-delta poll).
+    pub committed: bool,
+    pub rows_read: usize,
+    pub subjects_upserted: usize,
+}
+
+/// Materialize an R2RML / Iceberg graph source into a native ledger.
+///
+/// POST /v1/fluree/iceberg/materialize
+pub async fn iceberg_materialize(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+
+    iceberg_materialize_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_materialize_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+
+    let body_bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergMaterializeRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+
+    let span = create_request_span(
+        "iceberg:materialize",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.source),
+        None,
+        None,
+    );
+    async move {
+        tracing::info!(
+            status = "start",
+            source = %req.source,
+            target = %req.target,
+            force_full = req.force_full,
+            "iceberg materialize requested"
+        );
+
+        let result = state
+            .fluree
+            .materialize_r2rml_graph_source(&req.source, &req.target, req.force_full)
+            .await
+            .map_err(ServerError::Api)?;
+
+        let response = IcebergMaterializeResponse {
+            source: req.source.clone(),
+            target: req.target.clone(),
+            from_snapshot_id: result.from_snapshot_id,
+            to_snapshot_id: result.to_snapshot_id,
+            incremental: result.incremental,
+            committed: result.committed,
+            rows_read: result.rows_read,
+            subjects_upserted: result.subjects_upserted,
+        };
+
+        tracing::info!(
+            status = "success",
+            source = %response.source,
+            target = %response.target,
+            to_snapshot_id = ?response.to_snapshot_id,
+            incremental = response.incremental,
+            committed = response.committed,
+            rows_read = response.rows_read,
+            subjects_upserted = response.subjects_upserted,
+            "iceberg materialize complete"
+        );
+        Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Request body for `POST /v1/fluree/iceberg/track` and `/untrack`.
+#[derive(Deserialize)]
+pub struct IcebergTrackRequest {
+    /// Source graph source id to track.
+    pub source: String,
+    /// Target native ledger to keep materialized.
+    pub target: String,
+    /// How often the worker re-syncs this job, in seconds. Omit to use the
+    /// worker's default (30s). Ignored by `/untrack`. Must be > 0.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// Response for `POST /v1/fluree/iceberg/track`.
+#[derive(Serialize)]
+pub struct IcebergTrackResponse {
+    pub source: String,
+    pub target: String,
+    /// Whether the worker is now tracking this pair.
+    pub tracked: bool,
+    /// The effective poll interval for this job, in seconds.
+    pub poll_interval_secs: u64,
+    /// Number of jobs the worker is tracking.
+    pub tracked_jobs: usize,
+    /// Result of the immediate first materialize run on registration.
+    pub initial: IcebergMaterializeResponse,
+}
+
+/// Register a `source → target` materialization tracking job and run an
+/// immediate first sync. The worker then keeps the target fresh on its poll
+/// interval (incremental when safe).
+///
+/// POST /v1/fluree/iceberg/track
+pub async fn iceberg_track(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    iceberg_track_local(state, request).await.into_response()
+}
+
+async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<impl IntoResponse> {
+    let _headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergTrackRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    if req.poll_interval_secs == Some(0) {
+        return Err(ServerError::bad_request(
+            "poll_interval_secs must be greater than 0",
+        ));
+    }
+
+    let worker = state.materialize_worker.as_ref().ok_or_else(|| {
+        ServerError::bad_request("materialization tracking worker is not running on this node")
+    })?;
+
+    let interval = worker.track(
+        &req.source,
+        &req.target,
+        req.poll_interval_secs.map(std::time::Duration::from_secs),
+    );
+
+    // Immediate first sync so the target is populated without waiting a cycle.
+    let result = state
+        .fluree
+        .materialize_r2rml_graph_source(&req.source, &req.target, false)
+        .await
+        .map_err(ServerError::Api)?;
+
+    let response = IcebergTrackResponse {
+        source: req.source.clone(),
+        target: req.target.clone(),
+        tracked: true,
+        poll_interval_secs: interval.as_secs(),
+        tracked_jobs: worker.tracked_jobs().len(),
+        initial: IcebergMaterializeResponse {
+            source: req.source,
+            target: req.target,
+            from_snapshot_id: result.from_snapshot_id,
+            to_snapshot_id: result.to_snapshot_id,
+            incremental: result.incremental,
+            committed: result.committed,
+            rows_read: result.rows_read,
+            subjects_upserted: result.subjects_upserted,
+        },
+    };
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Stop tracking a `source → target` pair (leaves already-materialized data).
+///
+/// POST /v1/fluree/iceberg/untrack
+pub async fn iceberg_untrack(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    if state.config.server_role == ServerRole::Peer {
+        return forward_write_request(&state, request).await;
+    }
+    iceberg_untrack_local(state, request).await.into_response()
+}
+
+async fn iceberg_untrack_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let _headers = FlureeHeaders::from_headers(request.headers())?;
+    let body_bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| ServerError::bad_request(format!("Failed to read body: {e}")))?;
+    let req: IcebergTrackRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ServerError::bad_request(format!("Invalid JSON: {e}")))?;
+
+    let worker = state.materialize_worker.as_ref().ok_or_else(|| {
+        ServerError::bad_request("materialization tracking worker is not running on this node")
+    })?;
+    let removed = worker.untrack(&req.source, &req.target);
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "source": req.source,
+            "target": req.target,
+            "removed": removed,
+            "tracked_jobs": worker.tracked_jobs().len(),
+        })),
+    ))
+}
+
+/// Tracking-worker status: tracked jobs + cumulative stats.
+///
+/// GET /v1/fluree/iceberg/tracking
+pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Response {
+    let Some(worker) = state.materialize_worker.as_ref() else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "running": false, "jobs": [] })),
+        )
+            .into_response();
+    };
+    let jobs: Vec<_> = worker
+        .job_infos()
+        .into_iter()
+        .map(|j| {
+            serde_json::json!({
+                "source": j.source,
+                "target": j.target,
+                "poll_interval_secs": j.poll_interval_secs,
+            })
+        })
+        .collect();
+    let stats = worker.stats();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "running": true,
+            "jobs": jobs,
+            "stats": {
+                "polls": stats.polls,
+                "syncs_committed": stats.syncs_committed,
+                "syncs_noop": stats.syncs_noop,
+                "syncs_failed": stats.syncs_failed,
+                "tracked_jobs": stats.tracked_jobs,
+            }
+        })),
+    )
+        .into_response()
+}
+
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
     let mode = req.mode.to_lowercase();
     let mut config = match mode.as_str() {

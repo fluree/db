@@ -166,6 +166,34 @@ impl TableMetadata {
         let window = self.snapshot_window(from_id, to_id)?;
         Ok(window.iter().all(|s| s.operation() == Some("append")))
     }
+
+    /// Whether every snapshot in `(from_id, to_id]` is incremental-safe for an
+    /// **added-files-only** scan — i.e. each is an `append` (new data files
+    /// only) or a `replace` (compaction: files rewritten without any logical
+    /// change). A `replace` is safe because Iceberg preserves each row's
+    /// `data_sequence_number` through compaction, so the sequence-number window
+    /// `(from.seq, to.seq]` still excludes the rewritten old rows — compaction
+    /// never surfaces as a spurious "added" row. `overwrite`/`delete`
+    /// operations carry row-level updates and deletions an added-files scan
+    /// cannot see, so they are NOT incremental-safe (the caller must
+    /// full-refresh). A snapshot with no recorded operation is treated as
+    /// unsafe (fail safe). Propagates `snapshot_window` errors
+    /// (unknown/expired/non-ancestor).
+    ///
+    /// This is the check the materialization path uses: it keeps routine
+    /// appends *and* periodic compaction on the cheap incremental path, while
+    /// still falling back to a full re-read whenever genuine updates/deletes
+    /// (overwrite/delete) appear in the window.
+    pub fn window_is_incremental_safe(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+    ) -> crate::error::Result<bool> {
+        let window = self.snapshot_window(from_id, to_id)?;
+        Ok(window
+            .iter()
+            .all(|s| matches!(s.operation(), Some("append" | "replace"))))
+    }
 }
 
 /// Schema definition.
@@ -491,5 +519,47 @@ mod tests {
             snap(2, Some(1), 2, None),
         ]);
         assert!(!no_op.window_is_append_only(Some(1), 2).unwrap());
+    }
+
+    #[test]
+    fn window_is_incremental_safe_allows_compaction_but_not_overwrite() {
+        // append + compaction (replace) is incremental-safe: compaction
+        // preserves data_sequence_number, so the seq-number window still
+        // excludes the rewritten old rows.
+        let append_then_compact = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("append")),
+            snap(3, Some(2), 3, Some("replace")),
+        ]);
+        assert!(append_then_compact
+            .window_is_incremental_safe(Some(1), 3)
+            .unwrap());
+        // ...but a pure replace window must NOT be treated as append-only.
+        assert!(!append_then_compact
+            .window_is_append_only(Some(1), 3)
+            .unwrap());
+
+        // overwrite carries row-level updates/deletes -> not incremental-safe.
+        let with_overwrite = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("overwrite")),
+        ]);
+        assert!(!with_overwrite
+            .window_is_incremental_safe(Some(1), 2)
+            .unwrap());
+
+        // delete carries row removals -> not incremental-safe.
+        let with_delete = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, Some("delete")),
+        ]);
+        assert!(!with_delete.window_is_incremental_safe(Some(1), 2).unwrap());
+
+        // unrecorded operation -> fail safe.
+        let no_op = meta_with(vec![
+            snap(1, None, 1, Some("append")),
+            snap(2, Some(1), 2, None),
+        ]);
+        assert!(!no_op.window_is_incremental_safe(Some(1), 2).unwrap());
     }
 }

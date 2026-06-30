@@ -71,6 +71,8 @@ mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
 pub mod materialize;
+#[cfg(feature = "iceberg")]
+pub mod materialize_worker;
 mod merge;
 mod merge_preview;
 pub mod nameservice_query;
@@ -202,13 +204,7 @@ pub use view::{
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
     browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
-    sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse,
-    CatalogMode, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions,
-    GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig,
-    IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult,
-    R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    StorageAccessReport, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride,
-    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse, CatalogMode, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult, MaterializeResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
@@ -228,6 +224,12 @@ pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
 
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
+};
+
+#[cfg(feature = "iceberg")]
+pub use materialize_worker::{
+    MaterializeTrackingWorker, MaterializeWorkerConfig, MaterializeWorkerHandle,
+    MaterializeWorkerStats,
 };
 
 #[cfg(feature = "vector")]

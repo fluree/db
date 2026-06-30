@@ -138,6 +138,9 @@ mod iceberg_validate;
 #[cfg(feature = "iceberg")]
 mod ephemeral;
 
+#[cfg(feature = "iceberg")]
+mod r2rml_materialize;
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 
@@ -213,5 +216,8 @@ pub use provider::FlureeIndexProvider;
 
 #[cfg(feature = "iceberg")]
 pub use r2rml::FlureeR2rmlProvider;
+
+#[cfg(feature = "iceberg")]
+pub use r2rml_materialize::MaterializeResult;
 
 // Helper functions are used internally by bm25.rs via direct module path

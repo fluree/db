@@ -948,6 +948,99 @@ impl<'a> FlureeR2rmlProvider<'a> {
 
         self.read_scan_tasks(&storage, plan.added_tasks).await
     }
+
+    /// Resolve the source table's current snapshot and read the rows to
+    /// materialize, choosing incremental vs full automatically.
+    ///
+    /// Returns `(to_snapshot_id, incremental, batches)`:
+    /// - `to_snapshot_id` — the source's current snapshot id (the new
+    ///   watermark to persist), or `None` if the table has no snapshots yet
+    ///   (nothing to materialize).
+    /// - `incremental` — whether an added-files-only scan was used (vs a full
+    ///   read of the live table state).
+    ///
+    /// An incremental scan is used when `from_snapshot_id` is set **and** the
+    /// window `(from, to]` is incremental-safe — only `append`/`replace`
+    /// (compaction) operations, see
+    /// [`TableMetadata::window_is_incremental_safe`]. Otherwise a full scan of
+    /// `to` is performed: initial materialization (`from = None`), expired or
+    /// branched history, or a genuine `overwrite`/`delete` in the window (which
+    /// an added-files scan would miss). This keeps routine appends and periodic
+    /// compaction on the cheap incremental path while staying correct across
+    /// updates/deletes.
+    pub async fn scan_for_materialize(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        from_snapshot_id: Option<i64>,
+    ) -> QueryResult<(Option<i64>, bool, Vec<ColumnBatch>)> {
+        let (storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+
+        let Some(to_snapshot_id) = metadata.current_snapshot().map(|s| s.snapshot_id) else {
+            // Table has no snapshots: nothing to materialize.
+            return Ok((None, false, Vec::new()));
+        };
+
+        let schema = metadata
+            .current_schema()
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids: Vec<i32> = if projection.is_empty() {
+            schema
+                .fields
+                .iter()
+                .filter(|f| !f.is_nested())
+                .map(|f| f.id)
+                .collect()
+        } else {
+            projection
+                .iter()
+                .filter_map(|col| schema.field_by_name(col).map(|f| f.id))
+                .collect()
+        };
+
+        let incremental = from_snapshot_id.is_some()
+            && metadata
+                .window_is_incremental_safe(from_snapshot_id, to_snapshot_id)
+                .unwrap_or(false);
+
+        let scan_config = ScanConfig::new().with_projection(projected_field_ids);
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+
+        let tasks = if incremental {
+            let plan = planner
+                .plan_incremental(from_snapshot_id, to_snapshot_id)
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to plan incremental scan: {e}"))
+                })?;
+            info!(
+                from_snapshot_id = ?from_snapshot_id,
+                to_snapshot_id,
+                files = plan.files_selected,
+                estimated_rows = plan.estimated_row_count,
+                "materialize: incremental (added-files) scan plan"
+            );
+            plan.added_tasks
+        } else {
+            let plan = planner
+                .plan_scan()
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to plan full scan: {e}")))?;
+            info!(
+                to_snapshot_id,
+                files = plan.files_selected,
+                estimated_rows = plan.estimated_row_count,
+                "materialize: full scan plan"
+            );
+            plan.tasks
+        };
+
+        let batches = self.read_scan_tasks(&storage, tasks).await?;
+        Ok((Some(to_snapshot_id), incremental, batches))
+    }
 }
 
 impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
