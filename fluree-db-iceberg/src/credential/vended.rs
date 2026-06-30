@@ -33,7 +33,8 @@ impl VendedCredentials {
     /// - `s3.secret-access-key`
     /// - `s3.session-token`
     /// - `s3.endpoint`
-    /// - `s3.region`
+    /// - `client.region` (Iceberg-REST spec key, e.g. sent by Snowflake Horizon),
+    ///   with `s3.region` accepted as a defensive fallback
     /// - `s3.path-style-access`
     /// - `expiration-time` or `s3.session-token-expires-at-ms`
     pub fn from_config_map(config: &HashMap<String, serde_json::Value>) -> Result<Option<Self>> {
@@ -63,8 +64,11 @@ impl VendedCredentials {
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string);
 
+        // The Iceberg-REST spec carries the region as `client.region` (this is what
+        // Snowflake Horizon / Polaris send). Prefer it, falling back to `s3.region`.
         let region = config
-            .get("s3.region")
+            .get("client.region")
+            .or_else(|| config.get("s3.region"))
             .and_then(|v| v.as_str())
             .map(std::string::ToString::to_string);
 
@@ -276,6 +280,68 @@ mod tests {
         let config = HashMap::new();
         let creds = VendedCredentials::from_config_map(&config).unwrap();
         assert!(creds.is_none());
+    }
+
+    #[test]
+    fn test_parse_client_region_preferred() {
+        // The Iceberg-REST spec key `client.region` (what Snowflake Horizon sends)
+        // must be honored even when no `s3.region` is present.
+        let mut config = HashMap::new();
+        config.insert(
+            "s3.access-key-id".to_string(),
+            serde_json::json!("AKIATEST"),
+        );
+        config.insert(
+            "s3.secret-access-key".to_string(),
+            serde_json::json!("secret123"),
+        );
+        config.insert("client.region".to_string(), serde_json::json!("us-east-2"));
+
+        let creds = VendedCredentials::from_config_map(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.region, Some("us-east-2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_client_region_beats_s3_region() {
+        // When both are present, `client.region` wins.
+        let mut config = HashMap::new();
+        config.insert(
+            "s3.access-key-id".to_string(),
+            serde_json::json!("AKIATEST"),
+        );
+        config.insert(
+            "s3.secret-access-key".to_string(),
+            serde_json::json!("secret123"),
+        );
+        config.insert("client.region".to_string(), serde_json::json!("us-east-2"));
+        config.insert("s3.region".to_string(), serde_json::json!("us-east-1"));
+
+        let creds = VendedCredentials::from_config_map(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.region, Some("us-east-2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_s3_region_fallback() {
+        // With only the legacy `s3.region` key present, it is still parsed.
+        let mut config = HashMap::new();
+        config.insert(
+            "s3.access-key-id".to_string(),
+            serde_json::json!("AKIATEST"),
+        );
+        config.insert(
+            "s3.secret-access-key".to_string(),
+            serde_json::json!("secret123"),
+        );
+        config.insert("s3.region".to_string(), serde_json::json!("us-east-1"));
+
+        let creds = VendedCredentials::from_config_map(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(creds.region, Some("us-east-1".to_string()));
     }
 
     #[test]
