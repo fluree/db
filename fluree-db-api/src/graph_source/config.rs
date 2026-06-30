@@ -520,6 +520,63 @@ impl IcebergCreateConfig {
         self
     }
 
+    /// Set the OAuth2 `scope` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Mutates the existing OAuth2 auth config in place, so call this AFTER
+    /// [`Self::with_auth_oauth2`]. It has no effect (and warns) if OAuth2
+    /// client-credentials auth has not been configured. Required for
+    /// scope-gated REST catalogs such as Snowflake Horizon / Apache Polaris,
+    /// where the catalog session role is selected via
+    /// `scope=session:role:<ROLE>`.
+    pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
+        match &mut self.catalog_mode {
+            CatalogMode::Rest(rest) => {
+                if let fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    scope: slot,
+                    ..
+                } = &mut rest.auth
+                {
+                    *slot = Some(scope.into());
+                } else {
+                    tracing::warn!(
+                        "with_oauth2_scope has no effect unless OAuth2 client-credentials auth is set first (call with_auth_oauth2)"
+                    );
+                }
+            }
+            CatalogMode::Direct { .. } => {
+                tracing::warn!("with_oauth2_scope has no effect in Direct catalog mode");
+            }
+        }
+        self
+    }
+
+    /// Set the OAuth2 `audience` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Mutates the existing OAuth2 auth config in place, so call this AFTER
+    /// [`Self::with_auth_oauth2`]. It has no effect (and warns) if OAuth2
+    /// client-credentials auth has not been configured.
+    pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
+        match &mut self.catalog_mode {
+            CatalogMode::Rest(rest) => {
+                if let fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    audience: slot,
+                    ..
+                } = &mut rest.auth
+                {
+                    *slot = Some(audience.into());
+                } else {
+                    tracing::warn!(
+                        "with_oauth2_audience has no effect unless OAuth2 client-credentials auth is set first (call with_auth_oauth2)"
+                    );
+                }
+            }
+            CatalogMode::Direct { .. } => {
+                tracing::warn!("with_oauth2_audience has no effect in Direct catalog mode");
+            }
+        }
+        self
+    }
+
     /// Set the warehouse identifier (REST mode only).
     pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> Self {
         if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
@@ -790,6 +847,24 @@ impl R2rmlCreateConfig {
         self
     }
 
+    /// Set the OAuth2 `scope` (delegates to the underlying Iceberg config).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergCreateConfig::with_oauth2_scope`].
+    pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_oauth2_scope(scope);
+        self
+    }
+
+    /// Set the OAuth2 `audience` (delegates to the underlying Iceberg config).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergCreateConfig::with_oauth2_audience`].
+    pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_oauth2_audience(audience);
+        self
+    }
+
     /// Set the warehouse identifier.
     pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> Self {
         self.iceberg = self.iceberg.with_warehouse(warehouse);
@@ -981,5 +1056,108 @@ mod tests {
         // selectOne is also valid
         let config = Bm25CreateConfig::new("search", "docs:main", json!({"selectOne": ["?x"]}));
         assert!(config.validate().is_ok());
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn oauth2_auth(config: &IcebergCreateConfig) -> &fluree_db_iceberg::auth::AuthConfig {
+        match &config.catalog_mode {
+            CatalogMode::Rest(rest) => &rest.auth,
+            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_iceberg_with_oauth2_scope_and_audience() {
+        let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_oauth2("https://catalog.example.com/v1/oauth/tokens", "", "secret")
+            .with_oauth2_scope("session:role:ICEBERG_READER")
+            .with_oauth2_audience("polaris");
+
+        match oauth2_auth(&config) {
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                scope,
+                audience,
+                ..
+            } => {
+                assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
+                assert_eq!(audience.as_deref(), Some("polaris"));
+            }
+            other => panic!("expected OAuth2 auth, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_oauth2_scope_setter_warns_without_oauth2() {
+        // Bearer auth set, scope setter should be a no-op (and not panic).
+        let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_bearer("tok")
+            .with_oauth2_scope("session:role:READER");
+        assert!(matches!(
+            oauth2_auth(&config),
+            fluree_db_iceberg::auth::AuthConfig::Bearer { .. }
+        ));
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_iceberg_oauth2_scope_roundtrip_no_migration() {
+        // Locks the "no migration" claim: scope/audience survive the
+        // to_iceberg_gs_config -> serialize -> deserialize round-trip that the
+        // persistence layer performs.
+        let config = IcebergCreateConfig::new("gs", "https://catalog.example.com", "ns.tbl")
+            .with_auth_oauth2(
+                "https://catalog.example.com/v1/oauth/tokens",
+                "client",
+                "secret",
+            )
+            .with_oauth2_scope("session:role:ICEBERG_READER")
+            .with_oauth2_audience("polaris");
+
+        let gs = config.to_iceberg_gs_config();
+        let serialized = serde_json::to_string(&gs).unwrap();
+        let back: IcebergGsConfig = serde_json::from_str(&serialized).unwrap();
+
+        match back.catalog {
+            fluree_db_iceberg::config::CatalogConfig::Rest { auth, .. } => match auth {
+                fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                    scope,
+                    audience,
+                    ..
+                } => {
+                    assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
+                    assert_eq!(audience.as_deref(), Some("polaris"));
+                }
+                other => panic!("expected OAuth2 auth after round-trip, got {other:?}"),
+            },
+            other => panic!("expected REST catalog after round-trip, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_r2rml_with_oauth2_scope_delegates() {
+        let config = R2rmlCreateConfig::new(
+            "gs",
+            "https://catalog.example.com",
+            "ns.tbl",
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
+        )
+        .with_auth_oauth2("https://catalog.example.com/v1/oauth/tokens", "", "secret")
+        .with_oauth2_scope("session:role:ICEBERG_READER")
+        .with_oauth2_audience("polaris");
+
+        match oauth2_auth(&config.iceberg) {
+            fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+                scope,
+                audience,
+                ..
+            } => {
+                assert_eq!(scope.as_deref(), Some("session:role:ICEBERG_READER"));
+                assert_eq!(audience.as_deref(), Some("polaris"));
+            }
+            other => panic!("expected OAuth2 auth, got {other:?}"),
+        }
     }
 }

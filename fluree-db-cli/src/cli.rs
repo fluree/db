@@ -2167,6 +2167,14 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub oauth2_client_secret: Option<String>,
 
+    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon / Polaris)
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+
     /// Warehouse identifier (REST mode)
     #[arg(long)]
     pub warehouse: Option<String>,

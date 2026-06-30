@@ -81,9 +81,16 @@ impl OAuth2ClientCredentials {
     async fn fetch_token(&self) -> Result<CachedToken> {
         let mut form = vec![
             ("grant_type", "client_credentials".to_string()),
-            ("client_id", self.config.client_id.clone()),
             ("client_secret", self.config.client_secret.clone()),
         ];
+
+        // Only send `client_id` when non-empty. Some catalogs (notably Snowflake
+        // Horizon / Polaris for the `session:role:` token exchange) reject the
+        // request with `invalid_scope` if a non-empty `client_id` is present, and
+        // require it to be omitted entirely.
+        if !self.config.client_id.is_empty() {
+            form.push(("client_id", self.config.client_id.clone()));
+        }
 
         if let Some(scope) = &self.config.scope {
             form.push(("scope", scope.clone()));
@@ -247,5 +254,145 @@ mod tests {
             expires_at: Utc::now() + Duration::hours(1),
         };
         assert_eq!(custom_token.authorization_header(), "MAC my-access-token");
+    }
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Parse a `application/x-www-form-urlencoded` body into key/value pairs,
+    /// percent-decoding each component so value assertions are encoding-agnostic.
+    fn parse_form(body: &[u8]) -> Vec<(String, String)> {
+        let s = std::str::from_utf8(body).unwrap();
+        s.split('&')
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| {
+                let mut it = kv.splitn(2, '=');
+                let k = decode(it.next().unwrap_or(""));
+                let v = decode(it.next().unwrap_or(""));
+                (k, v)
+            })
+            .collect()
+    }
+
+    /// Minimal `application/x-www-form-urlencoded` component decoder (`+` -> space,
+    /// `%XX` -> byte). Sufficient for the ASCII scope/audience values under test.
+    fn decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => {
+                    out.push(b' ');
+                    i += 1;
+                }
+                b'%' if i + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap();
+                    out.push(u8::from_str_radix(hex, 16).unwrap());
+                    i += 3;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    async fn mock_token_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/tokens"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"access_token":"abc123","token_type":"Bearer","expires_in":3600}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn fetch_token_encodes_scope_and_omits_empty_client_id() {
+        let server = mock_token_server().await;
+        let config = OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: String::new(), // empty -> must be omitted
+            client_secret: "pat-secret".to_string(),
+            scope: Some("session:role:ICEBERG_READER".to_string()),
+            audience: None,
+        };
+        let auth = OAuth2ClientCredentials::new(config).unwrap();
+        let token = auth.fetch_token().await.unwrap();
+        assert_eq!(token.access_token, "abc123");
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let form = parse_form(&reqs[0].body);
+
+        // (a) scope IS form-encoded in the token request
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "scope")
+                .map(|(_, v)| v.as_str()),
+            Some("session:role:ICEBERG_READER")
+        );
+        // (b) client_id is OMITTED when empty
+        assert!(
+            !form.iter().any(|(k, _)| k == "client_id"),
+            "client_id must be omitted when empty, got: {form:?}"
+        );
+        // client_secret + grant_type always present
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "client_secret")
+                .map(|(_, v)| v.as_str()),
+            Some("pat-secret")
+        );
+        // (c) audience absent when None
+        assert!(!form.iter().any(|(k, _)| k == "audience"));
+    }
+
+    #[tokio::test]
+    async fn fetch_token_includes_client_id_when_non_empty_and_audience() {
+        let server = mock_token_server().await;
+        let config = OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: "my-client".to_string(),
+            client_secret: "the-secret".to_string(),
+            scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+            audience: Some("polaris".to_string()),
+        };
+        let auth = OAuth2ClientCredentials::new(config).unwrap();
+        auth.fetch_token().await.unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        let form = parse_form(&reqs[0].body);
+
+        // (b) client_id is PRESENT when non-empty
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "client_id")
+                .map(|(_, v)| v.as_str()),
+            Some("my-client")
+        );
+        // (c) audience sent when Some
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "audience")
+                .map(|(_, v)| v.as_str()),
+            Some("polaris")
+        );
+        assert_eq!(
+            form.iter()
+                .find(|(k, _)| k == "scope")
+                .map(|(_, v)| v.as_str()),
+            Some("PRINCIPAL_ROLE:ALL")
+        );
     }
 }
