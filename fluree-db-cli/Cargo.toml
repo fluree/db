@@ -49,6 +49,9 @@ fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-vocab = { path = "../fluree-vocab" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+# Shared R2RML media-type resolver (MappingFormat) so the CLI infers the same
+# ext→format table the server uses, instead of a divergent local copy (#1397).
+fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 
 # Developer memory layer (store + CLI subcommands)
 fluree-db-memory = { path = "../fluree-db-memory" }

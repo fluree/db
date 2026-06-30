@@ -1613,6 +1613,74 @@ async fn integration_create_r2rml_graph_source_with_mapping() {
     );
 }
 
+/// Regression test for issue #1397: a Turtle mapping registered WITHOUT an
+/// explicit media type must still compile at query time.
+///
+/// Before the shared `MappingFormat` resolver, registration defaulted a missing
+/// media type to Turtle (so creation succeeded) but the query path defaulted it
+/// to JSON-LD and failed with "...uses JSON-LD format, which is not yet
+/// supported". The stored `mapping_source` is a content-addressed CID with no
+/// extension, so the query-time extension sniff could never recover Turtle.
+///
+/// This test deliberately omits `.with_mapping_media_type(...)` — mirroring
+/// `fluree iceberg map` of a `.ttl` file without `--r2rml-type` — and asserts
+/// both that the resolved media type is persisted (not `null`) and that the
+/// real `FlureeR2rmlProvider::compiled_mapping` now returns `Ok`.
+#[tokio::test]
+async fn integration_r2rml_turtle_without_media_type_compiles_at_query_time() {
+    use fluree_db_api::{FlureeR2rmlProvider, R2rmlCreateConfig};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // NOTE: no `.with_mapping_media_type(...)` — this is the reported flow.
+    let config = R2rmlCreateConfig::new(
+        "airlines-rdf",
+        "https://polaris.example.com",
+        "openflights.airlines",
+        AIRLINE_MAPPING_TTL,
+    );
+
+    let create_result = fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("registering a Turtle mapping without an explicit media type should succeed");
+    assert!(
+        create_result.mapping_validated,
+        "mapping should validate at registration"
+    );
+
+    // Persistence: the stored config must carry a concrete `text/turtle` media
+    // type (not `null`) so the query path reuses it instead of re-defaulting.
+    let record = fluree
+        .nameservice()
+        .lookup_graph_source("airlines-rdf:main")
+        .await
+        .expect("lookup should succeed")
+        .expect("graph source record should exist");
+    let config_json: serde_json::Value = serde_json::from_str(&record.config).unwrap();
+    assert_eq!(
+        config_json["mapping"]["media_type"], "text/turtle",
+        "resolved media type must be persisted (not null) so query-time reuses it"
+    );
+
+    // Regression: the real provider's `compiled_mapping` must now succeed. Before
+    // the fix this returned `Err(InvalidQuery(\"...uses JSON-LD format...\"))`.
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let compiled = provider
+        .compiled_mapping("airlines-rdf:main", Some(0))
+        .await;
+    assert!(
+        compiled.is_ok(),
+        "compiled_mapping must succeed for a Turtle mapping with no explicit media type (issue #1397); got: {:?}",
+        compiled.err()
+    );
+    assert_eq!(
+        compiled.unwrap().len(),
+        1,
+        "the airline mapping defines exactly one TriplesMap"
+    );
+}
+
 // =============================================================================
 // query_graph_source API Tests (GraphSourcePublisher impl)
 // =============================================================================

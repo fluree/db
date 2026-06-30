@@ -189,7 +189,11 @@ impl crate::Fluree {
             .mapping
         {
             R2rmlMappingInput::Content(content) => {
-                let compiled = Self::compile_r2rml_content(content, &config)?;
+                // Inline content has no filename to sniff; the shared resolver
+                // defaults a missing media type to Turtle (matching the eventual
+                // CID address, which is also extensionless).
+                let compiled =
+                    Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
                 let count = compiled.len();
                 let tables = Self::sorted_table_names(&compiled);
                 let gs_id = config.graph_source_id();
@@ -307,25 +311,28 @@ impl crate::Fluree {
     }
 
     /// Compile R2RML content and return the compiled mapping.
+    ///
+    /// `source` is the mapping's filename, storage address, or content-addressed
+    /// CID; it is only consulted to infer the format when no explicit
+    /// `media_type` is given. Format selection goes through the shared
+    /// [`fluree_db_r2rml::loader::MappingFormat`] resolver (default Turtle) so
+    /// registration and query time can never disagree (issue #1397).
     fn compile_r2rml_content(
         content: &str,
-        config: &R2rmlCreateConfig,
+        media_type: Option<&str>,
+        source: &str,
     ) -> Result<fluree_db_r2rml::mapping::CompiledR2rmlMapping> {
-        let is_turtle = config
-            .mapping_media_type
-            .as_ref()
-            .is_none_or(|mt| mt.contains("turtle"));
-        if is_turtle {
-            fluree_db_r2rml::loader::R2rmlLoader::from_turtle(content)
+        use fluree_db_r2rml::loader::MappingFormat;
+        match MappingFormat::resolve(media_type, source) {
+            MappingFormat::Turtle => fluree_db_r2rml::loader::R2rmlLoader::from_turtle(content)
                 .map_err(|e| crate::ApiError::Config(format!("Failed to parse R2RML Turtle: {e}")))?
                 .compile()
                 .map_err(|e| {
                     crate::ApiError::Config(format!("Failed to compile R2RML mapping: {e}"))
-                })
-        } else {
-            Err(crate::ApiError::Config(
+                }),
+            MappingFormat::JsonLd => Err(crate::ApiError::Config(
                 "R2RML mapping must be in Turtle format. JSON-LD is not yet supported.".into(),
-            ))
+            )),
         }
     }
 
@@ -351,7 +358,10 @@ impl crate::Fluree {
         let content = String::from_utf8(bytes).map_err(|e| {
             crate::ApiError::Config(format!("R2RML mapping is not valid UTF-8: {e}"))
         })?;
-        let compiled = Self::compile_r2rml_content(&content, config)?;
+        // `address` may carry an extension (e.g. `.ttl`/`.jsonld`); pass it so the
+        // resolver can infer the format when no explicit media type is set.
+        let compiled =
+            Self::compile_r2rml_content(&content, config.mapping_media_type.as_deref(), address)?;
         Ok((compiled.len(), Self::sorted_table_names(&compiled)))
     }
 
@@ -529,32 +539,32 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             ))
         })?;
 
-        // Parse and compile the mapping
-        let media_type = mapping_config.media_type.as_deref();
-
-        let is_turtle = media_type.map_or_else(
-            || mapping_source.ends_with(".ttl") || mapping_source.ends_with(".turtle"),
-            |mt| mt.contains("turtle"),
-        );
-
-        let compiled = if is_turtle {
-            fluree_db_r2rml::loader::R2rmlLoader::from_turtle(&mapping_content)
-                .map_err(|e| {
-                    QueryError::InvalidQuery(format!(
-                        "Failed to parse R2RML Turtle from '{mapping_source}': {e}"
-                    ))
-                })?
-                .compile()
-                .map_err(|e| {
-                    QueryError::InvalidQuery(format!(
-                        "Failed to compile R2RML mapping from '{mapping_source}': {e}"
-                    ))
-                })?
-        } else {
-            return Err(QueryError::InvalidQuery(format!(
-                "R2RML mapping for '{graph_source_id}' uses JSON-LD format, which is not yet supported. \
-                 Please use Turtle format (.ttl)."
-            )));
+        // Parse and compile the mapping. Format selection goes through the same
+        // shared resolver the registration path uses, so a mapping stored
+        // without an explicit media type (e.g. a CAS CID) defaults to Turtle
+        // here too instead of erroring as JSON-LD (issue #1397).
+        use fluree_db_r2rml::loader::MappingFormat;
+        let compiled = match MappingFormat::resolve(media_type, mapping_source) {
+            MappingFormat::Turtle => {
+                fluree_db_r2rml::loader::R2rmlLoader::from_turtle(&mapping_content)
+                    .map_err(|e| {
+                        QueryError::InvalidQuery(format!(
+                            "Failed to parse R2RML Turtle from '{mapping_source}': {e}"
+                        ))
+                    })?
+                    .compile()
+                    .map_err(|e| {
+                        QueryError::InvalidQuery(format!(
+                            "Failed to compile R2RML mapping from '{mapping_source}': {e}"
+                        ))
+                    })?
+            }
+            MappingFormat::JsonLd => {
+                return Err(QueryError::InvalidQuery(format!(
+                    "R2RML mapping for '{graph_source_id}' uses JSON-LD format, which is not yet supported. \
+                     Please use Turtle format (.ttl)."
+                )));
+            }
         };
 
         let compiled = Arc::new(compiled);

@@ -333,6 +333,26 @@ async fn run_iceberg_map_remote(
     Ok(())
 }
 
+/// Infer an R2RML mapping media type from a file extension.
+///
+/// Delegates to the shared [`fluree_db_r2rml::loader::MappingFormat`] resolver so
+/// the CLI and the server share one ext→format table and cannot drift (issue
+/// #1397): `.jsonld`/`.json` → `application/ld+json`, any other extension →
+/// `text/turtle` (the resolver's default), case-insensitively. Returns `None`
+/// only when the path has no extension at all, leaving the server to apply the
+/// same default. An explicit `--r2rml-type` still overrides this at the call site.
+fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
+    use fluree_db_r2rml::loader::MappingFormat;
+    // No extension means no signal to infer from — defer to the server default.
+    path.extension()?;
+    let source = path.to_str()?;
+    Some(
+        MappingFormat::resolve(None, source)
+            .media_type()
+            .to_string(),
+    )
+}
+
 /// Convert CLI args to a JSON body for the server endpoint.
 fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
@@ -357,8 +377,15 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
         })?;
         obj.insert("r2rml".into(), content.into());
     }
-    if let Some(ref v) = args.r2rml_type {
-        obj.insert("r2rml_type".into(), v.clone().into());
+    // Explicit `--r2rml-type` wins; otherwise infer from the mapping file
+    // extension so the server records a concrete, self-describing media type
+    // (issue #1397).
+    let r2rml_type = args
+        .r2rml_type
+        .clone()
+        .or_else(|| args.r2rml.as_deref().and_then(infer_mapping_media_type));
+    if let Some(v) = r2rml_type {
+        obj.insert("r2rml_type".into(), v.into());
     }
     if let Some(ref v) = args.branch {
         obj.insert("branch".into(), v.clone().into());
@@ -603,7 +630,12 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
         let config = fluree_db_api::R2rmlCreateConfig {
             iceberg: iceberg_config,
             mapping: fluree_db_api::R2rmlMappingInput::Content(mapping_content),
-            mapping_media_type: args.r2rml_type.clone(),
+            // Explicit `--r2rml-type` wins; otherwise infer from the file
+            // extension (issue #1397).
+            mapping_media_type: args
+                .r2rml_type
+                .clone()
+                .or_else(|| infer_mapping_media_type(r2rml_path)),
         };
 
         let result = fluree.create_r2rml_graph_source(config).await?;
@@ -854,5 +886,67 @@ mod tests {
         let gs = config.to_iceberg_gs_config();
         let v = serde_json::to_value(&gs).unwrap();
         assert_eq!(v["catalog"]["auth"]["type"], "none");
+    }
+
+    #[test]
+    fn infer_mapping_media_type_maps_known_extensions() {
+        use std::path::Path;
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.ttl")).as_deref(),
+            Some("text/turtle")
+        );
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.turtle")).as_deref(),
+            Some("text/turtle")
+        );
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.jsonld")).as_deref(),
+            Some("application/ld+json")
+        );
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.json")).as_deref(),
+            Some("application/ld+json")
+        );
+        // Extension matching is case-insensitive.
+        assert_eq!(
+            infer_mapping_media_type(Path::new("MAPPING.TTL")).as_deref(),
+            Some("text/turtle")
+        );
+        // An unrecognized extension defers to the shared resolver's default
+        // (Turtle) — the same decision the server makes, so the two never drift.
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.rdf")).as_deref(),
+            Some("text/turtle")
+        );
+        // No extension at all -> None, so the caller leaves the type unset and the
+        // server applies the same default.
+        assert_eq!(infer_mapping_media_type(Path::new("mapping")), None);
+    }
+
+    #[test]
+    fn args_to_json_infers_r2rml_type_from_ttl_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airlines.ttl");
+        std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
+
+        let mut args = base_rest_args();
+        args.r2rml = Some(path);
+        // No explicit --r2rml-type: inferred from the `.ttl` extension.
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["r2rml_type"], "text/turtle");
+    }
+
+    #[test]
+    fn args_to_json_explicit_r2rml_type_overrides_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airlines.ttl");
+        std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
+
+        let mut args = base_rest_args();
+        args.r2rml = Some(path);
+        // Explicit flag wins over the conflicting `.ttl` extension.
+        args.r2rml_type = Some("application/ld+json".to_string());
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["r2rml_type"], "application/ld+json");
     }
 }

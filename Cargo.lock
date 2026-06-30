@@ -2598,6 +2598,7 @@ dependencies = [
  "fluree-db-nameservice-sync",
  "fluree-db-novelty",
  "fluree-db-query",
+ "fluree-db-r2rml",
  "fluree-db-server",
  "fluree-vocab",
  "futures",
