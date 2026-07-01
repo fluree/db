@@ -993,6 +993,38 @@ Iceberg table: ~62s with the system allocator vs ~31s with mimalloc).
 Pair it with bounded query parallelism so a single large scan cannot monopolize
 cores and allocator pressure under concurrent load.
 
+## Iceberg / R2RML Graph-Source Tuning
+
+Queries against an Iceberg-backed R2RML graph source are tuned by a set of
+environment-only knobs. All are optional; the defaults are chosen for correct,
+reasonable behavior out of the box.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `FLUREE_ICEBERG_LOADTABLE_CACHE` | on | Master switch for all REST catalog caching. Set to `0`/`false`/`off` to build a fresh catalog client and reload the table on **every** scan (restores a per-scan OAuth exchange + `loadTable` round-trip). Disables the client/OAuth reuse, the cross-query `loadTable` cache, and the per-query snapshot pin. |
+| `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` | `60` | TTL (seconds) for the **cross-query** `loadTable`-response cache. A REST `loadTable` GET against a catalog such as Snowflake Horizon costs ~1.3–3 s, so caching it lets a burst of queries against the same table skip the round-trip. The TTL bounds how stale a snapshot a *new* query may observe; `0` disables the cross-query layer (leaving only the per-query pin). Every cache read is additionally gated on vended-credential expiry (30 s buffer), so a long TTL never hands out about-to-expire credentials. |
+| `FLUREE_R2RML_SCAN_CACHE` | on | Toggles the correlated-join inner-scan cache, which reuses a materialized inner (dimension) table across a join's child batches instead of re-scanning it per batch. Set to `0`/`false`/`off` to restore per-child-batch re-scans. |
+| `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` | `524288` | Target table rows materialized into RDF-term bindings per parallel window. Bounds resident memory during a scan (materialization explodes the compact columnar form into fat binding rows). Also caps the size of an inner scan eligible for the inner-scan cache above. |
+| `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |
+
+**Caching model.** Catalog access is cached at two scopes. Within a single query,
+the first scan of a table pins its `metadata_location`, so every scan in that
+query reads one consistent Iceberg snapshot even if the table commits mid-query.
+Across queries, a process-wide cache reuses the REST client (so its OAuth token —
+valid ~1 h — and HTTPS connection pool survive) and the `loadTable` response
+(bounded by `FLUREE_ICEBERG_LOADTABLE_TTL_SECS`). On a warm server this means the
+second and later queries against a table typically skip both the OAuth exchange
+and the `loadTable` GET entirely. The cross-query cache always records the
+catalog's current state, never a query's pinned snapshot, so pin preservation
+cannot leak a stale location to other queries. The client cache is keyed by a
+config fingerprint, so rotating the source's access token rebuilds the client.
+
+**Freshness vs. latency.** The only knob with a data-freshness tradeoff is
+`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`: a new query may read a snapshot up to that
+many seconds old. This is well within typical warehouse ETL latency; lower it (or
+set `0`) if you need each query to always resolve the newest snapshot, at the cost
+of paying the `loadTable` GET per query.
+
 ## Related Documentation
 
 - [Query Peers](query-peers.md) - Peer mode and replication
