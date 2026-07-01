@@ -269,7 +269,7 @@ impl crate::Fluree {
     async fn test_iceberg_connection(&self, config: &IcebergCreateConfig) -> Result<()> {
         use fluree_db_iceberg::catalog::parse_table_identifier;
 
-        let rest = match &config.catalog_mode {
+        let rest = match &config.connection.catalog_mode {
             CatalogMode::Rest(rest) => rest,
             CatalogMode::Direct { .. } => {
                 return Err(crate::ApiError::Config(
@@ -296,12 +296,12 @@ impl crate::Fluree {
         })?;
 
         // Parse table identifier
-        let table_id = parse_table_identifier(&rest.table_identifier)
+        let table_id = parse_table_identifier(&config.table_identifier)
             .map_err(|e| crate::ApiError::Config(format!("Invalid table identifier: {e}")))?;
 
         // Attempt to load table metadata (this tests the connection)
         catalog
-            .load_table(&table_id, rest.vended_credentials)
+            .load_table(&table_id, config.connection.io.vended_credentials)
             .await
             .map_err(|e| {
                 crate::ApiError::Config(format!("Failed to load table from catalog: {e}"))

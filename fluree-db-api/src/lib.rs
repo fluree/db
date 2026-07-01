@@ -189,8 +189,8 @@ pub use view::{
 
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    CatalogMode, FlureeR2rmlProvider, IcebergCreateConfig, IcebergCreateResult, R2rmlCreateConfig,
-    R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode,
+    CatalogMode, FlureeR2rmlProvider, IcebergConnectionConfig, IcebergCreateConfig,
+    IcebergCreateResult, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode,
 };
 
 pub use bm25_worker::{

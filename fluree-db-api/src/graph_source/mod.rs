@@ -121,7 +121,7 @@ pub use config::Bm25CreateConfig;
 pub use config::VectorCreateConfig;
 
 #[cfg(feature = "iceberg")]
-pub use config::{CatalogMode, IcebergCreateConfig, RestCatalogMode};
+pub use config::{CatalogMode, IcebergConnectionConfig, IcebergCreateConfig, RestCatalogMode};
 
 #[cfg(feature = "iceberg")]
 pub use config::{R2rmlCreateConfig, R2rmlMappingInput};
