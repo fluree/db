@@ -719,4 +719,101 @@ mod tests {
         let unmapped = HashMap::from([(2i32, 0usize)]);
         assert!(row_group_can_contain(&ge, meta.row_group(0), &unmapped));
     }
+
+    /// Two row groups with disjoint UTF-8 string ranges, for `ByteArray`-stats
+    /// pruning: rg0 = [apple, cherry], rg1 = [mango, peach].
+    fn two_row_group_string_parquet() -> bytes::Bytes {
+        use parquet::data_type::{ByteArray, ByteArrayType};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let schema =
+            Arc::new(parse_message_type("message s { REQUIRED BYTE_ARRAY v (UTF8); }").unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            for vals in [["apple", "banana", "cherry"], ["mango", "orange", "peach"]] {
+                let arr: Vec<ByteArray> = vals.iter().map(|s| ByteArray::from(*s)).collect();
+                let mut rg = writer.next_row_group().unwrap();
+                let mut col = rg.next_column().unwrap().unwrap();
+                col.typed::<ByteArrayType>()
+                    .write_batch(&arr, None, None)
+                    .unwrap();
+                col.close().unwrap();
+                rg.close().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn row_group_pruning_uses_string_stats() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(two_row_group_string_parquet()).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 2);
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let cmp = |op, v: &str| Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op,
+            value: LiteralValue::String(v.to_string()),
+        };
+
+        // = "banana": only rg0 (in [apple, cherry]); rg1 (min mango) pruned.
+        let eq_b = cmp(ComparisonOp::Eq, "banana");
+        assert!(row_group_can_contain(
+            &eq_b,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &eq_b,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // = "orange": rg0 (max cherry) pruned; only rg1 can contain it.
+        let eq_o = cmp(ComparisonOp::Eq, "orange");
+        assert!(!row_group_can_contain(
+            &eq_o,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &eq_o,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // >= "m": rg0 (max cherry < m) pruned; rg1 kept.
+        let ge_m = cmp(ComparisonOp::GtEq, "m");
+        assert!(!row_group_can_contain(
+            &ge_m,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &ge_m,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // < "m": rg0 kept; rg1 (min mango > m) pruned.
+        let lt_m = cmp(ComparisonOp::Lt, "m");
+        assert!(row_group_can_contain(
+            &lt_m,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &lt_m,
+            meta.row_group(1),
+            &field_to_col
+        ));
+    }
 }

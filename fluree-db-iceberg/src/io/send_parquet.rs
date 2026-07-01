@@ -105,7 +105,7 @@ const WHOLE_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const WHOLE_FILE_MIN_SHARE_PCT: u64 = 50;
 
 /// Correctness floor: files below this size are always read whole (a sparse
-/// buffer can omit chunks the row iterator dereferences). Applies even without a
+/// buffer can omit chunks the reader dereferences). Applies even without a
 /// disk cache.
 const MIN_SPARSE_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -349,11 +349,9 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
 
     /// Read a file scan task into column batches.
     ///
-    /// Uses parquet-rs's row iterator API for reliable decoding.
-    /// Optimizations:
-    /// - Projection pushdown: Only decodes projected columns
-    /// - O(1) field lookup: Uses iterator position instead of name lookup
-    /// - Per-row-group batches: Emits one batch per row group for streaming
+    /// Decodes via the Arrow reader ([`crate::io::arrow_reader`]) with:
+    /// - projection pushdown (only the requested columns are read),
+    /// - row-group pruning + exact row filtering from `task.residual_filter`.
     ///
     /// For files larger than 64MB, uses `RangeBackedChunkReader` for on-demand
     /// range reads instead of loading the entire file into memory.
@@ -579,7 +577,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             }
         } else if file_size < MIN_SPARSE_FILE_BYTES {
             // No disk cache: keep the small-file correctness behavior (read whole
-            // to avoid a sparse buffer missing chunks the row iterator needs).
+            // to avoid a sparse buffer missing chunks the reader needs).
             tracing::debug!(path, file_size, "Reading entire small Parquet file");
             return self.storage.read(path).await;
         }
