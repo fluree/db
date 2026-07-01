@@ -231,10 +231,111 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
+    // Consume a fully scan-local FILTER into the single R2RML scan so the
+    // downstream LIMIT row budget can reach it. Narrow and safe: only when the
+    // group is purely R2RML scans and FILTERs (no OPTIONAL / UNION / BIND /
+    // multi-scan join) and there is exactly one R2RML pattern, so a filter whose
+    // variables are all produced by that scan cannot depend on any other pattern.
+    // The operator re-applies the moved filter with the same evaluator (results
+    // unchanged); removing the `Pattern::Filter` is what lets the budget flow.
+    consume_scan_local_filters(&mut result_patterns);
+
     R2rmlRewriteResult {
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
+    }
+}
+
+/// Whether scan-local FILTER consumption is enabled. Read once from
+/// `FLUREE_R2RML_FILTER_CONSUMPTION` (only `0`/`false`/`off` disable it). The
+/// kill switch keeps the FILTER in the plan (no LIMIT flow) for A/B validation.
+fn filter_consumption_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_FILTER_CONSUMPTION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Move scan-local top-level FILTERs into the single R2RML scan's
+/// `consumed_filter`, removing them from the pattern list. See the call site for
+/// the safety conditions.
+fn consume_scan_local_filters(patterns: &mut Vec<Pattern>) {
+    if !filter_consumption_enabled() {
+        return;
+    }
+    let all_scan_or_filter = patterns
+        .iter()
+        .all(|p| matches!(p, Pattern::R2rml(_) | Pattern::Filter(_)));
+    let scan_count = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::R2rml(_)))
+        .count();
+    if !all_scan_or_filter || scan_count != 1 {
+        return;
+    }
+
+    let produced: HashSet<VarId> = patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp.produced_vars().into_iter().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut consumed: Vec<Expression> = Vec::new();
+    patterns.retain(|p| {
+        if let Pattern::Filter(expr) = p {
+            let mut vars = HashSet::new();
+            // A variable-free filter (constant), one this analysis can't fully
+            // understand, or one touching a var the scan does not produce is
+            // left in place for the in-engine FILTER.
+            if collect_expr_vars(expr, &mut vars)
+                && !vars.is_empty()
+                && vars.iter().all(|v| produced.contains(v))
+            {
+                consumed.push(expr.clone());
+                return false;
+            }
+        }
+        true
+    });
+
+    if consumed.is_empty() {
+        return;
+    }
+    let combined = if consumed.len() == 1 {
+        consumed.pop().unwrap()
+    } else {
+        Expression::and(consumed)
+    };
+    for p in patterns.iter_mut() {
+        if let Pattern::R2rml(rp) = p {
+            rp.consumed_filter = Some(combined);
+            break;
+        }
+    }
+}
+
+/// Collect all variables referenced by an expression into `out`, returning
+/// `false` if the expression contains a construct this analysis does not fully
+/// understand (EXISTS, comprehensions, maps, resolved bindings, ...). A `false`
+/// result means the filter must NOT be consumed: it may reference variables — or
+/// carry scoping semantics — this walk cannot see, so the in-engine FILTER keeps
+/// authority. Only plain `Call` trees over `Var`/`Const` are consumable.
+fn collect_expr_vars(expr: &Expression, out: &mut HashSet<VarId>) -> bool {
+    match expr {
+        Expression::Var(v) => {
+            out.insert(*v);
+            true
+        }
+        Expression::Const(_) => true,
+        Expression::Call { args, .. } => args.iter().all(|a| collect_expr_vars(a, out)),
+        _ => false,
     }
 }
 
@@ -448,5 +549,79 @@ mod tests {
         assert!(tp.s.is_var());
         assert!(tp.p.is_var());
         assert!(tp.o.is_var());
+    }
+
+    // subject=VarId(0), object=VarId(1) → produced vars {0, 1}.
+    fn scan() -> Pattern {
+        Pattern::R2rml(R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))))
+    }
+
+    fn consumed_of(patterns: &[Pattern]) -> Option<&Expression> {
+        patterns.iter().find_map(|p| match p {
+            Pattern::R2rml(rp) => rp.consumed_filter.as_ref(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn consumes_scan_local_filter() {
+        // FILTER references only ?o (produced by the single scan): consumed.
+        let mut patterns = vec![scan(), Pattern::Filter(Expression::Var(VarId(1)))];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 1, "Filter pattern should be removed");
+        assert!(consumed_of(&patterns).is_some());
+    }
+
+    #[test]
+    fn keeps_filter_on_unproduced_var() {
+        // ?2 is not produced by the scan: leave the FILTER in place.
+        let mut patterns = vec![scan(), Pattern::Filter(Expression::Var(VarId(2)))];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_when_multiple_scans() {
+        // Two scans: a filter could depend on a join, so never consume.
+        let mut patterns = vec![
+            scan(),
+            Pattern::R2rml(R2rmlPattern::new("gs:main", VarId(2), Some(VarId(3)))),
+            Pattern::Filter(Expression::Var(VarId(1))),
+        ];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 3);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_when_non_scan_pattern_present() {
+        // A BIND (or any non-scan/non-filter pattern) could produce or reorder
+        // vars, so consumption is disabled for the whole group.
+        let mut patterns = vec![
+            scan(),
+            Pattern::Bind {
+                var: VarId(5),
+                expr: Expression::Var(VarId(1)),
+            },
+            Pattern::Filter(Expression::Var(VarId(1))),
+        ];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 3);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_with_unanalyzable_expression() {
+        // A Resolved binding (stand-in for EXISTS/comprehension constructs) is
+        // fail-closed: even though ?1 is produced, the filter is not consumed.
+        let expr = Expression::and(vec![
+            Expression::Var(VarId(1)),
+            Expression::Resolved(Box::new(crate::binding::Binding::Unbound)),
+        ]);
+        let mut patterns = vec![scan(), Pattern::Filter(expr)];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
     }
 }

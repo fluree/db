@@ -6,6 +6,7 @@
 //! Iceberg table reachable via R2RML mappings — and gives it a plug shape
 //! that fits where a `Pattern::Triple` would otherwise sit.
 
+use crate::ir::Expression;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
@@ -633,6 +634,14 @@ pub struct R2rmlPattern {
     /// product over multi-valued predicates) binding the subject and every
     /// object var, instead of producing one pattern per triple and joining them.
     pub star_bindings: Vec<(String, VarId)>,
+
+    /// A scan-local FILTER fully consumed into this scan by the planner: every
+    /// variable it references is produced by this pattern alone. The operator
+    /// applies it to its output rows (same evaluator as the in-engine FILTER, so
+    /// results are unchanged), which lets the downstream LIMIT row budget reach
+    /// the scan — the standalone `FilterOperator` that would otherwise block the
+    /// budget is dropped. `None` when no filter was consumed.
+    pub consumed_filter: Option<Expression>,
 }
 
 impl R2rmlPattern {
@@ -651,6 +660,7 @@ impl R2rmlPattern {
             class_filter: None,
             star_bindings: Vec::new(),
             scan_filters: Vec::new(),
+            consumed_filter: None,
         }
     }
 

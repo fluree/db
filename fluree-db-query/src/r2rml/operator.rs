@@ -33,6 +33,8 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::eval::PreparedBoolExpression;
+use crate::filter::filter_batch;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -172,6 +174,12 @@ pub struct R2rmlScanOperator {
     row_budget: Option<usize>,
     /// Output rows emitted so far, counted against `row_budget`.
     emitted: usize,
+    /// A scan-local FILTER the planner folded into this scan (see
+    /// [`R2rmlPattern::consumed_filter`]). Applied to each output batch with the
+    /// same evaluator the dropped `FilterOperator` would use, so results are
+    /// unchanged — but now the LIMIT budget and the filter live in one operator,
+    /// so a `FILTER + LIMIT` scan can stop after enough *matching* rows.
+    consumed_filter: Option<PreparedBoolExpression>,
     /// State
     state: OperatorState,
 }
@@ -213,6 +221,11 @@ impl R2rmlScanOperator {
 
         let schema = Arc::from(schema_vars);
 
+        let consumed_filter = pattern
+            .consumed_filter
+            .clone()
+            .map(PreparedBoolExpression::new);
+
         Self {
             child,
             pattern,
@@ -224,7 +237,26 @@ impl R2rmlScanOperator {
             scan_cache: HashMap::new(),
             row_budget: None,
             emitted: 0,
+            consumed_filter,
             state: OperatorState::Created,
+        }
+    }
+
+    /// Build the output batch from accumulated `columns`, applying the consumed
+    /// scan-local filter when present. Returns `None` when nothing survives (an
+    /// empty window, or every row filtered out), so the caller keeps pulling.
+    fn finalize_batch(
+        &self,
+        columns: Vec<Vec<Binding>>,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Batch>> {
+        let batch = Batch::new(Arc::clone(&self.schema), columns)?;
+        if batch.is_empty() {
+            return Ok(None);
+        }
+        match &self.consumed_filter {
+            Some(prepared) => filter_batch(&batch, prepared, &self.schema, ctx),
+            None => Ok(Some(batch)),
         }
     }
 
@@ -670,9 +702,16 @@ impl R2rmlScanOperator {
         // Under a LIMIT, cap the materialize window at the remaining budget so a
         // `LIMIT n` does not explode a full 512K-row window into bindings before
         // the first output row.
+        // Cap the window to the remaining budget only when the operator is
+        // row-preserving. With a consumed filter, the budget counts *matching*
+        // rows while a window materializes unfiltered rows, so capping by budget
+        // would starve the filter and under-return a `LIMIT n`; materialize full
+        // windows instead and let the post-filter `emitted` count stop the scan.
         let window_rows = match self.row_budget {
-            Some(b) => materialize_window_rows().min(b.saturating_sub(self.emitted).max(1)),
-            None => materialize_window_rows(),
+            Some(b) if self.consumed_filter.is_none() => {
+                materialize_window_rows().min(b.saturating_sub(self.emitted).max(1))
+            }
+            _ => materialize_window_rows(),
         };
 
         Ok(Some(ScanProgress {
@@ -1316,18 +1355,41 @@ impl Operator for R2rmlScanOperator {
                     columns[col_idx].push(binding);
                 }
             }
-            // Emit once a full batch is accumulated, or once the LIMIT budget is
-            // met — the latter stops the scan early without pulling/materializing
-            // more (the downstream LIMIT truncates to the exact count).
-            let budget_met = self
-                .row_budget
-                .is_some_and(|b| self.emitted + columns[0].len() >= b);
+            // Emit once a full batch is accumulated, or — for a row-preserving
+            // scan — once the LIMIT budget is met, stopping early. With a
+            // consumed filter the pre-filter count can't trigger the budget
+            // (it counts unmatched rows), so a full window is accumulated and
+            // `emitted` counts matching rows after `finalize_batch` filters.
+            let budget_met = self.consumed_filter.is_none()
+                && self
+                    .row_budget
+                    .is_some_and(|b| self.emitted + columns[0].len() >= b);
             if columns[0].len() >= ctx.batch_size || (budget_met && !columns[0].is_empty()) {
-                self.emitted += columns[0].len();
-                if self.row_budget.is_some_and(|b| self.emitted >= b) {
-                    self.state = OperatorState::Exhausted;
+                // Fast path (no consumed filter): emit the accumulated columns
+                // directly, exactly as before — no extra allocation.
+                if self.consumed_filter.is_none() {
+                    self.emitted += columns[0].len();
+                    if self.row_budget.is_some_and(|b| self.emitted >= b) {
+                        self.state = OperatorState::Exhausted;
+                    }
+                    return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
                 }
-                return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+                // Consumed-filter path: filter this window, count matching rows,
+                // and keep pulling if the whole window is filtered out.
+                let taken = std::mem::replace(
+                    &mut columns,
+                    (0..num_cols)
+                        .map(|_| Vec::with_capacity(ctx.batch_size))
+                        .collect(),
+                );
+                if let Some(out) = self.finalize_batch(taken, ctx)? {
+                    self.emitted += out.len();
+                    if self.row_budget.is_some_and(|b| self.emitted >= b) {
+                        self.state = OperatorState::Exhausted;
+                    }
+                    return Ok(Some(out));
+                }
+                continue;
             }
 
             // 2. Advance an in-flight scan by one materialization window. The
@@ -1356,8 +1418,20 @@ impl Operator for R2rmlScanOperator {
                         self.state = OperatorState::Exhausted;
                         return Ok(None);
                     }
-                    self.emitted += columns[0].len();
-                    return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+                    // Fast path (no consumed filter): emit directly, unchanged.
+                    if self.consumed_filter.is_none() {
+                        self.emitted += columns[0].len();
+                        return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+                    }
+                    // The child is exhausted, so this is the terminal batch
+                    // whether or not any row survives the consumed filter.
+                    self.state = OperatorState::Exhausted;
+                    let taken = std::mem::take(&mut columns);
+                    if let Some(out) = self.finalize_batch(taken, ctx)? {
+                        self.emitted += out.len();
+                        return Ok(Some(out));
+                    }
+                    return Ok(None);
                 }
             }
         }
