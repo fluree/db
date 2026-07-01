@@ -49,7 +49,7 @@ use fluree_db_core::comparator::IndexType;
 use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
-use fluree_db_core::{Flake, GraphDbRef, Sid, Tracker};
+use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, PolicyContext};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Root};
@@ -81,6 +81,24 @@ use std::sync::Arc;
 /// query can never serve one ledger's rendering for another ledger's subject
 /// (issue #1259).
 type CacheKey = (usize, Sid, u64, usize, Option<Arc<str>>);
+
+/// Per-response hydration caches, threaded through the recursive formatter.
+///
+/// - `results`: memoizes a subject's finished JSON so a subject reached many
+///   times in one response (shared ancestors/units, multiply-referenced
+///   entities) is hydrated once.
+/// - `rebinds`: memoizes a projection level re-encoded into a target ledger's
+///   namespace dict (issue #1295), keyed by `(target view index, level
+///   address)`, so each `(level, target)` is rebound at most once per response
+///   and reused via a shared `Arc` instead of re-cloning the sub-tree on every
+///   cross-ledger crossing. The address key is stable for the response
+///   (originals live in the `HydrationSpec`, rebounds are held here) and is only
+///   ever compared, never dereferenced.
+#[derive(Default)]
+struct HydrationCaches {
+    results: HashMap<CacheKey, JsonValue>,
+    rebinds: HashMap<(usize, usize), Arc<NestedSelectSpec>>,
+}
 
 /// Depth bookkeeping for one hydration call.
 ///
@@ -161,6 +179,70 @@ fn predicate_filter_for_level(level: &NestedSelectSpec) -> Option<Arc<[Sid]>> {
                 .collect();
             Some(Arc::from(preds))
         }
+    }
+}
+
+/// Re-encode one hydration level's IMMEDIATE predicate `Sid`s from the lowering
+/// (primary) namespace dict into `target`'s dict, for cross-ledger hydration.
+///
+/// A dataset query is lowered once against the primary ledger's dict, so every
+/// predicate `Sid` in a [`NestedSelectSpec`] carries the *primary* ledger's
+/// namespace code. When [`HydrationFormatter::expand_ref`] crosses into another
+/// ledger, those codes no longer match the target ledger's `Sid`s, so the
+/// predicate filter (`predicate_filter_for_level`) misses the target's SPOT
+/// index and `select_predicate` fails its `Sid`-equality match — predicates in
+/// divergent namespaces are silently dropped (issue #1295). Reserved namespaces
+/// (rdf, rdfs, …) survive because their codes are stable across ledgers.
+///
+/// This rebinds the immediate forward/reverse (and wildcard-refinement) keys by
+/// `lowering.decode_sid` → IRI → `target.encode_iri_strict`. It is **shallow**:
+/// `sub_spec`s (and refinement/reverse values) are left in lowering-dict form —
+/// each is rebound at *its own* crossing, so the decode source is ALWAYS the
+/// lowering (primary) view, never `self`, even in depth-N chains where `self`
+/// is a non-primary view. A predicate the target can't encode is dropped: the
+/// target ledger has no code for that namespace, so it can hold no such flake —
+/// mirroring the subject-side `encode_iri_strict … else continue` in `expand_ref`.
+fn rebind_level_to_view(
+    level: &NestedSelectSpec,
+    lowering: &IriCompactor,
+    target: &LedgerSnapshot,
+) -> NestedSelectSpec {
+    let rebind = |sid: &Sid| -> Option<Sid> {
+        let iri = lowering.decode_sid(sid).ok()?;
+        target.encode_iri_strict(&iri)
+    };
+    let rebind_map = |m: &std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>| {
+        m.iter()
+            .filter_map(|(k, v)| Some((rebind(k)?, v.clone())))
+            .collect()
+    };
+    match level {
+        NestedSelectSpec::Explicit { forward, reverse } => NestedSelectSpec::Explicit {
+            forward: forward
+                .iter()
+                .filter_map(|item| match item {
+                    ForwardItem::Id => Some(ForwardItem::Id),
+                    ForwardItem::Property {
+                        predicate,
+                        sub_spec,
+                    } => Some(ForwardItem::Property {
+                        predicate: rebind(predicate)?,
+                        sub_spec: sub_spec.clone(),
+                    }),
+                })
+                .collect(),
+            reverse: rebind_map(reverse),
+        },
+        NestedSelectSpec::Wildcard {
+            refinements,
+            reverse,
+        } => NestedSelectSpec::Wildcard {
+            refinements: refinements
+                .iter()
+                .filter_map(|(k, v)| Some((rebind(k)?, v.clone())))
+                .collect(),
+            reverse: rebind_map(reverse),
+        },
     }
 }
 
@@ -391,7 +473,7 @@ async fn format_hydration_column(
     result: &QueryResult,
     batch: &fluree_db_query::Batch,
     row_idx: usize,
-    cache: &mut HashMap<CacheKey, JsonValue>,
+    cache: &mut HydrationCaches,
 ) -> Result<JsonValue> {
     // Resolve the root. For an `IriMatch` root, `iri` is the ledger-correct
     // canonical IRI (used for the `@id`) and `ledger_alias` names its home
@@ -666,7 +748,7 @@ async fn run_hydration_rows(set: &FormatterSet<'_>, result: &QueryResult) -> Res
     // includes the active ledger + a hash of the current `NestedSelectSpec`, so
     // columns with structurally identical levels share entries while different
     // levels (and different ledgers) stay separate.
-    let mut cache: HashMap<CacheKey, JsonValue> = HashMap::new();
+    let mut cache = HydrationCaches::default();
     let mut rows: Vec<JsonValue> = Vec::new();
 
     // If the underlying query produced no solutions, expansion produces no
@@ -866,7 +948,7 @@ impl<'a> HydrationFormatter<'a> {
         level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
             let cache_key = (
@@ -878,7 +960,7 @@ impl<'a> HydrationFormatter<'a> {
             );
 
             // Check cache first (same Sid + spec + depth = same result)
-            if let Some(cached) = cache.get(&cache_key) {
+            if let Some(cached) = cache.results.get(&cache_key) {
                 return Ok(cached.clone());
             }
 
@@ -1080,7 +1162,7 @@ impl<'a> HydrationFormatter<'a> {
             let result = JsonValue::Object(obj.into_iter().collect());
 
             // Cache the result
-            cache.insert(cache_key, result.clone());
+            cache.results.insert(cache_key, result.clone());
 
             Ok(result)
         }
@@ -1104,7 +1186,7 @@ impl<'a> HydrationFormatter<'a> {
         level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> BoxFuture<'b, Result<JsonValue>> {
         async move {
             let Some(ctx) = self.dataset else {
@@ -1135,8 +1217,45 @@ impl<'a> HydrationFormatter<'a> {
                     continue;
                 };
                 let tfmt = ctx.formatter_for(tidx);
+                // Re-encode the projection's predicate Sids into this target
+                // ledger's namespace dict (issue #1295). The level is lowered
+                // once against the primary dict, so a same-ledger ref
+                // (`tidx == primary`) needs no rebind — keep the original level
+                // (no allocation, byte-identical output). The decode source is
+                // the primary/lowering view, never `self` (which may be a
+                // non-primary view in a depth-N chain).
+                let rebound_arc;
+                let level_for_target = if tidx == ctx.primary {
+                    level
+                } else {
+                    // Memoize per (target view, level address): re-encode a level
+                    // into this ledger's dict at most once per response, then reuse
+                    // the shared Arc (a refcount bump) rather than re-cloning the
+                    // sub-tree on every crossing. The key uses the level's address
+                    // — stable for the response, only ever compared.
+                    let key = (tidx, level as *const NestedSelectSpec as usize);
+                    rebound_arc = cache
+                        .rebinds
+                        .entry(key)
+                        .or_insert_with(|| {
+                            Arc::new(rebind_level_to_view(
+                                level,
+                                &ctx.views[ctx.primary].compactor,
+                                tview.db.snapshot,
+                            ))
+                        })
+                        .clone();
+                    &*rebound_arc
+                };
                 let obj = tfmt
-                    .format_subject(&tsid, Some(Arc::clone(&iri)), level, depth, visited, cache)
+                    .format_subject(
+                        &tsid,
+                        Some(Arc::clone(&iri)),
+                        level_for_target,
+                        depth,
+                        visited,
+                        cache,
+                    )
                     .await?;
                 merged = Some(match merged {
                     None => obj,
@@ -1167,7 +1286,7 @@ impl<'a> HydrationFormatter<'a> {
         level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> Result<JsonValue> {
         if self.dataset.is_some() {
             self.expand_ref(ref_sid, level, depth, visited, cache).await
@@ -1214,7 +1333,7 @@ impl<'a> HydrationFormatter<'a> {
         parent_level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> Result<Vec<JsonValue>> {
         let expanded = self.compactor.decode_sid(pred_ctx.pred)?;
         let is_rdf_type = expanded == RDF_TYPE_IRI;
@@ -1335,7 +1454,7 @@ impl<'a> HydrationFormatter<'a> {
         value: &mut JsonValue,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> Result<()> {
         let bodies = self
             .lookup_annotation_bodies(flake, depth, visited, cache)
@@ -1370,7 +1489,7 @@ impl<'a> HydrationFormatter<'a> {
         flake: &'b Flake,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> Result<Vec<JsonValue>> {
         // Zero-cost gate for non-annotation ledgers — mirrors the
         // cascade fast-path in `fluree_db_transact::stage` so a
@@ -1538,7 +1657,7 @@ impl<'a> HydrationFormatter<'a> {
         ann_sids: &[Sid],
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> Result<Vec<JsonValue>> {
         let ann_level = NestedSelectSpec::Wildcard {
             refinements: HashMap::new(),
@@ -1719,7 +1838,7 @@ impl<'a> HydrationFormatter<'a> {
         parent_level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
-        cache: &'b mut HashMap<CacheKey, JsonValue>,
+        cache: &'b mut HydrationCaches,
     ) -> Result<Vec<JsonValue>> {
         let mut values = Vec::new();
         for flake in flakes {

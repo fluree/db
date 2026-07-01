@@ -491,3 +491,272 @@ async fn dataset_nested_projection_cross_graph_iri_resolution_via_connection() {
         "the mis-decoded (catalog-namespace) @id must not appear: {s}"
     );
 }
+
+/// Seed a primary `catalog` ledger whose product REFERENCES a person in a
+/// separate `people` ledger, where the person carries a predicate (`p:fullName`)
+/// in a namespace that is allocated a DIFFERENT code in each ledger:
+///   - catalog: people.example registered last (via the `schema:author` ref) → high code
+///   - people:  people.example registered first (the subject `p:ada`)        → low code
+///
+/// This is the cross-ledger explicit-projection drop condition.
+async fn seed_divergent_predicate_ref_ledgers(fluree: &MemoryFluree) {
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/catalog:main"),
+            &json!({
+                "@context": {
+                    "schema": "http://schema.org/",
+                    "cat": "http://catalog.example/",
+                    "p": "http://people.example/",
+                    "id": "@id", "type": "@type",
+                },
+                "@graph": [
+                    {"@id": "cat:item1", "@type": "schema:Product",
+                     "schema:author": {"@id": "p:ada"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert catalog");
+
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/people:main"),
+            &json!({
+                "@context": {
+                    "schema": "http://schema.org/",
+                    "p": "http://people.example/",
+                    "id": "@id", "type": "@type",
+                },
+                "@graph": [
+                    {"@id": "p:ada", "@type": "schema:Person",
+                     "schema:name": "Ada Lovelace", "p:fullName": "Augusta Ada King"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert people");
+}
+
+/// Cross-ledger NESTED EXPLICIT projection must return ALL projected predicates
+/// of the foreign subject — not just `@id` and reserved-namespace ones.
+///
+/// Pre-fix: `p:fullName` is lowered against the primary (catalog) dict and its
+/// Sid is filtered against the people view, where the same IRI has a different
+/// namespace code → silently dropped. `@id` and `schema:name` (schema.org shares
+/// a code here) survive, masking the loss. With the cross-ledger predicate-Sid
+/// rebind the predicate is re-encoded into the people dict and resolves to
+/// "Augusta Ada King".
+#[tokio::test]
+async fn cross_graph_nested_explicit_projection_divergent_predicate() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_divergent_predicate_ref_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "schema": "http://schema.org/",
+            "cat": "http://catalog.example/",
+            "p": "http://people.example/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/catalog:main", "test/people:main"],
+        // EXPLICIT projection (not ["*"]) crossing catalog -> people:
+        "select": { "?item": ["@id",
+            { "schema:author": ["@id", "schema:name", "p:fullName"] }
+        ]},
+        "where": { "@id": "?item", "type": "schema:Product" }
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let item = value.as_array().and_then(|a| a.first()).expect("one item");
+    let author = item.get("schema:author").expect("author present");
+
+    assert_eq!(author.get("@id").and_then(|v| v.as_str()), Some("p:ada"));
+    // Reserved/shared-code predicate survives even pre-fix:
+    assert_eq!(
+        author.get("schema:name").and_then(|v| v.as_str()),
+        Some("Ada Lovelace"),
+    );
+    // THE REGRESSION: divergent-namespace predicate must be present, not dropped.
+    assert_eq!(
+        author.get("p:fullName").and_then(|v| v.as_str()),
+        Some("Augusta Ada King"),
+        "cross-ledger explicit projection dropped a non-primary-namespace predicate: {value:#}"
+    );
+}
+
+// =============================================================================
+// Issue #1295 — "non-primary hydration root" extension (predicted by the
+// issue's Direction section). A *second, distinct mechanism* from the
+// per-predicate-Sid drop: a hydration root whose subject lives in a non-primary
+// ledger is hydrated against the PRIMARY view, so the whole subject comes back
+// `@id`-only — even reserved-namespace predicates are dropped.
+//
+// These two tests share the `schema.org` namespace, which is allocated the SAME
+// code across all three `seed_divergent_ledgers` ledgers. So a per-predicate Sid
+// mismatch (the original #1295 mechanism) CANNOT explain `schema:name` dropping
+// — that isolates the root-view-routing mechanism cleanly.
+// =============================================================================
+
+/// CONTROL — when the root variable is bound by a pattern in the subject's HOME
+/// graph, the binding carries home-ledger provenance, so it hydrates correctly.
+#[tokio::test]
+async fn cross_graph_root_bound_in_home_graph_hydrates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_divergent_ledgers(&fluree).await;
+
+    // ?b is matched by its own type/predicate in the books ledger.
+    let q = json!({
+        "@context": {
+            "book": "http://book.example/",
+            "schema": "http://schema.org/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/movies:main", "test/books:main"],
+        "select": { "?b": ["@id", "schema:name", "schema:isbn"] },
+        "where": { "@id": "?b", "type": "schema:Book" }
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let b = value.as_array().and_then(|a| a.first()).expect("one book");
+    assert_eq!(b.get("@id").and_then(|v| v.as_str()), Some("book:b1"));
+    assert_eq!(
+        b.get("schema:name").and_then(|v| v.as_str()),
+        Some("Gone with the Wind"),
+        "home-graph-bound root should hydrate its properties: {value:#}"
+    );
+}
+
+/// BUG (#1295 root extension) — when the SAME root subject is bound as the
+/// OBJECT of a primary-ledger triple (`movie:m1 schema:isBasedOn ?b`, matched in
+/// the movies ledger) but the subject (`book:b1`) lives in the books ledger, the
+/// bare object SID carries no home-ledger provenance, so the formatter routes
+/// hydration to the primary (movies) view — where `book:b1` has no triples — and
+/// returns it `@id`-only. `schema:name` (aligned namespace) is dropped, proving
+/// this is the root-view-routing mechanism, not the per-predicate-Sid mismatch.
+///
+/// Out of scope for the #1295 core fix (the rebind lives in `expand_ref`; this
+/// root path goes through `format_hydration_column`/`FormatterSet::pick`).
+/// Kept as a documented, ignored repro pending the root-routing follow-up.
+#[ignore = "pending #1295 non-primary-root routing follow-up"]
+#[tokio::test]
+async fn cross_graph_root_bound_as_object_hydrates_in_home_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_divergent_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "movie": "http://movie.example/",
+            "book": "http://book.example/",
+            "schema": "http://schema.org/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/movies:main", "test/books:main"],
+        "select": { "?b": ["@id", "schema:name", "schema:isbn"] },
+        "where": { "@id": "?m", "schema:isBasedOn": "?b" }
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let b = value.as_array().and_then(|a| a.first()).expect("one book");
+    assert_eq!(b.get("@id").and_then(|v| v.as_str()), Some("book:b1"));
+    assert_eq!(
+        b.get("schema:name").and_then(|v| v.as_str()),
+        Some("Gone with the Wind"),
+        "root bound as object of a primary-ledger triple came back @id-only \
+         (hydrated against the wrong view): {value:#}"
+    );
+}
+
+/// Cross-ledger WILDCARD projection with a divergent-namespace **refinement**.
+/// The refinement key (`s:parent`, in `http://sys.example/`) is lowered against
+/// the primary (app) dict; hydration of `s:cat` happens in the sys ledger, where
+/// `sys.example` has a different namespace code. Without rebinding the refinement
+/// key, `select_predicate` misses it and the refined ref renders as a bare `@id`
+/// instead of expanding. Locks in the `refinements`-key rebind (issue #1295),
+/// which had no prior coverage.
+#[tokio::test]
+async fn cross_graph_wildcard_refinement_divergent_ns() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // Primary (app): item → category in the sys ledger. `app.example` registers
+    // first; `sys.example` only via the cross-ledger ref → a higher code here.
+    fluree
+        .insert(
+            genesis_ledger(&fluree, "test/wr-app:main"),
+            &json!({
+                "@context": {"app": "http://app.example/", "s": "http://sys.example/",
+                             "id": "@id", "type": "@type"},
+                "@graph": [
+                    {"@id": "app:item", "@type": "app:Item", "app:cat": {"@id": "s:cat"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert app");
+    // sys: category with a divergent-namespace ref predicate `s:parent` → root.
+    // `sys.example` registers first here → a lower code (divergent from app's).
+    fluree
+        .insert(
+            genesis_ledger(&fluree, "test/wr-sys:main"),
+            &json!({
+                "@context": {"s": "http://sys.example/", "id": "@id"},
+                "@graph": [
+                    {"@id": "s:cat", "s:label": "Category", "s:parent": {"@id": "s:root"}},
+                    {"@id": "s:root", "s:label": "Root"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert sys");
+
+    let q = json!({
+        "@context": {"app": "http://app.example/", "s": "http://sys.example/",
+                     "id": "@id", "type": "@type"},
+        "from": ["test/wr-app:main", "test/wr-sys:main"],
+        // ?i's app:cat crosses into sys; s:cat is hydrated with a WILDCARD that
+        // refines the divergent-namespace ref `s:parent` to expand it.
+        "select": {"?i": ["@id", {"app:cat": ["*", {"s:parent": ["@id", "s:label"]}]}]},
+        "where": {"@id": "?i", "type": "app:Item"}
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let item = value.as_array().and_then(|a| a.first()).expect("one item");
+    let cat = item.get("app:cat").expect("app:cat present");
+    // Wildcard includes the category's own s:label:
+    assert_eq!(
+        cat.get("s:label").and_then(|v| v.as_str()),
+        Some("Category"),
+        "wildcard cross-ledger hydration dropped s:label: {value:#}"
+    );
+    // The REFINEMENT on the divergent-namespace ref must apply cross-ledger →
+    // s:parent expands to include s:label, not render as a bare @id.
+    let parent = cat.get("s:parent").expect("s:parent present");
+    assert_eq!(
+        parent.get("s:label").and_then(|v| v.as_str()),
+        Some("Root"),
+        "wildcard refinement on a divergent-namespace ref did not apply cross-ledger: {value:#}"
+    );
+}
