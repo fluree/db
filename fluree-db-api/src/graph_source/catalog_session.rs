@@ -112,19 +112,43 @@ impl IcebergCatalogSession {
         })
     }
 
-    /// Cache a freshly loaded `loadTable` response for reuse by later scans of
-    /// the same `(source, table)` in this query. No-op when the cache is disabled.
+    /// The `metadata_location` pinned for `key` on its first load this query,
+    /// regardless of credential freshness. A creds-expiry reload uses this to
+    /// keep the query on one Iceberg snapshot even if the table commits mid-query
+    /// (the reload refreshes only the credentials). `None` if never loaded.
+    pub(crate) fn pinned_metadata_location(&self, key: &str) -> Option<String> {
+        if !cache_enabled() {
+            return None;
+        }
+        self.load_tables
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|e| e.metadata_location.clone())
+    }
+
+    /// Cache a `loadTable` response for reuse by later scans of the same
+    /// `(source, table)` in this query. The `metadata_location` is pinned on the
+    /// first store and never changes; a later store (a creds refresh) updates
+    /// only the credentials, so the query stays on one snapshot. No-op when the
+    /// cache is disabled.
     pub(crate) fn store_load_table(&self, key: String, resp: &LoadTableResponse) {
         if !cache_enabled() {
             return;
         }
-        self.load_tables.lock().unwrap().insert(
-            key,
-            CachedLoadTable {
-                metadata_location: resp.metadata_location.clone(),
-                credentials: resp.credentials.clone(),
-            },
-        );
+        let mut lts = self.load_tables.lock().unwrap();
+        match lts.get_mut(&key) {
+            Some(existing) => existing.credentials = resp.credentials.clone(),
+            None => {
+                lts.insert(
+                    key,
+                    CachedLoadTable {
+                        metadata_location: resp.metadata_location.clone(),
+                        credentials: resp.credentials.clone(),
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -190,6 +214,38 @@ mod tests {
         assert!(
             s.cached_load_table(&key).is_some(),
             "ambient-credential entries have no expiry"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_pinned_metadata_location() {
+        // First load pins the snapshot. A later store (as happens after a
+        // creds-expiry reload that observed a NEWER metadata_location because the
+        // table committed mid-query) must NOT move the pin — only refresh creds.
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(10)))),
+        );
+        assert_eq!(
+            s.pinned_metadata_location(&key).as_deref(),
+            Some("s3://snap-A.json")
+        );
+        // Simulate the reload landing on a newer snapshot with fresh creds.
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-B.json", Some(creds(Some(3600)))),
+        );
+        assert_eq!(
+            s.pinned_metadata_location(&key).as_deref(),
+            Some("s3://snap-A.json"),
+            "snapshot must stay pinned across a credential refresh"
+        );
+        let hit = s.cached_load_table(&key).expect("fresh creds now valid");
+        assert_eq!(
+            hit.metadata_location, "s3://snap-A.json",
+            "later scans read the pinned snapshot, not the reloaded one"
         );
     }
 

@@ -707,12 +707,28 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                         table = %table_id.table,
                         "Loading table from REST catalog"
                     );
-                    let resp = catalog
+                    let mut resp = catalog
                         .load_table(&table_id, iceberg_config.io.vended_credentials)
                         .await
                         .map_err(|e| {
                             QueryError::Internal(format!("Failed to load table from catalog: {e}"))
                         })?;
+                    // If this table was already loaded earlier in the query, only
+                    // the (expired) vended credentials needed refreshing — keep the
+                    // originally pinned metadata_location so a mid-query table
+                    // commit cannot shift this query onto a newer Iceberg snapshot.
+                    // Vended creds are bucket/prefix-scoped, so the fresh creds
+                    // still read the pinned snapshot's immutable data files.
+                    if let Some(pinned) = self.session.pinned_metadata_location(&lt_key) {
+                        if pinned != resp.metadata_location {
+                            debug!(
+                                pinned = %pinned,
+                                reloaded = %resp.metadata_location,
+                                "Refreshed vended credentials; keeping the query's pinned snapshot"
+                            );
+                            resp.metadata_location = pinned;
+                        }
+                    }
                     self.session.store_load_table(lt_key, &resp);
                     info!(
                         metadata_location = %resp.metadata_location,
