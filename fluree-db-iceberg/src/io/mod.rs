@@ -10,20 +10,16 @@
 pub mod batch;
 #[cfg(feature = "aws")]
 pub mod chunk_reader;
-pub mod gcs;
 pub mod parquet;
 #[cfg(feature = "aws")]
 pub mod send_parquet;
 pub mod storage;
 
 pub use batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
-pub use gcs::is_gcs_endpoint;
 pub use storage::{IcebergStorage, MemoryStorage, RangeOnlyStorage};
 
 #[cfg(feature = "aws")]
 pub use chunk_reader::RangeBackedChunkReader;
-#[cfg(feature = "aws")]
-pub use gcs::{GcsXmlStorage, IcebergBackend};
 #[cfg(feature = "aws")]
 pub use send_parquet::SendParquetReader;
 #[cfg(feature = "aws")]

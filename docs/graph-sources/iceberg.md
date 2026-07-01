@@ -208,7 +208,7 @@ Direct mode assumes `table_location` points at a **valid Iceberg table layout** 
 
 ### Google Cloud Storage (GCS)
 
-Fluree can read Iceberg tables stored in Google Cloud Storage. Set `s3_endpoint` to the GCS S3-interoperability endpoint and Fluree automatically uses a **native GCS reader** for object reads:
+Fluree can read Iceberg tables stored in Google Cloud Storage over the GCS **S3-interoperability** endpoint. Set `s3_endpoint` to that endpoint and use path-style addressing:
 
 ```json
 {
@@ -223,9 +223,11 @@ Fluree can read Iceberg tables stored in Google Cloud Storage. Set `s3_endpoint`
 }
 ```
 
-**Why a native reader:** reading byte-range requests from GCS through the AWS S3 SDK over HTTP/2 fails (the SDK rejects the partial-content response body). The Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. When the endpoint is `storage.googleapis.com`, Fluree reads objects with a native HTTP client pinned to HTTP/1.1, which handles GCS range responses correctly. (Range/partial reads are an HTTP/1.1 feature, so only the Parquet footer and the column chunks a query needs are fetched — never the whole object.) Non-GCS endpoints use the AWS S3 SDK exactly as before.
+GCS-backed tables are read through the **same AWS S3 SDK path** as any other S3-compatible store, with one adjustment: the SDK's transport is pinned to **HTTP/1.1**. Reading byte-range requests from GCS through the SDK over HTTP/2 fails (smithy-rs mishandles the partial-content response body), and the Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. HTTP/1.1 handles GCS range responses correctly, and only the Parquet footer plus the column chunks a query needs are fetched — never the whole object. AWS S3 and other S3-compatible stores serve range reads over HTTP/1.1 identically, so this is transparent for every endpoint. (Response-checksum validation is also disabled for these reads, because an object-level checksum cannot validate a partial byte range.)
 
-**Authentication.** The native GCS reader signs each request with **AWS SigV4** using GCS **HMAC interoperability keys** — the same credentials the S3-interop path already uses, resolved from the standard AWS credential chain. Set them as you would for any S3 access:
+Because reads go through the AWS SDK, GCS inherits the SDK's correct SigV4 signing — including partition directories like `event_date=2024-01-01/` and values with spaces or non-ASCII characters — plus credential refresh and retries.
+
+**Authentication.** Requests are signed with **AWS SigV4** using GCS **HMAC interoperability keys**, resolved from the standard AWS credential chain. Set them as you would for any S3 access:
 
 ```bash
 export AWS_ACCESS_KEY_ID=<gcs-hmac-access-key>
@@ -233,9 +235,9 @@ export AWS_SECRET_ACCESS_KEY=<gcs-hmac-secret>
 # s3_region in the config is the SigV4 signing region (the bucket location).
 ```
 
-HMAC keys do not expire, so no token-refresh handling is needed. In `rest` mode, if the catalog vends credentials for a GCS-backed table those are used instead.
+A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire; in `rest` mode, credentials vended by the catalog for a GCS-backed table are used instead (and refreshed by the SDK).
 
-GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. The reader handles GCS-native conventions automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
+GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
 
 ## RDF Mapping (R2RML)
 
@@ -465,7 +467,7 @@ export AWS_REGION=us-east-1
 
 REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct mode uses only ambient AWS credentials (env vars, IAM roles, `~/.aws/credentials`).
 
-**Google Cloud Storage:** when the endpoint is `storage.googleapis.com`, reads use the native GCS reader, which signs requests with AWS SigV4 using GCS HMAC interop keys — the same `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` shown above (set them to your HMAC keys). See [Google Cloud Storage (GCS)](#google-cloud-storage-gcs).
+**Google Cloud Storage:** when the endpoint is the GCS S3-interoperability host, reads go through the AWS S3 SDK (transport pinned to HTTP/1.1), signing requests with AWS SigV4 using GCS HMAC interop keys — the same `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` shown above (set them to your HMAC keys). See [Google Cloud Storage (GCS)](#google-cloud-storage-gcs).
 
 ## Use Cases
 

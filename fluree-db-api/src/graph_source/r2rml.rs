@@ -13,10 +13,8 @@ use async_trait::async_trait;
 use fluree_db_core::ContentStore;
 use fluree_db_iceberg::{
     catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
-    io::{
-        is_gcs_endpoint, ColumnBatch, GcsXmlStorage, IcebergBackend, S3IcebergStorage,
-        SendIcebergStorage, SendParquetReader,
-    },
+    credential::VendedCredentials,
+    io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
     scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
     IcebergGsConfig,
@@ -665,54 +663,37 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     "Loaded table metadata location"
                 );
 
-                let storage = if is_gcs_endpoint(iceberg_config.io.s3_endpoint.as_deref()) {
-                    info!("Using native GCS reader (gs:// over reqwest, SigV4-signed) for storage reads");
-                    // Honor catalog-vended credentials for GCS-backed tables when
-                    // present; otherwise resolve HMAC keys from the AWS credential
-                    // chain, the same as the S3 path.
-                    let gcs = match load_response.credentials {
-                        Some(ref credentials) => GcsXmlStorage::from_vended_credentials(
-                            credentials,
-                            iceberg_config.io.s3_endpoint.as_deref(),
-                        ),
-                        None => {
-                            GcsXmlStorage::from_default_chain(
-                                iceberg_config.io.s3_region.as_deref(),
-                                iceberg_config.io.s3_endpoint.as_deref(),
-                            )
-                            .await
-                        }
-                    }
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create GCS storage: {e}"))
-                    })?;
-                    IcebergBackend::Gcs(gcs)
-                } else if let Some(ref credentials) = load_response.credentials {
+                // GCS-backed tables (S3-interop endpoint) are read through this
+                // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
+                // GCS HTTP/2 range-read bug cannot occur.
+                let storage = if let Some(ref credentials) = load_response.credentials {
                     info!("Using vended credentials from catalog");
-                    IcebergBackend::S3(
-                        S3IcebergStorage::from_vended_credentials(credentials)
-                            .await
-                            .map_err(|e| {
-                                QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                            })?,
-                    )
+                    let credentials = merge_vended_with_io(
+                        credentials,
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    );
+                    S3IcebergStorage::from_vended_credentials(&credentials)
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                        })?
                 } else {
                     info!(
                         region = ?iceberg_config.io.s3_region,
                         endpoint = ?iceberg_config.io.s3_endpoint,
                         "Using ambient AWS credentials"
                     );
-                    IcebergBackend::S3(
-                        S3IcebergStorage::from_default_chain(
-                            iceberg_config.io.s3_region.as_deref(),
-                            iceberg_config.io.s3_endpoint.as_deref(),
-                            iceberg_config.io.s3_path_style,
-                        )
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?,
+                    S3IcebergStorage::from_default_chain(
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
                     )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
                 };
 
                 (load_response, Arc::new(storage))
@@ -724,34 +705,19 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 );
 
                 // Direct mode: create storage once, share via Arc. gs://-backed
-                // tables (GCS endpoint) use the native reqwest reader to avoid the
-                // AWS-SDK HTTP/2 range-read bug; everything else uses the S3 SDK.
-                let storage: Arc<IcebergBackend> = Arc::new(
-                    if is_gcs_endpoint(iceberg_config.io.s3_endpoint.as_deref()) {
-                        info!("Using native GCS reader (gs:// over reqwest, SigV4-signed) for storage reads");
-                        IcebergBackend::Gcs(
-                            GcsXmlStorage::from_default_chain(
-                                iceberg_config.io.s3_region.as_deref(),
-                                iceberg_config.io.s3_endpoint.as_deref(),
-                            )
-                            .await
-                            .map_err(|e| {
-                                QueryError::Internal(format!("Failed to create GCS storage: {e}"))
-                            })?,
-                        )
-                    } else {
-                        IcebergBackend::S3(
-                            S3IcebergStorage::from_default_chain(
-                                iceberg_config.io.s3_region.as_deref(),
-                                iceberg_config.io.s3_endpoint.as_deref(),
-                                iceberg_config.io.s3_path_style,
-                            )
-                            .await
-                            .map_err(|e| {
-                                QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                            })?,
-                        )
-                    },
+                // tables (GCS S3-interop endpoint) are read through the same S3
+                // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK
+                // HTTP/2 range-read bug against that endpoint.
+                let storage: Arc<S3IcebergStorage> = Arc::new(
+                    S3IcebergStorage::from_default_chain(
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?,
                 );
 
                 let cache = self.fluree.r2rml_cache();
@@ -1029,4 +995,110 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
 fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
+}
+
+/// Merge catalog-vended credentials with the graph-source IO config.
+///
+/// Vended credentials always supply auth. A catalog that manages its own
+/// storage also vends the connection params (endpoint / region / path style);
+/// when it omits one we fall back to the graph-source config. This is what lets
+/// a GCS-backed table (endpoint = `storage.googleapis.com`, path-style) be read
+/// through the S3 SDK when the catalog vends only keys.
+///
+/// `endpoint` and `region` use vended-wins-with-config-fallback (`Option::or`).
+/// `path_style` is a plain `bool` with no "unset" state, so config supplies it
+/// only when the catalog did **not** vend its own `endpoint`: a catalog that
+/// vends an endpoint owns the addressing style too, and its `path_style`
+/// (including an explicit `false`) must win over the graph-source config.
+fn merge_vended_with_io(
+    creds: &VendedCredentials,
+    cfg_endpoint: Option<&str>,
+    cfg_region: Option<&str>,
+    cfg_path_style: bool,
+) -> VendedCredentials {
+    VendedCredentials {
+        endpoint: creds
+            .endpoint
+            .clone()
+            .or_else(|| cfg_endpoint.map(str::to_string)),
+        region: creds
+            .region
+            .clone()
+            .or_else(|| cfg_region.map(str::to_string)),
+        path_style: if creds.endpoint.is_some() {
+            creds.path_style
+        } else {
+            creds.path_style || cfg_path_style
+        },
+        ..creds.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds(endpoint: Option<&str>, region: Option<&str>, path_style: bool) -> VendedCredentials {
+        VendedCredentials {
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            session_token: None,
+            expires_at: None,
+            endpoint: endpoint.map(str::to_string),
+            region: region.map(str::to_string),
+            path_style,
+        }
+    }
+
+    #[test]
+    fn merge_falls_back_to_config_when_catalog_omits_connection_params() {
+        // Catalog vends only keys (no endpoint/region/path-style) — config fills
+        // them so a GCS-backed table is reachable through the S3 SDK.
+        let merged = merge_vended_with_io(
+            &creds(None, None, false),
+            Some("https://storage.googleapis.com"),
+            Some("europe-west1"),
+            true,
+        );
+        assert_eq!(
+            merged.endpoint.as_deref(),
+            Some("https://storage.googleapis.com")
+        );
+        assert_eq!(merged.region.as_deref(), Some("europe-west1"));
+        assert!(
+            merged.path_style,
+            "config path-style fills a catalog that omits it"
+        );
+    }
+
+    #[test]
+    fn merge_lets_vended_connection_params_win() {
+        // Catalog vends its own endpoint/region — those win over config.
+        let merged = merge_vended_with_io(
+            &creds(Some("https://minio.example"), Some("us-east-1"), true),
+            Some("https://storage.googleapis.com"),
+            Some("europe-west1"),
+            false,
+        );
+        assert_eq!(merged.endpoint.as_deref(), Some("https://minio.example"));
+        assert_eq!(merged.region.as_deref(), Some("us-east-1"));
+        assert!(merged.path_style);
+    }
+
+    #[test]
+    fn merge_does_not_let_config_force_path_style_over_a_vended_endpoint() {
+        // Regression guard: a catalog that vends its own endpoint with
+        // virtual-hosted addressing (path_style = false) must NOT be overridden
+        // by a graph-source config that happens to set s3_path_style = true.
+        let merged = merge_vended_with_io(
+            &creds(Some("https://minio.example"), None, false),
+            None,
+            None,
+            true,
+        );
+        assert!(
+            !merged.path_style,
+            "vended endpoint owns addressing style; config must not force path-style on"
+        );
+    }
 }
