@@ -350,7 +350,11 @@ ${C_BOLD}EXAMPLES${C_RESET}
   $(basename "$0") load --workload single-pound --duration 30s
   $(basename "$0") load --workload wide-fanout --duration 60s --concurrency 64
   $(basename "$0") load --workload multitenant --duration 5m \\
-                        --watch-cluster http://localhost:9091
+                        --watch-cluster http://localhost:9091,http://localhost:9092,http://localhost:9093
+
+Watch-cluster: pass one URL per raft node so the annotator can
+fail over if you kill the node it's polling. Single-URL form works
+too but goes blind after that node dies.
 
 Pass through any load-tool flags. Run \`$(basename "$0") load --tool-help\`
 to see the load tool's own \`--help\` (workloads, env knobs, etc.).
@@ -527,11 +531,27 @@ generate_compose() {
         emit_service "$mode" "$i" "$storage"
     done
     echo
+    # Volume layout depends on mode:
+    # - monolithic: one per-node volume for both data + raft config.
+    # - raft: the commit worker (leader-only) writes commit envelope
+    #   blobs to /var/lib/fluree/data; followers read them back to
+    #   serve queries. This requires *shared* data storage across
+    #   nodes. Raft log / snapshot state stays per-node (that's
+    #   what makes each node a distinct openraft participant).
+    #   Mimics production topologies where a raft cluster sits over
+    #   shared storage (S3, shared FS, etc.).
     if [ "$storage" = "ephemeral" ]; then
         echo "volumes:"
-        for i in $(seq 1 "$node_count"); do
-            echo "  $(node_host "$i")-data:"
-        done
+        if [ "$mode" = "raft" ]; then
+            echo "  shared-data:"
+            for i in $(seq 1 "$node_count"); do
+                echo "  $(node_host "$i")-raft:"
+            done
+        else
+            for i in $(seq 1 "$node_count"); do
+                echo "  $(node_host "$i")-data:"
+            done
+        fi
     fi
 }
 
@@ -578,11 +598,25 @@ EOF
         echo "      FLUREE_RAFT_LISTEN_ADDR: \"0.0.0.0:$internal_raft\""
     fi
     echo "    volumes:"
+    # See the comment in generate_compose for why raft mode uses a
+    # shared data volume + per-node raft-log volume.
     if [ "$storage" = "ephemeral" ]; then
-        echo "      - $host-data:/var/lib/fluree"
+        if [ "$mode" = "raft" ]; then
+            echo "      - shared-data:/var/lib/fluree/data"
+            echo "      - $host-raft:/var/lib/fluree/raft"
+        else
+            echo "      - $host-data:/var/lib/fluree"
+        fi
     else
-        mkdir -p "$LOCAL_DIR/data/$host"
-        echo "      - ./data/$host:/var/lib/fluree"
+        if [ "$mode" = "raft" ]; then
+            mkdir -p "$LOCAL_DIR/data/shared"
+            mkdir -p "$LOCAL_DIR/data/$host-raft"
+            echo "      - ./data/shared:/var/lib/fluree/data"
+            echo "      - ./data/$host-raft:/var/lib/fluree/raft"
+        else
+            mkdir -p "$LOCAL_DIR/data/$host"
+            echo "      - ./data/$host:/var/lib/fluree"
+        fi
     fi
 }
 
