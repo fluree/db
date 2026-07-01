@@ -694,6 +694,9 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     "Loaded table metadata location"
                 );
 
+                // GCS-backed tables (S3-interop endpoint) are read through this
+                // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
+                // GCS HTTP/2 range-read bug cannot occur.
                 let storage = if let Some(ref credentials) = load_response.credentials {
                     info!(
                         region = ?iceberg_config.io.s3_region,
@@ -738,8 +741,11 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     "Loading table via direct S3 access"
                 );
 
-                // Direct mode: create storage once, share via Arc
-                let storage = Arc::new(
+                // Direct mode: create storage once, share via Arc. gs://-backed
+                // tables (GCS S3-interop endpoint) are read through the same S3
+                // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK
+                // HTTP/2 range-read bug against that endpoint.
+                let storage: Arc<S3IcebergStorage> = Arc::new(
                     S3IcebergStorage::from_default_chain(
                         iceberg_config.io.s3_region.as_deref(),
                         iceberg_config.io.s3_endpoint.as_deref(),

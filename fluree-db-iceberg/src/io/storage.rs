@@ -81,6 +81,60 @@ impl Debug for S3IcebergStorage {
     }
 }
 
+/// Build an HTTP client for the AWS S3 SDK pinned to **HTTP/1.1**.
+///
+/// GCS's S3-interoperability endpoint negotiates HTTP/2 via ALPN, and the
+/// smithy-rs body layer mishandles HTTP/2 range (`206 Partial Content`)
+/// responses — so every range-based Parquet read against a GCS-backed table
+/// fails while full-object GETs succeed. The `hyper-rustls` connector is built
+/// with **only** `.enable_http1()` and deliberately **no** `.enable_http2()`,
+/// which leaves the TLS ALPN protocol list empty: the client advertises no
+/// `h2`, the endpoint therefore cannot negotiate HTTP/2, and the exchange falls
+/// to HTTP/1.1, where range reads behave correctly. **Do not add
+/// `.enable_http2()` here** — it would put `h2` back in ALPN and reintroduce the
+/// range-read bug.
+///
+/// Response checksum validation is set to `WhenRequired` separately on the
+/// client config (see the constructors): the SDK's default `WhenSupported`
+/// validates an object-level checksum against the returned body, which fails on
+/// every partial range GET.
+///
+/// This keeps a single S3 storage path: the SDK still performs SigV4 signing
+/// (with correct key/path encoding), credential refresh, retries, and uses the
+/// shared disk cache. AWS S3 and S3-compatible stores serve range reads over
+/// HTTP/1.1 identically (S3's data plane is HTTP/1.1 only), so forcing HTTP/1.1
+/// is safe for every endpoint, not just GCS. Native root certificates are used
+/// (matching the SDK's default connector) so S3-compatible endpoints fronted by
+/// a private/enterprise CA keep working.
+#[cfg(feature = "aws")]
+fn http1_only_http_client() -> aws_sdk_s3::config::SharedHttpClient {
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .https_or_http()
+        .enable_http1() // HTTP/1.1 only — do NOT add .enable_http2() (see above).
+        .build();
+    aws_smithy_http_client::hyper_014::HyperClientBuilder::new().build(connector)
+}
+
+/// Format an error together with its full `source()` chain.
+///
+/// AWS SDK / smithy errors (`SdkError`, `ByteStreamError`) render as terse
+/// top-level strings like `"service error"` or `"streaming error"`; the useful
+/// detail (HTTP status, `NoSuchKey`, `SignatureDoesNotMatch`, TLS/connect
+/// failures) lives in the source chain. Walking it turns opaque failures into
+/// actionable messages — important for diagnosing GCS S3-interop misconfig.
+#[cfg(feature = "aws")]
+fn error_chain(err: &dyn std::error::Error) -> String {
+    use std::fmt::Write;
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(inner) = source {
+        let _ = write!(msg, ": {inner}");
+        source = inner.source();
+    }
+    msg
+}
+
 #[cfg(feature = "aws")]
 impl S3IcebergStorage {
     /// Resolve effective region/endpoint/path-style from vended credentials plus
@@ -168,8 +222,20 @@ impl S3IcebergStorage {
 
         let sdk_config = config_loader.load().await;
 
-        // Build S3 client, optionally with endpoint override
-        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+        // Build S3 client, optionally with endpoint override. Pin the transport
+        // to HTTP/1.1 so GCS-backed tables (S3-interop endpoint) can be read via
+        // this same SDK path — see `http1_only_http_client`.
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .http_client(http1_only_http_client())
+            // Range reads (Parquet footer + column chunks) can't be validated
+            // against an object-level checksum: the checksum covers the whole
+            // object, not the returned byte range. GCS returns such a checksum on
+            // every response, so the SDK's default `WhenSupported` validation
+            // fails every ranged GET with a body-checksum mismatch. Only validate
+            // when the operation explicitly requires it (never, for range GETs).
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            );
 
         if let Some(endpoint) = &endpoint {
             s3_config = s3_config.endpoint_url(endpoint);
@@ -210,8 +276,20 @@ impl S3IcebergStorage {
 
         let sdk_config = config_loader.load().await;
 
-        // Build S3 client with optional endpoint override
-        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+        // Build S3 client with optional endpoint override. Pin the transport to
+        // HTTP/1.1 so GCS-backed tables (S3-interop endpoint) can be read via
+        // this same SDK path — see `http1_only_http_client`.
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
+            .http_client(http1_only_http_client())
+            // Range reads (Parquet footer + column chunks) can't be validated
+            // against an object-level checksum: the checksum covers the whole
+            // object, not the returned byte range. GCS returns such a checksum on
+            // every response, so the SDK's default `WhenSupported` validation
+            // fails every ranged GET with a body-checksum mismatch. Only validate
+            // when the operation explicitly requires it (never, for range GETs).
+            .response_checksum_validation(
+                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+            );
 
         if let Some(ep) = endpoint {
             s3_config = s3_config.endpoint_url(ep);
@@ -245,17 +323,26 @@ impl S3IcebergStorage {
         }
     }
 
-    /// Parse S3 URI into (bucket, key).
+    /// Parse an object-store URI into (bucket, key).
     ///
     /// Supports formats:
     /// - `s3://bucket/key/path`
     /// - `s3a://bucket/key/path` (Hadoop style)
+    /// - `gs://bucket/key/path` (Google Cloud Storage, read via the GCS
+    ///   S3-interoperability endpoint). Iceberg metadata/manifests for GCS-backed
+    ///   tables reference `gs://` paths; when the storage endpoint is
+    ///   set to `storage.googleapis.com`, `gs://bucket/key` and `s3://bucket/key`
+    ///   address the same object, so the scheme is accepted and resolved against
+    ///   the configured endpoint.
     pub fn parse_s3_uri(path: &str) -> Result<(&str, &str)> {
         let path = path
             .strip_prefix("s3://")
             .or_else(|| path.strip_prefix("s3a://"))
+            .or_else(|| path.strip_prefix("gs://"))
             .ok_or_else(|| {
-                IcebergError::storage(format!("Invalid S3 URI (must start with s3://): {path}"))
+                IcebergError::storage(format!(
+                    "Invalid object-store URI (must start with s3://, s3a://, or gs://): {path}"
+                ))
             })?;
 
         let (bucket, key) = path.split_once('/').ok_or_else(|| {
@@ -281,13 +368,13 @@ impl S3IcebergStorage {
             .range(range_header)
             .send()
             .await
-            .map_err(|e| IcebergError::storage(format!("S3 GetObject failed: {e}")))?;
+            .map_err(|e| {
+                IcebergError::storage(format!("S3 GetObject failed: {}", error_chain(&e)))
+            })?;
 
-        let body = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| IcebergError::storage(format!("Failed to read S3 body: {e}")))?;
+        let body = response.body.collect().await.map_err(|e| {
+            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
+        })?;
 
         Ok(body.into_bytes())
     }
@@ -335,13 +422,13 @@ impl IcebergStorage for S3IcebergStorage {
             .key(key)
             .send()
             .await
-            .map_err(|e| IcebergError::storage(format!("S3 GetObject failed: {e}")))?;
+            .map_err(|e| {
+                IcebergError::storage(format!("S3 GetObject failed: {}", error_chain(&e)))
+            })?;
 
-        let body = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| IcebergError::storage(format!("Failed to read S3 body: {e}")))?;
+        let body = response.body.collect().await.map_err(|e| {
+            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
+        })?;
 
         Ok(body.into_bytes())
     }
@@ -361,7 +448,9 @@ impl IcebergStorage for S3IcebergStorage {
             .key(key)
             .send()
             .await
-            .map_err(|e| IcebergError::storage(format!("S3 HeadObject failed: {e}")))?;
+            .map_err(|e| {
+                IcebergError::storage(format!("S3 HeadObject failed: {}", error_chain(&e)))
+            })?;
 
         response
             .content_length()
@@ -383,13 +472,13 @@ impl SendIcebergStorage for S3IcebergStorage {
             .key(key)
             .send()
             .await
-            .map_err(|e| IcebergError::storage(format!("S3 GetObject failed: {e}")))?;
+            .map_err(|e| {
+                IcebergError::storage(format!("S3 GetObject failed: {}", error_chain(&e)))
+            })?;
 
-        let body = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| IcebergError::storage(format!("Failed to read S3 body: {e}")))?;
+        let body = response.body.collect().await.map_err(|e| {
+            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
+        })?;
 
         Ok(body.into_bytes())
     }
@@ -409,7 +498,9 @@ impl SendIcebergStorage for S3IcebergStorage {
             .key(key)
             .send()
             .await
-            .map_err(|e| IcebergError::storage(format!("S3 HeadObject failed: {e}")))?;
+            .map_err(|e| {
+                IcebergError::storage(format!("S3 HeadObject failed: {}", error_chain(&e)))
+            })?;
 
         response
             .content_length()
@@ -551,10 +642,29 @@ mod tests {
         assert_eq!(bucket, "bucket");
         assert_eq!(key, "key");
 
+        // GCS scheme (read via the S3-interop endpoint) — Iceberg metadata for
+        // GCS-backed tables references gs:// paths.
+        let (bucket, key) =
+            S3IcebergStorage::parse_s3_uri("gs://my-bucket/iceberg/t/metadata/v1.metadata.json")
+                .unwrap();
+        assert_eq!(bucket, "my-bucket");
+        assert_eq!(key, "iceberg/t/metadata/v1.metadata.json");
+
         // Invalid URIs
         assert!(S3IcebergStorage::parse_s3_uri("http://bucket/key").is_err());
         assert!(S3IcebergStorage::parse_s3_uri("s3://bucket").is_err());
         assert!(S3IcebergStorage::parse_s3_uri("s3:///key").is_err());
+    }
+
+    // Building the HTTP/1.1-pinned client exercises the hyper-rustls connector
+    // and the hyper-014 client builder. rustls 0.21 (via hyper-rustls 0.24)
+    // links `ring` directly, so no crypto provider needs installing — this test
+    // makes a feature-gate regression or a missing-provider panic fail loudly
+    // here instead of at the first S3 request.
+    #[test]
+    #[cfg(feature = "aws")]
+    fn test_http1_only_client_builds() {
+        let _client = super::http1_only_http_client();
     }
 
     #[cfg(feature = "aws")]
