@@ -53,7 +53,7 @@ const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
 
 /// Whether row-group / row-level predicate pushdown is enabled. Read once from
 /// `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` (only `0`/`false`/`off` disable it).
-fn predicate_pushdown_enabled() -> bool {
+pub(crate) fn predicate_pushdown_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(
         || match std::env::var("FLUREE_ICEBERG_PREDICATE_PUSHDOWN") {
@@ -1236,5 +1236,170 @@ mod tests {
             _ => panic!("bday not Date"),
         });
         assert_eq!(bday, vec![Some(100), Some(200), Some(300)]);
+    }
+
+    /// A whole-file scan task for an in-memory Parquet blob (empty projection =>
+    /// all columns), with an optional residual pushdown predicate and optional
+    /// Iceberg schema (needed for field_id → column resolution when the fixture
+    /// carries no embedded Parquet field IDs).
+    #[cfg(feature = "arrow")]
+    fn whole_file_task(
+        bytes: &Bytes,
+        residual: Option<Expression>,
+        schema: Option<Arc<Schema>>,
+    ) -> FileScanTask {
+        let data_file = crate::manifest::DataFile {
+            file_path: "mem://fixture.parquet".to_string(),
+            file_format: crate::manifest::FileFormat::Parquet,
+            record_count: 0,
+            file_size_in_bytes: bytes.len() as i64,
+            partition: crate::manifest::PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        match schema {
+            Some(s) => FileScanTask::for_whole_file_with_schema(data_file, vec![], residual, s),
+            None => FileScanTask::for_whole_file(data_file, vec![], residual),
+        }
+    }
+
+    /// Build a minimal Iceberg schema from `(name, type)` fields, ids assigned by
+    /// position (matching the fixtures' column order).
+    #[cfg(feature = "arrow")]
+    fn schema_of(fields: &[(&str, &str)]) -> Arc<Schema> {
+        use crate::metadata::SchemaField;
+        Arc::new(Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: fields
+                .iter()
+                .enumerate()
+                .map(|(i, (name, ty))| SchemaField {
+                    id: i as i32,
+                    name: name.to_string(),
+                    required: false,
+                    field_type: serde_json::json!(ty),
+                    doc: None,
+                })
+                .collect(),
+        })
+    }
+
+    /// A single-row-group Parquet with an `xsd:integer`-style column physically
+    /// stored as `DECIMAL(9,0)` (INT32-backed) — how Iceberg materializes small
+    /// integers. Columns: id=0, year=1. Rows: (1,2020) (2,2024) (3,null).
+    #[cfg(feature = "arrow")]
+    fn decimal_backed_int_parquet() -> Bytes {
+        use parquet::data_type::{Int32Type, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = "
+            message schema {
+              OPTIONAL INT64 id;
+              OPTIONAL INT32 year (DECIMAL(9,0));
+            }";
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            let mut rg = writer.next_row_group().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<Int64Type>()
+                .write_batch(&[1, 2, 3], Some(&[1, 1, 1]), None)
+                .unwrap();
+            c.close().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<Int32Type>()
+                .write_batch(&[2020, 2024], Some(&[1, 1, 0]), None)
+                .unwrap();
+            c.close().unwrap();
+            rg.close().unwrap();
+            writer.close().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// Arrow row filter drops rows that fail the predicate and rows whose filter
+    /// column is null (an R2RML null column produces no triple). Arrow-only: the
+    /// RowIter path does row-group pruning but not row-level filtering.
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn read_task_row_filter_drops_nonmatching_and_null_rows() {
+        use crate::io::batch::Column;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        // age (field_id 2) >= 20
+        let residual = Expression::Comparison {
+            field_id: 2,
+            column: "age".to_string(),
+            op: crate::scan::predicate::ComparisonOp::GtEq,
+            value: crate::scan::predicate::LiteralValue::Int64(20),
+        };
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ]);
+        let task = whole_file_task(&bytes, Some(residual), Some(schema));
+        let batches = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect("decode");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        // age 10 dropped, age 20 kept, age null dropped.
+        assert_eq!(ids, vec![Some(2)]);
+    }
+
+    /// The Decimal landmine: an `xsd:integer` column is physically `DECIMAL`, so
+    /// an `Int64` literal must be cast to the column's decimal type before
+    /// comparison. A naive raw compare dropped every row; this asserts the one
+    /// matching row survives. Arrow-only.
+    #[cfg(feature = "arrow")]
+    #[tokio::test]
+    async fn read_task_row_filter_handles_decimal_backed_integer() {
+        use crate::io::batch::Column;
+
+        let bytes = decimal_backed_int_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        // year (field_id 1) >= 2024, literal is a plain integer.
+        let residual = Expression::Comparison {
+            field_id: 1,
+            column: "year".to_string(),
+            op: crate::scan::predicate::ComparisonOp::GtEq,
+            value: crate::scan::predicate::LiteralValue::Int64(2024),
+        };
+        let schema = schema_of(&[("id", "long"), ("year", "decimal(9, 0)")]);
+        let task = whole_file_task(&bytes, Some(residual), Some(schema));
+        let batches = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect("decode");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        // year 2020 dropped, year 2024 kept, year null dropped.
+        assert_eq!(ids, vec![Some(2)], "decimal-backed integer filter mismatch");
     }
 }
