@@ -28,11 +28,14 @@ use crate::io::batch::ColumnBatch;
 use crate::io::chunk_reader::RangeBackedChunkReader;
 use crate::io::parquet::{
     build_batch_schema, build_batch_schema_with_iceberg, build_columns_from_values,
-    build_projected_schema, calculate_column_chunk_ranges, convert_field_to_column_value,
-    parse_parquet_metadata_from_bytes, ColumnValue, ParquetFooterCache, NULL_COLUMN_SENTINEL,
+    build_field_id_to_column_mapping, build_projected_schema, calculate_column_chunk_ranges,
+    convert_field_to_column_value, parse_parquet_metadata_from_bytes, ColumnValue,
+    ParquetFooterCache, NULL_COLUMN_SENTINEL,
 };
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
+use crate::scan::predicate::Expression;
+use crate::scan::pruning::row_group_can_contain;
 use crate::scan::FileScanTask;
 
 use parquet::file::metadata::ParquetMetaData;
@@ -41,6 +44,53 @@ use parquet::file::serialized_reader::SerializedFileReader;
 
 /// Parquet magic bytes (footer ends with "PAR1").
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+
+/// Whether row-group / row-level predicate pushdown is enabled. Read once from
+/// `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` (only `0`/`false`/`off` disable it).
+fn predicate_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_PREDICATE_PUSHDOWN") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// The row groups to decode: those whose column statistics do not rule out
+/// `residual`. Returns every row group (no pruning) when pushdown is disabled or
+/// there is no residual filter. Pruning is conservative — a row group is dropped
+/// only when its min/max bounds prove no row can match, so results are unchanged.
+fn surviving_row_groups(
+    metadata: &ParquetMetaData,
+    residual: Option<&Expression>,
+    iceberg_schema: Option<&Schema>,
+) -> Vec<usize> {
+    let n = metadata.num_row_groups();
+    let Some(expr) = residual.filter(|_| predicate_pushdown_enabled()) else {
+        return (0..n).collect();
+    };
+    let field_to_col =
+        build_field_id_to_column_mapping(metadata.file_metadata().schema(), iceberg_schema);
+    let mut keep = Vec::with_capacity(n);
+    for rg in 0..n {
+        if row_group_can_contain(expr, metadata.row_group(rg), &field_to_col) {
+            keep.push(rg);
+        }
+    }
+    let pruned = n - keep.len();
+    if pruned > 0 {
+        tracing::debug!(
+            row_groups_total = n,
+            row_groups_pruned = pruned,
+            "Row-group pruning skipped non-matching row groups"
+        );
+    }
+    keep
+}
 
 /// Maximum file size for sparse buffer allocation (64MB).
 ///
@@ -378,8 +428,16 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
 
         let mut batches = Vec::new();
 
-        // Process each row group separately to emit streaming batches
-        for rg_idx in 0..metadata.num_row_groups() {
+        // Row-group pruning: skip groups whose statistics rule out the residual
+        // filter (safe — bounds only exclude non-matching rows).
+        let surviving = surviving_row_groups(
+            metadata,
+            task.residual_filter.as_ref(),
+            task.iceberg_schema.as_deref(),
+        );
+
+        // Process each surviving row group separately to emit streaming batches
+        for rg_idx in surviving {
             let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
                 IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
             })?;
@@ -450,6 +508,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         let path = task.data_file.file_path.clone();
         let file_size = task.data_file.file_size_in_bytes as u64;
         let projected_field_ids = task.projected_field_ids.clone();
+        let residual_filter = task.residual_filter.clone();
         let iceberg_schema = task.iceberg_schema.clone();
         let runtime = Handle::current();
 
@@ -467,6 +526,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     path,
                     file_size,
                     projected_field_ids,
+                    residual_filter,
                     iceberg_schema,
                     runtime,
                 )
@@ -501,6 +561,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         path,
                         file_size,
                         projected_field_ids,
+                        residual_filter,
                         iceberg_schema,
                         runtime,
                     )
@@ -516,6 +577,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             path,
             file_size,
             projected_field_ids,
+            residual_filter,
             iceberg_schema,
             runtime,
         )
@@ -531,6 +593,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         path: String,
         file_size: u64,
         projected_field_ids: Vec<i32>,
+        residual_filter: Option<Expression>,
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
     ) -> Result<Vec<ColumnBatch>> {
@@ -582,8 +645,18 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
 
             let mut batches = Vec::new();
 
-            // Process each row group
-            for rg_idx in 0..metadata.num_row_groups() {
+            // Row-group pruning: skip groups whose statistics rule out the
+            // residual filter. For this range-backed reader, a skipped group's
+            // column chunks are never requested, so the on-demand reads are
+            // avoided too.
+            let surviving = surviving_row_groups(
+                metadata,
+                residual_filter.as_ref(),
+                iceberg_schema.as_deref(),
+            );
+
+            // Process each surviving row group
+            for rg_idx in surviving {
                 let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
                     IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
                 })?;

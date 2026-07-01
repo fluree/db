@@ -30,6 +30,7 @@ use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{FlakeValue, LedgerSnapshot};
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
@@ -54,6 +55,11 @@ pub struct R2rmlRewriteResult {
 /// * `patterns` - The patterns to rewrite
 /// * `graph_source_id` - The graph source alias (e.g., "airlines-gs:main")
 /// * `snapshot` - Database for Sid-to-IRI conversion
+/// * `mapping` - The compiled R2RML mapping, when available. Used to decide
+///   whether a same-subject `rdf:type` may be safely fused into a star scan
+///   (see [`class_fusion_is_safe`]). `None` disables class fusion — always
+///   correct, just less optimal — so callers that can cheaply load the mapping
+///   should pass it.
 ///
 /// # Returns
 ///
@@ -62,6 +68,7 @@ pub fn rewrite_patterns_for_r2rml(
     patterns: &[Pattern],
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
+    mapping: Option<&CompiledR2rmlMapping>,
 ) -> R2rmlRewriteResult {
     let mut result_patterns = Vec::with_capacity(patterns.len());
     let mut converted = 0;
@@ -71,6 +78,11 @@ pub fn rewrite_patterns_for_r2rml(
     // (const predicate + fresh object var) by subject so they can be merged into
     // a single scan, eliminating the O(N^2) self-join. First-seen order preserved.
     let mut star_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
+    // Same-subject `rdf:type` patterns, by subject. A single class per subject is
+    // fused into that subject's star (constraining its TriplesMap resolution to
+    // the class and dropping a redundant correlated re-scan); a subject with no
+    // star members, or multiple classes, is emitted as a subject-only scan.
+    let mut class_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
 
     for pattern in patterns {
         match pattern {
@@ -86,6 +98,16 @@ pub fn rewrite_patterns_for_r2rml(
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
                                 star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                            }
+                        }
+                    } else if is_class_only(&r2rml_pattern) {
+                        match class_groups
+                            .iter_mut()
+                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
+                        {
+                            Some((_, members)) => members.push(r2rml_pattern),
+                            None => {
+                                class_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
                             }
                         }
                     } else {
@@ -107,7 +129,7 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
-                    let r = rewrite_patterns_for_r2rml(&inner, graph_source_id, snapshot);
+                    let r = rewrite_patterns_for_r2rml(&inner, graph_source_id, snapshot, mapping);
                     converted += r.converted_count;
                     unconverted += r.unconverted_count;
                     r.patterns
@@ -138,9 +160,14 @@ pub fn rewrite_patterns_for_r2rml(
 
     // Emit star groups. Single-member groups stay on the normal single-object
     // path; multi-member groups with distinct object vars merge into one scan.
-    for (_subject, mut members) in star_groups {
+    // A same-subject `rdf:type` is fused into the base by setting its
+    // `class_filter`, which constrains TriplesMap resolution to the class and
+    // removes the separate class operator's correlated re-scan.
+    for (subject, mut members) in star_groups {
         if members.len() == 1 {
-            result_patterns.push(Pattern::R2rml(members.pop().unwrap()));
+            let mut base = members.pop().unwrap();
+            fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
+            result_patterns.push(Pattern::R2rml(base));
             continue;
         }
         let mut seen_obj = HashSet::new();
@@ -149,12 +176,15 @@ pub fn rewrite_patterns_for_r2rml(
             .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
         if !distinct {
             // Shared object var implies a self-join constraint; keep separate.
+            // Leave any same-subject class pattern in `class_groups` so it is
+            // emitted as a subject-only scan below.
             for m in members {
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
         }
         let mut base = members.remove(0);
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
         base.star_bindings = members
             .into_iter()
             .map(|m| {
@@ -165,6 +195,15 @@ pub fn rewrite_patterns_for_r2rml(
             })
             .collect();
         result_patterns.push(Pattern::R2rml(base));
+    }
+
+    // Class patterns not fused into a star (no same-subject star members, or
+    // multiple classes on one subject) become subject-only scans: the operator
+    // projects only the subject columns and scans no RefObjectMap parents.
+    for (_subject, members) in class_groups {
+        for m in members {
+            result_patterns.push(Pattern::R2rml(m));
+        }
     }
 
     // Attach pushable FILTER comparisons to the R2RML pattern that produces
@@ -283,6 +322,88 @@ fn is_star_eligible(p: &R2rmlPattern) -> bool {
         }
 }
 
+/// A pure `rdf:type` pattern (`?s a ex:Class`): a class filter, no object var, no
+/// predicate, no star members. These are candidates to fuse into a same-subject
+/// star (or, failing that, to run as a subject-only scan).
+fn is_class_only(p: &R2rmlPattern) -> bool {
+    p.class_filter.is_some()
+        && p.object_var.is_none()
+        && p.predicate_filter.is_none()
+        && p.triples_map_iri.is_none()
+        && p.star_bindings.is_empty()
+}
+
+/// Fuse a subject's lone `rdf:type` into its star `base` by setting
+/// `base.class_filter`, but only when doing so cannot change the result set.
+///
+/// Fusion constrains TriplesMap resolution in
+/// [`operator::build_progress`](super::operator) to maps that satisfy the class
+/// **and** the star's base predicate. That is only equivalent to the pre-fusion
+/// two-pattern plan (a subject-only class scan joined with the predicate scan)
+/// when the class and predicate co-locate in the same TriplesMap. A vertically
+/// partitioned mapping (`TM_A` = subject+class, `TM_B` = subject+predicate, same
+/// subject template) has no single map with both, so a fused scan resolves zero
+/// maps and silently returns no rows (fluree/db#1406 review).
+///
+/// So fuse only when [`class_fusion_is_safe`] holds; otherwise leave the class
+/// pattern in `class_groups` to be emitted as its own subject-only scan, which
+/// the engine joins on the shared subject — the always-correct pre-fusion path.
+/// Fusion is also skipped when the subject carries more than one class (a single
+/// `class_filter` cannot represent them) or when the mapping is unavailable.
+fn fuse_class_if_safe(
+    base: &mut R2rmlPattern,
+    class_groups: &mut Vec<(VarId, Vec<R2rmlPattern>)>,
+    subject: VarId,
+    mapping: Option<&CompiledR2rmlMapping>,
+) {
+    let Some(idx) = class_groups.iter().position(|(s, _)| *s == subject) else {
+        return;
+    };
+    if class_groups[idx].1.len() != 1 {
+        return;
+    }
+    let Some(class) = class_groups[idx].1[0].class_filter.clone() else {
+        return;
+    };
+    // The base predicate drives TriplesMap selection; a star always has one.
+    let Some(base_pred) = base.predicate_filter.as_deref() else {
+        return;
+    };
+    if !mapping.is_some_and(|m| class_fusion_is_safe(m, &class, base_pred)) {
+        return;
+    }
+    class_groups.remove(idx);
+    base.class_filter = Some(class);
+}
+
+/// Whether fusing `class_iri` into the star for `base_predicate` preserves the
+/// result set: every TriplesMap that resolves `base_predicate` must also declare
+/// the class. Then adding the class as a TriplesMap-selection constraint cannot
+/// drop any map the predicate scan would otherwise select, and every scanned row
+/// genuinely carries the class. If some predicate map lacks the class (the
+/// vertically partitioned / split-TriplesMap shape), fusion is unsafe.
+fn class_fusion_is_safe(
+    mapping: &CompiledR2rmlMapping,
+    class_iri: &str,
+    base_predicate: &str,
+) -> bool {
+    let mut saw_predicate_map = false;
+    for tm in mapping.triples_maps.values() {
+        let has_predicate = tm
+            .predicate_object_maps
+            .iter()
+            .any(|pom| pom.predicate_map.as_constant() == Some(base_predicate));
+        if !has_predicate {
+            continue;
+        }
+        saw_predicate_map = true;
+        if !tm.classes().iter().any(|c| c == class_iri) {
+            return false;
+        }
+    }
+    saw_predicate_map
+}
+
 /// Convert a triple pattern to an R2RML pattern.
 ///
 /// Returns `None` if the pattern cannot be converted (e.g., subject is a literal).
@@ -385,5 +506,71 @@ mod tests {
         assert!(tp.s.is_var());
         assert!(tp.p.is_var());
         assert!(tp.o.is_var());
+    }
+
+    use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap};
+
+    const CLASS: &str = "http://example.org/Person";
+    const PRED: &str = "http://example.org/name";
+
+    fn pom(pred: &str, col: &str) -> PredicateObjectMap {
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant(pred),
+            object_map: ObjectMap::column(col),
+        }
+    }
+
+    #[test]
+    fn class_fusion_safe_when_class_and_predicate_colocate() {
+        // One TriplesMap declares the class and the predicate — the star-schema
+        // shape fusion optimizes for.
+        let tm = TriplesMap::new("#TM", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        assert!(class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    #[test]
+    fn class_fusion_unsafe_when_split_across_triples_maps() {
+        // Vertically partitioned: TM_A holds the class, TM_B holds the predicate,
+        // sharing a subject template. No single map has both, so fusing the class
+        // into the predicate star would resolve zero maps → silent empty result.
+        let tm_class = TriplesMap::new("#TM_A", "people_class")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS);
+        let tm_pred = TriplesMap::new("#TM_B", "people_name")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "name"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_class, tm_pred]);
+        assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    #[test]
+    fn class_fusion_unsafe_when_a_predicate_map_lacks_the_class() {
+        // One predicate map co-locates the class, another resolves the same
+        // predicate without it. Fusing would drop rows from the classless map.
+        let tm_both = TriplesMap::new("#TM_both", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let tm_pred_only = TriplesMap::new("#TM_pred", "aliases")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "alias"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_both, tm_pred_only]);
+        assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    #[test]
+    fn class_fusion_unsafe_when_no_map_resolves_the_predicate() {
+        // Guards against fusing (and thus dropping the separate class scan) when
+        // the predicate resolves nowhere — the result must stay whatever the
+        // unfused plan produces, not silently collapse.
+        let tm = TriplesMap::new("#TM", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS);
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
     }
 }

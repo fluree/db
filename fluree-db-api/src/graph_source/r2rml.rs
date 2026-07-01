@@ -47,6 +47,20 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
     cpus.min(num_files.max(1)).clamp(1, 8)
 }
 
+/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
+/// catalog client cache. A config *edit* (including a secret written inline)
+/// yields a new fingerprint and a freshly built client. Note this hashes the raw
+/// JSON only: a secret referenced by env var / secret store is stored as that
+/// reference, so rotating the underlying secret leaves the fingerprint unchanged
+/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
+/// fingerprint, is what bounds staleness in that case.
+fn config_fingerprint(config: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    config.hash(&mut h);
+    h.finish()
+}
+
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
 /// file pruning. Filters on unknown columns are skipped; an empty result is
 /// `None`. Conservative — pruning never drops matching rows because the
@@ -399,12 +413,20 @@ impl crate::Fluree {
 /// ```
 pub struct FlureeR2rmlProvider<'a> {
     fluree: &'a crate::Fluree,
+    /// Query-scoped catalog state. The provider is constructed once per query, so
+    /// this caches the REST client (OAuth token) and `loadTable` responses for
+    /// the lifetime of one query — collapsing the per-scan REST round-trip storm
+    /// and pinning a single Iceberg snapshot across the query.
+    session: std::sync::Arc<super::catalog_session::IcebergCatalogSession>,
 }
 
 impl<'a> FlureeR2rmlProvider<'a> {
     /// Create a new R2RML provider wrapping a Fluree instance.
     pub fn new(fluree: &'a crate::Fluree) -> Self {
-        Self { fluree }
+        Self {
+            fluree,
+            session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
+        }
     }
 }
 
@@ -659,40 +681,119 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 auth,
                 ..
             } => {
-                info!(
-                    catalog_uri = %uri,
-                    namespace = %table_id.namespace,
-                    table = %table_id.table,
-                    "Loading table from REST catalog"
+                let cache = self.fluree.r2rml_cache();
+
+                // Process-wide REST client keyed by the source config fingerprint:
+                // its OAuth `CachedToken` and HTTPS connection pool are reused
+                // across queries, so a warm server does one token exchange per
+                // ~hour instead of one per query. The fingerprint hashes the full
+                // source config, so a rotated PAT (or any config change) builds a
+                // fresh client.
+                let client_fp = format!(
+                    "{graph_source_id}\u{1f}{:016x}",
+                    config_fingerprint(&record.config)
                 );
-
-                let auth_provider = auth.create_provider_arc().map_err(|e| {
-                    QueryError::Internal(format!("Failed to create auth provider: {e}"))
-                })?;
-
-                let catalog_config = RestCatalogConfig {
-                    uri: uri.clone(),
-                    warehouse: warehouse.clone(),
-                    ..Default::default()
+                let catalog = match cache.rest_client(&client_fp) {
+                    Some(c) => c,
+                    None => {
+                        let auth_provider = auth.create_provider_arc().map_err(|e| {
+                            QueryError::Internal(format!("Failed to create auth provider: {e}"))
+                        })?;
+                        let catalog_config = RestCatalogConfig {
+                            uri: uri.clone(),
+                            warehouse: warehouse.clone(),
+                            ..Default::default()
+                        };
+                        let client = Arc::new(
+                            RestCatalogClient::new(catalog_config, auth_provider).map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to create catalog client: {e}"
+                                ))
+                            })?,
+                        );
+                        cache.put_rest_client(client_fp, Arc::clone(&client));
+                        client
+                    }
                 };
 
-                let catalog =
-                    RestCatalogClient::new(catalog_config, auth_provider).map_err(|e| {
-                        QueryError::Internal(format!("Failed to create catalog client: {e}"))
-                    })?;
-
-                let load_response = catalog
-                    .load_table(&table_id, iceberg_config.io.vended_credentials)
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to load table from catalog: {e}"))
-                    })?;
-
-                info!(
-                    metadata_location = %load_response.metadata_location,
-                    has_credentials = load_response.credentials.is_some(),
-                    "Loaded table metadata location"
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
                 );
+
+                // Resolve `loadTable`, cheapest first: (1) the per-query pin (one
+                // snapshot for the whole query); (2) the cross-query cache (skips
+                // the ~1.3–3s catalog GET, TTL + creds gated); (3) a real REST
+                // load, which populates both caches.
+                let load_response = if let Some(cached) = self.session.cached_load_table(&lt_key) {
+                    debug!(namespace = %table_id.namespace, table = %table_id.table,
+                        "loadTable pin hit (query-scoped)");
+                    cached
+                } else {
+                    let pinned = self.session.pinned_metadata_location(&lt_key);
+                    // A cross-query hit applies only on the FIRST resolution of
+                    // this table in the query. Once pinned, a reload is a creds
+                    // refresh that must keep the pinned snapshot.
+                    let cross_query = if pinned.is_none() {
+                        cache.get_rest_load_table(&lt_key)
+                    } else {
+                        None
+                    };
+                    let mut resp = if let Some(cq) = cross_query {
+                        debug!(namespace = %table_id.namespace, table = %table_id.table,
+                            "loadTable cache hit (cross-query)");
+                        cq.to_response()
+                    } else {
+                        info!(catalog_uri = %uri, namespace = %table_id.namespace,
+                            table = %table_id.table, "Loading table from REST catalog");
+                        let actual = catalog
+                            .load_table(&table_id, iceberg_config.io.vended_credentials)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to load table from catalog: {e}"
+                                ))
+                            })?;
+                        // The cross-query cache reflects the CURRENT catalog state
+                        // (never this query's pin), so other queries see the newest
+                        // snapshot within the TTL.
+                        cache.put_rest_load_table(
+                            lt_key.clone(),
+                            Arc::new(super::catalog_session::CachedLoadTable::from_response(
+                                &actual,
+                            )),
+                        );
+                        // This query keeps its pinned snapshot across a creds
+                        // refresh: vended creds are bucket/prefix-scoped, so the
+                        // fresh creds still read the pinned snapshot's immutable
+                        // data files.
+                        let mut r = actual;
+                        if let Some(ref pinned_loc) = pinned {
+                            if *pinned_loc != r.metadata_location {
+                                debug!(pinned = %pinned_loc, reloaded = %r.metadata_location,
+                                    "Refreshed vended credentials; keeping the query's pinned snapshot");
+                                r.metadata_location = pinned_loc.clone();
+                            }
+                        }
+                        info!(metadata_location = %r.metadata_location,
+                            has_credentials = r.credentials.is_some(), "Loaded table metadata location");
+                        r
+                    };
+                    self.session.store_load_table(lt_key.clone(), &resp);
+                    // Converge on the pinned snapshot. `store_load_table` keeps the
+                    // first writer's `metadata_location`, so if a concurrent first
+                    // load of this table pinned a different location between our
+                    // pin check above and this store, adopt the winning pin rather
+                    // than scan our own freshly loaded location — otherwise two
+                    // scans in one query could read different snapshots
+                    // (fluree/db#1406 review). Sequential execution makes this a
+                    // no-op; it holds the invariant unconditionally.
+                    if let Some(pinned_loc) = self.session.pinned_metadata_location(&lt_key) {
+                        resp.metadata_location = pinned_loc;
+                    }
+                    resp
+                };
 
                 let storage = if let Some(ref credentials) = load_response.credentials {
                     info!(

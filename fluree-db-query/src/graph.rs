@@ -43,8 +43,28 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 // Note: tracing::debug removed to fix compilation - add tracing dependency if needed
+
+/// Best-effort load of the compiled R2RML mapping for `graph_iri`, used only to
+/// let [`rewrite_patterns_for_r2rml`] decide whether a same-subject `rdf:type`
+/// may be safely fused into a star scan. Returns `None` (which disables class
+/// fusion but stays correct) when there is no provider or the load fails; the
+/// R2RML operator loads the mapping again at setup, so within a query this is a
+/// cache hit under the query-scoped catalog session.
+async fn r2rml_mapping_for_rewrite(
+    ctx: &ExecutionContext<'_>,
+    graph_iri: &str,
+) -> Option<Arc<CompiledR2rmlMapping>> {
+    let provider = ctx.r2rml_provider?;
+    let as_of_t = if ctx.dataset.is_some() {
+        None
+    } else {
+        Some(ctx.to_t)
+    };
+    provider.compiled_mapping(graph_iri, as_of_t).await.ok()
+}
 
 /// GRAPH pattern operator - scopes inner patterns to a specific graph
 ///
@@ -69,6 +89,11 @@ pub struct GraphOperator {
     buffer_pos: usize,
     /// Planning context captured at planner-time for the per-row inner subplan.
     planning: PlanningContext,
+    /// LIMIT budget forwarded from a downstream `LIMIT` (via row-preserving
+    /// operators). Threaded into the per-parent-batch inner subplan so a scan
+    /// under a GRAPH wrapper (notably an R2RML graph source) can early-terminate
+    /// instead of draining the whole table into `result_buffer`.
+    row_budget: Option<usize>,
 }
 
 impl GraphOperator {
@@ -121,6 +146,7 @@ impl GraphOperator {
             result_buffer: Vec::new(),
             buffer_pos: 0,
             planning,
+            row_budget: None,
         }
     }
 
@@ -201,8 +227,13 @@ impl GraphOperator {
         // Determine which patterns to use (rewritten for R2RML or original)
         let patterns_to_execute: std::borrow::Cow<'_, [Pattern]> = if is_r2rml_gs {
             // Rewrite triple patterns to R2RML patterns
-            let rewrite_result =
-                rewrite_patterns_for_r2rml(&self.inner_patterns, &graph_iri, ctx.active_snapshot);
+            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+            let rewrite_result = rewrite_patterns_for_r2rml(
+                &self.inner_patterns,
+                &graph_iri,
+                ctx.active_snapshot,
+                mapping.as_deref(),
+            );
 
             // If there are unconverted patterns in an R2RML graph source, return an error.
             // R2RML graph sources don't have ledger-backed indexes, so unconverted patterns
@@ -234,6 +265,9 @@ impl GraphOperator {
             &self.planning,
         )?;
 
+        if let Some(budget) = self.row_budget {
+            inner.set_row_budget(budget);
+        }
         inner.open(&graph_ctx).await?;
 
         // NumBig arena handles are scoped per (graph, predicate). When this
@@ -343,8 +377,13 @@ impl GraphOperator {
             graph_ctx.eager_materialization = true;
         }
 
-        let rewrite_result =
-            rewrite_patterns_for_r2rml(&self.inner_patterns, &graph_iri, ctx.active_snapshot);
+        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
+        let rewrite_result = rewrite_patterns_for_r2rml(
+            &self.inner_patterns,
+            &graph_iri,
+            ctx.active_snapshot,
+            mapping.as_deref(),
+        );
         if rewrite_result.unconverted_count > 0 {
             return Err(crate::error::QueryError::InvalidQuery(format!(
                 "R2RML graph source '{}' contains {} pattern(s) that cannot be converted \
@@ -361,6 +400,13 @@ impl GraphOperator {
             None,
             &self.planning,
         )?;
+        // Forward a downstream LIMIT budget so the inner scan early-terminates
+        // instead of draining the whole table into `result_buffer`. Correctness
+        // is bounded by the outer LIMIT; a per-parent-batch budget can over-read
+        // across parent batches but never under-reads.
+        if let Some(budget) = self.row_budget {
+            inner.set_row_budget(budget);
+        }
         inner.open(&graph_ctx).await?;
 
         let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
@@ -457,6 +503,14 @@ impl Operator for GraphOperator {
     }
     fn schema(&self) -> &[VarId] {
         &self.schema
+    }
+
+    fn set_row_budget(&mut self, budget: usize) {
+        // Record the budget and thread it into the per-parent-batch inner subplan
+        // (see the execute helpers). Do NOT forward to `self.child`: the child
+        // produces parent rows that seed the correlated inner execution, which is
+        // not row-preserving, so it must still yield every row the inner needs.
+        self.row_budget = Some(budget);
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
