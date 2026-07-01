@@ -1103,6 +1103,19 @@ fn parse_selection_level(
             JsonValue::String(s) if s == "@id" || s == "id" || s == ctx.context.id_key.as_str() => {
                 forward.push(UnresolvedForwardItem::Id);
             }
+            // Explicit @type selection on a node is an alias for the rdf:type
+            // predicate, so `["@id", "@type"]` behaves identically to
+            // `["@id", "rdf:type"]` and the `*` wildcard (both surface types).
+            // On a literal value, the hydration formatter re-interprets an
+            // rdf:type forward item as "emit the literal's datatype".
+            JsonValue::String(s)
+                if s == "@type" || s == "type" || s == ctx.context.type_key.as_str() =>
+            {
+                forward.push(UnresolvedForwardItem::Property {
+                    predicate: node_map::RDF_TYPE.to_string(),
+                    sub_spec: None,
+                });
+            }
             // Property name: "ex:name" or inline "@reverse:ex:friend"
             JsonValue::String(s) => {
                 if let Some(rev_iri) = parse_inline_reverse_key(s, ctx)? {
@@ -1138,6 +1151,17 @@ fn parse_selection_level(
 
                 if let Some(rev_iri) = parse_inline_reverse_key(pred_str, ctx)? {
                     reverse.insert(rev_iri, nested);
+                } else if pred_str == "@type"
+                    || pred_str == "type"
+                    || pred_str == ctx.context.type_key.as_str()
+                {
+                    // Nested `{"@type": [...]}` selects rdf:type, same as the
+                    // bare `"@type"` string form. Type values always render as
+                    // compact IRI strings, so any sub-spec is inert here.
+                    forward.push(UnresolvedForwardItem::Property {
+                        predicate: node_map::RDF_TYPE.to_string(),
+                        sub_spec: nested,
+                    });
                 } else {
                     let (expanded, entry) = ctx.expand_vocab(pred_str)?;
                     let context_reverse = entry.as_ref().and_then(|e| e.reverse.as_ref());
