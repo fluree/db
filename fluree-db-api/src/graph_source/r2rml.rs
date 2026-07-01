@@ -48,8 +48,12 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
 }
 
 /// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
-/// catalog client cache, so a rotated PAT (or any config change) yields a new
-/// fingerprint and a freshly built client.
+/// catalog client cache. A config *edit* (including a secret written inline)
+/// yields a new fingerprint and a freshly built client. Note this hashes the raw
+/// JSON only: a secret referenced by env var / secret store is stored as that
+/// reference, so rotating the underlying secret leaves the fingerprint unchanged
+/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
+/// fingerprint, is what bounds staleness in that case.
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -736,7 +740,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     } else {
                         None
                     };
-                    let resp = if let Some(cq) = cross_query {
+                    let mut resp = if let Some(cq) = cross_query {
                         debug!(namespace = %table_id.namespace, table = %table_id.table,
                             "loadTable cache hit (cross-query)");
                         cq.to_response()
@@ -776,7 +780,18 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                             has_credentials = r.credentials.is_some(), "Loaded table metadata location");
                         r
                     };
-                    self.session.store_load_table(lt_key, &resp);
+                    self.session.store_load_table(lt_key.clone(), &resp);
+                    // Converge on the pinned snapshot. `store_load_table` keeps the
+                    // first writer's `metadata_location`, so if a concurrent first
+                    // load of this table pinned a different location between our
+                    // pin check above and this store, adopt the winning pin rather
+                    // than scan our own freshly loaded location — otherwise two
+                    // scans in one query could read different snapshots
+                    // (fluree/db#1406 review). Sequential execution makes this a
+                    // no-op; it holds the invariant unconditionally.
+                    if let Some(pinned_loc) = self.session.pinned_metadata_location(&lt_key) {
+                        resp.metadata_location = pinned_loc;
+                    }
                     resp
                 };
 

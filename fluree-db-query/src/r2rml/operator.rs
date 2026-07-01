@@ -761,6 +761,22 @@ impl R2rmlScanOperator {
                     ctx,
                 )?;
             }
+            // Geometric window growth. A budgeted (LIMIT) scan starts with a small
+            // window (~the remaining budget) so a selective query does not explode
+            // a full window into bindings before the first output row. But when the
+            // produced rows feed an internal join that filters most of them out,
+            // the output budget is never met, and a fixed tiny window would re-scan
+            // the whole table in many small passes (slower than the un-budgeted
+            // full-window path — fluree/db#1406 review). Growing the window each
+            // pass ramps it up to the full materialize size after a handful of
+            // low-yield passes, so the pathological case self-corrects while a
+            // genuinely selective LIMIT still stops after its cheap first window.
+            // The un-budgeted window already starts at the full size, so `.min`
+            // makes this a no-op there.
+            progress.window_rows = progress
+                .window_rows
+                .saturating_mul(4)
+                .min(materialize_window_rows());
             // `window` is dropped here, freeing the batches before the next pull.
             return Ok(true);
         }

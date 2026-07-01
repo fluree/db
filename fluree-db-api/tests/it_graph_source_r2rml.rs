@@ -1137,6 +1137,187 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
     );
 }
 
+/// Regression (fluree/db#1406 review): a class and a predicate that live in
+/// SEPARATE TriplesMaps sharing a subject template must NOT be fused. Fusing the
+/// class into the predicate star would make TriplesMap resolution require one map
+/// with both the class and the predicate; the split mapping has none, so a fused
+/// scan resolves zero maps and silently returns no rows. The rewrite must instead
+/// leave the class as its own subject-only scan and join it with the predicate
+/// scan on the shared subject.
+#[tokio::test]
+async fn engine_e2e_split_triples_map_class_and_predicate_not_fused() {
+    /// Returns different batches per logical table so the two TriplesMaps back
+    /// distinct data (unlike `MockR2rmlProvider`, which serves one batch set).
+    #[derive(Debug)]
+    struct SplitTableProvider {
+        mapping: Arc<CompiledR2rmlMapping>,
+        people: Vec<ColumnBatch>,
+        names: Vec<ColumnBatch>,
+    }
+
+    #[async_trait]
+    impl R2rmlProvider for SplitTableProvider {
+        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+            true
+        }
+        async fn compiled_mapping(
+            &self,
+            _gs: &str,
+            _t: Option<i64>,
+        ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+            Ok(Arc::clone(&self.mapping))
+        }
+    }
+
+    #[async_trait]
+    impl R2rmlTableProvider for SplitTableProvider {
+        async fn scan_table(
+            &self,
+            _gs: &str,
+            table: &str,
+            _p: &[String],
+            _f: &[ScanFilter],
+            _t: Option<i64>,
+        ) -> QueryResult<ColumnBatchStream> {
+            let batches = if table == "names" {
+                self.names.clone()
+            } else {
+                self.people.clone()
+            };
+            Ok(vec_batch_stream(batches))
+        }
+    }
+
+    const SPLIT_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#PersonClass> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "people" ] ;
+    rr:subjectMap [
+        rr:template "http://example.org/person/{id}" ;
+        rr:class ex:Person
+    ] .
+
+<http://example.org/mapping#PersonName> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "names" ] ;
+    rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:name ;
+        rr:objectMap [ rr:column "name" ]
+    ] .
+"#;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-split:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+
+    let mapping = R2rmlLoader::from_turtle(SPLIT_MAPPING_TTL)
+        .expect("parse split mapping")
+        .compile()
+        .expect("compile split mapping");
+
+    // people (class table): subject id only.
+    let people_schema = BatchSchema::new(vec![FieldInfo {
+        name: "id".to_string(),
+        field_type: FieldType::Int64,
+        nullable: false,
+        field_id: 1,
+    }]);
+    let people = ColumnBatch::new(
+        Arc::new(people_schema),
+        vec![Column::Int64(vec![Some(1), Some(2)])],
+    )
+    .unwrap();
+
+    // names (predicate table): same subjects, plus the name column.
+    let names_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let names = ColumnBatch::new(
+        Arc::new(names_schema),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("Alice".to_string()), Some("Bob".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let provider = SplitTableProvider {
+        mapping: Arc::new(mapping),
+        people: vec![people],
+        names: vec![names],
+    };
+
+    // SELECT ?s ?name WHERE { GRAPH <r2rml-split:main> { ?s a ex:Person ; ex:name ?name } }
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let name = vars.get_or_insert("?name");
+    let rdf_type = ledger
+        .snapshot
+        .encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+        .expect("rdf:type encodable");
+    let person = ledger
+        .snapshot
+        .encode_iri("http://example.org/Person")
+        .expect("ex:Person encodable");
+    let ex_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("ex:name encodable");
+
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(rdf_type),
+            Term::Sid(person),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(ex_name),
+            Term::Var(name),
+        )),
+    ];
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("r2rml-split:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(vec![s, name]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("split-TriplesMap query should execute");
+
+    let total_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(
+        total_rows, 2,
+        "class and predicate in separate TriplesMaps must join to 2 rows, not silently \
+         collapse to 0 via unsafe fusion; got {total_rows}"
+    );
+}
+
 /// Engine-level E2E test: Verify R2RML provider is consulted for GRAPH patterns.
 ///
 /// This test uses a custom provider that tracks method calls to verify
