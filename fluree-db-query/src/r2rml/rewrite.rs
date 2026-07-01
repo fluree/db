@@ -27,7 +27,7 @@
 use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
-use crate::r2rml::{ScanCmpOp, ScanValue};
+use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
 use fluree_vocab::namespaces::XSD;
@@ -525,15 +525,20 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(_) => None, // Predicate is variable - no filter
     };
 
-    // Extract the object: a variable, or a constant literal equality constraint
-    // the operator enforces. Supported for string/integer/boolean literals with
-    // a loose-matchable (untyped or XSD) datatype and a constant predicate (to
-    // resolve the column). Language-tagged / custom-typed literals need strict
-    // matching, and ref/IRI or float/decimal/date objects are not pushed yet —
-    // all left unconverted (rejected as unsupported) rather than mismatched.
-    let object_constant = match &tp.o {
+    // Extract the object: a variable, or a constant equality constraint the
+    // operator enforces. A constant predicate is required (to resolve the map).
+    //   - Literal (string/integer/boolean, loose-matchable datatype) → Scalar.
+    //   - Bound IRI / ref object (`?s edw:geography <geo/1>`) → Iri.
+    // Language-tagged / custom-typed literals need strict matching, and
+    // float/decimal/date literals are not pushed yet — all left unconverted
+    // (rejected as unsupported) rather than mismatched.
+    let object_constant: Option<ObjectConstant> = match &tp.o {
         Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
-            const_object_scan_value(v)
+            const_object_scan_value(v).map(ObjectConstant::Scalar)
+        }
+        Term::Iri(iri) if predicate_filter.is_some() => Some(ObjectConstant::Iri(iri.to_string())),
+        Term::Sid(sid) if predicate_filter.is_some() => {
+            snapshot.decode_sid(sid).map(ObjectConstant::Iri)
         }
         _ => None,
     };

@@ -330,9 +330,10 @@ impl R2rmlScanOperator {
             });
         }
 
-        // Constant-object equality pushes as a scan filter too (optimization;
-        // the operator enforces correctness). Same single-scalar-column rule.
-        if let (Some(value), Some(pred_iri)) = (
+        // A scalar constant-object equality pushes as a scan filter too
+        // (optimization; the operator enforces correctness). IRI constants are
+        // operator-enforced only — a FK-key pushdown needs template reversal.
+        if let (Some(crate::r2rml::ObjectConstant::Scalar(value)), Some(pred_iri)) = (
             &self.pattern.object_constant,
             self.pattern.predicate_filter.as_deref(),
         ) {
@@ -1149,30 +1150,38 @@ fn materialize_pom_object(
     }
 }
 
-/// Whether a materialized object term equals a constant-object `ScanValue`.
-/// Constant objects are loose-matched (gated in `convert_triple_to_r2rml`), so
-/// this compares the literal's value and intentionally ignores its
-/// datatype/language: a lexical compare for strings, and a value compare for
-/// integers/booleans that tolerates lexical differences (e.g. "2024" vs
-/// "2024.0", "true" vs "1").
-fn rdf_term_eq_scan_value(term: &RdfTerm, value: &crate::r2rml::ScanValue) -> bool {
-    use crate::r2rml::ScanValue;
-    let RdfTerm::Literal { value: v, .. } = term else {
-        return false;
-    };
-    match value {
-        ScanValue::Str(s) => v == s,
-        ScanValue::Int(n) => {
-            v.parse::<i64>().is_ok_and(|x| x == *n)
-                || v.parse::<f64>().is_ok_and(|x| x == *n as f64)
+/// Whether a materialized object term equals a constant-object constraint.
+/// IRI constants match exactly; literal (scalar) constants are loose-matched
+/// (gated in `convert_triple_to_r2rml`), comparing the value and ignoring the
+/// materialized term's datatype/language — a lexical compare for strings and a
+/// value compare for integers/booleans that tolerates lexical differences (e.g.
+/// "2024" vs "2024.0", "true" vs "1").
+fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectConstant) -> bool {
+    use crate::r2rml::{ObjectConstant, ScanValue};
+    match constant {
+        // Bound IRI / ref object: exact IRI match.
+        ObjectConstant::Iri(iri) => matches!(term, RdfTerm::Iri(v) if v == iri),
+        // Literal object: loose value match (see comment on the scalar arms),
+        // ignoring the materialized term's datatype/language.
+        ObjectConstant::Scalar(value) => {
+            let RdfTerm::Literal { value: v, .. } = term else {
+                return false;
+            };
+            match value {
+                ScanValue::Str(s) => v == s,
+                ScanValue::Int(n) => {
+                    v.parse::<i64>().is_ok_and(|x| x == *n)
+                        || v.parse::<f64>().is_ok_and(|x| x == *n as f64)
+                }
+                ScanValue::Bool(b) => match v.as_str() {
+                    "true" | "1" => *b,
+                    "false" | "0" => !*b,
+                    _ => false,
+                },
+                // Date constant objects are not produced by convert yet.
+                ScanValue::Date(_) => false,
+            }
         }
-        ScanValue::Bool(b) => match v.as_str() {
-            "true" | "1" => *b,
-            "false" | "0" => !*b,
-            _ => false,
-        },
-        // Date constant objects are not produced by convert_triple_to_r2rml yet.
-        ScanValue::Date(_) => false,
     }
 }
 
@@ -1273,7 +1282,7 @@ fn materialize_batch(
                     if let Some(t) =
                         materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
                     {
-                        if rdf_term_eq_scan_value(&t, required) {
+                        if rdf_term_eq_object_constant(&t, required) {
                             matched = true;
                             break;
                         }
@@ -1526,5 +1535,53 @@ impl Operator for R2rmlScanOperator {
     fn estimated_rows(&self) -> Option<usize> {
         // Could use Iceberg table statistics in the future
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::r2rml::{ObjectConstant, ScanValue};
+    use fluree_db_r2rml::materialize::RdfTerm;
+
+    #[test]
+    fn object_constant_matching() {
+        // IRI constant: exact IRI match only.
+        let iri = ObjectConstant::Iri("http://ex/geo/1".to_string());
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::iri("http://ex/geo/1"),
+            &iri
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::iri("http://ex/geo/2"),
+            &iri
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("http://ex/geo/1"),
+            &iri
+        ));
+
+        // String constant: loose lexical match, datatype/language-agnostic — a
+        // plain-string query object matches a lang-tagged materialized literal.
+        let s = ObjectConstant::Scalar(ScanValue::Str("chat".to_string()));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("chat"), &s));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::lang_string("chat", "fr"),
+            &s
+        ));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("dog"), &s));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("chat"), &s));
+
+        // Integer constant: tolerant of lexical form (2024 vs a Decimal 2024.0).
+        let n = ObjectConstant::Scalar(ScanValue::Int(2024));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024"), &n));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024.0"), &n));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2025"), &n));
+
+        // Boolean constant: true/1 vs false/0.
+        let b = ObjectConstant::Scalar(ScanValue::Bool(true));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("false"), &b));
     }
 }

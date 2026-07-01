@@ -643,12 +643,13 @@ pub struct R2rmlPattern {
     /// budget is dropped. `None` when no filter was consumed.
     pub consumed_filter: Option<Expression>,
 
-    /// A constant object in the triple pattern (`?s <pred> "value"`): the object
-    /// is not a variable but a required literal. `object_var` is `None`; the
-    /// operator keeps a subject only when this predicate's object equals the
+    /// A constant object in the triple pattern (`?s <pred> <const>`): the object
+    /// is not a variable but a required literal or IRI. `object_var` is `None`;
+    /// the operator keeps a subject only when this predicate's object equals the
     /// constant (enforced as the pattern's semantics, independent of scan
-    /// pushdown), and also emits a `ScanFilter` for row-group + row pruning.
-    pub object_constant: Option<crate::r2rml::ScanValue>,
+    /// pushdown). A scalar literal also emits a `ScanFilter` for row-group + row
+    /// pruning; IRI constants are operator-enforced only.
+    pub object_constant: Option<crate::r2rml::ObjectConstant>,
 }
 
 impl R2rmlPattern {

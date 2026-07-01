@@ -49,6 +49,19 @@ pub enum ScanValue {
     Str(String),
 }
 
+/// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the
+/// R2RML operator so results are correct regardless of scan pushdown.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectConstant {
+    /// A literal object — loose value match (string/integer/boolean).
+    Scalar(ScanValue),
+    /// A bound IRI object — exact IRI match, e.g. a reference to a parent entity
+    /// (`?s edw:geography <geo/1>`). Compared against the materialized IRI; the
+    /// column-level scan filter is not applied to these yet (a FK-key pushdown
+    /// needs subject-template reversal), so only the operator enforces them.
+    Iri(String),
+}
+
 /// A predicate pushed down to the Iceberg scan for file pruning.
 ///
 /// Resolved to a concrete table column (the R2RML operator maps the query
