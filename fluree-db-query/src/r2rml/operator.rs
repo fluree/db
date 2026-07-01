@@ -1153,26 +1153,25 @@ fn materialize_pom_object(
 /// Whether a materialized object term equals a constant-object constraint.
 /// IRI constants match exactly; literal (scalar) constants are loose-matched
 /// (gated in `convert_triple_to_r2rml`), comparing the value and ignoring the
-/// materialized term's datatype/language — a lexical compare for strings and a
-/// value compare for integers/booleans that tolerates lexical differences (e.g.
-/// "2024" vs "2024.0", "true" vs "1").
+/// materialized term's datatype/language.
+///
+/// Integer comparison is EXACT (parse to `i64`, no `f64`): a float compare would
+/// both admit false positives across adjacent large integers and let the
+/// operator keep a lexical form (`"2024.0"`) that the Arrow scan filter would
+/// drop, breaking the invariant that pushdown never removes an operator-kept row.
 fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectConstant) -> bool {
     use crate::r2rml::{ObjectConstant, ScanValue};
     match constant {
         // Bound IRI / ref object: exact IRI match.
         ObjectConstant::Iri(iri) => matches!(term, RdfTerm::Iri(v) if v == iri),
-        // Literal object: loose value match (see comment on the scalar arms),
-        // ignoring the materialized term's datatype/language.
+        // Literal object: loose value match, ignoring datatype/language.
         ObjectConstant::Scalar(value) => {
             let RdfTerm::Literal { value: v, .. } = term else {
                 return false;
             };
             match value {
                 ScanValue::Str(s) => v == s,
-                ScanValue::Int(n) => {
-                    v.parse::<i64>().is_ok_and(|x| x == *n)
-                        || v.parse::<f64>().is_ok_and(|x| x == *n as f64)
-                }
+                ScanValue::Int(n) => v.parse::<i64>().is_ok_and(|x| x == *n),
                 ScanValue::Bool(b) => match v.as_str() {
                     "true" | "1" => *b,
                     "false" | "0" => !*b,
@@ -1572,11 +1571,23 @@ mod tests {
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("dog"), &s));
         assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("chat"), &s));
 
-        // Integer constant: tolerant of lexical form (2024 vs a Decimal 2024.0).
+        // Integer constant: EXACT — "2024" matches; a decimal lexical does not
+        // (it would break the pushdown invariant on a string-backed column).
         let n = ObjectConstant::Scalar(ScanValue::Int(2024));
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024"), &n));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024.0"), &n));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2024.0"), &n));
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2025"), &n));
+        // Large-integer boundary: f64 rounds these two together; exact i64 must
+        // keep them distinct (no false positive).
+        let big = ObjectConstant::Scalar(ScanValue::Int(9_007_199_254_740_993));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("9007199254740993"),
+            &big
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("9007199254740992"),
+            &big
+        ));
 
         // Boolean constant: true/1 vs false/0.
         let b = ObjectConstant::Scalar(ScanValue::Bool(true));
