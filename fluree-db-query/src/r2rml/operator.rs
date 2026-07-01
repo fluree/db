@@ -140,6 +140,13 @@ pub struct R2rmlScanOperator {
     /// In-flight streaming scan for the current buffered child batch, advanced
     /// one window per `next_batch` so the whole table is never materialized.
     progress: Option<ScanProgress>,
+    /// Inner-table scans cached across child batches, keyed by
+    /// `(table_name, projection)`. A correlated join re-invokes `build_progress`
+    /// once per child batch; without this the (dimension-sized) inner table is
+    /// re-scanned every batch. Only inners up to one materialize window are
+    /// cached, so a cached inner never exceeds the resident footprint a single
+    /// scan window already holds; larger inners fall back to per-batch streaming.
+    scan_cache: HashMap<(String, Vec<String>), Arc<Vec<ColumnBatch>>>,
     /// State
     state: OperatorState,
 }
@@ -189,6 +196,7 @@ impl R2rmlScanOperator {
             mapping: None,
             pending: VecDeque::new(),
             progress: None,
+            scan_cache: HashMap::new(),
             state: OperatorState::Created,
         }
     }
@@ -348,7 +356,7 @@ impl R2rmlScanOperator {
     /// build the per-TriplesMap join plan against the child. Returns `None` when
     /// no TriplesMap matches this pattern (the caller pulls the next child).
     async fn build_progress(
-        &self,
+        &mut self,
         ctx: &ExecutionContext<'_>,
         child_batch: Batch,
     ) -> Result<Option<ScanProgress>> {
@@ -466,15 +474,46 @@ impl R2rmlScanOperator {
             } else {
                 Some(ctx.to_t)
             };
-            let stream = table_provider
-                .scan_table(
-                    &self.pattern.graph_source_id,
-                    table_name,
-                    &projection,
-                    &scan_filters,
-                    as_of_t,
-                )
-                .await?;
+            // Reuse an already-materialized inner scan across child batches: a
+            // correlated join calls `build_progress` once per child batch, so
+            // without this the (dimension-sized) inner table is re-scanned every
+            // batch. The first scan of a `(table, projection)` is collected (up to
+            // one window) and replayed for later batches; a larger inner streams
+            // fresh each batch as before.
+            let cache_key = (table_name.to_string(), projection.clone());
+            let stream: ColumnBatchStream = if !scan_cache_enabled() {
+                table_provider
+                    .scan_table(
+                        &self.pattern.graph_source_id,
+                        table_name,
+                        &projection,
+                        &scan_filters,
+                        as_of_t,
+                    )
+                    .await?
+            } else if let Some(cached) = self.scan_cache.get(&cache_key) {
+                replay_stream(Arc::clone(cached))
+            } else {
+                let fresh = table_provider
+                    .scan_table(
+                        &self.pattern.graph_source_id,
+                        table_name,
+                        &projection,
+                        &scan_filters,
+                        as_of_t,
+                    )
+                    .await?;
+                match collect_scan_capped(fresh, materialize_window_rows()).await? {
+                    CollectedScan::Complete(batches) => {
+                        let arc = Arc::new(batches);
+                        self.scan_cache.insert(cache_key, Arc::clone(&arc));
+                        replay_stream(arc)
+                    }
+                    CollectedScan::Overflow(prefix, remainder) => {
+                        Box::pin(futures::stream::iter(prefix.into_iter().map(Ok)).chain(remainder))
+                    }
+                }
+            };
 
             // Build parent lookup tables for RefObjectMap POMs that pass the
             // predicate filter. Parent (dimension) tables are small and consumed
@@ -687,6 +726,57 @@ async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch
         out.push(batch?);
     }
     Ok(out)
+}
+
+/// Whether the correlated inner-scan cache is enabled. Read once from
+/// `FLUREE_R2RML_SCAN_CACHE` (only `0`/`false`/`off` disable it); disabling
+/// restores the per-child-batch re-scan behavior.
+fn scan_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_SCAN_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Outcome of trying to fully collect an inner scan for caching.
+enum CollectedScan {
+    /// The whole inner fit within the cap — safe to cache and replay.
+    Complete(Vec<ColumnBatch>),
+    /// The inner exceeded the cap — too large to cache. The prefix already
+    /// pulled plus the still-open remainder serve this one batch.
+    Overflow(Vec<ColumnBatch>, ColumnBatchStream),
+}
+
+/// Collect `stream` until it ends (→ `Complete`, cacheable) or its row count
+/// reaches `cap` with more remaining (→ `Overflow`, too large to cache). The cap
+/// equals one materialize window, so a cached inner never exceeds the resident
+/// footprint a single scan window already materializes.
+async fn collect_scan_capped(mut stream: ColumnBatchStream, cap: usize) -> Result<CollectedScan> {
+    let mut collected = Vec::new();
+    let mut rows = 0usize;
+    while rows < cap {
+        match stream.next().await {
+            Some(batch) => {
+                let batch = batch?;
+                rows += batch.num_rows;
+                collected.push(batch);
+            }
+            None => return Ok(CollectedScan::Complete(collected)),
+        }
+    }
+    Ok(CollectedScan::Overflow(collected, stream))
+}
+
+/// A [`ColumnBatchStream`] that replays cached batches. `ColumnBatch` clones are
+/// cheap (its columns are `Arc`-backed), so replay does not re-copy the data.
+fn replay_stream(batches: Arc<Vec<ColumnBatch>>) -> ColumnBatchStream {
+    Box::pin(futures::stream::iter(
+        (0..batches.len()).map(move |i| Ok(batches[i].clone())),
+    ))
 }
 
 /// Emit one combined output row: the child row's bindings overlaid with a

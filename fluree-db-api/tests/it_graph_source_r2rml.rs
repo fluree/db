@@ -2790,8 +2790,14 @@ struct CountingProvider {
 
 impl CountingProvider {
     fn edw() -> Self {
+        Self::edw_with_stores(vec![edw_store_batch()])
+    }
+
+    /// Like [`Self::edw`] but with a caller-supplied `dw.store` scan (used to
+    /// drive a multi-batch outer for the inner-scan-reuse guardrail).
+    fn edw_with_stores(store: Vec<ColumnBatch>) -> Self {
         let mut batches_by_table = HashMap::new();
-        batches_by_table.insert("dw.store".to_string(), vec![edw_store_batch()]);
+        batches_by_table.insert("dw.store".to_string(), store);
         batches_by_table.insert("dw.geography".to_string(), vec![edw_geography_batch()]);
         batches_by_table.insert("dw.employee".to_string(), vec![edw_employee_batch()]);
         Self {
@@ -2808,6 +2814,18 @@ impl CountingProvider {
             *counts.entry(t.clone()).or_default() += 1;
         }
         counts
+    }
+
+    /// Count scans of `table` whose projection includes column `col` — used to
+    /// isolate a table's main scan (by a scalar column it projects) from an
+    /// unrelated RefObjectMap parent-lookup scan of the same table.
+    fn scans_projecting(&self, table: &str, col: &str) -> usize {
+        self.scans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, proj)| t == table && proj.iter().any(|c| c == col))
+            .count()
     }
 
     /// Sorted projection columns of the FIRST scan of `table` (every scan of a
@@ -3085,4 +3103,110 @@ async fn guard_wildcard_still_scans_all_maps() {
         counts.contains_key("dw.employee"),
         "wildcard still scans Employee, got {counts:?}"
     );
+}
+
+/// `dw.store` scan with `n` rows, each pointing at geo_key 10 or 20 (both present
+/// in `edw_geography_batch`), so a `?store -> geography` join emits every row.
+fn edw_store_batch_n(n: usize) -> ColumnBatch {
+    let store_key: Vec<Option<i64>> = (1..=n as i64).map(Some).collect();
+    let ids: Vec<Option<String>> = (1..=n).map(|i| Some(format!("STORE-{i}"))).collect();
+    let names: Vec<Option<String>> = (1..=n).map(|i| Some(format!("Store {i}"))).collect();
+    let geo: Vec<Option<i64>> = (0..n)
+        .map(|i| Some(if i % 2 == 0 { 10 } else { 20 }))
+        .collect();
+    batch_from(vec![
+        (
+            FieldInfo {
+                name: "store_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            Column::Int64(store_key),
+        ),
+        (
+            FieldInfo {
+                name: "store_id".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            Column::String(ids),
+        ),
+        (
+            FieldInfo {
+                name: "store_name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+            Column::String(names),
+        ),
+        (
+            FieldInfo {
+                name: "geo_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 4,
+            },
+            Column::Int64(geo),
+        ),
+    ])
+}
+
+/// Issue 3: a correlated join must scan the inner table's data ONCE, not once per
+/// child batch. With a 2500-row store outer (3 batches at the 1000-row default),
+/// the Geography star (`?g city ; region`) is driven by 3 child batches; the
+/// inner-scan cache must collapse its main scan to a single call. The scan is
+/// isolated from Store's separate geography parent-lookup (which projects
+/// `geo_key`, not `city`) by matching on the `city` column.
+#[tokio::test]
+async fn guard_inner_scan_reused_across_child_batches() {
+    let provider = CountingProvider::edw_with_stores(vec![edw_store_batch_n(2500)]);
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let g = vars.get_or_insert("?g");
+    let c = vars.get_or_insert("?c");
+    let r = vars.get_or_insert("?r");
+    let p_geo = ledger
+        .snapshot
+        .encode_iri("http://example.org/geography")
+        .unwrap();
+    let p_city = ledger
+        .snapshot
+        .encode_iri("http://example.org/city")
+        .unwrap();
+    let p_region = ledger
+        .snapshot
+        .encode_iri("http://example.org/region")
+        .unwrap();
+
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_geo),
+            Term::Var(g),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(g),
+            Ref::Sid(p_city),
+            Term::Var(c),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(g),
+            Ref::Sid(p_region),
+            Term::Var(r),
+        )),
+    ];
+    let (_counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, g, c, r]).await;
+
+    let geo_main_scans = provider.scans_projecting("dw.geography", "city");
+    assert_eq!(
+        geo_main_scans, 1,
+        "Geography main scan must be cached to 1 despite a multi-batch outer \
+         (would be one-per-child-batch without the cache)"
+    );
+    assert_eq!(rows, 2500, "every store row joins to a geography");
 }
