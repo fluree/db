@@ -146,6 +146,8 @@ pub struct R2rmlScanOperator {
     /// re-scanned every batch. Only inners up to one materialize window are
     /// cached, so a cached inner never exceeds the resident footprint a single
     /// scan window already holds; larger inners fall back to per-batch streaming.
+    /// Only UNFILTERED scans are cached — a filtered scan may return a pruned
+    /// subset, which the filter-agnostic key must never replay for another scan.
     scan_cache: HashMap<(String, Vec<String>), Arc<Vec<ColumnBatch>>>,
     /// State
     state: OperatorState,
@@ -480,8 +482,16 @@ impl R2rmlScanOperator {
             // batch. The first scan of a `(table, projection)` is collected (up to
             // one window) and replayed for later batches; a larger inner streams
             // fresh each batch as before.
+            //
+            // Only unfiltered scans are cached. A pushdown `scan_filter` can prune
+            // files, so a filtered scan may yield a row SUBSET; the cache key is
+            // `(table, projection)` and does not carry the filter, so replaying a
+            // pruned subset for a differently-filtered (or unfiltered) scan of the
+            // same table/projection would drop rows. Filtered scans therefore
+            // bypass the cache entirely (both read and write).
+            let cacheable = scan_cache_enabled() && scan_filters.is_empty();
             let cache_key = (table_name.to_string(), projection.clone());
-            let stream: ColumnBatchStream = if !scan_cache_enabled() {
+            let stream: ColumnBatchStream = if !cacheable {
                 table_provider
                     .scan_table(
                         &self.pattern.graph_source_id,
@@ -1294,6 +1304,7 @@ impl Operator for R2rmlScanOperator {
         self.mapping = None;
         self.pending.clear();
         self.progress = None;
+        self.scan_cache.clear();
         self.state = OperatorState::Closed;
     }
 
