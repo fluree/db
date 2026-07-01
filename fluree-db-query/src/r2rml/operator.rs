@@ -76,6 +76,20 @@ fn materialize_window_rows() -> usize {
         .unwrap_or(DEFAULT_MATERIALIZE_WINDOW_ROWS)
 }
 
+/// Whether LIMIT early-termination (row-budget) pushdown into the scan is
+/// enabled. Read once from `FLUREE_R2RML_LIMIT_PUSHDOWN` (only `0`/`false`/`off`
+/// disable it); disabling restores full-window materialization under a LIMIT.
+fn limit_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_LIMIT_PUSHDOWN") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
 /// How a window of produced rows is combined with the buffered child rows.
 ///
 /// The join is *flipped* relative to a naive per-child probe: the (small,
@@ -149,6 +163,15 @@ pub struct R2rmlScanOperator {
     /// Only UNFILTERED scans are cached — a filtered scan may return a pruned
     /// subset, which the filter-agnostic key must never replay for another scan.
     scan_cache: HashMap<(String, Vec<String>), Arc<Vec<ColumnBatch>>>,
+    /// LIMIT early-termination budget: the max output rows a downstream `LIMIT`
+    /// needs from this operator. `None` = unbounded. Set only when this is the
+    /// topmost row-preserving scan (a scan feeding a join/FILTER never receives
+    /// one), so once `emitted` reaches it the scan can stop without changing
+    /// results. Also caps the materialize window so a `LIMIT n` does not
+    /// materialize a full window before the first row.
+    row_budget: Option<usize>,
+    /// Output rows emitted so far, counted against `row_budget`.
+    emitted: usize,
     /// State
     state: OperatorState,
 }
@@ -199,6 +222,8 @@ impl R2rmlScanOperator {
             pending: VecDeque::new(),
             progress: None,
             scan_cache: HashMap::new(),
+            row_budget: None,
+            emitted: 0,
             state: OperatorState::Created,
         }
     }
@@ -489,7 +514,14 @@ impl R2rmlScanOperator {
             // pruned subset for a differently-filtered (or unfiltered) scan of the
             // same table/projection would drop rows. Filtered scans therefore
             // bypass the cache entirely (both read and write).
-            let cacheable = scan_cache_enabled() && scan_filters.is_empty();
+            //
+            // A budgeted scan (under a LIMIT) also bypasses the cache: caching
+            // collects a full window before the operator can stop early, which
+            // would defeat the LIMIT. A budgeted scan is the topmost
+            // row-preserving scan, so it stops after ~a batch and gains little
+            // from cross-batch reuse anyway.
+            let cacheable =
+                scan_cache_enabled() && scan_filters.is_empty() && self.row_budget.is_none();
             let cache_key = (table_name.to_string(), projection.clone());
             let stream: ColumnBatchStream = if !cacheable {
                 table_provider
@@ -635,12 +667,20 @@ impl R2rmlScanOperator {
             });
         }
 
+        // Under a LIMIT, cap the materialize window at the remaining budget so a
+        // `LIMIT n` does not explode a full 512K-row window into bindings before
+        // the first output row.
+        let window_rows = match self.row_budget {
+            Some(b) => materialize_window_rows().min(b.saturating_sub(self.emitted).max(1)),
+            None => materialize_window_rows(),
+        };
+
         Ok(Some(ScanProgress {
             child_batch,
             child_schema,
             tms,
             tm_idx: 0,
-            window_rows: materialize_window_rows(),
+            window_rows,
         }))
     }
 
@@ -1218,9 +1258,22 @@ impl Operator for R2rmlScanOperator {
         &self.schema
     }
 
+    fn set_row_budget(&mut self, budget: usize) {
+        // Record the budget but do NOT forward it to the child: the child feeds
+        // this operator's correlated scan/join, which is not row-preserving, so
+        // an inner scan must still produce every row the join needs. Only the
+        // topmost row-preserving scan is budgeted — `LimitOperator` forwards a
+        // budget solely through row-preserving operators, so if this operator
+        // received one, its output flows 1:1 to the LIMIT.
+        if limit_pushdown_enabled() {
+            self.row_budget = Some(budget);
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         // Open child first
         self.child.open(ctx).await?;
+        self.emitted = 0;
 
         // Load the compiled mapping from the provider
         let provider = ctx
@@ -1263,7 +1316,17 @@ impl Operator for R2rmlScanOperator {
                     columns[col_idx].push(binding);
                 }
             }
-            if columns[0].len() >= ctx.batch_size {
+            // Emit once a full batch is accumulated, or once the LIMIT budget is
+            // met — the latter stops the scan early without pulling/materializing
+            // more (the downstream LIMIT truncates to the exact count).
+            let budget_met = self
+                .row_budget
+                .is_some_and(|b| self.emitted + columns[0].len() >= b);
+            if columns[0].len() >= ctx.batch_size || (budget_met && !columns[0].is_empty()) {
+                self.emitted += columns[0].len();
+                if self.row_budget.is_some_and(|b| self.emitted >= b) {
+                    self.state = OperatorState::Exhausted;
+                }
                 return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
             }
 
@@ -1293,6 +1356,7 @@ impl Operator for R2rmlScanOperator {
                         self.state = OperatorState::Exhausted;
                         return Ok(None);
                     }
+                    self.emitted += columns[0].len();
                     return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
                 }
             }

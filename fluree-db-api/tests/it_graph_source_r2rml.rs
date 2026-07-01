@@ -3210,3 +3210,163 @@ async fn guard_inner_scan_reused_across_child_batches() {
     );
     assert_eq!(rows, 2500, "every store row joins to a geography");
 }
+
+/// `dw.store` streamed as `n_chunks` batches of `per_chunk` rows, so a scan's
+/// consumption is observable at batch granularity.
+fn store_chunks(n_chunks: usize, per_chunk: usize) -> Vec<ColumnBatch> {
+    (0..n_chunks)
+        .map(|c| {
+            let base = (c * per_chunk) as i64;
+            let keys: Vec<Option<i64>> =
+                (0..per_chunk as i64).map(|i| Some(base + i + 1)).collect();
+            let ids: Vec<Option<String>> = (0..per_chunk)
+                .map(|i| Some(format!("STORE-{}", base as usize + i + 1)))
+                .collect();
+            batch_from(vec![
+                (
+                    FieldInfo {
+                        name: "store_key".to_string(),
+                        field_type: FieldType::Int64,
+                        nullable: false,
+                        field_id: 1,
+                    },
+                    Column::Int64(keys),
+                ),
+                (
+                    FieldInfo {
+                        name: "store_id".to_string(),
+                        field_type: FieldType::String,
+                        nullable: true,
+                        field_id: 2,
+                    },
+                    Column::String(ids),
+                ),
+            ])
+        })
+        .collect()
+}
+
+/// Provider that streams pre-chunked batches and counts how many are pulled, so a
+/// test can prove a `LIMIT` stops the scan early instead of draining the table.
+#[derive(Debug)]
+struct LimitProbeProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    chunks: Vec<ColumnBatch>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl R2rmlProvider for LimitProbeProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
+        graph_source_id == "edw-gs:main"
+    }
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for LimitProbeProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        _filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        use futures::StreamExt;
+        let polls = Arc::clone(&self.polls);
+        Ok(Box::pin(futures::stream::iter(self.chunks.clone()).map(
+            move |b| {
+                polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(b)
+            },
+        )))
+    }
+}
+
+async fn run_store_probe(
+    provider: &LimitProbeProvider,
+    ledger: &support::MemoryLedger,
+    vars: &VarRegistry,
+    inner: Vec<Pattern>,
+    select: Vec<VarId>,
+    limit: Option<usize>,
+) -> usize {
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(select);
+    parsed.limit = limit;
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("store probe query should execute");
+    result.iter().fold(0, |acc, b| acc + b.len())
+}
+
+/// 4a: a `LIMIT n` above the scan must terminate it early. Store is streamed as 40
+/// chunks of 50 rows (2000); `LIMIT 5` must stop after ~one chunk, while the same
+/// query without a LIMIT drains all 40 — proving the row budget reaches the scan
+/// (through Project) and caps its work.
+#[tokio::test]
+async fn guard_limit_terminates_scan_early() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let inner = || {
+        vec![
+            type_triple(s, "http://example.org/Store"),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(p_id.clone()),
+                Term::Var(id),
+            )),
+        ]
+    };
+
+    let limited = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&limited, &ledger, &vars, inner(), vec![s, id], Some(5)).await;
+    let limited_polls = limited.polls.load(Ordering::SeqCst);
+    assert_eq!(rows, 5, "LIMIT 5 returns exactly 5 rows");
+    assert!(
+        limited_polls <= 2,
+        "LIMIT 5 must stop after ~one chunk, pulled {limited_polls} of 40"
+    );
+
+    let full = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let _ = run_store_probe(&full, &ledger, &vars, inner(), vec![s, id], None).await;
+    assert_eq!(
+        full.polls.load(Ordering::SeqCst),
+        40,
+        "without a LIMIT the whole table streams"
+    );
+}

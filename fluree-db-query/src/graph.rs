@@ -69,6 +69,11 @@ pub struct GraphOperator {
     buffer_pos: usize,
     /// Planning context captured at planner-time for the per-row inner subplan.
     planning: PlanningContext,
+    /// LIMIT budget forwarded from a downstream `LIMIT` (via row-preserving
+    /// operators). Threaded into the per-parent-batch inner subplan so a scan
+    /// under a GRAPH wrapper (notably an R2RML graph source) can early-terminate
+    /// instead of draining the whole table into `result_buffer`.
+    row_budget: Option<usize>,
 }
 
 impl GraphOperator {
@@ -121,6 +126,7 @@ impl GraphOperator {
             result_buffer: Vec::new(),
             buffer_pos: 0,
             planning,
+            row_budget: None,
         }
     }
 
@@ -234,6 +240,9 @@ impl GraphOperator {
             &self.planning,
         )?;
 
+        if let Some(budget) = self.row_budget {
+            inner.set_row_budget(budget);
+        }
         inner.open(&graph_ctx).await?;
 
         // NumBig arena handles are scoped per (graph, predicate). When this
@@ -361,6 +370,13 @@ impl GraphOperator {
             None,
             &self.planning,
         )?;
+        // Forward a downstream LIMIT budget so the inner scan early-terminates
+        // instead of draining the whole table into `result_buffer`. Correctness
+        // is bounded by the outer LIMIT; a per-parent-batch budget can over-read
+        // across parent batches but never under-reads.
+        if let Some(budget) = self.row_budget {
+            inner.set_row_budget(budget);
+        }
         inner.open(&graph_ctx).await?;
 
         let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
@@ -457,6 +473,14 @@ impl Operator for GraphOperator {
     }
     fn schema(&self) -> &[VarId] {
         &self.schema
+    }
+
+    fn set_row_budget(&mut self, budget: usize) {
+        // Record the budget and thread it into the per-parent-batch inner subplan
+        // (see the execute helpers). Do NOT forward to `self.child`: the child
+        // produces parent rows that seed the correlated inner execution, which is
+        // not row-preserving, so it must still yield every row the inner needs.
+        self.row_budget = Some(budget);
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
