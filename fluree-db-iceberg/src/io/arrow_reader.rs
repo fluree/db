@@ -39,7 +39,7 @@ use crate::error::{IcebergError, Result};
 use crate::io::batch::{ColumnBatch, FieldType};
 use crate::io::parquet::{
     build_batch_schema, build_batch_schema_with_iceberg, build_columns_from_values,
-    build_field_id_to_column_mapping, ColumnValue, NULL_COLUMN_SENTINEL,
+    build_field_id_to_leaf_mapping, build_root_to_leaf_map, ColumnValue, NULL_COLUMN_SENTINEL,
 };
 use crate::io::send_parquet::predicate_pushdown_enabled;
 use crate::metadata::Schema;
@@ -79,12 +79,21 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     };
     let batch_schema = Arc::new(batch_schema);
 
-    // Real (non-null-sentinel) parquet leaf indices this projection needs.
-    let real: Vec<usize> = column_indices
+    // `column_indices` are ROOT field indices; the projection and row-group
+    // statistics APIs below index the flat LEAF-column space, which diverges
+    // under nested columns. Translate through the root→leaf map once and reuse
+    // it (also avoids rebuilding the field-id mapping per consumer).
+    let root_to_leaf = build_root_to_leaf_map(builder.parquet_schema());
+
+    // batch field → its parquet leaf index, or None (schema-evolution column
+    // absent from this file → always null).
+    let field_to_leaf: Vec<Option<usize>> = column_indices
         .iter()
-        .copied()
-        .filter(|&idx| idx != NULL_COLUMN_SENTINEL)
+        .map(|&idx| (idx != NULL_COLUMN_SENTINEL).then(|| root_to_leaf.get(&idx).copied()).flatten())
         .collect();
+
+    // Real (non-null-sentinel) parquet leaf indices this projection needs.
+    let real: Vec<usize> = field_to_leaf.iter().flatten().copied().collect();
 
     let mask = ProjectionMask::leaves(builder.parquet_schema(), real.iter().copied());
 
@@ -99,18 +108,15 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         .map(|(pos, &c)| (c, pos))
         .collect();
 
-    // batch field → Some(RecordBatch column position) or None (schema-evolution
-    // column absent from this file → always null).
-    let field_to_pos: Vec<Option<usize>> = column_indices
+    // batch field → Some(RecordBatch column position) or None (absent column).
+    let field_to_pos: Vec<Option<usize>> = field_to_leaf
         .iter()
-        .map(|&idx| {
-            if idx == NULL_COLUMN_SENTINEL {
-                None
-            } else {
-                leaf_to_pos.get(&idx).copied()
-            }
-        })
+        .map(|&leaf| leaf.and_then(|l| leaf_to_pos.get(&l).copied()))
         .collect();
+
+    // Iceberg field ID → leaf column index, shared by the row filter and
+    // row-group pruning (built once here instead of once per consumer).
+    let field_id_to_leaf = build_field_id_to_leaf_mapping(md, iceberg_schema);
 
     // Exact row-level filtering, applied to each decoded RecordBatch via
     // `filter_record_batch`. We deliberately do NOT use Arrow's `with_row_filter`:
@@ -123,10 +129,10 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     // yields no R2RML triple) would be excluded downstream anyway.
     let predicate_plan = residual_filter
         .filter(|_| predicate_pushdown_enabled())
-        .and_then(|r| build_predicate_plan(r, md, iceberg_schema, &leaf_to_pos));
+        .and_then(|r| build_predicate_plan(r, &field_id_to_leaf, &leaf_to_pos));
 
     let surviving =
-        crate::io::send_parquet::surviving_row_groups(md, residual_filter, iceberg_schema);
+        crate::io::send_parquet::surviving_row_groups(md, residual_filter, &field_id_to_leaf);
 
     let reader = builder
         .with_projection(mask)
@@ -137,7 +143,6 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
             IcebergError::Storage(format!("Failed to build Parquet reader (arrow): {e}"))
         })?;
 
-    let num_fields = batch_schema.fields.len();
     let mut batches = Vec::new();
 
     for record_batch in reader {
@@ -154,25 +159,20 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
             continue;
         }
 
-        let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
-            .map(|_| Vec::with_capacity(num_rows))
+        let column_data: Vec<Vec<Option<ColumnValue>>> = batch_schema
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(batch_idx, field_info)| match field_to_pos[batch_idx] {
+                Some(pos) => arrow_column_to_values(
+                    record_batch.column(pos).as_ref(),
+                    &field_info.field_type,
+                    num_rows,
+                ),
+                // schema-evolution column absent from this file → all null.
+                None => vec![None; num_rows],
+            })
             .collect();
-
-        for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
-            match field_to_pos[batch_idx] {
-                Some(pos) => {
-                    let array = record_batch.column(pos).as_ref();
-                    for row in 0..num_rows {
-                        column_data[batch_idx].push(arrow_cell_to_column_value(
-                            array,
-                            row,
-                            &field_info.field_type,
-                        ));
-                    }
-                }
-                None => column_data[batch_idx].extend(std::iter::repeat_n(None, num_rows)),
-            }
-        }
 
         let columns = build_columns_from_values(column_data, &batch_schema)?;
         let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
@@ -184,65 +184,77 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     Ok(batches)
 }
 
-/// Convert a single Arrow array cell to the intermediate [`ColumnValue`],
-/// producing the intermediate `ColumnValue` for the shared column assembly.
-/// Returns `None` for nulls and unsupported types.
-fn arrow_cell_to_column_value(
+/// Convert a whole Arrow column to a `Vec<Option<ColumnValue>>` for the shared
+/// column assembly. The array type is resolved (`downcast_ref` + `data_type`
+/// match) ONCE per column, then the row loop runs over the concrete typed array
+/// — instead of re-dispatching on every cell. Nulls and unsupported types map to
+/// `None`.
+fn arrow_column_to_values(
     array: &dyn Array,
-    row: usize,
     field_type: &FieldType,
-) -> Option<ColumnValue> {
-    if array.is_null(row) {
-        return None;
-    }
-
-    macro_rules! cell {
-        ($ty:ty) => {
-            array.as_any().downcast_ref::<$ty>().map(|a| a.value(row))
+    num_rows: usize,
+) -> Vec<Option<ColumnValue>> {
+    // Downcast to the concrete array once, then map each row through `$f`,
+    // preserving nulls.
+    macro_rules! column {
+        ($ty:ty, $f:expr) => {
+            match array.as_any().downcast_ref::<$ty>() {
+                Some(a) => (0..num_rows)
+                    .map(|i| (!a.is_null(i)).then(|| $f(a.value(i))))
+                    .collect(),
+                None => vec![None; num_rows],
+            }
         };
     }
 
     match array.data_type() {
-        DataType::Boolean => cell!(BooleanArray).map(ColumnValue::Boolean),
-        DataType::Int8 => cell!(Int8Array).map(|v| ColumnValue::Int32(v as i32)),
-        DataType::Int16 => cell!(Int16Array).map(|v| ColumnValue::Int32(v as i32)),
-        DataType::Int32 => cell!(Int32Array).map(|v| match field_type {
+        DataType::Boolean => column!(BooleanArray, ColumnValue::Boolean),
+        DataType::Int8 => column!(Int8Array, |v| ColumnValue::Int32(v as i32)),
+        DataType::Int16 => column!(Int16Array, |v| ColumnValue::Int32(v as i32)),
+        DataType::Int32 => column!(Int32Array, |v| match field_type {
             FieldType::Date => ColumnValue::Date(v),
             _ => ColumnValue::Int32(v),
         }),
-        DataType::Int64 => cell!(Int64Array).map(ColumnValue::Int64),
-        DataType::UInt8 => cell!(UInt8Array).map(|v| ColumnValue::Int32(v as i32)),
-        DataType::UInt16 => cell!(UInt16Array).map(|v| ColumnValue::Int32(v as i32)),
-        DataType::UInt32 => cell!(UInt32Array).map(|v| ColumnValue::Int64(v as i64)),
-        DataType::UInt64 => cell!(UInt64Array).map(|v| ColumnValue::Int64(v as i64)),
-        DataType::Float16 => cell!(Float16Array).map(|v| ColumnValue::Float32(v.to_f32())),
-        DataType::Float32 => cell!(Float32Array).map(ColumnValue::Float32),
-        DataType::Float64 => cell!(Float64Array).map(ColumnValue::Float64),
-        DataType::Utf8 => cell!(StringArray).map(|s| ColumnValue::String(s.to_string())),
-        DataType::LargeUtf8 => cell!(LargeStringArray).map(|s| ColumnValue::String(s.to_string())),
-        DataType::Binary => cell!(BinaryArray).map(|b| ColumnValue::Bytes(b.to_vec())),
-        DataType::LargeBinary => cell!(LargeBinaryArray).map(|b| ColumnValue::Bytes(b.to_vec())),
+        DataType::Int64 => column!(Int64Array, ColumnValue::Int64),
+        DataType::UInt8 => column!(UInt8Array, |v| ColumnValue::Int32(v as i32)),
+        DataType::UInt16 => column!(UInt16Array, |v| ColumnValue::Int32(v as i32)),
+        DataType::UInt32 => column!(UInt32Array, |v| ColumnValue::Int64(v as i64)),
+        DataType::UInt64 => column!(UInt64Array, |v| ColumnValue::Int64(v as i64)),
+        // Inline (not via `column!`) so `a.value(i)`'s `half::f16` type is known
+        // for `.to_f32()` without naming the `half` crate.
+        DataType::Float16 => match array.as_any().downcast_ref::<Float16Array>() {
+            Some(a) => (0..num_rows)
+                .map(|i| (!a.is_null(i)).then(|| ColumnValue::Float32(a.value(i).to_f32())))
+                .collect(),
+            None => vec![None; num_rows],
+        },
+        DataType::Float32 => column!(Float32Array, ColumnValue::Float32),
+        DataType::Float64 => column!(Float64Array, ColumnValue::Float64),
+        DataType::Utf8 => column!(StringArray, |s: &str| ColumnValue::String(s.to_string())),
+        DataType::LargeUtf8 => {
+            column!(LargeStringArray, |s: &str| ColumnValue::String(s.to_string()))
+        }
+        DataType::Binary => column!(BinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec())),
+        DataType::LargeBinary => column!(LargeBinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec())),
         DataType::FixedSizeBinary(_) => {
-            cell!(FixedSizeBinaryArray).map(|b| ColumnValue::Bytes(b.to_vec()))
+            column!(FixedSizeBinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec()))
         }
-        DataType::Date32 => cell!(Date32Array).map(ColumnValue::Date),
-        DataType::Date64 => {
-            cell!(Date64Array).map(|ms| ColumnValue::Date((ms / 86_400_000) as i32))
-        }
-        DataType::Decimal128(_, _) => cell!(Decimal128Array).map(ColumnValue::Decimal),
+        DataType::Date32 => column!(Date32Array, ColumnValue::Date),
+        DataType::Date64 => column!(Date64Array, |ms| ColumnValue::Date((ms / 86_400_000) as i32)),
+        DataType::Decimal128(_, _) => column!(Decimal128Array, ColumnValue::Decimal),
         DataType::Timestamp(unit, _tz) => {
-            let micros = match unit {
-                TimeUnit::Second => cell!(TimestampSecondArray).map(|v| v * 1_000_000),
-                TimeUnit::Millisecond => cell!(TimestampMillisecondArray).map(|v| v * 1_000),
-                TimeUnit::Microsecond => cell!(TimestampMicrosecondArray),
-                TimeUnit::Nanosecond => cell!(TimestampNanosecondArray).map(|v| v / 1_000),
-            };
-            micros.map(|m| match field_type {
+            let to_value = |m: i64| match field_type {
                 FieldType::TimestampTz => ColumnValue::TimestampTz(m),
                 _ => ColumnValue::Timestamp(m),
-            })
+            };
+            match unit {
+                TimeUnit::Second => column!(TimestampSecondArray, |v| to_value(v * 1_000_000)),
+                TimeUnit::Millisecond => column!(TimestampMillisecondArray, |v| to_value(v * 1_000)),
+                TimeUnit::Microsecond => column!(TimestampMicrosecondArray, to_value),
+                TimeUnit::Nanosecond => column!(TimestampNanosecondArray, |v| to_value(v / 1_000)),
+            }
         }
-        _ => None,
+        _ => vec![None; num_rows],
     }
 }
 
@@ -257,12 +269,12 @@ type ResolvedComparison = (usize, ComparisonOp, LiteralValue);
 ///
 /// A comparison on a column that is not projected is dropped, which only
 /// weakens the filter (keeps more rows) — safe, since the in-engine FILTER
-/// remains the authority. `leaf_to_pos` maps a parquet leaf index to its
-/// position in the decoded `RecordBatch`.
+/// remains the authority. `field_id_to_leaf` maps an Iceberg field ID to its
+/// parquet leaf index; `leaf_to_pos` maps that leaf index to its position in
+/// the decoded `RecordBatch`.
 fn build_predicate_plan(
     residual: &Expression,
-    metadata: &ParquetMetaData,
-    iceberg_schema: Option<&Schema>,
+    field_id_to_leaf: &HashMap<i32, usize>,
     leaf_to_pos: &HashMap<usize, usize>,
 ) -> Option<Vec<ResolvedComparison>> {
     let mut comparisons = Vec::new();
@@ -270,16 +282,13 @@ fn build_predicate_plan(
         return None;
     }
 
-    let field_to_col =
-        build_field_id_to_column_mapping(metadata.file_metadata().schema(), iceberg_schema);
-
     // field_id → parquet leaf → RecordBatch position; drop any we cannot resolve
     // to a projected column.
     let plan: Vec<ResolvedComparison> = comparisons
         .into_iter()
         .filter_map(|(field_id, op, value)| {
-            let col = field_to_col.get(&field_id)?;
-            let pos = leaf_to_pos.get(col)?;
+            let leaf = field_id_to_leaf.get(&field_id)?;
+            let pos = leaf_to_pos.get(leaf)?;
             Some((*pos, op, value))
         })
         .collect();

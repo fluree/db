@@ -205,29 +205,30 @@ fn bounds_can_contain(
 
 /// Row-group-level pruning: can this Parquet row group contain a row matching
 /// `expr`? Conservative — returns `true` unless the row group's column
-/// statistics prove no row can match. `field_to_col` maps an Iceberg field id to
-/// the Parquet column index in this file.
+/// statistics prove no row can match. `field_id_to_leaf` maps an Iceberg field
+/// id to the Parquet **leaf** column index in this file (what
+/// `RowGroupMetaData::column` indexes; root ≠ leaf under nested schemas).
 pub fn row_group_can_contain(
     expr: &Expression,
     row_group: &RowGroupMetaData,
-    field_to_col: &HashMap<i32, usize>,
+    field_id_to_leaf: &HashMap<i32, usize>,
 ) -> bool {
     match expr {
         Expression::AlwaysTrue => true,
         Expression::AlwaysFalse => false,
         Expression::And(exprs) => exprs
             .iter()
-            .all(|e| row_group_can_contain(e, row_group, field_to_col)),
+            .all(|e| row_group_can_contain(e, row_group, field_id_to_leaf)),
         Expression::Or(exprs) => exprs
             .iter()
-            .any(|e| row_group_can_contain(e, row_group, field_to_col)),
+            .any(|e| row_group_can_contain(e, row_group, field_id_to_leaf)),
         Expression::Comparison {
             field_id,
             op,
             value,
             ..
         } => {
-            let Some(&col_idx) = field_to_col.get(field_id) else {
+            let Some(&col_idx) = field_id_to_leaf.get(field_id) else {
                 return true;
             };
             let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
@@ -240,7 +241,7 @@ pub fn row_group_can_contain(
         Expression::In {
             field_id, values, ..
         } => {
-            let Some(&col_idx) = field_to_col.get(field_id) else {
+            let Some(&col_idx) = field_id_to_leaf.get(field_id) else {
                 return true;
             };
             let Some(stats) = prunable_stats(row_group.column(col_idx)) else {

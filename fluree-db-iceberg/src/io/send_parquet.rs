@@ -27,9 +27,8 @@ use crate::error::{IcebergError, Result};
 use crate::io::batch::ColumnBatch;
 use crate::io::chunk_reader::RangeBackedChunkReader;
 use crate::io::parquet::{
-    build_batch_schema, build_batch_schema_with_iceberg, build_field_id_to_column_mapping,
-    calculate_column_chunk_ranges, parse_parquet_metadata_from_bytes, ParquetFooterCache,
-    NULL_COLUMN_SENTINEL,
+    build_batch_schema, build_batch_schema_with_iceberg, calculate_column_chunk_ranges,
+    parse_parquet_metadata_from_bytes, ParquetFooterCache, NULL_COLUMN_SENTINEL,
 };
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
@@ -38,6 +37,7 @@ use crate::scan::pruning::row_group_can_contain;
 use crate::scan::FileScanTask;
 
 use parquet::file::metadata::ParquetMetaData;
+use std::collections::HashMap;
 
 /// Parquet magic bytes (footer ends with "PAR1").
 const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
@@ -64,17 +64,15 @@ pub(crate) fn predicate_pushdown_enabled() -> bool {
 pub(crate) fn surviving_row_groups(
     metadata: &ParquetMetaData,
     residual: Option<&Expression>,
-    iceberg_schema: Option<&Schema>,
+    field_id_to_leaf: &HashMap<i32, usize>,
 ) -> Vec<usize> {
     let n = metadata.num_row_groups();
     let Some(expr) = residual.filter(|_| predicate_pushdown_enabled()) else {
         return (0..n).collect();
     };
-    let field_to_col =
-        build_field_id_to_column_mapping(metadata.file_metadata().schema(), iceberg_schema);
     let mut keep = Vec::with_capacity(n);
     for rg in 0..n {
-        if row_group_can_contain(expr, metadata.row_group(rg), &field_to_col) {
+        if row_group_can_contain(expr, metadata.row_group(rg), field_id_to_leaf) {
             keep.push(rg);
         }
     }
