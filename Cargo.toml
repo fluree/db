@@ -169,10 +169,10 @@ flate2 = "1"
 
 # Iceberg format support (manifest Avro, data Parquet)
 apache-avro = "0.21.0"
-# `snap` (Snappy) is the default Parquet codec for most writers (Spark, Hive,
-# etc.); `zstd` is also common. Keep both enabled so Iceberg data files written
-# by external engines decode.
-parquet = { version = "54", default-features = false, features = ["zstd", "snap"] }
+# Parquet compression codecs. `snap` (Snappy) is the Spark/Hive default and `zstd`
+# is common; the Apache Iceberg Kafka Connect connector writes GZIP, which needs
+# `flate2`. Keep all enabled so Iceberg data files from any engine decode.
+parquet = { version = "54", default-features = false, features = ["zstd", "snap", "flate2"] }
 
 # LRU cache for Parquet footers
 lru = "0.12"

@@ -5137,6 +5137,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "flate2",
  "half",
  "hashbrown 0.15.5",
  "num",
