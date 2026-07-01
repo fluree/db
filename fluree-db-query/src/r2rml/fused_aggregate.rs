@@ -1085,11 +1085,34 @@ impl Operator for FusedR2rmlAggregateOperator {
 impl FusedR2rmlAggregateOperator {
     /// Rewrite inner triples → R2RML at `open` and resolve column folds.
     async fn resolve_at_open(&self, ctx: &ExecutionContext<'_>) -> Result<Option<Resolved>> {
+        // Load the compiled mapping first so the rewrite can decide whether a
+        // same-subject `rdf:type` is safe to fuse into the star (see
+        // `rewrite::class_fusion_is_safe`); it is then reused as the resolved
+        // mapping below. A missing provider / load failure leaves `mapping` as
+        // `None`, which disables fusion and, for a genuine R2RML scan, falls
+        // back to the normal path.
+        let as_of_t = if ctx.dataset.is_some() {
+            None
+        } else {
+            Some(ctx.to_t)
+        };
+        let mapping = match ctx.r2rml_provider {
+            Some(provider) => provider
+                .compiled_mapping(&self.graph_iri, as_of_t)
+                .await
+                .ok(),
+            None => None,
+        };
+
         // Rewrite the inner triples for this graph using the active snapshot.
         // A non-R2RML graph (or an unconvertible pattern) leaves triples
         // unconverted → fall back.
-        let rr =
-            rewrite_patterns_for_r2rml(&self.inner_patterns, &self.graph_iri, ctx.active_snapshot);
+        let rr = rewrite_patterns_for_r2rml(
+            &self.inner_patterns,
+            &self.graph_iri,
+            ctx.active_snapshot,
+            mapping.as_deref(),
+        );
         if rr.unconverted_count > 0 {
             return Ok(None);
         }
@@ -1098,17 +1121,11 @@ impl FusedR2rmlAggregateOperator {
             _ => return Ok(None), // multiple scans / star not handled in slice 1
         };
 
-        let provider = ctx
-            .r2rml_provider
-            .ok_or_else(|| QueryError::InvalidQuery("R2RML provider not configured".to_string()))?;
-        let as_of_t = if ctx.dataset.is_some() {
-            None
-        } else {
-            Some(ctx.to_t)
+        // The graph is genuinely R2RML-backed here; without the mapping fall back
+        // to the normal path (which surfaces any real load error).
+        let Some(mapping) = mapping else {
+            return Ok(None);
         };
-        let mapping = provider
-            .compiled_mapping(&pattern.graph_source_id, as_of_t)
-            .await?;
 
         let Some(tm) = Self::resolve_triples_map(&pattern, &mapping) else {
             return Ok(None);

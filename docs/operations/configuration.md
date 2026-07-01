@@ -1003,6 +1003,7 @@ reasonable behavior out of the box.
 |----------|---------|---------|
 | `FLUREE_ICEBERG_LOADTABLE_CACHE` | on | Master switch for all REST catalog caching. Set to `0`/`false`/`off` to build a fresh catalog client and reload the table on **every** scan (restores a per-scan OAuth exchange + `loadTable` round-trip). Disables the client/OAuth reuse, the cross-query `loadTable` cache, and the per-query snapshot pin. |
 | `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` | `60` | TTL (seconds) for the **cross-query** `loadTable`-response cache. A REST `loadTable` GET against a catalog such as Snowflake Horizon costs ~1.3–3 s, so caching it lets a burst of queries against the same table skip the round-trip. The TTL bounds how stale a snapshot a *new* query may observe; `0` disables the cross-query layer (leaving only the per-query pin). Every cache read is additionally gated on vended-credential expiry (30 s buffer), so a long TTL never hands out about-to-expire credentials. |
+| `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` | `900` | TTL (seconds) for the process-wide REST **catalog-client** cache (the reused OAuth token + HTTPS pool). The cache is keyed by a fingerprint of the raw config JSON, which does **not** change when a secret referenced by env var / secret store is rotated; this TTL bounds how long a rotated secret stays stale before the client is rebuilt and re-authenticated. `0` rebuilds the client every query (restoring a per-query OAuth exchange). |
 | `FLUREE_R2RML_SCAN_CACHE` | on | Toggles the correlated-join inner-scan cache, which reuses a materialized inner (dimension) table across a join's child batches instead of re-scanning it per batch. Set to `0`/`false`/`off` to restore per-child-batch re-scans. |
 | `FLUREE_R2RML_LIMIT_PUSHDOWN` | on | Toggles pushing a query's `LIMIT` into the R2RML scan as a row budget, so a scan stops after enough output rows instead of draining the table. Set to `0`/`false`/`off` to always scan fully. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | Toggles pushing simple date/int/bool/string FILTER comparisons into the Iceberg reader for **row-group pruning** (skip groups whose min/max rule out the predicate) and **exact row filtering** (drop non-matching rows during decode — e.g. `= "Acme"` on a name/code column). The in-engine FILTER remains the authority, so this only ever affects performance. Set to `0`/`false`/`off` to disable both. |
@@ -1020,7 +1021,12 @@ second and later queries against a table typically skip both the OAuth exchange
 and the `loadTable` GET entirely. The cross-query cache always records the
 catalog's current state, never a query's pinned snapshot, so pin preservation
 cannot leak a stale location to other queries. The client cache is keyed by a
-config fingerprint, so rotating the source's access token rebuilds the client.
+fingerprint of the raw config JSON: editing the config (including an inline
+secret) rebuilds the client immediately, but a secret referenced by env var or
+secret store is invisible to the fingerprint, so a rotation of that secret is
+picked up only when the client cache entry expires
+(`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`, default 15 min) — until then the reused
+client keeps presenting the old credential.
 
 **Freshness vs. latency.** The only knob with a data-freshness tradeoff is
 `FLUREE_ICEBERG_LOADTABLE_TTL_SECS`: a new query may read a snapshot up to that

@@ -49,6 +49,26 @@ fn rest_loadtable_ttl_secs() -> u64 {
         .unwrap_or(DEFAULT_REST_LOADTABLE_TTL_SECS)
 }
 
+/// Default TTL for the process-wide REST catalog client cache. Reusing a client
+/// preserves its OAuth `CachedToken` and HTTPS connection pool, but the cache is
+/// keyed by a fingerprint of the *raw* config JSON. When a Bearer/OAuth secret is
+/// sourced from an env var or secret store, that JSON stores the reference, not
+/// the secret, so rotating the secret does not change the fingerprint — without a
+/// TTL the stale client (and its cached token) would serve 401s until LRU
+/// eviction or a process restart. A bounded TTL lets a rotated secret self-heal:
+/// the client rebuilds and re-authenticates within the window. Override with
+/// `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` (`0` rebuilds the client every query).
+#[cfg(feature = "iceberg")]
+const DEFAULT_REST_CLIENT_TTL_SECS: u64 = 900;
+
+#[cfg(feature = "iceberg")]
+fn rest_client_ttl_secs() -> u64 {
+    std::env::var("FLUREE_ICEBERG_REST_CLIENT_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REST_CLIENT_TTL_SECS)
+}
+
 /// Cache for R2RML compiled mappings and Iceberg table metadata.
 ///
 /// This cache is shared across queries to avoid repeated:
@@ -92,7 +112,11 @@ pub struct R2rmlCache {
     /// Process-wide REST catalog clients keyed by source config fingerprint.
     /// Reused across queries so the OAuth `CachedToken` and the HTTPS connection
     /// pool survive — one token exchange per ~hour instead of one per query.
-    /// Keyed by a config fingerprint so a rotated PAT invalidates the client.
+    /// The fingerprint is over the raw config JSON, so a secret changed *inline*
+    /// in the config invalidates the client, but a secret referenced by env var
+    /// / secret store does not (the JSON is unchanged). A TTL
+    /// (`DEFAULT_REST_CLIENT_TTL_SECS`) bounds how long such a rotation stays
+    /// stale before the client is rebuilt and re-authenticated.
     #[cfg(feature = "iceberg")]
     rest_clients: moka::sync::Cache<String, Arc<RestCatalogClient>>,
 
@@ -141,8 +165,14 @@ impl R2rmlCache {
                     .time_to_live(DIRECT_METADATA_LOCATION_TTL)
                     .build(),
                 // A process serves few distinct graph sources; a small cap is
-                // plenty and bounds retained clients/connection pools.
-                rest_clients: moka::sync::Cache::new(64),
+                // plenty and bounds retained clients/connection pools. A TTL lets
+                // an env-var/secret-store secret rotation self-heal (see
+                // `DEFAULT_REST_CLIENT_TTL_SECS`) since the config fingerprint
+                // does not change when the referenced secret does.
+                rest_clients: moka::sync::Cache::builder()
+                    .max_capacity(64)
+                    .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
+                    .build(),
                 rest_load_tables: moka::sync::Cache::builder()
                     .max_capacity(metadata_cap)
                     .time_to_live(Duration::from_secs(rest_loadtable_ttl_secs()))

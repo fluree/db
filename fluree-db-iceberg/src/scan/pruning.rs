@@ -14,7 +14,7 @@ use crate::manifest::value_codec::TypedValue;
 use crate::manifest::{decode_by_type_string, DataFile, PartitionFieldSummary};
 use crate::metadata::Schema;
 use crate::scan::predicate::{ComparisonOp, Expression, LiteralValue};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use std::collections::HashMap;
 
@@ -230,7 +230,7 @@ pub fn row_group_can_contain(
             let Some(&col_idx) = field_to_col.get(field_id) else {
                 return true;
             };
-            let Some(stats) = row_group.column(col_idx).statistics() else {
+            let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
                 return true;
             };
             let lit = value.to_typed_value();
@@ -243,7 +243,7 @@ pub fn row_group_can_contain(
             let Some(&col_idx) = field_to_col.get(field_id) else {
                 return true;
             };
-            let Some(stats) = row_group.column(col_idx).statistics() else {
+            let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
                 return true;
             };
             values.iter().any(|v| {
@@ -255,6 +255,30 @@ pub fn row_group_can_contain(
         // Null predicates and negations keep the row group (conservative).
         _ => true,
     }
+}
+
+/// Statistics usable for row-group pruning, or `None` (→ keep the row group
+/// conservatively) when the column has no statistics or is a Decimal type.
+///
+/// [`stat_bounds`] keys purely on the Parquet *physical* variant. A decimal
+/// stored as INT32/INT64 holds unscaled integers, so comparing a scaled query
+/// literal (`5`) against unscaled bounds (`[500, 504]` for `Decimal(_, 2)`) could
+/// prune a row group that actually matches. The Iceberg spec currently mandates
+/// `fixed_len_byte_array` for decimals — whose statistics already fall through to
+/// the conservative `(None, None)` — so this guard is defensive rather than a live
+/// bug, keeping correctness off the implicit encoding assumption (fluree/db#1406
+/// review).
+fn prunable_stats(col: &ColumnChunkMetaData) -> Option<&Statistics> {
+    let info = col.column_descr().self_type().get_basic_info();
+    let is_decimal = info.converted_type() == parquet::basic::ConvertedType::DECIMAL
+        || matches!(
+            info.logical_type(),
+            Some(parquet::basic::LogicalType::Decimal { .. })
+        );
+    if is_decimal {
+        return None;
+    }
+    col.statistics()
 }
 
 /// Extract a Parquet row-group column's min/max as `TypedValue`s coerced to the

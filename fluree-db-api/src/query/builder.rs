@@ -1332,21 +1332,83 @@ impl<'a> FromQueryBuilder<'a> {
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
         {
-            return self
-                .fluree
-                .query_connection_sparql_tracked_with_opts_options(
-                    sparql,
-                    qc_opts,
-                    format_config,
-                    tracking,
-                    execution.clone(),
-                )
-                .await;
+            // Box the dispatched future: this async fn `.await`s one of ~9
+            // large `query_connection_*` futures, and (especially in debug
+            // builds) the compiler stores each awaited sub-future inline in
+            // this fn's state machine rather than overlapping the mutually
+            // exclusive arms. That inflated `execute_tracked`'s stack frame to
+            // ~470 KB, which — stacked with the deep ledger-load / novelty-
+            // rebuild chain — overflowed the default ~2 MB worker stack on a
+            // plain `select *` connection query (fluree/db#1408). Boxing moves
+            // the sub-future's state to the heap so the frame holds only a
+            // pointer.
+            return Box::pin(
+                self.fluree
+                    .query_connection_sparql_tracked_with_opts_options(
+                        sparql,
+                        qc_opts,
+                        format_config,
+                        tracking,
+                        execution.clone(),
+                    ),
+            )
+            .await;
         }
-        match input {
+        // Dispatch to the chosen `query_connection_*` variant via a separate,
+        // non-inlined fn that RETURNS the boxed future. The large per-arm future
+        // is materialized transiently inside that helper's frame during
+        // `Box::pin`; the helper returns (and its frame is popped) before we
+        // await here, so that transient never coexists on the stack with the
+        // deep query / load / novelty-rebuild chain the future then drives.
+        // Constructed inline here instead, the dispatcher frame would reserve
+        // stack for the largest arm's future for the whole descent — one of the
+        // frames that overflowed the default ~2 MB worker stack on a plain
+        // `select *` connection query (fluree/db#1408).
+        self.dispatch_connection_query(input, format_config, tracking, execution, r2rml.as_ref())
+            .await
+    }
+
+    /// Build the boxed connection-query future for the chosen input / policy /
+    /// r2rml combination (helper for [`execute_tracked`](Self::execute_tracked)).
+    ///
+    /// Returns an already-heap-allocated future so the caller's frame holds only
+    /// a pointer while driving it. `#[inline(never)]` is load-bearing: it keeps
+    /// the transient materialization of the selected (large) arm future in this
+    /// short-lived frame instead of the caller's long-lived one — see the call
+    /// site and fluree/db#1408.
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn dispatch_connection_query<'s>(
+        &'s self,
+        input: QueryInput<'s>,
+        format_config: Option<FormatterConfig>,
+        tracking: Option<TrackingOptions>,
+        execution: QueryExecutionOptions,
+        r2rml: Option<&'s (
+            Arc<dyn R2rmlProvider + 'a>,
+            Arc<dyn R2rmlTableProvider + 'a>,
+        )>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<TrackedQueryResponse, TrackedErrorResponse>,
+                > + Send
+                + 's,
+        >,
+    > {
+        // `let`-bind with the trait-object type so each arm's distinct
+        // `impl Future` unsize-coerces to the shared `dyn` future type.
+        let dispatched: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = std::result::Result<TrackedQueryResponse, TrackedErrorResponse>,
+                    > + Send
+                    + 's,
+            >,
+        > = match input {
             QueryInput::JsonLd(json) => match &self.policy {
-                Some(policy) => match r2rml.as_ref() {
-                    Some((provider, table_provider)) => {
+                Some(policy) => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
                         self.fluree
                             .query_connection_jsonld_tracked_with_policy_and_r2rml_options(
                                 json,
@@ -1358,10 +1420,9 @@ impl<'a> FromQueryBuilder<'a> {
                                     table_provider: table_provider.as_ref(),
                                 },
                                 execution,
-                            )
-                            .await
-                    }
-                    None => {
+                            ),
+                    ),
+                    None => Box::pin(
                         self.fluree
                             .query_connection_jsonld_tracked_with_policy_options(
                                 json,
@@ -1369,12 +1430,11 @@ impl<'a> FromQueryBuilder<'a> {
                                 format_config,
                                 tracking,
                                 execution,
-                            )
-                            .await
-                    }
+                            ),
+                    ),
                 },
-                None => match r2rml.as_ref() {
-                    Some((provider, table_provider)) => {
+                None => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
                         self.fluree
                             .query_connection_jsonld_tracked_with_r2rml_options(
                                 json,
@@ -1383,24 +1443,19 @@ impl<'a> FromQueryBuilder<'a> {
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                                 execution,
-                            )
-                            .await
-                    }
-                    None => {
-                        self.fluree
-                            .query_connection_jsonld_tracked_with_options(
-                                json,
-                                format_config,
-                                tracking,
-                                execution,
-                            )
-                            .await
-                    }
+                            ),
+                    ),
+                    None => Box::pin(self.fluree.query_connection_jsonld_tracked_with_options(
+                        json,
+                        format_config,
+                        tracking,
+                        execution,
+                    )),
                 },
             },
             QueryInput::Sparql(sparql) => match &self.policy {
-                Some(policy) => match r2rml.as_ref() {
-                    Some((provider, table_provider)) => {
+                Some(policy) => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
                         self.fluree
                             .query_connection_sparql_tracked_with_policy_and_r2rml_options(
                                 sparql,
@@ -1412,10 +1467,9 @@ impl<'a> FromQueryBuilder<'a> {
                                     table_provider: table_provider.as_ref(),
                                 },
                                 execution,
-                            )
-                            .await
-                    }
-                    None => {
+                            ),
+                    ),
+                    None => Box::pin(
                         self.fluree
                             .query_connection_sparql_tracked_with_policy_options(
                                 sparql,
@@ -1423,12 +1477,11 @@ impl<'a> FromQueryBuilder<'a> {
                                 format_config,
                                 tracking,
                                 execution,
-                            )
-                            .await
-                    }
+                            ),
+                    ),
                 },
-                None => match r2rml.as_ref() {
-                    Some((provider, table_provider)) => {
+                None => match r2rml {
+                    Some((provider, table_provider)) => Box::pin(
                         self.fluree
                             .query_connection_sparql_tracked_with_r2rml_options(
                                 sparql,
@@ -1437,22 +1490,18 @@ impl<'a> FromQueryBuilder<'a> {
                                 provider.as_ref(),
                                 table_provider.as_ref(),
                                 execution,
-                            )
-                            .await
-                    }
-                    None => {
-                        self.fluree
-                            .query_connection_sparql_tracked_with_options(
-                                sparql,
-                                format_config,
-                                tracking,
-                                execution,
-                            )
-                            .await
-                    }
+                            ),
+                    ),
+                    None => Box::pin(self.fluree.query_connection_sparql_tracked_with_options(
+                        sparql,
+                        format_config,
+                        tracking,
+                        execution,
+                    )),
                 },
             },
-        }
+        };
+        dispatched
     }
 }
 
