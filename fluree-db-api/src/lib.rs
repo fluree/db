@@ -221,6 +221,8 @@ pub use fluree_db_iceberg::{SecretResolveError, SecretResolver};
 /// use site instead of silently diverging from a hard-copied literal.
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::DeleteConvention;
 
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,

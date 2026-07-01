@@ -406,6 +406,16 @@ pub struct IcebergCreateConfig {
     /// Table identifier (e.g., "openflights.airlines"). Empty for Direct mode
     /// (derived from the table location).
     pub table_identifier: String,
+
+    /// Optional tombstone/delete convention for materialization (which source
+    /// column + value(s)/null mark a row as a delete). `None` => additive
+    /// materialization (no retraction). Not a connection concern, so it lives on
+    /// the create config rather than the reusable `IcebergConnectionConfig`.
+    pub delete_convention: Option<fluree_db_iceberg::DeleteConvention>,
+
+    /// Optional ordering column for latest-by-key materialization (e.g. an event
+    /// timestamp or offset). `None` => last-in-scan-order wins.
+    pub order_by: Option<String>,
 }
 
 /// The reusable Iceberg connection block — catalog access + IO, with **no**
@@ -697,6 +707,8 @@ impl IcebergCreateConfig {
             branch: None,
             connection: IcebergConnectionConfig::rest(catalog_uri),
             table_identifier: table_identifier.into(),
+            delete_convention: None,
+            order_by: None,
         }
     }
 
@@ -707,6 +719,8 @@ impl IcebergCreateConfig {
             branch: None,
             connection: IcebergConnectionConfig::direct(table_location),
             table_identifier: String::new(),
+            delete_convention: None,
+            order_by: None,
         }
     }
 
@@ -807,6 +821,21 @@ impl IcebergCreateConfig {
         self
     }
 
+    /// Set the tombstone/delete convention used during materialization.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.delete_convention = Some(convention);
+        self
+    }
+
+    /// Set the ordering column for latest-by-key materialization.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.order_by = Some(column.into());
+        self
+    }
+
     /// Get the effective branch name.
     pub fn effective_branch(&self) -> &str {
         self.branch.as_deref().unwrap_or(DEFAULT_BRANCH)
@@ -859,6 +888,8 @@ impl IcebergCreateConfig {
                 table: TableConfig::Identifier(self.table_identifier.clone()),
                 io: self.connection.io.clone(),
                 mapping: None,
+                delete: self.delete_convention.clone(),
+                order_by: self.order_by.clone(),
             },
             CatalogMode::Direct { table_location } => {
                 // Direct never uses vended credentials, regardless of the io flag.
@@ -869,6 +900,8 @@ impl IcebergCreateConfig {
                     table: TableConfig::Identifier(String::new()),
                     io,
                     mapping: None,
+                    delete: self.delete_convention.clone(),
+                    order_by: self.order_by.clone(),
                 }
             }
         }
@@ -911,6 +944,14 @@ impl IcebergCreateConfig {
                     )));
                 }
             }
+        }
+
+        // Validate the tombstone/delete convention at creation time rather than
+        // deferring to the first materialize scan.
+        if let Some(delete) = &self.delete_convention {
+            delete
+                .validate()
+                .map_err(|e| crate::ApiError::config(format!("Invalid delete convention: {e}")))?;
         }
 
         Ok(())
@@ -1106,6 +1147,21 @@ impl R2rmlCreateConfig {
     /// Enable path-style S3 URLs.
     pub fn with_s3_path_style(mut self, enabled: bool) -> Self {
         self.iceberg = self.iceberg.with_s3_path_style(enabled);
+        self
+    }
+
+    /// Set the tombstone/delete convention used during materialization.
+    pub fn with_delete_convention(
+        mut self,
+        convention: fluree_db_iceberg::DeleteConvention,
+    ) -> Self {
+        self.iceberg = self.iceberg.with_delete_convention(convention);
+        self
+    }
+
+    /// Set the ordering column for latest-by-key materialization.
+    pub fn with_order_by(mut self, column: impl Into<String>) -> Self {
+        self.iceberg = self.iceberg.with_order_by(column);
         self
     }
 

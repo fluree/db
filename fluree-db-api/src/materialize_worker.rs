@@ -287,6 +287,7 @@ impl MaterializeTrackingWorker {
                     incremental = result.incremental,
                     rows_read = result.rows_read,
                     subjects_upserted = result.subjects_upserted,
+                    subjects_retracted = result.subjects_retracted,
                     "materialize tracking synced"
                 );
             }

@@ -319,6 +319,147 @@ ORDER BY DESC(?date)
 LIMIT 100
 ```
 
+## Materialization (into a native ledger)
+
+Querying a graph source reads the Iceberg table on the fly. Native Fluree
+features — **BM25 full-text search, vector / RAG, and reasoning** — operate only
+on facts committed to a *native* ledger. To use those over an Iceberg table,
+**materialize** it: Fluree expands the R2RML mapping over the source rows and
+`upsert`s the resulting triples into a target native ledger, which you can then
+index and reason over like any other ledger.
+
+> Requires the `iceberg` feature. The endpoints are admin-protected (send the
+> admin Bearer token when one is configured).
+
+### One-shot materialize
+
+`POST {api_base_url}/iceberg/materialize` reads the source and writes it into the
+target ledger (created if it does not exist):
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/materialize \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main", "target": "orders-native:main" }'
+```
+
+```json
+{
+  "source": "orders:main",
+  "target": "orders-native:main",
+  "from_snapshot_id": null,
+  "to_snapshot_id": 5648190075564901028,
+  "incremental": false,
+  "committed": true,
+  "rows_read": 1200,
+  "subjects_upserted": 1200,
+  "subjects_retracted": 0
+}
+```
+
+The materialized snapshot id is persisted as a **watermark** inside the target
+ledger (one per source table), so re-running resumes **incrementally** — only
+the rows added since the last run are read. You track nothing; just call it
+again. A run with no new data commits nothing and returns `committed: false`.
+Pass `"force_full": true` to ignore the watermark and re-read the whole table.
+
+Incremental reads apply when the source's snapshot window is append- or
+compaction-only; an `overwrite`/`delete` snapshot, or expired history, falls back
+to a full re-read automatically.
+
+### Tracking (keep the target fresh automatically)
+
+`POST {api_base_url}/iceberg/track` registers a `source → target` job with the
+in-process tracking worker, runs an immediate first sync, and then refreshes the
+target on a timer (default every 30s):
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main", "target": "orders-native:main" }'
+```
+
+- `POST {api_base_url}/iceberg/untrack` — stop tracking (leaves materialized data in place).
+- `GET {api_base_url}/iceberg/tracking` — list tracked jobs and worker stats.
+
+The worker runs on write nodes (not peers). Tracked jobs are held in memory, so
+after a restart re-issue `track` — the watermark in the target ledger means it
+resumes incrementally rather than re-reading everything.
+
+### Change data capture: updates and deletes (latest-by-key)
+
+By default materialization is **additive** (it inserts/updates triples; it never
+removes them). For a change-data-capture source — an append-only log where each
+change is a new row and a delete is a **tombstone row** — configure two options
+so Fluree applies *latest-by-key* semantics that match a
+`ROW_NUMBER() OVER (PARTITION BY id ORDER BY <ts> DESC) = 1` view:
+
+- **`order_by`** — a column that orders a key's revisions (e.g. an event
+  timestamp or offset). Must be an **integer / date / timestamp** column. The
+  latest row per subject wins, and a whole-subject *replace* clears fields that
+  were dropped in the newer revision.
+- **`delete_column`** + **`delete_values`** — how a row is recognized as a
+  delete. `delete_values` lists the `delete_column` values that mean "deleted";
+  a `null` entry matches a NULL column (the Debezium null-payload convention).
+  When the latest row for a key is a tombstone, the **entire subject** (all its
+  triples) is retracted.
+
+Two ways to encode a delete:
+
+```bash
+# (a) value-match: an op column carries "d" on a delete (Debezium-style).
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -d '{ "name": "orders", "mode": "direct",
+        "table_location": "s3://my-bucket/warehouse/sales/orders",
+        "r2rml": "...", "r2rml_type": "text/turtle",
+        "order_by": "event_timestamp",
+        "delete_column": "_op", "delete_values": ["d", "delete"] }'
+
+# (b) null-payload: a delete row has the key set but content columns null;
+#     pick a column always set on a live row but null on a delete, and list null.
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -d '{ "name": "orders", "mode": "direct",
+        "table_location": "s3://my-bucket/warehouse/sales/orders",
+        "r2rml": "...", "r2rml_type": "text/turtle",
+        "order_by": "event_timestamp",
+        "delete_column": "status", "delete_values": [null] }'
+
+# (combine both: a "d" op value OR a null column both mean delete)
+#   "delete_column": "_op", "delete_values": ["d", null]
+```
+
+These live in the graph source's stored config (`IcebergGsConfig.delete` and
+`order_by`); set them once at `iceberg map` time. A delete removes the **whole
+entity**, not individual columns — a `null` in an ordinary column of a *live* row
+just clears that one predicate.
+
+### Assumptions and limitations
+
+Latest-by-key mode (i.e. when `order_by` and/or a delete convention is set)
+assumes the source matches the append-only, full-image CDC shape these features
+target. The materializer enforces what it can and documents the rest:
+
+- **One complete row per subject revision.** Each row is a full snapshot of its
+  subject. A source that assembles one subject across multiple rows (e.g. an
+  unpivoted join table) is not supported in latest-by-key mode — use additive
+  mode (omit `order_by`/`delete`) or a one-row-per-subject view.
+- **One triples map per logical table** (enforced — multiple would clobber under
+  whole-subject replace).
+- **`order_by` must be populated and value-orderable** (int/date/timestamp,
+  enforced). A row with a null ordering value sorts as oldest.
+- **The target ledger is dedicated to one source.** Whole-subject retraction owns
+  the subject; don't mix other sources or hand-written data about the same IRIs
+  into the same target.
+- **Deletes must be expressed as tombstone rows.** A key that simply stops
+  appearing — with no tombstone — is not reconciled (a set-difference pass is a
+  possible future addition).
+- Retract and re-assert are two ordered commits; the watermark advances only in
+  the second, so an interrupted run re-materializes the same window on the next
+  pass (self-healing).
+
 ## Partition Pruning
 
 Iceberg's partition pruning optimizes queries:

@@ -28,7 +28,7 @@ use fluree_db_iceberg::{
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
     },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
-    IcebergGsConfig,
+    DeleteConvention, IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
@@ -893,6 +893,31 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
         Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
+    }
+
+    /// The source graph source's materialization options from the persisted
+    /// `IcebergGsConfig`: the optional tombstone/delete convention and the
+    /// optional latest-by-key ordering column. Both `None` means additive,
+    /// scan-order materialization (legacy behavior).
+    pub async fn materialize_options(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<(Option<DeleteConvention>, Option<String>)> {
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .ok_or_else(|| {
+                QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
+            })?;
+        let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
+            QueryError::Internal(format!(
+                "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
+            ))
+        })?;
+        Ok((config.delete, config.order_by))
     }
 
     /// Scan only the data files ADDED in the snapshot window

@@ -60,6 +60,16 @@ pub struct IcebergMapRequest {
     /// Use path-style S3 URLs
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Tombstone/delete convention: source column inspected to classify a row
+    /// as a delete during materialization. Omit to disable retraction.
+    pub delete_column: Option<String>,
+    /// Column values that mark a row as a delete. A `null` element matches a NULL
+    /// `delete_column` value (null-payload tombstone), e.g. `["d", "delete"]`,
+    /// `[null]`, or `["d", null]`. Required when `delete_column` is set.
+    #[serde(default)]
+    pub delete_values: Vec<Option<String>>,
+    /// Ordering column for latest-by-key materialization (e.g. `event_timestamp`).
+    pub order_by: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -218,6 +228,7 @@ pub struct IcebergMaterializeResponse {
     pub committed: bool,
     pub rows_read: usize,
     pub subjects_upserted: usize,
+    pub subjects_retracted: usize,
 }
 
 /// Materialize an R2RML / Iceberg graph source into a native ledger.
@@ -280,6 +291,7 @@ async fn iceberg_materialize_local(
             committed: result.committed,
             rows_read: result.rows_read,
             subjects_upserted: result.subjects_upserted,
+            subjects_retracted: result.subjects_retracted,
         };
 
         tracing::info!(
@@ -291,6 +303,7 @@ async fn iceberg_materialize_local(
             committed = response.committed,
             rows_read = response.rows_read,
             subjects_upserted = response.subjects_upserted,
+            subjects_retracted = response.subjects_retracted,
             "iceberg materialize complete"
         );
         Ok((StatusCode::OK, Json(response)))
@@ -385,6 +398,7 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
             committed: result.committed,
             rows_read: result.rows_read,
             subjects_upserted: result.subjects_upserted,
+            subjects_retracted: result.subjects_retracted,
         },
     };
     Ok((StatusCode::OK, Json(response)))
@@ -534,6 +548,19 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     }
     if req.s3_path_style {
         config = config.with_s3_path_style(true);
+    }
+    if let Some(ref column) = req.delete_column {
+        let convention = fluree_db_api::DeleteConvention {
+            column: column.clone(),
+            deleted_values: req.delete_values.clone(),
+        };
+        convention
+            .validate()
+            .map_err(|e| ServerError::bad_request(format!("invalid delete convention: {e}")))?;
+        config = config.with_delete_convention(convention);
+    }
+    if let Some(ref order_by) = req.order_by {
+        config = config.with_order_by(order_by);
     }
 
     Ok(config)
