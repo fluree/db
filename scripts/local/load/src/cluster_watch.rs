@@ -1,6 +1,6 @@
 //! Optional `--watch-cluster` annotation task.
 //!
-//! Polls `/cluster/status` on a single URL at a configurable
+//! Polls `/cluster/status` on one of a list of URLs at a configurable
 //! interval, prints a marker whenever:
 //!
 //! - the leader changes,
@@ -9,6 +9,13 @@
 //!   rendezvous-hash mirror in `crate::ownership`),
 //! - the term advances (often coincident with a leader change, but
 //!   worth surfacing separately to catch election storms).
+//!
+//! Multiple URLs are supported so a chaos run that kills the node
+//! whose raft port we were watching doesn't leave the watcher blind
+//! for the rest of the run. On each tick the poller walks the list
+//! in order and uses the first URL that responds; the previously
+//! successful URL is tried first the next tick, so a healthy watch
+//! stays sticky.
 //!
 //! When the voter set changes, the task also computes — locally,
 //! via the rendezvous mirror — how many of the currently-registered
@@ -39,11 +46,15 @@ struct ClusterStatus {
 }
 
 pub async fn run(
-    url: String,
+    urls: Vec<String>,
     interval: Duration,
     ledgers: LedgerState,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    if urls.is_empty() {
+        eprintln!("[watch-cluster] no URLs supplied; watcher exiting");
+        return;
+    }
     let http = match Client::builder().timeout(Duration::from_secs(3)).build() {
         Ok(c) => c,
         Err(e) => {
@@ -52,8 +63,14 @@ pub async fn run(
         }
     };
     let started = Instant::now();
-    let status_url = format!("{}/cluster/status", url.trim_end_matches('/'));
+    let status_urls: Vec<String> = urls
+        .iter()
+        .map(|u| format!("{}/cluster/status", u.trim_end_matches('/')))
+        .collect();
     let mut last: Option<ClusterStatus> = None;
+    // Sticky preference for the URL that last succeeded, so a healthy
+    // watch doesn't cycle through the list on every tick.
+    let mut preferred: usize = 0;
 
     loop {
         let sleep = tokio::time::sleep(interval);
@@ -66,16 +83,25 @@ pub async fn run(
             return;
         }
 
-        let next = match fetch(&http, &status_url).await {
-            Ok(s) => s,
-            Err(e) => {
+        let (next, chosen_idx) = match poll(&http, &status_urls, preferred).await {
+            Ok(v) => v,
+            Err(errors) => {
+                let msg = errors.join("; ");
                 eprintln!(
-                    "[watch-cluster t={:>5.1}s] poll failed: {e}",
+                    "[watch-cluster t={:>5.1}s] all polls failed: {msg}",
                     started.elapsed().as_secs_f64()
                 );
                 continue;
             }
         };
+        if chosen_idx != preferred {
+            println!(
+                "[watch-cluster t={:>5.1}s] failover: now polling {}",
+                started.elapsed().as_secs_f64(),
+                urls[chosen_idx],
+            );
+            preferred = chosen_idx;
+        }
 
         if let Some(prev) = &last {
             announce_changes(&started, prev, &next, &ledgers);
@@ -90,6 +116,27 @@ pub async fn run(
         }
         last = Some(next);
     }
+}
+
+/// Walk the URL list starting from `preferred`; return the first
+/// successful response and the URL's index. On complete failure
+/// return the collected per-URL errors so the caller can log a
+/// single line rather than N.
+async fn poll(
+    http: &Client,
+    urls: &[String],
+    preferred: usize,
+) -> Result<(ClusterStatus, usize), Vec<String>> {
+    let n = urls.len();
+    let mut errors = Vec::with_capacity(n);
+    for offset in 0..n {
+        let idx = (preferred + offset) % n;
+        match fetch(http, &urls[idx]).await {
+            Ok(s) => return Ok((s, idx)),
+            Err(e) => errors.push(format!("{}: {e}", urls[idx])),
+        }
+    }
+    Err(errors)
 }
 
 async fn fetch(http: &Client, url: &str) -> Result<ClusterStatus, String> {
