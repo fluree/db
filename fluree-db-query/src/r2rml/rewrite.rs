@@ -29,8 +29,8 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
-use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot, Sid};
-use fluree_vocab::{namespaces::XSD, xsd_names};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
+use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
@@ -398,15 +398,28 @@ fn cmp_op(func: &Function, reversed: bool) -> Option<ScanCmpOp> {
 
 /// Convert a constant literal to a prunable `ScanValue`. Only date, integer and
 /// boolean are pushed; everything else stays with the in-engine FILTER.
-/// Whether a triple's object datatype constraint is a plain (untyped)
-/// `xsd:string` — the only literal shape taken through the constant-object scan,
-/// where a loose value-only match matches product behavior. A language tag or
-/// any other explicit datatype requires strict matching and is excluded.
-fn is_plain_string_object(dtc: &Option<DatatypeConstraint>) -> bool {
+/// Whether a triple's object datatype constraint permits a loose (value-only)
+/// constant-object match. The product matches untyped literals loosely, and a
+/// literal written without an explicit `^^type` carries its natural XSD datatype
+/// (`xsd:string`, `xsd:integer`, ...), so any XSD-namespaced datatype qualifies.
+/// A language tag or a custom (non-XSD) datatype requires strict matching and is
+/// excluded from this path.
+fn is_loose_matchable_datatype(dtc: &Option<DatatypeConstraint>) -> bool {
     match dtc {
         None => true,
-        Some(DatatypeConstraint::Explicit(sid)) => *sid == Sid::new(XSD, xsd_names::STRING),
+        Some(DatatypeConstraint::Explicit(sid)) => sid.namespace_code == XSD,
         Some(DatatypeConstraint::LangTag(_)) => false,
+    }
+}
+
+/// The scan value for a constant object literal, or `None` for value types not
+/// yet supported as constant objects (float/decimal/date, refs).
+fn const_object_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+    match value {
+        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
+        FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
+        FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
+        _ => None,
     }
 }
 
@@ -512,23 +525,23 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(_) => None, // Predicate is variable - no filter
     };
 
-    // Extract the object: a variable, or a constant string equality constraint.
-    let (object_var, object_constant) = match &tp.o {
-        Term::Var(v) => (Some(*v), None),
-        // `?s <pred> "value"`: a plain (untyped) string object becomes an
-        // equality constraint the operator enforces. The product does a loose,
-        // value-only match on untyped literals, which is exactly the lexical
-        // comparison here — so this is only taken for a plain `xsd:string`
-        // object. Language-tagged or explicitly-typed literals need strict
-        // datatype matching and are left unconverted (rejected as unsupported),
-        // never loosely matched. Requires a constant predicate to resolve the
-        // column; non-string constants (numbers, refs) are not pushed yet.
-        Term::Value(FlakeValue::String(s))
-            if predicate_filter.is_some() && is_plain_string_object(&tp.dtc) =>
-        {
-            (None, Some(ScanValue::Str(s.clone())))
+    // Extract the object: a variable, or a constant literal equality constraint
+    // the operator enforces. Supported for string/integer/boolean literals with
+    // a loose-matchable (untyped or XSD) datatype and a constant predicate (to
+    // resolve the column). Language-tagged / custom-typed literals need strict
+    // matching, and ref/IRI or float/decimal/date objects are not pushed yet —
+    // all left unconverted (rejected as unsupported) rather than mismatched.
+    let object_constant = match &tp.o {
+        Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
+            const_object_scan_value(v)
         }
-        Term::Sid(_) | Term::Iri(_) | Term::Value(_) => return None,
+        _ => None,
+    };
+    let object_var = match (&tp.o, &object_constant) {
+        (Term::Var(v), _) => Some(*v),
+        (_, Some(_)) => None,
+        // Bound object we cannot yet convert.
+        _ => return None,
     };
 
     let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, object_var);
@@ -583,20 +596,24 @@ mod tests {
     }
 
     #[test]
-    fn plain_string_object_gate() {
-        // Untyped / plain xsd:string → loose value match is allowed.
-        assert!(is_plain_string_object(&None));
-        assert!(is_plain_string_object(&Some(DatatypeConstraint::Explicit(
-            Sid::new(XSD, xsd_names::STRING)
-        ))));
-        // Explicitly typed or language-tagged → strict; excluded from the loose
-        // constant-object path (so `"chat"@fr` never matches a plain `"chat"`).
-        assert!(!is_plain_string_object(&Some(
+    fn loose_matchable_datatype_gate() {
+        use fluree_vocab::xsd_names;
+        // Untyped or any XSD datatype (string, integer, ...) → loose value match.
+        assert!(is_loose_matchable_datatype(&None));
+        assert!(is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::STRING))
+        )));
+        assert!(is_loose_matchable_datatype(&Some(
             DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::INTEGER))
         )));
-        assert!(!is_plain_string_object(&Some(DatatypeConstraint::LangTag(
-            "fr".into()
-        ))));
+        // A language tag or a custom (non-XSD) datatype → strict; excluded (so
+        // `"chat"@fr` or `"x"^^custom` never loose-match).
+        assert!(!is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::LangTag("fr".into())
+        )));
+        assert!(!is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(100, "myType"))
+        )));
     }
 
     #[test]

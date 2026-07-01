@@ -1150,14 +1150,29 @@ fn materialize_pom_object(
 }
 
 /// Whether a materialized object term equals a constant-object `ScanValue`.
-/// Only plain (untyped) `xsd:string` objects reach this path (gated in
-/// `convert_triple_to_r2rml`), where the product does a loose value-only match,
-/// so this is a lexical comparison and intentionally ignores the materialized
-/// term's datatype/language.
+/// Constant objects are loose-matched (gated in `convert_triple_to_r2rml`), so
+/// this compares the literal's value and intentionally ignores its
+/// datatype/language: a lexical compare for strings, and a value compare for
+/// integers/booleans that tolerates lexical differences (e.g. "2024" vs
+/// "2024.0", "true" vs "1").
 fn rdf_term_eq_scan_value(term: &RdfTerm, value: &crate::r2rml::ScanValue) -> bool {
-    match (term, value) {
-        (RdfTerm::Literal { value: v, .. }, crate::r2rml::ScanValue::Str(s)) => v == s,
-        _ => false,
+    use crate::r2rml::ScanValue;
+    let RdfTerm::Literal { value: v, .. } = term else {
+        return false;
+    };
+    match value {
+        ScanValue::Str(s) => v == s,
+        ScanValue::Int(n) => {
+            v.parse::<i64>().is_ok_and(|x| x == *n)
+                || v.parse::<f64>().is_ok_and(|x| x == *n as f64)
+        }
+        ScanValue::Bool(b) => match v.as_str() {
+            "true" | "1" => *b,
+            "false" | "0" => !*b,
+            _ => false,
+        },
+        // Date constant objects are not produced by convert_triple_to_r2rml yet.
+        ScanValue::Date(_) => false,
     }
 }
 
