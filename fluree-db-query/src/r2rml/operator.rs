@@ -43,7 +43,8 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TriplesMap};
 use fluree_db_r2rml::materialize::{
-    get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
+    get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch,
+    reverse_subject_template, RdfTerm,
 };
 use fluree_db_tabular::ColumnBatch;
 use fluree_vocab::xsd;
@@ -90,6 +91,27 @@ fn limit_pushdown_enabled() -> bool {
         ),
         Err(_) => true,
     })
+}
+
+/// Whether bound-subject key pushdown is enabled. UNLIKE the other R2RML
+/// switches, this defaults to OFF and must be explicitly enabled with
+/// `FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN` set to `1`/`true`/`on`. It pushes a filter
+/// derived from reversing the subject template — correct by construction for the
+/// supported template shapes and physical types — but wants a live pruning check
+/// against a real backend before becoming the default. The operator always
+/// enforces the subject equality regardless, so enabling it can never change
+/// results, only which rows the scan returns.
+fn subject_key_pushdown_enabled() -> bool {
+    // Read live (not cached) so it is deterministically togglable in tests; the
+    // check runs once per TriplesMap scan, never per row, so the cost is nil.
+    matches!(
+        std::env::var("FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on"
+    )
 }
 
 /// How a window of produced rows is combined with the buffered child rows.
@@ -350,6 +372,31 @@ impl R2rmlScanOperator {
                             column: (*col).to_string(),
                             op: crate::r2rml::ScanCmpOp::Eq,
                             value: value.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Bound-subject key pushdown (opt-in): reverse the subject template
+        // against the constant IRI to recover each key column's raw value, and
+        // push it as an equality so Iceberg can prune to the matching rows. Only
+        // unambiguously-reversible template shapes yield filters (see
+        // `reverse_subject_template`); the physical type is resolved later against
+        // the Iceberg schema, and unsupported types are skipped. The operator
+        // still enforces the subject equality, so a skipped or partial push is a
+        // perf choice, never a correctness one.
+        if subject_key_pushdown_enabled() {
+            if let (Some(subject_iri), Some(template)) = (
+                self.pattern.subject_constant.as_deref(),
+                triples_map.subject_map.template.as_deref(),
+            ) {
+                if let Some(keys) = reverse_subject_template(template, subject_iri) {
+                    for (column, raw) in keys {
+                        out.push(crate::r2rml::ScanFilter {
+                            column,
+                            op: crate::r2rml::ScanCmpOp::Eq,
+                            value: crate::r2rml::ScanValue::TemplateKey(raw),
                         });
                     }
                 }
@@ -1215,6 +1262,9 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
                 ScanValue::Date(days) => {
                     fluree_db_core::Date::parse(v).is_ok_and(|d| d.days_since_epoch() == *days)
                 }
+                // A TemplateKey is only ever a reversed subject-key filter, never
+                // an object constant, so it never matches an object term.
+                ScanValue::TemplateKey(_) => false,
             }
         }
     }

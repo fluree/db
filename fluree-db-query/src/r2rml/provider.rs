@@ -47,6 +47,12 @@ pub enum ScanValue {
     Date(i32),
     /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
     Str(String),
+    /// A raw column value recovered by reversing a subject template (bound-subject
+    /// pushdown). The physical type is unknown here — it is resolved against the
+    /// Iceberg field type when the pushdown predicate is built, and the pushdown is
+    /// skipped for field types not yet supported. The R2RML operator still enforces
+    /// the subject equality, so a skipped or imperfect push is never wrong.
+    TemplateKey(String),
 }
 
 /// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the

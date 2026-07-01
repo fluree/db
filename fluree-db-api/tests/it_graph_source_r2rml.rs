@@ -13,7 +13,9 @@ mod support;
 use async_trait::async_trait;
 use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanValue,
+};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::collections::HashMap;
@@ -3546,6 +3548,105 @@ async fn run_store_probe(
     .await
     .expect("store probe query should execute");
     result.iter().fold(0, |acc, b| acc + b.len())
+}
+
+/// A provider that records the scan filters it is handed, so a test can assert
+/// exactly which pushdown predicates the operator produced.
+#[derive(Debug)]
+struct FilterCapturingProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    chunks: Vec<ColumnBatch>,
+    filters: Arc<Mutex<Vec<ScanFilter>>>,
+}
+
+#[async_trait::async_trait]
+impl R2rmlProvider for FilterCapturingProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
+        graph_source_id == "edw-gs:main"
+    }
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait::async_trait]
+impl R2rmlTableProvider for FilterCapturingProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        use futures::StreamExt;
+        self.filters.lock().unwrap().extend(filters.iter().cloned());
+        Ok(Box::pin(futures::stream::iter(self.chunks.clone()).map(Ok)))
+    }
+}
+
+/// With `FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN` on, a bound subject reverses the
+/// subject template and hands the scan an equality filter on the key column, and
+/// the result is still correct (the operator remains authority). This is the
+/// end-to-end proof of the pushdown wiring; the physical-type coercion and the
+/// template reversal are unit-tested separately.
+#[tokio::test]
+async fn guard_bound_subject_pushes_key_filter_when_enabled() {
+    std::env::set_var("FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN", "1");
+    let (_fluree, ledger) = edw_guard_ledger();
+    let filters = Arc::new(Mutex::new(Vec::new()));
+    let provider = FilterCapturingProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(1, 10),
+        filters: Arc::clone(&filters),
+    };
+    let mut vars = VarRegistry::new();
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // <http://example.org/store/5> ex:storeId ?id
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(id),
+    ))];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![id]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("bound-subject query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+
+    std::env::remove_var("FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN");
+
+    // The subject template `.../store/{store_key}` reversed against `.../store/5`
+    // must push `store_key = 5` as a template key.
+    let captured = filters.lock().unwrap();
+    assert!(
+        captured.iter().any(|f| f.column == "store_key"
+            && matches!(&f.value, ScanValue::TemplateKey(v) if v == "5")),
+        "expected a store_key TemplateKey(5) filter, got {captured:?}"
+    );
+    // Operator authority still yields exactly the one matching subject.
+    assert_eq!(rows, 1, "only <store/5>'s storeId object is returned");
 }
 
 /// 4a: a `LIMIT n` above the scan must terminate it early. Store is streamed as 40
