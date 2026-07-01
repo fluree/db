@@ -402,6 +402,7 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
         FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
         FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
+        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
         _ => None,
     }
 }

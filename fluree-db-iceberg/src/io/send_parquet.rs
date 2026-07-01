@@ -1134,6 +1134,48 @@ mod tests {
         assert_eq!(ids, vec![Some(2)]);
     }
 
+    /// String-equality row filter: `name = "alice"` keeps only the matching row
+    /// (and drops the null-name row). Exercises the Arrow string comparison path.
+    #[tokio::test]
+    async fn read_task_row_filter_string_equality() {
+        use crate::io::batch::Column;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        // name (field_id 1) = "alice"
+        let residual = Expression::Comparison {
+            field_id: 1,
+            column: "name".to_string(),
+            op: crate::scan::predicate::ComparisonOp::Eq,
+            value: crate::scan::predicate::LiteralValue::String("alice".to_string()),
+        };
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ]);
+        let task = whole_file_task(&bytes, Some(residual), Some(schema));
+        let batches = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect("decode");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        let names = flatten(&batches, 1, |c| match c {
+            Column::String(v) => v.as_slice(),
+            _ => panic!("name not String"),
+        });
+        assert_eq!(ids, vec![Some(1)], "only alice's row survives");
+        assert_eq!(names, vec![Some("alice".to_string())]);
+    }
+
     /// The Decimal landmine: an `xsd:integer` column is physically `DECIMAL`, so
     /// an `Int64` literal must be cast to the column's decimal type before
     /// comparison. A naive raw compare dropped every row; this asserts the one

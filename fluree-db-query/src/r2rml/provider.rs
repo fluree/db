@@ -35,15 +35,18 @@ pub enum ScanCmpOp {
 
 /// A literal value for a pushed-down scan filter.
 ///
-/// Intentionally limited to the types that prune safely against Iceberg column
-/// min/max bounds in the MVP (date partition pruning is the target). Decimal /
-/// float / string predicates are left to the in-engine FILTER.
+/// Limited to types that prune safely against Iceberg column min/max bounds and
+/// that the Arrow row filter can evaluate: date/int/bool, plus strings
+/// (lexicographic, e.g. equality on a name/code column). Decimal / float
+/// predicates are left to the in-engine FILTER.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanValue {
     Bool(bool),
     Int(i64),
     /// Days since 1970-01-01 (matches Iceberg date storage).
     Date(i32),
+    /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
+    Str(String),
 }
 
 /// A predicate pushed down to the Iceberg scan for file pruning.

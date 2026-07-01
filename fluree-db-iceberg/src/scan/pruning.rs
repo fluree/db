@@ -280,6 +280,17 @@ fn stat_bounds(stats: &Statistics, like: &TypedValue) -> (Option<TypedValue>, Op
             s.min_opt().map(|&v| TypedValue::Int64(v)),
             s.max_opt().map(|&v| TypedValue::Int64(v)),
         ),
+        // UTF-8 string min/max. Parquet stats are valid bounds even when the
+        // writer truncates them (min truncated down, max up), so lexicographic
+        // pruning stays conservative. Non-UTF-8 bytes fall through to no bound.
+        (Statistics::ByteArray(s), TypedValue::String(_)) => {
+            let to_str = |b: &parquet::data_type::ByteArray| {
+                std::str::from_utf8(b.data())
+                    .ok()
+                    .map(|v| TypedValue::String(v.to_string()))
+            };
+            (s.min_opt().and_then(to_str), s.max_opt().and_then(to_str))
+        }
         _ => (None, None),
     }
 }
