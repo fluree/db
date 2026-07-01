@@ -13,7 +13,9 @@ mod support;
 use async_trait::async_trait;
 use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter, ScanValue,
+};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::collections::HashMap;
@@ -3184,6 +3186,52 @@ async fn guard_class_star_scans_only_store_once() {
     assert_eq!(rows, 2, "two store rows expected");
 }
 
+/// A constant-object triple (`?s ex:storeId "STORE-2"`) fuses into the same-subject
+/// var-object star (`?s ex:name ?name`) as an existence constraint: dw.store is
+/// scanned exactly once (no separate scan + self-join), and only the row whose
+/// storeId equals the constant survives.
+#[tokio::test]
+async fn guard_constant_object_fuses_into_star_single_scan() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let name = vars.get_or_insert("?name");
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+    let p_store_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+
+    // ?s ex:name ?name ; ex:storeId "STORE-2"
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_name),
+            Term::Var(name),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_store_id),
+            Term::Value(FlakeValue::String("STORE-2".to_string())),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, name]).await;
+
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "constant-object storeId must fuse into the name star → one scan, got {counts:?}"
+    );
+    assert_eq!(
+        rows, 1,
+        "only STORE-2 satisfies the fused constant-object constraint"
+    );
+}
+
 /// `?s a ex:Store` alone must scan ONLY dw.store once (subject-only): no POMs,
 /// no RefObjectMap parent, and the class filter keeps it off Employee/Geography.
 #[tokio::test]
@@ -3502,6 +3550,101 @@ async fn run_store_probe(
     result.iter().fold(0, |acc, b| acc + b.len())
 }
 
+/// A provider that records the scan filters it is handed, so a test can assert
+/// exactly which pushdown predicates the operator produced.
+#[derive(Debug)]
+struct FilterCapturingProvider {
+    mapping: Arc<CompiledR2rmlMapping>,
+    chunks: Vec<ColumnBatch>,
+    filters: Arc<Mutex<Vec<ScanFilter>>>,
+}
+
+#[async_trait::async_trait]
+impl R2rmlProvider for FilterCapturingProvider {
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
+        graph_source_id == "edw-gs:main"
+    }
+    async fn compiled_mapping(
+        &self,
+        _graph_source_id: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait::async_trait]
+impl R2rmlTableProvider for FilterCapturingProvider {
+    async fn scan_table(
+        &self,
+        _graph_source_id: &str,
+        _table_name: &str,
+        _projection: &[String],
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        use futures::StreamExt;
+        self.filters.lock().unwrap().extend(filters.iter().cloned());
+        Ok(Box::pin(futures::stream::iter(self.chunks.clone()).map(Ok)))
+    }
+}
+
+/// A bound subject reverses the subject template and hands the scan an equality
+/// filter on the key column, and the result is still correct (the operator
+/// remains authority). This is the end-to-end proof of the pushdown wiring; the
+/// physical-type coercion and the template reversal are unit-tested separately.
+#[tokio::test]
+async fn guard_bound_subject_pushes_key_filter() {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let filters = Arc::new(Mutex::new(Vec::new()));
+    let provider = FilterCapturingProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(1, 10),
+        filters: Arc::clone(&filters),
+    };
+    let mut vars = VarRegistry::new();
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // <http://example.org/store/5> ex:storeId ?id
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(id),
+    ))];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![id]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("bound-subject query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+
+    // The subject template `.../store/{store_key}` reversed against `.../store/5`
+    // must push `store_key = 5` as a template key.
+    let captured = filters.lock().unwrap();
+    assert!(
+        captured.iter().any(|f| f.column == "store_key"
+            && matches!(&f.value, ScanValue::TemplateKey(v) if v == "5")),
+        "expected a store_key TemplateKey(5) filter, got {captured:?}"
+    );
+    // Operator authority still yields exactly the one matching subject.
+    assert_eq!(rows, 1, "only <store/5>'s storeId object is returned");
+}
+
 /// 4a: a `LIMIT n` above the scan must terminate it early. Store is streamed as 40
 /// chunks of 50 rows (2000); `LIMIT 5` must stop after ~one chunk, while the same
 /// query without a LIMIT drains all 40 — proving the row budget reaches the scan
@@ -3677,4 +3820,107 @@ async fn guard_constant_object_integer_equality() {
     };
     let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![s], None).await;
     assert_eq!(rows, 1, "only store_key 5 matches the integer constant");
+}
+
+/// A bound (constant) subject (`<store/5> ex:storeId ?id`) is enforced by the
+/// operator: it materializes each row's subject from the template and keeps only
+/// the row whose subject IRI equals the constant, binding just the object var.
+/// The mock provider streams every row (no pruning), so exactly the one matching
+/// subject's object must come back.
+#[tokio::test]
+async fn guard_bound_subject_binds_object_only() {
+    use std::sync::atomic::AtomicUsize;
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // <http://example.org/store/5> ex:storeId ?id
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(id),
+    ))];
+
+    let provider = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    // Select only the object var — the constant subject binds no variable.
+    let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![id], None).await;
+    assert_eq!(
+        rows, 1,
+        "only the <store/5> subject's storeId object is returned"
+    );
+}
+
+/// A decimal constant object (`?s ex:val 9.99`) is enforced by the operator with
+/// a scale-insensitive numeric match: a column materialized as `9.990` (scale 3)
+/// matches the `9.99` query constant, while `12.345` does not. This also exercises
+/// the real `format_decimal` → `BigDecimal::parse` path end to end.
+#[tokio::test]
+async fn guard_constant_object_decimal_scale_insensitive() {
+    use num_bigdecimal::BigDecimal;
+    use std::str::FromStr;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:decimal"))
+        .unwrap()
+        .compile()
+        .unwrap();
+    // Scale-3 column: unscaled 9990 → "9.990", 12345 → "12.345".
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Decimal {
+            values: vec![Some(9990), Some(12345)],
+            precision: 10,
+            scale: 3,
+        },
+        FieldType::Decimal {
+            precision: 10,
+            scale: 3,
+        },
+    );
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+    // ?s ex:val 9.99
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Value(FlakeValue::Decimal(Box::new(
+                BigDecimal::from_str("9.99").unwrap(),
+            ))),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![s]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("decimal object-constant query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    assert_eq!(rows, 1, "decimal 9.99 matches only the 9.990-scaled row");
 }

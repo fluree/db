@@ -306,6 +306,21 @@ R2RML graph sources execute by scanning the underlying Iceberg table and materia
 
 4. **Partition by Common Filters:** Partition your Iceberg tables by columns frequently used in filters (e.g., date).
 
+### Bound-subject key pushdown
+
+A query that names a specific subject IRI — e.g. `<http://example.org/store/5> ex:name ?n` — can be answered without scanning the whole table. Fluree reverses the subject template (`rr:subjectMap rr:template "http://example.org/store/{store_key}"`) to recover the key value (`store_key = 5`) and pushes it to the Iceberg scan as an equality predicate, so the reader can prune to the matching rows. The mapping's subject equality is always re-checked in-engine, so this only ever affects *which rows the scan returns*, never the result.
+
+This is **on by default**. It shares the Iceberg predicate-pushdown kill-switch, `FLUREE_ICEBERG_PREDICATE_PUSHDOWN=0` (see [Configuration](../operations/configuration.md)); with pushdown off, bound-subject queries are still answered correctly — just by scanning and filtering in-engine instead of pruning.
+
+**The percent-encoding contract.** R2RML builds subject IRIs by substituting column values into the template and percent-encoding each value per RFC 3987 (letters, digits, and `- . _ ~ ! $ & ' ( ) * + , ; = : @` are left literal; everything else — including `/`, `#`, `?`, space, and non-ASCII — becomes `%XX`). Reversal is the exact inverse. **For the pushdown to engage, a query's subject IRI must use this same encoding.** For example, a `store_key` of `west/5` is stored in the IRI as `http://example.org/store/west%2F5` — query it with the `%2F`, not a literal `/`.
+
+If a query IRI is encoded differently, it simply matches no generated subject — and it does so *identically* whether pushdown is on or off (both return no rows). A mis-encoded IRI is therefore a query-authoring issue, never a case where pushdown and a full scan disagree.
+
+**What is pushed.** Pushdown engages only for templates that reverse unambiguously and key columns whose physical type is supported:
+
+- **Template shape:** a single trailing placeholder (`.../{key}`) always qualifies; multi-placeholder templates (`.../{a}/{b}`) qualify only when the separators between placeholders are characters that are always percent-encoded (like `/`). Ambiguous shapes such as `.../{a};{b}` (`;` is left literal) are skipped and fall back to a full scan.
+- **Key column type:** integer keys on `int`, `long`, or integer-valued `decimal` columns, and `string` keys. Other physical types (dates, floats, non-integer decimals) are not pushed yet and fall back to a full scan.
+
 ## Use Cases
 
 ### Data Lake Analytics

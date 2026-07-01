@@ -1170,7 +1170,7 @@ impl FusedR2rmlAggregateOperator {
         for (_, func) in &self.aggregates {
             match func {
                 AggregateFn::CountAll => folds.push(Fold::CountRows),
-                AggregateFn::Count(v) if *v == pattern.subject_var => {
+                AggregateFn::Count(v) if pattern.subject_var == Some(*v) => {
                     // COUNT of the subject counts the rows that produce a row,
                     // which the row-validity gate already enforces.
                     folds.push(Fold::CountRows);

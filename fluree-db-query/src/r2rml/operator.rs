@@ -43,7 +43,8 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TriplesMap};
 use fluree_db_r2rml::materialize::{
-    get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
+    get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch,
+    reverse_subject_template, RdfTerm,
 };
 use fluree_db_tabular::ColumnBatch;
 use fluree_vocab::xsd;
@@ -193,9 +194,11 @@ impl R2rmlScanOperator {
         let mut schema_vars: Vec<VarId> = child_schema.to_vec();
         let mut seen: HashSet<VarId> = schema_vars.iter().copied().collect();
 
-        // Add subject variable if new
-        if seen.insert(pattern.subject_var) {
-            schema_vars.push(pattern.subject_var);
+        // Add subject variable if new (constant subjects bind no variable)
+        if let Some(subject_var) = pattern.subject_var {
+            if seen.insert(subject_var) {
+                schema_vars.push(subject_var);
+            }
         }
 
         // Add object variable if present and new
@@ -350,6 +353,32 @@ impl R2rmlScanOperator {
                             value: value.clone(),
                         });
                     }
+                }
+            }
+        }
+
+        // Bound-subject key pushdown: reverse the subject template against the
+        // constant IRI to recover each key column's raw value, and push it as an
+        // equality so Iceberg can prune to the matching rows. Emitted
+        // unconditionally, like the object-constant filters above; whether it is
+        // *applied* is governed by the same reader-level pushdown kill-switch
+        // (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`). Only unambiguously-reversible
+        // template shapes yield filters (see `reverse_subject_template`); the
+        // physical type is resolved later against the Iceberg schema, and
+        // unsupported types are skipped. The operator still enforces the subject
+        // equality, so a skipped or partial push is a perf choice, never a
+        // correctness one.
+        if let (Some(subject_iri), Some(template)) = (
+            self.pattern.subject_constant.as_deref(),
+            triples_map.subject_map.template.as_deref(),
+        ) {
+            if let Some(keys) = reverse_subject_template(template, subject_iri) {
+                for (column, raw) in keys {
+                    out.push(crate::r2rml::ScanFilter {
+                        column,
+                        op: crate::r2rml::ScanCmpOp::Eq,
+                        value: crate::r2rml::ScanValue::TemplateKey(raw),
+                    });
                 }
             }
         }
@@ -1180,6 +1209,21 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
     match constant {
         // Bound IRI / ref object: exact IRI match.
         ObjectConstant::Iri(iri) => matches!(term, RdfTerm::Iri(v) if v == iri),
+        // Decimal / big-integer object: numeric (scale-insensitive) match, so a
+        // query `9.99` matches a column materialized as `9.990`.
+        ObjectConstant::Decimal(d) => {
+            let RdfTerm::Literal { value: v, .. } = term else {
+                return false;
+            };
+            v.parse::<bigdecimal::BigDecimal>().is_ok_and(|x| &x == d)
+        }
+        // Double object: exact f64 value match.
+        ObjectConstant::Double(f) => {
+            let RdfTerm::Literal { value: v, .. } = term else {
+                return false;
+            };
+            v.parse::<f64>().is_ok_and(|x| x == *f)
+        }
         // Literal object: loose value match, ignoring datatype/language.
         ObjectConstant::Scalar(value) => {
             let RdfTerm::Literal { value: v, .. } = term else {
@@ -1193,11 +1237,23 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
                     "false" | "0" => !*b,
                     _ => false,
                 },
-                // Date constant objects are not produced by convert yet.
-                ScanValue::Date(_) => false,
+                // The subject/object date column materializes as ISO 8601; parse
+                // it back to days-since-epoch and compare to the constant.
+                ScanValue::Date(days) => {
+                    fluree_db_core::Date::parse(v).is_ok_and(|d| d.days_since_epoch() == *days)
+                }
+                // A TemplateKey is only ever a reversed subject-key filter, never
+                // an object constant, so it never matches an object term.
+                ScanValue::TemplateKey(_) => false,
             }
         }
     }
+}
+
+/// Whether a materialized subject term equals a constant (bound) subject IRI.
+/// Subject maps always produce IRIs, so a non-IRI term never matches.
+fn subject_term_matches_iri(term: &RdfTerm, want: &str) -> bool {
+    matches!(term, RdfTerm::Iri(v) if v == want)
 }
 
 /// Materialize one column batch into produced variable assignments (subject +
@@ -1220,9 +1276,27 @@ fn materialize_batch(
             Some(t) => t,
             None => continue,
         };
+
+        // Bound-subject filter (`<store/5> <pred> ?o`): keep only rows whose
+        // subject IRI equals the constant. This is the pattern's semantics,
+        // enforced regardless of any scan pushdown.
+        if let Some(want) = pattern.subject_constant.as_deref() {
+            if !subject_term_matches_iri(&subject_term, want) {
+                continue;
+            }
+        }
         let subject_binding = encoder.encode(&subject_term);
 
-        if !pattern.star_bindings.is_empty() {
+        // Seed a fresh output row with the subject binding, or an empty row when
+        // the subject is a constant (which binds no variable).
+        let seed_row = || -> Vec<(VarId, Binding)> {
+            match pattern.subject_var {
+                Some(sv) => vec![(sv, subject_binding.clone())],
+                None => Vec::new(),
+            }
+        };
+
+        if !pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty() {
             let mut members: Vec<(VarId, &str)> = Vec::new();
             if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
             {
@@ -1253,12 +1327,41 @@ fn materialize_batch(
                 }
                 binding_lists.push((*var, vals));
             }
+
+            // Fused constant-object constraints: the row survives only when each
+            // predicate produces at least one object equal to its constant. This
+            // is an existence filter (produces no var), enforced by the operator.
+            if row_ok {
+                for (pred, required) in &pattern.star_constraints {
+                    let mut matched = false;
+                    for pom in triples_map
+                        .predicate_object_maps
+                        .iter()
+                        .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
+                    {
+                        if let Some(t) = materialize_pom_object(
+                            pom,
+                            iceberg_batch,
+                            table_row_idx,
+                            parent_lookups,
+                        )? {
+                            if rdf_term_eq_object_constant(&t, required) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !matched {
+                        row_ok = false;
+                        break;
+                    }
+                }
+            }
             if !row_ok {
                 continue;
             }
 
-            let mut rows: Vec<Vec<(VarId, Binding)>> =
-                vec![vec![(pattern.subject_var, subject_binding.clone())]];
+            let mut rows: Vec<Vec<(VarId, Binding)>> = vec![seed_row()];
             for (var, vals) in &binding_lists {
                 if vals.len() == 1 {
                     for r in &mut rows {
@@ -1304,11 +1407,11 @@ fn materialize_batch(
                     }
                 }
                 if matched {
-                    produced.push(vec![(pattern.subject_var, subject_binding)]);
+                    produced.push(seed_row());
                 }
                 continue;
             }
-            produced.push(vec![(pattern.subject_var, subject_binding)]);
+            produced.push(seed_row());
             continue;
         };
 
@@ -1322,10 +1425,9 @@ fn materialize_batch(
                 materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
             {
                 let object_binding = encoder.encode(&t);
-                produced.push(vec![
-                    (pattern.subject_var, subject_binding.clone()),
-                    (obj_var, object_binding),
-                ]);
+                let mut row = seed_row();
+                row.push((obj_var, object_binding));
+                produced.push(row);
             }
         }
     }
@@ -1610,5 +1712,56 @@ mod tests {
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b));
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b));
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("false"), &b));
+    }
+
+    #[test]
+    fn numeric_and_date_object_matching() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        // Decimal: scale-insensitive numeric match (`9.99` == `9.990`).
+        let d = ObjectConstant::Decimal(BigDecimal::from_str("9.99").unwrap());
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("9.99"), &d));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("9.990"), &d));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("9.98"), &d));
+        // An IRI term never matches a literal constant.
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("9.99"), &d));
+
+        // Double: exact f64 value match, insensitive to trailing zeros.
+        let f = ObjectConstant::Double(1.5);
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1.5"), &f));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1.50"), &f));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("1.6"), &f));
+
+        // Date: ISO 8601 materialized lexical parsed back to days-since-epoch.
+        let days = fluree_db_core::Date::parse("2024-01-15")
+            .unwrap()
+            .days_since_epoch();
+        let dt = ObjectConstant::Scalar(ScanValue::Date(days));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("2024-01-15"),
+            &dt
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("2024-01-16"),
+            &dt
+        ));
+    }
+
+    #[test]
+    fn bound_subject_matching() {
+        // Subject maps always yield IRIs: exact IRI match, never a literal.
+        assert!(subject_term_matches_iri(
+            &RdfTerm::iri("http://ex/store/5"),
+            "http://ex/store/5"
+        ));
+        assert!(!subject_term_matches_iri(
+            &RdfTerm::iri("http://ex/store/50"),
+            "http://ex/store/5"
+        ));
+        assert!(!subject_term_matches_iri(
+            &RdfTerm::string("http://ex/store/5"),
+            "http://ex/store/5"
+        ));
     }
 }

@@ -198,6 +198,120 @@ fn iri_escape(value: &str) -> String {
     result
 }
 
+/// Whether `iri_escape` always percent-encodes `c` (i.e. `c` can never appear
+/// literally inside an escaped template value). This is exactly the complement of
+/// the "safe" set in [`iri_escape`] — keep the two in sync.
+///
+/// A "hard" delimiter (every char always-escaped) between placeholders is what
+/// makes [`reverse_subject_template`] unambiguous.
+fn is_always_escaped(c: char) -> bool {
+    !matches!(c,
+        'A'..='Z' | 'a'..='z' | '0'..='9'
+        | '-' | '.' | '_' | '~'
+        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+        | ':' | '@')
+}
+
+/// Percent-decode a value produced by [`iri_escape`] back to its raw bytes.
+/// Inverse of the `%XX` encoding; returns `None` on a malformed escape or on
+/// bytes that are not valid UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Reverse a subject template against a concrete IRI, recovering the raw column
+/// value for each `{placeholder}`. This is the inverse of [`expand_template`] +
+/// [`iri_escape`]: `("http://ex/store/{store_key}", "http://ex/store/5")` yields
+/// `[("store_key", "5")]`.
+///
+/// Returns `None` — and the caller falls back to a full scan, which is always
+/// correct — when the IRI does not match the template, or when the template shape
+/// is not *unambiguously* reversible. Reversal is unambiguous only when every
+/// placeholder is either the final token at end-of-template, or is followed by a
+/// literal separator whose first character is always percent-encoded by
+/// `iri_escape` (a "hard" delimiter that can never appear literally inside an
+/// encoded value). This admits the common `.../{key}` and `.../{a}/{b}` shapes
+/// and rejects ambiguous ones like `.../{a};{b}` (`;` is not escaped) or
+/// `.../{a}{b}` (adjacent placeholders).
+pub fn reverse_subject_template(template: &str, iri: &str) -> Option<Vec<(String, String)>> {
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+
+    // Placeholder columns with their byte spans in the template.
+    let cols: Vec<(String, usize, usize)> = PLACEHOLDER_RE
+        .captures_iter(template)
+        .map(|cap| {
+            let m = cap.get(0).unwrap();
+            (cap[1].to_string(), m.start(), m.end())
+        })
+        .collect();
+    if cols.is_empty() {
+        return None; // constant subject — nothing to reverse
+    }
+
+    // The leading literal (prefix) must anchor the IRI.
+    let prefix = &template[..cols[0].1];
+    let mut rest = iri.strip_prefix(prefix)?;
+
+    let mut out = Vec::with_capacity(cols.len());
+    for i in 0..cols.len() {
+        let (col, _start, end) = &cols[i];
+        // Literal between this placeholder and the next one (or end of template).
+        let sep_end = if i + 1 < cols.len() {
+            cols[i + 1].1
+        } else {
+            template.len()
+        };
+        let sep = &template[*end..sep_end];
+
+        let value_enc = if sep.is_empty() {
+            // Only the final placeholder may run to end-of-string; two adjacent
+            // placeholders have no boundary and are ambiguous.
+            if i + 1 < cols.len() {
+                return None;
+            }
+            let v = rest;
+            rest = "";
+            v
+        } else {
+            // The separator must begin with a hard (always-escaped) char so the
+            // value's right boundary is unambiguous.
+            if !sep.chars().next().is_some_and(is_always_escaped) {
+                return None;
+            }
+            let idx = rest.find(sep)?;
+            let v = &rest[..idx];
+            rest = &rest[idx + sep.len()..];
+            v
+        };
+        out.push((col.clone(), percent_decode(value_enc)?));
+    }
+
+    // The whole IRI must be consumed — no trailing residue.
+    if rest.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Materialize a subject term from a SubjectMap and column values
 ///
 /// # Arguments
@@ -1044,5 +1158,62 @@ mod tests {
             let s = i128::MIN.to_string();
             format!("{}.{}", &s[..s.len() - 2], &s[s.len() - 2..])
         });
+    }
+
+    /// `expand_template` then `reverse_subject_template` must recover the exact
+    /// raw values — the bijection the subject-key pushdown relies on.
+    fn assert_round_trips(template: &str, cols: &[(&str, &str)]) {
+        let mut values = HashMap::new();
+        for (c, v) in cols {
+            values.insert((*c).to_string(), Some((*v).to_string()));
+        }
+        let iri = expand_template(template, &values).unwrap();
+        let reversed = reverse_subject_template(template, &iri)
+            .unwrap_or_else(|| panic!("template {template:?} should reverse from {iri:?}"));
+        let expected: Vec<(String, String)> = cols
+            .iter()
+            .map(|(c, v)| ((*c).to_string(), (*v).to_string()))
+            .collect();
+        assert_eq!(reversed, expected, "round-trip for {template:?}");
+    }
+
+    #[test]
+    fn reverse_template_round_trips() {
+        // Single trailing placeholder — the common surrogate-key shape.
+        assert_round_trips("http://ex/store/{store_key}", &[("store_key", "5")]);
+        // Values with hard chars survive because they percent-encode losslessly.
+        assert_round_trips("http://ex/store/{k}", &[("k", "west/5")]);
+        assert_round_trips("http://ex/store/{k}", &[("k", "a b")]);
+        assert_round_trips("http://ex/store/{k}", &[("k", "café")]);
+        // A literal '%' in the raw value round-trips (it encodes to %25).
+        assert_round_trips("http://ex/store/{k}", &[("k", "50%off")]);
+        // Multi-placeholder with a hard '/' separator.
+        assert_round_trips(
+            "http://ex/{region}/{store_key}",
+            &[("region", "west"), ("store_key", "5")],
+        );
+        assert_round_trips("http://ex/{a}/{b}", &[("a", "x/y"), ("b", "z")]);
+        // Trailing suffix that begins with a hard char.
+        assert_round_trips("http://ex/store/{k}/detail", &[("k", "5")]);
+    }
+
+    #[test]
+    fn reverse_template_bails_on_ambiguous_shapes() {
+        // Soft separator (';' is never escaped) → ambiguous → None.
+        assert!(reverse_subject_template("http://ex/{a};{b}", "http://ex/x;y").is_none());
+        // Adjacent placeholders, no boundary → None.
+        assert!(reverse_subject_template("http://ex/{a}{b}", "http://ex/xy").is_none());
+        // No placeholder (constant subject) → None.
+        assert!(reverse_subject_template("http://ex/store", "http://ex/store").is_none());
+    }
+
+    #[test]
+    fn reverse_template_rejects_non_matching_iri() {
+        // Wrong prefix.
+        assert!(reverse_subject_template("http://ex/store/{k}", "http://other/store/5").is_none());
+        // Missing required suffix.
+        assert!(
+            reverse_subject_template("http://ex/store/{k}/detail", "http://ex/store/5").is_none()
+        );
     }
 }

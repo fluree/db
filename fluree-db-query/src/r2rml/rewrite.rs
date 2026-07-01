@@ -91,24 +91,21 @@ pub fn rewrite_patterns_for_r2rml(
                 if let Some(r2rml_pattern) = convert_triple_to_r2rml(tp, graph_source_id, snapshot)
                 {
                     converted += 1;
-                    if is_star_eligible(&r2rml_pattern) {
-                        match star_groups
-                            .iter_mut()
-                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
-                        {
+                    // Only variable-subject patterns are grouped by shared
+                    // subject; a bound-subject pattern (subject_var = None) is
+                    // never star/class eligible and falls to standalone emit.
+                    if let Some(sv) = star_member_subject(&r2rml_pattern) {
+                        match star_groups.iter_mut().find(|(s, _)| *s == sv) {
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
-                                star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                                star_groups.push((sv, vec![r2rml_pattern]));
                             }
                         }
-                    } else if is_class_only(&r2rml_pattern) {
-                        match class_groups
-                            .iter_mut()
-                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
-                        {
+                    } else if let Some(sv) = class_only_subject(&r2rml_pattern) {
+                        match class_groups.iter_mut().find(|(s, _)| *s == sv) {
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
-                                class_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                                class_groups.push((sv, vec![r2rml_pattern]));
                             }
                         }
                     } else {
@@ -164,37 +161,52 @@ pub fn rewrite_patterns_for_r2rml(
     // A same-subject `rdf:type` is fused into the base by setting its
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
-    for (subject, mut members) in star_groups {
-        if members.len() == 1 {
-            let mut base = members.pop().unwrap();
-            fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
-            result_patterns.push(Pattern::R2rml(base));
-            continue;
-        }
-        let mut seen_obj = HashSet::new();
-        let distinct = members
-            .iter()
-            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
-        if !distinct {
-            // Shared object var implies a self-join constraint; keep separate.
-            // Leave any same-subject class pattern in `class_groups` so it is
-            // emitted as a subject-only scan below.
-            for m in members {
+    for (subject, members) in star_groups {
+        // Split into object-var members (produce bindings) and constant-object
+        // members (equality existence constraints fused into the same scan).
+        let (mut var_members, const_members): (Vec<R2rmlPattern>, Vec<R2rmlPattern>) =
+            members.into_iter().partition(|m| m.object_var.is_some());
+
+        if var_members.is_empty() {
+            // No var-object base to fuse the constraints onto: each constant-object
+            // pattern is already correct as its own standalone scan.
+            for m in const_members {
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
         }
-        let mut base = members.remove(0);
+
+        // Var-object members need distinct object vars to fuse; a shared object
+        // var is a self-join constraint, not a star. If not distinct, keep every
+        // member separate (var and constant alike).
+        let mut seen_obj = HashSet::new();
+        let distinct = var_members
+            .iter()
+            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
+        if !distinct {
+            for m in var_members.into_iter().chain(const_members) {
+                result_patterns.push(Pattern::R2rml(m));
+            }
+            continue;
+        }
+
+        let star_constraints: Vec<(String, ObjectConstant)> = const_members
+            .into_iter()
+            .filter_map(|m| Some((m.predicate_filter?, m.object_constant?)))
+            .collect();
+
+        let mut base = var_members.remove(0);
         fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
-        base.star_bindings = members
+        base.star_bindings = var_members
             .into_iter()
             .map(|m| {
                 (
-                    m.predicate_filter.expect("star-eligible has predicate"),
-                    m.object_var.expect("star-eligible has object var"),
+                    m.predicate_filter.expect("star member has predicate"),
+                    m.object_var.expect("var member has object var"),
                 )
             })
             .collect();
+        base.star_constraints = star_constraints;
         result_patterns.push(Pattern::R2rml(base));
     }
 
@@ -223,7 +235,7 @@ pub fn rewrite_patterns_for_r2rml(
                 for (var, op, value) in &pushdowns {
                     // Only object-position vars map to columns (the subject is an
                     // IRI template, not a scannable column).
-                    if *var != rp.subject_var && produced.contains(var) {
+                    if Some(*var) != rp.subject_var && produced.contains(var) {
                         rp.scan_filters.push(ScanPushdown {
                             var: *var,
                             op: *op,
@@ -415,13 +427,29 @@ fn is_loose_matchable_datatype(dtc: &Option<DatatypeConstraint>) -> bool {
     }
 }
 
-/// The scan value for a constant object literal, or `None` for value types not
-/// yet supported as constant objects (float/decimal/date, refs).
-fn const_object_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+/// The operator-enforced constant for an object literal, or `None` for value
+/// types not supported as constant objects (refs, temporal types beyond date,
+/// durations, vectors, JSON, geo).
+///
+/// String / integer / boolean / date go through `Scalar` and additionally emit a
+/// scan filter for pruning. Decimal / big-integer / double are numeric matches
+/// enforced by the operator only (no scan pushdown yet).
+fn const_object(value: &FlakeValue) -> Option<ObjectConstant> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
     match value {
-        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
-        FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
-        FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
+        FlakeValue::String(s) => Some(ObjectConstant::Scalar(ScanValue::Str(s.clone()))),
+        FlakeValue::Long(n) => Some(ObjectConstant::Scalar(ScanValue::Int(*n))),
+        FlakeValue::Boolean(b) => Some(ObjectConstant::Scalar(ScanValue::Bool(*b))),
+        FlakeValue::Date(d) => Some(ObjectConstant::Scalar(ScanValue::Date(
+            d.days_since_epoch(),
+        ))),
+        FlakeValue::Decimal(d) => Some(ObjectConstant::Decimal((**d).clone())),
+        FlakeValue::Double(f) => Some(ObjectConstant::Double(*f)),
+        // Big integers compare numerically as exact decimals.
+        FlakeValue::BigInt(n) => BigDecimal::from_str(&n.to_string())
+            .ok()
+            .map(ObjectConstant::Decimal),
         _ => None,
     }
 }
@@ -436,29 +464,38 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     }
 }
 
-/// A regular-predicate R2RML pattern that can join via the subject: constant
-/// predicate, a fresh object var distinct from the subject, no class/TM filter.
-/// These are the patterns that can be merged into a same-subject star scan.
-fn is_star_eligible(p: &R2rmlPattern) -> bool {
-    p.predicate_filter.is_some()
+/// The subject var of a regular-predicate R2RML pattern that can join a
+/// same-subject star: variable subject, constant predicate, no class/TM filter,
+/// and either a fresh object var (distinct from the subject) or a constant-object
+/// equality. `None` (not eligible) for bound-subject patterns. Constant-object
+/// members become existence constraints on the star; var-object members produce
+/// bindings.
+fn star_member_subject(p: &R2rmlPattern) -> Option<VarId> {
+    let subject_var = p.subject_var?;
+    let base_ok = p.predicate_filter.is_some()
         && p.class_filter.is_none()
         && p.triples_map_iri.is_none()
-        && p.star_bindings.is_empty()
-        && match p.object_var {
-            Some(obj) => obj != p.subject_var,
-            None => false,
-        }
+        && p.star_bindings.is_empty();
+    if !base_ok {
+        return None;
+    }
+    let var_object = p.object_var.is_some_and(|obj| obj != subject_var);
+    let const_object = p.object_var.is_none() && p.object_constant.is_some();
+    (var_object || const_object).then_some(subject_var)
 }
 
-/// A pure `rdf:type` pattern (`?s a ex:Class`): a class filter, no object var, no
-/// predicate, no star members. These are candidates to fuse into a same-subject
-/// star (or, failing that, to run as a subject-only scan).
-fn is_class_only(p: &R2rmlPattern) -> bool {
-    p.class_filter.is_some()
+/// The subject var of a pure `rdf:type` pattern (`?s a ex:Class`): variable
+/// subject, a class filter, no object var, no predicate, no star members. `None`
+/// (not eligible) for bound-subject patterns. Candidates to fuse into a
+/// same-subject star (or, failing that, to run as a subject-only scan).
+fn class_only_subject(p: &R2rmlPattern) -> Option<VarId> {
+    let subject_var = p.subject_var?;
+    let eligible = p.class_filter.is_some()
         && p.object_var.is_none()
         && p.predicate_filter.is_none()
         && p.triples_map_iri.is_none()
-        && p.star_bindings.is_empty()
+        && p.star_bindings.is_empty();
+    eligible.then_some(subject_var)
 }
 
 /// Fuse a subject's lone `rdf:type` into its star `base` by setting
@@ -540,14 +577,25 @@ pub fn convert_triple_to_r2rml(
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
 ) -> Option<R2rmlPattern> {
-    // Extract subject variable (must be a variable for basic R2RML support)
-    let subject_var = match &tp.s {
-        Ref::Var(v) => *v,
-        Ref::Sid(_) | Ref::Iri(_) => {
-            // Subject is bound - we could support this with a filter,
-            // but for now we return None to preserve the original pattern.
-            // The GraphOperator will handle this case differently.
-            return None;
+    // Extract the subject: a variable, or a constant (bound) IRI the operator
+    // matches against each row's materialized subject. Exactly one is set.
+    let (subject_var, subject_constant): (Option<VarId>, Option<String>) = match &tp.s {
+        Ref::Var(v) => (Some(*v), None),
+        Ref::Iri(iri) => (None, Some(iri.to_string())),
+        // A bound SID subject we cannot decode to an IRI is left unconverted.
+        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
+            Some(iri) => (None, Some(iri)),
+            None => return None,
+        },
+    };
+
+    // Build a pattern for `object_var`, carrying either the subject variable or
+    // the constant subject IRI (exactly one of the pair above is set).
+    let make_pattern = |object_var: Option<VarId>| -> R2rmlPattern {
+        match (subject_var, subject_constant.as_deref()) {
+            (Some(sv), _) => R2rmlPattern::new(graph_source_id, sv, object_var),
+            (None, Some(sc)) => R2rmlPattern::new_bound_subject(graph_source_id, sc, object_var),
+            (None, None) => unreachable!("subject is always a var or a constant IRI"),
         }
     };
 
@@ -568,7 +616,7 @@ pub fn convert_triple_to_r2rml(
 
         // For rdf:type, we create an R2RML pattern with class_filter and no object_var
         // (the type binding is implicit in the class_filter)
-        let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, None);
+        let mut pattern = make_pattern(None);
         if let Some(class_iri) = class_filter {
             pattern = pattern.with_class(class_iri);
         }
@@ -585,14 +633,20 @@ pub fn convert_triple_to_r2rml(
 
     // Extract the object: a variable, or a constant equality constraint the
     // operator enforces. A constant predicate is required (to resolve the map).
-    //   - Literal (string/integer/boolean, loose-matchable datatype) → Scalar.
+    //   - Literal (string/integer/boolean/date, loose-matchable datatype) →
+    //     Scalar (also emits a scan filter for pruning).
+    //   - Decimal / big-integer / double literal → numeric operator-only match.
     //   - Bound IRI / ref object (`?s edw:geography <geo/1>`) → Iri.
-    // Language-tagged / custom-typed literals need strict matching, and
-    // float/decimal/date literals are not pushed yet — all left unconverted
-    // (rejected as unsupported) rather than mismatched.
+    // Language-tagged / custom-typed literals need strict matching and are left
+    // unconverted rather than mismatched.
     let object_constant: Option<ObjectConstant> = match &tp.o {
+        // A ref object can arrive as a typed value (`FlakeValue::Ref`); decode it
+        // to an IRI so it takes the same operator-enforced path as Term::Sid/Iri.
+        Term::Value(FlakeValue::Ref(sid)) if predicate_filter.is_some() => {
+            snapshot.decode_sid(sid).map(ObjectConstant::Iri)
+        }
         Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
-            const_object_scan_value(v).map(ObjectConstant::Scalar)
+            const_object(v)
         }
         Term::Iri(iri) if predicate_filter.is_some() => Some(ObjectConstant::Iri(iri.to_string())),
         Term::Sid(sid) if predicate_filter.is_some() => {
@@ -607,7 +661,7 @@ pub fn convert_triple_to_r2rml(
         _ => return None,
     };
 
-    let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, object_var);
+    let mut pattern = make_pattern(object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
     }
