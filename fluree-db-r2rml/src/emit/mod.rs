@@ -22,7 +22,9 @@ pub mod input;
 pub mod ir;
 
 mod heuristic;
-mod naming;
+// `naming` is public so the api-side preview lane can call the canonical
+// `naming::xsd_datatype` map instead of duplicating it (single source of truth).
+pub mod naming;
 mod render;
 
 #[cfg(test)]

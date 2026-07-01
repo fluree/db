@@ -28,6 +28,9 @@ use fluree_db_iceberg::stats::{
     aggregate_column_stats, send_read_snapshot_data_files, AggregatedColumnStats,
 };
 use fluree_db_iceberg::FieldType;
+// The emitter owns the canonical `FieldType → xsd:` map; the preview lane reuses
+// it (single source of truth) rather than duplicating it here.
+use fluree_db_r2rml::emit::naming::xsd_datatype;
 
 // =============================================================================
 // Shared identifiers
@@ -287,6 +290,10 @@ pub struct ColumnInfo {
     #[serde(with = "field_type_serde", default)]
     pub field_type: Option<FieldType>,
     /// The emitter's chosen `xsd:` datatype CURIE; `None` for string/nested.
+    ///
+    /// Pinned at `xsd_long_as_integer = true` (the reference convention); a
+    /// generate call overriding that to `false` makes this hint differ from the
+    /// emitted datatype for `Int32`/`Int64` columns.
     pub xsd_type: Option<String>,
     /// Whether the column is required (non-nullable) per the schema.
     pub required: bool,
@@ -354,29 +361,6 @@ pub struct TablePreview {
     pub warnings: Vec<String>,
 }
 
-/// The `xsd:` datatype CURIE for a [`FieldType`] (or `None` for strings / nested).
-///
-/// This is a deliberate, test-pinned mirror of the emitter's canonical
-/// `fluree_db_r2rml::emit::naming::xsd_datatype` (with the reference-matching
-/// `xsd_long_as_integer = true` convention). That function is the single source
-/// of truth, but it lives in a **private** module of the emitter lane which this
-/// PR must not edit; the parity is locked by [`tests::xsd_map_matches_emitter`].
-fn field_type_to_xsd(field_type: FieldType) -> Option<&'static str> {
-    let curie = match field_type {
-        FieldType::Boolean => "xsd:boolean",
-        // Reference (`enterprise.ttl`) convention: longs/ints as xsd:integer.
-        FieldType::Int32 | FieldType::Int64 => "xsd:integer",
-        FieldType::Float32 => "xsd:float",
-        FieldType::Float64 => "xsd:double",
-        FieldType::Decimal { .. } => "xsd:decimal",
-        FieldType::Date => "xsd:date",
-        FieldType::Timestamp | FieldType::TimestampTz => "xsd:dateTime",
-        FieldType::Bytes => "xsd:hexBinary",
-        FieldType::String => return None,
-    };
-    Some(curie)
-}
-
 /// Canonical Iceberg type string for a [`FieldType`], round-trippable through
 /// `FieldType::from_iceberg_type` (used for wire serialization of `field_type`).
 fn field_type_to_iceberg_string(field_type: FieldType) -> String {
@@ -441,8 +425,10 @@ fn column_info_tier_a(field: &SchemaField) -> ColumnInfo {
     } else {
         field.type_string().and_then(FieldType::from_iceberg_type)
     };
+    // Canonical emitter map, pinned at `xsd_long_as_integer = true` (see the
+    // `ColumnInfo::xsd_type` doc for the generate-override caveat).
     let xsd_type = field_type
-        .and_then(field_type_to_xsd)
+        .and_then(|ft| xsd_datatype(ft, true))
         .map(str::to_string);
     ColumnInfo {
         field_id: field.id,
@@ -908,23 +894,27 @@ mod tests {
         assert!(err.to_string().contains("Direct catalog mode"));
     }
 
-    /// Parity guard: our local `field_type_to_xsd` must agree with the emitter's
-    /// canonical `xsd_datatype` map (which lives in a private emit module we
-    /// cannot import). Pins the same load-bearing cases the emitter test pins.
+    /// Preview surfaces the emitter's canonical `xsd_datatype` map (pinned at
+    /// `xsd_long_as_integer = true`, the reference convention) as its `xsd_type`
+    /// hint. This pins the load-bearing cases the preview lane relies on; the map
+    /// is now the emitter's single source of truth (no api-side duplicate).
     #[test]
     fn xsd_map_matches_emitter() {
-        assert_eq!(field_type_to_xsd(FieldType::Bytes), Some("xsd:hexBinary"));
-        assert_eq!(field_type_to_xsd(FieldType::Timestamp), Some("xsd:dateTime"));
-        assert_eq!(field_type_to_xsd(FieldType::TimestampTz), Some("xsd:dateTime"));
-        assert_eq!(field_type_to_xsd(FieldType::String), None);
-        assert_eq!(field_type_to_xsd(FieldType::Boolean), Some("xsd:boolean"));
-        assert_eq!(field_type_to_xsd(FieldType::Float64), Some("xsd:double"));
-        assert_eq!(field_type_to_xsd(FieldType::Float32), Some("xsd:float"));
-        assert_eq!(field_type_to_xsd(FieldType::Int64), Some("xsd:integer"));
-        assert_eq!(field_type_to_xsd(FieldType::Int32), Some("xsd:integer"));
-        assert_eq!(field_type_to_xsd(FieldType::Date), Some("xsd:date"));
+        assert_eq!(xsd_datatype(FieldType::Bytes, true), Some("xsd:hexBinary"));
+        assert_eq!(xsd_datatype(FieldType::Timestamp, true), Some("xsd:dateTime"));
         assert_eq!(
-            field_type_to_xsd(FieldType::Decimal { precision: 18, scale: 2 }),
+            xsd_datatype(FieldType::TimestampTz, true),
+            Some("xsd:dateTime")
+        );
+        assert_eq!(xsd_datatype(FieldType::String, true), None);
+        assert_eq!(xsd_datatype(FieldType::Boolean, true), Some("xsd:boolean"));
+        assert_eq!(xsd_datatype(FieldType::Float64, true), Some("xsd:double"));
+        assert_eq!(xsd_datatype(FieldType::Float32, true), Some("xsd:float"));
+        assert_eq!(xsd_datatype(FieldType::Int64, true), Some("xsd:integer"));
+        assert_eq!(xsd_datatype(FieldType::Int32, true), Some("xsd:integer"));
+        assert_eq!(xsd_datatype(FieldType::Date, true), Some("xsd:date"));
+        assert_eq!(
+            xsd_datatype(FieldType::Decimal { precision: 18, scale: 2 }, true),
             Some("xsd:decimal")
         );
     }
