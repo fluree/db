@@ -652,28 +652,19 @@ impl BinaryIndexStore {
 
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
 
-        // Fast path 1: local filesystem — full read is optimal (OS page cache).
+        // Fast path 1: local filesystem — mmap so the raw bytes stay in OS page
+        // cache (only touched pages fault in) with the directory served from the
+        // shared cache. Avoids copying the whole (possibly grown) leaf blob and
+        // re-decoding its directory on every read.
         if let Some(local_path) = cs.resolve_local_path(leaf_cid) {
-            let bytes = std::fs::read(local_path)?;
-            let sidecar = if need_replay {
-                self.fetch_sidecar_bytes_sync(sidecar_cid)?
-            } else {
-                None
-            };
-            return Ok(Box::new(FullBlobLeafHandle::new(bytes, sidecar, leaf_id)?));
+            return self.open_mmapped_leaf(&local_path, leaf_id, sidecar_cid, need_replay);
         }
 
-        // Fast path 2: locally cached — full read from disk cache.
+        // Fast path 2: locally cached (remote-promoted) — same mmap path; a
+        // missing cache file falls through to the range-read paths below.
         let cache_path = self.cache_dir.join(leaf_cid.to_string());
-        match std::fs::read(&cache_path) {
-            Ok(bytes) => {
-                let sidecar = if need_replay {
-                    self.fetch_sidecar_bytes_sync(sidecar_cid)?
-                } else {
-                    None
-                };
-                return Ok(Box::new(FullBlobLeafHandle::new(bytes, sidecar, leaf_id)?));
-            }
+        match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
+            Ok(handle) => return Ok(handle),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
@@ -758,6 +749,43 @@ impl BinaryIndexStore {
     /// Decoded directories are cached in the shared [`LeafletCache`] keyed by
     /// leaf CID — content-addressed, so entries never go stale.
     ///
+    /// Open a local (or locally-cached) leaf via mmap, with the decoded
+    /// directory served from the shared `LeafletCache`. The raw bytes stay in OS
+    /// page cache (only touched pages fault in) — no whole-blob copy, and the
+    /// directory is parsed once per leaf CID. See [`super::leaf_access::MmapLeafHandle`].
+    fn open_mmapped_leaf(
+        &self,
+        path: &Path,
+        leaf_id: u128,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: leaf files are immutable, content-addressed CAS artifacts —
+        // never modified after write, so the mapping's bytes are stable.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Content-addressed directory: parse once per leaf CID, reused across
+        // opens. `leaf_id` == xxh3_128(leaf_cid) is the same key `open_leaf_dir`
+        // and warm-on-write use.
+        let dir = if let Some(cache) = &self.leaflet_cache {
+            cache.try_get_or_load_leaf_dir(leaf_id, || {
+                let header = crate::format::leaf::decode_leaf_header_v3(&mmap[..])?;
+                crate::format::leaf::decode_leaf_dir_v3_with_base(&mmap[..], &header).map(Arc::new)
+            })?
+        } else {
+            let header = crate::format::leaf::decode_leaf_header_v3(&mmap[..])?;
+            Arc::new(crate::format::leaf::decode_leaf_dir_v3_with_base(&mmap[..], &header)?)
+        };
+        let sidecar = if need_replay {
+            self.fetch_sidecar_bytes_sync(sidecar_cid)?
+        } else {
+            None
+        };
+        Ok(Box::new(super::leaf_access::MmapLeafHandle::new(
+            mmap, dir, sidecar, leaf_id,
+        )))
+    }
+
     /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
     pub fn open_leaf_dir(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
         let key = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());

@@ -145,6 +145,93 @@ impl LeafHandle for FullBlobLeafHandle {
 }
 
 // ============================================================================
+// MmapLeafHandle
+// ============================================================================
+
+/// Leaf handle backed by an mmap of the local leaf file, with the decoded
+/// directory shared from the [`LeafletCache`](super::leaflet_cache::LeafletCache).
+///
+/// The local read fast path used to `std::fs::read` the entire leaf blob into a
+/// fresh heap buffer on every open and re-decode the directory each time. For a
+/// leaf that grows across incremental builds, that whole-blob copy + full
+/// directory decode is re-paid per point read. This handle instead:
+/// - maps the (immutable, content-addressed) leaf file, so the raw bytes stay in
+///   OS page cache and only the pages actually touched (header, directory, and
+///   the one scanned leaflet's columns) fault in — no whole-blob copy; and
+/// - takes the decoded directory as an `Arc` from the shared cache, so the
+///   directory is parsed once per leaf CID, not per open.
+///
+/// Column data itself is still materialized once, per leaflet, via the V3Batch
+/// cache — this handle only supplies the bytes for a cold decode. Raw leaf bytes
+/// are never copied into the cache budget.
+pub struct MmapLeafHandle {
+    mmap: memmap2::Mmap,
+    dir: Arc<DecodedLeafDirV3>,
+    sidecar: Option<Vec<u8>>,
+    leaf_id: u128,
+}
+
+impl MmapLeafHandle {
+    pub fn new(
+        mmap: memmap2::Mmap,
+        dir: Arc<DecodedLeafDirV3>,
+        sidecar: Option<Vec<u8>>,
+        leaf_id: u128,
+    ) -> Self {
+        Self {
+            mmap,
+            dir,
+            sidecar,
+            leaf_id,
+        }
+    }
+}
+
+impl LeafHandle for MmapLeafHandle {
+    fn dir(&self) -> &DecodedLeafDirV3 {
+        &self.dir
+    }
+
+    fn load_columns(
+        &self,
+        leaflet_idx: usize,
+        projection: &ColumnProjection,
+        order: RunSortOrder,
+    ) -> io::Result<ColumnBatch> {
+        let entry = &self.dir.entries[leaflet_idx];
+        load_leaflet_columns(&self.mmap[..], entry, self.dir.payload_base, projection, order)
+    }
+
+    fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
+        let entry = &self.dir.entries[leaflet_idx];
+        if entry.history_len == 0 {
+            return Ok(Vec::new());
+        }
+        let sc_bytes = self.sidecar.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "sidecar bytes required for history replay but not available",
+            )
+        })?;
+        let seg = HistorySegmentRef {
+            offset: entry.history_offset,
+            len: entry.history_len,
+            min_t: entry.history_min_t,
+            max_t: entry.history_max_t,
+        };
+        decode_history_segment(sc_bytes, &seg)
+    }
+
+    fn sidecar_bytes(&self) -> Option<&[u8]> {
+        self.sidecar.as_deref()
+    }
+
+    fn leaf_id(&self) -> u128 {
+        self.leaf_id
+    }
+}
+
+// ============================================================================
 // RangeReadFetcher trait
 // ============================================================================
 
