@@ -125,6 +125,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `state.import_jobs` map (each node owns the jobs it minted).
         .route("/import-upload/:import_id", get(import::import_status));
 
+    // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
+    // connection carries a secret in the body) but they mutate nothing and
+    // create no graph source, so they sit in the reads block (no leader-forward).
+    #[cfg(feature = "iceberg")]
+    let v1_admin_protected_reads = v1_admin_protected_reads
+        .route("/iceberg/catalog/browse", post(iceberg::iceberg_catalog_browse));
+
     let v1_admin_protected_reads = v1_admin_protected_reads
         .layer(middleware::from_fn_with_state(
             state.clone(),

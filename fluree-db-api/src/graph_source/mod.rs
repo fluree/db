@@ -114,6 +114,9 @@ mod vector;
 #[cfg(feature = "iceberg")]
 mod r2rml;
 
+#[cfg(feature = "iceberg")]
+mod iceberg_catalog;
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 
@@ -122,6 +125,11 @@ pub use config::VectorCreateConfig;
 
 #[cfg(feature = "iceberg")]
 pub use config::{CatalogMode, IcebergConnectionConfig, IcebergCreateConfig, RestCatalogMode};
+
+#[cfg(feature = "iceberg")]
+pub use iceberg_catalog::{
+    browse_iceberg_catalog, BrowseDepth, CatalogBrowse, TableIdentifier, TableRef,
+};
 
 #[cfg(feature = "iceberg")]
 pub use config::{R2rmlCreateConfig, R2rmlMappingInput};
