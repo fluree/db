@@ -55,6 +55,29 @@ impl std::fmt::Debug for ApiAttachmentEventsProvider {
     }
 }
 
+/// Resolves the process-shared read cache from the api's `LedgerManager` once
+/// it's constructed — the manager owns the `LeafletCache` the query server
+/// reads from, so the background indexer can warm-on-write into that exact
+/// cache. Yields `None` until the manager cell is filled (and always for a
+/// separate-machine indexer, which has no local manager).
+pub(crate) struct LedgerManagerWarmCache {
+    pub(crate) manager: LedgerManagerCell,
+}
+
+impl std::fmt::Debug for LedgerManagerWarmCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LedgerManagerWarmCache")
+            .field("bound", &self.manager.get().is_some())
+            .finish()
+    }
+}
+
+impl fluree_db_indexer::WarmCacheSource for LedgerManagerWarmCache {
+    fn warm_cache(&self) -> Option<Arc<fluree_db_binary_index::LeafletCache>> {
+        self.manager.get().and_then(|m| m.leaflet_cache().cloned())
+    }
+}
+
 #[async_trait]
 impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
     async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {

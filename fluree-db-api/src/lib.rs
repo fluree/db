@@ -2427,11 +2427,20 @@ impl FlureeBuilder {
                 },
             )
                 as Arc<dyn fluree_db_indexer::AttachmentEventsProvider>;
+            // Warm-on-write (co-located only): let the background build seed the
+            // query server's shared read cache with the leaflets it just wrote.
+            // Resolved late from the same LedgerManager cell used above, so the
+            // worker warms the exact cache readers use.
+            let warm_cache_source =
+                Arc::new(crate::indexer_attachment_provider::LedgerManagerWarmCache {
+                    manager: Arc::clone(attachment_provider_cell),
+                }) as Arc<dyn fluree_db_indexer::WarmCacheSource>;
             let indexer_config = idx_config
                 .indexer_config
                 .clone()
                 .with_fulltext_config_provider(provider)
-                .with_attachment_events_provider(ann_provider);
+                .with_attachment_events_provider(ann_provider)
+                .with_warm_cache_source(warm_cache_source);
             // BackgroundIndexerWorker takes an
             // `Arc<dyn IndexingNameService>` — the combined lookup
             // + index-publish surface. `ReadWriteNameService`
