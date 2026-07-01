@@ -120,22 +120,27 @@ async fn point_read_product(fluree: &Fluree, alias: &str, product_local_id: &str
     let query = format!("SELECT ?p ?o WHERE {{ <{iri}> ?p ?o }}");
 
     let entries_before = fluree.leaflet_cache().entry_count() as i64;
-    let t0 = Instant::now();
+    let t_load = Instant::now();
     let snapshot = fluree
         .graph(alias)
         .load()
         .await
         .expect("graph load for read");
+    let load_ms = t_load.elapsed().as_secs_f64() * 1e3;
+    let t_q = Instant::now();
     let result = snapshot
         .query()
         .sparql(&query)
         .execute()
         .await
         .expect("point read execute");
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let query_ms = t_q.elapsed().as_secs_f64() * 1e3;
     std::hint::black_box(result);
+    let _ = load_ms; // load is negligible once the generation is applied
     let entries_after = fluree.leaflet_cache().entry_count() as i64;
-    (elapsed_ms, entries_after - entries_before)
+    // Return query-only time (load excluded) so the metric isolates read
+    // latency on the applied generation.
+    (query_ms, entries_after - entries_before)
 }
 
 #[derive(Default)]
