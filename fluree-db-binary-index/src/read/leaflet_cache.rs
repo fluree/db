@@ -546,6 +546,16 @@ impl LeafletCache {
         }
     }
 
+    /// Warm-on-write: seed a reverse-dict leaf the *writer* already holds.
+    ///
+    /// Key must be `cid_cache_key(cas_address_string)` — the reader keys dict
+    /// leaves on the CAS address string (`cid.to_string()`), not the CID bytes.
+    /// Value is the raw on-disk leaf bytes; the reader decodes on access.
+    pub fn insert_dict_leaf(&self, key: u128, bytes: Arc<[u8]>) {
+        self.inner
+            .insert(CacheKey::DictLeaf(key), CachedEntry::DictLeaf(bytes));
+    }
+
     // ========================================================================
     // Decoded leaf directory cache
     // ========================================================================

@@ -3,7 +3,7 @@
 //! These functions handle updating existing reverse dictionary trees when
 //! new subjects or strings are added during incremental indexing.
 
-use fluree_db_binary_index::DictTreeRefs;
+use fluree_db_binary_index::{DictTreeRefs, LeafletCache};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 
 use crate::error::{IndexerError, Result};
@@ -15,6 +15,7 @@ pub(crate) async fn upload_incremental_reverse_tree_async(
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
     new_subjects: Vec<(u16, u64, Vec<u8>)>,
+    warm_cache: Option<&LeafletCache>,
 ) -> Result<UpdatedReverseTree> {
     use fluree_db_binary_index::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
 
@@ -27,7 +28,8 @@ pub(crate) async fn upload_incremental_reverse_tree_async(
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries).await
+    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries, warm_cache)
+        .await
 }
 
 /// Async version of reverse tree upload for **string** dictionaries.
@@ -40,6 +42,7 @@ pub(crate) async fn upload_incremental_reverse_tree_async_strings(
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
     new_strings: Vec<(u32, Vec<u8>)>,
+    warm_cache: Option<&LeafletCache>,
 ) -> Result<UpdatedReverseTree> {
     use fluree_db_binary_index::dict::reverse_leaf::ReverseEntry;
 
@@ -52,7 +55,8 @@ pub(crate) async fn upload_incremental_reverse_tree_async_strings(
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
 
-    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries).await
+    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries, warm_cache)
+        .await
 }
 
 /// Core async reverse tree upload: pre-fetch affected leaves, spawn_blocking
@@ -62,6 +66,7 @@ async fn upload_incremental_reverse_tree_core(
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
     entries: Vec<fluree_db_binary_index::dict::reverse_leaf::ReverseEntry>,
+    warm_cache: Option<&LeafletCache>,
 ) -> Result<UpdatedReverseTree> {
     let kind = ContentKind::DictBlob { dict };
 
@@ -130,6 +135,15 @@ async fn upload_incremental_reverse_tree_core(
             .await
             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
         let cid_str = cid.to_string();
+        // Warm-on-write (co-located): seed the just-written reverse-dict leaf so
+        // a reader resolving a newly-added IRI/string hits the cache instead of
+        // a cold read. Reader keys on the CAS address string (== cid_str).
+        if let Some(cache) = warm_cache {
+            cache.insert_dict_leaf(
+                LeafletCache::cid_cache_key(cid_str.as_bytes()),
+                std::sync::Arc::from(leaf_art.bytes.as_slice()),
+            );
+        }
         address_to_cid.insert(cid_str.clone(), cid);
         hash_to_address.insert(leaf_art.hash.clone(), cid_str);
     }

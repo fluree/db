@@ -838,6 +838,13 @@ pub async fn incremental_index(
         upload_incremental_reverse_tree_async, upload_incremental_reverse_tree_async_strings,
     };
     let mut new_dict_refs = base_root.dict_refs.clone();
+    // Resolve the warm-on-write cache once (co-located only); seeds the
+    // reverse-dict leaves we rewrite so a reader resolving a just-added
+    // IRI/string hits the cache instead of a cold read.
+    let warm_cache = config
+        .warm_cache_source
+        .as_ref()
+        .and_then(|s| s.warm_cache());
 
     if !novelty.new_subjects.is_empty() {
         tracing::debug!(
@@ -849,6 +856,7 @@ pub async fn incremental_index(
             fluree_db_core::DictKind::SubjectReverse,
             &base_root.dict_refs.subject_reverse,
             novelty.new_subjects.clone(),
+            warm_cache.as_deref(),
         )
         .await?;
         root_builder.add_replaced_cids(updated.replaced_cids);
@@ -865,6 +873,7 @@ pub async fn incremental_index(
             fluree_db_core::DictKind::StringReverse,
             &base_root.dict_refs.string_reverse,
             novelty.new_strings.clone(),
+            warm_cache.as_deref(),
         )
         .await?;
         root_builder.add_replaced_cids(updated.replaced_cids);
