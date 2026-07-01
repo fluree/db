@@ -282,8 +282,19 @@ fn run() {
             let swapped = res.index_t > prev_index_t;
             prev_index_t = res.index_t;
 
-            // 3 + 4. Read a just-written product (cold-hot) and a base product
-            // (warm control). Each reload picks up the published generation.
+            // Absorb the one-time apply/swap cost (fresh store build + novelty
+            // dict rebuild) that the FIRST load after a publish pays, so the
+            // measured reads reflect query latency on the already-applied
+            // generation — as a client read does, since the background listener
+            // applies before client traffic arrives.
+            let _ = fluree
+                .graph(&alias)
+                .load()
+                .await
+                .expect("absorb apply load");
+
+            // 3 + 4. Read the just-written product (cold-hot region) and a base
+            // product (warm control), on the already-applied generation.
             let new_local = full.products[p1 - 1].id.trim_start_matches("ex:").to_string();
             let (read_new_ms, ins_new) = point_read_product(&fluree, &alias, &new_local).await;
             let (read_old_ms, ins_old) = point_read_product(&fluree, &alias, &old_local).await;
