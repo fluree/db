@@ -774,7 +774,10 @@ impl BinaryIndexStore {
             })?
         } else {
             let header = crate::format::leaf::decode_leaf_header_v3(&mmap[..])?;
-            Arc::new(crate::format::leaf::decode_leaf_dir_v3_with_base(&mmap[..], &header)?)
+            Arc::new(crate::format::leaf::decode_leaf_dir_v3_with_base(
+                &mmap[..],
+                &header,
+            )?)
         };
         let sidecar = if need_replay {
             self.fetch_sidecar_bytes_sync(sidecar_cid)?

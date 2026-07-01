@@ -199,7 +199,13 @@ impl LeafHandle for MmapLeafHandle {
         order: RunSortOrder,
     ) -> io::Result<ColumnBatch> {
         let entry = &self.dir.entries[leaflet_idx];
-        load_leaflet_columns(&self.mmap[..], entry, self.dir.payload_base, projection, order)
+        load_leaflet_columns(
+            &self.mmap[..],
+            entry,
+            self.dir.payload_base,
+            projection,
+            order,
+        )
     }
 
     fn load_sidecar_segment(&self, leaflet_idx: usize) -> io::Result<Vec<HistEntryV2>> {
