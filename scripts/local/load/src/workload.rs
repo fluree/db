@@ -27,6 +27,12 @@ pub enum WorkloadShape {
     /// Transact-only against ledgers the runner expects to exist
     /// already. Useful when targeting a pre-seeded cluster.
     TransactOnly,
+    /// Query-only against ledgers the runner expects to exist
+    /// already. Exercises the read path — no consensus involvement —
+    /// so it characterizes local snapshot / cache-refresh behavior
+    /// and stays available during chaos even when writes are
+    /// refusing.
+    QueryOnly,
     /// Schedule [`WideFanoutTuning::target_ledger_count`] CreateLedger
     /// ops over the run, interleaved with transacts against whichever
     /// ledgers have landed. Exercises per-branch work queues and
@@ -45,11 +51,12 @@ impl FromStr for WorkloadShape {
             "single-pound" => Ok(Self::SinglePound),
             "create-only" => Ok(Self::CreateOnly),
             "transact-only" => Ok(Self::TransactOnly),
+            "query-only" => Ok(Self::QueryOnly),
             "wide-fanout" => Ok(Self::WideFanout),
             "multitenant" => Ok(Self::Multitenant),
             other => Err(format!(
                 "unknown workload: {other} (try: single-pound, create-only, \
-                 transact-only, wide-fanout, multitenant)"
+                 transact-only, query-only, wide-fanout, multitenant)"
             )),
         }
     }
@@ -73,9 +80,10 @@ pub struct WorkloadTuning {
     /// Prefix used when generating ledger names. Combined with a
     /// ULID for the suffix so collisions across runs are impossible.
     pub ledger_prefix: String,
-    /// `transact-only`: ledger names the workload assumes already
-    /// exist. The workload picks from this list round-robin. Empty
-    /// is an error at construction time.
+    /// `transact-only` / `query-only`: ledger names the workload
+    /// assumes already exist. The workload picks from this list
+    /// round-robin. Empty is an error at CLI-parse time for those
+    /// two shapes.
     pub seeded_ledgers: Vec<String>,
 }
 
@@ -139,6 +147,7 @@ impl Workload {
             WorkloadShape::SinglePound => self.next_single_pound(idx),
             WorkloadShape::CreateOnly => Some(self.gen_create(idx)),
             WorkloadShape::TransactOnly => self.next_transact_against_pool(idx),
+            WorkloadShape::QueryOnly => self.next_query_against_pool(idx),
             WorkloadShape::WideFanout => self.next_wide_fanout(idx),
             WorkloadShape::Multitenant => self.next_multitenant(idx),
         }
@@ -181,6 +190,11 @@ impl Workload {
         Some(self.gen_transact(idx, ledger))
     }
 
+    fn next_query_against_pool(&self, idx: u64) -> Option<Op> {
+        let ledger = self.ledgers.pick(idx as usize)?;
+        Some(self.gen_query(ledger))
+    }
+
     fn gen_create(&self, idx: u64) -> Op {
         let name = self.ledger_name(idx);
         let body = json!({ "ledger": name });
@@ -206,6 +220,32 @@ impl Workload {
         });
         Op {
             kind: OpKind::Transact,
+            ledger,
+            body,
+        }
+    }
+
+    /// Bounded triple scan targeting the predicate the transact
+    /// workload writes. Returns real bindings on ledgers that were
+    /// populated by a prior transact-only / single-pound / wide-fanout
+    /// / multitenant run; returns an empty result set on fresh
+    /// ledgers (still 200 OK, still exercises the query path).
+    ///
+    /// Kept deliberately shape-fixed for now — a per-request cursor
+    /// (varying IRI, varying LIMIT) can go in later once we know
+    /// whether tail-latency measurement wants that. First cut: one
+    /// stable query so cache warmth is honest across the run.
+    fn gen_query(&self, ledger: String) -> Op {
+        let body = json!({
+            "select": ["?s"],
+            "where": {
+                "@id": "?s",
+                "http://load.fluree/idx": "?idx"
+            },
+            "limit": 10
+        });
+        Op {
+            kind: OpKind::Query,
             ledger,
             body,
         }

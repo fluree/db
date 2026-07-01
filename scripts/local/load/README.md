@@ -48,8 +48,41 @@ the per-workload tuning knobs.
 | `single-pound` | One `CreateLedger` at t=0, then transact-only | Baseline single-queue ceiling |
 | `create-only` | Pure `CreateLedger` stream | `Command::CreateLedger` apply throughput in isolation |
 | `transact-only` | Transact against `--seeded-ledger` names; fails if missing | Pre-seeded steady-state, no creates competing |
+| `query-only` | Query against `--seeded-ledger` names; fails if missing | Local read path (no consensus), snapshot / cache-refresh behavior, read availability during chaos |
 | `wide-fanout` | Creates N ledgers over the run; transacts to whichever have landed | Per-branch work queues, ownership recalc under failure, state machine growth |
 | `multitenant` | Continuous mix: 1 in N ops is a `CreateLedger`, rest transact | Multi-tenant onboarding behavior, ledger-count scaling |
+
+### query-only body shape
+
+Every `query-only` request sends the same bounded triple-scan against
+the picked ledger:
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "http://load.fluree/idx": "?idx"},
+  "limit": 10
+}
+```
+
+It targets the predicate the transact workloads write, so ledgers that
+were populated by a prior `transact-only` / `single-pound` /
+`wide-fanout` / `multitenant` run return real bindings; fresh ledgers
+return an empty result set (still 200 OK, still exercises the query
+path). Query is held stable across the run so cache warmth is honest;
+per-request cursor variation is a follow-up once we know whether
+tail-latency measurement wants it.
+
+Typical two-run pattern:
+
+```bash
+# 1. Seed a ledger with data
+./stack load --workload single-pound --duration 30s
+
+# 2. Query it (use the ledger name single-pound printed in the top-ledgers
+#    section of the summary — the "load-<ULID>-0" one)
+./stack load --workload query-only --seeded-ledger load-<ULID>-0 --duration 30s
+```
 
 ## Per-op outcome classes
 

@@ -167,12 +167,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    if matches!(cli.workload, WorkloadShape::TransactOnly) && cli.seeded_ledger.is_empty() {
-        return Err(
-            "--workload transact-only requires --seeded-ledger NAME[,NAME...]"
-                .to_string()
-                .into(),
-        );
+    if matches!(
+        cli.workload,
+        WorkloadShape::TransactOnly | WorkloadShape::QueryOnly
+    ) && cli.seeded_ledger.is_empty()
+    {
+        return Err(format!(
+            "--workload {} requires --seeded-ledger NAME[,NAME...]",
+            match cli.workload {
+                WorkloadShape::TransactOnly => "transact-only",
+                WorkloadShape::QueryOnly => "query-only",
+                _ => unreachable!(),
+            }
+        )
+        .into());
     }
 
     let stop = match (cli.duration, cli.total) {
