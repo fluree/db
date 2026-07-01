@@ -282,6 +282,24 @@ async fn run_iceberg_map_remote(
         {
             println!("  TriplesMaps: {count}");
         }
+        if let Some(table_count) = result
+            .get("table_count")
+            .and_then(serde_json::Value::as_u64)
+        {
+            let table_names: Vec<String> = result
+                .get("table_names")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!(
+                "  Tables:      {}",
+                format_table_summary(table_count as usize, &table_names)
+            );
+        }
         println!(
             "  Connection:  {}",
             if connection { "verified" } else { "not tested" }
@@ -315,6 +333,26 @@ async fn run_iceberg_map_remote(
     Ok(())
 }
 
+/// Infer an R2RML mapping media type from a file extension.
+///
+/// Delegates to the shared [`fluree_db_r2rml::loader::MappingFormat`] resolver so
+/// the CLI and the server share one ext→format table and cannot drift (issue
+/// #1397): `.jsonld`/`.json` → `application/ld+json`, any other extension →
+/// `text/turtle` (the resolver's default), case-insensitively. Returns `None`
+/// only when the path has no extension at all, leaving the server to apply the
+/// same default. An explicit `--r2rml-type` still overrides this at the call site.
+fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
+    use fluree_db_r2rml::loader::MappingFormat;
+    // No extension means no signal to infer from — defer to the server default.
+    path.extension()?;
+    let source = path.to_str()?;
+    Some(
+        MappingFormat::resolve(None, source)
+            .media_type()
+            .to_string(),
+    )
+}
+
 /// Convert CLI args to a JSON body for the server endpoint.
 fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
@@ -339,8 +377,15 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
         })?;
         obj.insert("r2rml".into(), content.into());
     }
-    if let Some(ref v) = args.r2rml_type {
-        obj.insert("r2rml_type".into(), v.clone().into());
+    // Explicit `--r2rml-type` wins; otherwise infer from the mapping file
+    // extension so the server records a concrete, self-describing media type
+    // (issue #1397).
+    let r2rml_type = args
+        .r2rml_type
+        .clone()
+        .or_else(|| args.r2rml.as_deref().and_then(infer_mapping_media_type));
+    if let Some(v) = r2rml_type {
+        obj.insert("r2rml_type".into(), v.into());
     }
     if let Some(ref v) = args.branch {
         obj.insert("branch".into(), v.clone().into());
@@ -356,6 +401,12 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     }
     if let Some(ref v) = args.oauth2_client_secret {
         obj.insert("oauth2_client_secret".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.oauth2_scope {
+        obj.insert("oauth2_scope".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.oauth2_audience {
+        obj.insert("oauth2_audience".into(), v.clone().into());
     }
     if let Some(ref v) = args.warehouse {
         obj.insert("warehouse".into(), v.clone().into());
@@ -579,7 +630,12 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
         let config = fluree_db_api::R2rmlCreateConfig {
             iceberg: iceberg_config,
             mapping: fluree_db_api::R2rmlMappingInput::Content(mapping_content),
-            mapping_media_type: args.r2rml_type.clone(),
+            // Explicit `--r2rml-type` wins; otherwise infer from the file
+            // extension (issue #1397).
+            mapping_media_type: args
+                .r2rml_type
+                .clone()
+                .or_else(|| infer_mapping_media_type(r2rml_path)),
         };
 
         let result = fluree.create_r2rml_graph_source(config).await?;
@@ -592,6 +648,10 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
         println!("  Catalog:     {}", result.catalog_uri);
         println!("  R2RML:       {}", result.mapping_source);
         println!("  TriplesMaps: {}", result.triples_map_count);
+        println!(
+            "  Tables:      {}",
+            format_table_summary(result.table_count, &result.table_names)
+        );
         println!(
             "  Connection:  {}",
             if result.connection_tested {
@@ -683,12 +743,19 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     if let Some(ref token) = args.auth_bearer {
         config = config.with_auth_bearer(token);
     }
-    if let (Some(ref url), Some(ref id), Some(ref secret)) = (
-        &args.oauth2_token_url,
-        &args.oauth2_client_id,
-        &args.oauth2_client_secret,
-    ) {
+    // OAuth2 activates on token_url + client_secret; client_id defaults to "" so
+    // Horizon / PAT users can omit it (an empty client_id is what Snowflake
+    // Horizon's `session:role:` exchange requires).
+    if let (Some(ref url), Some(ref secret)) = (&args.oauth2_token_url, &args.oauth2_client_secret)
+    {
+        let id = args.oauth2_client_id.as_deref().unwrap_or("");
         config = config.with_auth_oauth2(url, id, secret);
+        if let Some(ref scope) = args.oauth2_scope {
+            config = config.with_oauth2_scope(scope);
+        }
+        if let Some(ref audience) = args.oauth2_audience {
+            config = config.with_oauth2_audience(audience);
+        }
     }
     if let Some(ref wh) = args.warehouse {
         config = config.with_warehouse(wh);
@@ -707,6 +774,16 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     }
 
     Ok(config)
+}
+
+/// Format the `Tables:` summary as `N (name1, name2, …)`, or just `N` when no
+/// table names are available (e.g. an unvalidated address-based mapping).
+fn format_table_summary(count: usize, names: &[String]) -> String {
+    if names.is_empty() {
+        count.to_string()
+    } else {
+        format!("{count} ({})", names.join(", "))
+    }
 }
 
 fn is_iceberg_family_source_type(st: &fluree_db_nameservice::GraphSourceType) -> bool {
@@ -729,5 +806,147 @@ fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
         fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
         fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
         fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_rest_args() -> IcebergMapArgs {
+        IcebergMapArgs {
+            name: "gs".to_string(),
+            remote: None,
+            mode: "rest".to_string(),
+            catalog_uri: Some("https://catalog.example.com".to_string()),
+            table: Some("ns.tbl".to_string()),
+            table_location: None,
+            r2rml: None,
+            r2rml_type: None,
+            branch: None,
+            auth_bearer: None,
+            oauth2_token_url: None,
+            oauth2_client_id: None,
+            oauth2_client_secret: None,
+            oauth2_scope: None,
+            oauth2_audience: None,
+            warehouse: None,
+            no_vended_credentials: false,
+            s3_region: None,
+            s3_endpoint: None,
+            s3_path_style: false,
+        }
+    }
+
+    #[test]
+    fn args_to_json_includes_oauth2_scope_and_audience() {
+        let mut args = base_rest_args();
+        args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
+        args.oauth2_client_secret = Some("pat".to_string());
+        args.oauth2_scope = Some("session:role:ICEBERG_READER".to_string());
+        args.oauth2_audience = Some("polaris".to_string());
+
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["oauth2_scope"], "session:role:ICEBERG_READER");
+        assert_eq!(body["oauth2_audience"], "polaris");
+        // Omitting client_id leaves it out of the remote body entirely.
+        assert!(body.get("oauth2_client_id").is_none());
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn build_iceberg_config_activates_oauth2_without_client_id_and_threads_scope() {
+        let mut args = base_rest_args();
+        args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
+        // No client_id -> defaults to "" so OAuth2 still activates.
+        args.oauth2_client_secret = Some("pat".to_string());
+        args.oauth2_scope = Some("session:role:ICEBERG_READER".to_string());
+        args.oauth2_audience = Some("polaris".to_string());
+
+        let config = build_iceberg_config(&args).unwrap();
+        let gs = config.to_iceberg_gs_config();
+        let v = serde_json::to_value(&gs).unwrap();
+        let auth = &v["catalog"]["auth"];
+
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_id"], "");
+        assert_eq!(auth["client_secret"], "pat");
+        assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
+        assert_eq!(auth["audience"], "polaris");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn build_iceberg_config_no_oauth2_without_secret() {
+        let mut args = base_rest_args();
+        // token_url alone (no client_secret) must NOT activate OAuth2.
+        args.oauth2_token_url = Some("https://catalog.example.com/v1/oauth/tokens".to_string());
+
+        let config = build_iceberg_config(&args).unwrap();
+        let gs = config.to_iceberg_gs_config();
+        let v = serde_json::to_value(&gs).unwrap();
+        assert_eq!(v["catalog"]["auth"]["type"], "none");
+    }
+
+    #[test]
+    fn infer_mapping_media_type_maps_known_extensions() {
+        use std::path::Path;
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.ttl")).as_deref(),
+            Some("text/turtle")
+        );
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.turtle")).as_deref(),
+            Some("text/turtle")
+        );
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.jsonld")).as_deref(),
+            Some("application/ld+json")
+        );
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.json")).as_deref(),
+            Some("application/ld+json")
+        );
+        // Extension matching is case-insensitive.
+        assert_eq!(
+            infer_mapping_media_type(Path::new("MAPPING.TTL")).as_deref(),
+            Some("text/turtle")
+        );
+        // An unrecognized extension defers to the shared resolver's default
+        // (Turtle) — the same decision the server makes, so the two never drift.
+        assert_eq!(
+            infer_mapping_media_type(Path::new("mapping.rdf")).as_deref(),
+            Some("text/turtle")
+        );
+        // No extension at all -> None, so the caller leaves the type unset and the
+        // server applies the same default.
+        assert_eq!(infer_mapping_media_type(Path::new("mapping")), None);
+    }
+
+    #[test]
+    fn args_to_json_infers_r2rml_type_from_ttl_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airlines.ttl");
+        std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
+
+        let mut args = base_rest_args();
+        args.r2rml = Some(path);
+        // No explicit --r2rml-type: inferred from the `.ttl` extension.
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["r2rml_type"], "text/turtle");
+    }
+
+    #[test]
+    fn args_to_json_explicit_r2rml_type_overrides_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airlines.ttl");
+        std::fs::write(&path, "@prefix rr: <http://www.w3.org/ns/r2rml#> .").unwrap();
+
+        let mut args = base_rest_args();
+        args.r2rml = Some(path);
+        // Explicit flag wins over the conflicting `.ttl` extension.
+        args.r2rml_type = Some("application/ld+json".to_string());
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["r2rml_type"], "application/ld+json");
     }
 }

@@ -43,6 +43,10 @@ pub struct IcebergMapRequest {
     pub oauth2_client_id: Option<String>,
     /// OAuth2 client secret
     pub oauth2_client_secret: Option<String>,
+    /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
+    pub oauth2_scope: Option<String>,
+    /// OAuth2 audience
+    pub oauth2_audience: Option<String>,
     /// Warehouse identifier
     pub warehouse: Option<String>,
     /// Disable vended credentials
@@ -72,6 +76,10 @@ pub struct IcebergMapResponse {
     pub mapping_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub triples_map_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_names: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping_validated: Option<bool>,
 }
@@ -137,6 +145,8 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 connection_tested: result.connection_tested,
                 mapping_source: Some(result.mapping_source),
                 triples_map_count: Some(result.triples_map_count),
+                table_count: Some(result.table_count),
+                table_names: Some(result.table_names),
                 mapping_validated: Some(result.mapping_validated),
             }
         } else {
@@ -153,6 +163,8 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 connection_tested: result.connection_tested,
                 mapping_source: None,
                 triples_map_count: None,
+                table_count: None,
+                table_names: None,
                 mapping_validated: None,
             }
         };
@@ -208,12 +220,18 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     if let Some(ref token) = req.auth_bearer {
         config = config.with_auth_bearer(token);
     }
-    if let (Some(ref url), Some(ref id), Some(ref secret)) = (
-        &req.oauth2_token_url,
-        &req.oauth2_client_id,
-        &req.oauth2_client_secret,
-    ) {
+    // OAuth2 activates on oauth2_token_url + oauth2_client_secret; client_id
+    // defaults to "" so Horizon / PAT callers can omit it (Snowflake Horizon's
+    // `session:role:` token exchange requires an absent/empty client_id).
+    if let (Some(ref url), Some(ref secret)) = (&req.oauth2_token_url, &req.oauth2_client_secret) {
+        let id = req.oauth2_client_id.as_deref().unwrap_or("");
         config = config.with_auth_oauth2(url, id, secret);
+        if let Some(ref scope) = req.oauth2_scope {
+            config = config.with_oauth2_scope(scope);
+        }
+        if let Some(ref audience) = req.oauth2_audience {
+            config = config.with_oauth2_audience(audience);
+        }
     }
     if let Some(ref wh) = req.warehouse {
         config = config.with_warehouse(wh);
@@ -232,4 +250,55 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     }
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_deserializes_oauth2_scope_and_reaches_auth_config() {
+        // Omit client_id (Horizon case); provide token_url + secret + scope.
+        let body = serde_json::json!({
+            "name": "gs",
+            "mode": "rest",
+            "catalog_uri": "https://catalog.example.com",
+            "table": "ns.tbl",
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
+            "oauth2_client_secret": "pat",
+            "oauth2_scope": "session:role:ICEBERG_READER",
+            "oauth2_audience": "polaris"
+        });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(
+            req.oauth2_scope.as_deref(),
+            Some("session:role:ICEBERG_READER")
+        );
+        assert_eq!(req.oauth2_audience.as_deref(), Some("polaris"));
+
+        let config = build_iceberg_config(&req).unwrap();
+        let gs = config.to_iceberg_gs_config();
+        let v = serde_json::to_value(&gs).unwrap();
+        let auth = &v["catalog"]["auth"];
+
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_id"], ""); // defaulted to empty
+        assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
+        assert_eq!(auth["audience"], "polaris");
+    }
+
+    #[test]
+    fn request_without_secret_does_not_activate_oauth2() {
+        let body = serde_json::json!({
+            "name": "gs",
+            "catalog_uri": "https://catalog.example.com",
+            "table": "ns.tbl",
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens"
+        });
+        let req: IcebergMapRequest = serde_json::from_value(body).unwrap();
+        let config = build_iceberg_config(&req).unwrap();
+        let gs = config.to_iceberg_gs_config();
+        let v = serde_json::to_value(&gs).unwrap();
+        assert_eq!(v["catalog"]["auth"]["type"], "none");
+    }
 }

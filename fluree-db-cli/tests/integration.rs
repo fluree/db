@@ -456,6 +456,71 @@ fn query_ndjson_local_sparql_at_rejects_inline_from() {
 }
 
 #[test]
+fn query_connection_remote_routes_to_named_remote() {
+    // `--connection=<remote>` forces the connection-scoped path against a named
+    // remote. With `require_equals`, the `=value` form is parsed as the remote
+    // (not the following query string), and the request routes through the
+    // remote resolver — which errors for an unknown remote.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--connection=definitely-no-such-remote",
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("definitely-no-such-remote"));
+}
+
+#[test]
+fn query_bare_connection_keeps_positional_query() {
+    // A bare `--connection` (no `=value`) must not swallow the following query
+    // string: the SPARQL stays the positional input and is executed via the
+    // local connection path. With no `FROM` dataset it fails at execution, but
+    // crucially NOT with a clap parsing error about the argument.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "mydb"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "mydb",
+            "--connection",
+            "SELECT ?s WHERE { ?s <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument").not())
+        .stderr(predicate::str::contains("invalid value").not());
+}
+
+#[test]
+fn query_bare_connection_without_active_ledger_routes_to_connection_path() {
+    // #1398 review must-fix: a pure-federation query names its sources in FROM,
+    // so bare `--connection` with no active ledger (and no ledger argument) must
+    // route to the local connection path — NOT error with `NoActiveLedger`.
+    // The FROM target doesn't exist here, so the query still fails, but it fails
+    // at source resolution rather than for lack of an active ledger.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    // Deliberately no `create` / `use`: there is no active ledger.
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "--connection",
+            "SELECT ?id WHERE { ?o <http://example.org/id> ?id }",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no active ledger").not());
+}
+
+#[test]
 fn query_ndjson_local_with_default_allow_policy_streams() {
     let tmp = TempDir::new().unwrap();
     seed_named_people(&tmp, "streamdb");

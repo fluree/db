@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use fluree_db_core::ContentStore;
 use fluree_db_iceberg::{
     catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
-    credential::VendedCredentials,
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
     scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
@@ -186,10 +185,17 @@ impl crate::Fluree {
         config.validate()?;
 
         // Resolve mapping: validate and store to CAS if inline content
-        let (mapping_address, triples_map_count, mapping_validated) = match &config.mapping {
+        let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
+            .mapping
+        {
             R2rmlMappingInput::Content(content) => {
-                let compiled = Self::compile_r2rml_content(content, &config)?;
+                // Inline content has no filename to sniff; the shared resolver
+                // defaults a missing media type to Turtle (matching the eventual
+                // CID address, which is also extensionless).
+                let compiled =
+                    Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
                 let count = compiled.len();
+                let tables = Self::sorted_table_names(&compiled);
                 let gs_id = config.graph_source_id();
                 let cs = self.content_store(&gs_id);
                 let cid = cs
@@ -203,20 +209,21 @@ impl crate::Fluree {
                     })?;
                 let addr = cid.to_string();
                 info!(graph_source_id = %graph_source_id, mapping_cid = %addr, "R2RML mapping stored to CAS");
-                (addr, count, true)
+                (addr, count, tables, true)
             }
             R2rmlMappingInput::Address(address) => {
-                let (count, validated) = self
-                    .validate_r2rml_mapping_from_address(address, &config)
-                    .await
-                    .map(|c| (c, true))
-                    .unwrap_or_else(|e| {
-                        warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
-                        (0, false)
-                    });
-                (address.clone(), count, validated)
+                let (count, tables, validated) = self
+                        .validate_r2rml_mapping_from_address(address, &config)
+                        .await
+                        .map(|(c, t)| (c, t, true))
+                        .unwrap_or_else(|e| {
+                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
+                            (0, Vec::new(), false)
+                        });
+                (address.clone(), count, tables, validated)
             }
         };
+        let table_count = table_names.len();
 
         // Test catalog connection (REST mode only)
         let connection_tested = if config.iceberg.is_rest() {
@@ -249,6 +256,8 @@ impl crate::Fluree {
             catalog_uri: config.iceberg.catalog_uri_or_location().to_string(),
             mapping_source: mapping_address,
             triples_map_count,
+            table_count,
+            table_names,
             connection_tested,
             mapping_validated,
         })
@@ -302,34 +311,40 @@ impl crate::Fluree {
     }
 
     /// Compile R2RML content and return the compiled mapping.
+    ///
+    /// `source` is the mapping's filename, storage address, or content-addressed
+    /// CID; it is only consulted to infer the format when no explicit
+    /// `media_type` is given. Format selection goes through the shared
+    /// [`fluree_db_r2rml::loader::MappingFormat`] resolver (default Turtle) so
+    /// registration and query time can never disagree (issue #1397).
     fn compile_r2rml_content(
         content: &str,
-        config: &R2rmlCreateConfig,
+        media_type: Option<&str>,
+        source: &str,
     ) -> Result<fluree_db_r2rml::mapping::CompiledR2rmlMapping> {
-        let is_turtle = config
-            .mapping_media_type
-            .as_ref()
-            .is_none_or(|mt| mt.contains("turtle"));
-        if is_turtle {
-            fluree_db_r2rml::loader::R2rmlLoader::from_turtle(content)
+        use fluree_db_r2rml::loader::MappingFormat;
+        match MappingFormat::resolve(media_type, source) {
+            MappingFormat::Turtle => fluree_db_r2rml::loader::R2rmlLoader::from_turtle(content)
                 .map_err(|e| crate::ApiError::Config(format!("Failed to parse R2RML Turtle: {e}")))?
                 .compile()
                 .map_err(|e| {
                     crate::ApiError::Config(format!("Failed to compile R2RML mapping: {e}"))
-                })
-        } else {
-            Err(crate::ApiError::Config(
+                }),
+            MappingFormat::JsonLd => Err(crate::ApiError::Config(
                 "R2RML mapping must be in Turtle format. JSON-LD is not yet supported.".into(),
-            ))
+            )),
         }
     }
 
     /// Validate an R2RML mapping from a pre-existing storage address.
+    ///
+    /// Returns the number of TriplesMap definitions and the sorted list of
+    /// distinct logical table names referenced by the mapping.
     async fn validate_r2rml_mapping_from_address(
         &self,
         address: &str,
         config: &R2rmlCreateConfig,
-    ) -> Result<usize> {
+    ) -> Result<(usize, Vec<String>)> {
         let storage = self.admin_storage().ok_or_else(|| {
             crate::ApiError::Config(format!(
                 "Cannot load R2RML mapping from address '{address}': address-based reads are not supported on this backend"
@@ -343,7 +358,23 @@ impl crate::Fluree {
         let content = String::from_utf8(bytes).map_err(|e| {
             crate::ApiError::Config(format!("R2RML mapping is not valid UTF-8: {e}"))
         })?;
-        Ok(Self::compile_r2rml_content(&content, config)?.len())
+        // `address` may carry an extension (e.g. `.ttl`/`.jsonld`); pass it so the
+        // resolver can infer the format when no explicit media type is set.
+        let compiled =
+            Self::compile_r2rml_content(&content, config.mapping_media_type.as_deref(), address)?;
+        Ok((compiled.len(), Self::sorted_table_names(&compiled)))
+    }
+
+    /// Collect the distinct logical table names referenced by a compiled
+    /// mapping, sorted for deterministic reporting.
+    fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
+        let mut names: Vec<String> = compiled
+            .table_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
     }
 }
 
@@ -508,32 +539,32 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             ))
         })?;
 
-        // Parse and compile the mapping
-        let media_type = mapping_config.media_type.as_deref();
-
-        let is_turtle = media_type.map_or_else(
-            || mapping_source.ends_with(".ttl") || mapping_source.ends_with(".turtle"),
-            |mt| mt.contains("turtle"),
-        );
-
-        let compiled = if is_turtle {
-            fluree_db_r2rml::loader::R2rmlLoader::from_turtle(&mapping_content)
-                .map_err(|e| {
-                    QueryError::InvalidQuery(format!(
-                        "Failed to parse R2RML Turtle from '{mapping_source}': {e}"
-                    ))
-                })?
-                .compile()
-                .map_err(|e| {
-                    QueryError::InvalidQuery(format!(
-                        "Failed to compile R2RML mapping from '{mapping_source}': {e}"
-                    ))
-                })?
-        } else {
-            return Err(QueryError::InvalidQuery(format!(
-                "R2RML mapping for '{graph_source_id}' uses JSON-LD format, which is not yet supported. \
-                 Please use Turtle format (.ttl)."
-            )));
+        // Parse and compile the mapping. Format selection goes through the same
+        // shared resolver the registration path uses, so a mapping stored
+        // without an explicit media type (e.g. a CAS CID) defaults to Turtle
+        // here too instead of erroring as JSON-LD (issue #1397).
+        use fluree_db_r2rml::loader::MappingFormat;
+        let compiled = match MappingFormat::resolve(media_type, mapping_source) {
+            MappingFormat::Turtle => {
+                fluree_db_r2rml::loader::R2rmlLoader::from_turtle(&mapping_content)
+                    .map_err(|e| {
+                        QueryError::InvalidQuery(format!(
+                            "Failed to parse R2RML Turtle from '{mapping_source}': {e}"
+                        ))
+                    })?
+                    .compile()
+                    .map_err(|e| {
+                        QueryError::InvalidQuery(format!(
+                            "Failed to compile R2RML mapping from '{mapping_source}': {e}"
+                        ))
+                    })?
+            }
+            MappingFormat::JsonLd => {
+                return Err(QueryError::InvalidQuery(format!(
+                    "R2RML mapping for '{graph_source_id}' uses JSON-LD format, which is not yet supported. \
+                     Please use Turtle format (.ttl)."
+                )));
+            }
         };
 
         let compiled = Arc::new(compiled);
@@ -667,18 +698,24 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
                 // GCS HTTP/2 range-read bug cannot occur.
                 let storage = if let Some(ref credentials) = load_response.credentials {
-                    info!("Using vended credentials from catalog");
-                    let credentials = merge_vended_with_io(
-                        credentials,
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_path_style,
+                    info!(
+                        region = ?iceberg_config.io.s3_region,
+                        endpoint = ?iceberg_config.io.s3_endpoint,
+                        "Using vended credentials from catalog"
                     );
-                    S3IcebergStorage::from_vended_credentials(&credentials)
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?
+                    // Thread the io overrides so a catalog that omits the region (or where
+                    // we want an operator-configured endpoint/path-style) still resolves
+                    // correctly. Precedence inside the call: vended > these overrides > SDK.
+                    S3IcebergStorage::from_vended_credentials(
+                        credentials,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?
                 } else {
                     info!(
                         region = ?iceberg_config.io.s3_region,
@@ -995,110 +1032,4 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
 fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
-}
-
-/// Merge catalog-vended credentials with the graph-source IO config.
-///
-/// Vended credentials always supply auth. A catalog that manages its own
-/// storage also vends the connection params (endpoint / region / path style);
-/// when it omits one we fall back to the graph-source config. This is what lets
-/// a GCS-backed table (endpoint = `storage.googleapis.com`, path-style) be read
-/// through the S3 SDK when the catalog vends only keys.
-///
-/// `endpoint` and `region` use vended-wins-with-config-fallback (`Option::or`).
-/// `path_style` is a plain `bool` with no "unset" state, so config supplies it
-/// only when the catalog did **not** vend its own `endpoint`: a catalog that
-/// vends an endpoint owns the addressing style too, and its `path_style`
-/// (including an explicit `false`) must win over the graph-source config.
-fn merge_vended_with_io(
-    creds: &VendedCredentials,
-    cfg_endpoint: Option<&str>,
-    cfg_region: Option<&str>,
-    cfg_path_style: bool,
-) -> VendedCredentials {
-    VendedCredentials {
-        endpoint: creds
-            .endpoint
-            .clone()
-            .or_else(|| cfg_endpoint.map(str::to_string)),
-        region: creds
-            .region
-            .clone()
-            .or_else(|| cfg_region.map(str::to_string)),
-        path_style: if creds.endpoint.is_some() {
-            creds.path_style
-        } else {
-            creds.path_style || cfg_path_style
-        },
-        ..creds.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn creds(endpoint: Option<&str>, region: Option<&str>, path_style: bool) -> VendedCredentials {
-        VendedCredentials {
-            access_key_id: "ak".into(),
-            secret_access_key: "sk".into(),
-            session_token: None,
-            expires_at: None,
-            endpoint: endpoint.map(str::to_string),
-            region: region.map(str::to_string),
-            path_style,
-        }
-    }
-
-    #[test]
-    fn merge_falls_back_to_config_when_catalog_omits_connection_params() {
-        // Catalog vends only keys (no endpoint/region/path-style) — config fills
-        // them so a GCS-backed table is reachable through the S3 SDK.
-        let merged = merge_vended_with_io(
-            &creds(None, None, false),
-            Some("https://storage.googleapis.com"),
-            Some("europe-west1"),
-            true,
-        );
-        assert_eq!(
-            merged.endpoint.as_deref(),
-            Some("https://storage.googleapis.com")
-        );
-        assert_eq!(merged.region.as_deref(), Some("europe-west1"));
-        assert!(
-            merged.path_style,
-            "config path-style fills a catalog that omits it"
-        );
-    }
-
-    #[test]
-    fn merge_lets_vended_connection_params_win() {
-        // Catalog vends its own endpoint/region — those win over config.
-        let merged = merge_vended_with_io(
-            &creds(Some("https://minio.example"), Some("us-east-1"), true),
-            Some("https://storage.googleapis.com"),
-            Some("europe-west1"),
-            false,
-        );
-        assert_eq!(merged.endpoint.as_deref(), Some("https://minio.example"));
-        assert_eq!(merged.region.as_deref(), Some("us-east-1"));
-        assert!(merged.path_style);
-    }
-
-    #[test]
-    fn merge_does_not_let_config_force_path_style_over_a_vended_endpoint() {
-        // Regression guard: a catalog that vends its own endpoint with
-        // virtual-hosted addressing (path_style = false) must NOT be overridden
-        // by a graph-source config that happens to set s3_path_style = true.
-        let merged = merge_vended_with_io(
-            &creds(Some("https://minio.example"), None, false),
-            None,
-            None,
-            true,
-        );
-        assert!(
-            !merged.path_style,
-            "vended endpoint owns addressing style; config must not force path-style on"
-        );
-    }
 }
