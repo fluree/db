@@ -93,27 +93,6 @@ fn limit_pushdown_enabled() -> bool {
     })
 }
 
-/// Whether bound-subject key pushdown is enabled. UNLIKE the other R2RML
-/// switches, this defaults to OFF and must be explicitly enabled with
-/// `FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN` set to `1`/`true`/`on`. It pushes a filter
-/// derived from reversing the subject template — correct by construction for the
-/// supported template shapes and physical types — but wants a live pruning check
-/// against a real backend before becoming the default. The operator always
-/// enforces the subject equality regardless, so enabling it can never change
-/// results, only which rows the scan returns.
-fn subject_key_pushdown_enabled() -> bool {
-    // Read live (not cached) so it is deterministically togglable in tests; the
-    // check runs once per TriplesMap scan, never per row, so the cost is nil.
-    matches!(
-        std::env::var("FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "on"
-    )
-}
-
 /// How a window of produced rows is combined with the buffered child rows.
 ///
 /// The join is *flipped* relative to a naive per-child probe: the (small,
@@ -378,27 +357,28 @@ impl R2rmlScanOperator {
             }
         }
 
-        // Bound-subject key pushdown (opt-in): reverse the subject template
-        // against the constant IRI to recover each key column's raw value, and
-        // push it as an equality so Iceberg can prune to the matching rows. Only
-        // unambiguously-reversible template shapes yield filters (see
-        // `reverse_subject_template`); the physical type is resolved later against
-        // the Iceberg schema, and unsupported types are skipped. The operator
-        // still enforces the subject equality, so a skipped or partial push is a
-        // perf choice, never a correctness one.
-        if subject_key_pushdown_enabled() {
-            if let (Some(subject_iri), Some(template)) = (
-                self.pattern.subject_constant.as_deref(),
-                triples_map.subject_map.template.as_deref(),
-            ) {
-                if let Some(keys) = reverse_subject_template(template, subject_iri) {
-                    for (column, raw) in keys {
-                        out.push(crate::r2rml::ScanFilter {
-                            column,
-                            op: crate::r2rml::ScanCmpOp::Eq,
-                            value: crate::r2rml::ScanValue::TemplateKey(raw),
-                        });
-                    }
+        // Bound-subject key pushdown: reverse the subject template against the
+        // constant IRI to recover each key column's raw value, and push it as an
+        // equality so Iceberg can prune to the matching rows. Emitted
+        // unconditionally, like the object-constant filters above; whether it is
+        // *applied* is governed by the same reader-level pushdown kill-switch
+        // (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`). Only unambiguously-reversible
+        // template shapes yield filters (see `reverse_subject_template`); the
+        // physical type is resolved later against the Iceberg schema, and
+        // unsupported types are skipped. The operator still enforces the subject
+        // equality, so a skipped or partial push is a perf choice, never a
+        // correctness one.
+        if let (Some(subject_iri), Some(template)) = (
+            self.pattern.subject_constant.as_deref(),
+            triples_map.subject_map.template.as_deref(),
+        ) {
+            if let Some(keys) = reverse_subject_template(template, subject_iri) {
+                for (column, raw) in keys {
+                    out.push(crate::r2rml::ScanFilter {
+                        column,
+                        op: crate::r2rml::ScanCmpOp::Eq,
+                        value: crate::r2rml::ScanValue::TemplateKey(raw),
+                    });
                 }
             }
         }

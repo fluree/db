@@ -3589,14 +3589,12 @@ impl R2rmlTableProvider for FilterCapturingProvider {
     }
 }
 
-/// With `FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN` on, a bound subject reverses the
-/// subject template and hands the scan an equality filter on the key column, and
-/// the result is still correct (the operator remains authority). This is the
-/// end-to-end proof of the pushdown wiring; the physical-type coercion and the
-/// template reversal are unit-tested separately.
+/// A bound subject reverses the subject template and hands the scan an equality
+/// filter on the key column, and the result is still correct (the operator
+/// remains authority). This is the end-to-end proof of the pushdown wiring; the
+/// physical-type coercion and the template reversal are unit-tested separately.
 #[tokio::test]
-async fn guard_bound_subject_pushes_key_filter_when_enabled() {
-    std::env::set_var("FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN", "1");
+async fn guard_bound_subject_pushes_key_filter() {
     let (_fluree, ledger) = edw_guard_ledger();
     let filters = Arc::new(Mutex::new(Vec::new()));
     let provider = FilterCapturingProvider {
@@ -3634,8 +3632,6 @@ async fn guard_bound_subject_pushes_key_filter_when_enabled() {
     .await
     .expect("bound-subject query should execute");
     let rows = result.iter().fold(0, |acc, b| acc + b.len());
-
-    std::env::remove_var("FLUREE_R2RML_SUBJECT_KEY_PUSHDOWN");
 
     // The subject template `.../store/{store_key}` reversed against `.../store/5`
     // must push `store_key = 5` as a template key.
