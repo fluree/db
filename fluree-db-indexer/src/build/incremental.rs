@@ -24,7 +24,7 @@ use std::time::Instant;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
-use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
+use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef, LeafletCache};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -176,6 +176,7 @@ async fn run_update_branch(
     upload_budget: Arc<Semaphore>,
     upload_buffer: usize,
     cache_dir: std::path::PathBuf,
+    warm_cache: Option<Arc<LeafletCache>>,
 ) -> std::result::Result<(BranchUpdateMeta, Phase2FetchStatsSnapshot), IndexerError> {
     let parent_span = tracing::Span::current();
     let stats = Phase2FetchStats::default();
@@ -332,6 +333,7 @@ async fn run_update_branch(
         let content_store = content_store.as_ref();
         let tracker = &tracker;
         let cache_dir = &cache_dir;
+        let warm_cache = warm_cache.as_deref();
         async move {
             let mut totals = LeafUploadCounts::default();
             while let Some(blob) = rx.recv().await {
@@ -341,6 +343,7 @@ async fn run_update_branch(
                     upload_budget_ref,
                     cache_dir,
                     blob,
+                    warm_cache,
                 )
                 .await?;
                 totals.leaf_bytes += c.leaf_bytes;
@@ -434,6 +437,13 @@ async fn execute_phase2_task(
     };
 
     let started = Instant::now();
+    // Resolve the warm-on-write cache once per task (co-located only; `None`
+    // elsewhere). The CoW (update) paths seed it; fresh builds do not (they'd
+    // decode the whole graph).
+    let warm_cache = config
+        .warm_cache_source
+        .as_ref()
+        .and_then(|s| s.warm_cache());
     let output = match kind {
         Phase2TaskKind::DefaultExisting { leaves } => {
             let branch_bytes =
@@ -448,6 +458,7 @@ async fn execute_phase2_task(
                 Arc::clone(&upload_budget),
                 upload_buffer,
                 cache_dir.clone(),
+                warm_cache.clone(),
             )
             .await?;
             Phase2TaskOutput {
@@ -508,6 +519,7 @@ async fn execute_phase2_task(
                 Arc::clone(&upload_budget),
                 upload_buffer,
                 cache_dir.clone(),
+                warm_cache.clone(),
             )
             .await?;
             let branch_cid = content_store
@@ -3755,6 +3767,7 @@ async fn upload_one_leaf_blob(
     upload_budget: &Semaphore,
     cache_dir: &std::path::Path,
     blob: NewLeafBlob,
+    warm_cache: Option<&LeafletCache>,
 ) -> Result<LeafUploadCounts> {
     let _permit = upload_budget
         .acquire()
@@ -3773,6 +3786,13 @@ async fn upload_one_leaf_blob(
     cache_artifact_bytes(cache_dir, &leaf_cid, &info.leaf_bytes, "index_leaf");
     counts.leaf_bytes = info.leaf_bytes.len() as u64;
 
+    // Warm-on-write (co-located only): seed the shared read cache with the
+    // leaflets we just wrote, from bytes already in hand, so the query server's
+    // immediate read of this new-CID leaf hits the cache instead of cold decode.
+    if let Some(cache) = warm_cache {
+        warm_leaf_into_cache(cache, &info.leaf_cid, &info.leaf_bytes);
+    }
+
     if let Some(sc_bytes) = info.sidecar_bytes.as_deref() {
         let sidecar_cid = content_store
             .put(ContentKind::HistorySidecar, sc_bytes)
@@ -3787,6 +3807,56 @@ async fn upload_one_leaf_blob(
     }
     // `info` (and its leaf_bytes/sidecar_bytes) drops here, freeing the buffers.
     Ok(counts)
+}
+
+/// Warm-on-write: seed the shared read cache with the leaflets this build just
+/// wrote so a co-located query server's immediate read of the freshly-rewritten
+/// (new-CID) leaf hits the cache instead of re-reading + re-decoding from disk.
+///
+/// Decodes from the bytes already in hand (no re-fetch) and inserts each leaflet
+/// under `ColumnSet::ALL`; the read-side superset fallback projects that down to
+/// any narrower request, so we never have to guess a reader's projection. The
+/// `leaf_id` derivation matches the reader's (`xxh3_128(leaf_cid.to_bytes())`).
+/// Best-effort: a decode error just leaves the reader to cold-decode as before.
+fn warm_leaf_into_cache(cache: &LeafletCache, leaf_cid: &ContentId, leaf_bytes: &[u8]) {
+    use fluree_db_binary_index::format::leaf::{
+        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
+    };
+    use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
+    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+    use fluree_db_binary_index::V3BatchCacheKey;
+
+    let Ok(header) = decode_leaf_header_v3(leaf_bytes) else {
+        return;
+    };
+    let order = header.order;
+    let Ok(dir) = decode_leaf_dir_v3_with_base(leaf_bytes, &header) else {
+        return;
+    };
+    let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
+    for (idx, entry) in dir.entries.iter().enumerate() {
+        if entry.row_count == 0 {
+            continue;
+        }
+        if let Ok(batch) = load_leaflet_columns(
+            leaf_bytes,
+            entry,
+            dir.payload_base,
+            &ColumnProjection::all(),
+            order,
+        ) {
+            cache.insert_v3_batch(
+                V3BatchCacheKey {
+                    leaf_id,
+                    leaflet_idx: idx as u32,
+                    columns: ColumnSet::ALL.0,
+                },
+                batch,
+            );
+        }
+    }
+    // Seed the directory too (used once the local scan path consults it).
+    cache.insert_leaf_dir(leaf_id, std::sync::Arc::new(dir));
 }
 
 /// Upload a fully-materialized set of leaf blobs (the fresh-build paths produce
@@ -3806,7 +3876,9 @@ async fn upload_leaf_blobs(
     // large fresh build.
     let buffer = upload_buffer.max(1);
     let totals = stream::iter(blobs)
-        .map(|blob| upload_one_leaf_blob(content_store, tracker, upload_budget, cache_dir, blob))
+        .map(|blob| {
+            upload_one_leaf_blob(content_store, tracker, upload_budget, cache_dir, blob, None)
+        })
         .buffer_unordered(buffer)
         .try_fold(LeafUploadCounts::default(), |mut acc, c| async move {
             acc.leaf_bytes += c.leaf_bytes;

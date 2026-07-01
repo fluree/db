@@ -45,7 +45,7 @@ pub mod stats;
 // Re-export main types
 pub use config::{
     AttachmentEventCoverage, AttachmentEventsProvider, ConfiguredFulltextProperty,
-    ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig,
+    ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig, WarmCacheSource,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
