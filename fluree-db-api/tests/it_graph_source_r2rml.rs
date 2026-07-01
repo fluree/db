@@ -3432,3 +3432,36 @@ async fn guard_consumed_filter_limit_terminates_scan_early() {
     );
     assert_eq!(rows_full, 1999, "the consumed filter drops exactly STORE-1");
 }
+
+/// A constant object in the triple (`?s <storeId> "STORE-5"`) is enforced by the
+/// operator, not just the scan filter. The mock provider streams every row
+/// without pruning, so exactly the one matching subject must come back — proving
+/// the equality is applied as the pattern's semantics.
+#[tokio::test]
+async fn guard_constant_object_string_equality() {
+    use std::sync::atomic::AtomicUsize;
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // ?s ex:storeId "STORE-5"
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Var(s),
+        Ref::Sid(p_id),
+        Term::Value(FlakeValue::String("STORE-5".to_string())),
+    ))];
+
+    let provider = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![s], None).await;
+    assert_eq!(
+        rows, 1,
+        "only the STORE-5 subject matches the constant object"
+    );
+}

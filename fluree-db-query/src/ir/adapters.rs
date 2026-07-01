@@ -642,6 +642,13 @@ pub struct R2rmlPattern {
     /// the scan — the standalone `FilterOperator` that would otherwise block the
     /// budget is dropped. `None` when no filter was consumed.
     pub consumed_filter: Option<Expression>,
+
+    /// A constant object in the triple pattern (`?s <pred> "value"`): the object
+    /// is not a variable but a required literal. `object_var` is `None`; the
+    /// operator keeps a subject only when this predicate's object equals the
+    /// constant (enforced as the pattern's semantics, independent of scan
+    /// pushdown), and also emits a `ScanFilter` for row-group + row pruning.
+    pub object_constant: Option<crate::r2rml::ScanValue>,
 }
 
 impl R2rmlPattern {
@@ -661,6 +668,7 @@ impl R2rmlPattern {
             star_bindings: Vec::new(),
             scan_filters: Vec::new(),
             consumed_filter: None,
+            object_constant: None,
         }
     }
 

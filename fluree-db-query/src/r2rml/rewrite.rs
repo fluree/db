@@ -499,25 +499,25 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(_) => None, // Predicate is variable - no filter
     };
 
-    // Extract object variable
-    // If object is bound (constant), don't rewrite - we can't currently push
-    // object value constraints into the R2RML scan, so the original pattern
-    // needs to be preserved for correct filtering.
-    let object_var = match &tp.o {
-        Term::Var(v) => Some(*v),
-        Term::Sid(_) | Term::Iri(_) | Term::Value(_) => {
-            // Object is bound - don't rewrite this pattern.
-            // The R2RML scan cannot filter by object value, and rewriting
-            // would drop the constraint, returning incorrect results.
-            // Preserve the original triple pattern for normal evaluation.
-            return None;
+    // Extract the object: a variable, or a constant string equality constraint.
+    let (object_var, object_constant) = match &tp.o {
+        Term::Var(v) => (Some(*v), None),
+        // `?s <pred> "value"`: a constant string object becomes an equality
+        // constraint the operator enforces (see `R2rmlPattern::object_constant`).
+        // Requires a constant predicate to resolve the column. Non-string
+        // constants (numbers, refs) are not yet pushed and preserve the original
+        // pattern (which the graph-source path rejects as unsupported).
+        Term::Value(FlakeValue::String(s)) if predicate_filter.is_some() => {
+            (None, Some(ScanValue::Str(s.clone())))
         }
+        Term::Sid(_) | Term::Iri(_) | Term::Value(_) => return None,
     };
 
     let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
     }
+    pattern.object_constant = object_constant;
 
     Some(pattern)
 }

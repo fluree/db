@@ -329,6 +329,29 @@ impl R2rmlScanOperator {
                 value: pd.value.clone(),
             });
         }
+
+        // Constant-object equality pushes as a scan filter too (optimization;
+        // the operator enforces correctness). Same single-scalar-column rule.
+        if let (Some(value), Some(pred_iri)) = (
+            &self.pattern.object_constant,
+            self.pattern.predicate_filter.as_deref(),
+        ) {
+            let mut matching = triples_map
+                .predicate_object_maps
+                .iter()
+                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+            if let (Some(pom), None) = (matching.next(), matching.next()) {
+                if !matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
+                    if let [col] = pom.object_map.referenced_columns().as_slice() {
+                        out.push(crate::r2rml::ScanFilter {
+                            column: (*col).to_string(),
+                            op: crate::r2rml::ScanCmpOp::Eq,
+                            value: value.clone(),
+                        });
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -1126,6 +1149,16 @@ fn materialize_pom_object(
     }
 }
 
+/// Whether a materialized object term equals a constant-object `ScanValue`.
+/// Only string constants are pushed as constant objects (see
+/// `convert_triple_to_r2rml`), so this is an exact lexical string comparison.
+fn rdf_term_eq_scan_value(term: &RdfTerm, value: &crate::r2rml::ScanValue) -> bool {
+    match (term, value) {
+        (RdfTerm::Literal { value: v, .. }, crate::r2rml::ScanValue::Str(s)) => v == s,
+        _ => false,
+    }
+}
+
 /// Materialize one column batch into produced variable assignments (subject +
 /// object vars) — the per-batch unit of the parallel scan. Mirrors the previous
 /// per-row logic (star cross product, subject-only, single-object).
@@ -1207,6 +1240,33 @@ fn materialize_batch(
         }
 
         let Some(obj_var) = pattern.object_var else {
+            // Constant-object (`?s <pred> "value"`): keep the subject only when
+            // this predicate has an object equal to the required constant. The
+            // equality is the pattern's semantics, so it is enforced here
+            // regardless of scan pushdown; the pushed ScanFilter is only an
+            // optimization on top.
+            if let Some(required) = &pattern.object_constant {
+                let mut matched = false;
+                for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
+                    pattern
+                        .predicate_filter
+                        .as_deref()
+                        .is_some_and(|pf| pom.predicate_map.as_constant() == Some(pf))
+                }) {
+                    if let Some(t) =
+                        materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
+                    {
+                        if rdf_term_eq_scan_value(&t, required) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if matched {
+                    produced.push(vec![(pattern.subject_var, subject_binding)]);
+                }
+                continue;
+            }
             produced.push(vec![(pattern.subject_var, subject_binding)]);
             continue;
         };
