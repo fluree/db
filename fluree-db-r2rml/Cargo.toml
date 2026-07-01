@@ -44,6 +44,8 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# Tests-only: assert the wire IR serializes to solo's camelCase shape.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

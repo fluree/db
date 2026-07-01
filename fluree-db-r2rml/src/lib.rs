@@ -30,12 +30,14 @@
 //! indexed lookup methods like `find_maps_for_class()` for efficient pattern matching
 //! during query execution.
 
+pub mod emit;
 pub mod error;
 pub mod loader;
 pub mod mapping;
 pub mod materialize;
 pub mod vocab;
 
+pub use emit::{emit_r2rml, EmitOptions, EmitOutput, EmitTableSchema, StructuredR2rmlMapping};
 pub use error::{R2rmlError, R2rmlResult};
 pub use loader::R2rmlLoader;
 pub use mapping::{
