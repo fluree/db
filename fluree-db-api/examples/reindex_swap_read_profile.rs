@@ -146,7 +146,9 @@ async fn point_read_product(fluree: &Fluree, alias: &str, product_local_id: &str
 #[derive(Default)]
 struct Agg {
     read_new: Vec<f64>,
+    read_new2: Vec<f64>,
     read_old: Vec<f64>,
+    read_old_random: Vec<f64>,
     index_ms: Vec<f64>,
     ins_new: Vec<i64>,
     ins_old: Vec<i64>,
@@ -302,7 +304,16 @@ fn run() {
             // product (warm control), on the already-applied generation.
             let new_local = full.products[p1 - 1].id.trim_start_matches("ex:").to_string();
             let (read_new_ms, ins_new) = point_read_product(&fluree, &alias, &new_local).await;
+            // Control A: second read of the SAME just-inserted product, back to
+            // back — isolates first-touch CPU/cache/setup from insertedness.
+            let (read_new2_ms, _) = point_read_product(&fluree, &alias, &new_local).await;
             let (read_old_ms, ins_old) = point_read_product(&fluree, &alias, &old_local).await;
+            // Control B: a DIFFERENT existing base product each burst (indexed at
+            // t=1, stable structure) — isolates "fresh cold subject" from
+            // "just-inserted". If this tracks read_new, the gap is cold-subject.
+            let rnd_idx = cycle.wrapping_mul(48_611).wrapping_add(12_345) % base_products;
+            let rnd_local = full.products[rnd_idx].id.trim_start_matches("ex:").to_string();
+            let (read_old_rand_ms, _) = point_read_product(&fluree, &alias, &rnd_local).await;
 
             let cache_entries = fluree.leaflet_cache().entry_count();
             let cache_mb = fluree.leaflet_cache().weighted_size_bytes() as f64 / (1024.0 * 1024.0);
@@ -318,7 +329,9 @@ fn run() {
 
             if !is_warmup {
                 agg.read_new.push(read_new_ms);
+                agg.read_new2.push(read_new2_ms);
                 agg.read_old.push(read_old_ms);
+                agg.read_old_random.push(read_old_rand_ms);
                 agg.index_ms.push(index_ms);
                 agg.ins_new.push(ins_new);
                 agg.ins_old.push(ins_old);
@@ -335,7 +348,9 @@ fn run() {
         // --- Summary ---
         eprintln!("\n[reindex_swap_read] summary over {bursts} measured bursts:");
         summarize("read_new", &mut agg.read_new);
+        summarize("read_new2", &mut agg.read_new2);
         summarize("read_old", &mut agg.read_old);
+        summarize("read_old_random", &mut agg.read_old_random);
         summarize("index_ms", &mut agg.index_ms);
         let sum_i64 = |v: &[i64]| v.iter().sum::<i64>();
         let n = agg.ins_new.len().max(1) as i64;
