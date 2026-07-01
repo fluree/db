@@ -77,7 +77,7 @@ pub use cache::{ShaclCache, ShaclCacheKey};
 pub use compile::{CompiledShape, PropertyShape, Severity, ShapeId, TargetType};
 pub use constraints::Constraint;
 pub use error::{Result, ShaclError};
-pub use validate::{ShaclEngine, ValidationReport, ValidationResult};
+pub use validate::{CrossLedgerMembership, ShaclEngine, ValidationReport, ValidationResult};
 
 /// SHACL namespace code (re-exported from fluree-vocab)
 pub use fluree_vocab::namespaces::SHACL;

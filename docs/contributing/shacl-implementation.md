@@ -178,9 +178,11 @@ By default, membership is resolved against the **focus node's own data graph** (
 
 A **per-transaction memo** on the `ShaclEngine` (`class_cache`, keyed `(value, class, focus g_id)`) collapses repeated checks — inserting 100 records that all reference `ex:illinois` performs a single membership lookup. The engine is built fresh per transaction (`validate_view_with_shacl`) and shared across all focus nodes, so the memo is scoped to exactly one validation pass. Cache hits skip the range scan **and** its fuel charge, so per-transaction fuel depends on intra-transaction value repetition.
 
+**Cross-ledger value-sets.** When `f:shapesSource` is cross-ledger (`f:ledger`), the controlled vocabulary lives in the *model ledger* M alongside the shapes. Because M's ABox (`ex:illinois a ex:USState`) is *not* carried in the shapes wire (which projects only SHACL predicates + `rdf:list` internals), membership is resolved by **querying M live**: `stage_with_config_shacl` opens M at the resolved `t` (`load_graph_db_at_t`) and threads a `CrossLedgerMembership { model_db, data_ns_map }` down to `validate_class_constraint`. On a local miss, `value_conforms_cross_ledger` decodes the value/class Sids to IRIs via D's staged namespace map (`data_ns_map` — the base snapshot alone can't decode namespaces staged this txn), re-encodes them against M (whose split mode may differ), then does the `rdf:type` + `subClassOf` lookup in M's term space. Well-known predicates (`rdf:type`, `rdfs:subClassOf`) share global namespace codes, so only the user IRIs are translated. The per-txn memo covers cross-ledger verdicts too. M is pinned at the resolved `t` (latest at tx time), consistent with cross-ledger shapes.
+
 Scope limits (as of this writing):
-- **Same-ledger only.** Cross-ledger value-sets aren't wired — the cross-ledger shapes wire projects only SHACL predicates, not `rdf:type`/`subClassOf`. The unused `cross_ledger/schema_materializer.rs` (`ArtifactKind::Schema`) is the hook if that's ever needed.
-- **Top-level property shapes only.** `sh:class` reached via a referenced/nested shape (`sh:and`/`or`/`xone`/`node` referencing a shape by id) passes `None` for the context and keeps the legacy data-graph lookup.
+- **Top-level property shapes only.** `sh:class` reached via a referenced/nested shape (`sh:and`/`or`/`xone`/`node` referencing a shape by id) passes `None` for the context and keeps the legacy data-graph lookup (no vocabulary union, no cross-ledger, no memo).
+- **`f:atT` / trust dimensions** on the source are still rejected globally, so a cross-ledger value-set tracks M's latest committed state.
 
 ### RDFS subclass fallback (`is_subclass_of`)
 
@@ -286,8 +288,7 @@ This is how we guard against tests that pass trivially but don't actually exerci
 - **`sh:uniqueLang`, `sh:languageIn`** — parsed but not evaluated. Needs language-tag metadata on flakes, which isn't yet threaded through the validation path.
 - **`sh:qualifiedValueShape` (+ `sh:qualifiedMinCount` / `sh:qualifiedMaxCount`)** — parsed but not evaluated. Needs recursive nested-shape counting.
 - **Cross-transaction shape cache** — every call to `from_dbs_with_overlay` recompiles from scratch. `ShaclCacheKey` has a `schema_epoch` field that's ready to drive a shared `Arc<ShaclCache>` cache on the connection, but nothing populates it yet. Low priority until perf regressions are observed.
-- **Cross-ledger `sh:class` value-sets** — value membership is same-ledger only; a value-set defined in a different ledger isn't consulted (see the `sh:class` scope-limits note above).
-- **`sh:class` in referenced/nested shapes** — value-membership context (vocabulary graphs + per-txn memo) isn't threaded through the `sh:and`/`or`/`xone`/`node` referenced-shape path; those keep the legacy data-graph lookup.
+- **`sh:class` in referenced/nested shapes** — value-membership context (vocabulary graphs, cross-ledger model, per-txn memo) isn't threaded through the `sh:and`/`or`/`xone`/`node` referenced-shape path; those keep the legacy data-graph lookup.
 
 ## Where to look in the code
 

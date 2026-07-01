@@ -467,6 +467,7 @@ impl Fluree {
                         // construct; commit replay carries no
                         // `opts` payload.
                         inline_shape_bundle: None,
+                        cross_ledger_membership: None,
                     },
                 )
                 .await

@@ -276,6 +276,14 @@ pub(crate) struct StagedShaclContext<'a> {
     /// additively. Inline shapes do not persist into the ledger.
     pub inline_shape_bundle:
         Option<std::sync::Arc<fluree_db_query::schema_bundle::SchemaBundleFlakes>>,
+
+    /// Live model-ledger membership source for cross-ledger `sh:class`
+    /// value-sets. Present only when `f:shapesSource` is cross-ledger
+    /// (`f:ledger` set). Carries a `GraphDbRef` into M's value-set graph at the
+    /// resolved `t` plus D's staged namespace map (needed to translate D-term
+    /// Sids into M's term space); `validate_class_constraint` consults it on
+    /// demand after a local miss.
+    pub cross_ledger_membership: Option<fluree_db_shacl::CrossLedgerMembership<'a>>,
 }
 
 /// Inspect the data ledger's resolved config and, when
@@ -588,6 +596,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         ctx.tracker,
         per_graph_policy.as_ref(),
         &membership_g_ids,
+        ctx.cross_ledger_membership,
     )
     .await?;
 
@@ -702,6 +711,65 @@ async fn stage_with_config_shacl(
         .map(|(&g_id, iri)| (g_id, ns_registry.sid_for_iri(iri)))
         .collect();
 
+    // Cross-ledger `sh:class` value-sets: when f:shapesSource is cross-ledger,
+    // open the model ledger M live at the resolved t and expose a GraphDbRef
+    // into its value-set graph (the shapes-source graph, where the controlled
+    // vocabulary lives alongside the shapes). `validate_class_constraint`
+    // consults it on demand — memoized — after a local membership miss. The
+    // owned handle and D's namespace map (for term translation) are held across
+    // the validation await below.
+    let cross_ledger_model_db = match cross_ledger_shapes.as_deref() {
+        Some(resolved) => Some(
+            resolve_ctx
+                .fluree
+                .load_graph_db_at_t(&resolved.model_ledger_id, resolved.resolved_t)
+                .await
+                .map_err(|e| {
+                    fluree_db_transact::TransactError::Parse(format!(
+                        "failed to open cross-ledger value-set model {} at t={}: {e}",
+                        resolved.model_ledger_id, resolved.resolved_t
+                    ))
+                })?,
+        ),
+        None => None,
+    };
+    // D's namespace codes → IRI prefixes (base + this transaction's staged
+    // allocations). Needed to decode a staged value Sid to its IRI before
+    // re-encoding against M — the staged base snapshot alone can't decode a
+    // namespace introduced this transaction.
+    let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
+        cross_ledger_model_db.as_ref().map(|_| {
+            ns_registry
+                .all_codes()
+                .into_iter()
+                .filter_map(|code| ns_registry.get_prefix(code).map(|p| (code, p.to_string())))
+                .collect()
+        });
+    let cross_ledger_membership = match (
+        &cross_ledger_model_db,
+        &cross_ledger_data_ns_map,
+        cross_ledger_shapes.as_deref(),
+    ) {
+        (Some(m_db), Some(ns_map), Some(resolved)) => {
+            crate::cross_ledger::resolve_selector_g_id(&m_db.snapshot, &resolved.graph_iri)
+                .map_err(|e| {
+                    fluree_db_transact::TransactError::Parse(format!(
+                        "cross-ledger value-set graph resolution failed: {e}"
+                    ))
+                })?
+                .map(|g_id| fluree_db_shacl::CrossLedgerMembership {
+                    model_db: fluree_db_core::GraphDbRef::new(
+                        &m_db.snapshot,
+                        g_id,
+                        m_db.overlay.as_ref(),
+                        m_db.t,
+                    ),
+                    data_ns_map: ns_map,
+                })
+        }
+        _ => None,
+    };
+
     apply_shacl_policy_to_staged_view(
         &view,
         StagedShaclContext {
@@ -716,6 +784,7 @@ async fn stage_with_config_shacl(
                 }),
             staged_ns: cross_ledger_shapes.as_deref().map(|_| &ns_registry),
             inline_shape_bundle,
+            cross_ledger_membership,
         },
     )
     .await?;
@@ -2311,6 +2380,7 @@ impl crate::Fluree {
                 // today — inline SHACL flows in over the JSON
                 // transaction path. Wireable later if needed.
                 inline_shape_bundle: None,
+                cross_ledger_membership: None,
             },
         )
         .await

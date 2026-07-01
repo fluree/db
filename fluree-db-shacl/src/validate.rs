@@ -39,6 +39,21 @@ type ClassMembershipCache = Mutex<HashMap<(Sid, Sid, GraphId), bool>>;
 /// vocabulary graphs to union into the `rdf:type` / `rdfs:subClassOf` lookup
 /// (the `f:shapesSource` graph[s]) plus the per-transaction memo. `Copy`
 /// because it is just two borrows passed down the validation call tree.
+/// A live cross-ledger membership source for `sh:class`: a handle into the
+/// model ledger M holding the controlled vocabulary, plus the data ledger's
+/// namespace map (code → IRI prefix, including this transaction's staged
+/// allocations) needed to translate D-term Sids into M's term space.
+#[derive(Clone, Copy)]
+pub struct CrossLedgerMembership<'a> {
+    /// `GraphDbRef` into M's value-set graph at the resolved `t`.
+    pub model_db: GraphDbRef<'a>,
+    /// D's namespace codes → IRI prefixes (base + this transaction's staged
+    /// allocations). Used to decode a D-term Sid to its full IRI before
+    /// re-encoding it against M (whose split mode may differ), because the
+    /// staged base snapshot alone can't decode namespaces introduced this txn.
+    pub data_ns_map: &'a HashMap<u16, String>,
+}
+
 #[derive(Clone, Copy)]
 struct ClassMembershipCtx<'a> {
     /// Graphs beyond the focus node's own data graph to consult for membership.
@@ -47,6 +62,10 @@ struct ClassMembershipCtx<'a> {
     membership_g_ids: &'a [GraphId],
     /// Per-transaction memo shared across all focus nodes in one pass.
     cache: &'a ClassMembershipCache,
+    /// Cross-ledger value-set source (model ledger M holding the controlled
+    /// vocabulary), when `f:shapesSource` is cross-ledger. Consulted on demand
+    /// for `sh:class` membership after the local lookup misses.
+    cross_ledger: Option<CrossLedgerMembership<'a>>,
 }
 
 /// SHACL validation engine
@@ -192,6 +211,7 @@ impl ShaclEngine {
         db: GraphDbRef<'_>,
         focus_node: &Sid,
         node_types: &[Sid],
+        cross_ledger: Option<CrossLedgerMembership<'_>>,
     ) -> Result<ValidationReport> {
         let mut results = Vec::new();
 
@@ -254,6 +274,7 @@ impl ShaclEngine {
         let class_ctx = ClassMembershipCtx {
             membership_g_ids: &self.membership_g_ids,
             cache: &self.class_cache,
+            cross_ledger,
         };
         for shape in applicable_shapes {
             if shape.deactivated {
@@ -279,7 +300,7 @@ impl ShaclEngine {
         node_types: &[Sid],
     ) -> Result<ValidationReport> {
         let db = GraphDbRef::new(snapshot, g_id, &NoOverlay, snapshot.t);
-        self.validate_node(db, focus_node, node_types).await
+        self.validate_node(db, focus_node, node_types, None).await
     }
 
     /// Validate all focus nodes targeted by shapes
@@ -292,6 +313,9 @@ impl ShaclEngine {
         let class_ctx = ClassMembershipCtx {
             membership_g_ids: &self.membership_g_ids,
             cache: &self.class_cache,
+            // Full-db validation (`validate_all`) has no cross-ledger model
+            // context; `sh:class` uses the local lookup only.
+            cross_ledger: None,
         };
         for shape in self.cache.all_shapes() {
             if shape.deactivated {
@@ -416,7 +440,7 @@ impl ShaclEngine {
                 .collect();
 
             // Validate this node against applicable shapes
-            let report = self.validate_node(db, subject, &node_types).await?;
+            let report = self.validate_node(db, subject, &node_types, None).await?;
             all_results.extend(report.results);
         }
 
@@ -1528,6 +1552,8 @@ async fn validate_class_constraint(
     // lookup. Empty when no context is threaded (e.g. `sh:class` reached via a
     // referenced shape), which preserves the historical data-graph-only lookup.
     let membership_g_ids: &[GraphId] = class_ctx.map(|c| c.membership_g_ids).unwrap_or(&[]);
+    // Cross-ledger value-set source, if any.
+    let cross_ledger: Option<CrossLedgerMembership<'_>> = class_ctx.and_then(|c| c.cross_ledger);
 
     // Fast-path acceptable set: expected_class + its descendants per the
     // indexed-schema hierarchy. Misses novelty-added subclass relations;
@@ -1573,6 +1599,7 @@ async fn validate_class_constraint(
                 let computed = value_conforms_to_class(
                     db,
                     membership_g_ids,
+                    cross_ledger,
                     value_ref,
                     &hierarchy_accepted,
                     expected_class,
@@ -1602,10 +1629,14 @@ async fn validate_class_constraint(
 
 /// Resolve whether `value_ref` is (transitively) an instance of
 /// `expected_class`, consulting the focus node's data graph unioned with
-/// `membership_g_ids` (the `f:shapesSource` vocabulary graph[s]).
+/// `membership_g_ids` (the `f:shapesSource` vocabulary graph[s]). When a
+/// cross-ledger model handle is present, it is consulted on demand only after
+/// the local lookup misses (so locally-typed values never touch the model
+/// ledger).
 async fn value_conforms_to_class(
     db: GraphDbRef<'_>,
     membership_g_ids: &[GraphId],
+    cross_ledger: Option<CrossLedgerMembership<'_>>,
     value_ref: &Sid,
     hierarchy_accepted: &HashSet<Sid>,
     expected_class: &Sid,
@@ -1649,6 +1680,88 @@ async fn value_conforms_to_class(
     // with the vocabulary graphs) for novelty-added / vocabulary-local relations.
     for t in &value_types {
         if is_subclass_of(db, membership_g_ids, t, expected_class).await? {
+            return Ok(true);
+        }
+    }
+
+    // Cross-ledger fallback: the controlled vocabulary lives in a model ledger.
+    // Only reached when the value isn't typed locally.
+    if let Some(cl) = cross_ledger {
+        return value_conforms_cross_ledger(cl, value_ref, expected_class).await;
+    }
+
+    Ok(false)
+}
+
+/// Decode a data-ledger Sid to its IRI using an explicit namespace-code map.
+///
+/// Mirrors `LedgerSnapshot::decode_sid` but reads from a supplied map so that
+/// namespaces this transaction *staged* (absent from the base snapshot) still
+/// decode. `EMPTY` / `OVERFLOW` codes carry the full IRI as the name.
+fn decode_sid_with_ns_map(ns_map: &HashMap<u16, String>, sid: &Sid) -> Option<String> {
+    use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+    if sid.namespace_code == EMPTY || sid.namespace_code == OVERFLOW {
+        return Some(sid.name.to_string());
+    }
+    ns_map
+        .get(&sid.namespace_code)
+        .map(|prefix| format!("{}{}", prefix, sid.name))
+}
+
+/// Resolve `sh:class` membership against a cross-ledger model ledger `M`.
+///
+/// `value_ref` / `expected_class` are Sids in the data ledger D's term space,
+/// so they are decoded to IRIs against D's (staged) namespace map and
+/// re-encoded against M — which re-splits with its own mode, so differing
+/// namespace-split modes between the ledgers are handled correctly. Well-known
+/// vocab predicates (`rdf:type`, `rdfs:subClassOf`) share global namespace
+/// codes across ledgers, so only the user IRIs need translation. If M has never
+/// seen the value or class IRI, it cannot be a member there.
+async fn value_conforms_cross_ledger(
+    cl: CrossLedgerMembership<'_>,
+    value_ref: &Sid,
+    expected_class: &Sid,
+) -> Result<bool> {
+    let m_db = cl.model_db;
+    // D term -> IRI (via D's staged ns map) -> M term. A missing decode/encode
+    // means the value/class is simply not known to M -> not a member there.
+    let (Some(value_iri), Some(class_iri)) = (
+        decode_sid_with_ns_map(cl.data_ns_map, value_ref),
+        decode_sid_with_ns_map(cl.data_ns_map, expected_class),
+    ) else {
+        return Ok(false);
+    };
+    let (Some(m_value), Some(m_class)) = (
+        m_db.snapshot.encode_iri_strict(&value_iri),
+        m_db.snapshot.encode_iri_strict(&class_iri),
+    ) else {
+        return Ok(false);
+    };
+
+    let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+    let type_flakes = m_db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject_predicate(m_value, rdf_type),
+        )
+        .await?;
+    let m_types: Vec<Sid> = type_flakes
+        .iter()
+        .filter_map(|f| match &f.o {
+            FlakeValue::Ref(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+
+    if m_types.contains(&m_class) {
+        return Ok(true);
+    }
+
+    // Subclass reasoning within M: walk `subClassOf` over M's value-set graph
+    // unioned with M's schema graph (g_id=0).
+    for t in &m_types {
+        if is_subclass_of(m_db, &[m_db.g_id], t, &m_class).await? {
             return Ok(true);
         }
     }
