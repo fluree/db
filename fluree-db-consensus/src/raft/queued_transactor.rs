@@ -35,7 +35,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{CommitReceipt, Fluree};
-use fluree_db_core::ledger_id::{normalize_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
 use fluree_db_core::ContentId;
 use fluree_db_core::ContentKind;
 use fluree_db_transact::CommitOptsRequest;
@@ -321,6 +321,69 @@ impl QueuedTransactor {
             );
         }
     }
+
+    /// Encode `envelope`, write it to the per-ledger content store,
+    /// derive the body-CID from the same envelope bytes, and submit
+    /// `EnqueueCommand` through [`Self::submit_and_await`].
+    ///
+    /// Consolidates the invariants that are otherwise re-derived at
+    /// every per-op `Committer` call site:
+    ///
+    /// - `body_cid` is computed from the same [`QueuedRequest`] whose
+    ///   bytes produced `request_cid`, so the state machine's
+    ///   body-hash dedup stays honest.
+    /// - `applied_at_millis` is sampled once per submission, not once
+    ///   per derived field.
+    /// - `idempotency_cache_key` uses the canonical `name:branch`
+    ///   form via [`format_ledger_id`].
+    /// - `retry_eligible` mirrors `idempotency_key.is_some()`.
+    ///
+    /// Per-op preprocessing (raw-txn upload resolution, per-commit
+    /// CAS uploads, merge target resolution) stays at the call site —
+    /// only the envelope-to-outcome plumbing is shared.
+    async fn enqueue_and_await(
+        &self,
+        ledger_name: String,
+        branch: String,
+        envelope: QueuedRequest,
+        body_kind: BodyKind,
+        idempotency_key: Option<&IdempotencyKey>,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let full_ledger_id = format_ledger_id(&ledger_name, &branch);
+        let ref_key = RefKey::new(&ledger_name, &branch);
+        let idempotency_cache_key =
+            idempotency_key.map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
+
+        let bytes = envelope
+            .to_bytes()
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("QueuedRequest encode failed: {e}"),
+            })?;
+        let request_cid = self
+            .fluree
+            .content_store(&full_ledger_id)
+            .put(ContentKind::Txn, &bytes)
+            .await
+            .map_err(|e| SubmissionError::Execution {
+                status: 500,
+                message: format!("QueuedRequest CAS write failed: {e}"),
+            })?;
+
+        let body_cid = Self::canonical_body_cid(&envelope)?;
+        let retry_eligible = idempotency_cache_key.is_some();
+        let args = QueueSubmission {
+            ledger_id: ledger_name,
+            branch,
+            idempotency: idempotency_cache_key,
+            request_cid,
+            body_cid,
+            body_kind,
+            applied_at_millis: crate::raft::current_millis(),
+        };
+
+        self.submit_and_await(args, ref_key, retry_eligible).await
+    }
 }
 
 /// Internal result shape `submit_and_await` returns to each
@@ -390,11 +453,6 @@ impl Committer for QueuedTransactor {
                 status: 400,
                 message: format!("invalid ledger_id: {e}"),
             })?;
-        let ref_key = RefKey::new(&ledger_name, &branch);
-
-        let idempotency_cache_key = idempotency_key
-            .as_ref()
-            .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
 
         let body_kind = BodyKind::from(&body);
         let mut commit_opts_request = CommitOptsRequest::from(&commit_opts);
@@ -406,35 +464,17 @@ impl Committer for QueuedTransactor {
             tracking,
             governance,
         }));
-        let bytes = envelope
-            .to_bytes()
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest encode failed: {e}"),
-            })?;
-        let request_cid = self
-            .fluree
-            .content_store(&ledger_id)
-            .put(ContentKind::Txn, &bytes)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest CAS write failed: {e}"),
-            })?;
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch,
+                envelope,
+                body_kind,
+                idempotency_key.as_ref(),
+            )
+            .await?;
 
-        let body_cid = Self::canonical_body_cid(&envelope)?;
-        let retry_eligible = idempotency_cache_key.is_some();
-        let args = QueueSubmission {
-            ledger_id: ledger_name,
-            branch,
-            idempotency: idempotency_cache_key,
-            request_cid,
-            body_cid,
-            body_kind,
-            applied_at_millis: crate::raft::current_millis(),
-        };
-
-        match self.submit_and_await(args, ref_key, retry_eligible).await? {
+        match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 transaction_receipt_from(idempotency_key, receipt)
             }
@@ -466,46 +506,21 @@ impl Committer for QueuedTransactor {
             strategy,
         } = request;
 
-        let ref_key = RefKey::new(&ledger_name, &branch);
-        let full_ledger_id = format!("{ledger_name}:{branch}");
-
-        let idempotency_cache_key = idempotency_key
-            .as_ref()
-            .map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
-
         let envelope = QueuedRequest::Revert(QueuedRevert {
             selection,
             strategy,
         });
-        let bytes = envelope
-            .to_bytes()
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest encode failed: {e}"),
-            })?;
-        let request_cid = self
-            .fluree
-            .content_store(&full_ledger_id)
-            .put(ContentKind::Txn, &bytes)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest CAS write failed: {e}"),
-            })?;
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch.clone(),
+                envelope,
+                BodyKind::Revert,
+                idempotency_key.as_ref(),
+            )
+            .await?;
 
-        let body_cid = Self::canonical_body_cid(&envelope)?;
-        let retry_eligible = idempotency_cache_key.is_some();
-        let args = QueueSubmission {
-            ledger_id: ledger_name,
-            branch: branch.clone(),
-            idempotency: idempotency_cache_key,
-            request_cid,
-            body_cid,
-            body_kind: BodyKind::Revert,
-            applied_at_millis: crate::raft::current_millis(),
-        };
-
-        match self.submit_and_await(args, ref_key, retry_eligible).await? {
+        match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 revert_receipt_from(idempotency_key, branch, strategy, receipt)
             }
@@ -562,47 +577,22 @@ impl Committer for QueuedTransactor {
             }
         };
 
-        let ref_key = RefKey::new(&ledger_name, &target_for_queue);
-        let full_ledger_id = format!("{ledger_name}:{target_for_queue}");
-
-        let idempotency_cache_key = idempotency_key
-            .as_ref()
-            .map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
-
         let envelope = QueuedRequest::Merge(QueuedMerge {
             source_branch: source_branch.clone(),
             target_branch,
             strategy,
         });
-        let bytes = envelope
-            .to_bytes()
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest encode failed: {e}"),
-            })?;
-        let request_cid = self
-            .fluree
-            .content_store(&full_ledger_id)
-            .put(ContentKind::Txn, &bytes)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest CAS write failed: {e}"),
-            })?;
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                target_for_queue.clone(),
+                envelope,
+                BodyKind::Merge,
+                idempotency_key.as_ref(),
+            )
+            .await?;
 
-        let body_cid = Self::canonical_body_cid(&envelope)?;
-        let retry_eligible = idempotency_cache_key.is_some();
-        let args = QueueSubmission {
-            ledger_id: ledger_name,
-            branch: target_for_queue.clone(),
-            idempotency: idempotency_cache_key,
-            request_cid,
-            body_cid,
-            body_kind: BodyKind::Merge,
-            applied_at_millis: crate::raft::current_millis(),
-        };
-
-        match self.submit_and_await(args, ref_key, retry_eligible).await? {
+        match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => merge_receipt_from(
                 idempotency_key,
                 source_branch,
@@ -639,43 +629,18 @@ impl Committer for QueuedTransactor {
             strategy,
         } = request;
 
-        let ref_key = RefKey::new(&ledger_name, &branch);
-        let full_ledger_id = format!("{ledger_name}:{branch}");
-
-        let idempotency_cache_key = idempotency_key
-            .as_ref()
-            .map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
-
         let envelope = QueuedRequest::Rebase(QueuedRebase { strategy });
-        let bytes = envelope
-            .to_bytes()
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest encode failed: {e}"),
-            })?;
-        let request_cid = self
-            .fluree
-            .content_store(&full_ledger_id)
-            .put(ContentKind::Txn, &bytes)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest CAS write failed: {e}"),
-            })?;
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch.clone(),
+                envelope,
+                BodyKind::Rebase,
+                idempotency_key.as_ref(),
+            )
+            .await?;
 
-        let body_cid = Self::canonical_body_cid(&envelope)?;
-        let retry_eligible = idempotency_cache_key.is_some();
-        let args = QueueSubmission {
-            ledger_id: ledger_name,
-            branch: branch.clone(),
-            idempotency: idempotency_cache_key,
-            request_cid,
-            body_cid,
-            body_kind: BodyKind::Rebase,
-            applied_at_millis: crate::raft::current_millis(),
-        };
-
-        match self.submit_and_await(args, ref_key, retry_eligible).await? {
+        match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 rebase_receipt_from(idempotency_key, branch, strategy, receipt)
             }
@@ -724,11 +689,6 @@ impl Committer for QueuedTransactor {
                 status: 400,
                 message: format!("invalid ledger_id: {e}"),
             })?;
-        let ref_key = RefKey::new(&ledger_name, &branch);
-
-        let idempotency_cache_key = idempotency_key
-            .as_ref()
-            .map(|k| IdempotencyCacheKey::new(ledger_id.clone(), k.clone()));
 
         // Upload each commit's bytes to the per-ledger content store
         // and record its CID. The envelope carries only the CIDs;
@@ -751,33 +711,17 @@ impl Committer for QueuedTransactor {
             blobs,
             governance,
         }));
-        let bytes = envelope
-            .to_bytes()
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest encode failed: {e}"),
-            })?;
-        let request_cid = content_store
-            .put(ContentKind::Txn, &bytes)
-            .await
-            .map_err(|e| SubmissionError::Execution {
-                status: 500,
-                message: format!("QueuedRequest CAS write failed: {e}"),
-            })?;
+        let outcome = self
+            .enqueue_and_await(
+                ledger_name,
+                branch,
+                envelope,
+                BodyKind::Pushed,
+                idempotency_key.as_ref(),
+            )
+            .await?;
 
-        let body_cid = Self::canonical_body_cid(&envelope)?;
-        let retry_eligible = idempotency_cache_key.is_some();
-        let args = QueueSubmission {
-            ledger_id: ledger_name,
-            branch,
-            idempotency: idempotency_cache_key,
-            request_cid,
-            body_cid,
-            body_kind: BodyKind::Pushed,
-            applied_at_millis: crate::raft::current_millis(),
-        };
-
-        match self.submit_and_await(args, ref_key, retry_eligible).await? {
+        match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
                 push_receipt_from(idempotency_key, ledger_id, receipt)
             }

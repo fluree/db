@@ -43,7 +43,7 @@ members = [
     "fluree-bench-support",
     "fluree-db-consensus",
 ]
-exclude = ["testsuite-sparql"]
+exclude = ["testsuite-sparql", "scripts/local/load"]
 
 [workspace.package]
 version = "4.1.1"
