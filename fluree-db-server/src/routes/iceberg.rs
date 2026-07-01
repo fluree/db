@@ -435,6 +435,81 @@ async fn iceberg_catalog_browse_local(
     .await
 }
 
+/// Request body for `POST /v1/fluree/iceberg/catalog/preview`
+#[derive(Deserialize)]
+pub struct IcebergPreviewRequest {
+    #[serde(flatten)]
+    pub connection: IcebergConnectionRequest,
+    /// Table namespace (e.g. "DW")
+    pub namespace: String,
+    /// Table name (e.g. "DIM_STORE")
+    pub name: String,
+    /// Stats tier: "schema" (Tier-A) or "stats" (Tier-A + Tier-B). Default "schema".
+    pub tier: Option<String>,
+}
+
+/// Preview an Iceberg table's schema (+ optional per-column stats). Read-only.
+///
+/// POST /v1/fluree/iceberg/catalog/preview
+pub async fn iceberg_catalog_preview(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    iceberg_catalog_preview_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_catalog_preview_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    use fluree_db_api::{StatsTier, TableIdentifier};
+
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let req: IcebergPreviewRequest = parse_iceberg_body(request).await?;
+
+    let span = create_request_span(
+        "iceberg:catalog:preview",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&format!("{}.{}", req.namespace, req.name)),
+        None,
+        None,
+    );
+    async move {
+        let conn = build_iceberg_connection(&req.connection)?;
+        let tier = match req.tier.as_deref().map(str::to_lowercase).as_deref() {
+            None | Some("schema") => StatsTier::Schema,
+            Some("stats") => StatsTier::Stats,
+            Some(other) => {
+                return Err(ServerError::bad_request(format!(
+                    "unknown tier '{other}'. Use 'schema' or 'stats'."
+                )));
+            }
+        };
+        let table = TableIdentifier::new(&req.namespace, &req.name);
+
+        let preview = state
+            .fluree
+            .preview_iceberg_table(conn, table, tier)
+            .await
+            .map_err(ServerError::Api)?;
+
+        tracing::info!(
+            status = "success",
+            table = %format!("{}.{}", req.namespace, req.name),
+            columns = preview.schema.columns.len(),
+            "iceberg table previewed"
+        );
+        Ok((StatusCode::OK, Json(preview)))
+    }
+    .instrument(span)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

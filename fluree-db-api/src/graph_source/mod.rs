@@ -128,7 +128,9 @@ pub use config::{CatalogMode, IcebergConnectionConfig, IcebergCreateConfig, Rest
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_catalog::{
-    browse_iceberg_catalog, BrowseDepth, CatalogBrowse, TableIdentifier, TableRef,
+    browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, CatalogBrowse, ColumnInfo,
+    ColumnStats, PartitionFieldInfo, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
+    TableIdentifier, TablePreview, TableRef, TableSchema,
 };
 
 #[cfg(feature = "iceberg")]

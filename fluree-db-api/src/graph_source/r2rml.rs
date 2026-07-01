@@ -764,6 +764,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                         metadata_location,
                         config: std::collections::HashMap::default(),
                         credentials: None,
+                        metadata: None,
                     }
                 } else {
                     debug!(table_location = %table_location, "Direct metadata-location cache miss");
