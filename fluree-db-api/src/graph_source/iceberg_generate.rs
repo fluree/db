@@ -130,7 +130,9 @@ pub struct GenerateR2rmlResponse {
 /// absent, or out-of-`i64`-range) becomes `None` — an unbounded column the
 /// range-containment FK check simply cannot confirm a join for.
 fn json_to_typed_bound(value: Option<&serde_json::Value>) -> Option<TypedBound> {
-    value.and_then(serde_json::Value::as_i64).map(TypedBound::Int)
+    value
+        .and_then(serde_json::Value::as_i64)
+        .map(TypedBound::Int)
 }
 
 /// Map Tier-B [`ColumnStats`] onto the emitter's [`EmitColumnStats`].
@@ -191,7 +193,12 @@ fn build_emit_options(req: &GenerateR2rmlRequest) -> EmitOptions {
     let per_table_overrides = req
         .per_table_overrides
         .iter()
-        .map(|(id, ov)| (TableKey::new(id.namespace.clone(), id.name.clone()), ov.clone()))
+        .map(|(id, ov)| {
+            (
+                TableKey::new(id.namespace.clone(), id.name.clone()),
+                ov.clone(),
+            )
+        })
         .collect();
 
     EmitOptions {
@@ -258,10 +265,7 @@ impl crate::Fluree {
     ///
     /// **Metadata-only and side-effect-free**: no Parquet scan, no graph source
     /// created. `target_model_ledger_id` is RESERVED for PR-4 and ignored here.
-    pub async fn generate_r2rml(
-        &self,
-        req: GenerateR2rmlRequest,
-    ) -> Result<GenerateR2rmlResponse> {
+    pub async fn generate_r2rml(&self, req: GenerateR2rmlRequest) -> Result<GenerateR2rmlResponse> {
         if req.tables.is_empty() {
             return Err(crate::ApiError::config(
                 "generate_r2rml requires at least one table",
@@ -355,7 +359,12 @@ mod tests {
         }
     }
 
-    fn preview(ns: &str, name: &str, ident: Vec<i32>, columns: Vec<ColumnInfo>) -> (TableIdentifier, TablePreview) {
+    fn preview(
+        ns: &str,
+        name: &str,
+        ident: Vec<i32>,
+        columns: Vec<ColumnInfo>,
+    ) -> (TableIdentifier, TablePreview) {
         let schema = TableSchema {
             table: format!("{ns}.{name}"),
             table_uuid: None,
@@ -483,8 +492,18 @@ mod tests {
     #[test]
     fn snapshot_is_pinned_from_first_table() {
         let previews = vec![
-            preview("DW", "DIM_A", vec![1], vec![int_col(1, "A_KEY", true, 1, 100)]),
-            preview("DW", "DIM_B", vec![1], vec![int_col(1, "B_KEY", true, 1, 100)]),
+            preview(
+                "DW",
+                "DIM_A",
+                vec![1],
+                vec![int_col(1, "A_KEY", true, 1, 100)],
+            ),
+            preview(
+                "DW",
+                "DIM_B",
+                vec![1],
+                vec![int_col(1, "B_KEY", true, 1, 100)],
+            ),
         ];
         let ids: Vec<TableIdentifier> = previews.iter().map(|(id, _)| id.clone()).collect();
         let resp = assemble_generate_response(&previews, &base_req(ids, HashMap::new())).unwrap();

@@ -1367,7 +1367,10 @@ fn test_iceberg_create_config_builder() {
         _ => panic!("Expected REST catalog mode"),
     }
     assert!(!config.connection.io.vended_credentials);
-    assert_eq!(config.connection.io.s3_region, Some("us-west-2".to_string()));
+    assert_eq!(
+        config.connection.io.s3_region,
+        Some("us-west-2".to_string())
+    );
     assert_eq!(
         config.connection.io.s3_endpoint,
         Some("http://localhost:9000".to_string())

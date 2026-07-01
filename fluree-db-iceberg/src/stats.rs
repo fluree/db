@@ -107,8 +107,12 @@ fn keep_max(cur: Option<TypedValue>, candidate: TypedValue) -> TypedValue {
 /// decodable). Every scalar column gets an entry, even when the manifests carry
 /// no statistics for it (all-`None`).
 pub fn aggregate_column_stats(data_files: &[DataFile], schema: &Schema) -> TableStatsAggregation {
-    let scalar_fields: Vec<&SchemaField> = schema.fields.iter().filter(|f| !f.is_nested()).collect();
-    let mut accs: HashMap<i32, Acc> = scalar_fields.iter().map(|f| (f.id, Acc::default())).collect();
+    let scalar_fields: Vec<&SchemaField> =
+        schema.fields.iter().filter(|f| !f.is_nested()).collect();
+    let mut accs: HashMap<i32, Acc> = scalar_fields
+        .iter()
+        .map(|f| (f.id, Acc::default()))
+        .collect();
 
     let mut row_count = 0i64;
     let mut total_bytes = 0i64;
@@ -196,7 +200,10 @@ pub fn typed_value_to_json(value: &TypedValue) -> JsonValue {
         TypedValue::Float32(v) => JsonValue::from(f64::from(*v)),
         TypedValue::Float64(v) => JsonValue::from(*v),
         TypedValue::Date(days) => DateTime::from_timestamp(i64::from(*days) * 86_400, 0)
-            .map_or_else(|| JsonValue::from(*days), |dt| JsonValue::from(dt.format("%Y-%m-%d").to_string())),
+            .map_or_else(
+                || JsonValue::from(*days),
+                |dt| JsonValue::from(dt.format("%Y-%m-%d").to_string()),
+            ),
         TypedValue::Timestamp(micros) | TypedValue::TimestampTz(micros) => {
             DateTime::from_timestamp_micros(*micros).map_or_else(
                 || JsonValue::from(*micros),
@@ -412,10 +419,10 @@ mod tests {
         let id = &agg.columns[&1];
         assert_eq!(id.null_count, Some(10)); // 3 + 7
         assert_eq!(id.value_count, Some(300)); // 100 + 200
-        // null_fraction = 10 / 300
+                                               // null_fraction = 10 / 300
         assert!((id.null_fraction.unwrap() - (10.0 / 300.0)).abs() < 1e-9);
         assert_eq!(id.on_disk_bytes, Some(3000)); // 1000 + 2000
-        // Typed min/max across files: min(10,5)=5, max(50,80)=80.
+                                                  // Typed min/max across files: min(10,5)=5, max(50,80)=80.
         assert_eq!(id.min, Some(serde_json::json!(5)));
         assert_eq!(id.max, Some(serde_json::json!(80)));
         // distinct_count is always None.
@@ -445,7 +452,10 @@ mod tests {
 
     #[test]
     fn typed_value_json_rendering() {
-        assert_eq!(typed_value_to_json(&TypedValue::Int64(42)), serde_json::json!(42));
+        assert_eq!(
+            typed_value_to_json(&TypedValue::Int64(42)),
+            serde_json::json!(42)
+        );
         assert_eq!(
             typed_value_to_json(&TypedValue::Boolean(true)),
             serde_json::json!(true)
@@ -590,20 +600,53 @@ mod tests {
         let schema = AvroSchema::parse_str(MANIFEST_SCHEMA).unwrap();
         let mut writer = Writer::new(&schema, Vec::new());
         let data_file = AvroValue::Record(vec![
-            ("file_path".to_string(), AvroValue::String(data_file_path.to_string())),
-            ("file_format".to_string(), AvroValue::String("PARQUET".to_string())),
+            (
+                "file_path".to_string(),
+                AvroValue::String(data_file_path.to_string()),
+            ),
+            (
+                "file_format".to_string(),
+                AvroValue::String("PARQUET".to_string()),
+            ),
             ("record_count".to_string(), AvroValue::Long(1000)),
             ("file_size_in_bytes".to_string(), AvroValue::Long(204_800)),
-            ("column_sizes".to_string(), AvroValue::Union(1, Box::new(long_map(&[(1, 4000), (2, 8000)])))),
-            ("value_counts".to_string(), AvroValue::Union(1, Box::new(long_map(&[(1, 1000), (2, 1000)])))),
-            ("null_value_counts".to_string(), AvroValue::Union(1, Box::new(long_map(&[(1, 0), (2, 5)])))),
-            ("nan_value_counts".to_string(), AvroValue::Union(0, Box::new(AvroValue::Null))),
-            ("lower_bounds".to_string(), AvroValue::Union(1, Box::new(bytes_map(&[(1, encode_value(&TypedValue::Int64(1)))])))),
-            ("upper_bounds".to_string(), AvroValue::Union(1, Box::new(bytes_map(&[(1, encode_value(&TypedValue::Int64(999)))])))),
+            (
+                "column_sizes".to_string(),
+                AvroValue::Union(1, Box::new(long_map(&[(1, 4000), (2, 8000)]))),
+            ),
+            (
+                "value_counts".to_string(),
+                AvroValue::Union(1, Box::new(long_map(&[(1, 1000), (2, 1000)]))),
+            ),
+            (
+                "null_value_counts".to_string(),
+                AvroValue::Union(1, Box::new(long_map(&[(1, 0), (2, 5)]))),
+            ),
+            (
+                "nan_value_counts".to_string(),
+                AvroValue::Union(0, Box::new(AvroValue::Null)),
+            ),
+            (
+                "lower_bounds".to_string(),
+                AvroValue::Union(
+                    1,
+                    Box::new(bytes_map(&[(1, encode_value(&TypedValue::Int64(1)))])),
+                ),
+            ),
+            (
+                "upper_bounds".to_string(),
+                AvroValue::Union(
+                    1,
+                    Box::new(bytes_map(&[(1, encode_value(&TypedValue::Int64(999)))])),
+                ),
+            ),
         ]);
         let entry = AvroValue::Record(vec![
             ("status".to_string(), AvroValue::Int(1)),
-            ("snapshot_id".to_string(), AvroValue::Union(1, Box::new(AvroValue::Long(100)))),
+            (
+                "snapshot_id".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::Long(100))),
+            ),
             ("data_file".to_string(), data_file),
         ]);
         writer.append_value_ref(&entry).unwrap();

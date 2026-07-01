@@ -491,16 +491,23 @@ pub(crate) fn table_schema_from_metadata(
         },
     };
 
-    let (row_count, data_file_count, total_bytes) = current_snapshot.map_or((None, None, None), |s| {
-        (s.total_records(), s.total_data_files(), s.total_files_size())
-    });
+    let (row_count, data_file_count, total_bytes) =
+        current_snapshot.map_or((None, None, None), |s| {
+            (
+                s.total_records(),
+                s.total_data_files(),
+                s.total_files_size(),
+            )
+        });
 
-    let partition_spec = metadata.default_partition_spec().map_or_else(Vec::new, |spec| {
-        spec.fields
-            .iter()
-            .map(|pf| partition_field_info(pf, schema))
-            .collect()
-    });
+    let partition_spec = metadata
+        .default_partition_spec()
+        .map_or_else(Vec::new, |spec| {
+            spec.fields
+                .iter()
+                .map(|pf| partition_field_info(pf, schema))
+                .collect()
+        });
 
     let sort_order = metadata
         .sort_orders
@@ -619,7 +626,8 @@ pub async fn preview_iceberg_table(
                 }
                 None => {
                     warnings.push(
-                        "Table has no current snapshot; no column statistics available.".to_string(),
+                        "Table has no current snapshot; no column statistics available."
+                            .to_string(),
                     );
                     (0, false)
                 }
@@ -824,7 +832,10 @@ mod tests {
         assert_eq!(schema.sort_order[0].direction, "asc");
         assert_eq!(schema.sort_order[0].null_order, "nulls-first");
 
-        assert_eq!(schema.properties.get("owner").map(String::as_str), Some("analytics"));
+        assert_eq!(
+            schema.properties.get("owner").map(String::as_str),
+            Some("analytics")
+        );
 
         // Column type mapping: field_type + xsd_type per FieldType.
         let key = column(&schema, "SALE_KEY");
@@ -844,7 +855,10 @@ mod tests {
         assert_eq!(amount.iceberg_type, "decimal(18, 2)");
         assert_eq!(
             amount.field_type,
-            Some(FieldType::Decimal { precision: 18, scale: 2 })
+            Some(FieldType::Decimal {
+                precision: 18,
+                scale: 2
+            })
         );
         assert_eq!(amount.xsd_type.as_deref(), Some("xsd:decimal"));
 
@@ -882,15 +896,22 @@ mod tests {
         let back: ColumnInfo =
             serde_json::from_value(serde_json::to_value(column(&schema, "AMOUNT")).unwrap())
                 .unwrap();
-        assert_eq!(back.field_type, Some(FieldType::Decimal { precision: 18, scale: 2 }));
+        assert_eq!(
+            back.field_type,
+            Some(FieldType::Decimal {
+                precision: 18,
+                scale: 2
+            })
+        );
     }
 
     #[tokio::test]
     async fn preview_direct_mode_errors() {
         let conn = IcebergConnectionConfig::direct("s3://bucket/warehouse/ns/table");
-        let err = preview_iceberg_table(conn, TableIdentifier::new("ns", "table"), StatsTier::Schema)
-            .await
-            .expect_err("Direct mode must not be previewable");
+        let err =
+            preview_iceberg_table(conn, TableIdentifier::new("ns", "table"), StatsTier::Schema)
+                .await
+                .expect_err("Direct mode must not be previewable");
         assert!(err.to_string().contains("Direct catalog mode"));
     }
 
@@ -901,7 +922,10 @@ mod tests {
     #[test]
     fn xsd_map_matches_emitter() {
         assert_eq!(xsd_datatype(FieldType::Bytes, true), Some("xsd:hexBinary"));
-        assert_eq!(xsd_datatype(FieldType::Timestamp, true), Some("xsd:dateTime"));
+        assert_eq!(
+            xsd_datatype(FieldType::Timestamp, true),
+            Some("xsd:dateTime")
+        );
         assert_eq!(
             xsd_datatype(FieldType::TimestampTz, true),
             Some("xsd:dateTime")
@@ -914,7 +938,13 @@ mod tests {
         assert_eq!(xsd_datatype(FieldType::Int32, true), Some("xsd:integer"));
         assert_eq!(xsd_datatype(FieldType::Date, true), Some("xsd:date"));
         assert_eq!(
-            xsd_datatype(FieldType::Decimal { precision: 18, scale: 2 }, true),
+            xsd_datatype(
+                FieldType::Decimal {
+                    precision: 18,
+                    scale: 2
+                },
+                true
+            ),
             Some("xsd:decimal")
         );
     }

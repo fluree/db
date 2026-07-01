@@ -130,7 +130,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     // create no graph source, so they sit in the reads block (no leader-forward).
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_reads = v1_admin_protected_reads
-        .route("/iceberg/catalog/browse", post(iceberg::iceberg_catalog_browse))
+        .route(
+            "/iceberg/catalog/browse",
+            post(iceberg::iceberg_catalog_browse),
+        )
         .route(
             "/iceberg/catalog/preview",
             post(iceberg::iceberg_catalog_preview),
