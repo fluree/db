@@ -760,3 +760,65 @@ async fn cross_graph_wildcard_refinement_divergent_ns() {
         "wildcard refinement on a divergent-namespace ref did not apply cross-ledger: {value:#}"
     );
 }
+
+/// BUG (#1295 root path) — a hydration ROOT whose subject lives in a non-primary
+/// ledger, bound by a home-graph WHERE pattern (so it routes to the home ledger
+/// correctly — reserved/shared-code predicates hydrate), STILL drops a
+/// divergent-namespace predicate from its EXPLICIT projection.
+///
+/// This is the same per-predicate-Sid drop as the nested #1295 mechanism, one
+/// level up: the projection level is lowered once against the primary (catalog)
+/// dict, so every predicate Sid carries catalog's namespace codes. When the root
+/// (`p:ada`) is hydrated against the people view, `p:fullName`'s Sid carries the
+/// wrong code and misses the people index — while `schema:name` (shared code)
+/// survives, masking the loss. The nested fix lives in `expand_ref`; this root
+/// path routes through `format_hydration_column`, which now rebinds the level
+/// into the routed view's dict when the root is non-primary.
+///
+/// Distinct from `cross_graph_root_bound_as_object_hydrates_in_home_ledger`
+/// (Finding B): there the whole subject comes back `@id`-only because routing
+/// itself fails; here routing succeeds (`schema:name` is present) and only the
+/// divergent-namespace predicate is dropped.
+#[tokio::test]
+async fn cross_graph_root_projection_divergent_predicate() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_divergent_predicate_ref_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "schema": "http://schema.org/",
+            "cat": "http://catalog.example/",
+            "p": "http://people.example/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/catalog:main", "test/people:main"],
+        // Root ?person is bound in its HOME (people) graph, but the projection is
+        // lowered against the primary (catalog) dict.
+        "select": { "?person": ["@id", "schema:name", "p:fullName"] },
+        "where": { "@id": "?person", "type": "schema:Person" }
+    });
+
+    let value = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("execute_formatted should not error");
+
+    let person = value
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("one person");
+    assert_eq!(person.get("@id").and_then(|v| v.as_str()), Some("p:ada"));
+    // Shared-code predicate survives even pre-fix (routing succeeds):
+    assert_eq!(
+        person.get("schema:name").and_then(|v| v.as_str()),
+        Some("Ada Lovelace"),
+    );
+    // THE REGRESSION: divergent-namespace predicate on the ROOT must be present.
+    assert_eq!(
+        person.get("p:fullName").and_then(|v| v.as_str()),
+        Some("Augusta Ada King"),
+        "cross-ledger root projection dropped a non-primary-namespace predicate: {value:#}"
+    );
+}

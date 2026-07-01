@@ -492,12 +492,46 @@ async fn format_hydration_column(
     };
 
     let formatter = set.pick(root.ledger_alias.as_ref());
+
+    // Re-encode the projection level's predicate Sids into the routed view's
+    // namespace dict when the root subject lives in a non-primary ledger
+    // (issue #1295, root path). The level is lowered once against the primary
+    // dict, so predicate Sids carry the primary ledger's namespace codes; a
+    // root routed to a non-primary view would otherwise miss that ledger's
+    // index for any divergent-code predicate (reserved-namespace predicates
+    // survive only because their codes are stable). A root that stays on the
+    // primary view needs no rebind — keep the original level (no allocation,
+    // byte-identical output). This mirrors the nested `expand_ref` rebind and
+    // shares its memo (per target view + level address). The lowering/decode
+    // source is the primary view's compactor, never the routed view's.
+    let rebound_arc;
+    let level = if formatter.active_idx == set.primary {
+        &spec.level
+    } else {
+        let key = (
+            formatter.active_idx,
+            &spec.level as *const NestedSelectSpec as usize,
+        );
+        rebound_arc = cache
+            .rebinds
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(rebind_level_to_view(
+                    &spec.level,
+                    set.primary().compactor,
+                    formatter.db.snapshot,
+                ))
+            })
+            .clone();
+        &*rebound_arc
+    };
+
     let mut visited = HashSet::new();
     formatter
         .format_subject(
             &root.sid,
             root.iri,
-            &spec.level,
+            level,
             DepthBudget::root(spec.depth),
             &mut visited,
             cache,
