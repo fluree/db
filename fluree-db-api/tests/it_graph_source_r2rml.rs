@@ -3184,6 +3184,52 @@ async fn guard_class_star_scans_only_store_once() {
     assert_eq!(rows, 2, "two store rows expected");
 }
 
+/// A constant-object triple (`?s ex:storeId "STORE-2"`) fuses into the same-subject
+/// var-object star (`?s ex:name ?name`) as an existence constraint: dw.store is
+/// scanned exactly once (no separate scan + self-join), and only the row whose
+/// storeId equals the constant survives.
+#[tokio::test]
+async fn guard_constant_object_fuses_into_star_single_scan() {
+    let provider = CountingProvider::edw();
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let name = vars.get_or_insert("?name");
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+    let p_store_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+
+    // ?s ex:name ?name ; ex:storeId "STORE-2"
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_name),
+            Term::Var(name),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(p_store_id),
+            Term::Value(FlakeValue::String("STORE-2".to_string())),
+        )),
+    ];
+    let (counts, rows) = run_edw_guard(&provider, &ledger, &vars, inner, vec![s, name]).await;
+
+    assert_eq!(
+        counts.get("dw.store").copied(),
+        Some(1),
+        "constant-object storeId must fuse into the name star → one scan, got {counts:?}"
+    );
+    assert_eq!(
+        rows, 1,
+        "only STORE-2 satisfies the fused constant-object constraint"
+    );
+}
+
 /// `?s a ex:Store` alone must scan ONLY dw.store once (subject-only): no POMs,
 /// no RefObjectMap parent, and the class filter keeps it off Employee/Geography.
 #[tokio::test]

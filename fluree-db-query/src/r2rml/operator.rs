@@ -1266,7 +1266,7 @@ fn materialize_batch(
             }
         };
 
-        if !pattern.star_bindings.is_empty() {
+        if !pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty() {
             let mut members: Vec<(VarId, &str)> = Vec::new();
             if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
             {
@@ -1296,6 +1296,36 @@ fn materialize_batch(
                     break;
                 }
                 binding_lists.push((*var, vals));
+            }
+
+            // Fused constant-object constraints: the row survives only when each
+            // predicate produces at least one object equal to its constant. This
+            // is an existence filter (produces no var), enforced by the operator.
+            if row_ok {
+                for (pred, required) in &pattern.star_constraints {
+                    let mut matched = false;
+                    for pom in triples_map
+                        .predicate_object_maps
+                        .iter()
+                        .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
+                    {
+                        if let Some(t) = materialize_pom_object(
+                            pom,
+                            iceberg_batch,
+                            table_row_idx,
+                            parent_lookups,
+                        )? {
+                            if rdf_term_eq_object_constant(&t, required) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !matched {
+                        row_ok = false;
+                        break;
+                    }
+                }
             }
             if !row_ok {
                 continue;

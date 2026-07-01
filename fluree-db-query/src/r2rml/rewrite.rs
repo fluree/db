@@ -94,7 +94,7 @@ pub fn rewrite_patterns_for_r2rml(
                     // Only variable-subject patterns are grouped by shared
                     // subject; a bound-subject pattern (subject_var = None) is
                     // never star/class eligible and falls to standalone emit.
-                    if let Some(sv) = star_eligible_subject(&r2rml_pattern) {
+                    if let Some(sv) = star_member_subject(&r2rml_pattern) {
                         match star_groups.iter_mut().find(|(s, _)| *s == sv) {
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
@@ -161,37 +161,52 @@ pub fn rewrite_patterns_for_r2rml(
     // A same-subject `rdf:type` is fused into the base by setting its
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
-    for (subject, mut members) in star_groups {
-        if members.len() == 1 {
-            let mut base = members.pop().unwrap();
-            fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
-            result_patterns.push(Pattern::R2rml(base));
-            continue;
-        }
-        let mut seen_obj = HashSet::new();
-        let distinct = members
-            .iter()
-            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
-        if !distinct {
-            // Shared object var implies a self-join constraint; keep separate.
-            // Leave any same-subject class pattern in `class_groups` so it is
-            // emitted as a subject-only scan below.
-            for m in members {
+    for (subject, members) in star_groups {
+        // Split into object-var members (produce bindings) and constant-object
+        // members (equality existence constraints fused into the same scan).
+        let (mut var_members, const_members): (Vec<R2rmlPattern>, Vec<R2rmlPattern>) =
+            members.into_iter().partition(|m| m.object_var.is_some());
+
+        if var_members.is_empty() {
+            // No var-object base to fuse the constraints onto: each constant-object
+            // pattern is already correct as its own standalone scan.
+            for m in const_members {
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
         }
-        let mut base = members.remove(0);
+
+        // Var-object members need distinct object vars to fuse; a shared object
+        // var is a self-join constraint, not a star. If not distinct, keep every
+        // member separate (var and constant alike).
+        let mut seen_obj = HashSet::new();
+        let distinct = var_members
+            .iter()
+            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
+        if !distinct {
+            for m in var_members.into_iter().chain(const_members) {
+                result_patterns.push(Pattern::R2rml(m));
+            }
+            continue;
+        }
+
+        let star_constraints: Vec<(String, ObjectConstant)> = const_members
+            .into_iter()
+            .filter_map(|m| Some((m.predicate_filter?, m.object_constant?)))
+            .collect();
+
+        let mut base = var_members.remove(0);
         fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
-        base.star_bindings = members
+        base.star_bindings = var_members
             .into_iter()
             .map(|m| {
                 (
-                    m.predicate_filter.expect("star-eligible has predicate"),
-                    m.object_var.expect("star-eligible has object var"),
+                    m.predicate_filter.expect("star member has predicate"),
+                    m.object_var.expect("var member has object var"),
                 )
             })
             .collect();
+        base.star_constraints = star_constraints;
         result_patterns.push(Pattern::R2rml(base));
     }
 
@@ -449,18 +464,24 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     }
 }
 
-/// The subject var of a regular-predicate R2RML pattern that can join via the
-/// subject: variable subject, constant predicate, a fresh object var distinct
-/// from the subject, no class/TM filter. `None` (not eligible) for bound-subject
-/// patterns. These are the patterns that can be merged into a same-subject star.
-fn star_eligible_subject(p: &R2rmlPattern) -> Option<VarId> {
+/// The subject var of a regular-predicate R2RML pattern that can join a
+/// same-subject star: variable subject, constant predicate, no class/TM filter,
+/// and either a fresh object var (distinct from the subject) or a constant-object
+/// equality. `None` (not eligible) for bound-subject patterns. Constant-object
+/// members become existence constraints on the star; var-object members produce
+/// bindings.
+fn star_member_subject(p: &R2rmlPattern) -> Option<VarId> {
     let subject_var = p.subject_var?;
-    let eligible = p.predicate_filter.is_some()
+    let base_ok = p.predicate_filter.is_some()
         && p.class_filter.is_none()
         && p.triples_map_iri.is_none()
-        && p.star_bindings.is_empty()
-        && p.object_var.is_some_and(|obj| obj != subject_var);
-    eligible.then_some(subject_var)
+        && p.star_bindings.is_empty();
+    if !base_ok {
+        return None;
+    }
+    let var_object = p.object_var.is_some_and(|obj| obj != subject_var);
+    let const_object = p.object_var.is_none() && p.object_constant.is_some();
+    (var_object || const_object).then_some(subject_var)
 }
 
 /// The subject var of a pure `rdf:type` pattern (`?s a ex:Class`): variable

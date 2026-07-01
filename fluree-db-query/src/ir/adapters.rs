@@ -646,6 +646,14 @@ pub struct R2rmlPattern {
     /// object var, instead of producing one pattern per triple and joining them.
     pub star_bindings: Vec<(String, VarId)>,
 
+    /// Same-subject star: additional `(predicate IRI, required constant)` equality
+    /// constraints checked in the SAME table scan, fused from constant-object
+    /// triples (`?s <pred> <const>`) that share `subject_var` with a star base.
+    /// A row survives only when, for every entry, the predicate produces at least
+    /// one object equal to the constant — an existence filter that produces no
+    /// variable, avoiding a separate scan + self-join.
+    pub star_constraints: Vec<(String, crate::r2rml::ObjectConstant)>,
+
     /// A scan-local FILTER fully consumed into this scan by the planner: every
     /// variable it references is produced by this pattern alone. The operator
     /// applies it to its output rows (same evaluator as the in-engine FILTER, so
@@ -679,6 +687,7 @@ impl R2rmlPattern {
             predicate_filter: None,
             class_filter: None,
             star_bindings: Vec::new(),
+            star_constraints: Vec::new(),
             scan_filters: Vec::new(),
             consumed_filter: None,
             object_constant: None,
@@ -703,6 +712,7 @@ impl R2rmlPattern {
             predicate_filter: None,
             class_filter: None,
             star_bindings: Vec::new(),
+            star_constraints: Vec::new(),
             scan_filters: Vec::new(),
             consumed_filter: None,
             object_constant: None,
