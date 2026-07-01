@@ -16,9 +16,6 @@ aws = [
     "dep:aws-config",
     "fluree-db-core/native",
 ]
-# Arrow columnar output (OFF by default for Lambda size)
-arrow = ["dep:arrow", "parquet/arrow"]
-
 [dependencies]
 # Core dependencies
 fluree-db-core = { path = "../fluree-db-core" }
@@ -61,7 +58,7 @@ bytes.workspace = true
 apache-avro.workspace = true
 
 # Parquet for data files (metadata + range-read column access)
-parquet = { workspace = true }
+parquet = { workspace = true, features = ["arrow"] }
 
 # LRU cache for Parquet footer caching
 lru.workspace = true
@@ -75,7 +72,10 @@ aws-sdk-s3 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 
 # Optional: Arrow columnar output
-arrow = { version = "54", optional = true }
+# Arrow columnar reader (the single Iceberg decode path). `default-features =
+# false` drops the unused csv/json readers (compile-time only; LTO already
+# strips them from the binary).
+arrow = { version = "54", default-features = false }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

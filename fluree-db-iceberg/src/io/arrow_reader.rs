@@ -1,22 +1,19 @@
-//! Arrow-based Parquet decode path.
-//!
-//! An alternative to the row-based `RowIter` decode in [`super::send_parquet`],
-//! compiled in when the `arrow` feature is enabled. It uses
-//! `ParquetRecordBatchReaderBuilder` for native columnar decode with:
+//! Arrow-based Parquet decode path — the single decode path for the Send reader
+//! ([`super::send_parquet`]). It uses `ParquetRecordBatchReaderBuilder` for
+//! native columnar decode with:
 //!
 //! - **projection** via `ProjectionMask` (only the requested leaves are read),
 //! - **row-group pruning** via `with_row_groups` (skipped groups' column chunks
-//!   are never fetched — the same statistic-based pruning as the RowIter path),
+//!   are never fetched),
 //! - **exact row filtering** by evaluating the pushed predicate on each decoded
 //!   `RecordBatch` and dropping non-matching rows with `filter_record_batch`.
 //!   Arrow's `with_row_filter` is deliberately NOT used: its RowSelection calls
 //!   `skip_records`, which panics in parquet-rs 54 on Snowflake's
 //!   DELTA_BINARY_PACKED integer columns.
 //!
-//! To stay byte-identical to the RowIter path, each Arrow cell is converted to
-//! the same intermediate [`ColumnValue`] the row path produces, then assembled
-//! by the shared [`build_columns_from_values`]. Only the "Arrow cell →
-//! `ColumnValue`" step is new; column construction is unchanged.
+//! Each Arrow cell is converted to the intermediate [`ColumnValue`] and
+//! assembled by the shared [`build_columns_from_values`], so the output
+//! `ColumnBatch` format matches the rest of the crate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,8 +58,7 @@ const ARROW_BATCH_ROWS: usize = 8192;
 /// `ChunkReader`, so the same fetched bytes / on-demand ranges are reused.
 ///
 /// The batch schema and projected column indices are recomputed from the
-/// reader's own footer (identical to the RowIter path, which derives them from
-/// the same file), so callers only pass the projection request.
+/// reader's own footer, so callers only pass the projection request.
 pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     chunk_reader: R,
     projected_field_ids: &[i32],
@@ -75,7 +71,7 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     let metadata = builder.metadata().clone();
     let md: &ParquetMetaData = &metadata;
 
-    // Same schema/projection resolution as the RowIter path.
+    // Resolve the batch schema and projected column indices from the footer.
     let (batch_schema, column_indices) = if let Some(schema) = iceberg_schema {
         build_batch_schema_with_iceberg(md, schema, projected_field_ids)?
     } else {
@@ -189,8 +185,8 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
 }
 
 /// Convert a single Arrow array cell to the intermediate [`ColumnValue`],
-/// mirroring `convert_field_to_column_value` for the RowIter path so downstream
-/// column assembly is identical. Returns `None` for nulls and unsupported types.
+/// producing the intermediate `ColumnValue` for the shared column assembly.
+/// Returns `None` for nulls and unsupported types.
 fn arrow_cell_to_column_value(
     array: &dyn Array,
     row: usize,
