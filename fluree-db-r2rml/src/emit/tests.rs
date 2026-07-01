@@ -14,7 +14,7 @@ use fluree_db_tabular::FieldType;
 use crate::emit::diagnostic::DiagCode;
 use crate::emit::fixtures::enterprise_dw_tables;
 use crate::emit::input::{EmitColumn, EmitColumnStats, EmitTableSchema, TypedBound};
-use crate::emit::{emit_r2rml, EmitOptions, EmitOutput};
+use crate::emit::{emit_r2rml, EmitOptions, EmitOutput, TableKey, TableOverride};
 
 // =============================================================================
 // Synthetic-input helpers (for focused FK-heuristic unit tests)
@@ -798,6 +798,229 @@ fn session_id_is_the_only_extra_unresolved_candidate() {
         .collect();
     expected.insert(("DW.FACT_WEB_EVENT".to_string(), "SESSION_ID".to_string()));
     assert_eq!(unresolved, expected);
+}
+
+// =============================================================================
+// Per-table overrides (primary_key / class_name)
+// =============================================================================
+
+/// `EmitOptions::default()` plus a single `{namespace,name}` override entry.
+fn opts_with_override(namespace: &str, name: &str, ov: TableOverride) -> EmitOptions {
+    let mut opts = EmitOptions::default();
+    opts.per_table_overrides
+        .insert(TableKey::new(namespace, name), ov);
+    opts
+}
+
+#[test]
+fn override_primary_key_replaces_identifier_field_ids() {
+    // identifier_field_ids=[1] would key on WIDGET_KEY with no unverified diag;
+    // the override REPLACES it with ALT_KEY and always earns SubjectKeyUnverified.
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, true),
+            ik(2, "ALT_KEY", 1, 100, true),
+            sc(3, "NAME", FieldType::String),
+        ],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "DIM_WIDGET",
+        TableOverride {
+            primary_key: Some("ALT_KEY".to_string()),
+            class_name: None,
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+    let tm = &out.structured.table_mappings[0];
+
+    // Subject keys on the override column, not the identifier_field_ids column.
+    assert!(
+        tm.subject_template.ends_with("/{ALT_KEY}"),
+        "subject template {} must key on the override column",
+        tm.subject_template
+    );
+    assert!(!tm.subject_template.contains("{WIDGET_KEY}"));
+    // The override column is the isSubjectId literal.
+    let pk = tm
+        .columns
+        .iter()
+        .find(|c| c.column_name == "ALT_KEY")
+        .unwrap();
+    assert!(pk.is_subject_id);
+    assert!(tm
+        .columns
+        .iter()
+        .find(|c| c.column_name == "WIDGET_KEY")
+        .is_some_and(|c| !c.is_subject_id));
+
+    // An override PK ALWAYS attaches SubjectKeyUnverified, and never NoSafeSubjectKey.
+    assert_eq!(
+        diag_cols(&out, DiagCode::SubjectKeyUnverified),
+        BTreeSet::from([("DW.DIM_WIDGET".to_string(), "ALT_KEY".to_string())])
+    );
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
+}
+
+#[test]
+fn override_primary_key_failing_null_gate_yields_no_safe_subject_key() {
+    // The override column exists but is nullable (required=false, null_fraction
+    // unknown) → fails the required / null_fraction==0 gate → NoSafeSubjectKey,
+    // no subject, and NOT SubjectKeyUnverified.
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, true),
+            ik(2, "NULLABLE_COL", 1, 100, false),
+        ],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "DIM_WIDGET",
+        TableOverride {
+            primary_key: Some("NULLABLE_COL".to_string()),
+            class_name: None,
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+    let tm = &out.structured.table_mappings[0];
+
+    assert!(
+        tm.subject_template.is_empty(),
+        "a failing override gate must emit no subject"
+    );
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+        .contains(&("DW.DIM_WIDGET".to_string(), "NULLABLE_COL".to_string())));
+    assert!(diag_cols(&out, DiagCode::SubjectKeyUnverified).is_empty());
+}
+
+#[test]
+fn override_primary_key_gate_passes_via_null_fraction_zero() {
+    // required=false but null_fraction==0.0 (stats-proven null-free) passes the gate.
+    let mut col = ik(2, "PROVEN_COL", 1, 100, false);
+    col.stats.null_fraction = Some(0.0);
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![ik(1, "WIDGET_KEY", 1, 100, true), col],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "DIM_WIDGET",
+        TableOverride {
+            primary_key: Some("PROVEN_COL".to_string()),
+            class_name: None,
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+    assert!(out.structured.table_mappings[0]
+        .subject_template
+        .ends_with("/{PROVEN_COL}"));
+    assert_eq!(
+        diag_cols(&out, DiagCode::SubjectKeyUnverified),
+        BTreeSet::from([("DW.DIM_WIDGET".to_string(), "PROVEN_COL".to_string())])
+    );
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
+}
+
+#[test]
+fn override_primary_key_on_missing_column_is_clean_diagnostic_not_panic() {
+    // A nonexistent override column must produce a clean NoSafeSubjectKey (no
+    // subject), never a panic.
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![ik(1, "WIDGET_KEY", 1, 100, true)],
+    );
+    let opts = opts_with_override(
+        "DW",
+        "DIM_WIDGET",
+        TableOverride {
+            primary_key: Some("DOES_NOT_EXIST".to_string()),
+            class_name: None,
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+    assert!(out.structured.table_mappings[0].subject_template.is_empty());
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey)
+        .contains(&("DW.DIM_WIDGET".to_string(), "DOES_NOT_EXIST".to_string())));
+    // No fabricated subject key column exists in the output.
+    assert!(out.structured.table_mappings[0]
+        .columns
+        .iter()
+        .all(|c| !c.is_subject_id));
+}
+
+#[test]
+fn override_class_name_changes_class_and_slug_only() {
+    // DIM_WIDGET derives class "Widget" / slug "widget"; the override forces
+    // "Gadget" / "gadget" and changes NOTHING else (columns, subject key column).
+    let t = tbl(
+        "DIM_WIDGET",
+        vec![1],
+        vec![
+            ik(1, "WIDGET_KEY", 1, 100, true),
+            sc(2, "NAME", FieldType::String),
+        ],
+    );
+    let default_out = emit_r2rml(std::slice::from_ref(&t), &EmitOptions::default());
+    let opts = opts_with_override(
+        "DW",
+        "DIM_WIDGET",
+        TableOverride {
+            primary_key: None,
+            class_name: Some("Gadget".to_string()),
+        },
+    );
+    let out = emit_r2rml(&[t], &opts);
+
+    let default_tm = &default_out.structured.table_mappings[0];
+    let tm = &out.structured.table_mappings[0];
+
+    // rr:class + subject slug reflect the override.
+    assert!(default_tm.class_iri.ends_with("Widget"));
+    assert!(tm.class_iri.ends_with("Gadget"), "{}", tm.class_iri);
+    assert!(tm.subject_template.contains("/gadget/{WIDGET_KEY}"));
+    // ONLY the slug portion of the template changed (subject key column intact).
+    assert_eq!(
+        default_tm.subject_template.replace("/widget/", "/gadget/"),
+        tm.subject_template
+    );
+    // Predicate-object mappings (predicates derive from column names, not the
+    // class) are byte-identical, and no subject-key diagnostics fire.
+    assert_eq!(default_tm.columns, tm.columns);
+    assert!(out.diagnostics.is_empty());
+}
+
+#[test]
+fn empty_and_unmatched_overrides_are_byte_identical_to_pre_change_golden() {
+    // The golden was captured from the pre-override emitter over the 16-table
+    // fixture; empty overrides must reproduce it byte-for-byte (no-op safety).
+    const GOLDEN: &str = include_str!("testdata/enterprise_default.ttl");
+    let default_out = emit_r2rml(&enterprise_dw_tables(), &EmitOptions::default());
+    assert_eq!(
+        default_out.turtle, GOLDEN,
+        "default (empty-overrides) output must be byte-identical to the pre-change emitter"
+    );
+
+    // An override keyed on a table NOT in the input is inert — same bytes.
+    let opts = opts_with_override(
+        "DW",
+        "NOT_A_REAL_TABLE",
+        TableOverride {
+            primary_key: Some("X".to_string()),
+            class_name: Some("Y".to_string()),
+        },
+    );
+    let unmatched_out = emit_r2rml(&enterprise_dw_tables(), &opts);
+    assert_eq!(
+        unmatched_out.turtle, GOLDEN,
+        "an override on a table not in the request must be a no-op"
+    );
+    assert_eq!(unmatched_out.diagnostics, default_out.diagnostics);
 }
 
 // =============================================================================

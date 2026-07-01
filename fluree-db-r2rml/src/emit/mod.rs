@@ -31,8 +31,12 @@ mod fixtures;
 mod tests;
 
 pub use diagnostic::{DiagCode, Diagnostic, Severity};
-pub use input::{EmitColumn, EmitColumnStats, EmitTableSchema, TypedBound};
+pub use input::{
+    EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride, TypedBound,
+};
 pub use ir::{ColumnMapping, ForeignKey, PrefixDecl, StructuredR2rmlMapping, TableMapping};
+
+use std::collections::HashMap;
 
 /// Emitter configuration. Every field is a pure knob — identical options plus
 /// identical inputs yield byte-identical output.
@@ -54,6 +58,11 @@ pub struct EmitOptions {
     /// Keep resolved-FK key columns as literal predicate-object maps too
     /// (pushdown-friendly).
     pub keep_fk_keys_as_literals: bool,
+    /// Per-table subject-key / class-name overrides, keyed on the table's
+    /// `{namespace, name}` identity (PR-1's `per_table_overrides`). Default empty
+    /// — an empty map is a strict no-op, leaving every stem-derived default and
+    /// the byte-for-byte output unchanged.
+    pub per_table_overrides: HashMap<TableKey, TableOverride>,
 }
 
 impl EmitOptions {
@@ -75,6 +84,7 @@ impl Default for EmitOptions {
             xsd_long_as_integer: true,
             emit_fk_joins: true,
             keep_fk_keys_as_literals: true,
+            per_table_overrides: HashMap::new(),
         }
     }
 }

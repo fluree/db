@@ -133,10 +133,27 @@ fn build_table_draft(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> TableDraft {
     let stem = table.stem();
-    let class_iri = format!("{}{}", opts.base_namespace, naming::class_local_name(stem));
+    let table_override = opts.per_table_overrides.get(&table.key());
 
-    // Subject key selection.
-    let subject_key = select_subject_key(table, diagnostics);
+    // Class name + subject slug. A per-table `class_name` override replaces the
+    // stem-derived pair: the override is used verbatim as the `rr:class`
+    // ClassName, and the subject slug is its kebab-case rendering (the same case
+    // rule `class_slug` applies to a stem). An absent/`None` override reproduces
+    // the stem-derived defaults byte-for-byte.
+    let (class_local_name, subject_slug) =
+        match table_override.and_then(|o| o.class_name.as_deref()) {
+            Some(class_name) => (class_name.to_string(), naming::kebab_case(class_name)),
+            None => (naming::class_local_name(stem), naming::class_slug(stem)),
+        };
+    let class_iri = format!("{}{}", opts.base_namespace, class_local_name);
+
+    // Subject key selection. A per-table `primary_key` override REPLACES
+    // `identifier_field_ids` as the subject key (validated + always unverified).
+    let subject_key = select_subject_key(
+        table,
+        table_override.and_then(|o| o.primary_key.as_deref()),
+        diagnostics,
+    );
     let subject_key_columns: HashSet<String> = subject_key.columns.iter().cloned().collect();
 
     let subject_template = if subject_key.columns.is_empty() {
@@ -151,7 +168,7 @@ fn build_table_draft(
         format!(
             "{}{}/{}",
             naming::subject_base(&opts.base_namespace),
-            naming::class_slug(stem),
+            subject_slug,
             placeholders
         )
     };
@@ -212,10 +229,74 @@ fn build_table_draft(
     }
 }
 
-/// Choose the subject key: prefer `identifier_field_ids`; else a `required` /
-/// null-free `<STEM>_KEY` / `<STEM>_ID` fallback (`SubjectKeyUnverified`); else
+/// Choose the subject key.
+///
+/// A per-table `primary_key` override (`override_primary_key`), when present,
+/// REPLACES `identifier_field_ids`: the named column must exist and pass the
+/// `required` / null-free gate (else `NoSafeSubjectKey`, no subject), and — because
+/// uniqueness is unprovable metadata-only — it ALWAYS earns a `SubjectKeyUnverified`
+/// diagnostic. Never fabricate a surrogate.
+///
+/// Otherwise: prefer `identifier_field_ids`; else a `required` / null-free
+/// `<STEM>_KEY` / `<STEM>_ID` fallback (`SubjectKeyUnverified`); else
 /// `NoSafeSubjectKey` (no subject; never invent a surrogate row id).
-fn select_subject_key(table: &EmitTableSchema, diagnostics: &mut Vec<Diagnostic>) -> SubjectKey {
+fn select_subject_key(
+    table: &EmitTableSchema,
+    override_primary_key: Option<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> SubjectKey {
+    // -- Per-table `primary_key` override: replaces identifier_field_ids. --
+    if let Some(pk_name) = override_primary_key {
+        let col = match table.columns.iter().find(|c| c.name == pk_name) {
+            Some(col) => col,
+            None => {
+                diagnostics.push(Diagnostic::new(
+                    Severity::Error,
+                    DiagCode::NoSafeSubjectKey,
+                    table.qualified_name(),
+                    Some(pk_name.to_string()),
+                    format!(
+                        "per-table primary_key override '{pk_name}' is not a column of the \
+                         table; no safe subject key"
+                    ),
+                ));
+                return SubjectKey {
+                    columns: Vec::new(),
+                };
+            }
+        };
+        if !col.is_non_null() {
+            diagnostics.push(Diagnostic::new(
+                Severity::Error,
+                DiagCode::NoSafeSubjectKey,
+                table.qualified_name(),
+                Some(col.name.clone()),
+                format!(
+                    "per-table primary_key override '{}' is nullable (fails required / \
+                     null_fraction==0); no safe subject key",
+                    col.name
+                ),
+            ));
+            return SubjectKey {
+                columns: Vec::new(),
+            };
+        }
+        diagnostics.push(Diagnostic::new(
+            Severity::Warning,
+            DiagCode::SubjectKeyUnverified,
+            table.qualified_name(),
+            Some(col.name.clone()),
+            format!(
+                "subject key '{}' set by per-table override; uniqueness is unverifiable \
+                 metadata-only (NDV deferred)",
+                col.name
+            ),
+        ));
+        return SubjectKey {
+            columns: vec![col.name.clone()],
+        };
+    }
+
     if !table.identifier_field_ids.is_empty() {
         let mut columns = Vec::new();
         for &fid in &table.identifier_field_ids {
