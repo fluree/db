@@ -92,8 +92,8 @@ All data-plane paths below are relative to the API base URL. For the standalone
 server this is `/v1/fluree`.
 
 **Data Operations:**
-- `POST /query` — JSON-LD and SPARQL queries
-- `POST /update` — Update transactions (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE)
+- `POST /query` — JSON-LD, SPARQL, and Cypher queries
+- `POST /update` — Update transactions (WHERE/DELETE/INSERT JSON-LD, SPARQL UPDATE, or Cypher)
 - `POST /insert` / `POST /upsert` — Direct insert or upsert
 
 **Ledger Management:**

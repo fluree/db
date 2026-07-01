@@ -103,7 +103,7 @@
 - [Query](query/README.md)
   - [JSON-LD Query](query/jsonld-query.md)
   - [SPARQL](query/sparql.md)
-  - [Cypher (openCypher subset)](query/cypher.md)
+  - [Cypher (openCypher)](query/cypher.md)
   - [Output formats (JSON-LD / SPARQL JSON / typed JSON / Agent JSON)](query/output-formats.md)
   - [Datasets, FROM/FROM NAMED, and multi-graph execution](query/datasets.md)
   - [CONSTRUCT](query/construct.md)

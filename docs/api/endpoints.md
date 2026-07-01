@@ -45,7 +45,7 @@ This endpoint is intended for debugging and operator support. See also [Admin, h
 
 ### POST /update
 
-Submit an **update** transaction (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE) to write data to a ledger.
+Submit an **update** transaction (WHERE/DELETE/INSERT JSON-LD, SPARQL UPDATE, or Cypher `CREATE`/`MERGE`/`SET`/`DELETE`) to write data to a ledger.
 
 **URL:**
 ```
@@ -70,6 +70,17 @@ For SPARQL UPDATE:
 Content-Type: application/sparql-update
 Accept: application/json
 ```
+
+For Cypher writes (`CREATE`/`MERGE`/`SET`/`DELETE`):
+```http
+Content-Type: application/cypher
+Accept: application/json
+```
+
+Note: Cypher targets a ledger directly and must use the path form
+(`POST /update/{ledger-id}`); it has no `FROM`/dataset clause. The body may be
+raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the
+[Cypher reference](../query/cypher.md) for details.
 
 Note: Turtle/TriG are not accepted on `/update`. Use `/insert` (Turtle) or `/upsert` (Turtle/TriG).
 
@@ -1206,6 +1217,16 @@ SELECT ?commit ?t
 FROM <txn-meta>
 WHERE { ?commit f:t ?t }'
 ```
+
+Cypher (`Content-Type: application/cypher` — ledger-scoped only, no `FROM`/dataset clause):
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/query/mydb:main" \
+  -H "Content-Type: application/cypher" \
+  --data 'MATCH (p:Person) RETURN p.name'
+```
+
+Cypher responses default to `cypher-json`; request RDF JSON-LD with `Accept: application/ld+json`. The body may be raw Cypher or the JSON envelope `{"cypher": "...", "params": {...}}`. See the [Cypher reference](../query/cypher.md).
 
 ### History Queries via POST /query
 
@@ -2805,7 +2826,7 @@ This section summarizes the contract that third-party server implementations (e.
 |----------|-------------|
 | `GET /info/{ledger}` | `info`, `push`, `pull`, `clone` |
 | `GET /show/{ledger}?commit=<ref>` | `show --remote` |
-| `POST /query/{ledger}` | `query` (JSON-LD and SPARQL) |
+| `POST /query/{ledger}` | `query` (JSON-LD, SPARQL, and Cypher) |
 | `POST /insert/{ledger}` | `insert` |
 | `POST /upsert/{ledger}` | `upsert` |
 | `GET /exists/{ledger}` | `clone` (pre-create check) |

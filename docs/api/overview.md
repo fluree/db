@@ -82,7 +82,7 @@ defaults to `/v1/fluree`.
 ### Transaction Endpoints
 
 **POST /update**
-- Submit update transactions (WHERE/DELETE/INSERT JSON-LD or SPARQL UPDATE)
+- Submit update transactions (WHERE/DELETE/INSERT JSON-LD, SPARQL UPDATE, or Cypher `CREATE`/`MERGE`/`SET`/`DELETE`)
 - Parameters: `ledger`, `context`
 - Returns: Transaction receipt with commit info
 
@@ -92,7 +92,7 @@ defaults to `/v1/fluree`.
 ### Query Endpoints
 
 **POST /query**
-- Execute queries (JSON-LD Query or SPARQL)
+- Execute queries (JSON-LD Query, SPARQL, or Cypher — Cypher on the ledger-scoped `/query/{ledger}` route with `Content-Type: application/cypher`)
 - Parameters: None (ledger specified in query body)
 - Returns: Query results
 - Supports history queries via time range in `from` clause (see [Time Travel](../concepts/time-travel.md))

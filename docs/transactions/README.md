@@ -55,6 +55,14 @@ Import RDF data in Turtle format:
 - File uploads
 - Format conversion
 
+### [Cypher writes](../query/cypher.md)
+
+Write property-graph data with openCypher (`CREATE`/`MERGE`/`SET`/`DELETE`):
+- `MERGE` find-or-create semantics
+- Relationship properties via edge annotations
+- Writes go to the ledger-scoped `/update` endpoint (`Content-Type: application/cypher`) or `fluree update --format cypher`
+- See the [Cypher cookbook](../guides/cookbook-cypher.md) for end-to-end write patterns
+
 ### [Signed / Credentialed Transactions](signed-transactions.md)
 
 Cryptographically signed transactions:

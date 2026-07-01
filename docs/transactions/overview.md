@@ -15,7 +15,7 @@ A **transaction** in Fluree is a set of changes to the database, represented as 
 
 ### 1. Submission
 
-Client submits transaction to Fluree using either JSON-LD or SPARQL UPDATE:
+Client submits transaction to Fluree using JSON-LD, SPARQL UPDATE, or Cypher (`CREATE`/`MERGE`/`SET`/`DELETE`):
 
 **JSON-LD Transaction:**
 ```bash
