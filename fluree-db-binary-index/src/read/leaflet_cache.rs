@@ -383,6 +383,15 @@ pub struct LeafletCache {
     inner: Cache<CacheKey, CachedEntry>,
 }
 
+impl std::fmt::Debug for LeafletCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeafletCache")
+            .field("entries", &self.entry_count())
+            .field("bytes", &self.weighted_size_bytes())
+            .finish()
+    }
+}
+
 /// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
 /// blocking region when on a multi-thread runtime.
 ///
@@ -578,6 +587,18 @@ impl LeafletCache {
         }
     }
 
+    /// Warm-on-write: seed a decoded leaf directory the *writer* already holds.
+    ///
+    /// The incremental indexer, running co-located with the query server, has
+    /// the just-written leaf's bytes in hand; decoding + inserting the directory
+    /// here saves the reader that immediately revisits the leaf a re-decode.
+    /// Key is `cid_cache_key(leaf_cid)` — content-addressed, so this can never
+    /// serve stale data. Admission is TinyLFU-bounded like any other insert.
+    pub fn insert_leaf_dir(&self, key: u128, dir: Arc<DecodedLeafDirV3>) {
+        self.inner
+            .insert(CacheKey::LeafDir(key), CachedEntry::LeafDir(dir));
+    }
+
     // ========================================================================
     // BM25 posting leaflet cache
     // ========================================================================
@@ -765,6 +786,21 @@ impl LeafletCache {
         if let Some(batch) = self.get_v3_batch(&key) {
             return Ok(batch);
         }
+        // Superset fallback: a warm-on-write `ColumnSet::ALL` batch covers any
+        // narrower request. Serve it projected down rather than re-decoding —
+        // the invariant is that a cached batch may satisfy a request only when
+        // its columns ⊇ the requested columns, and ALL ⊇ everything.
+        let all_columns = super::column_types::ColumnSet::ALL.0;
+        if key.columns != all_columns {
+            let all_key = V3BatchCacheKey {
+                leaf_id: key.leaf_id,
+                leaflet_idx: key.leaflet_idx,
+                columns: all_columns,
+            };
+            if let Some(all_batch) = self.get_v3_batch(&all_key) {
+                return Ok(all_batch.project_to(super::column_types::ColumnSet(key.columns)));
+            }
+        }
         // Run the single-flight wait/init in a blocking region so a
         // waiter promotes a replacement worker (see in_blocking_region).
         let result = in_blocking_region(|| {
@@ -777,6 +813,17 @@ impl LeafletCache {
             Ok(_) => unreachable!("V3Batch key always maps to V3Batch entry"),
             Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
         }
+    }
+
+    /// Warm-on-write: seed a decoded V3 column batch the *writer* already holds.
+    ///
+    /// Counterpart to [`Self::insert_leaf_dir`] for the column data. The key's
+    /// `columns` bitmask must match the projection a reader will request, or the
+    /// warmed entry is simply never hit (never mis-served) — so seed the common
+    /// projection(s) only. Content-addressed leaf id makes this always safe.
+    pub fn insert_v3_batch(&self, key: V3BatchCacheKey, batch: super::column_types::ColumnBatch) {
+        self.inner
+            .insert(CacheKey::V3Batch(key), CachedEntry::V3Batch(batch));
     }
 
     // ========================================================================
@@ -960,6 +1007,56 @@ mod tests {
 
         // Different dict key → miss.
         assert!(cache.get_dict_leaf(1000).is_none());
+    }
+
+    #[test]
+    fn test_v3_batch_superset_serves_narrow_without_decode() {
+        use crate::read::column_types::{ColumnBatch, ColumnData, ColumnSet};
+        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
+
+        // Warm-on-write seeds a full (ALL) batch for a leaflet.
+        let all_batch = ColumnBatch {
+            row_count: 2,
+            s_id: ColumnData::Block(vec![10u64, 11].into()),
+            o_key: ColumnData::Block(vec![100u64, 101].into()),
+            p_id: ColumnData::Const(5),
+            o_type: ColumnData::Const(7),
+            o_i: ColumnData::Block(vec![0u32, 1].into()),
+            t: ColumnData::Block(vec![3u32, 4].into()),
+        };
+        let all_key = V3BatchCacheKey {
+            leaf_id: 0xABCD,
+            leaflet_idx: 2,
+            columns: ColumnSet::ALL.0,
+        };
+        cache.insert_v3_batch(all_key.clone(), all_batch);
+
+        // A narrow (CORE) read must be served from the ALL batch, projected —
+        // decode_fn panics to prove no re-decode happens.
+        let core_key = V3BatchCacheKey {
+            leaf_id: 0xABCD,
+            leaflet_idx: 2,
+            columns: ColumnSet::CORE.0,
+        };
+        let served = cache
+            .try_get_or_decode_v3_batch(core_key, || panic!("must not decode: ALL covers CORE"))
+            .expect("superset hit");
+
+        // Requested (CORE) columns carry real data; omitted ones are absent.
+        assert_eq!(served.row_count, 2);
+        assert_eq!(served.s_id.get(1), 11);
+        assert_eq!(served.o_key.get(0), 100);
+        assert_eq!(served.p_id.get(0), 5);
+        assert_eq!(served.o_type.get(0), 7);
+        assert!(served.o_i.is_absent(), "o_i not in CORE → projected away");
+        assert!(served.t.is_absent(), "t not in CORE → projected away");
+
+        // A request for columns NOT covered (here, an exact ALL request) still
+        // hits the stored ALL batch directly.
+        let full = cache
+            .try_get_or_decode_v3_batch(all_key, || panic!("must not decode: exact ALL hit"))
+            .expect("exact hit");
+        assert!(!full.t.is_absent(), "exact ALL request keeps t");
     }
 
     #[test]
