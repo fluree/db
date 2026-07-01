@@ -1,0 +1,48 @@
+[package]
+name = "fluree-load"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+description = "HTTP load harness for Fluree single-node and Raft cluster deployments."
+publish = false
+
+[[bin]]
+name = "fluree-load"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP + async. Versions track the workspace's pins so this tool stays
+# binary-compatible with what the server crate is built against.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# CLI.
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization. Mirrors the server's serde_json pin so JSON-LD
+# `preserve_order` semantics line up.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Per-request unique idempotency keys + IRIs. Same crate the consensus
+# state machine uses.
+ulid = "1"
+
+# Latency histograms. HDR is the standard for percentile work at this
+# scale (constant-time recording, accurate p99 without needing the full
+# sample set in memory).
+hdrhistogram = "7"
+
+# Rendezvous-hash mirror of `fluree-db-consensus/src/raft/ownership.rs`
+# so the harness can compute who owns each (ledger, branch) locally,
+# without any cluster RPC.
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+# Errors.
+thiserror = "1"
+
+# Logging — opt-in via RUST_LOG. The default reporter writes to stdout
+# directly so the tool can stay readable without a tracing subscriber
+# in the picture.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

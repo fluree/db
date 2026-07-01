@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 #
-# fluree local-cluster — run a Fluree raft cluster locally via Docker.
+# fluree local — run a Fluree deployment locally via Docker.
 #
-# Single entry point with subcommands. Run `./cluster help` for the
-# full list, or `./cluster help <command>` for per-command usage.
+# Single entry point with subcommands. Supports two deployment modes:
+#
+#   monolithic  one Fluree server, no consensus (default)
+#   raft        N-node Raft cluster
+#
+# Run `./stack help` for the full command list, or
+# `./stack help <command>` for per-command details. Future consensus
+# modes (bft, paxos, ...) slot in as new `--mode` values without
+# touching the rest of the command surface.
 
 set -euo pipefail
 
@@ -11,30 +18,33 @@ set -euo pipefail
 # Paths and configuration
 # ============================================================================
 
-LOCAL_CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "$LOCAL_CLUSTER_DIR/../.." && pwd)"
-BUILD_DIR="$LOCAL_CLUSTER_DIR/.build"
-COMPOSE_FILE="$LOCAL_CLUSTER_DIR/compose.generated.yml"
+LOCAL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_ROOT="$(cd "$LOCAL_DIR/../.." && pwd)"
+BUILD_DIR="$LOCAL_DIR/.build"
+COMPOSE_FILE="$LOCAL_DIR/compose.generated.yml"
 
 # Image and compose-project names. The project name is what
 # `docker compose` uses to namespace containers, networks, and volumes
 # — keeping it fixed means later subcommands find what `up` created.
-IMAGE_TAG="fluree-local-cluster:dev"
-COMPOSE_PROJECT="fluree-local-cluster"
+IMAGE_TAG="fluree-local:dev"
+COMPOSE_PROJECT="fluree-local"
+NETWORK_NAME="fluree-net"
 
-# Port base. Node N publishes its public listener on PUBLIC_PORT_BASE+N
-# and its raft listener on RAFT_PORT_BASE+N. Override via env if 8091
-# / 9091 are taken.
+# Port base. Node N publishes its public listener on PUBLIC_PORT_BASE+N.
+# Raft nodes additionally publish their raft listener on RAFT_PORT_BASE+N.
+# Override via env if 8091 / 9091 are taken. Monolithic deployments
+# still use BASE+1 for consistency with `kill 1` / `restart 1`.
 : "${PUBLIC_PORT_BASE:=8090}"
 : "${RAFT_PORT_BASE:=9090}"
 
-# Default cluster size when `up` is called without an arg.
-: "${DEFAULT_CLUSTER_SIZE:=3}"
+# Default raft node count when `up --mode raft` is called without
+# --nodes. Ignored for monolithic mode (which is always 1 node).
+: "${DEFAULT_RAFT_NODES:=3}"
 
 # Storage mode default. `--storage` flag on `up` overrides this.
 # "ephemeral" uses docker named volumes (wiped on `down`).
 # "persistent" bind-mounts ./data/ — survives `down --keep-data`.
-: "${FLUREE_LOCAL_CLUSTER_STORAGE:=ephemeral}"
+: "${FLUREE_LOCAL_STORAGE:=ephemeral}"
 
 # ============================================================================
 # Output helpers
@@ -78,8 +88,8 @@ detect_compose() {
 # Per-node URL helpers
 # ============================================================================
 
-# Hostname inside the cluster network. Used both as the container_name
-# and as the network alias peers resolve.
+# Hostname inside the deployment network. Used both as the
+# container_name and as the network alias peers resolve.
 node_host() { printf "fluree-%d" "$1"; }
 
 # Container-side ports — same for every node, distinguished by host
@@ -94,25 +104,43 @@ node_host_raft()   { echo $((RAFT_PORT_BASE   + $1)); }
 node_host_public_url() { printf "http://127.0.0.1:%d" "$(node_host_public "$1")"; }
 node_host_raft_url()   { printf "http://127.0.0.1:%d" "$(node_host_raft   "$1")"; }
 
-# URLs from inside the cluster network — used in the bootstrap
+# URLs from inside the deployment network — used in the bootstrap
 # NodeAddrs payload because peers reach each other via container
 # aliases, not host ports.
 node_peer_raft_url()   { printf "http://%s:%d/raft" "$(node_host "$1")" "$(node_internal_raft   "$1")"; }
 node_peer_client_url() { printf "http://%s:%d"      "$(node_host "$1")" "$(node_internal_public "$1")"; }
 
-# Read CLUSTER_SIZE from the generated compose file so commands after
-# `up` don't need it re-specified.
-read_cluster_size() {
-    [ -f "$COMPOSE_FILE" ] || die "No cluster running. Start one with: $(basename "$0") up"
-    grep -c '^  fluree-[0-9]\+:' "$COMPOSE_FILE" || die "Could not parse cluster size from $COMPOSE_FILE"
+# Read deployment mode (`monolithic` | `raft`) from a header comment
+# in compose.generated.yml. `up` writes this so subsequent commands
+# don't need it re-specified.
+read_mode() {
+    [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
+    local mode
+    mode="$(grep -m1 '^# Mode: ' "$COMPOSE_FILE" | sed 's/^# Mode: //' || true)"
+    [ -n "$mode" ] || die "Could not parse deployment mode from $COMPOSE_FILE"
+    echo "$mode"
+}
+
+# Read the number of nodes from the generated compose file.
+read_node_count() {
+    [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
+    grep -c '^  fluree-[0-9]\+:' "$COMPOSE_FILE" || die "Could not parse node count from $COMPOSE_FILE"
 }
 
 require_node_in_range() {
     local id="$1"
-    local size
-    size="$(read_cluster_size)"
-    [ "$id" -ge 1 ] && [ "$id" -le "$size" ] \
-        || die "node id $id out of range [1, $size]"
+    local count
+    count="$(read_node_count)"
+    [ "$id" -ge 1 ] && [ "$id" -le "$count" ] \
+        || die "node id $id out of range [1, $count]"
+}
+
+# Hard-fail when a raft-only command is invoked against a monolithic
+# deployment. Used by partition / heal.
+require_raft_mode() {
+    local mode
+    mode="$(read_mode)"
+    [ "$mode" = "raft" ] || die "\`$1\` only applies to --mode raft (current: $mode)"
 }
 
 # ============================================================================
@@ -121,29 +149,30 @@ require_node_in_range() {
 
 usage_top() {
     cat <<EOF
-${C_BOLD}fluree local-cluster${C_RESET} — run a Fluree raft cluster locally via Docker
+${C_BOLD}fluree local${C_RESET} — run a Fluree deployment locally via Docker
 
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") <command> [args]
 
 ${C_BOLD}COMMANDS${C_RESET}
-  up [N] [flags]       Build, start, and bootstrap an N-node cluster (default $DEFAULT_CLUSTER_SIZE)
-  down [flags]         Tear down the cluster
-  status               Show per-node container state and per-node /cluster/status view
+  up [flags]           Build, start, and (if raft) bootstrap a deployment
+  down [flags]         Tear down the deployment
+  status               Show per-node container state (+ /cluster/status in raft mode)
   kill <N>             SIGKILL node N (simulate a crash)
   restart <N>          Start a killed/stopped node
-  pause <N>            SIGSTOP node N (simulate unresponsive but alive — heartbeat timeout)
+  pause <N>            SIGSTOP node N (simulate unresponsive but alive)
   unpause <N>          SIGCONT a paused node
-  partition <N>        Disconnect node N from the cluster network (split-brain)
-  heal <N>             Reconnect a partitioned node
+  partition <N>        Disconnect node N from the network (raft only)
+  heal <N>             Reconnect a partitioned node (raft only)
   logs [N] [flags]     Tail logs from one node, or all nodes if N omitted
+  load [args...]       Run the HTTP load harness against this deployment
   help [command]       Show top-level help or per-command help
 
 ${C_BOLD}ENVIRONMENT${C_RESET}
-  DEFAULT_CLUSTER_SIZE          default node count for \`up\` (currently $DEFAULT_CLUSTER_SIZE)
-  PUBLIC_PORT_BASE              host port base for public listeners (currently $PUBLIC_PORT_BASE)
-  RAFT_PORT_BASE                host port base for raft listeners (currently $RAFT_PORT_BASE)
-  FLUREE_LOCAL_CLUSTER_STORAGE  ephemeral|persistent (currently $FLUREE_LOCAL_CLUSTER_STORAGE)
+  DEFAULT_RAFT_NODES     default node count for \`up --mode raft\` (currently $DEFAULT_RAFT_NODES)
+  PUBLIC_PORT_BASE       host port base for public listeners (currently $PUBLIC_PORT_BASE)
+  RAFT_PORT_BASE         host port base for raft listeners (currently $RAFT_PORT_BASE)
+  FLUREE_LOCAL_STORAGE   ephemeral|persistent (currently $FLUREE_LOCAL_STORAGE)
 
 Run \`$(basename "$0") help <command>\` for per-command details.
 EOF
@@ -152,22 +181,28 @@ EOF
 usage_up() {
     cat <<EOF
 ${C_BOLD}USAGE${C_RESET}
-  $(basename "$0") up [N] [--no-build] [--storage MODE]
+  $(basename "$0") up [--mode MODE] [--nodes N] [--no-build] [--storage MODE]
 
-Bring up an N-node raft cluster: builds fluree-server, builds the
-docker image, generates compose.generated.yml, starts containers,
-waits for /health, and bootstraps via /cluster/initialize +
-/cluster/add-learner + /cluster/change-membership.
-
-${C_BOLD}ARGUMENTS${C_RESET}
-  N                 cluster size, integer >= 1 (default $DEFAULT_CLUSTER_SIZE)
+Build the fluree-server binary and docker image, generate
+compose.generated.yml for the requested mode, start containers, wait
+for /health, and (in raft mode) run the cluster bootstrap.
 
 ${C_BOLD}FLAGS${C_RESET}
+  --mode MODE       deployment mode: monolithic (default) or raft
+  --nodes N         raft only: cluster size, integer >= 1
+                    [default: $DEFAULT_RAFT_NODES]
+                    rejected when --mode monolithic
   --no-build        skip cargo build; reuse .build/fluree-server
   --storage MODE    ephemeral (named volumes, wiped on down)
                     or persistent (bind-mount ./data/, survives down)
-                    [default: $FLUREE_LOCAL_CLUSTER_STORAGE]
+                    [default: $FLUREE_LOCAL_STORAGE]
   -h, --help        show this help
+
+${C_BOLD}EXAMPLES${C_RESET}
+  $(basename "$0") up                                    # one-node monolithic
+  $(basename "$0") up --mode raft                        # 3-node raft cluster
+  $(basename "$0") up --mode raft --nodes 5              # 5-node raft cluster
+  $(basename "$0") up --storage persistent               # data survives down --keep-data
 EOF
 }
 
@@ -176,7 +211,7 @@ usage_down() {
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") down [--keep-data]
 
-Tear down the cluster: stop containers, remove the network, and
+Tear down the deployment: stop containers, remove the network, and
 (by default) wipe volumes / bind-mounted data.
 
 ${C_BOLD}FLAGS${C_RESET}
@@ -190,10 +225,11 @@ usage_status() {
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") status
 
-Per-node container state and /health, plus each node's view of
-/cluster/status (leader, term, applied index, voters, learners).
-Differences across nodes surface split-brain / lagging-follower /
-membership-change-in-flight scenarios.
+Per-node container state and /health. In raft mode, additionally
+shows each node's view of /cluster/status (leader, term, applied
+index, voters, learners). Differences across nodes surface
+split-brain / lagging-follower / membership-change-in-flight
+scenarios.
 
 Install \`jq\` for parsed output.
 EOF
@@ -205,9 +241,10 @@ ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") kill <N>
 
 SIGKILL node N. Models a process crash or hardware failure — no
-graceful shutdown, peers detect via missed heartbeats. The container
-stays in \`exited\` state; \`restart\` brings it back with the same
-data dir.
+graceful shutdown. The container stays in \`exited\` state;
+\`restart\` brings it back with the same data dir.
+
+For monolithic deployments, only N=1 is valid.
 EOF
 }
 
@@ -216,9 +253,9 @@ usage_restart() {
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") restart <N>
 
-Start a stopped/killed node. The node rejoins the cluster, catches
-up from the leader, and waits for /health before this command
-returns.
+Start a stopped/killed node. The node comes back with its data dir
+intact and (in raft mode) catches up from the leader. Waits for
+/health before returning.
 EOF
 }
 
@@ -229,14 +266,9 @@ ${C_BOLD}USAGE${C_RESET}
 
 SIGSTOP every process in node N's container. The container keeps
 its memory, network connection, and TCP socket state, but the
-processes never run — peers see this as an unresponsive node and
-heartbeats time out. Different from \`kill\`: TCP accepts but
+processes never run — peers (in raft mode) see this as unresponsive
+and heartbeats time out. Different from \`kill\`: TCP accepts but
 nothing reads.
-
-Useful for exercising:
-  - The liveness monitor's demote-slow-voter path
-  - Election triggered by leader-stuck (not leader-crashed)
-  - Client-facing timeouts vs raft-internal timeouts
 
 Resume with: $(basename "$0") unpause <N>
 EOF
@@ -247,10 +279,10 @@ usage_unpause() {
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") unpause <N>
 
-SIGCONT a paused node. Its processes resume and find a queue of
-pending heartbeats / requests; the node either re-establishes its
-leader role, discovers it's been replaced, or stays a follower
-behind the current log.
+SIGCONT a paused node. Its processes resume and (in raft mode) find
+a queue of pending heartbeats / requests; the node either
+re-establishes its leader role, discovers it's been replaced, or
+stays a follower behind the current log.
 EOF
 }
 
@@ -259,13 +291,14 @@ usage_partition() {
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") partition <N>
 
-Disconnect node N from the cluster network (\`docker network
-disconnect\`). The container keeps running but loses its IP on
-\`fluree-cluster\` — peers can't reach it, it can't reach them.
-Because the published host port forwards through the cluster
-network, the host can't reach it either (matches real-world
-partition semantics: a partitioned node is unreachable from
-everywhere).
+Disconnect node N from the deployment network (\`docker network
+disconnect\`). Raft-only — has no meaning for a monolithic
+deployment, which errors.
+
+The container keeps running but loses its IP on \`$NETWORK_NAME\`:
+peers can't reach it, it can't reach them. Because the published
+host port forwards through that network, the host can't reach it
+either (matches real-world partition semantics).
 
 Status will show: container=running, health=unreachable.
 
@@ -278,11 +311,11 @@ usage_heal() {
 ${C_BOLD}USAGE${C_RESET}
   $(basename "$0") heal <N>
 
-Reconnect a partitioned node to the cluster network. Docker assigns
-the node a fresh IP from the network's pool; the \`fluree-N\`
-hostname alias is re-registered, so peer URLs resolve correctly.
-Existing TCP state on peers is stale and will get reset on the
-first attempt.
+Reconnect a partitioned node to the deployment network. Raft-only.
+Docker assigns the node a fresh IP from the network's pool; the
+\`fluree-N\` hostname alias is re-registered, so peer URLs resolve
+correctly. Existing TCP state on peers is stale and will get reset
+on the first attempt.
 EOF
 }
 
@@ -298,6 +331,29 @@ ${C_BOLD}FLAGS${C_RESET}
   -f, --follow      stream new lines as they arrive (Ctrl-C to stop)
       --tail LINES  show only the last LINES lines (default all)
   -h, --help        show this help
+EOF
+}
+
+usage_load() {
+    cat <<EOF
+${C_BOLD}USAGE${C_RESET}
+  $(basename "$0") load [load-tool-args...]
+
+Runs the \`fluree-load\` HTTP harness against the live deployment.
+Auto-passes \`--addrs\` derived from the running compose file unless
+you specify \`--addrs\` yourself.
+
+Builds the load tool on first invocation
+(\`cargo build --release\` inside \`load/\`).
+
+${C_BOLD}EXAMPLES${C_RESET}
+  $(basename "$0") load --workload single-pound --duration 30s
+  $(basename "$0") load --workload wide-fanout --duration 60s --concurrency 64
+  $(basename "$0") load --workload multitenant --duration 5m \\
+                        --watch-cluster http://localhost:9091
+
+Pass through any load-tool flags. Run \`$(basename "$0") load --tool-help\`
+to see the load tool's own \`--help\` (workloads, env knobs, etc.).
 EOF
 }
 
@@ -317,6 +373,7 @@ cmd_help() {
         partition) usage_partition ;;
         heal)      usage_heal      ;;
         logs)      usage_logs      ;;
+        load)      usage_load      ;;
         help)      usage_top       ;;
         *)         err "Unknown command: $1"; usage_top; exit 1 ;;
     esac
@@ -328,23 +385,45 @@ cmd_help() {
 
 cmd_up() {
     local skip_build=0
-    local cluster_size="$DEFAULT_CLUSTER_SIZE"
-    local storage="$FLUREE_LOCAL_CLUSTER_STORAGE"
+    local mode="monolithic"
+    local nodes_arg=""
+    local storage="$FLUREE_LOCAL_STORAGE"
 
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) usage_up; return 0 ;;
+            --mode)
+                [ $# -ge 2 ] || die "--mode requires an argument"
+                mode="$2"; shift 2 ;;
+            --nodes)
+                [ $# -ge 2 ] || die "--nodes requires an argument"
+                nodes_arg="$2"; shift 2 ;;
             --no-build) skip_build=1; shift ;;
             --storage)
                 [ $# -ge 2 ] || die "--storage requires an argument"
                 storage="$2"; shift 2 ;;
-            [1-9]|[1-9][0-9])
-                cluster_size="$1"; shift ;;
             *) die "Unknown argument: $1 (try: $(basename "$0") help up)" ;;
         esac
     done
 
-    [ "$cluster_size" -ge 1 ] || die "cluster size must be >= 1"
+    case "$mode" in
+        monolithic|raft) : ;;
+        *) die "--mode must be monolithic or raft (got: $mode)" ;;
+    esac
+
+    local node_count
+    case "$mode" in
+        monolithic)
+            [ -z "$nodes_arg" ] || die "--nodes is rejected for --mode monolithic (always 1 node)"
+            node_count=1
+            ;;
+        raft)
+            node_count="${nodes_arg:-$DEFAULT_RAFT_NODES}"
+            [[ "$node_count" =~ ^[0-9]+$ ]] || die "--nodes must be a positive integer (got: $node_count)"
+            [ "$node_count" -ge 1 ] || die "--nodes must be >= 1"
+            ;;
+    esac
+
     case "$storage" in
         ephemeral|persistent) : ;;
         *) die "--storage must be ephemeral or persistent (got: $storage)" ;;
@@ -355,7 +434,7 @@ cmd_up() {
     if [ -f "$COMPOSE_FILE" ]; then
         if "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" \
                 ps --status running -q | grep -q .; then
-            die "Cluster already running. Tear down with: $(basename "$0") down"
+            die "Deployment already running. Tear down with: $(basename "$0") down"
         fi
     fi
 
@@ -373,11 +452,11 @@ cmd_up() {
     fi
 
     info "Building docker image $IMAGE_TAG..."
-    docker build -q -t "$IMAGE_TAG" "$LOCAL_CLUSTER_DIR" >/dev/null
+    docker build -q -t "$IMAGE_TAG" "$LOCAL_DIR" >/dev/null
     ok "Image $IMAGE_TAG ready"
 
-    info "Generating compose file for $cluster_size-node cluster..."
-    generate_compose "$cluster_size" "$storage" > "$COMPOSE_FILE"
+    info "Generating compose file: mode=$mode nodes=$node_count..."
+    generate_compose "$mode" "$node_count" "$storage" > "$COMPOSE_FILE"
     ok "Wrote $COMPOSE_FILE"
 
     info "Starting containers..."
@@ -386,7 +465,8 @@ cmd_up() {
     info "Waiting for nodes to come up..."
     local deadline
     deadline=$(( $(date +%s) + 60 ))
-    for i in $(seq 1 "$cluster_size"); do
+    local i
+    for i in $(seq 1 "$node_count"); do
         local url
         url="$(node_host_public_url "$i")/health"
         while ! curl -fsS -m 2 "$url" >/dev/null 2>&1; do
@@ -402,59 +482,69 @@ cmd_up() {
         ok "Node $i healthy at $(node_host_public_url "$i")"
     done
 
-    bootstrap_cluster "$cluster_size"
+    if [ "$mode" = "raft" ]; then
+        bootstrap_raft "$node_count"
+    fi
 
     echo
-    printf "%sCluster up%s — %d node(s)\n\n" "$C_BOLD" "$C_RESET" "$cluster_size"
-    for i in $(seq 1 "$cluster_size"); do
-        printf "  node %d  public %s   raft %s\n" \
-            "$i" "$(node_host_public_url "$i")" "$(node_host_raft_url "$i")"
+    printf "%sDeployment up%s — mode=%s, %d node(s)\n\n" \
+        "$C_BOLD" "$C_RESET" "$mode" "$node_count"
+    for i in $(seq 1 "$node_count"); do
+        if [ "$mode" = "raft" ]; then
+            printf "  node %d  public %s   raft %s\n" \
+                "$i" "$(node_host_public_url "$i")" "$(node_host_raft_url "$i")"
+        else
+            printf "  node %d  public %s\n" "$i" "$(node_host_public_url "$i")"
+        fi
     done
     echo
     echo "Try:"
     echo "  curl $(node_host_public_url 1)/health"
     echo "  $(basename "$0") status"
-    echo "  $(basename "$0") kill 2"
+    if [ "$mode" = "raft" ] && [ "$node_count" -ge 2 ]; then
+        echo "  $(basename "$0") kill 2"
+    fi
     echo "  $(basename "$0") down"
 }
 
 # Generate compose.generated.yml on stdout.
 generate_compose() {
-    local cluster_size="$1"
-    local storage="$2"
+    local mode="$1"
+    local node_count="$2"
+    local storage="$3"
 
     echo "# Generated by \`$(basename "$0") up\` — do not edit. Re-run to regenerate."
+    echo "# Mode: $mode"
+    echo "# Nodes: $node_count"
     echo
     echo "networks:"
-    echo "  fluree-cluster:"
+    echo "  $NETWORK_NAME:"
     echo "    driver: bridge"
     echo
     echo "services:"
-    for i in $(seq 1 "$cluster_size"); do
-        emit_service "$i" "$storage"
+    local i
+    for i in $(seq 1 "$node_count"); do
+        emit_service "$mode" "$i" "$storage"
     done
     echo
     if [ "$storage" = "ephemeral" ]; then
         echo "volumes:"
-        for i in $(seq 1 "$cluster_size"); do
+        for i in $(seq 1 "$node_count"); do
             echo "  $(node_host "$i")-data:"
         done
     fi
 }
 
 emit_service() {
-    local i="$1"
-    local storage="$2"
+    local mode="$1"
+    local i="$2"
+    local storage="$3"
     local host
     host="$(node_host "$i")"
     local internal_public
     internal_public="$(node_internal_public "$i")"
-    local internal_raft
-    internal_raft="$(node_internal_raft "$i")"
     local host_public
     host_public="$(node_host_public "$i")"
-    local host_raft
-    host_raft="$(node_host_raft "$i")"
 
     cat <<EOF
   $host:
@@ -462,48 +552,58 @@ emit_service() {
     container_name: $host
     hostname: $host
     networks:
-      fluree-cluster:
+      $NETWORK_NAME:
         aliases:
           - $host
     ports:
       - "$host_public:$internal_public"
-      - "$host_raft:$internal_raft"
-    environment:
-      RUST_LOG: info
-      FLUREE_LISTEN_ADDR: "0.0.0.0:$internal_public"
-      FLUREE_STORAGE_PATH: "/var/lib/fluree/data"
-      FLUREE_RAFT_ENABLED: "true"
-      FLUREE_RAFT_NODE_ID: "$i"
-      FLUREE_RAFT_STORAGE_PATH: "/var/lib/fluree/raft"
-      FLUREE_RAFT_LISTEN_ADDR: "0.0.0.0:$internal_raft"
-    volumes:
 EOF
+    if [ "$mode" = "raft" ]; then
+        local internal_raft
+        internal_raft="$(node_internal_raft "$i")"
+        local host_raft
+        host_raft="$(node_host_raft "$i")"
+        echo "      - \"$host_raft:$internal_raft\""
+    fi
+    echo "    environment:"
+    echo "      RUST_LOG: info"
+    echo "      FLUREE_LISTEN_ADDR: \"0.0.0.0:$internal_public\""
+    echo "      FLUREE_STORAGE_PATH: \"/var/lib/fluree/data\""
+    if [ "$mode" = "raft" ]; then
+        local internal_raft
+        internal_raft="$(node_internal_raft "$i")"
+        echo "      FLUREE_RAFT_ENABLED: \"true\""
+        echo "      FLUREE_RAFT_NODE_ID: \"$i\""
+        echo "      FLUREE_RAFT_STORAGE_PATH: \"/var/lib/fluree/raft\""
+        echo "      FLUREE_RAFT_LISTEN_ADDR: \"0.0.0.0:$internal_raft\""
+    fi
+    echo "    volumes:"
     if [ "$storage" = "ephemeral" ]; then
         echo "      - $host-data:/var/lib/fluree"
     else
-        mkdir -p "$LOCAL_CLUSTER_DIR/data/$host"
+        mkdir -p "$LOCAL_DIR/data/$host"
         echo "      - ./data/$host:/var/lib/fluree"
     fi
 }
 
-# Run /cluster/initialize + /cluster/add-learner * N + /cluster/change-membership
-# against node 1.
-bootstrap_cluster() {
-    local cluster_size="$1"
+# Raft only: /cluster/initialize + /cluster/add-learner * (N-1) +
+# /cluster/change-membership against node 1.
+bootstrap_raft() {
+    local node_count="$1"
     local leader_raft_url
     leader_raft_url="$(node_host_raft_url 1)"
 
-    info "Initializing cluster on node 1..."
+    info "Initializing raft cluster on node 1..."
     local init_body
     init_body="{\"members\":{$(build_member_json 1)}}"
     curl -fsS -X POST -H 'Content-Type: application/json' \
         -d "$init_body" "$leader_raft_url/cluster/initialize" >/dev/null
     ok "Node 1 initialized as single-member cluster"
 
-    [ "$cluster_size" -gt 1 ] || return 0
+    [ "$node_count" -gt 1 ] || return 0
 
     local i
-    for i in $(seq 2 "$cluster_size"); do
+    for i in $(seq 2 "$node_count"); do
         info "Adding node $i as learner..."
         # AddLearnerRequest uses `#[serde(flatten)]` for the address
         # pair — raft_addr / client_addr sit at the top level
@@ -517,7 +617,7 @@ bootstrap_cluster() {
 
     info "Promoting learners to voters..."
     local members_json
-    members_json="$(seq 1 "$cluster_size" | paste -sd ',')"
+    members_json="$(seq 1 "$node_count" | paste -sd ',')"
     local promote_body
     promote_body="{\"members\":[$members_json],\"retain\":false}"
     curl -fsS -X POST -H 'Content-Type: application/json' \
@@ -558,14 +658,14 @@ cmd_down() {
     else
         info "Stopping containers and wiping volumes..."
         "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" down -v >/dev/null
-        if [ -d "$LOCAL_CLUSTER_DIR/data" ]; then
-            rm -rf "$LOCAL_CLUSTER_DIR/data"
+        if [ -d "$LOCAL_DIR/data" ]; then
+            rm -rf "$LOCAL_DIR/data"
             ok "Removed data/ bind-mount tree"
         fi
     fi
 
     rm -f "$COMPOSE_FILE"
-    ok "Cluster torn down"
+    ok "Deployment torn down"
 }
 
 # ============================================================================
@@ -577,17 +677,18 @@ cmd_status() {
     [ $# -eq 0 ] || die "status takes no arguments (try: $(basename "$0") help status)"
 
     detect_compose
-    local cluster_size
-    cluster_size="$(read_cluster_size)"
+    local mode node_count
+    mode="$(read_mode)"
+    node_count="$(read_node_count)"
 
-    printf "%sCluster%s — %d node(s)\n\n" "$C_BOLD" "$C_RESET" "$cluster_size"
+    printf "%sDeployment%s — mode=%s, %d node(s)\n\n" \
+        "$C_BOLD" "$C_RESET" "$mode" "$node_count"
 
     local i
-    for i in $(seq 1 "$cluster_size"); do
-        local host raw_state container_state health_state public_url raft_url
+    for i in $(seq 1 "$node_count"); do
+        local host raw_state container_state health_state public_url
         host="$(node_host "$i")"
         public_url="$(node_host_public_url "$i")"
-        raft_url="$(node_host_raft_url "$i")"
 
         raw_state="$(docker inspect -f '{{.State.Status}}' "$host" 2>/dev/null || echo "missing")"
         health_state="-"
@@ -606,14 +707,25 @@ cmd_status() {
             *)       container_state="$raw_state" ;;
         esac
 
-        printf "  node %d  container=%b  health=%b  public=%s  raft=%s\n" \
-            "$i" "$container_state" "$health_state" "$public_url" "$raft_url"
+        if [ "$mode" = "raft" ]; then
+            local raft_url
+            raft_url="$(node_host_raft_url "$i")"
+            printf "  node %d  container=%b  health=%b  public=%s  raft=%s\n" \
+                "$i" "$container_state" "$health_state" "$public_url" "$raft_url"
+        else
+            printf "  node %d  container=%b  health=%b  public=%s\n" \
+                "$i" "$container_state" "$health_state" "$public_url"
+        fi
     done
+
+    if [ "$mode" != "raft" ]; then
+        return 0
+    fi
 
     echo
     printf "%sLeader view (per node)%s\n\n" "$C_BOLD" "$C_RESET"
 
-    for i in $(seq 1 "$cluster_size"); do
+    for i in $(seq 1 "$node_count"); do
         local raft_url resp
         raft_url="$(node_host_raft_url "$i")"
         resp="$(curl -fsS -m 2 "$raft_url/cluster/status" 2>/dev/null || true)"
@@ -657,7 +769,7 @@ cmd_kill() {
     host="$(node_host "$node_id")"
     info "Killing $host (SIGKILL)..."
     docker kill "$host" >/dev/null
-    ok "$host killed. Inspect cluster with: $(basename "$0") status"
+    ok "$host killed. Inspect with: $(basename "$0") status"
 }
 
 # ============================================================================
@@ -737,7 +849,7 @@ cmd_unpause() {
 }
 
 # ============================================================================
-# Subcommand: partition
+# Subcommand: partition (raft only)
 # ============================================================================
 
 cmd_partition() {
@@ -747,12 +859,14 @@ cmd_partition() {
     esac
     [ $# -eq 1 ] || die "usage: $(basename "$0") partition <node-id>"
 
+    require_raft_mode partition
+
     local node_id="$1"
     require_node_in_range "$node_id"
 
     local host
     host="$(node_host "$node_id")"
-    local network="${COMPOSE_PROJECT}_fluree-cluster"
+    local network="${COMPOSE_PROJECT}_$NETWORK_NAME"
 
     # Idempotency: if the container isn't on the network, treat as
     # already-partitioned. `docker network disconnect` errors hard
@@ -770,7 +884,7 @@ cmd_partition() {
 }
 
 # ============================================================================
-# Subcommand: heal
+# Subcommand: heal (raft only)
 # ============================================================================
 
 cmd_heal() {
@@ -780,12 +894,14 @@ cmd_heal() {
     esac
     [ $# -eq 1 ] || die "usage: $(basename "$0") heal <node-id>"
 
+    require_raft_mode heal
+
     local node_id="$1"
     require_node_in_range "$node_id"
 
     local host
     host="$(node_host "$node_id")"
-    local network="${COMPOSE_PROJECT}_fluree-cluster"
+    local network="${COMPOSE_PROJECT}_$NETWORK_NAME"
 
     if docker network inspect "$network" \
             --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null \
@@ -798,7 +914,7 @@ cmd_heal() {
     # URLs (http://fluree-N:9090/raft) resolve to the new IP.
     info "Reconnecting $host to $network..."
     docker network connect --alias "$host" "$network" "$host" >/dev/null
-    ok "$host healed. Inspect cluster with: $(basename "$0") status"
+    ok "$host healed. Inspect with: $(basename "$0") status"
 }
 
 # ============================================================================
@@ -832,9 +948,79 @@ cmd_logs() {
         docker logs "${args[@]}" "$(node_host "$node_id")"
     else
         detect_compose
-        [ -f "$COMPOSE_FILE" ] || die "No cluster running. Start one with: $(basename "$0") up"
+        [ -f "$COMPOSE_FILE" ] || die "No deployment running. Start one with: $(basename "$0") up"
         "${DOCKER_COMPOSE[@]}" -p "$COMPOSE_PROJECT" -f "$COMPOSE_FILE" logs "${args[@]}"
     fi
+}
+
+# ============================================================================
+# Subcommand: load
+# ============================================================================
+
+cmd_load() {
+    case "${1:-}" in
+        -h|--help)
+            usage_load
+            return 0
+            ;;
+        --tool-help)
+            shift
+            ensure_load_built
+            exec "$BUILD_DIR/fluree-load" --help
+            ;;
+    esac
+
+    # Computing addrs against the live compose file is the convenience
+    # — if the caller wants to point at something else they can pass
+    # their own --addrs and we leave it alone.
+    local has_addrs=0
+    for arg in "$@"; do
+        case "$arg" in
+            --addrs|--addrs=*) has_addrs=1 ;;
+        esac
+    done
+
+    local args=("$@")
+    if [ "$has_addrs" -eq 0 ]; then
+        local node_count
+        node_count="$(read_node_count)"
+        local addrs=""
+        local i
+        for i in $(seq 1 "$node_count"); do
+            local url
+            url="$(node_host_public_url "$i")"
+            if [ -z "$addrs" ]; then
+                addrs="$url"
+            else
+                addrs="$addrs,$url"
+            fi
+        done
+        args=("--addrs" "$addrs" "${args[@]}")
+    fi
+
+    ensure_load_built
+    exec "$BUILD_DIR/fluree-load" "${args[@]}"
+}
+
+ensure_load_built() {
+    local load_dir="$LOCAL_DIR/load"
+    [ -d "$load_dir" ] || die "load tool source missing at $load_dir"
+    local bin="$BUILD_DIR/fluree-load"
+    # Skip the build if the cached binary is newer than every source
+    # file. Fast no-op when the user just wants to re-run the same
+    # workload against a live deployment.
+    if [ -x "$bin" ]; then
+        local newest_src
+        newest_src=$(find "$load_dir/src" "$load_dir/Cargo.toml" -newer "$bin" 2>/dev/null | head -1)
+        if [ -z "$newest_src" ]; then
+            return 0
+        fi
+    fi
+    info "Building fluree-load (release)..."
+    ( cd "$load_dir" && cargo build --release )
+    mkdir -p "$BUILD_DIR"
+    cp "$load_dir/target/release/fluree-load" "$bin"
+    ok "fluree-load built and cached at .build/fluree-load"
 }
 
 # ============================================================================
@@ -860,6 +1046,7 @@ case "$cmd" in
     partition)      cmd_partition "$@" ;;
     heal)           cmd_heal "$@" ;;
     logs)           cmd_logs "$@" ;;
+    load)           cmd_load "$@" ;;
     help|-h|--help) cmd_help "$@" ;;
     *)              err "Unknown command: $cmd"; usage_top; exit 1 ;;
 esac
