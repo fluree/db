@@ -12,8 +12,15 @@ default = ["native"]
 native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice).
 aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws"]
-# Iceberg / R2RML graph source support (pulls in AWS SDK + native deps)
+# Iceberg / R2RML graph source support (pulls in AWS SDK + native deps).
+# Kept lean (no Arrow) so size-sensitive downstream consumers (e.g. Lambda)
+# stay small. Uses the row-based Parquet reader.
 iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+# Iceberg with the Arrow columnar reader: native predicate pushdown
+# (row-group skipping + exact row filtering). Pulls in the Arrow crate stack,
+# so it is opt-in — the server/CLI binaries built here enable it; downstream
+# library consumers keep bare `iceberg`.
+iceberg-arrow = ["iceberg", "fluree-db-iceberg/arrow"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
   "dep:fluree-db-storage-aws",

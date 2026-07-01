@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # `iceberg` already pulls in.
 default = ["server", "iceberg", "shacl", "aws"]
 server = ["dep:fluree-db-server"]
-iceberg = ["fluree-db-api/iceberg"]
+iceberg = ["fluree-db-api/iceberg-arrow"]
 aws = ["fluree-db-server/aws"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]

@@ -27,10 +27,14 @@ use crate::error::{IcebergError, Result};
 use crate::io::batch::ColumnBatch;
 use crate::io::chunk_reader::RangeBackedChunkReader;
 use crate::io::parquet::{
-    build_batch_schema, build_batch_schema_with_iceberg, build_columns_from_values,
-    build_field_id_to_column_mapping, build_projected_schema, calculate_column_chunk_ranges,
-    convert_field_to_column_value, parse_parquet_metadata_from_bytes, ColumnValue,
-    ParquetFooterCache, NULL_COLUMN_SENTINEL,
+    build_batch_schema, build_batch_schema_with_iceberg, build_field_id_to_column_mapping,
+    calculate_column_chunk_ranges, parse_parquet_metadata_from_bytes, ParquetFooterCache,
+    NULL_COLUMN_SENTINEL,
+};
+// RowIter-path decode helpers — unused when the Arrow reader is compiled in.
+#[cfg(not(feature = "arrow"))]
+use crate::io::parquet::{
+    build_columns_from_values, build_projected_schema, convert_field_to_column_value, ColumnValue,
 };
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
@@ -39,7 +43,9 @@ use crate::scan::pruning::row_group_can_contain;
 use crate::scan::FileScanTask;
 
 use parquet::file::metadata::ParquetMetaData;
+#[cfg(not(feature = "arrow"))]
 use parquet::file::reader::FileReader;
+#[cfg(not(feature = "arrow"))]
 use parquet::file::serialized_reader::SerializedFileReader;
 
 /// Parquet magic bytes (footer ends with "PAR1").
@@ -64,7 +70,7 @@ fn predicate_pushdown_enabled() -> bool {
 /// `residual`. Returns every row group (no pruning) when pushdown is disabled or
 /// there is no residual filter. Pruning is conservative — a row group is dropped
 /// only when its min/max bounds prove no row can match, so results are unchanged.
-fn surviving_row_groups(
+pub(crate) fn surviving_row_groups(
     metadata: &ParquetMetaData,
     residual: Option<&Expression>,
     iceberg_schema: Option<&Schema>,
@@ -377,6 +383,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
 
     /// Read a small file using sparse buffer approach.
     async fn read_task_small_file(&self, task: &FileScanTask) -> Result<Vec<ColumnBatch>> {
+        #[cfg(not(feature = "arrow"))]
         use parquet::record::reader::RowIter;
 
         let path = &task.data_file.file_path;
@@ -402,97 +409,116 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             .read_file_for_task(path, task, &real_column_indices, &metadata)
             .await?;
 
-        // Parse using parquet-rs
-        let reader = SerializedFileReader::new(file_bytes)
-            .map_err(|e| IcebergError::Storage(format!("Failed to read Parquet file: {e}")))?;
-
-        let metadata = reader.metadata();
-
-        // Build mapping from batch position to row position (or None for NULL columns)
-        let batch_to_row_mapping: Vec<Option<usize>> = column_indices
-            .iter()
-            .scan(0usize, |row_idx, &col_idx| {
-                if col_idx == NULL_COLUMN_SENTINEL {
-                    Some(None) // NULL column - no row data
-                } else {
-                    let current = *row_idx;
-                    *row_idx += 1;
-                    Some(Some(current)) // Real column - maps to this row position
-                }
-            })
-            .collect();
-
-        // Build a projected schema for parquet-rs to only decode needed columns
-        let projected_schema =
-            build_projected_schema(metadata.file_metadata().schema(), &real_column_indices)?;
-
-        let mut batches = Vec::new();
-
-        // Row-group pruning: skip groups whose statistics rule out the residual
-        // filter (safe — bounds only exclude non-matching rows).
-        let surviving = surviving_row_groups(
-            metadata,
-            task.residual_filter.as_ref(),
-            task.iceberg_schema.as_deref(),
-        );
-
-        // Process each surviving row group separately to emit streaming batches
-        for rg_idx in surviving {
-            let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
-                IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
-            })?;
-
-            // Create row iterator for this row group with projection
-            let row_iter =
-                RowIter::from_row_group(Some(projected_schema.clone()), row_group_reader.as_ref())
-                    .map_err(|e| {
-                        IcebergError::Storage(format!(
-                            "Failed to create row iterator for row group {rg_idx}: {e}"
-                        ))
-                    })?;
-
-            // Collect rows into columnar format
-            let num_fields = batch_schema.fields.len();
-            let estimated_rows = metadata.row_group(rg_idx).num_rows() as usize;
-            let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
-                .map(|_| Vec::with_capacity(estimated_rows))
-                .collect();
-
-            for row_result in row_iter {
-                let row = row_result
-                    .map_err(|e| IcebergError::Storage(format!("Failed to read row: {e}")))?;
-
-                // With projection, row columns come in the same order as projected schema.
-                let row_fields: Vec<_> = row.get_column_iter().map(|(_, f)| f).collect();
-
-                // Map row columns to batch positions, inserting NULLs for missing columns
-                for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
-                    let value = match batch_to_row_mapping[batch_idx] {
-                        Some(row_idx) => {
-                            // Real column - get value from row
-                            row_fields.get(row_idx).and_then(|field| {
-                                convert_field_to_column_value(field, &field_info.field_type)
-                            })
-                        }
-                        None => {
-                            // NULL column (schema evolution) - always NULL
-                            None
-                        }
-                    };
-                    column_data[batch_idx].push(value);
-                }
-            }
-
-            // Convert to Column format and create batch for this row group
-            let columns = build_columns_from_values(column_data, &batch_schema)?;
-            let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
-
-            if !batch.is_empty() {
-                batches.push(batch);
-            }
+        // Arrow reader path: decode the same range-read bytes with native
+        // projection + row-group pruning (and, in later commits, row filtering).
+        // `Bytes` is a `ChunkReader`, so it reuses the exact bytes fetched above.
+        #[cfg(feature = "arrow")]
+        {
+            let _ = (&batch_schema, &column_indices);
+            crate::io::arrow_reader::decode_batches_arrow(
+                file_bytes,
+                &task.projected_field_ids,
+                task.residual_filter.as_ref(),
+                task.iceberg_schema.as_deref(),
+            )
         }
 
-        Ok(batches)
+        // Parse using parquet-rs
+        #[cfg(not(feature = "arrow"))]
+        {
+            let reader = SerializedFileReader::new(file_bytes)
+                .map_err(|e| IcebergError::Storage(format!("Failed to read Parquet file: {e}")))?;
+
+            let metadata = reader.metadata();
+
+            // Build mapping from batch position to row position (or None for NULL columns)
+            let batch_to_row_mapping: Vec<Option<usize>> = column_indices
+                .iter()
+                .scan(0usize, |row_idx, &col_idx| {
+                    if col_idx == NULL_COLUMN_SENTINEL {
+                        Some(None) // NULL column - no row data
+                    } else {
+                        let current = *row_idx;
+                        *row_idx += 1;
+                        Some(Some(current)) // Real column - maps to this row position
+                    }
+                })
+                .collect();
+
+            // Build a projected schema for parquet-rs to only decode needed columns
+            let projected_schema =
+                build_projected_schema(metadata.file_metadata().schema(), &real_column_indices)?;
+
+            let mut batches = Vec::new();
+
+            // Row-group pruning: skip groups whose statistics rule out the residual
+            // filter (safe — bounds only exclude non-matching rows).
+            let surviving = surviving_row_groups(
+                metadata,
+                task.residual_filter.as_ref(),
+                task.iceberg_schema.as_deref(),
+            );
+
+            // Process each surviving row group separately to emit streaming batches
+            for rg_idx in surviving {
+                let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
+                    IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
+                })?;
+
+                // Create row iterator for this row group with projection
+                let row_iter = RowIter::from_row_group(
+                    Some(projected_schema.clone()),
+                    row_group_reader.as_ref(),
+                )
+                .map_err(|e| {
+                    IcebergError::Storage(format!(
+                        "Failed to create row iterator for row group {rg_idx}: {e}"
+                    ))
+                })?;
+
+                // Collect rows into columnar format
+                let num_fields = batch_schema.fields.len();
+                let estimated_rows = metadata.row_group(rg_idx).num_rows() as usize;
+                let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
+                    .map(|_| Vec::with_capacity(estimated_rows))
+                    .collect();
+
+                for row_result in row_iter {
+                    let row = row_result
+                        .map_err(|e| IcebergError::Storage(format!("Failed to read row: {e}")))?;
+
+                    // With projection, row columns come in the same order as projected schema.
+                    let row_fields: Vec<_> = row.get_column_iter().map(|(_, f)| f).collect();
+
+                    // Map row columns to batch positions, inserting NULLs for missing columns
+                    for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
+                        let value = match batch_to_row_mapping[batch_idx] {
+                            Some(row_idx) => {
+                                // Real column - get value from row
+                                row_fields.get(row_idx).and_then(|field| {
+                                    convert_field_to_column_value(field, &field_info.field_type)
+                                })
+                            }
+                            None => {
+                                // NULL column (schema evolution) - always NULL
+                                None
+                            }
+                        };
+                        column_data[batch_idx].push(value);
+                    }
+                }
+
+                // Convert to Column format and create batch for this row group
+                let columns = build_columns_from_values(column_data, &batch_schema)?;
+                let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
+
+                if !batch.is_empty() {
+                    batches.push(batch);
+                }
+            }
+
+            Ok(batches)
+        }
     }
 
     /// Read a large file, applying the disk-cache policy before falling back to
@@ -597,6 +623,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
     ) -> Result<Vec<ColumnBatch>> {
+        #[cfg(not(feature = "arrow"))]
         use parquet::record::reader::RowIter;
 
         // Run the sync parquet decoding in a blocking context
@@ -604,103 +631,124 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             // Create range-backed chunk reader
             let chunk_reader = RangeBackedChunkReader::new(storage, path, file_size, runtime);
 
-            // Parse using parquet-rs with our chunk reader
-            let reader = SerializedFileReader::new(chunk_reader)
-                .map_err(|e| IcebergError::Storage(format!("Failed to read Parquet file: {e}")))?;
-
-            let metadata = reader.metadata();
-
-            // Build schema for batch and get column indices for projected columns
-            let (batch_schema, column_indices) = if let Some(ref iceberg_schema) = iceberg_schema {
-                build_batch_schema_with_iceberg(metadata, iceberg_schema, &projected_field_ids)?
-            } else {
-                build_batch_schema(metadata, &projected_field_ids)?
-            };
-            let batch_schema = Arc::new(batch_schema);
-
-            // Separate real columns from NULL columns (schema evolution)
-            let real_column_indices: Vec<usize> = column_indices
-                .iter()
-                .copied()
-                .filter(|&idx| idx != NULL_COLUMN_SENTINEL)
-                .collect();
-
-            // Build mapping from batch position to row position
-            let batch_to_row_mapping: Vec<Option<usize>> = column_indices
-                .iter()
-                .scan(0usize, |row_idx, &col_idx| {
-                    if col_idx == NULL_COLUMN_SENTINEL {
-                        Some(None)
-                    } else {
-                        let current = *row_idx;
-                        *row_idx += 1;
-                        Some(Some(current))
-                    }
-                })
-                .collect();
-
-            // Build a projected schema for parquet-rs
-            let projected_schema =
-                build_projected_schema(metadata.file_metadata().schema(), &real_column_indices)?;
-
-            let mut batches = Vec::new();
-
-            // Row-group pruning: skip groups whose statistics rule out the
-            // residual filter. For this range-backed reader, a skipped group's
-            // column chunks are never requested, so the on-demand reads are
-            // avoided too.
-            let surviving = surviving_row_groups(
-                metadata,
-                residual_filter.as_ref(),
-                iceberg_schema.as_deref(),
-            );
-
-            // Process each surviving row group
-            for rg_idx in surviving {
-                let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
-                    IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
-                })?;
-
-                let row_iter = RowIter::from_row_group(
-                    Some(projected_schema.clone()),
-                    row_group_reader.as_ref(),
+            // Arrow reader path: native projection + row-group pruning over the
+            // same range-backed reader (skipped groups' chunks are never fetched).
+            #[cfg(feature = "arrow")]
+            {
+                crate::io::arrow_reader::decode_batches_arrow(
+                    chunk_reader,
+                    &projected_field_ids,
+                    residual_filter.as_ref(),
+                    iceberg_schema.as_deref(),
                 )
-                .map_err(|e| {
-                    IcebergError::Storage(format!("Failed to create row iterator: {e}"))
-                })?;
-
-                let num_fields = batch_schema.fields.len();
-                let estimated_rows = metadata.row_group(rg_idx).num_rows() as usize;
-                let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
-                    .map(|_| Vec::with_capacity(estimated_rows))
-                    .collect();
-
-                for row_result in row_iter {
-                    let row = row_result
-                        .map_err(|e| IcebergError::Storage(format!("Failed to read row: {e}")))?;
-
-                    let row_fields: Vec<_> = row.get_column_iter().map(|(_, f)| f).collect();
-
-                    for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
-                        let value = match batch_to_row_mapping[batch_idx] {
-                            Some(row_idx) => row_fields.get(row_idx).and_then(|field| {
-                                convert_field_to_column_value(field, &field_info.field_type)
-                            }),
-                            None => None,
-                        };
-                        column_data[batch_idx].push(value);
-                    }
-                }
-
-                let columns = build_columns_from_values(column_data, &batch_schema)?;
-                let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
-
-                if !batch.is_empty() {
-                    batches.push(batch);
-                }
             }
 
-            Ok::<Vec<ColumnBatch>, IcebergError>(batches)
+            // Parse using parquet-rs with our chunk reader
+            #[cfg(not(feature = "arrow"))]
+            {
+                let reader = SerializedFileReader::new(chunk_reader).map_err(|e| {
+                    IcebergError::Storage(format!("Failed to read Parquet file: {e}"))
+                })?;
+
+                let metadata = reader.metadata();
+
+                // Build schema for batch and get column indices for projected columns
+                let (batch_schema, column_indices) = if let Some(ref iceberg_schema) =
+                    iceberg_schema
+                {
+                    build_batch_schema_with_iceberg(metadata, iceberg_schema, &projected_field_ids)?
+                } else {
+                    build_batch_schema(metadata, &projected_field_ids)?
+                };
+                let batch_schema = Arc::new(batch_schema);
+
+                // Separate real columns from NULL columns (schema evolution)
+                let real_column_indices: Vec<usize> = column_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| idx != NULL_COLUMN_SENTINEL)
+                    .collect();
+
+                // Build mapping from batch position to row position
+                let batch_to_row_mapping: Vec<Option<usize>> = column_indices
+                    .iter()
+                    .scan(0usize, |row_idx, &col_idx| {
+                        if col_idx == NULL_COLUMN_SENTINEL {
+                            Some(None)
+                        } else {
+                            let current = *row_idx;
+                            *row_idx += 1;
+                            Some(Some(current))
+                        }
+                    })
+                    .collect();
+
+                // Build a projected schema for parquet-rs
+                let projected_schema = build_projected_schema(
+                    metadata.file_metadata().schema(),
+                    &real_column_indices,
+                )?;
+
+                let mut batches = Vec::new();
+
+                // Row-group pruning: skip groups whose statistics rule out the
+                // residual filter. For this range-backed reader, a skipped group's
+                // column chunks are never requested, so the on-demand reads are
+                // avoided too.
+                let surviving = surviving_row_groups(
+                    metadata,
+                    residual_filter.as_ref(),
+                    iceberg_schema.as_deref(),
+                );
+
+                // Process each surviving row group
+                for rg_idx in surviving {
+                    let row_group_reader = reader.get_row_group(rg_idx).map_err(|e| {
+                        IcebergError::Storage(format!("Failed to get row group {rg_idx}: {e}"))
+                    })?;
+
+                    let row_iter = RowIter::from_row_group(
+                        Some(projected_schema.clone()),
+                        row_group_reader.as_ref(),
+                    )
+                    .map_err(|e| {
+                        IcebergError::Storage(format!("Failed to create row iterator: {e}"))
+                    })?;
+
+                    let num_fields = batch_schema.fields.len();
+                    let estimated_rows = metadata.row_group(rg_idx).num_rows() as usize;
+                    let mut column_data: Vec<Vec<Option<ColumnValue>>> = (0..num_fields)
+                        .map(|_| Vec::with_capacity(estimated_rows))
+                        .collect();
+
+                    for row_result in row_iter {
+                        let row = row_result.map_err(|e| {
+                            IcebergError::Storage(format!("Failed to read row: {e}"))
+                        })?;
+
+                        let row_fields: Vec<_> = row.get_column_iter().map(|(_, f)| f).collect();
+
+                        for (batch_idx, field_info) in batch_schema.fields.iter().enumerate() {
+                            let value = match batch_to_row_mapping[batch_idx] {
+                                Some(row_idx) => row_fields.get(row_idx).and_then(|field| {
+                                    convert_field_to_column_value(field, &field_info.field_type)
+                                }),
+                                None => None,
+                            };
+                            column_data[batch_idx].push(value);
+                        }
+                    }
+
+                    let columns = build_columns_from_values(column_data, &batch_schema)?;
+                    let batch = ColumnBatch::new(Arc::clone(&batch_schema), columns)?;
+
+                    if !batch.is_empty() {
+                        batches.push(batch);
+                    }
+                }
+
+                Ok::<Vec<ColumnBatch>, IcebergError>(batches)
+            }
         })
         .await
         .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?;
@@ -860,7 +908,7 @@ mod tests {
 
     /// In-memory source store standing in for S3, used to prove the local-cache
     /// fallback reads from source when the cache file is gone.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct InMemorySource {
         bytes: Bytes,
     }
@@ -1008,5 +1056,185 @@ mod tests {
             b"URC"
         );
         assert_eq!(&storage.read("ignored").await.unwrap()[..], b"SOURCEDATA");
+    }
+
+    /// A multi-type, multi-row-group Parquet file with nulls. Non-Iceberg (no
+    /// field-id metadata), so `build_batch_schema` assigns field_id = column
+    /// index: id=0, name=1, age=2, active=3, bday=4.
+    fn multitype_parquet() -> Bytes {
+        use parquet::data_type::{BoolType, ByteArray, ByteArrayType, Int32Type, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = "
+            message schema {
+              OPTIONAL INT64 id;
+              OPTIONAL BYTE_ARRAY name (UTF8);
+              OPTIONAL INT32 age;
+              OPTIONAL BOOLEAN active;
+              OPTIONAL INT32 bday (DATE);
+            }";
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+
+            // Row group 1: two rows; name is null in row 2.
+            {
+                let mut rg = writer.next_row_group().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int64Type>()
+                    .write_batch(&[1, 2], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<ByteArrayType>()
+                    .write_batch(&[ByteArray::from("alice")], Some(&[1, 0]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[10, 20], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<BoolType>()
+                    .write_batch(&[true, false], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[100, 200], Some(&[1, 1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                rg.close().unwrap();
+            }
+
+            // Row group 2: one row; age is null.
+            {
+                let mut rg = writer.next_row_group().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int64Type>()
+                    .write_batch(&[3], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<ByteArrayType>()
+                    .write_batch(&[ByteArray::from("carol")], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[], Some(&[0]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<BoolType>()
+                    .write_batch(&[true], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                let mut c = rg.next_column().unwrap().unwrap();
+                c.typed::<Int32Type>()
+                    .write_batch(&[300], Some(&[1]), None)
+                    .unwrap();
+                c.close().unwrap();
+                rg.close().unwrap();
+            }
+
+            writer.close().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// Flatten a decoded column across all batches (Arrow emits one batch of 3
+    /// rows; RowIter emits one per row group) into a single row-ordered vector.
+    fn flatten<'a, T: Clone + 'a>(
+        batches: &'a [ColumnBatch],
+        field_id: i32,
+        extract: impl Fn(&'a crate::io::batch::Column) -> &'a [Option<T>],
+    ) -> Vec<Option<T>> {
+        let mut out = Vec::new();
+        for b in batches {
+            let col = b
+                .column_by_id(field_id)
+                .unwrap_or_else(|| panic!("missing field {field_id}"));
+            out.extend(extract(col).iter().cloned());
+        }
+        out
+    }
+
+    /// End-to-end decode round-trip. Asserts the exact decoded values so the
+    /// result is identical whether the RowIter path (`aws`) or the Arrow path
+    /// (`aws,arrow`) is compiled in — this is the byte-identical parity guard.
+    #[tokio::test]
+    async fn read_task_decodes_all_types_with_nulls_across_row_groups() {
+        use crate::io::batch::Column;
+        use crate::scan::planner::FileScanTask;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let mut data_file = crate::manifest::DataFile {
+            file_path: "mem://multitype.parquet".to_string(),
+            file_format: crate::manifest::FileFormat::Parquet,
+            record_count: 3,
+            file_size_in_bytes: bytes.len() as i64,
+            partition: crate::manifest::PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        data_file.file_size_in_bytes = bytes.len() as i64;
+
+        // Empty projection => all columns.
+        let task = FileScanTask::for_whole_file(data_file, vec![], None);
+
+        let reader = SendParquetReader::new(&source);
+        let batches = reader.read_task(&task).await.expect("decode");
+
+        let total: usize = batches.iter().map(|b| b.num_rows).sum();
+        assert_eq!(total, 3, "expected 3 rows across all batches");
+
+        let ids = flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        assert_eq!(ids, vec![Some(1), Some(2), Some(3)]);
+
+        let names = flatten(&batches, 1, |c| match c {
+            Column::String(v) => v.as_slice(),
+            _ => panic!("name not String"),
+        });
+        assert_eq!(
+            names,
+            vec![Some("alice".to_string()), None, Some("carol".to_string())]
+        );
+
+        let ages = flatten(&batches, 2, |c| match c {
+            Column::Int32(v) => v.as_slice(),
+            _ => panic!("age not Int32"),
+        });
+        assert_eq!(ages, vec![Some(10), Some(20), None]);
+
+        let active = flatten(&batches, 3, |c| match c {
+            Column::Boolean(v) => v.as_slice(),
+            _ => panic!("active not Boolean"),
+        });
+        assert_eq!(active, vec![Some(true), Some(false), Some(true)]);
+
+        // INT32 + (DATE) logical annotation decodes as Date (days since epoch).
+        let bday = flatten(&batches, 4, |c| match c {
+            Column::Date(v) => v.as_slice(),
+            _ => panic!("bday not Date"),
+        });
+        assert_eq!(bday, vec![Some(100), Some(200), Some(300)]);
     }
 }
