@@ -146,7 +146,7 @@ impl ClusterClient {
         let idx = self.pick_target();
         let url = self.build_url(idx, op);
 
-        let res = self.http.post(url).json(&op.body).send().await;
+        let res = self.build_request(url, op).send().await;
         let outcome = match res {
             Ok(resp) => self.classify_response(resp).await,
             Err(e) => classify_send_error(&e),
@@ -162,7 +162,7 @@ impl ClusterClient {
             self.record_outcome(idx, outcome);
             let retry_idx = self.pick_target();
             let retry_url = self.build_url(retry_idx, op);
-            match self.http.post(retry_url).json(&op.body).send().await {
+            match self.build_request(retry_url, op).send().await {
                 Ok(resp) => {
                     let o = self.classify_response(resp).await;
                     self.record_outcome(retry_idx, o);
@@ -180,6 +180,17 @@ impl ClusterClient {
         };
 
         outcome
+    }
+
+    /// Assemble the request builder from an op. Consolidates the
+    /// two places we dispatch (first attempt + leader-change retry)
+    /// so the header set stays consistent.
+    fn build_request(&self, url: Url, op: &Op) -> reqwest::RequestBuilder {
+        let mut req = self.http.post(url).json(&op.body);
+        if let Some(key) = &op.idempotency_key {
+            req = req.header("Idempotency-Key", key);
+        }
+        req
     }
 
     fn build_url(&self, idx: usize, op: &Op) -> Url {

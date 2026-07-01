@@ -14,6 +14,44 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use ulid::Ulid;
 
+/// Whether the workload attaches an `Idempotency-Key` HTTP header to
+/// its write requests, and how. Read ops (`Query`) and `CreateLedger`
+/// don't carry keys either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyMode {
+    /// No key sent. Every request goes through the full Raft
+    /// propose → apply cycle. Baseline for measuring raw consensus
+    /// throughput.
+    Anonymous,
+    /// A fresh key per request (no repeats within the run). Exercises
+    /// the keyed-happy-path: `CachingCommitter` records each outcome,
+    /// the state machine writes an `ApplyRecord`, but nothing ever
+    /// dedups. Isolates the overhead of idempotency accounting.
+    Unique,
+    /// Keys drawn round-robin from a fixed pool of size
+    /// `idempotency_pool_size`. Same pool slot always emits the same
+    /// body (derived from `idx % pool_size`), so repeats trigger the
+    /// dedup path — `CachingCommitter`'s moka cache on the leader,
+    /// or the replicated `ApplyRecord` after a leader transition.
+    /// First `pool_size` ops per ledger fill the cache; the rest hit
+    /// it.
+    Pooled,
+}
+
+impl FromStr for IdempotencyMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "anonymous" => Ok(Self::Anonymous),
+            "unique" => Ok(Self::Unique),
+            "pooled" => Ok(Self::Pooled),
+            other => Err(format!(
+                "unknown idempotency mode: {other} (try: anonymous, unique, pooled)"
+            )),
+        }
+    }
+}
+
 /// Named workload shapes. See `--help` on the binary or the README
 /// for the per-shape semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +71,13 @@ pub enum WorkloadShape {
     /// and stays available during chaos even when writes are
     /// refusing.
     QueryOnly,
+    /// Interleaved reads + writes against ledgers the runner expects
+    /// to exist already: 1 in `mixed_write_every` ops is a transact,
+    /// the rest are queries. Exercises read/write concurrency on the
+    /// same ledger — query-time cache refresh while writes advance
+    /// heads, read availability during commit staging, and
+    /// query behavior during chaos with real ongoing write load.
+    MixedRw,
     /// Schedule [`WideFanoutTuning::target_ledger_count`] CreateLedger
     /// ops over the run, interleaved with transacts against whichever
     /// ledgers have landed. Exercises per-branch work queues and
@@ -52,11 +97,12 @@ impl FromStr for WorkloadShape {
             "create-only" => Ok(Self::CreateOnly),
             "transact-only" => Ok(Self::TransactOnly),
             "query-only" => Ok(Self::QueryOnly),
+            "mixed-rw" => Ok(Self::MixedRw),
             "wide-fanout" => Ok(Self::WideFanout),
             "multitenant" => Ok(Self::Multitenant),
             other => Err(format!(
                 "unknown workload: {other} (try: single-pound, create-only, \
-                 transact-only, query-only, wide-fanout, multitenant)"
+                 transact-only, query-only, mixed-rw, wide-fanout, multitenant)"
             )),
         }
     }
@@ -77,13 +123,26 @@ pub struct WorkloadTuning {
     /// transacts. Independent of total — the rate of new ledgers is
     /// implicitly throttled by the op rate.
     pub multitenant_create_every: u64,
+    /// `mixed-rw`: every Nth op is a transact; the rest are queries.
+    /// Default 5 gives roughly 20% writes / 80% reads — enough
+    /// write load to keep the consensus path busy without drowning
+    /// the query side.
+    pub mixed_write_every: u64,
+    /// How idempotency keys are (or aren't) attached to write ops.
+    /// See [`IdempotencyMode`] for the per-mode semantics.
+    pub idempotency_mode: IdempotencyMode,
+    /// `IdempotencyMode::Pooled`: the number of distinct
+    /// (key, body) pairs the workload rotates through. First
+    /// `idempotency_pool_size` ops per ledger populate the cache;
+    /// subsequent ops hit it.
+    pub idempotency_pool_size: u64,
     /// Prefix used when generating ledger names. Combined with a
     /// ULID for the suffix so collisions across runs are impossible.
     pub ledger_prefix: String,
-    /// `transact-only` / `query-only`: ledger names the workload
-    /// assumes already exist. The workload picks from this list
-    /// round-robin. Empty is an error at CLI-parse time for those
-    /// two shapes.
+    /// `transact-only` / `query-only` / `mixed-rw`: ledger names the
+    /// workload assumes already exist. The workload picks from this
+    /// list round-robin. Empty is an error at CLI-parse time for
+    /// those shapes.
     pub seeded_ledgers: Vec<String>,
 }
 
@@ -93,6 +152,9 @@ impl Default for WorkloadTuning {
             target_ledger_count: 50,
             wide_fanout_create_every: 50,
             multitenant_create_every: 100,
+            mixed_write_every: 5,
+            idempotency_mode: IdempotencyMode::Anonymous,
+            idempotency_pool_size: 100,
             ledger_prefix: "load".to_string(),
             seeded_ledgers: Vec::new(),
         }
@@ -148,6 +210,7 @@ impl Workload {
             WorkloadShape::CreateOnly => Some(self.gen_create(idx)),
             WorkloadShape::TransactOnly => self.next_transact_against_pool(idx),
             WorkloadShape::QueryOnly => self.next_query_against_pool(idx),
+            WorkloadShape::MixedRw => self.next_mixed_rw(idx),
             WorkloadShape::WideFanout => self.next_wide_fanout(idx),
             WorkloadShape::Multitenant => self.next_multitenant(idx),
         }
@@ -195,6 +258,16 @@ impl Workload {
         Some(self.gen_query(ledger))
     }
 
+    fn next_mixed_rw(&self, idx: u64) -> Option<Op> {
+        let write_every = self.tuning.mixed_write_every.max(1);
+        let ledger = self.ledgers.pick(idx as usize)?;
+        if idx.is_multiple_of(write_every) {
+            Some(self.gen_transact(idx, ledger))
+        } else {
+            Some(self.gen_query(ledger))
+        }
+    }
+
     fn gen_create(&self, idx: u64) -> Op {
         let name = self.ledger_name(idx);
         let body = json!({ "ledger": name });
@@ -202,19 +275,28 @@ impl Workload {
             kind: OpKind::CreateLedger,
             ledger: name,
             body,
+            // The Committer trait has no `create_ledger` method, so
+            // idempotency keys don't apply to this op even in
+            // `unique` / `pooled` modes.
+            idempotency_key: None,
         }
     }
 
     fn gen_transact(&self, idx: u64, ledger: String) -> Op {
-        // Per-request unique IRI so concurrent transacts don't collide
-        // on NamespaceConflict and so the body hash is distinct from
-        // any other request (no idempotency-cache short-circuit when
-        // no key is set).
-        let subject_id = format!("http://load.fluree/{}/s{}", self.run_id, idx);
+        // Body seed varies by idempotency mode. Anonymous / unique
+        // use `idx` directly so every request emits a distinct IRI
+        // (no NamespaceConflict). Pooled uses `idx % pool_size` so
+        // the same key always emits the same body — required for
+        // dedup to trigger rather than surfacing `KeyCollision`.
+        let body_seed = match self.tuning.idempotency_mode {
+            IdempotencyMode::Anonymous | IdempotencyMode::Unique => idx,
+            IdempotencyMode::Pooled => idx % self.tuning.idempotency_pool_size.max(1),
+        };
+        let subject_id = format!("http://load.fluree/{}/s{}", self.run_id, body_seed);
         let body = json!({
             "@graph": [{
                 "@id": subject_id,
-                "http://load.fluree/idx": idx,
+                "http://load.fluree/idx": body_seed,
                 "http://load.fluree/run": self.run_id,
             }]
         });
@@ -222,6 +304,7 @@ impl Workload {
             kind: OpKind::Transact,
             ledger,
             body,
+            idempotency_key: self.idempotency_key_for(idx),
         }
     }
 
@@ -248,6 +331,22 @@ impl Workload {
             kind: OpKind::Query,
             ledger,
             body,
+            idempotency_key: None,
+        }
+    }
+
+    /// Idempotency key for a write op at index `idx`, per the
+    /// configured mode. Keys are prefixed with the run id so
+    /// concurrent runs against the same cluster don't collide, and
+    /// stay well under the `MAX_IDEMPOTENCY_KEY_LEN` cap (128 bytes).
+    fn idempotency_key_for(&self, idx: u64) -> Option<String> {
+        match self.tuning.idempotency_mode {
+            IdempotencyMode::Anonymous => None,
+            IdempotencyMode::Unique => Some(format!("load-{}-u{}", self.run_id, idx)),
+            IdempotencyMode::Pooled => {
+                let slot = idx % self.tuning.idempotency_pool_size.max(1);
+                Some(format!("load-{}-p{}", self.run_id, slot))
+            }
         }
     }
 

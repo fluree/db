@@ -28,7 +28,7 @@ use crate::client::ClusterClient;
 use crate::ledger_state::LedgerState;
 use crate::metrics::Metrics;
 use crate::runner::{RunnerConfig, StopCondition};
-use crate::workload::{Workload, WorkloadShape, WorkloadTuning};
+use crate::workload::{IdempotencyMode, Workload, WorkloadShape, WorkloadTuning};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +100,25 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     multitenant_create_every: u64,
 
+    /// `mixed-rw`: every Nth op is a transact; the rest are queries.
+    /// Default 5 → 1 write per 5 ops (roughly 20% writes / 80% reads).
+    #[arg(long, default_value_t = 5)]
+    mixed_write_every: u64,
+
+    /// Whether write ops attach an `Idempotency-Key` header.
+    /// `anonymous` (default): no key, every request through consensus.
+    /// `unique`: fresh key per request, exercises the keyed-happy path.
+    /// `pooled`: keys rotate through a fixed pool with body derived
+    /// from the pool slot, exercises the cache-hit dedup path.
+    #[arg(long, default_value = "anonymous", value_parser = parse_idempotency_mode)]
+    idempotency_mode: IdempotencyMode,
+
+    /// `--idempotency-mode pooled`: pool size (distinct (key, body)
+    /// pairs the workload rotates through). First N ops per ledger
+    /// populate the cache; the rest dedup against it.
+    #[arg(long, default_value_t = 100)]
+    idempotency_pool_size: u64,
+
     /// Prefix used for generated ledger names. Run-id (a ULID) is
     /// appended automatically so concurrent runs against the same
     /// cluster never collide.
@@ -126,6 +145,10 @@ struct Cli {
 
 fn parse_workload_shape(s: &str) -> Result<WorkloadShape, String> {
     WorkloadShape::from_str(s)
+}
+
+fn parse_idempotency_mode(s: &str) -> Result<IdempotencyMode, String> {
+    IdempotencyMode::from_str(s)
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -169,7 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if matches!(
         cli.workload,
-        WorkloadShape::TransactOnly | WorkloadShape::QueryOnly
+        WorkloadShape::TransactOnly | WorkloadShape::QueryOnly | WorkloadShape::MixedRw
     ) && cli.seeded_ledger.is_empty()
     {
         return Err(format!(
@@ -177,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match cli.workload {
                 WorkloadShape::TransactOnly => "transact-only",
                 WorkloadShape::QueryOnly => "query-only",
+                WorkloadShape::MixedRw => "mixed-rw",
                 _ => unreachable!(),
             }
         )
@@ -204,6 +228,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             target_ledger_count: cli.target_ledger_count,
             wide_fanout_create_every: cli.wide_fanout_create_every,
             multitenant_create_every: cli.multitenant_create_every,
+            mixed_write_every: cli.mixed_write_every,
+            idempotency_mode: cli.idempotency_mode,
+            idempotency_pool_size: cli.idempotency_pool_size,
             ledger_prefix: cli.ledger_prefix,
             seeded_ledgers: cli.seeded_ledger,
         },

@@ -49,6 +49,7 @@ the per-workload tuning knobs.
 | `create-only` | Pure `CreateLedger` stream | `Command::CreateLedger` apply throughput in isolation |
 | `transact-only` | Transact against `--seeded-ledger` names; fails if missing | Pre-seeded steady-state, no creates competing |
 | `query-only` | Query against `--seeded-ledger` names; fails if missing | Local read path (no consensus), snapshot / cache-refresh behavior, read availability during chaos |
+| `mixed-rw` | Interleave: 1 in N ops is a transact, rest are queries, against `--seeded-ledger` names | Read/write concurrency on the same ledger, cache-refresh during head advance, read availability during commit staging + chaos |
 | `wide-fanout` | Creates N ledgers over the run; transacts to whichever have landed | Per-branch work queues, ownership recalc under failure, state machine growth |
 | `multitenant` | Continuous mix: 1 in N ops is a `CreateLedger`, rest transact | Multi-tenant onboarding behavior, ledger-count scaling |
 
@@ -82,6 +83,74 @@ Typical two-run pattern:
 # 2. Query it (use the ledger name single-pound printed in the top-ledgers
 #    section of the summary — the "load-<ULID>-0" one)
 ./stack load --workload query-only --seeded-ledger load-<ULID>-0 --duration 30s
+```
+
+### Idempotency mode
+
+Independent of workload shape, `--idempotency-mode` controls whether
+write ops attach an `Idempotency-Key` HTTP header and how. Queries and
+`CreateLedger` never carry keys regardless of mode (idempotency isn't
+part of their trait surface).
+
+| Mode | Behavior | What it exercises |
+|---|---|---|
+| `anonymous` (default) | No key sent | Baseline: raw consensus throughput, no cache path |
+| `unique` | Fresh key per request | Keyed-happy-path: `CachingCommitter` records outcomes and the state machine writes `ApplyRecord`s, but nothing dedups |
+| `pooled` | Keys drawn round-robin from a pool of `--idempotency-pool-size` (default 100); body derives from `idx % pool_size` so same key ⇒ same body | Cache-hit dedup path: first N ops populate the cache, subsequent ops hit it. `CachingCommitter` moka short-circuit + replicated `ApplyRecord` after leader transition |
+
+Pooled mode intentionally makes the body deterministic per pool slot
+so repeats produce `IdempotencyHit` rather than `KeyCollision`. If you
+want to test collision detection specifically, that's a separate mode
+we can add.
+
+Note the response classifier can't distinguish `IdempotencyHit` from a
+fresh `Success` — the HTTP response looks identical to the caller in
+both cases. What you'll see in pooled mode:
+- Throughput jumps once the cache is warm (dedup skips the propose)
+- The `success` outcome count keeps climbing
+- 409s show up as `client-error` if body-vs-key drift ever produces `KeyCollision` or `AlreadyInFlight`
+
+For interpretation, compare TPS between `anonymous` and `pooled` runs
+of the same workload — the delta is the cache short-circuit's win.
+
+### mixed-rw: read/write concurrency
+
+`mixed-rw` interleaves transacts and queries against the same seeded
+ledgers. Ratio is controlled by `--mixed-write-every N` (default 5,
+meaning one write per five ops, roughly 20% writes / 80% reads).
+Queries use the same body shape as `query-only`; transacts use the
+same shape as `transact-only`.
+
+The read/write balance drives what this exercises:
+
+- `--mixed-write-every 2` (50% writes) — heavy contention, worst-case
+  cache-refresh churn on the read side, tests read latency under
+  sustained head advance
+- `--mixed-write-every 5` (20% writes, default) — realistic mixed
+  service load, reads dominate, writes still push through consensus
+  every few ops
+- `--mixed-write-every 20` (5% writes) — mostly reads with occasional
+  writes; closer to a caching-tier profile
+
+Because writes and reads land on the same worker pool, `--concurrency
+N` splits attention across both. If you want independent throughput
+per side, run two `stack load` processes with different workloads
+against the same pool.
+
+Typical usage:
+
+```bash
+# 1. Seed a ledger
+./stack load --workload single-pound --duration 30s
+
+# 2. Read/write against it during chaos
+./stack load --workload mixed-rw --seeded-ledger load-<ULID>-0 \
+             --duration 5m --concurrency 32 --mixed-write-every 5 \
+             --watch-cluster http://localhost:9091
+
+# 3. In another shell, exercise the cluster
+./stack kill 2
+./stack partition 3
 ```
 
 ## Per-op outcome classes

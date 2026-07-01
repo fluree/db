@@ -17,6 +17,12 @@ pub struct Op {
     pub kind: OpKind,
     pub ledger: String,
     pub body: serde_json::Value,
+    /// Value to send in the `Idempotency-Key` HTTP header, or `None`
+    /// for anonymous submissions. Only meaningful on write ops
+    /// (`CreateLedger` / `Query` don't carry keys through the
+    /// `Committer` trait); the workload composer decides whether to
+    /// populate this per op.
+    pub idempotency_key: Option<String>,
 }
 
 /// Coarse operation taxonomy. Stays small so per-kind counter arrays
