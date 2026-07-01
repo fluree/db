@@ -7,8 +7,11 @@
 //! - **projection** via `ProjectionMask` (only the requested leaves are read),
 //! - **row-group pruning** via `with_row_groups` (skipped groups' column chunks
 //!   are never fetched — the same statistic-based pruning as the RowIter path),
-//! - **exact row filtering** via `with_row_filter` (the pushed predicate is
-//!   evaluated during decode, dropping non-matching rows before materialization).
+//! - **exact row filtering** by evaluating the pushed predicate on each decoded
+//!   `RecordBatch` and dropping non-matching rows with `filter_record_batch`.
+//!   Arrow's `with_row_filter` is deliberately NOT used: its RowSelection calls
+//!   `skip_records`, which panics in parquet-rs 54 on Snowflake's
+//!   DELTA_BINARY_PACKED integer columns.
 //!
 //! To stay byte-identical to the RowIter path, each Arrow cell is converted to
 //! the same intermediate [`ColumnValue`] the row path produces, then assembled

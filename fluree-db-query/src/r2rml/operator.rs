@@ -702,16 +702,15 @@ impl R2rmlScanOperator {
         // Under a LIMIT, cap the materialize window at the remaining budget so a
         // `LIMIT n` does not explode a full 512K-row window into bindings before
         // the first output row.
-        // Cap the window to the remaining budget only when the operator is
-        // row-preserving. With a consumed filter, the budget counts *matching*
-        // rows while a window materializes unfiltered rows, so capping by budget
-        // would starve the filter and under-return a `LIMIT n`; materialize full
-        // windows instead and let the post-filter `emitted` count stop the scan.
+        // Cap the window to the remaining LIMIT budget. This holds for a
+        // consumed filter too: the budget counts *matching* rows while a window
+        // materializes unfiltered rows, but the `next_batch` loop re-checks the
+        // post-filter `emitted` and keeps pulling more windows until the budget
+        // is met, so a bounded window can never under-return — it only avoids
+        // materializing a full window before the filter runs.
         let window_rows = match self.row_budget {
-            Some(b) if self.consumed_filter.is_none() => {
-                materialize_window_rows().min(b.saturating_sub(self.emitted).max(1))
-            }
-            _ => materialize_window_rows(),
+            Some(b) => materialize_window_rows().min(b.saturating_sub(self.emitted).max(1)),
+            None => materialize_window_rows(),
         };
 
         Ok(Some(ScanProgress {
@@ -1355,15 +1354,16 @@ impl Operator for R2rmlScanOperator {
                     columns[col_idx].push(binding);
                 }
             }
-            // Emit once a full batch is accumulated, or — for a row-preserving
-            // scan — once the LIMIT budget is met, stopping early. With a
-            // consumed filter the pre-filter count can't trigger the budget
-            // (it counts unmatched rows), so a full window is accumulated and
-            // `emitted` counts matching rows after `finalize_batch` filters.
-            let budget_met = self.consumed_filter.is_none()
-                && self
-                    .row_budget
-                    .is_some_and(|b| self.emitted + columns[0].len() >= b);
+            // Emit once a full batch is accumulated, or once the LIMIT budget is
+            // (optimistically) met. With a consumed filter the pre-filter count
+            // over-estimates matches, so this only triggers an emit *attempt* —
+            // `finalize_batch` filters and `emitted` counts the survivors; if
+            // that leaves the budget unmet the loop keeps pulling. Enabling it
+            // for the consumed case is what stops the scan after ~one window
+            // instead of accumulating a full `batch_size` before filtering.
+            let budget_met = self
+                .row_budget
+                .is_some_and(|b| self.emitted + columns[0].len() >= b);
             if columns[0].len() >= ctx.batch_size || (budget_met && !columns[0].is_empty()) {
                 // Fast path (no consumed filter): emit the accumulated columns
                 // directly, exactly as before — no extra allocation.

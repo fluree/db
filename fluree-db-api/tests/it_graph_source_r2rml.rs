@@ -3370,3 +3370,65 @@ async fn guard_limit_terminates_scan_early() {
         "without a LIMIT the whole table streams"
     );
 }
+
+/// C: a scan-local FILTER folded into the single scan must not block the LIMIT
+/// budget. `?s a Store; ?s storeId ?id . FILTER(?id != "STORE-1")` fuses into
+/// one scan that consumes the filter, so a `LIMIT 5` still reaches the scan and
+/// stops it after ~one chunk (were the filter left downstream, the filter
+/// operator would block the budget and drain all 40). The scan applies the
+/// filter itself, so `STORE-1` is dropped and, without a LIMIT, exactly one row
+/// is missing.
+#[tokio::test]
+async fn guard_consumed_filter_limit_terminates_scan_early() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    let inner = || {
+        vec![
+            type_triple(s, "http://example.org/Store"),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(p_id.clone()),
+                Term::Var(id),
+            )),
+            Pattern::Filter(Expression::ne(
+                Expression::Var(id),
+                Expression::Const(FlakeValue::String("STORE-1".to_string())),
+            )),
+        ]
+    };
+
+    // FILTER + LIMIT 5: the consumed filter lets the budget stop the scan early.
+    let limited = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows = run_store_probe(&limited, &ledger, &vars, inner(), vec![s, id], Some(5)).await;
+    assert_eq!(rows, 5, "LIMIT 5 returns exactly 5 filtered rows");
+    let limited_polls = limited.polls.load(Ordering::SeqCst);
+    assert!(
+        limited_polls <= 2,
+        "consumed FILTER + LIMIT 5 must stop early, pulled {limited_polls} of 40"
+    );
+
+    // FILTER without a LIMIT: the whole table streams and the scan drops STORE-1.
+    let full = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    let rows_full = run_store_probe(&full, &ledger, &vars, inner(), vec![s, id], None).await;
+    assert_eq!(
+        full.polls.load(Ordering::SeqCst),
+        40,
+        "without a LIMIT the whole table streams"
+    );
+    assert_eq!(rows_full, 1999, "the consumed filter drops exactly STORE-1");
+}
