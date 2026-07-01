@@ -2,6 +2,7 @@
 
 use crate::gc::{DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS};
 use async_trait::async_trait;
+use fluree_db_binary_index::LeafletCache;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -125,6 +126,18 @@ pub enum ConfiguredFulltextScope {
 pub struct ConfiguredFulltextProperty {
     pub scope: ConfiguredFulltextScope,
     pub property_iri: String,
+}
+
+/// Late-bound resolver for the shared read cache to warm on write.
+///
+/// The background indexer worker is constructed before the api's
+/// `LedgerManager` (which owns the process-shared `LeafletCache`) exists, so
+/// the api plugs in a resolver that yields that cache once it's available.
+/// Returns `None` until then — and always in separate-machine deployments,
+/// where the worker cannot reach the query server's cache.
+pub trait WarmCacheSource: std::fmt::Debug + Send + Sync {
+    /// The shared read cache to seed on write, or `None` if unavailable.
+    fn warm_cache(&self) -> Option<Arc<LeafletCache>>;
 }
 
 /// Configuration for index building
@@ -343,6 +356,17 @@ pub struct IndexerConfig {
     /// `pending_commit_cids` unset so discovery falls back to the serial walk.
     /// Used to A/B the fast path against its baseline on the same backlog.
     pub force_serial_commit_walk: bool,
+
+    /// Late-bound resolver for the shared read cache to warm on write — see
+    /// [`WarmCacheSource`].
+    ///
+    /// When it yields a cache (co-located deployments), the incremental build
+    /// seeds that cache with the leaflets it just wrote (decoded under
+    /// `ColumnSet::ALL`) so the query server's immediate read of a freshly
+    /// rewritten leaf hits the cache instead of re-reading + re-decoding from
+    /// disk. `None` (default) = off. Not build output, so excluded from config
+    /// identity.
+    pub warm_cache_source: Option<Arc<dyn WarmCacheSource>>,
 }
 
 /// Default run-sort budget: 256 MB.
@@ -387,6 +411,7 @@ impl Default for IndexerConfig {
             attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
+            warm_cache_source: None,
         }
     }
 }
@@ -422,6 +447,7 @@ impl IndexerConfig {
             attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
+            warm_cache_source: None,
         }
     }
 
@@ -450,6 +476,7 @@ impl IndexerConfig {
             attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
+            warm_cache_source: None,
         }
     }
 
@@ -478,6 +505,7 @@ impl IndexerConfig {
             attachment_events_provider: None,
             pending_commit_cids: None,
             force_serial_commit_walk: false,
+            warm_cache_source: None,
         }
     }
 
@@ -505,6 +533,14 @@ impl IndexerConfig {
         provider: Arc<dyn AttachmentEventsProvider>,
     ) -> Self {
         self.attachment_events_provider = Some(provider);
+        self
+    }
+
+    /// Attach a late-bound resolver for the shared read cache to warm on write.
+    /// Only co-located deployments plug this in; separate-machine indexers leave
+    /// it unset (they can't reach the query server's cache).
+    pub fn with_warm_cache_source(mut self, source: Arc<dyn WarmCacheSource>) -> Self {
+        self.warm_cache_source = Some(source);
         self
     }
 
