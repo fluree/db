@@ -3678,3 +3678,38 @@ async fn guard_constant_object_integer_equality() {
     let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![s], None).await;
     assert_eq!(rows, 1, "only store_key 5 matches the integer constant");
 }
+
+/// A bound (constant) subject (`<store/5> ex:storeId ?id`) is enforced by the
+/// operator: it materializes each row's subject from the template and keeps only
+/// the row whose subject IRI equals the constant, binding just the object var.
+/// The mock provider streams every row (no pruning), so exactly the one matching
+/// subject's object must come back.
+#[tokio::test]
+async fn guard_bound_subject_binds_object_only() {
+    use std::sync::atomic::AtomicUsize;
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let id = vars.get_or_insert("?id");
+    let p_id = ledger
+        .snapshot
+        .encode_iri("http://example.org/storeId")
+        .unwrap();
+    // <http://example.org/store/5> ex:storeId ?id
+    let inner = vec![Pattern::Triple(TriplePattern::new(
+        Ref::Iri("http://example.org/store/5".into()),
+        Ref::Sid(p_id),
+        Term::Var(id),
+    ))];
+
+    let provider = LimitProbeProvider {
+        mapping: Arc::new(edw_guard_mapping()),
+        chunks: store_chunks(40, 50),
+        polls: Arc::new(AtomicUsize::new(0)),
+    };
+    // Select only the object var — the constant subject binds no variable.
+    let rows = run_store_probe(&provider, &ledger, &vars, inner, vec![id], None).await;
+    assert_eq!(
+        rows, 1,
+        "only the <store/5> subject's storeId object is returned"
+    );
+}

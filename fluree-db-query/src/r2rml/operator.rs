@@ -193,9 +193,11 @@ impl R2rmlScanOperator {
         let mut schema_vars: Vec<VarId> = child_schema.to_vec();
         let mut seen: HashSet<VarId> = schema_vars.iter().copied().collect();
 
-        // Add subject variable if new
-        if seen.insert(pattern.subject_var) {
-            schema_vars.push(pattern.subject_var);
+        // Add subject variable if new (constant subjects bind no variable)
+        if let Some(subject_var) = pattern.subject_var {
+            if seen.insert(subject_var) {
+                schema_vars.push(subject_var);
+            }
         }
 
         // Add object variable if present and new
@@ -1200,6 +1202,12 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
     }
 }
 
+/// Whether a materialized subject term equals a constant (bound) subject IRI.
+/// Subject maps always produce IRIs, so a non-IRI term never matches.
+fn subject_term_matches_iri(term: &RdfTerm, want: &str) -> bool {
+    matches!(term, RdfTerm::Iri(v) if v == want)
+}
+
 /// Materialize one column batch into produced variable assignments (subject +
 /// object vars) — the per-batch unit of the parallel scan. Mirrors the previous
 /// per-row logic (star cross product, subject-only, single-object).
@@ -1220,7 +1228,25 @@ fn materialize_batch(
             Some(t) => t,
             None => continue,
         };
+
+        // Bound-subject filter (`<store/5> <pred> ?o`): keep only rows whose
+        // subject IRI equals the constant. This is the pattern's semantics,
+        // enforced regardless of any scan pushdown.
+        if let Some(want) = pattern.subject_constant.as_deref() {
+            if !subject_term_matches_iri(&subject_term, want) {
+                continue;
+            }
+        }
         let subject_binding = encoder.encode(&subject_term);
+
+        // Seed a fresh output row with the subject binding, or an empty row when
+        // the subject is a constant (which binds no variable).
+        let seed_row = || -> Vec<(VarId, Binding)> {
+            match pattern.subject_var {
+                Some(sv) => vec![(sv, subject_binding.clone())],
+                None => Vec::new(),
+            }
+        };
 
         if !pattern.star_bindings.is_empty() {
             let mut members: Vec<(VarId, &str)> = Vec::new();
@@ -1257,8 +1283,7 @@ fn materialize_batch(
                 continue;
             }
 
-            let mut rows: Vec<Vec<(VarId, Binding)>> =
-                vec![vec![(pattern.subject_var, subject_binding.clone())]];
+            let mut rows: Vec<Vec<(VarId, Binding)>> = vec![seed_row()];
             for (var, vals) in &binding_lists {
                 if vals.len() == 1 {
                     for r in &mut rows {
@@ -1304,11 +1329,11 @@ fn materialize_batch(
                     }
                 }
                 if matched {
-                    produced.push(vec![(pattern.subject_var, subject_binding)]);
+                    produced.push(seed_row());
                 }
                 continue;
             }
-            produced.push(vec![(pattern.subject_var, subject_binding)]);
+            produced.push(seed_row());
             continue;
         };
 
@@ -1322,10 +1347,9 @@ fn materialize_batch(
                 materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
             {
                 let object_binding = encoder.encode(&t);
-                produced.push(vec![
-                    (pattern.subject_var, subject_binding.clone()),
-                    (obj_var, object_binding),
-                ]);
+                let mut row = seed_row();
+                row.push((obj_var, object_binding));
+                produced.push(row);
             }
         }
     }
@@ -1610,5 +1634,22 @@ mod tests {
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b));
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b));
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("false"), &b));
+    }
+
+    #[test]
+    fn bound_subject_matching() {
+        // Subject maps always yield IRIs: exact IRI match, never a literal.
+        assert!(subject_term_matches_iri(
+            &RdfTerm::iri("http://ex/store/5"),
+            "http://ex/store/5"
+        ));
+        assert!(!subject_term_matches_iri(
+            &RdfTerm::iri("http://ex/store/50"),
+            "http://ex/store/5"
+        ));
+        assert!(!subject_term_matches_iri(
+            &RdfTerm::string("http://ex/store/5"),
+            "http://ex/store/5"
+        ));
     }
 }

@@ -91,24 +91,21 @@ pub fn rewrite_patterns_for_r2rml(
                 if let Some(r2rml_pattern) = convert_triple_to_r2rml(tp, graph_source_id, snapshot)
                 {
                     converted += 1;
-                    if is_star_eligible(&r2rml_pattern) {
-                        match star_groups
-                            .iter_mut()
-                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
-                        {
+                    // Only variable-subject patterns are grouped by shared
+                    // subject; a bound-subject pattern (subject_var = None) is
+                    // never star/class eligible and falls to standalone emit.
+                    if let Some(sv) = star_eligible_subject(&r2rml_pattern) {
+                        match star_groups.iter_mut().find(|(s, _)| *s == sv) {
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
-                                star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                                star_groups.push((sv, vec![r2rml_pattern]));
                             }
                         }
-                    } else if is_class_only(&r2rml_pattern) {
-                        match class_groups
-                            .iter_mut()
-                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
-                        {
+                    } else if let Some(sv) = class_only_subject(&r2rml_pattern) {
+                        match class_groups.iter_mut().find(|(s, _)| *s == sv) {
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
-                                class_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                                class_groups.push((sv, vec![r2rml_pattern]));
                             }
                         }
                     } else {
@@ -223,7 +220,7 @@ pub fn rewrite_patterns_for_r2rml(
                 for (var, op, value) in &pushdowns {
                     // Only object-position vars map to columns (the subject is an
                     // IRI template, not a scannable column).
-                    if *var != rp.subject_var && produced.contains(var) {
+                    if Some(*var) != rp.subject_var && produced.contains(var) {
                         rp.scan_filters.push(ScanPushdown {
                             var: *var,
                             op: *op,
@@ -436,29 +433,32 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     }
 }
 
-/// A regular-predicate R2RML pattern that can join via the subject: constant
-/// predicate, a fresh object var distinct from the subject, no class/TM filter.
-/// These are the patterns that can be merged into a same-subject star scan.
-fn is_star_eligible(p: &R2rmlPattern) -> bool {
-    p.predicate_filter.is_some()
+/// The subject var of a regular-predicate R2RML pattern that can join via the
+/// subject: variable subject, constant predicate, a fresh object var distinct
+/// from the subject, no class/TM filter. `None` (not eligible) for bound-subject
+/// patterns. These are the patterns that can be merged into a same-subject star.
+fn star_eligible_subject(p: &R2rmlPattern) -> Option<VarId> {
+    let subject_var = p.subject_var?;
+    let eligible = p.predicate_filter.is_some()
         && p.class_filter.is_none()
         && p.triples_map_iri.is_none()
         && p.star_bindings.is_empty()
-        && match p.object_var {
-            Some(obj) => obj != p.subject_var,
-            None => false,
-        }
+        && p.object_var.is_some_and(|obj| obj != subject_var);
+    eligible.then_some(subject_var)
 }
 
-/// A pure `rdf:type` pattern (`?s a ex:Class`): a class filter, no object var, no
-/// predicate, no star members. These are candidates to fuse into a same-subject
-/// star (or, failing that, to run as a subject-only scan).
-fn is_class_only(p: &R2rmlPattern) -> bool {
-    p.class_filter.is_some()
+/// The subject var of a pure `rdf:type` pattern (`?s a ex:Class`): variable
+/// subject, a class filter, no object var, no predicate, no star members. `None`
+/// (not eligible) for bound-subject patterns. Candidates to fuse into a
+/// same-subject star (or, failing that, to run as a subject-only scan).
+fn class_only_subject(p: &R2rmlPattern) -> Option<VarId> {
+    let subject_var = p.subject_var?;
+    let eligible = p.class_filter.is_some()
         && p.object_var.is_none()
         && p.predicate_filter.is_none()
         && p.triples_map_iri.is_none()
-        && p.star_bindings.is_empty()
+        && p.star_bindings.is_empty();
+    eligible.then_some(subject_var)
 }
 
 /// Fuse a subject's lone `rdf:type` into its star `base` by setting
@@ -540,14 +540,25 @@ pub fn convert_triple_to_r2rml(
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
 ) -> Option<R2rmlPattern> {
-    // Extract subject variable (must be a variable for basic R2RML support)
-    let subject_var = match &tp.s {
-        Ref::Var(v) => *v,
-        Ref::Sid(_) | Ref::Iri(_) => {
-            // Subject is bound - we could support this with a filter,
-            // but for now we return None to preserve the original pattern.
-            // The GraphOperator will handle this case differently.
-            return None;
+    // Extract the subject: a variable, or a constant (bound) IRI the operator
+    // matches against each row's materialized subject. Exactly one is set.
+    let (subject_var, subject_constant): (Option<VarId>, Option<String>) = match &tp.s {
+        Ref::Var(v) => (Some(*v), None),
+        Ref::Iri(iri) => (None, Some(iri.to_string())),
+        // A bound SID subject we cannot decode to an IRI is left unconverted.
+        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
+            Some(iri) => (None, Some(iri)),
+            None => return None,
+        },
+    };
+
+    // Build a pattern for `object_var`, carrying either the subject variable or
+    // the constant subject IRI (exactly one of the pair above is set).
+    let make_pattern = |object_var: Option<VarId>| -> R2rmlPattern {
+        match (subject_var, subject_constant.as_deref()) {
+            (Some(sv), _) => R2rmlPattern::new(graph_source_id, sv, object_var),
+            (None, Some(sc)) => R2rmlPattern::new_bound_subject(graph_source_id, sc, object_var),
+            (None, None) => unreachable!("subject is always a var or a constant IRI"),
         }
     };
 
@@ -568,7 +579,7 @@ pub fn convert_triple_to_r2rml(
 
         // For rdf:type, we create an R2RML pattern with class_filter and no object_var
         // (the type binding is implicit in the class_filter)
-        let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, None);
+        let mut pattern = make_pattern(None);
         if let Some(class_iri) = class_filter {
             pattern = pattern.with_class(class_iri);
         }
@@ -607,7 +618,7 @@ pub fn convert_triple_to_r2rml(
         _ => return None,
     };
 
-    let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, object_var);
+    let mut pattern = make_pattern(object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
     }
