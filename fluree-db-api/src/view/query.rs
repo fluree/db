@@ -371,22 +371,29 @@ impl Fluree {
         // Auto-wrap for graph source context
         maybe_wrap_for_graph_source(db, &mut parsed);
 
-        // Build executable with reasoning
-        let executable = self
-            .build_executable_for_view(db, &parsed)
+        // Build executable with reasoning.
+        //
+        // The plan-build, execution, and format futures below are each boxed
+        // before awaiting. They are deep async chains (operator trees, overlay
+        // reads, the hydration crawl), and inlining them here would make this
+        // frame — an ancestor for the whole descent — reserve stack for the
+        // largest of them, contributing to the ~2 MB worker-stack overflow on a
+        // plain `select *` query (fluree/db#1408). Boxing keeps their state on
+        // the heap so this frame stays O(1).
+        let executable = Box::pin(self.build_executable_for_view(db, &parsed))
             .await
             .map_err(|e| {
                 crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
             })?;
 
         // Execute with tracking
-        let batches = self
-            .execute_view_tracked(db, &vars, &executable, &tracker, &options)
-            .await
-            .map_err(|e| {
-                let status = query_error_to_status(&e);
-                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
-            })?;
+        let batches =
+            Box::pin(self.execute_view_tracked(db, &vars, &executable, &tracker, &options))
+                .await
+                .map_err(|e| {
+                    let status = query_error_to_status(&e);
+                    crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
+                })?;
 
         // Build result
         let query_result = build_query_result(
@@ -405,25 +412,28 @@ impl Fluree {
             format_config = crate::format::FormatterConfig::jsonld();
         }
 
-        // Format with tracking
+        // Format with tracking (boxed — the hydration crawl can itself recurse;
+        // see the note above and fluree/db#1408).
         let result_json = match db.policy() {
-            Some(policy) => query_result
-                .format_async_with_policy_tracked(
-                    db.as_graph_db_ref(),
-                    &format_config,
-                    policy,
-                    &tracker,
-                )
-                .await
-                .map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-                })?,
-            None => query_result
-                .format_async_tracked(db.as_graph_db_ref(), &format_config, &tracker)
-                .await
-                .map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
-                })?,
+            Some(policy) => Box::pin(query_result.format_async_with_policy_tracked(
+                db.as_graph_db_ref(),
+                &format_config,
+                policy,
+                &tracker,
+            ))
+            .await
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
+            })?,
+            None => Box::pin(query_result.format_async_tracked(
+                db.as_graph_db_ref(),
+                &format_config,
+                &tracker,
+            ))
+            .await
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(500, e.to_string(), tracker.tally())
+            })?,
         };
 
         Ok(crate::query::TrackedQueryResponse::success(
