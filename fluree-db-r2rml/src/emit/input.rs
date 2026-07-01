@@ -92,6 +92,45 @@ impl EmitColumn {
     }
 }
 
+/// A table's `{namespace, name}` identity — the key for [`crate::emit::EmitOptions::per_table_overrides`].
+///
+/// Mirrors PR-1's `TableIdentifier`: the same identity the input [`EmitTableSchema`]
+/// carries, so a `HashMap<TableKey, TableOverride>` keys on exactly what the
+/// emitter iterates. Case-sensitive and byte-for-byte (Snowflake folds UPPERCASE).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableKey {
+    /// Catalog namespace (e.g. `"DW"`).
+    pub namespace: String,
+    /// Table name within the namespace (e.g. `"DIM_STORE"`).
+    pub name: String,
+}
+
+impl TableKey {
+    /// Build a table key from its namespace and name parts.
+    pub fn new(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+}
+
+/// A per-table override for the subject key and/or class name (PR-1's `TableOverride`).
+///
+/// Every field is optional and additive: an all-`None` override (or no entry at
+/// all) leaves the deterministic stem-derived defaults untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableOverride {
+    /// REPLACES `identifier_field_ids` as the subject key K. The named column must
+    /// exist and still pass the `required` / `null_fraction == 0` gate (else
+    /// `NoSafeSubjectKey`); because uniqueness is unprovable metadata-only, an
+    /// override PK ALWAYS attaches a `SubjectKeyUnverified` diagnostic.
+    pub primary_key: Option<String>,
+    /// Overrides the stem-derived class name (`rr:class` local name) and the
+    /// subject-template `classSlug` for the table.
+    pub class_name: Option<String>,
+}
+
 /// A table's schema + PK hint + per-column stats — one emitter input unit.
 #[derive(Debug, Clone)]
 pub struct EmitTableSchema {
@@ -118,6 +157,14 @@ impl EmitTableSchema {
     /// The table stem (name without namespace), e.g. `"DIM_STORE"`.
     pub fn stem(&self) -> &str {
         &self.name
+    }
+
+    /// This table's `{namespace, name}` identity — its per-table-override key.
+    pub fn key(&self) -> TableKey {
+        TableKey {
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
     }
 
     /// Whether this is a fact table (`FACT_*`) — used for the child-fact→hub

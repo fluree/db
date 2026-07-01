@@ -1,0 +1,293 @@
+@base <http://mapping.fluree.dev/r2rml> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix v: <http://ns.fluree.dev/edw#> .
+
+<#DimDate> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_DATE" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/date/{DATE_KEY}" ; rr:class v:Date ] ;
+  rr:predicateObjectMap [ rr:predicate v:dateKey ; rr:objectMap [ rr:column "DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:date ; rr:objectMap [ rr:column "DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:dayOfWeek ; rr:objectMap [ rr:column "DAY_OF_WEEK" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:dayName ; rr:objectMap [ rr:column "DAY_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:dayOfMonth ; rr:objectMap [ rr:column "DAY_OF_MONTH" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:weekOfYear ; rr:objectMap [ rr:column "WEEK_OF_YEAR" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:monthNum ; rr:objectMap [ rr:column "MONTH_NUM" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:monthName ; rr:objectMap [ rr:column "MONTH_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:quarterNum ; rr:objectMap [ rr:column "QUARTER_NUM" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:yearNum ; rr:objectMap [ rr:column "YEAR_NUM" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:isWeekend ; rr:objectMap [ rr:column "IS_WEEKEND" ; rr:datatype xsd:boolean ] ] .
+
+<#DimGeography> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_GEOGRAPHY" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/geography/{GEOGRAPHY_KEY}" ; rr:class v:Geography ] ;
+  rr:predicateObjectMap [ rr:predicate v:geographyKey ; rr:objectMap [ rr:column "GEOGRAPHY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:countryCode ; rr:objectMap [ rr:column "COUNTRY_CODE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:country ; rr:objectMap [ rr:column "COUNTRY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:region ; rr:objectMap [ rr:column "REGION" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:stateProvince ; rr:objectMap [ rr:column "STATE_PROVINCE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:city ; rr:objectMap [ rr:column "CITY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:postalCode ; rr:objectMap [ rr:column "POSTAL_CODE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:latitude ; rr:objectMap [ rr:column "LATITUDE" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:longitude ; rr:objectMap [ rr:column "LONGITUDE" ; rr:datatype xsd:double ] ] .
+
+<#DimSupplier> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_SUPPLIER" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/supplier/{SUPPLIER_KEY}" ; rr:class v:Supplier ] ;
+  rr:predicateObjectMap [ rr:predicate v:supplierKey ; rr:objectMap [ rr:column "SUPPLIER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:supplierId ; rr:objectMap [ rr:column "SUPPLIER_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:supplierName ; rr:objectMap [ rr:column "SUPPLIER_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:contactEmail ; rr:objectMap [ rr:column "CONTACT_EMAIL" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:leadTimeDays ; rr:objectMap [ rr:column "LEAD_TIME_DAYS" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:rating ; rr:objectMap [ rr:column "RATING" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geographyKey ; rr:objectMap [ rr:column "GEOGRAPHY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geography ;
+    rr:objectMap [ rr:parentTriplesMap <#DimGeography> ; rr:joinCondition [ rr:child "GEOGRAPHY_KEY" ; rr:parent "GEOGRAPHY_KEY" ] ] ] .
+
+<#DimAccount> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_ACCOUNT" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/account/{ACCOUNT_KEY}" ; rr:class v:Account ] ;
+  rr:predicateObjectMap [ rr:predicate v:accountKey ; rr:objectMap [ rr:column "ACCOUNT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:accountId ; rr:objectMap [ rr:column "ACCOUNT_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:accountName ; rr:objectMap [ rr:column "ACCOUNT_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:industry ; rr:objectMap [ rr:column "INDUSTRY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:employeeCount ; rr:objectMap [ rr:column "EMPLOYEE_COUNT" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:annualRevenue ; rr:objectMap [ rr:column "ANNUAL_REVENUE" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:tier ; rr:objectMap [ rr:column "TIER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:createdDate ; rr:objectMap [ rr:column "CREATED_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geographyKey ; rr:objectMap [ rr:column "GEOGRAPHY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geography ;
+    rr:objectMap [ rr:parentTriplesMap <#DimGeography> ; rr:joinCondition [ rr:child "GEOGRAPHY_KEY" ; rr:parent "GEOGRAPHY_KEY" ] ] ] .
+
+<#DimEmployee> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_EMPLOYEE" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/employee/{EMPLOYEE_KEY}" ; rr:class v:Employee ] ;
+  rr:predicateObjectMap [ rr:predicate v:employeeKey ; rr:objectMap [ rr:column "EMPLOYEE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:employeeId ; rr:objectMap [ rr:column "EMPLOYEE_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:fullName ; rr:objectMap [ rr:column "FULL_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:email ; rr:objectMap [ rr:column "EMAIL" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:role ; rr:objectMap [ rr:column "ROLE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:department ; rr:objectMap [ rr:column "DEPARTMENT" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:hireDate ; rr:objectMap [ rr:column "HIRE_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:isActive ; rr:objectMap [ rr:column "IS_ACTIVE" ; rr:datatype xsd:boolean ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeKey ; rr:objectMap [ rr:column "STORE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:managerKey ; rr:objectMap [ rr:column "MANAGER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:store ;
+    rr:objectMap [ rr:parentTriplesMap <#DimStore> ; rr:joinCondition [ rr:child "STORE_KEY" ; rr:parent "STORE_KEY" ] ] ] .
+
+<#DimStore> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_STORE" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/store/{STORE_KEY}" ; rr:class v:Store ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeKey ; rr:objectMap [ rr:column "STORE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeId ; rr:objectMap [ rr:column "STORE_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeName ; rr:objectMap [ rr:column "STORE_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:channel ; rr:objectMap [ rr:column "CHANNEL" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeType ; rr:objectMap [ rr:column "STORE_TYPE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:openDate ; rr:objectMap [ rr:column "OPEN_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geographyKey ; rr:objectMap [ rr:column "GEOGRAPHY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:regionManagerKey ; rr:objectMap [ rr:column "REGION_MANAGER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geography ;
+    rr:objectMap [ rr:parentTriplesMap <#DimGeography> ; rr:joinCondition [ rr:child "GEOGRAPHY_KEY" ; rr:parent "GEOGRAPHY_KEY" ] ] ] .
+
+<#DimCustomer> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_CUSTOMER" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/customer/{CUSTOMER_KEY}" ; rr:class v:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate v:customerKey ; rr:objectMap [ rr:column "CUSTOMER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customerId ; rr:objectMap [ rr:column "CUSTOMER_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:fullName ; rr:objectMap [ rr:column "FULL_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:email ; rr:objectMap [ rr:column "EMAIL" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:phone ; rr:objectMap [ rr:column "PHONE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:segment ; rr:objectMap [ rr:column "SEGMENT" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:gender ; rr:objectMap [ rr:column "GENDER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:birthYear ; rr:objectMap [ rr:column "BIRTH_YEAR" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:signupDate ; rr:objectMap [ rr:column "SIGNUP_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:scdValidFrom ; rr:objectMap [ rr:column "SCD_VALID_FROM" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:scdValidTo ; rr:objectMap [ rr:column "SCD_VALID_TO" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:isCurrent ; rr:objectMap [ rr:column "IS_CURRENT" ; rr:datatype xsd:boolean ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geographyKey ; rr:objectMap [ rr:column "GEOGRAPHY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:accountKey ; rr:objectMap [ rr:column "ACCOUNT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:geography ;
+    rr:objectMap [ rr:parentTriplesMap <#DimGeography> ; rr:joinCondition [ rr:child "GEOGRAPHY_KEY" ; rr:parent "GEOGRAPHY_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:account ;
+    rr:objectMap [ rr:parentTriplesMap <#DimAccount> ; rr:joinCondition [ rr:child "ACCOUNT_KEY" ; rr:parent "ACCOUNT_KEY" ] ] ] .
+
+<#DimProduct> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.DIM_PRODUCT" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/product/{PRODUCT_KEY}" ; rr:class v:Product ] ;
+  rr:predicateObjectMap [ rr:predicate v:productKey ; rr:objectMap [ rr:column "PRODUCT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:productId ; rr:objectMap [ rr:column "PRODUCT_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:productName ; rr:objectMap [ rr:column "PRODUCT_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:brand ; rr:objectMap [ rr:column "BRAND" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:category ; rr:objectMap [ rr:column "CATEGORY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:subcategory ; rr:objectMap [ rr:column "SUBCATEGORY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:department ; rr:objectMap [ rr:column "DEPARTMENT" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:unitCost ; rr:objectMap [ rr:column "UNIT_COST" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:listPrice ; rr:objectMap [ rr:column "LIST_PRICE" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:isCurrent ; rr:objectMap [ rr:column "IS_CURRENT" ; rr:datatype xsd:boolean ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:supplierKey ; rr:objectMap [ rr:column "SUPPLIER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:supplier ;
+    rr:objectMap [ rr:parentTriplesMap <#DimSupplier> ; rr:joinCondition [ rr:child "SUPPLIER_KEY" ; rr:parent "SUPPLIER_KEY" ] ] ] .
+
+<#FactOrder> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_ORDER" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/order/{ORDER_KEY}" ; rr:class v:Order ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderKey ; rr:objectMap [ rr:column "ORDER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderId ; rr:objectMap [ rr:column "ORDER_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderStatus ; rr:objectMap [ rr:column "ORDER_STATUS" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderChannel ; rr:objectMap [ rr:column "ORDER_CHANNEL" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderTotal ; rr:objectMap [ rr:column "ORDER_TOTAL" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:currency ; rr:objectMap [ rr:column "CURRENCY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderDate ; rr:objectMap [ rr:column "ORDER_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customerKey ; rr:objectMap [ rr:column "CUSTOMER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:accountKey ; rr:objectMap [ rr:column "ACCOUNT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeKey ; rr:objectMap [ rr:column "STORE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:salesRepKey ; rr:objectMap [ rr:column "SALES_REP_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderDateKey ; rr:objectMap [ rr:column "ORDER_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customer ;
+    rr:objectMap [ rr:parentTriplesMap <#DimCustomer> ; rr:joinCondition [ rr:child "CUSTOMER_KEY" ; rr:parent "CUSTOMER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:account ;
+    rr:objectMap [ rr:parentTriplesMap <#DimAccount> ; rr:joinCondition [ rr:child "ACCOUNT_KEY" ; rr:parent "ACCOUNT_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:store ;
+    rr:objectMap [ rr:parentTriplesMap <#DimStore> ; rr:joinCondition [ rr:child "STORE_KEY" ; rr:parent "STORE_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "ORDER_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
+
+<#FactOrderLine> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_ORDER_LINE" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/order-line/{ORDER_LINE_KEY}" ; rr:class v:OrderLine ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderLineKey ; rr:objectMap [ rr:column "ORDER_LINE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:lineNumber ; rr:objectMap [ rr:column "LINE_NUMBER" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:quantity ; rr:objectMap [ rr:column "QUANTITY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:unitPrice ; rr:objectMap [ rr:column "UNIT_PRICE" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:discountPct ; rr:objectMap [ rr:column "DISCOUNT_PCT" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:extendedAmount ; rr:objectMap [ rr:column "EXTENDED_AMOUNT" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderDate ; rr:objectMap [ rr:column "ORDER_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderKey ; rr:objectMap [ rr:column "ORDER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:productKey ; rr:objectMap [ rr:column "PRODUCT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:order ;
+    rr:objectMap [ rr:parentTriplesMap <#FactOrder> ; rr:joinCondition [ rr:child "ORDER_KEY" ; rr:parent "ORDER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:product ;
+    rr:objectMap [ rr:parentTriplesMap <#DimProduct> ; rr:joinCondition [ rr:child "PRODUCT_KEY" ; rr:parent "PRODUCT_KEY" ] ] ] .
+
+<#FactInventorySnapshot> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_INVENTORY_SNAPSHOT" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/inventory-snapshot/{INVENTORY_KEY}" ; rr:class v:InventorySnapshot ] ;
+  rr:predicateObjectMap [ rr:predicate v:inventoryKey ; rr:objectMap [ rr:column "INVENTORY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:snapshotDate ; rr:objectMap [ rr:column "SNAPSHOT_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:onHandQty ; rr:objectMap [ rr:column "ON_HAND_QTY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:reservedQty ; rr:objectMap [ rr:column "RESERVED_QTY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:reorderPoint ; rr:objectMap [ rr:column "REORDER_POINT" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:unitsOnOrder ; rr:objectMap [ rr:column "UNITS_ON_ORDER" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:productKey ; rr:objectMap [ rr:column "PRODUCT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:storeKey ; rr:objectMap [ rr:column "STORE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:snapshotDateKey ; rr:objectMap [ rr:column "SNAPSHOT_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:product ;
+    rr:objectMap [ rr:parentTriplesMap <#DimProduct> ; rr:joinCondition [ rr:child "PRODUCT_KEY" ; rr:parent "PRODUCT_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:store ;
+    rr:objectMap [ rr:parentTriplesMap <#DimStore> ; rr:joinCondition [ rr:child "STORE_KEY" ; rr:parent "STORE_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:snapshotDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "SNAPSHOT_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
+
+<#FactShipment> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_SHIPMENT" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/shipment/{SHIPMENT_KEY}" ; rr:class v:Shipment ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipmentKey ; rr:objectMap [ rr:column "SHIPMENT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipmentId ; rr:objectMap [ rr:column "SHIPMENT_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipDate ; rr:objectMap [ rr:column "SHIP_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:carrier ; rr:objectMap [ rr:column "CARRIER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipMethod ; rr:objectMap [ rr:column "SHIP_METHOD" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipStatus ; rr:objectMap [ rr:column "SHIP_STATUS" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:trackingNumber ; rr:objectMap [ rr:column "TRACKING_NUMBER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipCost ; rr:objectMap [ rr:column "SHIP_COST" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderKey ; rr:objectMap [ rr:column "ORDER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:destGeographyKey ; rr:objectMap [ rr:column "DEST_GEOGRAPHY_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipDateKey ; rr:objectMap [ rr:column "SHIP_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:order ;
+    rr:objectMap [ rr:parentTriplesMap <#FactOrder> ; rr:joinCondition [ rr:child "ORDER_KEY" ; rr:parent "ORDER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:destGeography ;
+    rr:objectMap [ rr:parentTriplesMap <#DimGeography> ; rr:joinCondition [ rr:child "DEST_GEOGRAPHY_KEY" ; rr:parent "GEOGRAPHY_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:shipDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "SHIP_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
+
+<#FactPayment> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_PAYMENT" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/payment/{PAYMENT_KEY}" ; rr:class v:Payment ] ;
+  rr:predicateObjectMap [ rr:predicate v:paymentKey ; rr:objectMap [ rr:column "PAYMENT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:paymentId ; rr:objectMap [ rr:column "PAYMENT_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:paymentDate ; rr:objectMap [ rr:column "PAYMENT_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:tenderType ; rr:objectMap [ rr:column "TENDER_TYPE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:amount ; rr:objectMap [ rr:column "AMOUNT" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:currency ; rr:objectMap [ rr:column "CURRENCY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:paymentStatus ; rr:objectMap [ rr:column "PAYMENT_STATUS" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:orderKey ; rr:objectMap [ rr:column "ORDER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customerKey ; rr:objectMap [ rr:column "CUSTOMER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:paymentDateKey ; rr:objectMap [ rr:column "PAYMENT_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:order ;
+    rr:objectMap [ rr:parentTriplesMap <#FactOrder> ; rr:joinCondition [ rr:child "ORDER_KEY" ; rr:parent "ORDER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customer ;
+    rr:objectMap [ rr:parentTriplesMap <#DimCustomer> ; rr:joinCondition [ rr:child "CUSTOMER_KEY" ; rr:parent "CUSTOMER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:paymentDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "PAYMENT_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
+
+<#FactGlJournal> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_GL_JOURNAL" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/gl-journal/{JOURNAL_KEY}" ; rr:class v:GlJournal ] ;
+  rr:predicateObjectMap [ rr:predicate v:journalKey ; rr:objectMap [ rr:column "JOURNAL_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:journalId ; rr:objectMap [ rr:column "JOURNAL_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:postingDate ; rr:objectMap [ rr:column "POSTING_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:glAccountCode ; rr:objectMap [ rr:column "GL_ACCOUNT_CODE" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:glAccountName ; rr:objectMap [ rr:column "GL_ACCOUNT_NAME" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:costCenter ; rr:objectMap [ rr:column "COST_CENTER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:debitAmount ; rr:objectMap [ rr:column "DEBIT_AMOUNT" ; rr:datatype xsd:decimal ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:creditAmount ; rr:objectMap [ rr:column "CREDIT_AMOUNT" ; rr:datatype xsd:decimal ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:currency ; rr:objectMap [ rr:column "CURRENCY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:sourceModule ; rr:objectMap [ rr:column "SOURCE_MODULE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:postingDateKey ; rr:objectMap [ rr:column "POSTING_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:postingDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "POSTING_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
+
+<#FactWebEvent> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_WEB_EVENT" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/web-event/{EVENT_KEY}" ; rr:class v:WebEvent ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventKey ; rr:objectMap [ rr:column "EVENT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventId ; rr:objectMap [ rr:column "EVENT_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:sessionId ; rr:objectMap [ rr:column "SESSION_ID" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventDate ; rr:objectMap [ rr:column "EVENT_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventTs ; rr:objectMap [ rr:column "EVENT_TS" ; rr:datatype xsd:dateTime ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventType ; rr:objectMap [ rr:column "EVENT_TYPE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:pageUrl ; rr:objectMap [ rr:column "PAGE_URL" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:deviceType ; rr:objectMap [ rr:column "DEVICE_TYPE" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:browser ; rr:objectMap [ rr:column "BROWSER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:referrer ; rr:objectMap [ rr:column "REFERRER" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customerKey ; rr:objectMap [ rr:column "CUSTOMER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:productKey ; rr:objectMap [ rr:column "PRODUCT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventDateKey ; rr:objectMap [ rr:column "EVENT_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customer ;
+    rr:objectMap [ rr:parentTriplesMap <#DimCustomer> ; rr:joinCondition [ rr:child "CUSTOMER_KEY" ; rr:parent "CUSTOMER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:product ;
+    rr:objectMap [ rr:parentTriplesMap <#DimProduct> ; rr:joinCondition [ rr:child "PRODUCT_KEY" ; rr:parent "PRODUCT_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:eventDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "EVENT_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
+
+<#FactSupportTicket> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "DW.FACT_SUPPORT_TICKET" ] ;
+  rr:subjectMap [ rr:template "http://ns.fluree.dev/edw/support-ticket/{TICKET_KEY}" ; rr:class v:SupportTicket ] ;
+  rr:predicateObjectMap [ rr:predicate v:ticketKey ; rr:objectMap [ rr:column "TICKET_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:ticketId ; rr:objectMap [ rr:column "TICKET_ID" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:openDate ; rr:objectMap [ rr:column "OPEN_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:closeDate ; rr:objectMap [ rr:column "CLOSE_DATE" ; rr:datatype xsd:date ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:status ; rr:objectMap [ rr:column "STATUS" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:priority ; rr:objectMap [ rr:column "PRIORITY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:category ; rr:objectMap [ rr:column "CATEGORY" ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:csatScore ; rr:objectMap [ rr:column "CSAT_SCORE" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:resolutionHours ; rr:objectMap [ rr:column "RESOLUTION_HOURS" ; rr:datatype xsd:double ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customerKey ; rr:objectMap [ rr:column "CUSTOMER_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:productKey ; rr:objectMap [ rr:column "PRODUCT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:agentKey ; rr:objectMap [ rr:column "AGENT_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:openDateKey ; rr:objectMap [ rr:column "OPEN_DATE_KEY" ; rr:datatype xsd:integer ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:customer ;
+    rr:objectMap [ rr:parentTriplesMap <#DimCustomer> ; rr:joinCondition [ rr:child "CUSTOMER_KEY" ; rr:parent "CUSTOMER_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:product ;
+    rr:objectMap [ rr:parentTriplesMap <#DimProduct> ; rr:joinCondition [ rr:child "PRODUCT_KEY" ; rr:parent "PRODUCT_KEY" ] ] ] ;
+  rr:predicateObjectMap [ rr:predicate v:openDateRef ;
+    rr:objectMap [ rr:parentTriplesMap <#DimDate> ; rr:joinCondition [ rr:child "OPEN_DATE_KEY" ; rr:parent "DATE_KEY" ] ] ] .
