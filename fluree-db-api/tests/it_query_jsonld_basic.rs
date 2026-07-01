@@ -227,6 +227,90 @@ async fn jsonld_basic_single_subject_query_explicit_fields() {
 }
 
 #[tokio::test]
+async fn jsonld_basic_single_subject_query_explicit_type() {
+    // Regression: `@type` in an explicit select-crawl projection must return
+    // the subject's rdf:type values (parity with `rdf:type` and `*`), rather
+    // than being silently dropped as an unknown predicate.
+    let (fluree, ledger) = seed_movie_graph().await;
+
+    let query = json!({
+        "@context": ctx(),
+        "select": { "wiki:Qmovie": ["@id", "@type"] }
+    });
+
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let json = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld_async");
+
+    let arr = json.as_array().expect("array result");
+    assert_eq!(arr.len(), 1);
+    let obj = arr[0].as_object().expect("object row");
+
+    assert_eq!(obj.get("@id").and_then(|v| v.as_str()), Some("wiki:Qmovie"));
+    assert_eq!(
+        obj.get("@type").and_then(|v| v.as_str()),
+        Some("schema:Movie"),
+        "expected @type to be honored in explicit select-crawl; got {obj:?}"
+    );
+}
+
+#[tokio::test]
+async fn jsonld_basic_type_matches_rdf_type_in_crawl() {
+    // `@type` must return the same values as the equivalent `rdf:type`
+    // selection at every crawl level, including nested ref expansions.
+    let (fluree, ledger) = seed_movie_graph().await;
+
+    let context = json!({
+        "schema": "http://schema.org/",
+        "wiki": "http://www.wikidata.org/entity/",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    });
+
+    let with_type = json!({
+        "@context": context,
+        "selectOne": { "wiki:Qmovie": ["@id", "@type", {"schema:isBasedOn": ["@id", "@type"]}] }
+    });
+    let with_rdf_type = json!({
+        "@context": context,
+        "selectOne": { "wiki:Qmovie": ["@id", "rdf:type", {"schema:isBasedOn": ["@id", "rdf:type"]}] }
+    });
+
+    let run = |q: JsonValue| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            support::query_jsonld(fluree, ledger, &q)
+                .await
+                .expect("query")
+                .to_jsonld_async(ledger.as_graph_db_ref(0))
+                .await
+                .expect("to_jsonld_async")
+        }
+    };
+
+    let type_out = run(with_type).await;
+    let rdf_type_out = run(with_rdf_type).await;
+
+    assert_eq!(
+        type_out, rdf_type_out,
+        "@type and rdf:type must produce identical crawl output"
+    );
+    // And the nested ref actually carries its type.
+    assert_eq!(
+        type_out
+            .get("schema:isBasedOn")
+            .and_then(|b| b.get("@type"))
+            .and_then(|v| v.as_str()),
+        Some("schema:Book"),
+        "nested ref @type missing; got {type_out}"
+    );
+}
+
+#[tokio::test]
 async fn jsonld_basic_single_subject_query_select_one() {
     let (fluree, ledger) = seed_movie_graph().await;
 

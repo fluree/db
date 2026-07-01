@@ -2000,6 +2000,10 @@ impl<'a> HydrationFormatter<'a> {
                                 "language" => want_language = true,
                                 _ => {}
                             }
+                        } else if self.compactor.decode_sid(predicate)? == RDF_TYPE_IRI {
+                            // `@type` lowers to the rdf:type predicate; on a
+                            // literal value that means "emit the datatype".
+                            want_type = true;
                         }
                     }
                 }
