@@ -45,7 +45,7 @@ use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectM
 use fluree_db_r2rml::materialize::{
     get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
 };
-use fluree_db_tabular::ColumnBatch;
+use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1180,11 +1180,19 @@ fn materialize_pom_object(
 /// (gated in `convert_triple_to_r2rml`), comparing the value and ignoring the
 /// materialized term's datatype/language.
 ///
-/// Integer comparison is EXACT (parse to `i64`, no `f64`): a float compare would
-/// both admit false positives across adjacent large integers and let the
-/// operator keep a lexical form (`"2024.0"`) that the Arrow scan filter would
-/// drop, breaking the invariant that pushdown never removes an operator-kept row.
-fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectConstant) -> bool {
+/// Integer comparison never uses `f64` (which would admit false positives across
+/// adjacent large integers). It matches an exact integer lexical form always,
+/// and a decimal lexical form (`"100.00"`) only when `numeric_column` — i.e. the
+/// object's backing column is Decimal/Float. The Arrow scan filter casts the
+/// pushed integer literal into the column's own type, so it keeps `100.00` for a
+/// numeric column but drops a text `"100.00"` cell; mirroring that here keeps the
+/// operator match a superset of the scan filter (pushdown never drops a kept row)
+/// while still answering `?s :amount 100` against a `DECIMAL(10,2)` column.
+fn rdf_term_eq_object_constant(
+    term: &RdfTerm,
+    constant: &crate::r2rml::ObjectConstant,
+    numeric_column: bool,
+) -> bool {
     use crate::r2rml::{ObjectConstant, ScanValue};
     match constant {
         // Bound IRI / ref object: exact IRI match.
@@ -1196,7 +1204,10 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
             };
             match value {
                 ScanValue::Str(s) => v == s,
-                ScanValue::Int(n) => v.parse::<i64>().is_ok_and(|x| x == *n),
+                ScanValue::Int(n) => {
+                    v.parse::<i64>().is_ok_and(|x| x == *n)
+                        || (numeric_column && decimal_lexical_eq_int(v, *n))
+                }
                 ScanValue::Bool(b) => match v.as_str() {
                     "true" | "1" => *b,
                     "false" | "0" => !*b,
@@ -1207,6 +1218,28 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
             }
         }
     }
+}
+
+/// Whether a decimal lexical form (`"100.00"`, `"-100.0"`) equals integer `n`
+/// exactly: the fractional digits are all zero and the integer part parses to
+/// `n`. Uses no `f64`, so it stays exact for integers beyond `2^53`.
+fn decimal_lexical_eq_int(v: &str, n: i64) -> bool {
+    let (int_part, frac_part) = v.split_once('.').unwrap_or((v, ""));
+    frac_part.bytes().all(|b| b == b'0') && int_part.parse::<i64>().is_ok_and(|x| x == n)
+}
+
+/// Whether the object's backing column is a numeric (Decimal/Float) physical
+/// type, so an integer constant may match a decimal lexical form. Only a plain
+/// `rr:column` object qualifies — anything else does not push a scan filter (see
+/// [`value_pushdown_column`]), so the strict lexical match already suffices.
+fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
+    let ObjectMap::Column { column, .. } = &pom.object_map else {
+        return false;
+    };
+    matches!(
+        batch.column_by_name(column),
+        Some(Column::Decimal { .. } | Column::Float32(_) | Column::Float64(_))
+    )
 }
 
 /// Materialize one column batch into produced variable assignments (subject +
@@ -1306,7 +1339,8 @@ fn materialize_batch(
                     if let Some(t) =
                         materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
                     {
-                        if rdf_term_eq_object_constant(&t, required) {
+                        let numeric = object_column_is_numeric(pom, iceberg_batch);
+                        if rdf_term_eq_object_constant(&t, required, numeric) {
                             matched = true;
                             break;
                         }
@@ -1574,51 +1608,87 @@ mod tests {
         let iri = ObjectConstant::Iri("http://ex/geo/1".to_string());
         assert!(rdf_term_eq_object_constant(
             &RdfTerm::iri("http://ex/geo/1"),
-            &iri
+            &iri,
+            false
         ));
         assert!(!rdf_term_eq_object_constant(
             &RdfTerm::iri("http://ex/geo/2"),
-            &iri
+            &iri,
+            false
         ));
         assert!(!rdf_term_eq_object_constant(
             &RdfTerm::string("http://ex/geo/1"),
-            &iri
+            &iri,
+            false
         ));
 
         // String constant: loose lexical match, datatype/language-agnostic — a
         // plain-string query object matches a lang-tagged materialized literal.
         let s = ObjectConstant::Scalar(ScanValue::Str("chat".to_string()));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("chat"), &s));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("chat"), &s, false));
         assert!(rdf_term_eq_object_constant(
             &RdfTerm::lang_string("chat", "fr"),
-            &s
+            &s,
+            false
         ));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("dog"), &s));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("chat"), &s));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("dog"), &s, false));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("chat"), &s, false));
 
-        // Integer constant: EXACT — "2024" matches; a decimal lexical does not
-        // (it would break the pushdown invariant on a string-backed column).
+        // Integer constant against a NON-numeric (text) column: EXACT — "2024"
+        // matches; a decimal lexical does not (the scan filter casts the int to
+        // text and drops "2024.0", so the operator must too).
         let n = ObjectConstant::Scalar(ScanValue::Int(2024));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024"), &n));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2024.0"), &n));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2025"), &n));
-        // Large-integer boundary: f64 rounds these two together; exact i64 must
-        // keep them distinct (no false positive).
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024"), &n, false));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("2024.0"),
+            &n,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2025"), &n, false));
+
+        // Integer constant against a numeric (Decimal/Float) column: a
+        // zero-fraction decimal lexical matches (`?s :amount 100` vs 100.00),
+        // a non-zero fraction does not.
+        let amount = ObjectConstant::Scalar(ScanValue::Int(100));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("100.00"),
+            &amount,
+            true
+        ));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("100"), &amount, true));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("100.50"),
+            &amount,
+            true
+        ));
+        // Exactness holds beyond 2^53 (no f64): trailing-zero decimal matches,
+        // the adjacent integer does not.
         let big = ObjectConstant::Scalar(ScanValue::Int(9_007_199_254_740_993));
         assert!(rdf_term_eq_object_constant(
             &RdfTerm::string("9007199254740993"),
-            &big
+            &big,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("9007199254740993.00"),
+            &big,
+            true
         ));
         assert!(!rdf_term_eq_object_constant(
             &RdfTerm::string("9007199254740992"),
-            &big
+            &big,
+            false
         ));
 
         // Boolean constant: true/1 vs false/0.
         let b = ObjectConstant::Scalar(ScanValue::Bool(true));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("false"), &b));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b, false));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b, false));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("false"),
+            &b,
+            false
+        ));
     }
 
     #[test]

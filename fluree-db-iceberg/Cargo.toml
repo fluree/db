@@ -15,6 +15,11 @@ aws = [
     "dep:aws-sdk-s3",
     "dep:aws-config",
     "fluree-db-core/native",
+    # The Arrow columnar reader (`arrow_reader.rs`) is the only `arrow` user and
+    # is itself `#[cfg(feature = "aws")]`, so pull `arrow` + `parquet/arrow` only
+    # here — a non-`aws` build compiles neither.
+    "dep:arrow",
+    "parquet/arrow",
 ]
 [dependencies]
 # Core dependencies
@@ -57,8 +62,9 @@ bytes.workspace = true
 # Avro for manifest files
 apache-avro.workspace = true
 
-# Parquet for data files (metadata + range-read column access)
-parquet = { workspace = true, features = ["arrow"] }
+# Parquet for data files (metadata + range-read column access). The `arrow`
+# feature is enabled by the `aws` feature (the Arrow reader's only consumer).
+parquet = { workspace = true }
 
 # LRU cache for Parquet footer caching
 lru.workspace = true
@@ -71,11 +77,10 @@ aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 
-# Optional: Arrow columnar output
-# Arrow columnar reader (the single Iceberg decode path). `default-features =
-# false` drops the unused csv/json readers (compile-time only; LTO already
-# strips them from the binary).
-arrow = { version = "54", default-features = false }
+# Optional: Arrow columnar reader (the single Iceberg decode path, gated by the
+# `aws` feature). `default-features = false` drops the unused csv/json readers
+# (compile-time only; LTO already strips them from the binary).
+arrow = { version = "54", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
