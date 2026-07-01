@@ -25,15 +25,15 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
+use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::{boolean::and, cast::cast, cmp};
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::ChunkReader;
-use parquet::schema::types::SchemaDescriptor;
 
 use crate::error::{IcebergError, Result};
 use crate::io::batch::{ColumnBatch, FieldType};
@@ -89,17 +89,6 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
 
     let mask = ProjectionMask::leaves(builder.parquet_schema(), real.iter().copied());
 
-    // Exact row-level filtering: Arrow evaluates the pushed predicate during
-    // decode and drops non-matching rows before they are materialized. Native
-    // type handling (Int→Decimal casts, null semantics) sidesteps the manual
-    // type reconciliation that a hand-rolled evaluator needs. Conservative
-    // relative to the in-engine FILTER, which stays the authority: a row this
-    // keeps is re-checked, and a row it drops (predicate false, or a null cell
-    // that yields no R2RML triple) would also be excluded downstream.
-    let row_filter = residual_filter
-        .filter(|_| predicate_pushdown_enabled())
-        .and_then(|r| build_row_filter(r, builder.parquet_schema(), iceberg_schema));
-
     // A projection selects leaves in ascending file order regardless of request
     // order, so map each parquet leaf index → its RecordBatch column position.
     let mut sorted = real.clone();
@@ -124,26 +113,43 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         })
         .collect();
 
+    // Exact row-level filtering, applied to each decoded RecordBatch via
+    // `filter_record_batch`. We deliberately do NOT use Arrow's `with_row_filter`:
+    // it builds a RowSelection that calls `skip_records`, which panics on
+    // Snowflake's DELTA_BINARY_PACKED integer columns (parquet-rs 54
+    // `DeltaBitPackDecoder::skip`). Filtering post-decode sidesteps that while
+    // keeping native type handling (Int→Decimal casts). Row-group pruning
+    // (below) still runs, and the in-engine FILTER stays the authority — a kept
+    // row is re-checked; a dropped row (predicate false, or a null cell that
+    // yields no R2RML triple) would be excluded downstream anyway.
+    let predicate_plan = residual_filter
+        .filter(|_| predicate_pushdown_enabled())
+        .and_then(|r| build_predicate_plan(r, md, iceberg_schema, &leaf_to_pos));
+
     let surviving =
         crate::io::send_parquet::surviving_row_groups(md, residual_filter, iceberg_schema);
 
-    let mut builder = builder
+    let reader = builder
         .with_projection(mask)
         .with_row_groups(surviving)
-        .with_batch_size(ARROW_BATCH_ROWS);
-    if let Some(filter) = row_filter {
-        builder = builder.with_row_filter(filter);
-    }
-    let reader = builder.build().map_err(|e| {
-        IcebergError::Storage(format!("Failed to build Parquet reader (arrow): {e}"))
-    })?;
+        .with_batch_size(ARROW_BATCH_ROWS)
+        .build()
+        .map_err(|e| {
+            IcebergError::Storage(format!("Failed to build Parquet reader (arrow): {e}"))
+        })?;
 
     let num_fields = batch_schema.fields.len();
     let mut batches = Vec::new();
 
     for record_batch in reader {
-        let record_batch =
+        let mut record_batch =
             record_batch.map_err(|e| IcebergError::Storage(format!("Arrow decode error: {e}")))?;
+        if let Some(plan) = &predicate_plan {
+            let mask = eval_conjunction(&record_batch, plan)
+                .map_err(|e| IcebergError::Storage(format!("Row filter eval error: {e}")))?;
+            record_batch = filter_record_batch(&record_batch, &mask)
+                .map_err(|e| IcebergError::Storage(format!("Row filter apply error: {e}")))?;
+        }
         let num_rows = record_batch.num_rows();
         if num_rows == 0 {
             continue;
@@ -242,56 +248,44 @@ fn arrow_cell_to_column_value(
 }
 
 /// One resolved comparison in the row filter: the column's position within the
-/// predicate `RecordBatch` (predicate columns arrive in ascending leaf order),
-/// the operator, and the literal to compare against.
+/// decoded `RecordBatch`, the operator, and the literal to compare against.
 type ResolvedComparison = (usize, ComparisonOp, LiteralValue);
 
-/// Build an Arrow `RowFilter` from a residual predicate, or `None` when the
-/// predicate is not a plain conjunction of column comparisons (the only shape
-/// the R2RML → Iceberg bridge emits) or references no mappable column.
+/// Resolve a residual predicate into a plan evaluated against each decoded
+/// `RecordBatch` (of the main projection). Returns `None` when the predicate is
+/// not a plain conjunction of column comparisons (the only shape the R2RML →
+/// Iceberg bridge emits) or references no projected, mappable column.
 ///
-/// Dropping an unmappable conjunct only weakens the filter (keeps more rows),
-/// which is safe: the in-engine FILTER remains the authority.
-fn build_row_filter(
+/// A comparison on a column that is not projected is dropped, which only
+/// weakens the filter (keeps more rows) — safe, since the in-engine FILTER
+/// remains the authority. `leaf_to_pos` maps a parquet leaf index to its
+/// position in the decoded `RecordBatch`.
+fn build_predicate_plan(
     residual: &Expression,
-    parquet_schema: &SchemaDescriptor,
+    metadata: &ParquetMetaData,
     iceberg_schema: Option<&Schema>,
-) -> Option<RowFilter> {
+    leaf_to_pos: &HashMap<usize, usize>,
+) -> Option<Vec<ResolvedComparison>> {
     let mut comparisons = Vec::new();
     if !collect_and_comparisons(residual, &mut comparisons) || comparisons.is_empty() {
         return None;
     }
 
     let field_to_col =
-        build_field_id_to_column_mapping(parquet_schema.root_schema(), iceberg_schema);
+        build_field_id_to_column_mapping(metadata.file_metadata().schema(), iceberg_schema);
 
-    // Resolve each comparison to a parquet column index; drop any we cannot map.
-    let mut resolved: Vec<(usize, ComparisonOp, LiteralValue)> = Vec::new();
-    for (field_id, op, value) in comparisons {
-        if let Some(&col_idx) = field_to_col.get(&field_id) {
-            resolved.push((col_idx, op, value));
-        }
-    }
-    if resolved.is_empty() {
-        return None;
-    }
-
-    // Predicate columns are projected in ascending leaf order; map col → position.
-    let mut cols: Vec<usize> = resolved.iter().map(|(c, _, _)| *c).collect();
-    cols.sort_unstable();
-    cols.dedup();
-    let pos_of: HashMap<usize, usize> = cols.iter().enumerate().map(|(pos, &c)| (c, pos)).collect();
-
-    let plan: Vec<ResolvedComparison> = resolved
+    // field_id → parquet leaf → RecordBatch position; drop any we cannot resolve
+    // to a projected column.
+    let plan: Vec<ResolvedComparison> = comparisons
         .into_iter()
-        .map(|(col, op, value)| (pos_of[&col], op, value))
+        .filter_map(|(field_id, op, value)| {
+            let col = field_to_col.get(&field_id)?;
+            let pos = leaf_to_pos.get(col)?;
+            Some((*pos, op, value))
+        })
         .collect();
 
-    let mask = ProjectionMask::leaves(parquet_schema, cols.iter().copied());
-    let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
-        eval_conjunction(&batch, &plan)
-    });
-    Some(RowFilter::new(vec![Box::new(predicate)]))
+    (!plan.is_empty()).then_some(plan)
 }
 
 /// Flatten a predicate into a list of `(field_id, op, literal)` comparisons.
@@ -317,10 +311,10 @@ fn collect_and_comparisons(
     }
 }
 
-/// Evaluate the conjunction over a predicate `RecordBatch`, ANDing the per-
-/// comparison masks. A null cell yields a null mask entry, which Arrow's
-/// `RowFilter` treats as "drop" — correct for R2RML, where a null column
-/// produces no triple.
+/// Evaluate the conjunction over a decoded `RecordBatch`, ANDing the per-
+/// comparison masks into a keep mask for `filter_record_batch`. A null cell
+/// yields a null mask entry, which `filter_record_batch` treats as "drop" —
+/// correct for R2RML, where a null column produces no triple.
 fn eval_conjunction(
     batch: &RecordBatch,
     plan: &[ResolvedComparison],
