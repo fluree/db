@@ -632,6 +632,70 @@ async fn iceberg_r2rml_generate_local(
     .await
 }
 
+/// Request body for `POST /v1/fluree/iceberg/r2rml/validate`
+#[derive(Deserialize)]
+pub struct IcebergValidateRequest {
+    #[serde(flatten)]
+    pub connection: IcebergConnectionRequest,
+    /// R2RML mapping to validate, in Turtle format.
+    pub r2rml: String,
+    /// Optional Iceberg snapshot id to validate against. The metadata preview
+    /// resolves each table's current snapshot, so this is recorded, not enforced.
+    pub snapshot: Option<i64>,
+}
+
+/// Validate an R2RML mapping against a live catalog (compile + cross-check).
+/// Read-only: creates no graph source, writes nothing.
+///
+/// POST /v1/fluree/iceberg/r2rml/validate
+pub async fn iceberg_r2rml_validate(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    iceberg_r2rml_validate_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_r2rml_validate_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let req: IcebergValidateRequest = parse_iceberg_body(request).await?;
+
+    let span = create_request_span(
+        "iceberg:r2rml:validate",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        None,
+        None,
+        None,
+    );
+    async move {
+        let conn = build_iceberg_connection(&req.connection)?;
+
+        let response = state
+            .fluree
+            .validate_r2rml(conn, req.r2rml, req.snapshot)
+            .await
+            .map_err(ServerError::Api)?;
+
+        tracing::info!(
+            status = "success",
+            compiled_ok = response.compiled_ok,
+            triples_maps = response.triples_map_count,
+            diagnostics = response.diagnostics.len(),
+            "iceberg r2rml validated"
+        );
+        Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

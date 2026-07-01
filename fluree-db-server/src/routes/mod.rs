@@ -138,6 +138,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/iceberg/r2rml/generate",
             post(iceberg::iceberg_r2rml_generate),
+        )
+        .route(
+            "/iceberg/r2rml/validate",
+            post(iceberg::iceberg_r2rml_validate),
         );
 
     let v1_admin_protected_reads = v1_admin_protected_reads

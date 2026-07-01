@@ -195,6 +195,7 @@ pub use graph_source::{
     IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult,
     R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
     StructuredR2rmlMapping, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
+    ValidateR2rmlResponse,
 };
 
 pub use bm25_worker::{

@@ -120,6 +120,9 @@ mod iceberg_catalog;
 #[cfg(feature = "iceberg")]
 mod iceberg_generate;
 
+#[cfg(feature = "iceberg")]
+mod iceberg_validate;
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 
@@ -141,6 +144,9 @@ pub use iceberg_generate::{
     Diagnostic, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, StructuredR2rmlMapping,
     TableOverride,
 };
+
+#[cfg(feature = "iceberg")]
+pub use iceberg_validate::ValidateR2rmlResponse;
 
 #[cfg(feature = "iceberg")]
 pub use config::{R2rmlCreateConfig, R2rmlMappingInput};
