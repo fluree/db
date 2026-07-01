@@ -179,6 +179,10 @@ fn otype_to_value_type_tag(ot: fluree_db_core::o_type::OType) -> ValueTypeTag {
         OType::XSD_DOUBLE => ValueTypeTag::DOUBLE,
         OType::XSD_FLOAT => ValueTypeTag::FLOAT,
         OType::XSD_DECIMAL => ValueTypeTag::DECIMAL,
+        // Inline exact decimals (v3 roots) unambiguously carry only
+        // `FlakeValue::Decimal` — unlike NUM_BIG_OVERFLOW below — so they map
+        // straight to DECIMAL here.
+        OType::XSD_DECIMAL_INLINE => ValueTypeTag::DECIMAL,
         // NUM_BIG_OVERFLOW is intentionally NOT mapped here: it carries both
         // `FlakeValue::Decimal` (arbitrary-precision xsd:decimal) and
         // `FlakeValue::BigInt` (xsd:integer overflow > i64) — they share
@@ -858,5 +862,21 @@ mod tests {
         let key = GraphPropertyKey { g_id: 0, p_id: 1 };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
+    }
+
+    #[test]
+    fn inline_decimal_otype_classified_as_decimal() {
+        use fluree_db_core::o_type::OType;
+        // Both the lossy f64 decimal lane and the exact inline lane count as
+        // DECIMAL for datatype stats, so a reindexed (inline) ledger reports the
+        // same property datatype as before.
+        assert_eq!(
+            otype_to_value_type_tag(OType::XSD_DECIMAL),
+            ValueTypeTag::DECIMAL
+        );
+        assert_eq!(
+            otype_to_value_type_tag(OType::XSD_DECIMAL_INLINE),
+            ValueTypeTag::DECIMAL
+        );
     }
 }

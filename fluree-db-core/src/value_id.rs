@@ -15,6 +15,11 @@
 //! `NumInt(3)` vs `NumF64(3.0)`) is a query-layer concern resolved via
 //! multi-scan merge, not an index property.
 //!
+//! [`ObjKind::NUM_DEC`] (inline `xsd:decimal`) upholds this contract too: its
+//! key is canonical (equal values → identical bits) *and* order-preserving (raw
+//! `u64` order == numeric order), via an order-preserving base-10 float layout.
+//! See [`ObjKey::encode_decimal`].
+//!
 //! [`ValueTypeTag`] is a compact `u8` identifier for XSD/RDF datatypes, used as
 //! a tie-breaker in index sort keys so that values with the same `(ObjKind,
 //! ObjKey)` but different types (e.g., `xsd:integer 3` vs `xsd:long 3`)
@@ -116,6 +121,14 @@ impl ObjKind {
     /// Precision: approximately 0.3mm at the equator.
     pub const GEO_POINT: Self = Self(0x14);
 
+    /// Exact inline `xsd:decimal` — `o_key` is an order-preserving base-10 float
+    /// code (see [`ObjKey::encode_decimal`]). Canonical (equal values → identical
+    /// bits) AND value-ordered (raw `u64` order == numeric order), so it supports
+    /// equality, dedup, joins, and range / ORDER BY pushdown. Distinct from
+    /// [`NUM_BIG`](Self::NUM_BIG) (arena handle) — inline decimals carry the exact
+    /// value with no arena.
+    pub const NUM_DEC: Self = Self(0x15);
+
     /// Get the raw `u8` discriminant.
     #[inline]
     pub const fn as_u8(self) -> u8 {
@@ -159,6 +172,7 @@ impl fmt::Debug for ObjKind {
             0x12 => write!(f, "ObjKind::YearMonthDur"),
             0x13 => write!(f, "ObjKind::DayTimeDur"),
             0x14 => write!(f, "ObjKind::GeoPoint"),
+            0x15 => write!(f, "ObjKind::NumDec"),
             0xFF => write!(f, "ObjKind::Max"),
             n => write!(f, "ObjKind({n:#04x})"),
         }
@@ -168,6 +182,48 @@ impl fmt::Debug for ObjKind {
 impl fmt::Display for ObjKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(self, f)
+    }
+}
+
+// ============================================================================
+// DecimalEncoding
+// ============================================================================
+
+/// How an index root encodes `xsd:decimal` object values.
+///
+/// This is an **encode-time** policy derived from the active index root's
+/// format version — it is never user-facing. Decode is always capable of both
+/// schemes regardless of this policy, so new code reading any root is fully
+/// backward-compatible.
+///
+/// The policy is **sticky per root and preserved across incremental writes**:
+/// extending an `ArenaOnly` root keeps writing decimals to the NumBig arena;
+/// extending an `InlineWhenFits` root keeps inlining. Only a full reindex
+/// changes the policy, because only a full reindex rewrites existing facts under
+/// a new `(o_type, o_key)` identity. (Contrast `lex_sorted_string_ids`, which is
+/// *cleared* on incremental writes; inline decimals are not broken by appends.)
+///
+/// The hard invariant this protects: `(o_type, o_key)` is persisted fact
+/// identity, so a single root must use **one** decimal encoding for all
+/// inline-eligible values — never a mix — or a retract computed under one scheme
+/// would miss an assert stored under the other.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub enum DecimalEncoding {
+    /// All `xsd:decimal` values route to the per-`(graph, predicate)` NumBig
+    /// arena. The behavior of every pre-inline index root, bit-for-bit unchanged.
+    #[default]
+    ArenaOnly,
+    /// Inline-eligible decimals (see [`ObjKey::encode_decimal`]) encode inline
+    /// under [`ObjKind::NUM_DEC`]; values that do not fit fall back to the arena,
+    /// exactly like overflow integers.
+    InlineWhenFits,
+}
+
+impl DecimalEncoding {
+    /// True if this policy may emit inline decimal keys on write.
+    #[inline]
+    pub const fn inlines(self) -> bool {
+        matches!(self, Self::InlineWhenFits)
     }
 }
 
@@ -188,6 +244,54 @@ const SIGN_FLIP: u64 = 1u64 << 63;
 
 /// Sign bit mask for f64 bits.
 const F64_SIGN_BIT: u64 = 1u64 << 63;
+
+// ---- Inline decimal (NumDec) — ORDER-PRESERVING base-10 float layout ----
+//
+// An inline decimal key is a canonical, order-preserving code: equal values
+// produce identical bits (equality), and raw `u64` order equals numeric order
+// (range/ORDER BY pushdown). The magnitude is laid out as a base-10 float
+//
+//     magnitude = significand × 10^(exp10 - (DEC_DIGITS - 1))
+//
+// where `significand` is `|mantissa|` normalized to exactly `DEC_DIGITS`
+// decimal digits (MSD in the leading place, in `[10^(DEC_DIGITS-1), 10^DEC_DIGITS)`)
+// and `exp10` is the base-10 exponent of the most significant digit. The packed
+// magnitude code places the (biased) exponent above the significand:
+//
+//     mag = (biased_exp << DEC_SIG_BITS) | significand        (0 = the value zero)
+//
+// `mag` is monotonic in magnitude — a larger exponent dominates, and within one
+// exponent a larger significand wins. Sign is then folded so the full `u64`
+// order is numeric order, with zero at the exact midpoint:
+//
+//     value > 0  →  key = 2^63 + mag
+//     value == 0 →  key = 2^63
+//     value < 0  →  key = 2^63 - 1 - mag      (more negative ⇒ smaller key)
+//
+// Negatives complement the magnitude (like the f64 lane), so they sort below
+// zero and more-negative values sort lower. Canonicalization (normalize the
+// mantissa, strip trailing zeros) makes `1.5`, `1.50`, and `1.500` one code.
+
+// Magnitude budget is 63 bits (the 64th splits sign around the pivot), packed as
+// `[ exponent:6 | significand:57 ]` — all 63 bits used, no waste.
+
+/// Significant decimal digits an inline decimal carries. Values with more
+/// significant digits spill to the NumBig arena. 17 digits matches the original
+/// inline precision; `10^17 < 2^57` so the significand fits 57 bits exactly.
+const DEC_DIGITS: u32 = 17;
+/// Bits the `DEC_DIGITS`-digit significand occupies (low bits of the magnitude).
+const DEC_SIG_BITS: u64 = 57;
+/// Mask selecting the significand.
+const DEC_SIG_MASK: u64 = (1u64 << DEC_SIG_BITS) - 1;
+/// Exponent field width (bits), sitting just above the significand.
+const DEC_EXP_BITS: u64 = 6;
+/// Bias added to `exp10` so the stored exponent is non-negative. Representable
+/// `exp10` range is `[-DEC_EXP_BIAS, DEC_EXP_BIAS - 1]` = `[-32, 31]`; values
+/// outside (more than ~32 integer or fractional places) spill to the arena.
+const DEC_EXP_BIAS: i64 = 1 << (DEC_EXP_BITS - 1); // 32
+/// Sign split point: non-negative keys are `>= DEC_SIGN_PIVOT`, negatives below.
+/// Zero encodes exactly to this value (the midpoint).
+const DEC_SIGN_PIVOT: u64 = 1u64 << 63;
 
 /// Error returned when a value cannot be stored in the index.
 #[derive(Debug, Clone, PartialEq)]
@@ -285,6 +389,102 @@ impl ObjKey {
             !self.0 // was negative: undo full flip
         };
         f64::from_bits(bits)
+    }
+
+    // ---- Inline decimal encoding (NumDec) — order-preserving ----
+    //
+    // See the layout notes above the `DEC_*` constants. The key is canonical
+    // (equal values → identical bits) AND order-preserving (raw `u64` order ==
+    // numeric order), so inline decimals support equality, dedup, joins, AND
+    // range / ORDER BY pushdown. A value is inline-eligible iff, after
+    // canonicalization, it has at most `DEC_DIGITS` significant digits and a
+    // base-10 exponent in `[-DEC_EXP_BIAS, DEC_EXP_BIAS - 1]`. Anything else
+    // returns `None` and falls back to the NumBig arena, like overflow integers.
+
+    /// Encode a canonical `xsd:decimal` inline, order-preserving, or `None` if it
+    /// does not fit. Numerically-equal decimals (`1.50`, `1.5`, `1.500`) encode
+    /// to identical bits, and `a < b` numerically iff `encode(a) < encode(b)` as
+    /// `u64`.
+    pub fn encode_decimal(value: &bigdecimal::BigDecimal) -> Option<Self> {
+        use num_bigint::Sign;
+        use num_traits::{ToPrimitive, Zero};
+
+        // Canonicalize: strip trailing zeros so the significant-digit count and
+        // significand are unique for a given value.
+        let normalized = value.normalized();
+        let (mantissa, scale) = normalized.as_bigint_and_exponent();
+
+        if mantissa.is_zero() {
+            // Zero is the canonical midpoint between negatives and positives.
+            return Some(Self(DEC_SIGN_PIVOT));
+        }
+
+        let (sign, magnitude) = mantissa.into_parts();
+        // Anything larger than u64 has > 19 decimal digits, well past DEC_DIGITS,
+        // so a `to_u64` miss is itself the spill signal — no BigUint digit walk.
+        let mag_u64 = magnitude.to_u64()?;
+        let digits = mag_u64.ilog10() + 1; // mag_u64 > 0 here
+        if digits > DEC_DIGITS {
+            // More significant digits than the inline significand holds.
+            return None;
+        }
+
+        // Base-10 exponent of the most significant digit: with `magnitude` having
+        // `digits` digits and value = magnitude × 10^-scale, the MSD place is
+        // `(digits - 1) - scale`.
+        let exp10 = (digits as i64 - 1) - scale;
+        if !(-DEC_EXP_BIAS..DEC_EXP_BIAS).contains(&exp10) {
+            return None;
+        }
+
+        // Left-align to exactly DEC_DIGITS digits so same-exponent significands
+        // compare as integers. `mag_u64 < 10^digits` and the pad is
+        // `DEC_DIGITS - digits`, so the product is `< 10^17 < 2^DEC_SIG_BITS` and
+        // well under `u64::MAX` — no overflow.
+        let significand = mag_u64 * 10u64.pow(DEC_DIGITS - digits);
+
+        let biased_exp = (exp10 + DEC_EXP_BIAS) as u64;
+        let mag = (biased_exp << DEC_SIG_BITS) | significand;
+
+        let key = if sign == Sign::Minus {
+            // More negative ⇒ larger mag ⇒ smaller key, all below the pivot.
+            DEC_SIGN_PIVOT - 1 - mag
+        } else {
+            DEC_SIGN_PIVOT + mag
+        };
+        Some(Self(key))
+    }
+
+    /// Decode an inline `xsd:decimal` previously produced by [`encode_decimal`].
+    ///
+    /// [`encode_decimal`]: Self::encode_decimal
+    pub fn decode_decimal(self) -> bigdecimal::BigDecimal {
+        use num_bigint::BigInt;
+
+        if self.0 == DEC_SIGN_PIVOT {
+            return bigdecimal::BigDecimal::from(0);
+        }
+
+        let (negative, mag) = if self.0 >= DEC_SIGN_PIVOT {
+            (false, self.0 - DEC_SIGN_PIVOT)
+        } else {
+            (true, DEC_SIGN_PIVOT - 1 - self.0)
+        };
+
+        let significand = mag & DEC_SIG_MASK;
+        let biased_exp = (mag >> DEC_SIG_BITS) as i64;
+        let exp10 = biased_exp - DEC_EXP_BIAS;
+
+        // value = significand × 10^(exp10 - (DEC_DIGITS - 1)).
+        // As BigDecimal: mantissa = ±significand, scale = (DEC_DIGITS-1) - exp10.
+        let mut mantissa = BigInt::from(significand);
+        if negative {
+            mantissa = -mantissa;
+        }
+        let scale = (DEC_DIGITS as i64 - 1) - exp10;
+        // `normalized()` strips the left-alignment padding so output is minimal
+        // (1.5, not 1.500000000000000).
+        bigdecimal::BigDecimal::from_bigint(mantissa, scale).normalized()
     }
 
     // ---- Boolean encoding ----
@@ -1629,6 +1829,208 @@ mod tests {
         ] {
             assert!(!dt.is_integer_type(), "{dt} should not be integer type");
             assert!(!dt.is_float_type(), "{dt} should not be float type");
+        }
+    }
+
+    // ---- Inline decimal (NumDec) encode/decode ----
+
+    fn bd(s: &str) -> bigdecimal::BigDecimal {
+        s.parse().unwrap()
+    }
+
+    /// Round-trip an inline-eligible decimal: encode must succeed and decode back
+    /// to the numerically-equal value.
+    fn assert_decimal_roundtrip(s: &str) {
+        let v = bd(s);
+        let key =
+            ObjKey::encode_decimal(&v).unwrap_or_else(|| panic!("{s} should be inline-eligible"));
+        let back = key.decode_decimal();
+        assert_eq!(back, v, "round-trip mismatch for {s}: got {back}");
+    }
+
+    #[test]
+    fn decimal_roundtrip_common_values() {
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "19.99",
+            "-19.99",
+            "0.01",
+            "-0.01",
+            "3.14159",
+            "100",
+            "1000000.5",
+            "-1000000.5",
+            "0.0000001",
+            "12345678901234.56",
+        ] {
+            assert_decimal_roundtrip(s);
+        }
+    }
+
+    #[test]
+    fn decimal_zero_is_canonical() {
+        // All spellings of zero encode to the same key.
+        let keys: Vec<_> = ["0", "0.0", "-0", "-0.00", "0.000000"]
+            .iter()
+            .map(|s| ObjKey::encode_decimal(&bd(s)).unwrap())
+            .collect();
+        for k in &keys {
+            assert_eq!(*k, keys[0], "zero spellings must share one key");
+        }
+        assert_eq!(keys[0].decode_decimal(), bd("0"));
+    }
+
+    #[test]
+    fn decimal_scale_variants_share_key() {
+        // 1.50 and 1.5 are the same value -> identical key (equality identity).
+        assert_eq!(
+            ObjKey::encode_decimal(&bd("1.50")).unwrap(),
+            ObjKey::encode_decimal(&bd("1.5")).unwrap(),
+        );
+        // 1.00 and 1 fold to scale 0 -> identical key.
+        assert_eq!(
+            ObjKey::encode_decimal(&bd("1.00")).unwrap(),
+            ObjKey::encode_decimal(&bd("1")).unwrap(),
+        );
+    }
+
+    #[test]
+    fn decimal_integer_valued_folds_to_scale_zero() {
+        // Trailing-zero integers (normalized form has negative exponent) fold back.
+        for s in ["100", "1000", "100000000", "-100"] {
+            assert_decimal_roundtrip(s);
+        }
+    }
+
+    #[test]
+    fn decimal_significant_digit_boundary() {
+        // Up to DEC_DIGITS (17) significant digits fit; an 18th spills.
+        let d17 = bd("12345678901234567"); // 17 significant digits
+        assert!(ObjKey::encode_decimal(&d17).is_some());
+        assert_decimal_roundtrip("12345678901234567");
+        assert_decimal_roundtrip("1.2345678901234567"); // same 17 digits, fractional
+
+        let d18 = bd("123456789012345678"); // 18 significant digits
+        assert!(ObjKey::encode_decimal(&d18).is_none());
+        let d18_frac = bd("1.23456789012345678");
+        assert!(ObjKey::encode_decimal(&d18_frac).is_none());
+
+        // A 20-digit value (exceeds u64) also spills via the to_u64 miss.
+        assert!(ObjKey::encode_decimal(&bd("12345678901234567890")).is_none());
+    }
+
+    #[test]
+    fn decimal_exponent_boundary() {
+        // exp10 in [-32, 31] fits; outside spills. A single-digit value's exp10
+        // equals its power of ten.
+        assert!(ObjKey::encode_decimal(&bd("1e31")).is_some()); // exp10 = 31
+        assert_decimal_roundtrip("1e31");
+        assert!(ObjKey::encode_decimal(&bd("1e32")).is_none()); // exp10 = 32, out
+
+        assert!(ObjKey::encode_decimal(&bd("1e-32")).is_some()); // exp10 = -32
+        assert_decimal_roundtrip("1e-32");
+        assert!(ObjKey::encode_decimal(&bd("1e-33")).is_none()); // exp10 = -33, out
+    }
+
+    #[test]
+    fn decimal_sign_distinguished() {
+        let pos = ObjKey::encode_decimal(&bd("19.99")).unwrap();
+        let neg = ObjKey::encode_decimal(&bd("-19.99")).unwrap();
+        assert_ne!(pos, neg);
+        assert_eq!(pos.decode_decimal(), bd("19.99"));
+        assert_eq!(neg.decode_decimal(), bd("-19.99"));
+    }
+
+    #[test]
+    fn decimal_zero_sits_between_signs() {
+        let neg = ObjKey::encode_decimal(&bd("-0.0001")).unwrap();
+        let zero = ObjKey::encode_decimal(&bd("0")).unwrap();
+        let pos = ObjKey::encode_decimal(&bd("0.0001")).unwrap();
+        assert!(neg < zero, "negatives sort below zero");
+        assert!(zero < pos, "zero sorts below positives");
+    }
+
+    /// Build a broad, deterministic spread of distinct decimal values for the
+    /// order-preservation property test: every (sign, coefficient, scale) combo
+    /// that stays inline-eligible.
+    fn property_test_decimals() -> Vec<bigdecimal::BigDecimal> {
+        use bigdecimal::BigDecimal;
+        use num_bigint::BigInt;
+        let coeffs: [i64; 9] = [1, 2, 7, 9, 15, 100, 999, 12345, 9_999_999_999_999_999];
+        let scales: [i64; 13] = [-15, -8, -3, -1, 0, 1, 2, 3, 5, 8, 12, 20, 28];
+        let mut out = vec![BigDecimal::from(0)];
+        for &c in &coeffs {
+            for &s in &scales {
+                let v = BigDecimal::from_bigint(BigInt::from(c), s);
+                out.push(v.clone());
+                out.push(-v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decimal_encoding_is_order_preserving() {
+        // The headline invariant: raw u64 key order == numeric order. Sort the
+        // value set numerically, then assert encoded keys are strictly ascending
+        // across distinct values (and equal across numerically-equal ones).
+        let mut values = property_test_decimals();
+        // Numeric sort (BigDecimal Ord compares by value).
+        values.sort();
+
+        let mut prev: Option<(bigdecimal::BigDecimal, ObjKey)> = None;
+        for v in values {
+            let key = ObjKey::encode_decimal(&v)
+                .unwrap_or_else(|| panic!("{v} should be inline-eligible in the property set"));
+            // Decode must round-trip to the same numeric value.
+            assert_eq!(key.decode_decimal(), v, "round-trip failed for {v}");
+            if let Some((pv, pk)) = prev {
+                use std::cmp::Ordering;
+                match v.cmp(&pv) {
+                    Ordering::Greater => assert!(
+                        key.as_u64() > pk.as_u64(),
+                        "order broken: {pv} (key {}) !< {v} (key {})",
+                        pk.as_u64(),
+                        key.as_u64()
+                    ),
+                    Ordering::Equal => assert_eq!(
+                        key.as_u64(),
+                        pk.as_u64(),
+                        "equal values must share a key: {pv} vs {v}"
+                    ),
+                    Ordering::Less => unreachable!("values are sorted ascending"),
+                }
+            }
+            prev = Some((v, key));
+        }
+    }
+
+    #[test]
+    fn decimal_encoding_pairwise_monotonic() {
+        // Exhaustive pairwise check: for every ordered pair, the sign of the
+        // numeric comparison matches the sign of the key comparison.
+        let values = property_test_decimals();
+        let keyed: Vec<_> = values
+            .iter()
+            .map(|v| {
+                (
+                    v.clone(),
+                    ObjKey::encode_decimal(v).expect("inline-eligible").as_u64(),
+                )
+            })
+            .collect();
+        for (a, ka) in &keyed {
+            for (b, kb) in &keyed {
+                assert_eq!(
+                    a.cmp(b),
+                    ka.cmp(kb),
+                    "numeric {a} vs {b} ({:?}) disagrees with key {ka} vs {kb} ({:?})",
+                    a.cmp(b),
+                    ka.cmp(kb),
+                );
+            }
         }
     }
 }

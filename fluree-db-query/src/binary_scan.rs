@@ -1934,60 +1934,130 @@ impl Operator for BinaryScanOperator {
             Arc::clone(branch_ref);
 
         // If this scan has range bounds on the object variable and we're scanning in POST order,
-        // narrow the cursor's leaf range by object-key range.
-        //
-        // IMPORTANT: SPARQL numeric comparisons are cross-type (integer bounds match double
-        // values), and ObjKey encodings differ between types. For correctness, we only apply
-        // range narrowing for temporal types where cross-type comparison does not apply.
+        // narrow the cursor's leaf range by object-key range. Two cases are safe:
+        //   - **Temporal** types: comparison is within-type, so a cross-type value
+        //     can't satisfy the filter — dropping it via narrowing is harmless.
+        //   - **A uniform, order-preserving numeric predicate with no overlay**:
+        //     no other-typed base rows exist and no novelty can introduce a
+        //     cross-type match (see the numeric block below).
+        // SPARQL numeric comparison is otherwise cross-type (an integer bound
+        // matches double/decimal values under different o_types), so numeric
+        // narrowing is gated on those preconditions.
         let mut range_min_okey: Option<u64> = None;
         let mut range_max_okey: Option<u64> = None;
         let mut range_o_type: Option<u16> = None;
-        if order == RunSortOrder::Post && filter.p_id.is_some() && self.bound_o.is_none() {
-            if let Some(bounds) = self.object_bounds.as_ref() {
-                let supports_range = |ot: OType| -> bool {
+        if order == RunSortOrder::Post && self.bound_o.is_none() {
+            if let (Some(bounds), Some(p_id)) = (self.object_bounds.as_ref(), filter.p_id) {
+                // Only numeric bounds can target a numeric predicate; gate the
+                // manifest extent probe (which may open ≤2 boundary leaves) on
+                // that so temporal/string range scans don't pay for it.
+                let has_numeric_bound = |b: &Option<(FlakeValue, bool)>| {
                     matches!(
-                        ot,
-                        OType::XSD_DATE
-                            | OType::XSD_DATE_TIME
-                            | OType::XSD_TIME
-                            | OType::XSD_G_YEAR
-                            | OType::XSD_G_YEAR_MONTH
-                            | OType::XSD_G_MONTH
-                            | OType::XSD_G_DAY
-                            | OType::XSD_G_MONTH_DAY
+                        b,
+                        Some((
+                            FlakeValue::Long(_)
+                                | FlakeValue::BigInt(_)
+                                | FlakeValue::Decimal(_)
+                                | FlakeValue::Double(_),
+                            _
+                        ))
                     )
                 };
-
-                let encode = |v: &FlakeValue| -> Option<(u16, u64)> {
-                    let (ot, key) = value_to_otype_okey_simple(v, store_ref).ok()?;
-                    supports_range(ot).then_some((ot.as_u16(), key))
+                // Numeric range narrowing is unsafe in general (cross-type:
+                // `?o > 10` matches integer 11 AND decimal 11.5, stored under
+                // different o_types). It's safe only when the predicate is
+                // *uniformly* one order-preserving numeric type AND there is no
+                // overlay:
+                //
+                // - **Uniform base** (manifest extent min_o_type == max_o_type,
+                //   o_key-ordered — any inline integer subtype, double/float, or
+                //   inline decimal) means no other-typed *base* rows to miss.
+                // - **Overlay-free** is required because novelty can add a
+                //   matching value of a *different* type (e.g. integer 100 to a
+                //   decimal predicate). Its translated overlay op sorts outside
+                //   the narrowed o_type/o_key window and would be dropped before
+                //   the post-filter could rescue it. (Temporal narrowing doesn't
+                //   need this: cross-type values can't satisfy a temporal filter,
+                //   so dropping them is harmless.) With overlay present we fall
+                //   back to the full base scan + overlay merge + post-filter.
+                //
+                // The post-filter below stays as the correctness backstop.
+                let numeric_uniform_ot = if (has_numeric_bound(&bounds.lower)
+                    || has_numeric_bound(&bounds.upper))
+                    && ctx.overlay_free_single_graph()
+                {
+                    crate::fast_count::predicate_uniform_o_type(store_ref, self.g_id, p_id)
+                        .map(OType::from_u16)
+                        .filter(|ot| crate::fast_count::otype_okey_order_comparable(*ot))
+                } else {
+                    None
                 };
-
-                let mut ot: Option<u16> = None;
-                if let Some((v, _inclusive)) = bounds.lower.as_ref() {
-                    if let Some((o_type, key)) = encode(v) {
-                        ot = Some(o_type);
-                        range_min_okey = Some(key);
+                if let Some(pred_ot) = numeric_uniform_ot {
+                    let enc = |v: &FlakeValue| {
+                        crate::fast_count::encode_numeric_threshold_for_otype(pred_ot, v)
+                            .ok()
+                            .flatten()
+                    };
+                    if let Some((v, _inclusive)) = bounds.lower.as_ref() {
+                        range_min_okey = enc(v);
+                    }
+                    if let Some((v, _inclusive)) = bounds.upper.as_ref() {
+                        range_max_okey = enc(v);
+                    }
+                    if range_min_okey.is_some() || range_max_okey.is_some() {
+                        range_o_type = Some(pred_ot.as_u16());
+                        filter.o_type = Some(pred_ot.as_u16());
                     }
                 }
-                if let Some((v, _inclusive)) = bounds.upper.as_ref() {
-                    if let Some((o_type, key)) = encode(v) {
-                        if ot.is_some() && ot != Some(o_type) {
-                            // Mixed type bounds; don't attempt range narrowing.
-                            ot = None;
-                            range_min_okey = None;
-                            range_max_okey = None;
-                        } else {
+
+                // Temporal range narrowing (within-type comparison, always safe).
+                // Skipped if the numeric-uniform branch above already narrowed.
+                if numeric_uniform_ot.is_none() {
+                    let supports_range = |ot: OType| -> bool {
+                        matches!(
+                            ot,
+                            OType::XSD_DATE
+                                | OType::XSD_DATE_TIME
+                                | OType::XSD_TIME
+                                | OType::XSD_G_YEAR
+                                | OType::XSD_G_YEAR_MONTH
+                                | OType::XSD_G_MONTH
+                                | OType::XSD_G_DAY
+                                | OType::XSD_G_MONTH_DAY
+                        )
+                    };
+
+                    let encode = |v: &FlakeValue| -> Option<(u16, u64)> {
+                        let (ot, key) = value_to_otype_okey_simple(v, store_ref).ok()?;
+                        supports_range(ot).then_some((ot.as_u16(), key))
+                    };
+
+                    let mut ot: Option<u16> = None;
+                    if let Some((v, _inclusive)) = bounds.lower.as_ref() {
+                        if let Some((o_type, key)) = encode(v) {
                             ot = Some(o_type);
-                            range_max_okey = Some(key);
+                            range_min_okey = Some(key);
                         }
                     }
-                }
+                    if let Some((v, _inclusive)) = bounds.upper.as_ref() {
+                        if let Some((o_type, key)) = encode(v) {
+                            if ot.is_some() && ot != Some(o_type) {
+                                // Mixed type bounds; don't attempt range narrowing.
+                                ot = None;
+                                range_min_okey = None;
+                                range_max_okey = None;
+                            } else {
+                                ot = Some(o_type);
+                                range_max_okey = Some(key);
+                            }
+                        }
+                    }
 
-                if let Some(o_type) = ot {
-                    range_o_type = Some(o_type);
-                    // Also set the filter o_type so directory-level pre-skip can eliminate non-matching leaflets.
-                    filter.o_type = Some(o_type);
+                    if let Some(o_type) = ot {
+                        range_o_type = Some(o_type);
+                        // Also set the filter o_type so directory-level pre-skip can eliminate non-matching leaflets.
+                        filter.o_type = Some(o_type);
+                    }
                 }
             }
         }
@@ -2070,6 +2140,7 @@ impl Operator for BinaryScanOperator {
                         to_t: ctx.to_t,
                         g_id: self.g_id,
                         index: self.index,
+                        decimal_encoding: store_arc.decimal_encoding(),
                     };
                     let entry = if let Some(hit) = global_translation_cache().get(&global_key) {
                         hit
@@ -2341,6 +2412,14 @@ pub struct GlobalTranslationKey {
     pub to_t: i64,
     pub g_id: GraphId,
     pub index: IndexType,
+    /// The base store's decimal-encoding policy. A full reindex can replace an
+    /// arena-only (v2) root with an inline-decimal (v3) root at the *same*
+    /// `index_t` (a pure re-encode of the same committed data), so `store_max_t`
+    /// alone can't tell the two apart. The two roots translate the same novelty
+    /// decimal to different `(o_type, o_key)` (NUM_BIG_OVERFLOW handle vs inline
+    /// XSD_DECIMAL_INLINE); keying on the policy prevents serving a stale
+    /// arena-keyed translation against an inline root (or vice versa).
+    pub decimal_encoding: fluree_db_core::DecimalEncoding,
 }
 
 /// Cross-query LRU of translated overlay ops.
@@ -2966,7 +3045,18 @@ fn value_to_otype_okey(
             }
             find_numbig_okey(val, store, numbig_ctx)
         }
-        FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
+        FlakeValue::Decimal(bd) => {
+            // Mirror the resolver exactly: under InlineWhenFits a decimal that
+            // fits is stored inline (XSD_DECIMAL_INLINE), so the constant must
+            // encode the same way to match the stored row; values that don't fit
+            // (and every decimal under ArenaOnly) live in the NumBig arena.
+            if store.decimal_encoding().inlines() {
+                if let Some(key) = ObjKey::encode_decimal(bd) {
+                    return Ok((OType::XSD_DECIMAL_INLINE, key.as_u64()));
+                }
+            }
+            find_numbig_okey(val, store, numbig_ctx)
+        }
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
         // intended lane) and generic Duration (its V3 decode is a stub —
         // the raw flake preserves the value, the binary row would not).
@@ -3320,6 +3410,23 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
+        FlakeValue::Decimal(bd) => {
+            // An inline-eligible decimal under InlineWhenFits has a
+            // self-describing key, so the prefilter narrows with no arena
+            // round-trip (issue #1328). Arena decimals (too large, or any
+            // decimal under ArenaOnly) need a per-(graph, predicate) handle this
+            // helper has no context for, so leave the scan un-narrowed
+            // (Unsupported) — never NotFound, since the value may still exist.
+            if store.decimal_encoding().inlines() {
+                if let Some(key) = ObjKey::encode_decimal(bd) {
+                    return Ok((OType::XSD_DECIMAL_INLINE, key.as_u64()));
+                }
+            }
+            Err(Error::new(
+                ErrorKind::Unsupported,
+                "arena decimal not encodable without (graph, predicate) context",
+            ))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),

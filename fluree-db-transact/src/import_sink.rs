@@ -90,6 +90,10 @@ mod inner {
         pub vector_pool: Arc<SharedVectorArenaPool>,
         /// Shared namespace allocator (for prefix lookup).
         pub ns_alloc: Arc<SharedNamespaceAllocator>,
+        /// Decimal-encoding policy for the index this import builds. Must match
+        /// the version of the root written for the import (same source) so inline
+        /// decimals and the root format agree.
+        pub decimal_encoding: fluree_db_core::DecimalEncoding,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish`] —
@@ -157,6 +161,9 @@ mod inner {
         next_lang_id: u16,
         /// Graph ID for all records in this chunk (0 = default).
         g_id: GraphId,
+        /// Decimal-encoding policy (from `SpoolConfig`): under `InlineWhenFits`,
+        /// small exact decimals encode inline instead of via the numbig pool.
+        decimal_encoding: fluree_db_core::DecimalEncoding,
     }
 
     impl SpoolContext {
@@ -184,6 +191,7 @@ mod inner {
                 ns_alloc: Arc::clone(&config.ns_alloc),
                 ns_prefix_cache: FxHashMap::default(),
                 languages: FxHashMap::default(),
+                decimal_encoding: config.decimal_encoding,
                 next_lang_id: 1, // 0 = no language tag
                 g_id,
             })
@@ -384,14 +392,29 @@ mod inner {
                     }
                 }
                 FlakeValue::Decimal(dec) => {
-                    // Use shared numbig pool for global handle.
-                    let handle =
-                        self.numbig_pool
-                            .get_or_insert_bigdec(self.g_id, p_id, dec.as_ref());
-                    (
-                        ObjKind::NUM_BIG.as_u8(),
-                        ObjKey::encode_u32_id(handle).as_u64(),
-                    )
+                    // Under InlineWhenFits, a small exact decimal encodes inline —
+                    // no numbig-pool handle, avoiding the shared-pool insert on the
+                    // import hot path. Large/high-precision decimals (and every
+                    // decimal under ArenaOnly) fall back to the pool.
+                    let inline = self
+                        .decimal_encoding
+                        .inlines()
+                        .then(|| ObjKey::encode_decimal(dec.as_ref()))
+                        .flatten();
+                    match inline {
+                        Some(key) => (ObjKind::NUM_DEC.as_u8(), key.as_u64()),
+                        None => {
+                            let handle = self.numbig_pool.get_or_insert_bigdec(
+                                self.g_id,
+                                p_id,
+                                dec.as_ref(),
+                            );
+                            (
+                                ObjKind::NUM_BIG.as_u8(),
+                                ObjKey::encode_u32_id(handle).as_u64(),
+                            )
+                        }
+                    }
                 }
                 FlakeValue::Vector(v) => {
                     // Use shared vector pool for global handle.
@@ -823,6 +846,7 @@ mod inner {
                 numbig_pool: Arc::new(SharedNumBigPool::new()),
                 vector_pool: Arc::new(SharedVectorArenaPool::new()),
                 ns_alloc: Arc::new(SharedNamespaceAllocator::from_registry(ns)),
+                decimal_encoding: fluree_db_core::DecimalEncoding::InlineWhenFits,
             }
         }
 
