@@ -20,8 +20,12 @@ use crate::Result;
 
 use fluree_db_iceberg::catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient};
 use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
+use fluree_db_iceberg::io::S3IcebergStorage;
 use fluree_db_iceberg::metadata::{
     PartitionField, Schema, SchemaField, Snapshot, SortField, TableMetadata,
+};
+use fluree_db_iceberg::stats::{
+    aggregate_column_stats, send_read_snapshot_data_files, AggregatedColumnStats,
 };
 use fluree_db_iceberg::FieldType;
 
@@ -570,7 +574,7 @@ pub async fn preview_iceberg_table(
         ))
     })?;
 
-    let schema = table_schema_from_metadata(&table, metadata)?;
+    let mut schema = table_schema_from_metadata(&table, metadata)?;
 
     match tier {
         StatsTier::Schema => Ok(TablePreview {
@@ -583,18 +587,109 @@ pub async fn preview_iceberg_table(
             warnings: Vec::new(),
         }),
         StatsTier::Stats => {
-            // Tier-B per-column stats are aggregated from the manifest-list +
-            // manifests; wired in the Tier-B commit.
+            let mut warnings = vec![DISTINCT_COUNT_WARNING.to_string()];
+
+            let (manifests_read, had_column_bounds) = match metadata.current_snapshot() {
+                Some(snapshot) => {
+                    let iceberg_schema = metadata.current_schema().ok_or_else(|| {
+                        crate::ApiError::config("Table metadata has no current schema")
+                    })?;
+
+                    // Build S3 storage from vended credentials (if the catalog
+                    // delegated them) or the ambient AWS chain — same policy as
+                    // the scan path.
+                    let storage = build_preview_storage(&conn, load.credentials.as_ref()).await?;
+
+                    // Metadata-only: reads the manifest-list + manifests, never a
+                    // Parquet/data file (see fluree_db_iceberg::stats).
+                    let (data_files, manifests_read) =
+                        send_read_snapshot_data_files(&storage, snapshot)
+                            .await
+                            .map_err(|e| {
+                                crate::ApiError::config(format!(
+                                    "Failed to read manifests for {}: {e}",
+                                    table.qualified()
+                                ))
+                            })?;
+
+                    let agg = aggregate_column_stats(&data_files, iceberg_schema);
+
+                    for col in &mut schema.columns {
+                        if col.nested {
+                            continue;
+                        }
+                        if let Some(a) = agg.columns.get(&col.field_id) {
+                            col.stats = Some(to_api_column_stats(a));
+                        }
+                    }
+
+                    // Fill authoritative counts from the aggregation if the
+                    // snapshot summary omitted them.
+                    schema.row_count = schema.row_count.or(Some(agg.row_count));
+                    schema.data_file_count = schema.data_file_count.or(Some(agg.data_file_count));
+                    schema.total_bytes = schema.total_bytes.or(Some(agg.total_bytes));
+
+                    (manifests_read, agg.had_column_bounds)
+                }
+                None => {
+                    warnings.push(
+                        "Table has no current snapshot; no column statistics available.".to_string(),
+                    );
+                    (0, false)
+                }
+            };
+
             Ok(TablePreview {
                 schema,
                 stats_completeness: StatsCompleteness {
                     tier: "stats".to_string(),
-                    manifests_read: 0,
-                    had_column_bounds: false,
+                    manifests_read,
+                    had_column_bounds,
                 },
-                warnings: vec![DISTINCT_COUNT_WARNING.to_string()],
+                warnings,
             })
         }
+    }
+}
+
+/// Build S3 storage for reading manifests during a Tier-B preview, mirroring the
+/// scan path's policy: vended credentials when the catalog delegated them,
+/// otherwise the ambient AWS credential chain.
+async fn build_preview_storage(
+    conn: &IcebergConnectionConfig,
+    credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
+) -> Result<S3IcebergStorage> {
+    let io = &conn.io;
+    let storage = if let Some(creds) = credentials {
+        S3IcebergStorage::from_vended_credentials(
+            creds,
+            io.s3_region.as_deref(),
+            io.s3_endpoint.as_deref(),
+            io.s3_path_style,
+        )
+        .await
+    } else {
+        S3IcebergStorage::from_default_chain(
+            io.s3_region.as_deref(),
+            io.s3_endpoint.as_deref(),
+            io.s3_path_style,
+        )
+        .await
+    };
+    storage.map_err(|e| crate::ApiError::config(format!("Failed to create S3 storage: {e}")))
+}
+
+/// Map an iceberg-crate [`AggregatedColumnStats`] onto the API [`ColumnStats`].
+fn to_api_column_stats(a: &AggregatedColumnStats) -> ColumnStats {
+    ColumnStats {
+        null_count: a.null_count,
+        value_count: a.value_count,
+        null_fraction: a.null_fraction,
+        nan_count: a.nan_count,
+        min: a.min.clone(),
+        max: a.max.clone(),
+        on_disk_bytes: a.on_disk_bytes,
+        distinct_count: a.distinct_count,
     }
 }
 

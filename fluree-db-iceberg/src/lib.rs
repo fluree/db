@@ -61,6 +61,7 @@ pub mod io;
 pub mod manifest;
 pub mod metadata;
 pub mod scan;
+pub mod stats;
 
 // Re-export commonly used types
 pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
@@ -70,6 +71,10 @@ pub use error::{IcebergError, Result};
 // Re-export Phase 2 types for convenience
 pub use io::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType, IcebergStorage};
 pub use manifest::{DataFile, ManifestContent, ManifestEntry, ManifestListEntry, TypedValue};
+pub use stats::{
+    aggregate_column_stats, read_snapshot_data_files, typed_value_to_json, AggregatedColumnStats,
+    TableStatsAggregation,
+};
 pub use scan::{
     ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan, ScanPlanner,
 };
