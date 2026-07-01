@@ -442,7 +442,7 @@ impl BinaryCursor {
                     let batch = if self.filter.is_empty() || batch.is_empty() {
                         batch
                     } else {
-                        filter_batch(&self.filter, &batch)
+                        filter_batch(&self.filter, &batch, self.order)
                     };
 
                     // Apply overlay merge if we have overlay ops.
@@ -798,9 +798,16 @@ fn push_overlay_row(
 
 /// Apply the filter to a batch, returning only matching rows.
 /// Returns the batch unchanged if all rows match (avoids copy).
-fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch) -> ColumnBatch {
+fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder) -> ColumnBatch {
+    // Within-leaflet seek: leaflet rows are sorted by the order's key, so when
+    // the leading sort column is bound to a single value we binary-search its
+    // contiguous row range instead of scanning every row. This is the common
+    // bound-subject SPOT point read — a large leaflet with ~5 target rows. Rows
+    // outside the range have a different leading value, so they can't match a
+    // filter that pins it — the output is identical to a full scan.
+    let (start, end) = leading_bound_range(filter, batch, order);
     let mut matching: Vec<usize> = Vec::new();
-    for i in 0..batch.row_count {
+    for i in start..end {
         let s_id = batch.s_id.get(i); // always present
         let o_key = batch.o_key.get(i); // always present
         let p_id = batch.p_id.get_or(i, 0);
@@ -811,11 +818,45 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch) -> ColumnBatch {
         }
     }
 
+    // Fast path only when nothing was skipped and everything matched.
     if matching.len() == batch.row_count {
         return batch.clone();
     }
 
     gather_batch(batch, &matching)
+}
+
+/// Binary-search the contiguous `[start, end)` row range whose leading sort
+/// column equals its bound filter value. Returns the full `[0, row_count)`
+/// range when the leading column is unbound or not a materialized (sorted)
+/// block — so callers fall back to a full scan, never miss rows.
+fn leading_bound_range(
+    filter: &BinaryFilter,
+    batch: &ColumnBatch,
+    order: RunSortOrder,
+) -> (usize, usize) {
+    match order {
+        RunSortOrder::Spot => sorted_block_range(&batch.s_id, filter.s_id, batch.row_count),
+        RunSortOrder::Post | RunSortOrder::Psot => {
+            sorted_block_range(&batch.p_id, filter.p_id, batch.row_count)
+        }
+        RunSortOrder::Opst => sorted_block_range(&batch.o_type, filter.o_type, batch.row_count),
+    }
+}
+
+fn sorted_block_range<T: Copy + Ord>(
+    col: &ColumnData<T>,
+    bound: Option<T>,
+    row_count: usize,
+) -> (usize, usize) {
+    match (bound, col) {
+        (Some(v), ColumnData::Block(arr)) => {
+            let start = arr.partition_point(|&x| x < v);
+            let end = arr.partition_point(|&x| x <= v);
+            (start, end)
+        }
+        _ => (0, row_count),
+    }
 }
 
 /// Gather rows at the given indices from a batch into a new batch.
