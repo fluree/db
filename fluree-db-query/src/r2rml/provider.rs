@@ -53,13 +53,21 @@ pub enum ScanValue {
 /// R2RML operator so results are correct regardless of scan pushdown.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObjectConstant {
-    /// A literal object — loose value match (string/integer/boolean).
+    /// A literal object — loose value match (string/integer/boolean/date). Emits
+    /// a scan filter for row-group + row pruning in addition to operator enforcement.
     Scalar(ScanValue),
     /// A bound IRI object — exact IRI match, e.g. a reference to a parent entity
     /// (`?s edw:geography <geo/1>`). Compared against the materialized IRI; the
     /// column-level scan filter is not applied to these yet (a FK-key pushdown
     /// needs subject-template reversal), so only the operator enforces them.
     Iri(String),
+    /// A decimal / arbitrary-precision integer object — numeric (scale-insensitive)
+    /// match, so `9.99` matches a column materialized as `9.990`. Operator-enforced
+    /// only (no scan pushdown yet, which would need decimal-aware Iceberg predicates).
+    Decimal(bigdecimal::BigDecimal),
+    /// A double (xsd:double / xsd:float) object — exact f64 value match.
+    /// Operator-enforced only (no scan pushdown yet).
+    Double(f64),
 }
 
 /// A predicate pushed down to the Iceberg scan for file pruning.

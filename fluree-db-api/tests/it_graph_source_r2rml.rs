@@ -3713,3 +3713,71 @@ async fn guard_bound_subject_binds_object_only() {
         "only the <store/5> subject's storeId object is returned"
     );
 }
+
+/// A decimal constant object (`?s ex:val 9.99`) is enforced by the operator with
+/// a scale-insensitive numeric match: a column materialized as `9.990` (scale 3)
+/// matches the `9.99` query constant, while `12.345` does not. This also exercises
+/// the real `format_decimal` → `BigDecimal::parse` path end to end.
+#[tokio::test]
+async fn guard_constant_object_decimal_scale_insensitive() {
+    use num_bigdecimal::BigDecimal;
+    use std::str::FromStr;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "fa:main");
+    Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let mapping = R2rmlLoader::from_turtle(&val_mapping("xsd:decimal"))
+        .unwrap()
+        .compile()
+        .unwrap();
+    // Scale-3 column: unscaled 9990 → "9.990", 12345 → "12.345".
+    let batch = id_val_batch(
+        vec![Some(1), Some(2)],
+        Column::Decimal {
+            values: vec![Some(9990), Some(12345)],
+            precision: 10,
+            scale: 3,
+        },
+        FieldType::Decimal {
+            precision: 10,
+            scale: 3,
+        },
+    );
+    let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let pred = ledger
+        .snapshot
+        .encode_iri("http://example.org/val")
+        .expect("example.org namespace registered");
+    // ?s ex:val 9.99
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("fa-gs:main".into()),
+        patterns: vec![Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(pred),
+            Term::Value(FlakeValue::Decimal(Box::new(
+                BigDecimal::from_str("9.99").unwrap(),
+            ))),
+        ))],
+    };
+
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![s]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("decimal object-constant query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    assert_eq!(rows, 1, "decimal 9.99 matches only the 9.990-scaled row");
+}

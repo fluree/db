@@ -412,13 +412,29 @@ fn is_loose_matchable_datatype(dtc: &Option<DatatypeConstraint>) -> bool {
     }
 }
 
-/// The scan value for a constant object literal, or `None` for value types not
-/// yet supported as constant objects (float/decimal/date, refs).
-fn const_object_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+/// The operator-enforced constant for an object literal, or `None` for value
+/// types not supported as constant objects (refs, temporal types beyond date,
+/// durations, vectors, JSON, geo).
+///
+/// String / integer / boolean / date go through `Scalar` and additionally emit a
+/// scan filter for pruning. Decimal / big-integer / double are numeric matches
+/// enforced by the operator only (no scan pushdown yet).
+fn const_object(value: &FlakeValue) -> Option<ObjectConstant> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
     match value {
-        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
-        FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
-        FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
+        FlakeValue::String(s) => Some(ObjectConstant::Scalar(ScanValue::Str(s.clone()))),
+        FlakeValue::Long(n) => Some(ObjectConstant::Scalar(ScanValue::Int(*n))),
+        FlakeValue::Boolean(b) => Some(ObjectConstant::Scalar(ScanValue::Bool(*b))),
+        FlakeValue::Date(d) => Some(ObjectConstant::Scalar(ScanValue::Date(
+            d.days_since_epoch(),
+        ))),
+        FlakeValue::Decimal(d) => Some(ObjectConstant::Decimal((**d).clone())),
+        FlakeValue::Double(f) => Some(ObjectConstant::Double(*f)),
+        // Big integers compare numerically as exact decimals.
+        FlakeValue::BigInt(n) => BigDecimal::from_str(&n.to_string())
+            .ok()
+            .map(ObjectConstant::Decimal),
         _ => None,
     }
 }
@@ -596,14 +612,15 @@ pub fn convert_triple_to_r2rml(
 
     // Extract the object: a variable, or a constant equality constraint the
     // operator enforces. A constant predicate is required (to resolve the map).
-    //   - Literal (string/integer/boolean, loose-matchable datatype) → Scalar.
+    //   - Literal (string/integer/boolean/date, loose-matchable datatype) →
+    //     Scalar (also emits a scan filter for pruning).
+    //   - Decimal / big-integer / double literal → numeric operator-only match.
     //   - Bound IRI / ref object (`?s edw:geography <geo/1>`) → Iri.
-    // Language-tagged / custom-typed literals need strict matching, and
-    // float/decimal/date literals are not pushed yet — all left unconverted
-    // (rejected as unsupported) rather than mismatched.
+    // Language-tagged / custom-typed literals need strict matching and are left
+    // unconverted rather than mismatched.
     let object_constant: Option<ObjectConstant> = match &tp.o {
         Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
-            const_object_scan_value(v).map(ObjectConstant::Scalar)
+            const_object(v)
         }
         Term::Iri(iri) if predicate_filter.is_some() => Some(ObjectConstant::Iri(iri.to_string())),
         Term::Sid(sid) if predicate_filter.is_some() => {

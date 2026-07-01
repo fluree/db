@@ -1182,6 +1182,21 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
     match constant {
         // Bound IRI / ref object: exact IRI match.
         ObjectConstant::Iri(iri) => matches!(term, RdfTerm::Iri(v) if v == iri),
+        // Decimal / big-integer object: numeric (scale-insensitive) match, so a
+        // query `9.99` matches a column materialized as `9.990`.
+        ObjectConstant::Decimal(d) => {
+            let RdfTerm::Literal { value: v, .. } = term else {
+                return false;
+            };
+            v.parse::<bigdecimal::BigDecimal>().is_ok_and(|x| &x == d)
+        }
+        // Double object: exact f64 value match.
+        ObjectConstant::Double(f) => {
+            let RdfTerm::Literal { value: v, .. } = term else {
+                return false;
+            };
+            v.parse::<f64>().is_ok_and(|x| x == *f)
+        }
         // Literal object: loose value match, ignoring datatype/language.
         ObjectConstant::Scalar(value) => {
             let RdfTerm::Literal { value: v, .. } = term else {
@@ -1195,8 +1210,11 @@ fn rdf_term_eq_object_constant(term: &RdfTerm, constant: &crate::r2rml::ObjectCo
                     "false" | "0" => !*b,
                     _ => false,
                 },
-                // Date constant objects are not produced by convert yet.
-                ScanValue::Date(_) => false,
+                // The subject/object date column materializes as ISO 8601; parse
+                // it back to days-since-epoch and compare to the constant.
+                ScanValue::Date(days) => {
+                    fluree_db_core::Date::parse(v).is_ok_and(|d| d.days_since_epoch() == *days)
+                }
             }
         }
     }
@@ -1634,6 +1652,40 @@ mod tests {
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b));
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b));
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("false"), &b));
+    }
+
+    #[test]
+    fn numeric_and_date_object_matching() {
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        // Decimal: scale-insensitive numeric match (`9.99` == `9.990`).
+        let d = ObjectConstant::Decimal(BigDecimal::from_str("9.99").unwrap());
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("9.99"), &d));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("9.990"), &d));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("9.98"), &d));
+        // An IRI term never matches a literal constant.
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("9.99"), &d));
+
+        // Double: exact f64 value match, insensitive to trailing zeros.
+        let f = ObjectConstant::Double(1.5);
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1.5"), &f));
+        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1.50"), &f));
+        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("1.6"), &f));
+
+        // Date: ISO 8601 materialized lexical parsed back to days-since-epoch.
+        let days = fluree_db_core::Date::parse("2024-01-15")
+            .unwrap()
+            .days_since_epoch();
+        let dt = ObjectConstant::Scalar(ScanValue::Date(days));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("2024-01-15"),
+            &dt
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("2024-01-16"),
+            &dt
+        ));
     }
 
     #[test]
