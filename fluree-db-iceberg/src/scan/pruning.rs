@@ -10,9 +10,13 @@
 //! They are conservative: returning `true` is always safe (may include extra files),
 //! but returning `false` means we can definitively skip this manifest/file.
 
+use crate::manifest::value_codec::TypedValue;
 use crate::manifest::{decode_by_type_string, DataFile, PartitionFieldSummary};
 use crate::metadata::Schema;
 use crate::scan::predicate::{ComparisonOp, Expression, LiteralValue};
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::statistics::Statistics;
+use std::collections::HashMap;
 
 /// Evaluate expression against manifest partition summary.
 ///
@@ -163,63 +167,120 @@ fn can_contain_comparison(
     // Convert literal to typed value
     let lit_typed = value.to_typed_value();
 
-    // Evaluate based on operator
-    match op {
-        ComparisonOp::Eq => {
-            // value must be in [lower, upper]
+    bounds_can_contain(op, &lit_typed, lower_typed, upper_typed)
+}
 
-            match (&lower_typed, &upper_typed) {
-                (Some(l), Some(u)) => {
-                    lit_typed.ge(l).unwrap_or(true) && lit_typed.le(u).unwrap_or(true)
-                }
-                (Some(l), None) => lit_typed.ge(l).unwrap_or(true),
-                (None, Some(u)) => lit_typed.le(u).unwrap_or(true),
-                (None, None) => true,
-            }
+/// Shared min/max reasoning for a `column <op> value` predicate. `lower`/`upper`
+/// are the column's decoded bounds (from an Iceberg `DataFile` or a Parquet
+/// row-group `Statistics`); a missing bound is treated conservatively (cannot
+/// prune). Returns `true` if a value satisfying the predicate could lie within
+/// the bounds.
+fn bounds_can_contain(
+    op: ComparisonOp,
+    lit: &TypedValue,
+    lower: Option<TypedValue>,
+    upper: Option<TypedValue>,
+) -> bool {
+    match op {
+        // value ∈ [lower, upper]
+        ComparisonOp::Eq => match (&lower, &upper) {
+            (Some(l), Some(u)) => lit.ge(l).unwrap_or(true) && lit.le(u).unwrap_or(true),
+            (Some(l), None) => lit.ge(l).unwrap_or(true),
+            (None, Some(u)) => lit.le(u).unwrap_or(true),
+            (None, None) => true,
+        },
+        // Prunable only when every value equals the excluded one (lower==upper==value).
+        ComparisonOp::NotEq => match (&lower, &upper) {
+            (Some(l), Some(u)) if l == u => l != lit,
+            _ => true,
+        },
+        // column < value can occur iff lower < value.
+        ComparisonOp::Lt => lower.as_ref().is_none_or(|l| lit.gt(l).unwrap_or(true)),
+        ComparisonOp::LtEq => lower.as_ref().is_none_or(|l| lit.ge(l).unwrap_or(true)),
+        // column > value can occur iff upper > value.
+        ComparisonOp::Gt => upper.as_ref().is_none_or(|u| lit.lt(u).unwrap_or(true)),
+        ComparisonOp::GtEq => upper.as_ref().is_none_or(|u| lit.le(u).unwrap_or(true)),
+    }
+}
+
+/// Row-group-level pruning: can this Parquet row group contain a row matching
+/// `expr`? Conservative — returns `true` unless the row group's column
+/// statistics prove no row can match. `field_to_col` maps an Iceberg field id to
+/// the Parquet column index in this file.
+pub fn row_group_can_contain(
+    expr: &Expression,
+    row_group: &RowGroupMetaData,
+    field_to_col: &HashMap<i32, usize>,
+) -> bool {
+    match expr {
+        Expression::AlwaysTrue => true,
+        Expression::AlwaysFalse => false,
+        Expression::And(exprs) => exprs
+            .iter()
+            .all(|e| row_group_can_contain(e, row_group, field_to_col)),
+        Expression::Or(exprs) => exprs
+            .iter()
+            .any(|e| row_group_can_contain(e, row_group, field_to_col)),
+        Expression::Comparison {
+            field_id,
+            op,
+            value,
+            ..
+        } => {
+            let Some(&col_idx) = field_to_col.get(field_id) else {
+                return true;
+            };
+            let Some(stats) = row_group.column(col_idx).statistics() else {
+                return true;
+            };
+            let lit = value.to_typed_value();
+            let (lower, upper) = stat_bounds(stats, &lit);
+            bounds_can_contain(*op, &lit, lower, upper)
         }
-        ComparisonOp::NotEq => {
-            // Can only prune if all values equal the excluded value
-            // That means lower == upper == value, which means we can exclude
-            match (&lower_typed, &upper_typed) {
-                (Some(l), Some(u)) if l == u => {
-                    // All values are the same
-                    l != &lit_typed
-                }
-                _ => true, // Can't prune
-            }
+        Expression::In {
+            field_id, values, ..
+        } => {
+            let Some(&col_idx) = field_to_col.get(field_id) else {
+                return true;
+            };
+            let Some(stats) = row_group.column(col_idx).statistics() else {
+                return true;
+            };
+            values.iter().any(|v| {
+                let lit = v.to_typed_value();
+                let (lower, upper) = stat_bounds(stats, &lit);
+                bounds_can_contain(ComparisonOp::Eq, &lit, lower, upper)
+            })
         }
-        ComparisonOp::Lt => {
-            // value < column => column > value => lower > value won't match
-            // File can contain if lower < value
-            match &lower_typed {
-                Some(l) => lit_typed.gt(l).unwrap_or(true),
-                None => true,
-            }
-        }
-        ComparisonOp::LtEq => {
-            // value <= column => column >= value => lower > value won't match
-            // File can contain if lower <= value
-            match &lower_typed {
-                Some(l) => lit_typed.ge(l).unwrap_or(true),
-                None => true,
-            }
-        }
-        ComparisonOp::Gt => {
-            // value > column => column < value => upper < value won't match
-            // File can contain if upper > value
-            match &upper_typed {
-                Some(u) => lit_typed.lt(u).unwrap_or(true),
-                None => true,
-            }
-        }
-        ComparisonOp::GtEq => {
-            // value >= column => column <= value => upper <= value won't match
-            // File can contain if upper >= value
-            match &upper_typed {
-                Some(u) => lit_typed.le(u).unwrap_or(true),
-                None => true,
-            }
-        }
+        // Null predicates and negations keep the row group (conservative).
+        _ => true,
+    }
+}
+
+/// Extract a Parquet row-group column's min/max as `TypedValue`s coerced to the
+/// same variant as `like` (the predicate literal). Only the pushdown-supported
+/// physical types are read (bool / int32 / int64, including int32-backed dates);
+/// anything else yields `(None, None)` so pruning stays conservative.
+fn stat_bounds(stats: &Statistics, like: &TypedValue) -> (Option<TypedValue>, Option<TypedValue>) {
+    match (stats, like) {
+        (Statistics::Boolean(s), TypedValue::Boolean(_)) => (
+            s.min_opt().map(|&v| TypedValue::Boolean(v)),
+            s.max_opt().map(|&v| TypedValue::Boolean(v)),
+        ),
+        (Statistics::Int32(s), TypedValue::Int32(_)) => (
+            s.min_opt().map(|&v| TypedValue::Int32(v)),
+            s.max_opt().map(|&v| TypedValue::Int32(v)),
+        ),
+        // Iceberg dates are physically int32 (days since 1970-01-01).
+        (Statistics::Int32(s), TypedValue::Date(_)) => (
+            s.min_opt().map(|&v| TypedValue::Date(v)),
+            s.max_opt().map(|&v| TypedValue::Date(v)),
+        ),
+        (Statistics::Int64(s), TypedValue::Int64(_)) => (
+            s.min_opt().map(|&v| TypedValue::Int64(v)),
+            s.max_opt().map(|&v| TypedValue::Int64(v)),
+        ),
+        _ => (None, None),
     }
 }
 
@@ -569,5 +630,82 @@ mod tests {
         );
         let result = evaluate_batch(&expr, &batch);
         assert_eq!(result, vec![0, 2, 4]);
+    }
+
+    /// Write a Parquet file with two row groups over one INT64 column `v`:
+    /// row group 0 holds 0..=4, row group 1 holds 100..=104. The default writer
+    /// properties emit chunk statistics, so each row group carries real min/max.
+    fn two_row_group_parquet() -> bytes::Bytes {
+        use parquet::data_type::Int64Type;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let schema = Arc::new(parse_message_type("message s { REQUIRED INT64 v; }").unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            for vals in [[0i64, 1, 2, 3, 4], [100, 101, 102, 103, 104]] {
+                let mut rg = writer.next_row_group().unwrap();
+                let mut col = rg.next_column().unwrap().unwrap();
+                col.typed::<Int64Type>()
+                    .write_batch(&vals, None, None)
+                    .unwrap();
+                col.close().unwrap();
+                rg.close().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn row_group_pruning_uses_real_parquet_stats() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(two_row_group_parquet()).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 2);
+
+        // Iceberg field id 1 maps to Parquet column 0 (the sole column).
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let cmp = |op, v| Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op,
+            value: LiteralValue::Int64(v),
+        };
+
+        // v >= 50: rg0 (max 4) pruned, rg1 (min 100) kept.
+        let ge = cmp(ComparisonOp::GtEq, 50);
+        assert!(!row_group_can_contain(
+            &ge,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(&ge, meta.row_group(1), &field_to_col));
+
+        // v < 50: rg0 kept, rg1 pruned.
+        let lt = cmp(ComparisonOp::Lt, 50);
+        assert!(row_group_can_contain(&lt, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(
+            &lt,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // v == 2: only rg0 can contain it.
+        let eq = cmp(ComparisonOp::Eq, 2);
+        assert!(row_group_can_contain(&eq, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(
+            &eq,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // A field the query does not map is conservative — keep the row group.
+        let unmapped = HashMap::from([(2i32, 0usize)]);
+        assert!(row_group_can_contain(&ge, meta.row_group(0), &unmapped));
     }
 }
