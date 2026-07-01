@@ -167,14 +167,29 @@ Cost is bounded by the number of predicate-targeted shapes in the cache, not by 
    - For each subject: fetch `rdf:type` flakes, then call `engine.validate_node(db, subject, &types)`.
    - Tag each returned `ValidationResult` with `graph_id = Some(g_id)` so the caller can partition reject vs warn.
 
+### `sh:class` value membership and value-sets across graphs
+
+`sh:class` is validated by `validate_class_constraint` in `fluree-db-shacl/src/validate.rs`. There are **two distinct graph contexts** at play:
+
+- **Compilation graph** — where the shapes themselves are read from (`f:shapesSource`; see [Shape compilation from multiple graphs](#shape-compilation-from-multiple-graphs)).
+- **Membership graph(s)** — where a value's `rdf:type` (and any `rdfs:subClassOf` hierarchy) is looked up to decide `sh:class` conformance.
+
+By default, membership is resolved against the **focus node's own data graph** (plus `g_id=0` for the `subClassOf` walk). That breaks the "shared value-set" pattern — e.g. a controlled list of US states (`ex:illinois a ex:USState`) referenced by records living in a different graph. To support it, `validate_view_with_shacl` receives the `f:shapesSource` graph ids as `membership_g_ids` and the engine unions them into the lookup: a value's `rdf:type` is read across `{focus data graph} ∪ {membership graphs}`, so the value-set vocabulary can live alongside the shapes. When `f:shapesSource` is unset (shapes in `g_id=0`), this degenerates to the historical behaviour.
+
+A **per-transaction memo** on the `ShaclEngine` (`class_cache`, keyed `(value, class, focus g_id)`) collapses repeated checks — inserting 100 records that all reference `ex:illinois` performs a single membership lookup. The engine is built fresh per transaction (`validate_view_with_shacl`) and shared across all focus nodes, so the memo is scoped to exactly one validation pass. Cache hits skip the range scan **and** its fuel charge, so per-transaction fuel depends on intra-transaction value repetition.
+
+Scope limits (as of this writing):
+- **Same-ledger only.** Cross-ledger value-sets aren't wired — the cross-ledger shapes wire projects only SHACL predicates, not `rdf:type`/`subClassOf`. The unused `cross_ledger/schema_materializer.rs` (`ArtifactKind::Schema`) is the hook if that's ever needed.
+- **Top-level property shapes only.** `sh:class` reached via a referenced/nested shape (`sh:and`/`or`/`xone`/`node` referencing a shape by id) passes `None` for the context and keeps the legacy data-graph lookup.
+
 ### RDFS subclass fallback (`is_subclass_of`)
 
-When the indexed `SchemaHierarchy` doesn't know about a `rdfs:subClassOf` edge (e.g. asserted in the same or a recent unindexed transaction), `validate_class_constraint` calls `is_subclass_of(db, start, target)` which walks `rdfs:subClassOf` upward via BFS.
+When the indexed `SchemaHierarchy` doesn't know about a `rdfs:subClassOf` edge (e.g. asserted in the same or a recent unindexed transaction), `validate_class_constraint` (via `value_conforms_to_class`) calls `is_subclass_of(db, membership_g_ids, start, target)` which walks `rdfs:subClassOf` upward via BFS.
 
 Two invariants in that walk:
 
-- **Always scope to `g_id=0`** via `rescope_to_schema_graph(db)` — schema lives in the default graph, matching how `SchemaHierarchy::from_db_root_schema` is built. Subject may be in graph G but the `subClassOf` edge must be looked up in the schema graph.
-- **Preserve tracker + other `GraphDbRef` fields** — `rescope_to_schema_graph` uses `db` copy + `g_id = 0` mutation rather than `GraphDbRef::new(..)`, which would reset `tracker`, `runtime_small_dicts`, and `eager`. There's a unit test pinning this (`rescope_to_schema_graph_preserves_tracker_and_other_fields`).
+- **Scope to `g_id=0` unioned with the membership graphs** via `rescope_to_graph(db, g)` — schema lives in the default graph (matching how `SchemaHierarchy::from_db_root_schema` is built), while a value-set vocabulary configured via `f:shapesSource` may declare a small class hierarchy in its own graph that must also be honoured. Subject may be in graph G but the `subClassOf` edge is looked up in the schema/vocabulary graphs.
+- **Preserve tracker + other `GraphDbRef` fields** — `rescope_to_graph` uses `db` copy + `g_id` mutation rather than `GraphDbRef::new(..)`, which would reset `tracker`, `runtime_small_dicts`, and `eager`. There's a unit test pinning this (`rescope_to_graph_preserves_tracker_and_other_fields`).
 
 ## Adding a new constraint
 
@@ -250,6 +265,7 @@ fluree.upsert(ledger, &valid_data).await.expect("must pass");
 See `fluree-db-api/tests/it_config_graph.rs` for patterns that write config via TriG into the config graph, then stage transactions across multiple graphs. Examples:
 
 - `shacl_shapes_source_points_to_named_graph` — `f:shapesSource` wiring.
+- `shacl_class_value_set_in_shapes_graph` — `sh:class` value-set defined in the `f:shapesSource` graph, referenced by data in another graph (cross-graph membership union + per-txn memo).
 - `shacl_per_graph_disable_honored` — per-graph `shaclEnabled: false`.
 - `shacl_per_graph_mode_warn_vs_reject` — mixed modes across graphs.
 - `shacl_target_subjects_of_fires_on_base_state_edge` — base-state predicate-target discovery.
@@ -270,6 +286,8 @@ This is how we guard against tests that pass trivially but don't actually exerci
 - **`sh:uniqueLang`, `sh:languageIn`** — parsed but not evaluated. Needs language-tag metadata on flakes, which isn't yet threaded through the validation path.
 - **`sh:qualifiedValueShape` (+ `sh:qualifiedMinCount` / `sh:qualifiedMaxCount`)** — parsed but not evaluated. Needs recursive nested-shape counting.
 - **Cross-transaction shape cache** — every call to `from_dbs_with_overlay` recompiles from scratch. `ShaclCacheKey` has a `schema_epoch` field that's ready to drive a shared `Arc<ShaclCache>` cache on the connection, but nothing populates it yet. Low priority until perf regressions are observed.
+- **Cross-ledger `sh:class` value-sets** — value membership is same-ledger only; a value-set defined in a different ledger isn't consulted (see the `sh:class` scope-limits note above).
+- **`sh:class` in referenced/nested shapes** — value-membership context (vocabulary graphs + per-txn memo) isn't threaded through the `sh:and`/`or`/`xone`/`node` referenced-shape path; those keep the legacy data-graph lookup.
 
 ## Where to look in the code
 

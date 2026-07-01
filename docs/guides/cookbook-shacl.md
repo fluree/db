@@ -341,6 +341,35 @@ Semantics:
 - Use `f:graphSelector f:defaultGraph` to explicitly point at the default graph (same as omitting `f:shapesSource`).
 - `f:shapesSource` also supports **cross-ledger references** — set `f:ledger` on the inner `f:graphSource` to compile shapes from a different ledger at validation time. See [Cross-ledger governance — Cross-ledger SHACL shapes](../security/cross-ledger-policy.md#cross-ledger-shacl-shapes) for the end-to-end pattern.
 
+## Shared value-sets with `sh:class`
+
+`sh:class` is the natural way to model a **controlled value-set** — e.g. a fixed list of US states — as an *extensible* enumeration: each allowed value is an instance of a class, and adding a new value means inserting one triple rather than editing the shape (contrast [`sh:in`](#enumerated-values), which bakes the list into the shape). Put the value-set vocabulary **in the same graph as the shapes** (`f:shapesSource`), and it is honoured even when the referencing records live in a different graph:
+
+```trig
+@prefix f:   <https://ns.flur.ee/db#> .
+@prefix sh:  <http://www.w3.org/ns/shacl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix ex:  <http://example.org/> .
+
+GRAPH <http://example.org/shapes> {
+  ex:PersonShape a sh:NodeShape ;
+    sh:targetClass ex:Person ;
+    sh:property [ sh:path ex:homeState ; sh:class ex:USState ] .
+
+  # The value-set vocabulary lives alongside the shapes.
+  ex:illinois a ex:USState .
+  ex:iowa     a ex:USState .
+}
+```
+
+With `f:shapesSource` pointing at `<http://example.org/shapes>`, a record written to any graph passes validation when its `ex:homeState` is one of the declared states, and is rejected otherwise. Adding a state later (`ex:ohio a ex:USState`) requires no shape change.
+
+Semantics and limits:
+
+- **Membership graph = focus data graph ∪ the `f:shapesSource` graph.** A value is an instance of the class if it is typed so in either the record's own graph or the vocabulary graph. When shapes live in the default graph, this is just an ordinary local lookup.
+- **Per-transaction caching.** Repeated references to the same value within one transaction are memoized — bulk-inserting many records that share a state pays the membership lookup once.
+- **Same-ledger only.** The value-set must be in this ledger (any graph); cross-ledger value-sets are not yet supported.
+
 ## Inline shapes per transaction
 
 In addition to shapes stored in a ledger, a transaction can supply

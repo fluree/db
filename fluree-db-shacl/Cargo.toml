@@ -13,6 +13,7 @@ fluree-vocab = { path = "../fluree-vocab" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 regex = "1"
+parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true }

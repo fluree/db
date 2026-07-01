@@ -3110,6 +3110,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-query",
  "fluree-vocab",
+ "parking_lot",
  "regex",
  "thiserror 1.0.69",
  "tokio",

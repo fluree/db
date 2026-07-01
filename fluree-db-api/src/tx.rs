@@ -509,6 +509,13 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     let mut cl_overlay_holder = None;
     #[allow(unused_assignments)]
     let mut inline_overlay_holder = None;
+    // Graphs consulted for `sh:class` value membership at validation time. The
+    // focus node's own data graph is always consulted; these are the extra
+    // `f:shapesSource` vocabulary graph(s) unioned in, so a shared value-set
+    // (e.g. a list of US states) can live alongside the shapes rather than in
+    // every data graph. Cross-ledger value-sets aren't supported yet, so that
+    // branch falls back to the default graph.
+    let membership_g_ids: Vec<fluree_db_core::GraphId>;
     let mut shape_dbs: Vec<fluree_db_core::GraphDbRef<'_>> =
         if let (Some(wire), Some(staged_ns)) = (ctx.cross_ledger_shapes, ctx.staged_ns) {
             let bundle = wire
@@ -522,6 +529,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                 base.novelty.as_ref(),
                 bundle,
             ));
+            membership_g_ids = vec![0];
             vec![fluree_db_core::GraphDbRef::new(
                 &base.snapshot,
                 0u16,
@@ -532,6 +540,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             // 4b. Same-ledger path. Resolve `f:shapesSource` into
             //     concrete graph IDs; default to `[0]` when unset.
             let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
+            membership_g_ids = shapes_g_ids.clone();
             shapes_g_ids
                 .iter()
                 .map(|g_id| base.as_graph_db_ref(*g_id))
@@ -578,6 +587,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         ctx.graph_sids,
         ctx.tracker,
         per_graph_policy.as_ref(),
+        &membership_g_ids,
     )
     .await?;
 

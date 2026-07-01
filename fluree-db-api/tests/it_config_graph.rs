@@ -1201,6 +1201,124 @@ async fn shacl_shapes_source_excludes_default_graph() {
         );
 }
 
+/// `sh:class` value-set: the enumerated members of the target class live in
+/// the **shapes-source graph**, while the referencing data lives in a different
+/// (default) graph. Membership resolution unions the focus node's data graph
+/// with the `f:shapesSource` vocabulary graph, so a shared value-set (here: US
+/// states) is honoured cross-graph.
+///
+/// Pre-fix, `validate_class_constraint` looked up each value's `rdf:type` only
+/// in the focus node's own graph, so the vocabulary living in the shapes graph
+/// was invisible and the valid insert would have been rejected as a false
+/// violation.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_class_value_set_in_shapes_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/shacl-class-value-set:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Shapes graph carries BOTH the shape and the value-set vocabulary (the US
+    // states). Config points `f:shapesSource` at it.
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/> .
+
+        GRAPH <http://example.org/shapes> {{
+            ex:PersonShape rdf:type sh:NodeShape ;
+                           sh:targetClass ex:Person ;
+                           sh:property ex:pshape_state .
+            ex:pshape_state sh:path ex:homeState ;
+                            sh:class ex:USState .
+
+            ex:illinois rdf:type ex:USState .
+            ex:iowa rdf:type ex:USState .
+        }}
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true .
+            <urn:config:shacl> f:shapesSource <urn:config:shapes-ref> .
+            <urn:config:shapes-ref> rdf:type f:GraphRef ;
+                                    f:graphSource <urn:config:shapes-source> .
+            <urn:config:shapes-source> f:graphSelector <http://example.org/shapes> .
+        }}
+    "
+    );
+
+    let result = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config + shape + vocabulary write should succeed");
+    let ledger = result.ledger;
+
+    // A person in the DEFAULT graph referencing a state defined only in the
+    // shapes graph must PASS — membership unions the shapes-source graph.
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:homeState": {"@id": "ex:illinois"}
+            }),
+        )
+        .await
+        .expect(
+            "sh:class value-set member defined in the f:shapesSource graph must \
+             satisfy the constraint even though the data is in another graph",
+        );
+    let ledger = result.ledger;
+
+    // Multiple subjects referencing the SAME value-set member in one
+    // transaction exercise the per-transaction membership memo — the second
+    // `(ex:illinois, ex:USState, g0)` check is a cache hit.
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:carol", "@type": "ex:Person", "ex:homeState": {"@id": "ex:illinois"}},
+                    {"@id": "ex:dave", "@type": "ex:Person", "ex:homeState": {"@id": "ex:illinois"}}
+                ]
+            }),
+        )
+        .await
+        .expect("repeated value-set members in one transaction must pass (memoized)");
+    let ledger = result.ledger;
+
+    // A person referencing a non-member must be REJECTED — ex:atlantis is not
+    // typed ex:USState in any consulted graph.
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob",
+                "@type": "ex:Person",
+                "ex:homeState": {"@id": "ex:atlantis"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "value outside the sh:class value-set must be rejected: {err:?}"
+    );
+}
+
 // =============================================================================
 // Test 15d: Per-graph SHACL enable/disable
 // =============================================================================

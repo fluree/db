@@ -2227,13 +2227,18 @@ pub async fn validate_view_with_shacl(
     graph_sids: Option<&HashMap<GraphId, Sid>>,
     tracker: Option<&fluree_db_core::Tracker>,
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
+    membership_g_ids: &[GraphId],
 ) -> Result<ShaclValidationOutcome> {
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     if shacl_cache.is_empty() {
         return Ok(ShaclValidationOutcome::default());
     }
 
-    let engine = ShaclEngine::new(shacl_cache.clone());
+    // `membership_g_ids` (the `f:shapesSource` graph[s]) are unioned into
+    // `sh:class` value-membership resolution so a shared value-set vocabulary
+    // can live alongside the shapes rather than in each data graph.
+    let engine =
+        ShaclEngine::new(shacl_cache.clone()).with_membership_graphs(membership_g_ids.to_vec());
     let enabled_graphs: Option<HashSet<GraphId>> =
         per_graph_policy.map(|m| m.keys().copied().collect());
     let report =
@@ -2269,8 +2274,11 @@ pub async fn validate_view_with_shacl(
 /// Validate staged nodes against SHACL shapes, per graph.
 ///
 /// Groups staged subjects by their graph and validates each group with a
-/// `GraphDbRef` targeting the correct `g_id`. Shape compilation stays at
-/// g_id=0 (shapes are schema-level definitions in the default graph).
+/// `GraphDbRef` targeting the correct `g_id`. Shape *compilation* graph is
+/// chosen upstream by `f:shapesSource` (see `apply_shacl_policy_to_staged_view`)
+/// — this loop only drives per-graph *validation*. `sh:class` value membership
+/// additionally consults the engine's `membership_g_ids` (the `f:shapesSource`
+/// vocabulary graph[s]) unioned with each focus node's own data graph.
 ///
 /// When `graph_sids` is `None` (e.g., commit-transfer path where the txn
 /// context is unavailable), falls back to validating all subjects against
