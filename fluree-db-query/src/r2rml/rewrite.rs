@@ -29,7 +29,8 @@ use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
-use fluree_db_core::{FlakeValue, LedgerSnapshot};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot, Sid};
+use fluree_vocab::{namespaces::XSD, xsd_names};
 use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
@@ -397,6 +398,18 @@ fn cmp_op(func: &Function, reversed: bool) -> Option<ScanCmpOp> {
 
 /// Convert a constant literal to a prunable `ScanValue`. Only date, integer and
 /// boolean are pushed; everything else stays with the in-engine FILTER.
+/// Whether a triple's object datatype constraint is a plain (untyped)
+/// `xsd:string` — the only literal shape taken through the constant-object scan,
+/// where a loose value-only match matches product behavior. A language tag or
+/// any other explicit datatype requires strict matching and is excluded.
+fn is_plain_string_object(dtc: &Option<DatatypeConstraint>) -> bool {
+    match dtc {
+        None => true,
+        Some(DatatypeConstraint::Explicit(sid)) => *sid == Sid::new(XSD, xsd_names::STRING),
+        Some(DatatypeConstraint::LangTag(_)) => false,
+    }
+}
+
 fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     match value {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
@@ -502,12 +515,17 @@ pub fn convert_triple_to_r2rml(
     // Extract the object: a variable, or a constant string equality constraint.
     let (object_var, object_constant) = match &tp.o {
         Term::Var(v) => (Some(*v), None),
-        // `?s <pred> "value"`: a constant string object becomes an equality
-        // constraint the operator enforces (see `R2rmlPattern::object_constant`).
-        // Requires a constant predicate to resolve the column. Non-string
-        // constants (numbers, refs) are not yet pushed and preserve the original
-        // pattern (which the graph-source path rejects as unsupported).
-        Term::Value(FlakeValue::String(s)) if predicate_filter.is_some() => {
+        // `?s <pred> "value"`: a plain (untyped) string object becomes an
+        // equality constraint the operator enforces. The product does a loose,
+        // value-only match on untyped literals, which is exactly the lexical
+        // comparison here — so this is only taken for a plain `xsd:string`
+        // object. Language-tagged or explicitly-typed literals need strict
+        // datatype matching and are left unconverted (rejected as unsupported),
+        // never loosely matched. Requires a constant predicate to resolve the
+        // column; non-string constants (numbers, refs) are not pushed yet.
+        Term::Value(FlakeValue::String(s))
+            if predicate_filter.is_some() && is_plain_string_object(&tp.dtc) =>
+        {
             (None, Some(ScanValue::Str(s.clone())))
         }
         Term::Sid(_) | Term::Iri(_) | Term::Value(_) => return None,
@@ -562,6 +580,23 @@ mod tests {
             Pattern::R2rml(rp) => rp.consumed_filter.as_ref(),
             _ => None,
         })
+    }
+
+    #[test]
+    fn plain_string_object_gate() {
+        // Untyped / plain xsd:string → loose value match is allowed.
+        assert!(is_plain_string_object(&None));
+        assert!(is_plain_string_object(&Some(DatatypeConstraint::Explicit(
+            Sid::new(XSD, xsd_names::STRING)
+        ))));
+        // Explicitly typed or language-tagged → strict; excluded from the loose
+        // constant-object path (so `"chat"@fr` never matches a plain `"chat"`).
+        assert!(!is_plain_string_object(&Some(
+            DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::INTEGER))
+        )));
+        assert!(!is_plain_string_object(&Some(DatatypeConstraint::LangTag(
+            "fr".into()
+        ))));
     }
 
     #[test]

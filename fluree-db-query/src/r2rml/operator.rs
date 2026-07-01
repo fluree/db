@@ -1150,8 +1150,10 @@ fn materialize_pom_object(
 }
 
 /// Whether a materialized object term equals a constant-object `ScanValue`.
-/// Only string constants are pushed as constant objects (see
-/// `convert_triple_to_r2rml`), so this is an exact lexical string comparison.
+/// Only plain (untyped) `xsd:string` objects reach this path (gated in
+/// `convert_triple_to_r2rml`), where the product does a loose value-only match,
+/// so this is a lexical comparison and intentionally ignores the materialized
+/// term's datatype/language.
 fn rdf_term_eq_scan_value(term: &RdfTerm, value: &crate::r2rml::ScanValue) -> bool {
     match (term, value) {
         (RdfTerm::Literal { value: v, .. }, crate::r2rml::ScanValue::Str(s)) => v == s,
