@@ -117,6 +117,9 @@ mod r2rml;
 #[cfg(feature = "iceberg")]
 mod iceberg_catalog;
 
+#[cfg(feature = "iceberg")]
+mod iceberg_generate;
+
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
 
@@ -131,6 +134,12 @@ pub use iceberg_catalog::{
     browse_iceberg_catalog, preview_iceberg_table, BrowseDepth, CatalogBrowse, ColumnInfo,
     ColumnStats, PartitionFieldInfo, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
     TableIdentifier, TablePreview, TableRef, TableSchema,
+};
+
+#[cfg(feature = "iceberg")]
+pub use iceberg_generate::{
+    Diagnostic, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, StructuredR2rmlMapping,
+    TableOverride,
 };
 
 #[cfg(feature = "iceberg")]

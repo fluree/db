@@ -510,6 +510,128 @@ async fn iceberg_catalog_preview_local(
     .await
 }
 
+// =============================================================================
+// Deterministic R2RML generation (metadata-only; creates no graph source).
+// =============================================================================
+
+/// One `per_table_overrides` entry (its `{namespace, name}` key + values). JSON
+/// object keys must be strings, so overrides ride the wire as a list rather than
+/// a struct-keyed map.
+#[derive(Deserialize)]
+pub struct TableOverrideEntry {
+    /// Table namespace (e.g. "DW").
+    pub namespace: String,
+    /// Table name (e.g. "DIM_STORE").
+    pub name: String,
+    /// Replaces identifier_field_ids as the subject key (still gated on
+    /// required / null_fraction==0; always earns a SubjectKeyUnverified diagnostic).
+    #[serde(default)]
+    pub primary_key: Option<String>,
+    /// Overrides the derived class name / subject slug for the table.
+    #[serde(default)]
+    pub class_name: Option<String>,
+}
+
+/// Request body for `POST /v1/fluree/iceberg/r2rml/generate`.
+#[derive(Deserialize)]
+pub struct IcebergGenerateRequest {
+    #[serde(flatten)]
+    pub connection: IcebergConnectionRequest,
+    /// Tables to map, in output order: `[{ "namespace": .., "name": .. }]`.
+    pub tables: Vec<fluree_db_api::TableIdentifier>,
+    /// The SINGLE base namespace all IRIs derive from.
+    pub base_namespace: String,
+    /// Per-table subject-key / class-name overrides.
+    #[serde(default)]
+    pub per_table_overrides: Vec<TableOverrideEntry>,
+    /// Emit knobs (xsd_long_as_integer / emit_fk_joins / keep_fk_keys_as_literals).
+    #[serde(default)]
+    pub options: fluree_db_api::GenerateOptions,
+    /// RESERVED for PR-4 (target-model IRI rewrite); accepted and ignored.
+    #[serde(default)]
+    pub target_model_ledger_id: Option<String>,
+}
+
+/// Deterministically generate an R2RML mapping over Iceberg tables. Read-only
+/// (metadata-only; creates no graph source).
+///
+/// POST /v1/fluree/iceberg/r2rml/generate
+pub async fn iceberg_r2rml_generate(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    iceberg_r2rml_generate_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_r2rml_generate_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    use fluree_db_api::{GenerateR2rmlRequest, TableIdentifier, TableOverride};
+
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let req: IcebergGenerateRequest = parse_iceberg_body(request).await?;
+
+    let span = create_request_span(
+        "iceberg:r2rml:generate",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        None,
+        None,
+        None,
+    );
+    async move {
+        if req.tables.is_empty() {
+            return Err(ServerError::bad_request(
+                "at least one table is required for generate",
+            ));
+        }
+        let connection = build_iceberg_connection(&req.connection)?;
+        let per_table_overrides = req
+            .per_table_overrides
+            .into_iter()
+            .map(|e| {
+                (
+                    TableIdentifier::new(e.namespace, e.name),
+                    TableOverride {
+                        primary_key: e.primary_key,
+                        class_name: e.class_name,
+                    },
+                )
+            })
+            .collect();
+
+        let api_req = GenerateR2rmlRequest {
+            connection,
+            tables: req.tables,
+            base_namespace: req.base_namespace,
+            per_table_overrides,
+            options: req.options,
+            target_model_ledger_id: req.target_model_ledger_id,
+        };
+
+        let response = state
+            .fluree
+            .generate_r2rml(api_req)
+            .await
+            .map_err(ServerError::Api)?;
+
+        tracing::info!(
+            status = "success",
+            tables = response.structured.table_mappings.len(),
+            diagnostics = response.diagnostics.len(),
+            "iceberg r2rml generated"
+        );
+        Ok((StatusCode::OK, Json(response)))
+    }
+    .instrument(span)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +726,72 @@ mod tests {
         assert!(req.depth.is_none());
         let conn = build_iceberg_connection(&req.connection).unwrap();
         assert!(conn.is_direct());
+    }
+
+    #[test]
+    fn generate_request_flattens_connection_tables_overrides_and_options() {
+        // The flattened connection fields deserialize alongside the generate
+        // body: tables, base_namespace, an overrides list, options, and the
+        // reserved target_model_ledger_id.
+        let body = serde_json::json!({
+            "mode": "rest",
+            "catalog_uri": "https://catalog.example.com",
+            "warehouse": "wh1",
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
+            "oauth2_client_secret": "pat",
+            "oauth2_scope": "session:role:ICEBERG_READER",
+            "tables": [
+                {"namespace": "DW", "name": "DIM_GEOGRAPHY"},
+                {"namespace": "DW", "name": "DIM_SUPPLIER"}
+            ],
+            "base_namespace": "http://ns.fluree.dev/edw#",
+            "per_table_overrides": [
+                {"namespace": "DW", "name": "DIM_SUPPLIER", "primary_key": "ALT_KEY"}
+            ],
+            "options": {"xsd_long_as_integer": false},
+            "target_model_ledger_id": "model:main"
+        });
+        let req: IcebergGenerateRequest = serde_json::from_value(body).unwrap();
+
+        assert_eq!(req.tables.len(), 2);
+        assert_eq!(req.tables[0].namespace, "DW");
+        assert_eq!(req.tables[0].name, "DIM_GEOGRAPHY");
+        assert_eq!(req.base_namespace, "http://ns.fluree.dev/edw#");
+
+        assert_eq!(req.per_table_overrides.len(), 1);
+        assert_eq!(req.per_table_overrides[0].name, "DIM_SUPPLIER");
+        assert_eq!(
+            req.per_table_overrides[0].primary_key.as_deref(),
+            Some("ALT_KEY")
+        );
+        assert!(req.per_table_overrides[0].class_name.is_none());
+
+        // Explicit `false` overrides the default; the other knobs default `true`.
+        assert!(!req.options.xsd_long_as_integer);
+        assert!(req.options.emit_fk_joins);
+        assert!(req.options.keep_fk_keys_as_literals);
+
+        assert_eq!(req.target_model_ledger_id.as_deref(), Some("model:main"));
+
+        // The flattened connection builds a REST connection carrying the scope.
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_rest());
+    }
+
+    #[test]
+    fn generate_request_defaults_overrides_and_options() {
+        // Overrides and options are optional; options default to all-`true`.
+        let body = serde_json::json!({
+            "mode": "rest",
+            "catalog_uri": "https://catalog.example.com",
+            "tables": [{"namespace": "DW", "name": "DIM_DATE"}],
+            "base_namespace": "http://ns.fluree.dev/edw#"
+        });
+        let req: IcebergGenerateRequest = serde_json::from_value(body).unwrap();
+        assert!(req.per_table_overrides.is_empty());
+        assert!(req.options.xsd_long_as_integer);
+        assert!(req.options.emit_fk_joins);
+        assert!(req.options.keep_fk_keys_as_literals);
+        assert!(req.target_model_ledger_id.is_none());
     }
 }
