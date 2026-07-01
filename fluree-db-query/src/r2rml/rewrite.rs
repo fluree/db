@@ -619,6 +619,11 @@ pub fn convert_triple_to_r2rml(
     // Language-tagged / custom-typed literals need strict matching and are left
     // unconverted rather than mismatched.
     let object_constant: Option<ObjectConstant> = match &tp.o {
+        // A ref object can arrive as a typed value (`FlakeValue::Ref`); decode it
+        // to an IRI so it takes the same operator-enforced path as Term::Sid/Iri.
+        Term::Value(FlakeValue::Ref(sid)) if predicate_filter.is_some() => {
+            snapshot.decode_sid(sid).map(ObjectConstant::Iri)
+        }
         Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
             const_object(v)
         }
