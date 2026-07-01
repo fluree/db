@@ -756,6 +756,72 @@ mod tests {
     }
 
     #[test]
+    fn test_update_splits_oversized_leaf_gap_free() {
+        // Base leaf: subjects 1..=200 (SPOT). Novelty appends 201..=400.
+        let base: Vec<RunRecordV2> = (1..=200).map(|s| rec2(s, 1, s as i64, 1)).collect();
+        let (leaf_bytes, sidecar) = build_test_leaf(&base, RunSortOrder::Spot);
+        let novelty: Vec<RunRecordV2> = (201..=400).map(|s| rec2(s, 1, s as i64, 5)).collect();
+        let ops = vec![1u8; novelty.len()];
+
+        // Small targets force the merged 400 rows to split into multiple leaves.
+        let input = LeafUpdateInput {
+            leaf_bytes: &leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 50,
+            leaf_target_rows: 100,
+            sidecar_bytes: sidecar.as_deref(),
+        };
+        let output = update_leaf(&input).unwrap();
+
+        // Split occurred.
+        assert!(
+            output.leaves.len() >= 2,
+            "expected a split into multiple leaves, got {}",
+            output.leaves.len()
+        );
+        // No rows lost across the split.
+        let total: u64 = output.leaves.iter().map(|l| l.info.total_rows).sum();
+        assert_eq!(total, 400, "row count must be preserved across the split");
+        // Decode each leaf's header for its real routing keys (LeafInfo's
+        // first_key/last_key are zeroed placeholders; the keys live in the blob).
+        use fluree_db_binary_index::format::leaf::decode_leaf_header_v3;
+        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+        let headers: Vec<_> = output
+            .leaves
+            .iter()
+            .map(|l| decode_leaf_header_v3(&l.info.leaf_bytes).unwrap())
+            .collect();
+        // Ordered + non-overlapping: last_key(i) < first_key(i+1) (ordered-key
+        // bytes). With the full row count preserved, this proves a gap-free
+        // tiling — so first_key(next) slicing routes every key to exactly one
+        // leaf (no gap between one leaf's last and the next leaf's first).
+        for w in headers.windows(2) {
+            assert!(
+                w[0].last_key < w[1].first_key,
+                "leaf boundaries must be strictly increasing and non-overlapping",
+            );
+        }
+        // The split preserves the full span: first leaf starts at s_id 1, last
+        // leaf ends at s_id 400 (the leftmost/rightmost keep their −∞/+∞ reach).
+        assert_eq!(
+            read_ordered_key_v2(RunSortOrder::Spot, &headers[0].first_key)
+                .s_id
+                .as_u64(),
+            1
+        );
+        assert_eq!(
+            read_ordered_key_v2(RunSortOrder::Spot, &headers.last().unwrap().last_key)
+                .s_id
+                .as_u64(),
+            400
+        );
+    }
+
+    #[test]
     fn test_update_insert_new_fact() {
         let records = vec![rec2(1, 1, 10, 1), rec2(3, 1, 30, 1)];
         let (leaf_bytes, sidecar) = build_test_leaf(&records, RunSortOrder::Spot);

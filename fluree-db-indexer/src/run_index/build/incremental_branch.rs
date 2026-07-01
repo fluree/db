@@ -297,9 +297,26 @@ impl BranchAcc {
     }
 }
 
-/// Build the `LeafUpdateInput` for a touched leaf. The effective leaf target is
-/// bumped so a touched leaf is never split into multiple new leaves — preserving
-/// branch structure for CID stability (identical to the serial-loop logic).
+/// A touched leaf keeps its "grow in place, don't split" behaviour (target
+/// bumped to fit) only while its merged size stays within this multiple of the
+/// leaf target; beyond it, the real target is used so `assemble_output_leaves`
+/// splits the leaf into bounded, ~target-sized leaves. `2x` mirrors the config's
+/// `leaf_max = 2 * leaf_target` convention and the greedy packing of the
+/// full-build `LeafWriter`. Below the ceiling we avoid a split so a small commit
+/// doesn't churn the branch (CID stability) every build.
+const LEAF_SPLIT_CEILING_FACTOR: usize = 2;
+
+/// Build the `LeafUpdateInput` for a touched leaf.
+///
+/// A merged leaf that stays within `LEAF_SPLIT_CEILING_FACTOR × leaf_target` is
+/// kept whole (target bumped to fit) for branch/CID stability; a genuinely
+/// oversized one uses the real `leaf_target_rows` so it splits into bounded
+/// leaves. This applies uniformly to every touched leaf — middle, leftmost, and
+/// rightmost — so no leaf grows without bound. Splits are gap-free: novelty is
+/// routed to leaves by `first_key(next)` half-open intervals
+/// (`slice_novelty_to_leaves`), and the leftmost/rightmost leaves keep their
+/// −∞/+∞ coverage (leaf 0 takes everything below `leaves[1].first_key`; the last
+/// leaf takes all remaining).
 fn make_leaf_update_input<'a>(
     leaf_bytes: &'a [u8],
     sidecar_bytes: Option<&'a [u8]>,
@@ -308,9 +325,19 @@ fn make_leaf_update_input<'a>(
     config: &BranchUpdateConfig,
 ) -> io::Result<LeafUpdateInput<'a>> {
     let existing_header = decode_leaf_header_v3(leaf_bytes)?;
-    let effective_leaf_target_rows = (existing_header.total_rows as usize)
-        .saturating_add(nov_slice.len())
-        .saturating_add(1);
+    let estimated_rows = (existing_header.total_rows as usize).saturating_add(nov_slice.len());
+    let ceiling = config
+        .leaf_target_rows
+        .saturating_mul(LEAF_SPLIT_CEILING_FACTOR);
+    let leaf_target_rows = if estimated_rows > ceiling {
+        // Oversized → split into ~target-sized leaves via the existing machinery.
+        config.leaf_target_rows.max(1)
+    } else {
+        // Modest growth → keep as one leaf (bump target to fit) for CID stability.
+        config
+            .leaf_target_rows
+            .max(estimated_rows.saturating_add(1))
+    };
     Ok(LeafUpdateInput {
         leaf_bytes,
         novelty: nov_slice,
@@ -319,7 +346,7 @@ fn make_leaf_update_input<'a>(
         g_id: config.g_id,
         zstd_level: config.zstd_level,
         leaflet_target_rows: config.leaflet_target_rows,
-        leaf_target_rows: config.leaf_target_rows.max(effective_leaf_target_rows),
+        leaf_target_rows,
         sidecar_bytes,
     })
 }
