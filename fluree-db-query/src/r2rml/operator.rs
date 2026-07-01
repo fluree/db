@@ -288,8 +288,8 @@ impl R2rmlScanOperator {
 
     /// Resolve this pattern's pushdown predicates (keyed by query variable) to
     /// table columns for the given TriplesMap, producing scan filters. A
-    /// variable maps to a column via its predicate IRI; predicates backed by a
-    /// RefObjectMap (an IRI join, not a scalar column) are skipped.
+    /// variable maps to a column via its predicate IRI; only plain `rr:column`
+    /// scalar object maps are pushable (see [`value_pushdown_column`]).
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
         let mut out = Vec::new();
         for pd in &self.pattern.scan_filters {
@@ -316,15 +316,11 @@ impl R2rmlScanOperator {
             let (Some(pom), None) = (matching.next(), matching.next()) else {
                 continue;
             };
-            if matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
-                continue;
-            }
-            let cols = pom.object_map.referenced_columns();
-            let [col] = cols.as_slice() else {
+            let Some(col) = value_pushdown_column(&pom.object_map) else {
                 continue;
             };
             out.push(crate::r2rml::ScanFilter {
-                column: (*col).to_string(),
+                column: col.to_string(),
                 op: pd.op,
                 value: pd.value.clone(),
             });
@@ -342,14 +338,12 @@ impl R2rmlScanOperator {
                 .iter()
                 .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
             if let (Some(pom), None) = (matching.next(), matching.next()) {
-                if !matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
-                    if let [col] = pom.object_map.referenced_columns().as_slice() {
-                        out.push(crate::r2rml::ScanFilter {
-                            column: (*col).to_string(),
-                            op: crate::r2rml::ScanCmpOp::Eq,
-                            value: value.clone(),
-                        });
-                    }
+                if let Some(col) = value_pushdown_column(&pom.object_map) {
+                    out.push(crate::r2rml::ScanFilter {
+                        column: col.to_string(),
+                        op: crate::r2rml::ScanCmpOp::Eq,
+                        value: value.clone(),
+                    });
                 }
             }
         }
@@ -1112,6 +1106,21 @@ impl LiteralEncoder {
     }
 }
 
+/// The backing column of an object map whose materialized literal value is the
+/// raw column value *verbatim*, so a column-level scan filter comparing that
+/// value cannot drop a row the operator would keep. Only plain `rr:column`
+/// qualifies: `Template` transforms the value (`"PREFIX-{code}"` ≠ `code`),
+/// `Constant` ignores the row, and `RefObjectMap` is an IRI join. Pushing a
+/// filter for those compares the raw column against a transformed constant and
+/// silently prunes matching rows, violating the pushdown-is-only-an-optimization
+/// invariant.
+fn value_pushdown_column(om: &ObjectMap) -> Option<&str> {
+    match om {
+        ObjectMap::Column { column, .. } => Some(column.as_str()),
+        _ => None,
+    }
+}
+
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
 fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
     use fluree_db_r2rml::mapping::ConstantValue;
@@ -1610,5 +1619,45 @@ mod tests {
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b));
         assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b));
         assert!(!rdf_term_eq_object_constant(&RdfTerm::string("false"), &b));
+    }
+
+    #[test]
+    fn only_plain_columns_are_value_pushable() {
+        use fluree_db_r2rml::mapping::{ObjectMap, RefObjectMap};
+
+        // Plain rr:column → materialized value is the raw column, so a
+        // column-level scan filter is a sound optimization.
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::column("code")),
+            Some("code")
+        );
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::column_typed(
+                "year",
+                "http://www.w3.org/2001/XMLSchema#integer"
+            )),
+            Some("year")
+        );
+
+        // A single-column template transforms the value ("PREFIX-{code}" ≠ code):
+        // pushing Eq(code, "PREFIX-A") would drop every row the operator keeps.
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::template(
+                "PREFIX-{code}",
+                vec!["code".to_string()]
+            )),
+            None
+        );
+        // Constant ignores the row; RefObjectMap is an IRI join — neither pushable.
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::constant_literal("x")),
+            None
+        );
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::RefObjectMap(RefObjectMap::new(
+                "gs:other", "fk", "id"
+            ))),
+            None
+        );
     }
 }

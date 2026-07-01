@@ -295,6 +295,15 @@ fn consume_scan_local_filters(patterns: &mut Vec<Pattern>) {
     patterns.retain(|p| {
         if let Pattern::Filter(expr) = p {
             let mut vars = HashSet::new();
+            // A Cypher metadata read (`type`/`labels`/`keys`/...) is a `Call`
+            // that `collect_expr_vars` would accept, but the consumed path applies
+            // it via synchronous `filter_batch`, bypassing the policy-aware async
+            // resolver the standalone `FilterOperator` uses under a view policy.
+            // Leave it in place so authority — and fail-closed behavior — stays
+            // with the in-engine FILTER.
+            if crate::eval::metadata_resolve::contains_metadata_read(expr) {
+                return true;
+            }
             // A variable-free filter (constant), one this analysis can't fully
             // understand, or one touching a var the scan does not produce is
             // left in place for the in-engine FILTER.
@@ -735,6 +744,22 @@ mod tests {
             Expression::Var(VarId(1)),
             Expression::Resolved(Box::new(crate::binding::Binding::Unbound)),
         ]);
+        let mut patterns = vec![scan(), Pattern::Filter(expr)];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_metadata_read_filter() {
+        // FILTER(labels(?o) = ...) references only the scan-produced ?1, but a
+        // metadata read must route through the policy-aware async resolver, not
+        // the consumed sync path — so it stays with the in-engine FILTER.
+        use crate::ir::expression::Function;
+        let expr = Expression::Call {
+            func: Function::Labels,
+            args: vec![Expression::Var(VarId(1))],
+        };
         let mut patterns = vec![scan(), Pattern::Filter(expr)];
         consume_scan_local_filters(&mut patterns);
         assert_eq!(patterns.len(), 2);
