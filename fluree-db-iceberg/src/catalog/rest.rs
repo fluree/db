@@ -251,10 +251,28 @@ impl CatalogClient for RestCatalogClient {
         // Parse vended credentials if present
         let credentials = VendedCredentials::from_config_map(&config)?;
 
+        // Retain the inline `metadata` object the REST loadTable response carries
+        // (Snowflake Horizon / Polaris include it). This lets metadata preview
+        // read the full schema/snapshot with no extra S3 fetch. A present-but-
+        // unparseable metadata object is logged and dropped, never fatal — the
+        // metadata_location fetch path still works.
+        let metadata = response.get("metadata").and_then(|m| {
+            match serde_json::from_value::<crate::metadata::TableMetadata>(m.clone()) {
+                Ok(md) => Some(md),
+                Err(e) => {
+                    tracing::debug!(
+                        "REST loadTable inline metadata present but failed to parse: {e}"
+                    );
+                    None
+                }
+            }
+        });
+
         Ok(LoadTableResponse {
             metadata_location,
             config,
             credentials,
+            metadata,
         })
     }
 }
@@ -348,10 +366,23 @@ impl super::SendCatalogClient for RestCatalogClient {
 
         let credentials = VendedCredentials::from_config_map(&config)?;
 
+        let metadata = response.get("metadata").and_then(|m| {
+            match serde_json::from_value::<crate::metadata::TableMetadata>(m.clone()) {
+                Ok(md) => Some(md),
+                Err(e) => {
+                    tracing::debug!(
+                        "REST loadTable inline metadata present but failed to parse: {e}"
+                    );
+                    None
+                }
+            }
+        });
+
         Ok(LoadTableResponse {
             metadata_location,
             config,
             credentials,
+            metadata,
         })
     }
 }

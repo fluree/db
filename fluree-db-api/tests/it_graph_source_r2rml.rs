@@ -1541,19 +1541,22 @@ fn test_iceberg_create_config_builder() {
         .with_s3_path_style(true);
 
     assert_eq!(config.graph_source_id(), "my-gs:dev");
-    match &config.catalog_mode {
+    match &config.connection.catalog_mode {
         fluree_db_api::CatalogMode::Rest(rest) => {
             assert_eq!(rest.warehouse, Some("my-warehouse".to_string()));
-            assert!(!rest.vended_credentials);
         }
         _ => panic!("Expected REST catalog mode"),
     }
-    assert_eq!(config.s3_region, Some("us-west-2".to_string()));
+    assert!(!config.connection.io.vended_credentials);
     assert_eq!(
-        config.s3_endpoint,
+        config.connection.io.s3_region,
+        Some("us-west-2".to_string())
+    );
+    assert_eq!(
+        config.connection.io.s3_endpoint,
         Some("http://localhost:9000".to_string())
     );
-    assert!(config.s3_path_style);
+    assert!(config.connection.io.s3_path_style);
 
     // Validation should still pass
     assert!(config.validate().is_ok());
@@ -1619,7 +1622,7 @@ fn test_r2rml_create_config_builder() {
         matches!(&config.mapping, fluree_db_api::R2rmlMappingInput::Content(c) if c == "s3://bucket/mappings/airlines.ttl")
     );
     assert_eq!(config.mapping_media_type, Some("text/turtle".to_string()));
-    match &config.iceberg.catalog_mode {
+    match &config.iceberg.connection.catalog_mode {
         fluree_db_api::CatalogMode::Rest(rest) => {
             assert_eq!(rest.warehouse, Some("analytics".to_string()));
         }

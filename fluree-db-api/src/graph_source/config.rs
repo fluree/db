@@ -400,17 +400,29 @@ pub struct IcebergCreateConfig {
     /// Branch name (defaults to "main")
     pub branch: Option<String>,
 
+    /// The reusable connection block (catalog access + IO).
+    pub connection: IcebergConnectionConfig,
+
+    /// Table identifier (e.g., "openflights.airlines"). Empty for Direct mode
+    /// (derived from the table location).
+    pub table_identifier: String,
+}
+
+/// The reusable Iceberg connection block — catalog access + IO, with **no**
+/// table or mapping.
+///
+/// Factored out of [`IcebergCreateConfig`] so catalog browse / metadata preview
+/// can run against an **unsaved** connection during onboarding (before a graph
+/// source record is created). The relationship is:
+/// `IcebergCreateConfig` = `IcebergConnectionConfig` + `table_identifier`.
+#[cfg(feature = "iceberg")]
+#[derive(Debug, Clone)]
+pub struct IcebergConnectionConfig {
     /// Catalog mode: REST or Direct S3 access.
     pub catalog_mode: CatalogMode,
 
-    /// S3 region override
-    pub s3_region: Option<String>,
-
-    /// S3 endpoint override (for MinIO, LocalStack)
-    pub s3_endpoint: Option<String>,
-
-    /// Use path-style S3 URLs
-    pub s3_path_style: bool,
+    /// Storage / IO configuration (vended credentials + S3 region/endpoint/path-style).
+    pub io: fluree_db_iceberg::config::IoConfig,
 }
 
 /// How the Iceberg catalog is accessed.
@@ -428,63 +440,48 @@ pub enum CatalogMode {
 }
 
 /// REST catalog mode configuration.
+///
+/// This carries only the catalog-connection fields (`catalog_uri` / `warehouse`
+/// / `auth`); the table identifier lives on [`IcebergCreateConfig`] and
+/// vended-credential / S3 IO settings live on
+/// [`IcebergConnectionConfig::io`].
 #[cfg(feature = "iceberg")]
 #[derive(Debug, Clone)]
 pub struct RestCatalogMode {
     /// REST catalog URI
     pub catalog_uri: String,
-    /// Table identifier (e.g., "openflights.airlines")
-    pub table_identifier: String,
     /// Optional warehouse identifier
     pub warehouse: Option<String>,
     /// Authentication configuration
     pub auth: fluree_db_iceberg::auth::AuthConfig,
-    /// Whether to use vended credentials (default: true)
-    pub vended_credentials: bool,
 }
 
 #[cfg(feature = "iceberg")]
-impl IcebergCreateConfig {
-    /// Create a new Iceberg graph source config for REST catalog mode.
-    pub fn new(
-        name: impl Into<String>,
-        catalog_uri: impl Into<String>,
-        table_identifier: impl Into<String>,
-    ) -> Self {
+impl IcebergConnectionConfig {
+    /// Create a REST-catalog connection with default IO (vended credentials on).
+    pub fn rest(catalog_uri: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            branch: None,
             catalog_mode: CatalogMode::Rest(Box::new(RestCatalogMode {
                 catalog_uri: catalog_uri.into(),
-                table_identifier: table_identifier.into(),
                 warehouse: None,
                 auth: fluree_db_iceberg::auth::AuthConfig::None,
-                vended_credentials: true,
             })),
-            s3_region: None,
-            s3_endpoint: None,
-            s3_path_style: false,
+            io: fluree_db_iceberg::config::IoConfig::default(),
         }
     }
 
-    /// Create a new Iceberg graph source config for direct S3 access (no REST catalog).
-    pub fn new_direct(name: impl Into<String>, table_location: impl Into<String>) -> Self {
+    /// Create a Direct S3 connection (no REST catalog). Vended credentials are
+    /// forced off — Direct mode uses ambient/IAM credentials.
+    pub fn direct(table_location: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            branch: None,
             catalog_mode: CatalogMode::Direct {
                 table_location: table_location.into(),
             },
-            s3_region: None,
-            s3_endpoint: None,
-            s3_path_style: false,
+            io: fluree_db_iceberg::config::IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
         }
-    }
-
-    /// Set the branch name.
-    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
-        self.branch = Some(branch.into());
-        self
     }
 
     /// Set bearer token authentication (REST mode only).
@@ -589,8 +586,8 @@ impl IcebergCreateConfig {
 
     /// Enable or disable vended credentials (REST mode only).
     pub fn with_vended_credentials(mut self, enabled: bool) -> Self {
-        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
-            rest.vended_credentials = enabled;
+        if self.is_rest() {
+            self.io.vended_credentials = enabled;
         } else {
             tracing::warn!("with_vended_credentials has no effect in Direct catalog mode");
         }
@@ -599,19 +596,137 @@ impl IcebergCreateConfig {
 
     /// Set S3 region.
     pub fn with_s3_region(mut self, region: impl Into<String>) -> Self {
-        self.s3_region = Some(region.into());
+        self.io.s3_region = Some(region.into());
         self
     }
 
     /// Set S3 endpoint (for MinIO, LocalStack).
     pub fn with_s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.s3_endpoint = Some(endpoint.into());
+        self.io.s3_endpoint = Some(endpoint.into());
         self
     }
 
     /// Enable path-style S3 URLs.
     pub fn with_s3_path_style(mut self, enabled: bool) -> Self {
-        self.s3_path_style = enabled;
+        self.io.s3_path_style = enabled;
+        self
+    }
+
+    /// Get the catalog URI (for REST mode) or table location (for direct mode).
+    pub fn catalog_uri_or_location(&self) -> &str {
+        match &self.catalog_mode {
+            CatalogMode::Rest(rest) => &rest.catalog_uri,
+            CatalogMode::Direct { table_location } => table_location,
+        }
+    }
+
+    /// Returns `true` if this connection uses REST catalog mode.
+    pub fn is_rest(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::Rest(_))
+    }
+
+    /// Returns `true` if this connection uses direct S3 catalog mode.
+    pub fn is_direct(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::Direct { .. })
+    }
+}
+
+#[cfg(feature = "iceberg")]
+impl IcebergCreateConfig {
+    /// Create a new Iceberg graph source config for REST catalog mode.
+    pub fn new(
+        name: impl Into<String>,
+        catalog_uri: impl Into<String>,
+        table_identifier: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            branch: None,
+            connection: IcebergConnectionConfig::rest(catalog_uri),
+            table_identifier: table_identifier.into(),
+        }
+    }
+
+    /// Create a new Iceberg graph source config for direct S3 access (no REST catalog).
+    pub fn new_direct(name: impl Into<String>, table_location: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            branch: None,
+            connection: IcebergConnectionConfig::direct(table_location),
+            table_identifier: String::new(),
+        }
+    }
+
+    /// Set the branch name.
+    pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
+        self.branch = Some(branch.into());
+        self
+    }
+
+    /// Set bearer token authentication (REST mode only).
+    pub fn with_auth_bearer(mut self, token: impl Into<String>) -> Self {
+        self.connection = self.connection.with_auth_bearer(token);
+        self
+    }
+
+    /// Set OAuth2 client credentials authentication (REST mode only).
+    pub fn with_auth_oauth2(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> Self {
+        self.connection = self
+            .connection
+            .with_auth_oauth2(token_url, client_id, client_secret);
+        self
+    }
+
+    /// Set the OAuth2 `scope` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergConnectionConfig::with_oauth2_scope`].
+    pub fn with_oauth2_scope(mut self, scope: impl Into<String>) -> Self {
+        self.connection = self.connection.with_oauth2_scope(scope);
+        self
+    }
+
+    /// Set the OAuth2 `audience` for client-credentials auth (REST + OAuth2 only).
+    ///
+    /// Call after [`Self::with_auth_oauth2`]. See
+    /// [`IcebergConnectionConfig::with_oauth2_audience`].
+    pub fn with_oauth2_audience(mut self, audience: impl Into<String>) -> Self {
+        self.connection = self.connection.with_oauth2_audience(audience);
+        self
+    }
+
+    /// Set the warehouse identifier (REST mode only).
+    pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> Self {
+        self.connection = self.connection.with_warehouse(warehouse);
+        self
+    }
+
+    /// Enable or disable vended credentials (REST mode only).
+    pub fn with_vended_credentials(mut self, enabled: bool) -> Self {
+        self.connection = self.connection.with_vended_credentials(enabled);
+        self
+    }
+
+    /// Set S3 region.
+    pub fn with_s3_region(mut self, region: impl Into<String>) -> Self {
+        self.connection = self.connection.with_s3_region(region);
+        self
+    }
+
+    /// Set S3 endpoint (for MinIO, LocalStack).
+    pub fn with_s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.connection = self.connection.with_s3_endpoint(endpoint);
+        self
+    }
+
+    /// Enable path-style S3 URLs.
+    pub fn with_s3_path_style(mut self, enabled: bool) -> Self {
+        self.connection = self.connection.with_s3_path_style(enabled);
         self
     }
 
@@ -627,16 +742,13 @@ impl IcebergCreateConfig {
 
     /// Get the catalog URI (for REST mode) or table location (for direct mode).
     pub fn catalog_uri_or_location(&self) -> &str {
-        match &self.catalog_mode {
-            CatalogMode::Rest(rest) => &rest.catalog_uri,
-            CatalogMode::Direct { table_location } => table_location,
-        }
+        self.connection.catalog_uri_or_location()
     }
 
     /// Get the table identifier string (for REST mode), or derive from location (for direct mode).
     pub fn table_identifier_display(&self) -> String {
-        match &self.catalog_mode {
-            CatalogMode::Rest(rest) => rest.table_identifier.clone(),
+        match &self.connection.catalog_mode {
+            CatalogMode::Rest(_) => self.table_identifier.clone(),
             CatalogMode::Direct { table_location } => {
                 let path = table_location
                     .trim_start_matches("s3://")
@@ -657,9 +769,9 @@ impl IcebergCreateConfig {
 
     /// Convert to the internal IcebergGsConfig structure for storage.
     pub fn to_iceberg_gs_config(&self) -> IcebergGsConfig {
-        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+        use fluree_db_iceberg::config::{CatalogConfig, TableConfig};
 
-        match &self.catalog_mode {
+        match &self.connection.catalog_mode {
             CatalogMode::Rest(rest) => IcebergGsConfig {
                 catalog: CatalogConfig::Rest {
                     catalog_type: "polaris".to_string(),
@@ -667,26 +779,21 @@ impl IcebergCreateConfig {
                     auth: rest.auth.clone(),
                     warehouse: rest.warehouse.clone(),
                 },
-                table: TableConfig::Identifier(rest.table_identifier.clone()),
-                io: IoConfig {
-                    vended_credentials: rest.vended_credentials,
-                    s3_region: self.s3_region.clone(),
-                    s3_endpoint: self.s3_endpoint.clone(),
-                    s3_path_style: self.s3_path_style,
-                },
+                table: TableConfig::Identifier(self.table_identifier.clone()),
+                io: self.connection.io.clone(),
                 mapping: None,
             },
-            CatalogMode::Direct { table_location } => IcebergGsConfig {
-                catalog: CatalogConfig::direct(table_location),
-                table: TableConfig::Identifier(String::new()),
-                io: IoConfig {
-                    vended_credentials: false,
-                    s3_region: self.s3_region.clone(),
-                    s3_endpoint: self.s3_endpoint.clone(),
-                    s3_path_style: self.s3_path_style,
-                },
-                mapping: None,
-            },
+            CatalogMode::Direct { table_location } => {
+                // Direct never uses vended credentials, regardless of the io flag.
+                let mut io = self.connection.io.clone();
+                io.vended_credentials = false;
+                IcebergGsConfig {
+                    catalog: CatalogConfig::direct(table_location),
+                    table: TableConfig::Identifier(String::new()),
+                    io,
+                    mapping: None,
+                }
+            }
         }
     }
 
@@ -702,16 +809,16 @@ impl IcebergCreateConfig {
             ));
         }
 
-        match &self.catalog_mode {
+        match &self.connection.catalog_mode {
             CatalogMode::Rest(rest) => {
                 if rest.catalog_uri.trim().is_empty() {
                     return Err(crate::ApiError::config("Catalog URI cannot be empty"));
                 }
-                if rest.table_identifier.trim().is_empty() {
+                if self.table_identifier.trim().is_empty() {
                     return Err(crate::ApiError::config("Table identifier cannot be empty"));
                 }
                 use fluree_db_iceberg::catalog::parse_table_identifier;
-                parse_table_identifier(&rest.table_identifier).map_err(|e| {
+                parse_table_identifier(&self.table_identifier).map_err(|e| {
                     crate::ApiError::config(format!("Invalid table identifier: {e}"))
                 })?;
             }
@@ -734,12 +841,12 @@ impl IcebergCreateConfig {
 
     /// Returns `true` if this config uses REST catalog mode.
     pub fn is_rest(&self) -> bool {
-        matches!(self.catalog_mode, CatalogMode::Rest(_))
+        self.connection.is_rest()
     }
 
     /// Returns `true` if this config uses direct S3 catalog mode.
     pub fn is_direct(&self) -> bool {
-        matches!(self.catalog_mode, CatalogMode::Direct { .. })
+        self.connection.is_direct()
     }
 }
 
@@ -1072,7 +1179,7 @@ mod tests {
 
     #[cfg(feature = "iceberg")]
     fn oauth2_auth(config: &IcebergCreateConfig) -> &fluree_db_iceberg::auth::AuthConfig {
-        match &config.catalog_mode {
+        match &config.connection.catalog_mode {
             CatalogMode::Rest(rest) => &rest.auth,
             CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
         }

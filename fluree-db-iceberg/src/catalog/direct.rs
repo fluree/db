@@ -121,6 +121,7 @@ impl<S: IcebergStorage> CatalogClient for DirectCatalogClient<S> {
             metadata_location,
             config: HashMap::new(),
             credentials: None, // Direct mode uses ambient credentials
+            metadata: None,    // Direct mode has no inline metadata (resolved via version-hint)
         })
     }
 }
@@ -211,6 +212,7 @@ impl<S: SendIcebergStorage + 'static> SendCatalogClient for SendDirectCatalogCli
             metadata_location,
             config: HashMap::new(),
             credentials: None,
+            metadata: None,
         })
     }
 }
