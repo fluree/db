@@ -130,13 +130,17 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     seeded_ledger: Vec<String>,
 
-    /// Background poll of `/cluster/status` on this URL. When the
-    /// leader, term, or voter set changes, an annotation line is
-    /// printed; voter-set changes also report how many of the
-    /// currently-known ledger main-branch owners would reassign
-    /// (computed locally via the rendezvous-hash mirror).
-    #[arg(long)]
-    watch_cluster: Option<Url>,
+    /// Background poll of `/cluster/status`. Accepts a comma-separated
+    /// list of raft-port URLs — the watcher tries them in order on
+    /// each tick and sticks with the first that responds, so killing
+    /// the node whose URL you listed first doesn't blind the watcher
+    /// for the rest of the run. When the leader, term, or voter set
+    /// changes, an annotation line is printed; voter-set changes
+    /// also report how many of the currently-known ledger main-branch
+    /// owners would reassign (computed locally via the rendezvous-hash
+    /// mirror).
+    #[arg(long, value_delimiter = ',')]
+    watch_cluster: Vec<Url>,
 
     /// `--watch-cluster` poll interval.
     #[arg(long, value_parser = parse_duration, default_value = "500ms")]
@@ -245,18 +249,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         progress_shutdown_rx,
     ));
 
-    let watch_handle = cli.watch_cluster.as_ref().map(|url| {
-        let url = url.to_string();
+    let watch_handle = if cli.watch_cluster.is_empty() {
+        None
+    } else {
+        let urls: Vec<String> = cli.watch_cluster.iter().map(|u| u.to_string()).collect();
         let interval = cli.watch_interval;
         let ledgers = ledgers.clone();
         let shutdown_rx = progress_shutdown_tx.subscribe();
-        tokio::spawn(crate::cluster_watch::run(
-            url,
+        Some(tokio::spawn(crate::cluster_watch::run(
+            urls,
             interval,
             ledgers,
             shutdown_rx,
-        ))
-    });
+        )))
+    };
 
     let run_config = RunnerConfig {
         concurrency: cli.concurrency,
