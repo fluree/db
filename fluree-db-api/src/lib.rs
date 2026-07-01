@@ -193,7 +193,7 @@ pub use graph_source::{
     ColumnInfo, ColumnStats, FlureeR2rmlProvider, IcebergConnectionConfig, IcebergCreateConfig,
     IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult,
     R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
-    TableIdentifier, TablePreview, TableRef, TableSchema,
+    TableIdentifier, TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
 pub use bm25_worker::{
