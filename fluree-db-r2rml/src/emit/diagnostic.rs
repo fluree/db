@@ -36,6 +36,11 @@ pub enum DiagCode {
     AmbiguousFk,
     /// A candidate FK could not be proven referentially safe (reserved).
     DanglingFkNotProven,
+    /// The submitted R2RML mapping did not compile (parse/lower failure) — the validate
+    /// path's compile gate. `compiled_ok == false` is the authoritative signal and the
+    /// cross-check is skipped; kept distinct from `TableNotFound` so a compile failure and a
+    /// dangling table reference never collide on the wire.
+    CompileError,
     /// A referenced column does not exist (reserved for the validate cross-check).
     ColumnNotFound,
     /// A referenced table does not exist (reserved for the validate cross-check).

@@ -111,9 +111,11 @@ pub struct GenerateR2rmlResponse {
     pub structured: StructuredR2rmlMapping,
     /// Every decision the emitter could not make from metadata alone.
     pub diagnostics: Vec<Diagnostic>,
-    /// The snapshot the mapping was generated against (pinned; persisted
-    /// end-to-end so queries observe the same snapshot the mapping was approved
-    /// against).
+    /// A REPRESENTATIVE snapshot: the first requested table's current snapshot at
+    /// generation time. Iceberg snapshots are per-table (there is no catalog-wide
+    /// snapshot), so this is NOT a true multi-table pin — it is threaded through as a
+    /// single coherent `snapshotId` (solo persists one per Dataset), not a guarantee
+    /// that every mapped table was read at this snapshot.
     pub snapshot_id: SnapshotRef,
 }
 

@@ -78,14 +78,14 @@ fn table_identifier_from_name(name: &str) -> TableIdentifier {
     }
 }
 
-/// Diagnostic for a mapping that failed to compile. There is no compile/parse
-/// `DiagCode` in the shared emitter enum (which this lane must not modify), so this
-/// reuses [`DiagCode::TableNotFound`] with no table — the mapping resolved zero
-/// tables — while `compiled_ok == false` remains the authoritative machine signal.
+/// Diagnostic for a mapping that failed to compile. Uses the dedicated
+/// [`DiagCode::CompileError`] (with no table — the mapping resolved zero tables) so a
+/// compile failure never collides on the wire with a `TableNotFound` cross-check
+/// diagnostic; `compiled_ok == false` remains the authoritative machine signal.
 fn compile_error_diagnostic(message: &str) -> Diagnostic {
     Diagnostic {
         severity: Severity::Error,
-        code: DiagCode::TableNotFound,
+        code: DiagCode::CompileError,
         table: None,
         column: None,
         message: format!("R2RML mapping failed to compile: {message}"),
@@ -725,6 +725,15 @@ mod tests {
             "{:?}",
             response.diagnostics
         );
+        // The compile-fail diagnostic carries the dedicated CompileError code, never
+        // TableNotFound — so on the wire it can't be confused with a dangling table
+        // reference produced by the cross-check.
+        assert!(
+            has_code(&response.diagnostics, DiagCode::CompileError),
+            "{:?}",
+            response.diagnostics
+        );
+        assert!(!has_code(&response.diagnostics, DiagCode::TableNotFound));
         assert!(response.diagnostics[0]
             .message
             .contains("failed to compile"));
