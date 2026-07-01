@@ -34,7 +34,7 @@ shacl = ["fluree-db-api/shacl"]
 # Enable OIDC JWT verification via JWKS (RS256 tokens from external IdPs)
 oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 # Iceberg / R2RML graph source support
-iceberg = ["fluree-db-api/iceberg-arrow"]
+iceberg = ["fluree-db-api/iceberg"]
 # Use mimalloc as the global allocator. Better multicore allocation throughput
 # for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg
 # scans). Opt-in: enable in release packaging after a soak.
