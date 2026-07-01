@@ -20,14 +20,16 @@
 //! `FLUREE_ICEBERG_LOADTABLE_CACHE=0`, restoring per-scan loads.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
-use fluree_db_iceberg::catalog::{LoadTableResponse, RestCatalogClient};
+use fluree_db_iceberg::catalog::LoadTableResponse;
 use fluree_db_iceberg::credential::VendedCredentials;
 
-/// Whether the query-scoped catalog cache is enabled. Read once from
-/// `FLUREE_ICEBERG_LOADTABLE_CACHE` (only `0`/`false`/`off` disable it).
-fn cache_enabled() -> bool {
+/// Master switch for all Iceberg catalog caching. Read once from
+/// `FLUREE_ICEBERG_LOADTABLE_CACHE` (only `0`/`false`/`off` disable it). When
+/// off, every scan builds a fresh REST client and reloads the table (per-scan
+/// OAuth + `loadTable` restored).
+pub(crate) fn cache_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_LOADTABLE_CACHE") {
         Ok(v) => !matches!(
@@ -39,31 +41,47 @@ fn cache_enabled() -> bool {
 }
 
 /// The fields a later scan needs to rebuild a [`LoadTableResponse`] without
-/// another REST round-trip.
+/// another REST round-trip. Shared by the per-query snapshot pin (this module)
+/// and the process-wide cross-query `loadTable` cache (`R2rmlCache`).
 #[derive(Clone)]
-struct CachedLoadTable {
-    metadata_location: String,
-    credentials: Option<VendedCredentials>,
+pub(crate) struct CachedLoadTable {
+    pub(crate) metadata_location: String,
+    pub(crate) credentials: Option<VendedCredentials>,
 }
 
 impl CachedLoadTable {
+    pub(crate) fn from_response(resp: &LoadTableResponse) -> Self {
+        Self {
+            metadata_location: resp.metadata_location.clone(),
+            credentials: resp.credentials.clone(),
+        }
+    }
+
+    /// Rebuild a `LoadTableResponse` (the `config` map is debug-only and dropped).
+    pub(crate) fn to_response(&self) -> LoadTableResponse {
+        LoadTableResponse {
+            metadata_location: self.metadata_location.clone(),
+            credentials: self.credentials.clone(),
+            config: HashMap::default(),
+        }
+    }
+
     /// True when vended credentials are present and at/after their (30s-buffered)
     /// expiry, so a later scan must reload rather than hand out stale creds.
-    fn creds_expired(&self) -> bool {
+    pub(crate) fn creds_expired(&self) -> bool {
         self.credentials
             .as_ref()
             .is_some_and(VendedCredentials::is_expired)
     }
 }
 
-/// Query-scoped catalog state shared across every scan of one query.
+/// Per-query catalog state: the `loadTable` snapshot pin. `FlureeR2rmlProvider`
+/// is built once per query, so this map is naturally query-scoped — every scan
+/// in one query reads one pinned Iceberg snapshot. Process-wide client reuse
+/// (the OAuth token) and the cross-query `loadTable` cache live in `R2rmlCache`.
 #[derive(Default)]
 pub(crate) struct IcebergCatalogSession {
-    /// Reused REST clients keyed by graph source id. One client per source means
-    /// one OAuth token cache, hence one token exchange for the whole query.
-    /// `RestCatalogClient` is not `Clone`, so it is shared via `Arc`.
-    clients: Mutex<HashMap<String, Arc<RestCatalogClient>>>,
-    /// Cached `loadTable` responses keyed by `(graph_source_id, namespace.table)`.
+    /// Pinned `loadTable` responses keyed by `(graph_source_id, namespace.table)`.
     load_tables: Mutex<HashMap<String, CachedLoadTable>>,
 }
 
@@ -71,27 +89,6 @@ impl IcebergCatalogSession {
     /// Cache key for a `loadTable` response: source id + fully-qualified table.
     pub(crate) fn load_table_key(graph_source_id: &str, namespace: &str, table: &str) -> String {
         format!("{graph_source_id}\u{1f}{namespace}.{table}")
-    }
-
-    /// Get the cached REST client for `key`, or build one with `build` and cache
-    /// it. The build closure is synchronous (client construction performs no
-    /// I/O), so the lock is never held across an `await`. With the cache
-    /// disabled, every call builds a fresh client (per-scan OAuth restored).
-    pub(crate) fn rest_client_or_build<E>(
-        &self,
-        key: &str,
-        build: impl FnOnce() -> Result<RestCatalogClient, E>,
-    ) -> Result<Arc<RestCatalogClient>, E> {
-        if !cache_enabled() {
-            return Ok(Arc::new(build()?));
-        }
-        let mut clients = self.clients.lock().unwrap();
-        if let Some(c) = clients.get(key) {
-            return Ok(Arc::clone(c));
-        }
-        let client = Arc::new(build()?);
-        clients.insert(key.to_string(), Arc::clone(&client));
-        Ok(client)
     }
 
     /// Return a cached [`LoadTableResponse`] for `key` if present and its vended
@@ -105,11 +102,7 @@ impl IcebergCatalogSession {
         if hit.creds_expired() {
             return None;
         }
-        Some(LoadTableResponse {
-            metadata_location: hit.metadata_location.clone(),
-            credentials: hit.credentials.clone(),
-            config: HashMap::default(),
-        })
+        Some(hit.to_response())
     }
 
     /// The `metadata_location` pinned for `key` on its first load this query,
@@ -140,13 +133,7 @@ impl IcebergCatalogSession {
         match lts.get_mut(&key) {
             Some(existing) => existing.credentials = resp.credentials.clone(),
             None => {
-                lts.insert(
-                    key,
-                    CachedLoadTable {
-                        metadata_location: resp.metadata_location.clone(),
-                        credentials: resp.credentials.clone(),
-                    },
-                );
+                lts.insert(key, CachedLoadTable::from_response(resp));
             }
         }
     }
