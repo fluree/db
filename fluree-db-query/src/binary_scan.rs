@@ -1618,6 +1618,13 @@ fn build_match_val_for_snapshot(
         // Decode to canonical IRI and re-encode into the target snapshot.
         // Use `original_snapshot` (the primary) rather than `snapshot`
         // (which may be a per-graph snapshot with different namespace codes).
+        //
+        // Hydration performs the same primary→target re-encode when it renders a
+        // foreign subject (`fluree_db_api::format::hydration::reencode_level_for_view`).
+        // The miss policy differs on purpose: here we *preserve* the raw SID (see
+        // the fallback below) so a range scan can still match by raw bytes;
+        // hydration *drops* the predicate (a projection key that can't exist in
+        // the target ledger). Keep the vocabulary in sync with that function.
         if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
             if let Some(store) = ctx.binary_store.as_deref() {
                 if let Ok(Some(persisted_sid)) = store.find_subject_sid(&iri) {

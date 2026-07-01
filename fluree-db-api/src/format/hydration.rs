@@ -87,17 +87,17 @@ type CacheKey = (usize, Sid, u64, usize, Option<Arc<str>>);
 /// - `results`: memoizes a subject's finished JSON so a subject reached many
 ///   times in one response (shared ancestors/units, multiply-referenced
 ///   entities) is hydrated once.
-/// - `rebinds`: memoizes a projection level re-encoded into a target ledger's
-///   namespace dict (issue #1295), keyed by `(target view index, level
-///   address)`, so each `(level, target)` is rebound at most once per response
+/// - `reencoded_levels`: memoizes a projection level re-encoded into a target
+///   ledger's namespace dict (issue #1295), keyed by `(target view index, level
+///   address)`, so each `(level, target)` is re-encoded at most once per response
 ///   and reused via a shared `Arc` instead of re-cloning the sub-tree on every
 ///   cross-ledger crossing. The address key is stable for the response
-///   (originals live in the `HydrationSpec`, rebounds are held here) and is only
-///   ever compared, never dereferenced.
+///   (originals live in the `HydrationSpec`, re-encoded copies are held here) and
+///   is only ever compared, never dereferenced.
 #[derive(Default)]
 struct HydrationCaches {
     results: HashMap<CacheKey, JsonValue>,
-    rebinds: HashMap<(usize, usize), Arc<NestedSelectSpec>>,
+    reencoded_levels: HashMap<(usize, usize), Arc<NestedSelectSpec>>,
 }
 
 /// Depth bookkeeping for one hydration call.
@@ -194,26 +194,34 @@ fn predicate_filter_for_level(level: &NestedSelectSpec) -> Option<Arc<[Sid]>> {
 /// divergent namespaces are silently dropped (issue #1295). Reserved namespaces
 /// (rdf, rdfs, …) survive because their codes are stable across ledgers.
 ///
-/// This rebinds the immediate forward/reverse (and wildcard-refinement) keys by
-/// `lowering.decode_sid` → IRI → `target.encode_iri_strict`. It is **shallow**:
+/// This re-encodes the immediate forward/reverse (and wildcard-refinement) keys
+/// by `lowering.decode_sid` → IRI → `target.encode_iri_strict`. It is **shallow**:
 /// `sub_spec`s (and refinement/reverse values) are left in lowering-dict form —
-/// each is rebound at *its own* crossing, so the decode source is ALWAYS the
+/// each is re-encoded at *its own* crossing, so the decode source is ALWAYS the
 /// lowering (primary) view, never `self`, even in depth-N chains where `self`
 /// is a non-primary view. A predicate the target can't encode is dropped: the
 /// target ledger has no code for that namespace, so it can hold no such flake —
 /// mirroring the subject-side `encode_iri_strict … else continue` in `expand_ref`.
-fn rebind_level_to_view(
+///
+/// This is the hydration-side analogue of the WHERE-scan's per-graph re-encode
+/// (`fluree_db_query::binary_scan::build_match_val_for_snapshot`'s `reencode_sid`):
+/// both decode a primary-lowered `Sid` and re-encode it into the ledger they're
+/// about to touch. They differ, deliberately, in the miss policy — the scan
+/// *preserves* the raw `Sid` (still matchable by raw bytes), hydration *drops* the
+/// predicate (an absent projection key, not a mis-scan). Keep the vocabulary in
+/// sync with that function.
+fn reencode_level_for_view(
     level: &NestedSelectSpec,
     lowering: &IriCompactor,
     target: &LedgerSnapshot,
 ) -> NestedSelectSpec {
-    let rebind = |sid: &Sid| -> Option<Sid> {
+    let reencode = |sid: &Sid| -> Option<Sid> {
         let iri = lowering.decode_sid(sid).ok()?;
         target.encode_iri_strict(&iri)
     };
-    let rebind_map = |m: &std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>| {
+    let reencode_map = |m: &std::collections::HashMap<Sid, Option<Box<NestedSelectSpec>>>| {
         m.iter()
-            .filter_map(|(k, v)| Some((rebind(k)?, v.clone())))
+            .filter_map(|(k, v)| Some((reencode(k)?, v.clone())))
             .collect()
     };
     match level {
@@ -226,12 +234,12 @@ fn rebind_level_to_view(
                         predicate,
                         sub_spec,
                     } => Some(ForwardItem::Property {
-                        predicate: rebind(predicate)?,
+                        predicate: reencode(predicate)?,
                         sub_spec: sub_spec.clone(),
                     }),
                 })
                 .collect(),
-            reverse: rebind_map(reverse),
+            reverse: reencode_map(reverse),
         },
         NestedSelectSpec::Wildcard {
             refinements,
@@ -239,9 +247,9 @@ fn rebind_level_to_view(
         } => NestedSelectSpec::Wildcard {
             refinements: refinements
                 .iter()
-                .filter_map(|(k, v)| Some((rebind(k)?, v.clone())))
+                .filter_map(|(k, v)| Some((reencode(k)?, v.clone())))
                 .collect(),
-            reverse: rebind_map(reverse),
+            reverse: reencode_map(reverse),
         },
     }
 }
@@ -500,11 +508,11 @@ async fn format_hydration_column(
     // root routed to a non-primary view would otherwise miss that ledger's
     // index for any divergent-code predicate (reserved-namespace predicates
     // survive only because their codes are stable). A root that stays on the
-    // primary view needs no rebind — keep the original level (no allocation,
-    // byte-identical output). This mirrors the nested `expand_ref` rebind and
+    // primary view needs no re-encode — keep the original level (no allocation,
+    // byte-identical output). This mirrors the nested `expand_ref` re-encode and
     // shares its memo (per target view + level address). The lowering/decode
     // source is the primary view's compactor, never the routed view's.
-    let rebound_arc;
+    let reencoded_arc;
     let level = if formatter.active_idx == set.primary {
         &spec.level
     } else {
@@ -512,18 +520,18 @@ async fn format_hydration_column(
             formatter.active_idx,
             &spec.level as *const NestedSelectSpec as usize,
         );
-        rebound_arc = cache
-            .rebinds
+        reencoded_arc = cache
+            .reencoded_levels
             .entry(key)
             .or_insert_with(|| {
-                Arc::new(rebind_level_to_view(
+                Arc::new(reencode_level_for_view(
                     &spec.level,
                     set.primary().compactor,
                     formatter.db.snapshot,
                 ))
             })
             .clone();
-        &*rebound_arc
+        &*reencoded_arc
     };
 
     let mut visited = HashSet::new();
@@ -1254,11 +1262,11 @@ impl<'a> HydrationFormatter<'a> {
                 // Re-encode the projection's predicate Sids into this target
                 // ledger's namespace dict (issue #1295). The level is lowered
                 // once against the primary dict, so a same-ledger ref
-                // (`tidx == primary`) needs no rebind — keep the original level
+                // (`tidx == primary`) needs no re-encode — keep the original level
                 // (no allocation, byte-identical output). The decode source is
                 // the primary/lowering view, never `self` (which may be a
                 // non-primary view in a depth-N chain).
-                let rebound_arc;
+                let reencoded_arc;
                 let level_for_target = if tidx == ctx.primary {
                     level
                 } else {
@@ -1268,18 +1276,18 @@ impl<'a> HydrationFormatter<'a> {
                     // sub-tree on every crossing. The key uses the level's address
                     // — stable for the response, only ever compared.
                     let key = (tidx, level as *const NestedSelectSpec as usize);
-                    rebound_arc = cache
-                        .rebinds
+                    reencoded_arc = cache
+                        .reencoded_levels
                         .entry(key)
                         .or_insert_with(|| {
-                            Arc::new(rebind_level_to_view(
+                            Arc::new(reencode_level_for_view(
                                 level,
                                 &ctx.views[ctx.primary].compactor,
                                 tview.db.snapshot,
                             ))
                         })
                         .clone();
-                    &*rebound_arc
+                    &*reencoded_arc
                 };
                 let obj = tfmt
                     .format_subject(
