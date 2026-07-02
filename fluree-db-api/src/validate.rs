@@ -162,6 +162,112 @@ impl ValidateReport {
             "sh:result": results,
         })
     }
+
+    /// Serialize as a W3C `sh:ValidationReport` Turtle document.
+    pub fn to_turtle(&self) -> String {
+        let mut out = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n\n");
+        out.push_str("[] a sh:ValidationReport ;\n");
+        out.push_str(&format!("    sh:conforms {}", self.conforms));
+        for r in &self.results {
+            out.push_str(" ;\n    sh:result [\n        a sh:ValidationResult ;\n");
+            out.push_str(&format!(
+                "        sh:focusNode {} ;\n",
+                turtle_term(&r.focus_node)
+            ));
+            if let Some(path) = &r.result_path {
+                out.push_str(&format!("        sh:resultPath {} ;\n", turtle_term(path)));
+            }
+            out.push_str(&format!(
+                "        sh:resultSeverity {} ;\n",
+                turtle_sh_term(&r.severity)
+            ));
+            let source_shape = r.source_constraint.as_ref().unwrap_or(&r.source_shape);
+            out.push_str(&format!(
+                "        sh:sourceShape {} ;\n",
+                turtle_term(source_shape)
+            ));
+            out.push_str(&format!(
+                "        sh:sourceConstraintComponent {} ;\n",
+                turtle_sh_term(&r.constraint_component)
+            ));
+            if let Some(value) = &r.value {
+                out.push_str(&format!(
+                    "        sh:value {} ;\n",
+                    turtle_value_term(value)
+                ));
+            }
+            out.push_str(&format!(
+                "        sh:resultMessage {}\n    ]",
+                turtle_string(&r.message)
+            ));
+        }
+        out.push_str(" .\n");
+        out
+    }
+}
+
+/// Render an IRI or blank-node label as a Turtle term.
+///
+/// Skolemized blank-node labels may carry characters that are invalid in a
+/// Turtle BLANK_NODE_LABEL (e.g. `/` and `:` from embedded ledger ids) —
+/// sanitize them so the emitted document always parses.
+fn turtle_term(iri_or_bnode: &str) -> String {
+    match iri_or_bnode.strip_prefix("_:") {
+        Some(label) => {
+            let clean: String = label
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect();
+            format!("_:{clean}")
+        }
+        None => format!("<{iri_or_bnode}>"),
+    }
+}
+
+/// Render an IRI as `sh:Name` when it lives in the SHACL namespace.
+fn turtle_sh_term(iri: &str) -> String {
+    match iri.strip_prefix("http://www.w3.org/ns/shacl#") {
+        Some(local) => format!("sh:{local}"),
+        None => turtle_term(iri),
+    }
+}
+
+/// Render a report value (as produced by `value_json`) as a Turtle term.
+fn turtle_value_term(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Object(obj) => match obj.get("@id").and_then(|v| v.as_str()) {
+            Some(iri) => turtle_term(iri),
+            None => turtle_string(&value.to_string()),
+        },
+        JsonValue::Bool(b) => b.to_string(),
+        JsonValue::Number(n) => n.to_string(),
+        JsonValue::String(s) => turtle_string(s),
+        other => turtle_string(&other.to_string()),
+    }
+}
+
+/// Quote and escape a Turtle string literal.
+fn turtle_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Compact an IRI in the SHACL namespace to its `sh:` form for readability.
@@ -407,5 +513,54 @@ fn value_json(value: &FlakeValue, resolve: &impl Fn(&Sid) -> String) -> JsonValu
         FlakeValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| json!(s)),
         FlakeValue::Null => JsonValue::Null,
         other => json!(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_report() -> ValidateReport {
+        ValidateReport {
+            conforms: false,
+            results: vec![ReportResult {
+                focus_node: "http://example.org/ns/nameless".into(),
+                result_path: Some("http://schema.org/name".into()),
+                source_shape: "http://example.org/ns/UserShape".into(),
+                source_constraint: Some("http://example.org/ns/name-ps".into()),
+                constraint_component: "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+                    .into(),
+                severity: "http://www.w3.org/ns/shacl#Violation".into(),
+                message: "Expected at least 1 value(s) but found 0".into(),
+                value: None,
+            }],
+            shape_count: 1,
+        }
+    }
+
+    #[test]
+    fn turtle_report_round_trips_through_parser() {
+        let turtle = sample_report().to_turtle();
+        let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+        fluree_graph_turtle::parse(&turtle, &mut sink).expect("report Turtle must parse");
+        let graph = sink.finish();
+        // report node (type + conforms + result) and the result node's fields
+        assert!(graph.len() >= 8, "expected full report triples: {turtle}");
+        assert!(turtle.contains("sh:MinCountConstraintComponent"));
+        assert!(turtle.contains("<http://example.org/ns/nameless>"));
+    }
+
+    #[test]
+    fn turtle_term_sanitizes_blank_node_labels() {
+        assert_eq!(
+            turtle_term("_:fdb-inline-shapes-validate/scratch:main-2-b1"),
+            "_:fdb-inline-shapes-validate-scratch-main-2-b1"
+        );
+        assert_eq!(turtle_term("http://ex.org/a"), "<http://ex.org/a>");
+    }
+
+    #[test]
+    fn turtle_string_escapes_specials() {
+        assert_eq!(turtle_string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\nd\"");
     }
 }
