@@ -73,24 +73,16 @@ pub enum Constraint {
     LanguageIn(Vec<String>),
 
     // Qualified value shape constraints
-    /// sh:qualifiedValueShape with min/max counts
+    /// sh:qualifiedValueShape with min/max counts: the number of values
+    /// conforming to the nested shape must fall within the counts.
     QualifiedValueShape {
         /// The nested shape to validate against
-        shape: Arc<QualifiedShape>,
+        shape: Arc<NestedShape>,
         /// sh:qualifiedMinCount
         min_count: Option<usize>,
         /// sh:qualifiedMaxCount
         max_count: Option<usize>,
     },
-}
-
-/// A qualified shape for sh:qualifiedValueShape
-#[derive(Debug, Clone, PartialEq)]
-pub struct QualifiedShape {
-    /// The shape ID
-    pub id: Sid,
-    /// Constraints to apply
-    pub constraints: Vec<Constraint>,
 }
 
 /// Node-level constraints (applied to the focus node, not property values)
@@ -103,6 +95,11 @@ pub enum NodeConstraint {
         /// Properties to ignore when checking closed shape (sh:ignoredProperties)
         ignored_properties: HashSet<Sid>,
     },
+
+    /// sh:node - the node must conform to the referenced node shape. On a node
+    /// shape this applies to the focus node; on a property shape it applies to
+    /// each value node individually.
+    Node(Arc<NestedShape>),
 
     // Logical constraints
     /// sh:not - the nested shape must NOT match
@@ -178,6 +175,7 @@ impl NodeConstraint {
                     ignored_properties.len()
                 )
             }
+            NodeConstraint::Node(shape) => format!("sh:node {}", shape.id.name),
             NodeConstraint::Not(_) => "sh:not".to_string(),
             NodeConstraint::And(shapes) => format!("sh:and ({} shapes)", shapes.len()),
             NodeConstraint::Or(shapes) => format!("sh:or ({} shapes)", shapes.len()),

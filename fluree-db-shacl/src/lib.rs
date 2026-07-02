@@ -23,6 +23,21 @@
 //! - Closed: `sh:closed`, `sh:ignoredProperties`
 //! - Pair: `sh:equals`, `sh:disjoint`, `sh:lessThan`, `sh:lessThanOrEquals`
 //! - Logical: `sh:not`, `sh:and`, `sh:or`, `sh:xone`
+//! - Shape-based: `sh:node` — on a property shape each value node must conform
+//!   to the referenced node shape; on a node shape the focus node itself must.
+//!   Recursive shape references (e.g. `FriendShape → knows → sh:node
+//!   FriendShape` over cyclic data) terminate: a `(focus, shape)` pair already
+//!   being validated on the call stack is assumed conforming.
+//! - Qualified: `sh:qualifiedValueShape` with `sh:qualifiedMinCount` /
+//!   `sh:qualifiedMaxCount` — counts the values conforming to the qualified
+//!   shape (top-level property shapes; `sh:qualifiedValueShapesDisjoint` is
+//!   not supported)
+//! - Node-shape value constraints: per-value constraints declared directly on
+//!   a node shape (no `sh:path`) apply to the focus node itself
+//! - `sh:deactivated` — a deactivated shape is ignored entirely, including
+//!   when referenced via `sh:node` or logical constraints
+//! - Implicit class targets: a shape that is also an `rdfs:Class` /
+//!   `owl:Class` targets its own instances
 //! - Messages: `sh:message` on a property shape (or on the node shape for
 //!   `sh:closed` and node-level logical constraints) replaces the generated
 //!   violation message
@@ -61,8 +76,9 @@
 //!
 //! - `sh:uniqueLang`, `sh:languageIn` — require access to language-tag metadata
 //!   on flakes, which is not yet threaded through the validation path.
-//! - `sh:qualifiedValueShape` (+ `sh:qualifiedMinCount` / `sh:qualifiedMaxCount`)
-//!   — requires recursive nested-shape validation counting.
+//! - `sh:qualifiedValueShapesDisjoint` — sibling-shape disjointness for
+//!   qualified value shapes (the counting form of `sh:qualifiedValueShape` is
+//!   supported).
 //!
 //! # Example
 //!

@@ -2510,3 +2510,471 @@ async fn shacl_custom_message_node_shape_closed() {
         .unwrap_err();
     assert_shacl_violation(err, "Only declared properties are allowed");
 }
+
+// ===========================================================================
+// sh:node (shape-based constraint)
+// ===========================================================================
+
+/// `sh:node` referencing a named (targetless) node shape: each value of the
+/// property must conform to it.
+#[tokio::test]
+async fn shacl_node_named_shape_on_property() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@graph": [
+            {
+                "@id": "ex:AddressShape",
+                "@type": "sh:NodeShape",
+                "sh:property": [{
+                    "@id": "ex:pshape_postal",
+                    "sh:path": {"@id": "ex:postalCode"},
+                    "sh:minCount": 1
+                }]
+            },
+            {
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{
+                    "@id": "ex:pshape_address",
+                    "sh:path": {"@id": "ex:address"},
+                    "sh:node": {"@id": "ex:AddressShape"}
+                }]
+            }
+        ]
+    });
+
+    // Valid: the address node has a postal code.
+    let ledger_ok = fluree.create_ledger("shacl/node-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:alice",
+                "@type": "ex:Person",
+                "ex:address": {"@id": "ex:addr1", "ex:postalCode": "12345"}
+            }),
+        )
+        .await
+        .expect("address conforming to AddressShape should pass");
+
+    // Invalid: the address node lacks a postal code.
+    let ledger_bad = fluree.create_ledger("shacl/node-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bob",
+                "@type": "ex:Person",
+                "ex:address": {"@id": "ex:addr2", "ex:street": "Main St"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:node");
+}
+
+/// `sh:node` directly on a node shape: the focus node itself must conform to
+/// the referenced shape.
+#[tokio::test]
+async fn shacl_node_on_node_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@graph": [
+            {
+                "@id": "ex:EmployeeShape",
+                "@type": "sh:NodeShape",
+                "sh:property": [{
+                    "@id": "ex:pshape_empid",
+                    "sh:path": {"@id": "ex:employeeId"},
+                    "sh:minCount": 1
+                }]
+            },
+            {
+                "@id": "ex:ManagerShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Manager"},
+                "sh:node": {"@id": "ex:EmployeeShape"}
+            }
+        ]
+    });
+
+    // Valid: manager carries an employeeId, so it conforms to EmployeeShape.
+    let ledger_ok = fluree.create_ledger("shacl/nodens-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:carol",
+                "@type": "ex:Manager",
+                "ex:employeeId": "E-77"
+            }),
+        )
+        .await
+        .expect("manager with employeeId should pass");
+
+    // Invalid: manager without an employeeId.
+    let ledger_bad = fluree.create_ledger("shacl/nodens-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:dave",
+                "@type": "ex:Manager"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:node");
+}
+
+/// A recursive shape reference over cyclic data must terminate: FriendShape
+/// requires a name and validates `ex:knows` values against itself, while the
+/// data forms a knows-cycle (alice ↔ bob).
+#[tokio::test]
+async fn shacl_node_recursive_shape_cyclic_data() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:FriendShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Friend"},
+        "sh:property": [
+            {
+                "@id": "ex:pshape_friend_name",
+                "sh:path": {"@id": "schema:name"},
+                "sh:minCount": 1
+            },
+            {
+                "@id": "ex:pshape_friend_knows",
+                "sh:path": {"@id": "ex:knows"},
+                "sh:node": {"@id": "ex:FriendShape"}
+            }
+        ]
+    });
+
+    // Valid: both nodes named; the knows-cycle must not hang validation.
+    let ledger_ok = fluree.create_ledger("shacl/rec-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Friend", "schema:name": "Alice",
+                     "ex:knows": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "@type": "ex:Friend", "schema:name": "Bob",
+                     "ex:knows": {"@id": "ex:alice"}}
+                ]
+            }),
+        )
+        .await
+        .expect("cyclic knows-graph with conforming nodes should pass");
+
+    // Invalid: bob has no name, so alice's knows-value fails FriendShape.
+    let ledger_bad = fluree.create_ledger("shacl/rec-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:carol", "@type": "ex:Friend", "schema:name": "Carol",
+                     "ex:knows": {"@id": "ex:mallory"}},
+                    {"@id": "ex:mallory", "ex:knows": {"@id": "ex:carol"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:node");
+}
+
+// ===========================================================================
+// Node-shape value constraints, sh:deactivated, implicit class targets,
+// sh:qualifiedValueShape, and Turtle-list sh:ignoredProperties
+// ===========================================================================
+
+/// Value constraints directly on a node shape (no sh:path) apply to the focus
+/// node itself — here `sh:in` restricts which nodes may appear as the object
+/// of ex:status.
+#[tokio::test]
+async fn shacl_value_constraint_on_node_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:StatusShape",
+        "@type": "sh:NodeShape",
+        "sh:targetObjectsOf": {"@id": "ex:status"},
+        "sh:in": [{"@id": "ex:active"}, {"@id": "ex:inactive"}]
+    });
+
+    let ledger_ok = fluree.create_ledger("shacl/nodeval-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:task1",
+                "ex:status": {"@id": "ex:active"}
+            }),
+        )
+        .await
+        .expect("status in the allowed set should pass");
+
+    let ledger_bad = fluree
+        .create_ledger("shacl/nodeval-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:task2",
+                "ex:status": {"@id": "ex:bogus"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "not in the allowed set");
+}
+
+/// A shape with `sh:deactivated true` must not fire at all.
+#[tokio::test]
+async fn shacl_deactivated_shape_ignored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:NameShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:deactivated": true,
+        "sh:property": [{
+            "@id": "ex:pshape_deact_name",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree.create_ledger("shacl/deact:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // Would violate minCount if the shape were active.
+    fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:nameless",
+                "@type": "ex:Person"
+            }),
+        )
+        .await
+        .expect("deactivated shape must not reject data");
+}
+
+/// Implicit class target: a subject that is both `rdfs:Class` and a node shape
+/// targets its own instances without an explicit sh:targetClass.
+#[tokio::test]
+async fn shacl_implicit_class_target() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:Employee",
+        "@type": ["rdfs:Class", "sh:NodeShape"],
+        "sh:property": [{
+            "@id": "ex:pshape_impl_empid",
+            "sh:path": {"@id": "ex:employeeId"},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger_ok = fluree.create_ledger("shacl/impl-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:e1",
+                "@type": "ex:Employee",
+                "ex:employeeId": "E-1"
+            }),
+        )
+        .await
+        .expect("instance with employeeId should pass");
+
+    let ledger_bad = fluree.create_ledger("shacl/impl-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:e2",
+                "@type": "ex:Employee"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
+}
+
+/// `sh:qualifiedValueShape` + `sh:qualifiedMinCount`: at least N values must
+/// conform to the qualified shape.
+#[tokio::test]
+async fn shacl_qualified_value_shape_min_count() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@graph": [
+            {
+                "@id": "ex:BadgedShape",
+                "@type": "sh:NodeShape",
+                "sh:property": [{
+                    "@id": "ex:pshape_badge",
+                    "sh:path": {"@id": "ex:badge"},
+                    "sh:minCount": 1
+                }]
+            },
+            {
+                "@id": "ex:TeamShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Team"},
+                "sh:property": [{
+                    "@id": "ex:pshape_member",
+                    "sh:path": {"@id": "ex:member"},
+                    "sh:qualifiedValueShape": {"@id": "ex:BadgedShape"},
+                    "sh:qualifiedMinCount": 1
+                }]
+            }
+        ]
+    });
+
+    // Valid: one of the two members carries a badge.
+    let ledger_ok = fluree.create_ledger("shacl/qual-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:teamA", "@type": "ex:Team",
+                     "ex:member": [{"@id": "ex:m1"}, {"@id": "ex:m2"}]},
+                    {"@id": "ex:m1", "ex:badge": "B-1"},
+                    {"@id": "ex:m2", "ex:role": "guest"}
+                ]
+            }),
+        )
+        .await
+        .expect("team with one badged member should pass");
+
+    // Invalid: no member conforms to BadgedShape.
+    let ledger_bad = fluree.create_ledger("shacl/qual-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:teamB", "@type": "ex:Team",
+                     "ex:member": [{"@id": "ex:m3"}]},
+                    {"@id": "ex:m3", "ex:role": "guest"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1 value(s) conforming");
+}
+
+/// `sh:ignoredProperties` written as a Turtle RDF list: the list members must
+/// be honored (pre-fix, the unexpanded list-head blank node was treated as the
+/// ignored property, so the real members were rejected by sh:closed).
+#[tokio::test]
+async fn shacl_ignored_properties_turtle_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shapes_ttl = r#"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/ns/> .
+
+        ex:AuditedShape a sh:NodeShape ;
+          sh:targetClass ex:Audited ;
+          sh:closed true ;
+          sh:ignoredProperties ( ex:internal ex:auditLog ) ;
+          sh:property [ sh:path ex:label ] .
+    "#;
+
+    let ledger_ok = fluree.create_ledger("shacl/ignored-ok:main").await.unwrap();
+    let ledger_ok = fluree
+        .stage_owned(ledger_ok)
+        .upsert_turtle(shapes_ttl)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:rec1",
+                "@type": "ex:Audited",
+                "ex:label": "ok",
+                "ex:internal": "meta"
+            }),
+        )
+        .await
+        .expect("list-declared ignored property must be allowed on a closed shape");
+
+    let ledger_bad = fluree
+        .create_ledger("shacl/ignored-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree
+        .stage_owned(ledger_bad)
+        .upsert_turtle(shapes_ttl)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:rec2",
+                "@type": "ex:Audited",
+                "ex:label": "ok",
+                "ex:other": "not allowed"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "not allowed by closed shape");
+}

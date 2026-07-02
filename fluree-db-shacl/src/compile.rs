@@ -117,6 +117,9 @@ struct ShapeData {
     is_closed: Option<bool>,
     /// sh:ignoredProperties (list of property SIDs)
     ignored_properties: HashSet<Sid>,
+    /// sh:node - references to shapes the node (or each property value, when
+    /// this entry backs a property shape) must conform to
+    node_shapes: Vec<Sid>,
     /// sh:not - reference to a shape that must NOT match
     not_shape: Option<Sid>,
     /// sh:and - reference to RDF list head (expanded during list processing)
@@ -154,6 +157,15 @@ struct PropertyShapeData {
     pattern_string: Option<String>,
     /// sh:in list values (accumulated from RDF list traversal)
     in_values: Vec<FlakeValue>,
+    /// sh:deactivated — a deactivated property shape is skipped entirely
+    deactivated: bool,
+    /// sh:qualifiedValueShape — reference to the shape conforming values are
+    /// counted against (combined with the counts in finalize)
+    qualified_shape: Option<Sid>,
+    /// sh:qualifiedMinCount
+    qualified_min: Option<usize>,
+    /// sh:qualifiedMaxCount
+    qualified_max: Option<usize>,
 }
 
 impl ShapeCompiler {
@@ -231,12 +243,18 @@ impl ShapeCompiler {
             // Language
             predicates::UNIQUE_LANG,
             predicates::LANGUAGE_IN,
+            // Shape-based constraints
+            predicates::NODE,
+            predicates::QUALIFIED_VALUE_SHAPE,
+            predicates::QUALIFIED_MIN_COUNT,
+            predicates::QUALIFIED_MAX_COUNT,
             // Logical constraints
             predicates::NOT,
             predicates::AND,
             predicates::OR,
             predicates::XONE,
             // Metadata
+            predicates::DEACTIVATED,
             predicates::SEVERITY,
             predicates::MESSAGE,
             predicates::NAME,
@@ -244,6 +262,7 @@ impl ShapeCompiler {
 
         // Query each input graph for all SHACL predicates, accumulating into
         // one compiler so cross-graph sh:and/or/xone/sh:in references resolve.
+        let mut class_typed: HashSet<Sid> = HashSet::new();
         for db in dbs {
             for pred_name in &shacl_predicates {
                 let pred = Sid::new(SHACL, pred_name);
@@ -254,6 +273,28 @@ impl ShapeCompiler {
                 for flake in flakes {
                     compiler.process_flake(&flake)?;
                 }
+            }
+
+            // Collect subjects typed as a class — a shape that is also a class
+            // implicitly targets its own instances (SHACL "implicit class
+            // targets"). Bound-object scans, so cost scales with the number of
+            // declared classes, not the data.
+            let rdf_type = Sid::new(RDF, rdf_names::TYPE);
+            for class_class in [
+                Sid::new(fluree_vocab::namespaces::RDFS, "Class"),
+                Sid::new(fluree_vocab::namespaces::OWL, "Class"),
+            ] {
+                let flakes = db
+                    .range(
+                        IndexType::Opst,
+                        RangeTest::Eq,
+                        RangeMatch::predicate_object(
+                            rdf_type.clone(),
+                            FlakeValue::Ref(class_class),
+                        ),
+                    )
+                    .await?;
+                class_typed.extend(flakes.iter().map(|f| f.s.clone()));
             }
 
             // Expand rdf:first/rdf:rest lists referenced by sh:in / sh:and /
@@ -269,7 +310,24 @@ impl ShapeCompiler {
             compiler.resolve_paths(*db).await?;
         }
 
+        compiler.apply_implicit_class_targets(&class_typed);
         compiler.finalize()
+    }
+
+    /// Add an implicit-class target to every compiled shape that is also
+    /// declared a class (`rdfs:Class` / `owl:Class`): per SHACL, such a shape
+    /// targets all instances of itself.
+    fn apply_implicit_class_targets(&mut self, class_typed: &HashSet<Sid>) {
+        for (id, data) in &mut self.shapes {
+            if class_typed.contains(id)
+                && !data
+                    .targets
+                    .iter()
+                    .any(|t| matches!(t, TargetType::ImplicitClass(c) if c == id))
+            {
+                data.targets.push(TargetType::ImplicitClass(id.clone()));
+            }
+        }
     }
 
     /// Resolve raw `sh:path` objects into [`PropertyPath`] ASTs.
@@ -341,6 +399,36 @@ impl ShapeCompiler {
                 if let Some(ps_data) = self.property_shapes.get_mut(&ps_id) {
                     // Replace the single Ref with the expanded values
                     ps_data.in_values = values;
+                }
+            }
+        }
+
+        // Expand sh:ignoredProperties RDF-list heads (Turtle encoding). JSON-LD
+        // @list flattens to one flake per member, so members arrive directly;
+        // a Turtle list arrives as a single blank-node head that must be
+        // walked, otherwise the head itself would be treated as the ignored
+        // property and the real members would be rejected by sh:closed.
+        let ignored_candidates: Vec<(Sid, Sid)> = self
+            .shapes
+            .iter()
+            .flat_map(|(shape_id, sd)| {
+                sd.ignored_properties
+                    .iter()
+                    .map(|p| (shape_id.clone(), p.clone()))
+            })
+            .collect();
+        for (shape_id, head) in ignored_candidates {
+            let values = traverse_rdf_list(db, &head, &rdf_first, &rdf_rest, &rdf_nil).await?;
+            if values.is_empty() {
+                // Not a list head in this graph — a plain property IRI.
+                continue;
+            }
+            if let Some(sd) = self.shapes.get_mut(&shape_id) {
+                sd.ignored_properties.remove(&head);
+                for v in values {
+                    if let FlakeValue::Ref(p) = v {
+                        sd.ignored_properties.insert(p);
+                    }
                 }
             }
         }
@@ -620,6 +708,31 @@ impl ShapeCompiler {
                 }
             }
 
+            // Shape-based constraints
+            name if name == predicates::NODE => {
+                if let FlakeValue::Ref(shape_ref) = &flake.o {
+                    self.get_or_create_shape(&flake.s)
+                        .node_shapes
+                        .push(shape_ref.clone());
+                }
+            }
+            name if name == predicates::QUALIFIED_VALUE_SHAPE => {
+                if let FlakeValue::Ref(shape_ref) = &flake.o {
+                    self.get_or_create_property_shape(&flake.s).qualified_shape =
+                        Some(shape_ref.clone());
+                }
+            }
+            name if name == predicates::QUALIFIED_MIN_COUNT => {
+                if let FlakeValue::Long(n) = &flake.o {
+                    self.get_or_create_property_shape(&flake.s).qualified_min = Some(*n as usize);
+                }
+            }
+            name if name == predicates::QUALIFIED_MAX_COUNT => {
+                if let FlakeValue::Long(n) = &flake.o {
+                    self.get_or_create_property_shape(&flake.s).qualified_max = Some(*n as usize);
+                }
+            }
+
             // Logical constraints (node-level)
             name if name == predicates::NOT => {
                 if let FlakeValue::Ref(shape_ref) = &flake.o {
@@ -652,6 +765,17 @@ impl ShapeCompiler {
             }
 
             // Metadata
+            name if name == predicates::DEACTIVATED => {
+                if let FlakeValue::Boolean(v) = &flake.o {
+                    // The subject may be a node shape, a property shape, or
+                    // both maps may hold an entry for it — deactivate wherever
+                    // it appears so the shape is ignored entirely.
+                    if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                        ps.deactivated = *v;
+                    }
+                    self.get_or_create_shape(&flake.s).deactivated = *v;
+                }
+            }
             name if name == predicates::SEVERITY => {
                 if let FlakeValue::Ref(sev) = &flake.o {
                     let severity = parse_severity(sev);
@@ -717,13 +841,27 @@ impl ShapeCompiler {
             let mut prop_shapes = Vec::new();
             for ps_id in &data.property_shape_ids {
                 if let Some(ps_data) = ps_map.get(ps_id) {
+                    if ps_data.deactivated {
+                        continue;
+                    }
                     if ps_data.path.is_some() {
                         // `sh:path` present. If it never resolved to an AST it
                         // becomes an `Unresolvable` path, surfaced as a violation
                         // only when this shape fires — not a compile error that
                         // would wedge every transaction on the ledger.
                         let path = resolved_path_of(ps_data);
-                        let constraints = build_constraints_from_ps_data(ps_data);
+                        let mut constraints = build_constraints_from_ps_data(ps_data);
+
+                        // sh:qualifiedValueShape needs the shape map to inline
+                        // the qualified shape, so it's attached here rather
+                        // than in build_constraints_from_ps_data.
+                        if let Some(q_ref) = &ps_data.qualified_shape {
+                            constraints.push(Constraint::QualifiedValueShape {
+                                shape: Arc::new(build_nested_shape(q_ref, &ps_map)),
+                                min_count: ps_data.qualified_min,
+                                max_count: ps_data.qualified_max,
+                            });
+                        }
 
                         // Check if this property shape's subject also has structural
                         // constraints (e.g. sh:or on a property shape). If so, build
@@ -760,15 +898,31 @@ impl ShapeCompiler {
             // Add logical constraints (sh:not, sh:and, sh:or, sh:xone)
             structural_constraints.extend(build_logical_constraints(data, &ps_map));
 
+            // Value constraints declared directly on the node shape (no
+            // sh:path) accumulate in a path-less PropertyShapeData entry keyed
+            // by the shape's own Sid; per spec they apply to the focus node
+            // itself. Metadata (sh:message / sh:name) that landed on that entry
+            // also belongs to the node shape.
+            let mut node_constraints = data.node_constraints.clone();
+            let mut message = data.message.clone();
+            let mut name = data.name.clone();
+            if let Some(own_ps) = ps_map.get(id) {
+                if own_ps.path.is_none() {
+                    node_constraints.extend(build_constraints_from_ps_data(own_ps));
+                    message = message.or_else(|| own_ps.message.clone());
+                    name = name.or_else(|| own_ps.name.clone());
+                }
+            }
+
             compiled.push(CompiledShape {
                 id: id.clone(),
                 targets: data.targets.clone(),
                 property_shapes: prop_shapes,
-                node_constraints: data.node_constraints.clone(),
+                node_constraints,
                 structural_constraints,
                 severity: data.severity,
-                name: data.name.clone(),
-                message: data.message.clone(),
+                name,
+                message,
                 deactivated: data.deactivated,
             });
         }
@@ -862,13 +1016,20 @@ fn build_nested_shape(sid: &ShapeId, ps_map: &HashMap<ShapeId, PropertyShapeData
     }
 }
 
-/// Build logical `NodeConstraint`s (sh:not, sh:and, sh:or, sh:xone) from a
-/// `ShapeData`, using `build_nested_shape` to inline anonymous member constraints.
+/// Build shape-based and logical `NodeConstraint`s (sh:node, sh:not, sh:and,
+/// sh:or, sh:xone) from a `ShapeData`, using `build_nested_shape` to inline
+/// anonymous member constraints.
 fn build_logical_constraints(
     data: &ShapeData,
     ps_map: &HashMap<ShapeId, PropertyShapeData>,
 ) -> Vec<NodeConstraint> {
     let mut constraints = Vec::new();
+
+    for shape_ref in &data.node_shapes {
+        constraints.push(NodeConstraint::Node(Arc::new(build_nested_shape(
+            shape_ref, ps_map,
+        ))));
+    }
 
     if let Some(ref shape_ref) = data.not_shape {
         constraints.push(NodeConstraint::Not(Arc::new(build_nested_shape(

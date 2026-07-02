@@ -91,6 +91,7 @@ ex:PersonShape a sh:NodeShape ;
 | `sh:targetNode <N>` | The specific subject `<N>` |
 | `sh:targetSubjectsOf <P>` | Every subject that currently has predicate `<P>` |
 | `sh:targetObjectsOf <P>` | Every node that currently appears as the object of `<P>` |
+| implicit (shape `a rdfs:Class`) | A shape that is also a class targets its own instances — no explicit target needed |
 
 See [Predicate-target shapes](#predicate-target-shapes) for notes on how the staged-path validator discovers focus nodes for `sh:targetSubjectsOf` / `sh:targetObjectsOf`.
 
@@ -273,6 +274,67 @@ ex:ContactShape a sh:NodeShape ;
 ```
 
 Available: `sh:not`, `sh:and`, `sh:or`, `sh:xone`.
+
+### Shape-based constraints (`sh:node`)
+
+`sh:node` validates a node against another node shape. On a property shape it
+applies to each value; directly on a node shape it applies to the focus node
+itself. The referenced shape is usually targetless — it fires only where it is
+referenced.
+
+```turtle
+ex:AddressShape a sh:NodeShape ;
+  sh:property [ sh:path ex:postalCode ; sh:minCount 1 ] .
+
+ex:PersonShape a sh:NodeShape ;
+  sh:targetClass ex:Person ;
+  sh:property [
+    sh:path ex:address ;
+    sh:node ex:AddressShape
+  ] .
+```
+
+Recursive references are safe: a shape may reference itself (directly or via a
+chain), and validation over cyclic data (e.g. a mutual `ex:knows` graph)
+terminates — a node already being validated against a shape higher in the
+evaluation is assumed conforming, matching common SHACL engine behavior.
+
+### Qualified value shapes
+
+`sh:qualifiedValueShape` counts how many values conform to a shape and checks
+the count against `sh:qualifiedMinCount` / `sh:qualifiedMaxCount` — unlike
+`sh:node`, values that don't conform are fine as long as enough do.
+
+```turtle
+ex:TeamShape a sh:NodeShape ;
+  sh:targetClass ex:Team ;
+  sh:property [
+    sh:path ex:member ;
+    sh:qualifiedValueShape ex:BadgedMemberShape ;
+    sh:qualifiedMinCount 1
+  ] .
+```
+
+(`sh:qualifiedValueShapesDisjoint` is not supported.)
+
+### Constraints on the node itself
+
+Value constraints declared directly on a node shape (without `sh:path`) apply
+to the focus node. Combined with a predicate target this restricts which nodes
+may appear in a position:
+
+```turtle
+# Only ex:active / ex:inactive may be used as an ex:status value.
+ex:StatusShape a sh:NodeShape ;
+  sh:targetObjectsOf ex:status ;
+  sh:in ( ex:active ex:inactive ) .
+```
+
+### Deactivating a shape
+
+`sh:deactivated true` turns a shape off without deleting it — it stops firing
+for its targets and is treated as conforming when referenced via `sh:node` or
+logical constraints.
 
 ### Closed shapes
 
@@ -511,7 +573,7 @@ All three routes go through the same post-stage helper, so the ledger's configur
 The following SHACL constructs are parsed/compiled but currently **no-ops** at validation time. Shapes using them load without error but don't constrain data:
 
 - `sh:uniqueLang`, `sh:languageIn` — require language-tag metadata on flakes, which isn't yet threaded through the validation path.
-- `sh:qualifiedValueShape` (+ `sh:qualifiedMinCount` / `sh:qualifiedMaxCount`) — requires recursive nested-shape counting.
+- `sh:qualifiedValueShapesDisjoint` — sibling-shape disjointness for qualified value shapes (the counting form of `sh:qualifiedValueShape` is supported).
 
 These are tracked in the SHACL compliance effort.
 

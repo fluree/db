@@ -1186,6 +1186,9 @@ pub mod shacl_names {
     /// sh:nodeKind local name
     pub const NODE_KIND: &str = "nodeKind";
 
+    /// sh:node local name (value/focus must conform to the referenced node shape)
+    pub const NODE: &str = "node";
+
     /// sh:class local name
     pub const CLASS: &str = "class";
 
@@ -1324,6 +1327,9 @@ pub mod shacl_names {
     // ========================================================================
     // Severity Levels
     // ========================================================================
+
+    /// sh:deactivated local name (true = the shape is ignored entirely)
+    pub const DEACTIVATED: &str = "deactivated";
 
     /// sh:severity local name
     pub const SEVERITY: &str = "severity";

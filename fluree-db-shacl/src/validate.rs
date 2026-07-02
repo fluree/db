@@ -4,7 +4,7 @@
 //! against SHACL shapes.
 
 use crate::cache::{ShaclCache, ShaclCacheKey};
-use crate::compile::{CompiledShape, PropertyShape, Severity, ShapeCompiler, TargetType};
+use crate::compile::{CompiledShape, PropertyShape, Severity, ShapeCompiler, ShapeId, TargetType};
 use crate::constraints::cardinality::{validate_max_count, validate_min_count};
 use crate::constraints::datatype::{validate_datatype, validate_node_kind};
 use crate::constraints::pattern::{validate_max_length, validate_min_length, validate_pattern};
@@ -34,6 +34,17 @@ use std::collections::{HashMap, HashSet};
 /// value can legitimately resolve differently when referenced from a different
 /// data graph.
 type ClassMembershipCache = Mutex<HashMap<(Sid, Sid, GraphId), bool>>;
+
+/// `(focus node, shape id)` pairs currently being validated on the call stack.
+///
+/// Recursive shape references are legal SHACL (`FriendShape → sh:node
+/// FriendShape` via a property) and cyclic *data* would otherwise recurse
+/// forever. On re-entry of an already-active pair the engine assumes
+/// conformance — the standard terminating interpretation, since the spec
+/// leaves recursive validation undefined. One set is created per top-level
+/// validation entry point; entries are removed on exit, so the set only
+/// reflects the live call stack.
+type ActiveShapeChecks = Mutex<HashSet<(Sid, ShapeId)>>;
 
 /// Threaded context for resolving `sh:class` value membership: the extra
 /// vocabulary graphs to union into the `rdf:type` / `rdfs:subClassOf` lookup
@@ -276,13 +287,15 @@ impl ShaclEngine {
             cache: &self.class_cache,
             cross_ledger,
         };
+        let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
             if shape.deactivated {
                 continue;
             }
 
             let shape_results =
-                validate_shape(db, focus_node, shape, &all_shapes, Some(class_ctx)).await?;
+                validate_shape(db, focus_node, shape, &all_shapes, Some(class_ctx), &active)
+                    .await?;
             results.extend(shape_results);
         }
 
@@ -326,8 +339,16 @@ impl ShaclEngine {
             let focus_nodes = get_focus_nodes(db, shape, self.hierarchy.as_ref()).await?;
 
             for focus_node in focus_nodes {
-                let results =
-                    validate_shape(db, &focus_node, shape, &all_shapes, Some(class_ctx)).await?;
+                let active = ActiveShapeChecks::default();
+                let results = validate_shape(
+                    db,
+                    &focus_node,
+                    shape,
+                    &all_shapes,
+                    Some(class_ctx),
+                    &active,
+                )
+                .await?;
                 all_results.extend(results);
             }
         }
@@ -584,29 +605,121 @@ fn validate_shape<'a>(
     shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
     class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
+        // A deactivated shape is ignored entirely — including when reached via
+        // sh:node / logical shape references, not just from target selection.
+        if shape.deactivated {
+            return Ok(Vec::new());
+        }
+
+        // Recursion guard: a (focus, shape) pair already on the call stack
+        // (via sh:node / logical shape references over cyclic data) is assumed
+        // conforming so validation terminates.
+        let guard_key = (focus_node.clone(), shape.id.clone());
+        if !active.lock().insert(guard_key.clone()) {
+            return Ok(Vec::new());
+        }
+
         let mut results = Vec::new();
 
         // Validate property shapes
         for prop_shape in &shape.property_shapes {
-            let prop_results =
-                validate_property_shape(db, focus_node, prop_shape, shape, all_shapes, class_ctx)
-                    .await?;
+            let prop_results = validate_property_shape(
+                db, focus_node, prop_shape, shape, all_shapes, class_ctx, active,
+            )
+            .await?;
             results.extend(prop_results);
+        }
+
+        // Value constraints declared directly on the node shape apply to the
+        // focus node itself (a node shape's value nodes = the focus node).
+        if !shape.node_constraints.is_empty() {
+            let node_results =
+                validate_node_value_constraints(db, focus_node, shape, class_ctx).await?;
+            results.extend(node_results);
         }
 
         // Validate structural constraints (closed, logical)
         for constraint in &shape.structural_constraints {
-            let constraint_results =
-                validate_structural_constraint(db, focus_node, constraint, shape, all_shapes)
-                    .await?;
+            let constraint_results = validate_structural_constraint(
+                db, focus_node, constraint, shape, all_shapes, active,
+            )
+            .await?;
             results.extend(constraint_results);
         }
 
+        active.lock().remove(&guard_key);
         Ok(results)
     })
+}
+
+/// Validate value constraints declared directly on a node shape (no `sh:path`)
+/// against the focus node itself. Per spec, a node shape's value-node set is
+/// exactly the focus node, so per-value constraints (`sh:in`, `sh:hasValue`,
+/// `sh:nodeKind`, `sh:class`, ranges, …) evaluate over `[focus]`.
+async fn validate_node_value_constraints<'a>(
+    db: GraphDbRef<'a>,
+    focus_node: &Sid,
+    shape: &'a CompiledShape,
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+) -> Result<Vec<ValidationResult>> {
+    let mut results = Vec::new();
+    let values = [FlakeValue::Ref(focus_node.clone())];
+    let datatypes = [fluree_db_core::id_datatype_sid()];
+
+    let push = |violation: ConstraintViolation, results: &mut Vec<ValidationResult>| {
+        results.push(ValidationResult {
+            focus_node: focus_node.clone(),
+            result_path: None,
+            source_shape: shape.id.clone(),
+            source_constraint: None,
+            severity: shape.severity,
+            message: shape.message.clone().unwrap_or(violation.message),
+            value: violation.value,
+            graph_id: None,
+        });
+    };
+
+    for constraint in &shape.node_constraints {
+        match constraint {
+            Constraint::Equals(target_prop)
+            | Constraint::Disjoint(target_prop)
+            | Constraint::LessThan(target_prop)
+            | Constraint::LessThanOrEquals(target_prop) => {
+                let target_flakes = db
+                    .range(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject_predicate(focus_node.clone(), target_prop.clone()),
+                    )
+                    .await?;
+                let target_values: Vec<FlakeValue> =
+                    target_flakes.iter().map(|f| f.o.clone()).collect();
+                for violation in
+                    validate_pair_constraint(constraint, &values, &target_values, &target_prop.name)
+                {
+                    push(violation, &mut results);
+                }
+            }
+            Constraint::Class(expected_class) => {
+                for violation in
+                    validate_class_constraint(db, &values, expected_class, class_ctx).await?
+                {
+                    push(violation, &mut results);
+                }
+            }
+            _ => {
+                for violation in validate_constraint(constraint, &values, &datatypes)? {
+                    push(violation, &mut results);
+                }
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 /// Validate a structural (node-level) constraint
@@ -618,6 +731,7 @@ fn validate_structural_constraint<'a>(
     constraint: &'a crate::constraints::NodeConstraint,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    active: &'a ActiveShapeChecks,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -677,6 +791,39 @@ fn validate_structural_constraint<'a>(
                 }
             }
 
+            NodeConstraint::Node(nested_shape) => {
+                // sh:node - the focus node must conform to the referenced shape
+                let nested_results = validate_nested_shape(
+                    db,
+                    focus_node,
+                    nested_shape.as_ref(),
+                    parent_shape,
+                    all_shapes,
+                    active,
+                )
+                .await?;
+                let has_violations = nested_results
+                    .iter()
+                    .any(|r| r.severity == Severity::Violation);
+                if has_violations {
+                    results.push(ValidationResult {
+                        focus_node: focus_node.clone(),
+                        result_path: None,
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: None,
+                        severity: Severity::Violation,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Node does not conform to shape {} (sh:node)",
+                                nested_shape.id.name
+                            )
+                        }),
+                        value: None,
+                        graph_id: None,
+                    });
+                }
+            }
+
             NodeConstraint::Not(nested_shape) => {
                 // sh:not - the nested shape must NOT match
                 let nested_results = validate_nested_shape(
@@ -685,6 +832,7 @@ fn validate_structural_constraint<'a>(
                     nested_shape.as_ref(),
                     parent_shape,
                     all_shapes,
+                    active,
                 )
                 .await?;
                 // If the nested shape has NO violations, that's a violation of sh:not.
@@ -721,6 +869,7 @@ fn validate_structural_constraint<'a>(
                         nested.as_ref(),
                         parent_shape,
                         all_shapes,
+                        active,
                     )
                     .await?;
                     // Include violations from the nested shape
@@ -755,6 +904,7 @@ fn validate_structural_constraint<'a>(
                         nested.as_ref(),
                         parent_shape,
                         all_shapes,
+                        active,
                     )
                     .await?;
                     let has_violations = nested_results
@@ -803,6 +953,7 @@ fn validate_structural_constraint<'a>(
                         nested.as_ref(),
                         parent_shape,
                         all_shapes,
+                        active,
                     )
                     .await?;
                     let has_violations = nested_results
@@ -862,6 +1013,7 @@ fn validate_nested_shape<'a>(
     nested: &'a NestedShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    active: &'a ActiveShapeChecks,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -876,7 +1028,7 @@ fn validate_nested_shape<'a>(
                 // legacy data-graph lookup (no `f:shapesSource` vocabulary union
                 // and no shared memo) — the value-set feature targets top-level
                 // property shapes.
-                return validate_shape(db, focus_node, ref_shape, all_shapes, None).await;
+                return validate_shape(db, focus_node, ref_shape, all_shapes, None, active).await;
             }
             // Shape not found and no inline constraints — treat as unresolved.
             // Return a violation to prevent sh:or from being trivially true.
@@ -1002,6 +1154,7 @@ fn validate_nested_shape<'a>(
                 node_constraint,
                 parent_shape,
                 all_shapes,
+                active,
             )
             .await?;
             results.extend(nested_results);
@@ -1012,6 +1165,7 @@ fn validate_nested_shape<'a>(
 }
 
 /// Validate a focus node against a property shape
+#[allow(clippy::too_many_arguments)]
 async fn validate_property_shape<'a>(
     db: GraphDbRef<'a>,
     focus_node: &Sid,
@@ -1019,6 +1173,7 @@ async fn validate_property_shape<'a>(
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
     class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
 
@@ -1115,6 +1270,58 @@ async fn validate_property_shape<'a>(
                     });
                 }
             }
+            Constraint::QualifiedValueShape {
+                shape,
+                min_count,
+                max_count,
+            } => {
+                let mut conforming = 0usize;
+                for (i, value) in values.iter().enumerate() {
+                    let conforms = check_value_against_nested_shape(
+                        db,
+                        value,
+                        datatypes.get(i),
+                        shape,
+                        parent_shape,
+                        all_shapes,
+                        active,
+                    )
+                    .await?;
+                    if conforms {
+                        conforming += 1;
+                    }
+                }
+
+                let mut qualified_messages: Vec<String> = Vec::new();
+                if let Some(min) = min_count {
+                    if conforming < *min {
+                        qualified_messages.push(format!(
+                            "Expected at least {} value(s) conforming to shape {} but found {}",
+                            min, shape.id.name, conforming
+                        ));
+                    }
+                }
+                if let Some(max) = max_count {
+                    if conforming > *max {
+                        qualified_messages.push(format!(
+                            "Expected at most {} value(s) conforming to shape {} but found {}",
+                            max, shape.id.name, conforming
+                        ));
+                    }
+                }
+                for message in qualified_messages {
+                    results.push(ValidationResult {
+                        focus_node: focus_node.clone(),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or(message),
+                        value: None,
+                        graph_id: None,
+                    });
+                }
+            }
             _ => {
                 // Handle other constraints
                 let violations = validate_constraint(constraint, &values, &datatypes)?;
@@ -1147,6 +1354,7 @@ async fn validate_property_shape<'a>(
             prop_shape,
             parent_shape,
             all_shapes,
+            active,
         )
         .await?;
         results.extend(structural_results);
@@ -1170,6 +1378,7 @@ async fn validate_property_value_structural_constraint<'a>(
     prop_shape: &PropertyShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
 
@@ -1189,6 +1398,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         nested,
                         parent_shape,
                         all_shapes,
+                        active,
                     )
                     .await?;
                     if conforms {
@@ -1231,6 +1441,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         nested,
                         parent_shape,
                         all_shapes,
+                        active,
                     )
                     .await?;
                     if !conforms {
@@ -1268,6 +1479,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         nested,
                         parent_shape,
                         all_shapes,
+                        active,
                     )
                     .await?;
                     if conforms {
@@ -1307,6 +1519,40 @@ async fn validate_property_value_structural_constraint<'a>(
             }
         }
 
+        NodeConstraint::Node(nested) => {
+            // sh:node - each value must conform to the referenced shape
+            for (i, value) in values.iter().enumerate() {
+                let dt = datatypes.get(i);
+                let conforms = check_value_against_nested_shape(
+                    db,
+                    value,
+                    dt,
+                    nested,
+                    parent_shape,
+                    all_shapes,
+                    active,
+                )
+                .await?;
+                if !conforms {
+                    results.push(ValidationResult {
+                        focus_node: focus_node.clone(),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {:?} does not conform to shape {} (sh:node)",
+                                value, nested.id.name
+                            )
+                        }),
+                        value: Some(value.clone()),
+                        graph_id: None,
+                    });
+                }
+            }
+        }
+
         NodeConstraint::Not(nested) => {
             // For each value, the nested shape must NOT accept it
             for (i, value) in values.iter().enumerate() {
@@ -1318,6 +1564,7 @@ async fn validate_property_value_structural_constraint<'a>(
                     nested,
                     parent_shape,
                     all_shapes,
+                    active,
                 )
                 .await?;
                 if conforms {
@@ -1362,6 +1609,7 @@ async fn check_value_against_nested_shape<'a>(
     nested: &'a NestedShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    active: &'a ActiveShapeChecks,
 ) -> Result<bool> {
     // If the nested shape has value-level constraints (e.g. sh:datatype without sh:path),
     // check them directly against the value/datatype.
@@ -1385,7 +1633,7 @@ async fn check_value_against_nested_shape<'a>(
     // For IRI/blank-node values, evaluate the nested shape against the value as a focus node
     if let FlakeValue::Ref(sid) = value {
         let nested_results =
-            validate_nested_shape(db, sid, nested, parent_shape, all_shapes).await?;
+            validate_nested_shape(db, sid, nested, parent_shape, all_shapes, active).await?;
         let has_violations = nested_results
             .iter()
             .any(|r| r.severity == Severity::Violation);
@@ -1539,11 +1787,10 @@ fn validate_constraint(
             // Requires checking the language tag from flake metadata, not FlakeValue
         }
 
-        // Qualified value shape - requires nested validation
-        Constraint::QualifiedValueShape { .. } => {
-            // TODO: Implement qualified value shape validation
-            // This requires recursive shape validation
-        }
+        // Qualified value shape needs db access for nested-shape conformance
+        // counting — handled in `validate_property_shape` (this function is
+        // the pure-values path without a snapshot).
+        Constraint::QualifiedValueShape { .. } => {}
     }
 
     Ok(violations)
