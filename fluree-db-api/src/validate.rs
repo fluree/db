@@ -241,10 +241,21 @@ fn turtle_sh_term(iri: &str) -> String {
 /// Render a report value (as produced by `value_json`) as a Turtle term.
 fn turtle_value_term(value: &JsonValue) -> String {
     match value {
-        JsonValue::Object(obj) => match obj.get("@id").and_then(|v| v.as_str()) {
-            Some(iri) => turtle_term(iri),
-            None => turtle_string(&value.to_string()),
-        },
+        JsonValue::Object(obj) => {
+            if let Some(iri) = obj.get("@id").and_then(|v| v.as_str()) {
+                return turtle_term(iri);
+            }
+            if let Some(lex) = obj.get("@value").and_then(|v| v.as_str()) {
+                if let Some(lang) = obj.get("@language").and_then(|v| v.as_str()) {
+                    return format!("{}@{lang}", turtle_string(lex));
+                }
+                if let Some(dt) = obj.get("@type").and_then(|v| v.as_str()) {
+                    return format!("{}^^<{dt}>", turtle_string(lex));
+                }
+                return turtle_string(lex);
+            }
+            turtle_string(&value.to_string())
+        }
         JsonValue::Bool(b) => b.to_string(),
         JsonValue::Number(n) => n.to_string(),
         JsonValue::String(s) => turtle_string(s),
@@ -450,7 +461,14 @@ pub async fn validate_view(
             constraint_component: r.constraint_component.to_string(),
             severity: severity_iri(r.severity).to_string(),
             message: r.message.clone(),
-            value: r.value.as_ref().map(|v| value_json(v, &resolve)),
+            value: r.value.as_ref().map(|v| {
+                value_json(
+                    v,
+                    r.value_datatype.as_ref(),
+                    r.value_lang.as_deref(),
+                    &resolve,
+                )
+            }),
         })
         .collect();
     results.sort_by(|a, b| {
@@ -516,17 +534,88 @@ fn severity_iri(severity: Severity) -> &'static str {
     }
 }
 
-fn value_json(value: &FlakeValue, resolve: &impl Fn(&Sid) -> String) -> JsonValue {
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+/// Render an `sh:value` term as JSON-LD, preserving RDF term fidelity:
+/// language-tagged literals become `{"@value", "@language"}`, non-native
+/// datatypes become `{"@value", "@type"}` with the lexical form, and only
+/// the JSON-native XSD types (string / boolean / integer / double) render
+/// as bare JSON scalars.
+fn value_json(
+    value: &FlakeValue,
+    datatype: Option<&Sid>,
+    lang: Option<&str>,
+    resolve: &impl Fn(&Sid) -> String,
+) -> JsonValue {
+    if let FlakeValue::Ref(sid) = value {
+        return json!({"@id": resolve(sid)});
+    }
+    if let Some(lang) = lang {
+        return json!({"@value": lexical_form(value), "@language": lang});
+    }
+    if let Some(dt) = datatype {
+        let dt_iri = resolve(dt);
+        // A String carrying the `@id` datatype is a stringified IRI
+        // (STR() semantics in the string facets) — report the IRI node.
+        if dt_iri == "@id" || &*dt.name == "id" {
+            if let FlakeValue::String(s) = value {
+                return json!({"@id": s});
+            }
+        }
+        return match (value, dt_iri.strip_prefix(XSD)) {
+            (FlakeValue::String(s), Some("string")) => json!(s),
+            (FlakeValue::Boolean(b), Some("boolean")) => json!(b),
+            (FlakeValue::Long(n), Some("integer")) => json!(n),
+            (FlakeValue::Double(d), Some("double")) => json!(d),
+            _ => json!({"@value": lexical_form(value), "@type": dt_iri}),
+        };
+    }
+    // No datatype threaded: JSON natives stay native; self-describing
+    // temporal / numeric variants carry their XSD type.
     match value {
-        FlakeValue::Ref(sid) => json!({"@id": resolve(sid)}),
         FlakeValue::Boolean(b) => json!(b),
         FlakeValue::Long(n) => json!(n),
         FlakeValue::Double(d) => json!(d),
         FlakeValue::String(s) => json!(s),
         FlakeValue::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| json!(s)),
         FlakeValue::Null => JsonValue::Null,
-        other => json!(other.to_string()),
+        other => match inferred_xsd_type(other) {
+            Some(local) => json!({
+                "@value": lexical_form(other),
+                "@type": format!("{XSD}{local}"),
+            }),
+            None => json!(other.to_string()),
+        },
     }
+}
+
+/// Lexical form of a literal for `@value`. `Display` is the canonical form
+/// for the temporal / numeric variants, but wraps strings in quotes.
+fn lexical_form(value: &FlakeValue) -> String {
+    match value {
+        FlakeValue::String(s) | FlakeValue::Json(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// XSD local name for FlakeValue variants that self-describe their datatype.
+fn inferred_xsd_type(value: &FlakeValue) -> Option<&'static str> {
+    Some(match value {
+        FlakeValue::Decimal(_) => "decimal",
+        FlakeValue::BigInt(_) => "integer",
+        FlakeValue::DateTime(_) => "dateTime",
+        FlakeValue::Date(_) => "date",
+        FlakeValue::Time(_) => "time",
+        FlakeValue::GYear(_) => "gYear",
+        FlakeValue::GYearMonth(_) => "gYearMonth",
+        FlakeValue::GMonth(_) => "gMonth",
+        FlakeValue::GDay(_) => "gDay",
+        FlakeValue::GMonthDay(_) => "gMonthDay",
+        FlakeValue::YearMonthDuration(_) => "yearMonthDuration",
+        FlakeValue::DayTimeDuration(_) => "dayTimeDuration",
+        FlakeValue::Duration(_) => "duration",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

@@ -30,14 +30,13 @@ pub fn validate_unique_lang(
     duplicated.sort_unstable();
     for lang in duplicated {
         // Report the first value carrying the duplicated tag.
-        let value = langs
+        let index = langs
             .iter()
-            .position(|l| l.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&lang)))
-            .and_then(|i| values.get(i))
-            .cloned();
+            .position(|l| l.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&lang)));
         out.push(ConstraintViolation {
             constraint: Constraint::UniqueLang(true),
-            value,
+            value: index.and_then(|i| values.get(i)).cloned(),
+            value_index: index,
             message: format!("Language tag \"{lang}\" is used by more than one value"),
         });
     }
@@ -56,6 +55,7 @@ pub fn validate_language_in(
         Some(ConstraintViolation {
             constraint: Constraint::LanguageIn(allowed.to_vec()),
             value: Some(value.clone()),
+            value_index: None,
             message,
         })
     };

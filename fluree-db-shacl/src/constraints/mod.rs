@@ -240,6 +240,11 @@ pub struct ConstraintViolation {
     pub constraint: Constraint,
     /// The value that violated the constraint (if applicable)
     pub value: Option<FlakeValue>,
+    /// Index of `value` within the value set being checked, when the
+    /// violation concerns exactly one value. Lets result construction
+    /// recover the value's datatype / language tag from the parallel
+    /// `datatypes` / `langs` arrays (term fidelity for `sh:value`).
+    pub value_index: Option<usize>,
     /// Human-readable message about the violation
     pub message: String,
 }

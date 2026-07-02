@@ -25,6 +25,7 @@ pub fn validate_has_value(
         Some(ConstraintViolation {
             constraint: Constraint::HasValue(expected.clone()),
             value: None,
+            value_index: None,
             message: format!("Required value {expected:?} not found"),
         })
     }
@@ -40,6 +41,7 @@ pub fn validate_in(value: &FlakeValue, allowed: &[FlakeValue]) -> Option<Constra
         Some(ConstraintViolation {
             constraint: Constraint::In(allowed.to_vec()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!(
                 "Value {:?} is not in the allowed set of {} values",
                 value,
@@ -56,6 +58,7 @@ pub fn validate_min_inclusive(value: &FlakeValue, min: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MinInclusive(min.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} is less than minimum {min:?}"),
         }),
     }
@@ -68,6 +71,7 @@ pub fn validate_max_inclusive(value: &FlakeValue, max: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MaxInclusive(max.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} exceeds maximum {max:?}"),
         }),
     }
@@ -80,6 +84,7 @@ pub fn validate_min_exclusive(value: &FlakeValue, min: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MinExclusive(min.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} must be greater than {min:?}"),
         }),
     }
@@ -92,6 +97,7 @@ pub fn validate_max_exclusive(value: &FlakeValue, max: &FlakeValue) -> Option<Co
         _ => Some(ConstraintViolation {
             constraint: Constraint::MaxExclusive(max.clone()),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value {value:?} must be less than {max:?}"),
         }),
     }

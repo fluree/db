@@ -49,6 +49,7 @@ pub fn validate_pattern(
         return Ok(Some(ConstraintViolation {
             constraint: Constraint::Pattern(pattern.to_string(), flags.map(String::from)),
             value: Some(value.clone()),
+            value_index: None,
             message: "Pattern constraint cannot be applied to a non-literal value".to_string(),
         }));
     };
@@ -83,6 +84,7 @@ pub fn validate_pattern(
         Ok(Some(ConstraintViolation {
             constraint: Constraint::Pattern(pattern.to_string(), flags.map(String::from)),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value '{string_value}' does not match pattern '{pattern}'"),
         }))
     }
@@ -97,6 +99,7 @@ pub fn validate_min_length(value: &FlakeValue, min: usize) -> Option<ConstraintV
         return Some(ConstraintViolation {
             constraint: Constraint::MinLength(min),
             value: Some(value.clone()),
+            value_index: None,
             message: "Length constraint cannot be applied to a non-literal value".to_string(),
         });
     };
@@ -105,6 +108,7 @@ pub fn validate_min_length(value: &FlakeValue, min: usize) -> Option<ConstraintV
         Some(ConstraintViolation {
             constraint: Constraint::MinLength(min),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("String length {len} is less than minimum {min}"),
         })
     } else {
@@ -121,6 +125,7 @@ pub fn validate_max_length(value: &FlakeValue, max: usize) -> Option<ConstraintV
         return Some(ConstraintViolation {
             constraint: Constraint::MaxLength(max),
             value: Some(value.clone()),
+            value_index: None,
             message: "Length constraint cannot be applied to a non-literal value".to_string(),
         });
     };
@@ -129,6 +134,7 @@ pub fn validate_max_length(value: &FlakeValue, max: usize) -> Option<ConstraintV
         Some(ConstraintViolation {
             constraint: Constraint::MaxLength(max),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("String length {len} exceeds maximum {max}"),
         })
     } else {

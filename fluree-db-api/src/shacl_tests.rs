@@ -4188,3 +4188,92 @@ async fn validate_report_inline_shapes_carry_class_value_set() {
         "http://www.w3.org/ns/shacl#ClassConstraintComponent"
     );
 }
+
+#[tokio::test]
+async fn validate_report_value_term_fidelity() {
+    // sh:value must keep RDF term fidelity: language-tagged literals carry
+    // @language, non-native datatypes carry @type with the lexical form.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/validate-fidelity:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:thing",
+                "@type": "ex:Thing",
+                "ex:label": {"@value": "trop long", "@language": "fr"},
+                "ex:score": {"@value": "3.14", "@type": "xsd:decimal"}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:ThingShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Thing"},
+                "sh:property": [
+                    {
+                        "@id": "ex:vf-label-ps",
+                        "sh:path": {"@id": "ex:label"},
+                        "sh:maxLength": 4
+                    },
+                    {
+                        "@id": "ex:vf-score-ps",
+                        "sh:path": {"@id": "ex:score"},
+                        "sh:maxInclusive": 2
+                    }
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+    let options = crate::validate::ValidateOptions::default();
+    let report = crate::validate::validate_view(&view, "shacl/validate-fidelity:main", &options)
+        .await
+        .unwrap();
+    assert_eq!(report.violation_count(), 2, "{:?}", report.results);
+
+    let label = report
+        .results
+        .iter()
+        .find(|r| r.result_path.as_deref() == Some("http://example.org/ns/label"))
+        .expect("label violation");
+    assert_eq!(
+        label.value,
+        Some(json!({"@value": "trop long", "@language": "fr"})),
+        "language tag must survive into sh:value"
+    );
+
+    let score = report
+        .results
+        .iter()
+        .find(|r| r.result_path.as_deref() == Some("http://example.org/ns/score"))
+        .expect("score violation");
+    let value = score.value.as_ref().expect("sh:value present");
+    assert_eq!(value["@value"], json!("3.14"));
+    assert_eq!(
+        value["@type"],
+        json!("http://www.w3.org/2001/XMLSchema#decimal")
+    );
+
+    // Turtle report renders the same terms as typed / language literals.
+    let turtle = report.to_turtle();
+    assert!(turtle.contains("\"trop long\"@fr"), "{turtle}");
+    assert!(
+        turtle.contains("\"3.14\"^^<http://www.w3.org/2001/XMLSchema#decimal>"),
+        "{turtle}"
+    );
+}

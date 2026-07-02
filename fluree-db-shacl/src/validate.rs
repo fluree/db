@@ -696,6 +696,8 @@ async fn validate_node_value_constraints<'a>(
             severity: shape.severity,
             message: shape.message.clone().unwrap_or(violation.message),
             value: violation.value,
+            value_datatype: None,
+            value_lang: None,
             graph_id: None,
         })
         .collect())
@@ -829,6 +831,8 @@ fn validate_structural_constraint<'a>(
                                     format!("Property {} not allowed by closed shape", prop.name)
                                 }),
                                 value: Some(flake.o.clone()),
+                                value_datatype: None,
+                                value_lang: None,
                                 graph_id: None,
                             });
                         }
@@ -866,6 +870,8 @@ fn validate_structural_constraint<'a>(
                             )
                         }),
                         value: None,
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -904,6 +910,8 @@ fn validate_structural_constraint<'a>(
                             )
                         }),
                         value: None,
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -936,6 +944,8 @@ fn validate_structural_constraint<'a>(
                                     format!("sh:and constraint - {}", r.message)
                                 }),
                                 value: r.value,
+                                value_datatype: r.value_datatype,
+                                value_lang: r.value_lang,
                                 graph_id: None,
                             });
                         }
@@ -989,6 +999,8 @@ fn validate_structural_constraint<'a>(
                             )
                         }),
                         value: None,
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -1031,6 +1043,8 @@ fn validate_structural_constraint<'a>(
                             "Node does not conform to any shape in sh:xone".to_string()
                         }),
                         value: None,
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 } else if conforming_count > 1 {
@@ -1049,6 +1063,8 @@ fn validate_structural_constraint<'a>(
                             )
                         }),
                         value: None,
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -1095,6 +1111,8 @@ fn validate_nested_shape<'a>(
                 severity: Severity::Violation,
                 message: format!("Referenced shape {} could not be resolved", nested.id.name),
                 value: None,
+                value_datatype: None,
+                value_lang: None,
                 graph_id: None,
             }]);
         }
@@ -1119,6 +1137,8 @@ fn validate_nested_shape<'a>(
                     severity: Severity::Violation,
                     message: nested.message.clone().unwrap_or(violation.message),
                     value: violation.value,
+                    value_datatype: None,
+                    value_lang: None,
                     graph_id: None,
                 });
             }
@@ -1138,6 +1158,8 @@ fn validate_nested_shape<'a>(
                     severity: Severity::Violation,
                     message: format!("Unsupported sh:path expression: {reason}"),
                     value: None,
+                    value_datatype: None,
+                    value_lang: None,
                     graph_id: None,
                 });
                 continue;
@@ -1209,6 +1231,8 @@ fn validate_nested_shape<'a>(
                                     )
                                 }),
                                 value: None,
+                                value_datatype: None,
+                                value_lang: None,
                                 graph_id: None,
                             });
                         }
@@ -1227,6 +1251,14 @@ fn validate_nested_shape<'a>(
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
+                                value_datatype: violation
+                                    .value_index
+                                    .and_then(|i| datatypes.get(i))
+                                    .cloned(),
+                                value_lang: violation
+                                    .value_index
+                                    .and_then(|i| langs.get(i))
+                                    .and_then(std::clone::Clone::clone),
                                 graph_id: None,
                             });
                         }
@@ -1296,6 +1328,8 @@ fn validate_nested_shape<'a>(
                                     )
                                 }),
                                 value: None,
+                                value_datatype: None,
+                                value_lang: None,
                                 graph_id: None,
                             });
                         }
@@ -1318,6 +1352,14 @@ fn validate_nested_shape<'a>(
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
+                                value_datatype: violation
+                                    .value_index
+                                    .and_then(|i| datatypes.get(i))
+                                    .cloned(),
+                                value_lang: violation
+                                    .value_index
+                                    .and_then(|i| langs.get(i))
+                                    .and_then(std::clone::Clone::clone),
                                 graph_id: None,
                             });
                         }
@@ -1335,6 +1377,14 @@ fn validate_nested_shape<'a>(
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
+                                value_datatype: violation
+                                    .value_index
+                                    .and_then(|i| datatypes.get(i))
+                                    .cloned(),
+                                value_lang: violation
+                                    .value_index
+                                    .and_then(|i| langs.get(i))
+                                    .and_then(std::clone::Clone::clone),
                                 graph_id: None,
                             });
                         }
@@ -1387,6 +1437,8 @@ async fn validate_property_shape<'a>(
             severity: prop_shape.severity,
             message: format!("Unsupported sh:path expression: {reason}"),
             value: None,
+            value_datatype: None,
+            value_lang: None,
             graph_id: None,
         });
         return Ok(results);
@@ -1454,6 +1506,14 @@ async fn validate_property_shape<'a>(
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1471,6 +1531,14 @@ async fn validate_property_shape<'a>(
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1556,6 +1624,8 @@ async fn validate_property_shape<'a>(
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(message),
                         value: None,
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -1576,6 +1646,14 @@ async fn validate_property_shape<'a>(
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1594,6 +1672,14 @@ async fn validate_property_shape<'a>(
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1689,6 +1775,8 @@ async fn validate_property_value_structural_constraint<'a>(
                             )
                         }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1727,6 +1815,8 @@ async fn validate_property_value_structural_constraint<'a>(
                                 )
                             }),
                             value: Some(value.clone()),
+                            value_datatype: datatypes.get(i).cloned(),
+                            value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                             graph_id: None,
                         });
                     }
@@ -1770,6 +1860,8 @@ async fn validate_property_value_structural_constraint<'a>(
                             format!("Value {value:?} does not conform to any shape in sh:xone")
                         }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 } else if conforming_count > 1 {
@@ -1786,6 +1878,8 @@ async fn validate_property_value_structural_constraint<'a>(
                             )
                         }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1823,6 +1917,8 @@ async fn validate_property_value_structural_constraint<'a>(
                             )
                         }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1860,6 +1956,8 @@ async fn validate_property_value_structural_constraint<'a>(
                             )
                         }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -2012,15 +2110,17 @@ fn validate_constraint(
         Constraint::Datatype(expected_dt) => {
             for (i, value) in values.iter().enumerate() {
                 if let Some(actual_dt) = datatypes.get(i) {
-                    if let Some(v) = validate_datatype(value, actual_dt, expected_dt) {
+                    if let Some(mut v) = validate_datatype(value, actual_dt, expected_dt) {
+                        v.value_index = Some(i);
                         violations.push(v);
                     }
                 }
             }
         }
         Constraint::NodeKind(kind) => {
-            for value in values {
-                if let Some(v) = validate_node_kind(value, *kind) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_node_kind(value, *kind) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
@@ -2031,57 +2131,65 @@ fn validate_constraint(
             // pure-values path without a snapshot).
         }
         Constraint::MinInclusive(min) => {
-            for value in values {
-                if let Some(v) = validate_min_inclusive(value, min) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_min_inclusive(value, min) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MaxInclusive(max) => {
-            for value in values {
-                if let Some(v) = validate_max_inclusive(value, max) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_max_inclusive(value, max) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MinExclusive(min) => {
-            for value in values {
-                if let Some(v) = validate_min_exclusive(value, min) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_min_exclusive(value, min) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MaxExclusive(max) => {
-            for value in values {
-                if let Some(v) = validate_max_exclusive(value, max) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_max_exclusive(value, max) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::Pattern(pattern, flags) => {
-            for value in values {
-                if let Some(v) = validate_pattern(value, pattern, flags.as_deref())? {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_pattern(value, pattern, flags.as_deref())? {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MinLength(min) => {
-            for value in values {
-                if let Some(v) = validate_min_length(value, *min) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_min_length(value, *min) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MaxLength(max) => {
-            for value in values {
-                if let Some(v) = validate_max_length(value, *max) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_max_length(value, *max) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::In(allowed) => {
-            for value in values {
-                if let Some(v) = validate_in(value, allowed) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_in(value, allowed) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
@@ -2104,7 +2212,8 @@ fn validate_constraint(
         Constraint::LanguageIn(allowed) => {
             for (i, value) in values.iter().enumerate() {
                 let lang = langs.get(i).and_then(|l| l.as_deref());
-                if let Some(v) = validate_language_in(value, lang, allowed) {
+                if let Some(mut v) = validate_language_in(value, lang, allowed) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
@@ -2166,6 +2275,18 @@ fn validate_pair_constraint(
         // Caller is responsible for only passing pair-constraint variants.
         _ => {}
     }
+    // Backfill value indices by position so result construction can recover
+    // the datatype / language of the offending source value. Equality lookup
+    // is exact for the per-value helpers (the violation value IS values[i]).
+    for v in &mut out {
+        if v.value_index.is_none() {
+            v.value_index = v
+                .value
+                .as_ref()
+                .and_then(|val| values.iter().position(|x| x == val));
+        }
+    }
+
     out
 }
 
@@ -2215,13 +2336,14 @@ async fn validate_class_constraint(
         }
     }
 
-    for value in values {
+    for (value_index, value) in values.iter().enumerate() {
         let value_ref = match value {
             FlakeValue::Ref(r) => r,
             other => {
                 out.push(ConstraintViolation {
                     constraint: Constraint::Class(expected_class.clone()),
                     value: Some(other.clone()),
+                    value_index: Some(value_index),
                     message: format!(
                         "Value {:?} is a literal and cannot be an instance of class {}",
                         other, expected_class.name
@@ -2264,6 +2386,7 @@ async fn validate_class_constraint(
             out.push(ConstraintViolation {
                 constraint: Constraint::Class(expected_class.clone()),
                 value: Some(value.clone()),
+                value_index: Some(value_index),
                 message: format!(
                     "Value {} is not an instance of class {}",
                     value_ref.name, expected_class.name
@@ -2563,6 +2686,11 @@ pub struct ValidationResult {
     pub message: String,
     /// The value that caused the violation (if applicable)
     pub value: Option<FlakeValue>,
+    /// Datatype of `value`, when the violation concerns a single value whose
+    /// datatype is known (resolves to the `sh:value` literal's `@type`)
+    pub value_datatype: Option<Sid>,
+    /// Language tag of `value`, when it is a language-tagged literal
+    pub value_lang: Option<String>,
     /// The graph where the focus node was being validated. Populated by the
     /// staged-validation path (`validate_staged_nodes`) so that callers can
     /// apply per-graph SHACL policy (e.g. warn vs reject, enable/disable).
