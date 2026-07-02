@@ -1117,6 +1117,118 @@ pub mod shacl {
 
     /// sh:resultMessage IRI
     pub const RESULT_MESSAGE: &str = "http://www.w3.org/ns/shacl#resultMessage";
+
+    // ========================================================================
+    // Constraint Component IRIs (sh:sourceConstraintComponent values)
+    // ========================================================================
+
+    /// sh:MinCountConstraintComponent IRI
+    pub const MIN_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinCountConstraintComponent";
+
+    /// sh:MaxCountConstraintComponent IRI
+    pub const MAX_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxCountConstraintComponent";
+
+    /// sh:DatatypeConstraintComponent IRI
+    pub const DATATYPE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#DatatypeConstraintComponent";
+
+    /// sh:NodeKindConstraintComponent IRI
+    pub const NODE_KIND_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#NodeKindConstraintComponent";
+
+    /// sh:ClassConstraintComponent IRI
+    pub const CLASS_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#ClassConstraintComponent";
+
+    /// sh:MinInclusiveConstraintComponent IRI
+    pub const MIN_INCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinInclusiveConstraintComponent";
+
+    /// sh:MaxInclusiveConstraintComponent IRI
+    pub const MAX_INCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxInclusiveConstraintComponent";
+
+    /// sh:MinExclusiveConstraintComponent IRI
+    pub const MIN_EXCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinExclusiveConstraintComponent";
+
+    /// sh:MaxExclusiveConstraintComponent IRI
+    pub const MAX_EXCLUSIVE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxExclusiveConstraintComponent";
+
+    /// sh:PatternConstraintComponent IRI
+    pub const PATTERN_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#PatternConstraintComponent";
+
+    /// sh:MinLengthConstraintComponent IRI
+    pub const MIN_LENGTH_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MinLengthConstraintComponent";
+
+    /// sh:MaxLengthConstraintComponent IRI
+    pub const MAX_LENGTH_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#MaxLengthConstraintComponent";
+
+    /// sh:HasValueConstraintComponent IRI
+    pub const HAS_VALUE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#HasValueConstraintComponent";
+
+    /// sh:InConstraintComponent IRI
+    pub const IN_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#InConstraintComponent";
+
+    /// sh:EqualsConstraintComponent IRI
+    pub const EQUALS_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#EqualsConstraintComponent";
+
+    /// sh:DisjointConstraintComponent IRI
+    pub const DISJOINT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#DisjointConstraintComponent";
+
+    /// sh:LessThanConstraintComponent IRI
+    pub const LESS_THAN_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#LessThanConstraintComponent";
+
+    /// sh:LessThanOrEqualsConstraintComponent IRI
+    pub const LESS_THAN_OR_EQUALS_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#LessThanOrEqualsConstraintComponent";
+
+    /// sh:UniqueLangConstraintComponent IRI
+    pub const UNIQUE_LANG_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#UniqueLangConstraintComponent";
+
+    /// sh:LanguageInConstraintComponent IRI
+    pub const LANGUAGE_IN_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#LanguageInConstraintComponent";
+
+    /// sh:QualifiedMinCountConstraintComponent IRI
+    pub const QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#QualifiedMinCountConstraintComponent";
+
+    /// sh:QualifiedMaxCountConstraintComponent IRI
+    pub const QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#QualifiedMaxCountConstraintComponent";
+
+    /// sh:NodeConstraintComponent IRI
+    pub const NODE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#NodeConstraintComponent";
+
+    /// sh:NotConstraintComponent IRI
+    pub const NOT_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#NotConstraintComponent";
+
+    /// sh:AndConstraintComponent IRI
+    pub const AND_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#AndConstraintComponent";
+
+    /// sh:OrConstraintComponent IRI
+    pub const OR_CONSTRAINT_COMPONENT: &str = "http://www.w3.org/ns/shacl#OrConstraintComponent";
+
+    /// sh:XoneConstraintComponent IRI
+    pub const XONE_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#XoneConstraintComponent";
+
+    /// sh:ClosedConstraintComponent IRI
+    pub const CLOSED_CONSTRAINT_COMPONENT: &str =
+        "http://www.w3.org/ns/shacl#ClosedConstraintComponent";
 }
 
 /// SHACL vocabulary local names (for SID construction)
@@ -1419,6 +1531,11 @@ pub mod shacl_names {
 pub mod fluree {
     /// Fluree DB system namespace IRI (canonical base for all Fluree system vocabulary)
     pub const DB: &str = "https://ns.flur.ee/db#";
+
+    /// Constraint component reported when a `sh:path` could not be compiled
+    /// (Fluree extension; W3C SHACL has no component for this condition)
+    pub const UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT: &str =
+        "https://ns.flur.ee/db#UnresolvablePathConstraintComponent";
 
     /// Fluree URN prefix for ledger-scoped identifiers.
     ///

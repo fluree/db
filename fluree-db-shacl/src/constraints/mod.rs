@@ -169,6 +169,45 @@ impl Constraint {
             }
         }
     }
+
+    /// The W3C constraint-component IRI reported as
+    /// `sh:sourceConstraintComponent` for violations of this constraint.
+    ///
+    /// `QualifiedValueShape` maps to the min-count component when
+    /// `sh:qualifiedMinCount` is declared (max-count otherwise); emit sites
+    /// that know which bound actually failed pick the component directly.
+    pub fn component(&self) -> &'static str {
+        use fluree_vocab::shacl as sh;
+        match self {
+            Constraint::MinCount(_) => sh::MIN_COUNT_CONSTRAINT_COMPONENT,
+            Constraint::MaxCount(_) => sh::MAX_COUNT_CONSTRAINT_COMPONENT,
+            Constraint::Datatype(_) => sh::DATATYPE_CONSTRAINT_COMPONENT,
+            Constraint::NodeKind(_) => sh::NODE_KIND_CONSTRAINT_COMPONENT,
+            Constraint::Class(_) => sh::CLASS_CONSTRAINT_COMPONENT,
+            Constraint::MinInclusive(_) => sh::MIN_INCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::MaxInclusive(_) => sh::MAX_INCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::MinExclusive(_) => sh::MIN_EXCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::MaxExclusive(_) => sh::MAX_EXCLUSIVE_CONSTRAINT_COMPONENT,
+            Constraint::Pattern(..) => sh::PATTERN_CONSTRAINT_COMPONENT,
+            Constraint::MinLength(_) => sh::MIN_LENGTH_CONSTRAINT_COMPONENT,
+            Constraint::MaxLength(_) => sh::MAX_LENGTH_CONSTRAINT_COMPONENT,
+            Constraint::HasValue(_) => sh::HAS_VALUE_CONSTRAINT_COMPONENT,
+            Constraint::In(_) => sh::IN_CONSTRAINT_COMPONENT,
+            Constraint::Equals(_) => sh::EQUALS_CONSTRAINT_COMPONENT,
+            Constraint::Disjoint(_) => sh::DISJOINT_CONSTRAINT_COMPONENT,
+            Constraint::LessThan(_) => sh::LESS_THAN_CONSTRAINT_COMPONENT,
+            Constraint::LessThanOrEquals(_) => sh::LESS_THAN_OR_EQUALS_CONSTRAINT_COMPONENT,
+            Constraint::UniqueLang(_) => sh::UNIQUE_LANG_CONSTRAINT_COMPONENT,
+            Constraint::LanguageIn(_) => sh::LANGUAGE_IN_CONSTRAINT_COMPONENT,
+            Constraint::QualifiedValueShape { min_count, .. } => {
+                if min_count.is_some() {
+                    sh::QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT
+                } else {
+                    sh::QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT
+                }
+            }
+        }
+    }
 }
 
 impl NodeConstraint {
@@ -203,4 +242,50 @@ pub struct ConstraintViolation {
     pub value: Option<FlakeValue>,
     /// Human-readable message about the violation
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn component_iris_match_w3c_names() {
+        assert_eq!(
+            Constraint::MinCount(1).component(),
+            "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+        );
+        assert_eq!(
+            Constraint::Pattern("a".into(), None).component(),
+            "http://www.w3.org/ns/shacl#PatternConstraintComponent"
+        );
+        assert_eq!(
+            Constraint::LessThanOrEquals(Sid::new(0, "p")).component(),
+            "http://www.w3.org/ns/shacl#LessThanOrEqualsConstraintComponent"
+        );
+    }
+
+    #[test]
+    fn qualified_component_tracks_declared_bound() {
+        let qualified = |min_count, max_count| Constraint::QualifiedValueShape {
+            shape: Arc::new(NestedShape {
+                id: Sid::new(0, "q"),
+                property_constraints: Vec::new(),
+                node_constraints: Vec::new(),
+                value_constraints: Vec::new(),
+                message: None,
+            }),
+            min_count,
+            max_count,
+            disjoint: false,
+            sibling_shapes: Vec::new(),
+        };
+        assert_eq!(
+            qualified(Some(1), None).component(),
+            "http://www.w3.org/ns/shacl#QualifiedMinCountConstraintComponent"
+        );
+        assert_eq!(
+            qualified(None, Some(2)).component(),
+            "http://www.w3.org/ns/shacl#QualifiedMaxCountConstraintComponent"
+        );
+    }
 }

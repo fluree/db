@@ -21,6 +21,7 @@ use fluree_db_core::{
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::rdf_names;
+use fluree_vocab::shacl as sh_vocab;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 
@@ -676,6 +677,7 @@ async fn validate_node_value_constraints<'a>(
             result_path: None,
             source_shape: shape.id.clone(),
             source_constraint: None,
+            constraint_component: violation.constraint.component(),
             severity: shape.severity,
             message: shape.message.clone().unwrap_or(violation.message),
             value: violation.value,
@@ -806,6 +808,7 @@ fn validate_structural_constraint<'a>(
                                 result_path: Some(prop.clone()),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: None,
+                                constraint_component: sh_vocab::CLOSED_CONSTRAINT_COMPONENT,
                                 severity: parent_shape.severity,
                                 message: parent_shape.message.clone().unwrap_or_else(|| {
                                     format!("Property {} not allowed by closed shape", prop.name)
@@ -839,6 +842,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
+                        constraint_component: sh_vocab::NODE_CONSTRAINT_COMPONENT,
                         severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -876,6 +880,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
+                        constraint_component: sh_vocab::NOT_CONSTRAINT_COMPONENT,
                         severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -910,6 +915,7 @@ fn validate_structural_constraint<'a>(
                                 result_path: r.result_path,
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: None,
+                                constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
                                 severity: parent_shape.severity,
                                 message: parent_shape.message.clone().unwrap_or_else(|| {
                                     format!("sh:and constraint - {}", r.message)
@@ -959,6 +965,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
+                        constraint_component: sh_vocab::OR_CONSTRAINT_COMPONENT,
                         severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -1003,6 +1010,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
                         severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             "Node does not conform to any shape in sh:xone".to_string()
@@ -1016,6 +1024,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
                         severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -1067,6 +1076,7 @@ fn validate_nested_shape<'a>(
                 result_path: None,
                 source_shape: parent_shape.id.clone(),
                 source_constraint: Some(nested.id.clone()),
+                constraint_component: sh_vocab::NODE_CONSTRAINT_COMPONENT,
                 severity: Severity::Violation,
                 message: format!("Referenced shape {} could not be resolved", nested.id.name),
                 value: None,
@@ -1090,6 +1100,7 @@ fn validate_nested_shape<'a>(
                     result_path: None,
                     source_shape: parent_shape.id.clone(),
                     source_constraint: Some(nested.id.clone()),
+                    constraint_component: violation.constraint.component(),
                     severity: Severity::Violation,
                     message: nested.message.clone().unwrap_or(violation.message),
                     value: violation.value,
@@ -1107,6 +1118,8 @@ fn validate_nested_shape<'a>(
                     result_path: None,
                     source_shape: parent_shape.id.clone(),
                     source_constraint: Some(nested.id.clone()),
+                    constraint_component:
+                        fluree_vocab::fluree::UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT,
                     severity: Severity::Violation,
                     message: format!("Unsupported sh:path expression: {reason}"),
                     value: None,
@@ -1172,6 +1185,7 @@ fn validate_nested_shape<'a>(
                                 result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: sh_vocab::EQUALS_CONSTRAINT_COMPONENT,
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or_else(|| {
                                     format!(
@@ -1194,6 +1208,7 @@ fn validate_nested_shape<'a>(
                                 result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: sh_vocab::CLASS_CONSTRAINT_COMPONENT,
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
@@ -1254,6 +1269,7 @@ fn validate_nested_shape<'a>(
                                 result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: if below { sh_vocab::QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT } else { sh_vocab::QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT },
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or_else(|| {
                                     format!(
@@ -1283,6 +1299,7 @@ fn validate_nested_shape<'a>(
                                 result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: violation.constraint.component(),
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
@@ -1299,6 +1316,7 @@ fn validate_nested_shape<'a>(
                                 result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: violation.constraint.component(),
                                 severity: Severity::Violation,
                                 message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
@@ -1350,6 +1368,7 @@ async fn validate_property_shape<'a>(
             result_path: None,
             source_shape: parent_shape.id.clone(),
             source_constraint: Some(prop_shape.id.clone()),
+            constraint_component: fluree_vocab::fluree::UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT,
             severity: prop_shape.severity,
             message: format!("Unsupported sh:path expression: {reason}"),
             value: None,
@@ -1416,6 +1435,7 @@ async fn validate_property_shape<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: constraint.component(),
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
@@ -1432,6 +1452,7 @@ async fn validate_property_shape<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::CLASS_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
@@ -1487,29 +1508,36 @@ async fn validate_property_shape<'a>(
                     }
                 }
 
-                let mut qualified_messages: Vec<String> = Vec::new();
+                let mut qualified_messages: Vec<(String, &'static str)> = Vec::new();
                 if let Some(min) = min_count {
                     if conforming < *min {
-                        qualified_messages.push(format!(
-                            "Expected at least {} value(s) conforming to shape {} but found {}",
-                            min, shape.id.name, conforming
+                        qualified_messages.push((
+                            format!(
+                                "Expected at least {} value(s) conforming to shape {} but found {}",
+                                min, shape.id.name, conforming
+                            ),
+                            sh_vocab::QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT,
                         ));
                     }
                 }
                 if let Some(max) = max_count {
                     if conforming > *max {
-                        qualified_messages.push(format!(
-                            "Expected at most {} value(s) conforming to shape {} but found {}",
-                            max, shape.id.name, conforming
+                        qualified_messages.push((
+                            format!(
+                                "Expected at most {} value(s) conforming to shape {} but found {}",
+                                max, shape.id.name, conforming
+                            ),
+                            sh_vocab::QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT,
                         ));
                     }
                 }
-                for message in qualified_messages {
+                for (message, component) in qualified_messages {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: component,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(message),
                         value: None,
@@ -1529,6 +1557,7 @@ async fn validate_property_shape<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: violation.constraint.component(),
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
@@ -1546,6 +1575,7 @@ async fn validate_property_shape<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: violation.constraint.component(),
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
@@ -1634,6 +1664,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::OR_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -1672,6 +1703,7 @@ async fn validate_property_value_structural_constraint<'a>(
                             result_path: prop_shape.path.as_predicate().cloned(),
                             source_shape: parent_shape.id.clone(),
                             source_constraint: Some(prop_shape.id.clone()),
+                            constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
                             severity: prop_shape.severity,
                             message: prop_shape.message.clone().unwrap_or_else(|| {
                                 format!(
@@ -1717,6 +1749,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or_else(|| {
                             format!("Value {value:?} does not conform to any shape in sh:xone")
@@ -1730,6 +1763,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -1765,6 +1799,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::NODE_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -1801,6 +1836,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::NOT_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or_else(|| {
                             format!(
@@ -2495,6 +2531,9 @@ pub struct ValidationResult {
     pub source_shape: Sid,
     /// The constraint component that produced this result
     pub source_constraint: Option<Sid>,
+    /// IRI of the SHACL constraint component that produced this result
+    /// (`sh:sourceConstraintComponent` in W3C validation reports)
+    pub constraint_component: &'static str,
     /// Severity level
     pub severity: Severity,
     /// Human-readable message
