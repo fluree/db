@@ -30,8 +30,8 @@
 //!   being validated on the call stack is assumed conforming.
 //! - Qualified: `sh:qualifiedValueShape` with `sh:qualifiedMinCount` /
 //!   `sh:qualifiedMaxCount` — counts the values conforming to the qualified
-//!   shape (top-level property shapes; `sh:qualifiedValueShapesDisjoint` is
-//!   not supported)
+//!   shape, including on property shapes used as logical-constraint members
+//!   (`sh:qualifiedValueShapesDisjoint` is not supported)
 //! - Node-shape value constraints: per-value constraints declared directly on
 //!   a node shape (no `sh:path`) apply to the focus node itself
 //! - `sh:deactivated` — a deactivated shape is ignored entirely, including

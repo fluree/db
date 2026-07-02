@@ -855,12 +855,9 @@ impl ShapeCompiler {
                         // sh:qualifiedValueShape needs the shape map to inline
                         // the qualified shape, so it's attached here rather
                         // than in build_constraints_from_ps_data.
-                        if let Some(q_ref) = &ps_data.qualified_shape {
-                            constraints.push(Constraint::QualifiedValueShape {
-                                shape: Arc::new(build_nested_shape(q_ref, &ps_map)),
-                                min_count: ps_data.qualified_min,
-                                max_count: ps_data.qualified_max,
-                            });
+                        if let Some(q) = qualified_constraint(ps_data, &ps_map, &mut HashSet::new())
+                        {
+                            constraints.push(q);
                         }
 
                         // Check if this property shape's subject also has structural
@@ -980,40 +977,83 @@ fn resolved_path_of(ps_data: &PropertyShapeData) -> PropertyPath {
     })
 }
 
-/// Build a `NestedShape` for a member of sh:or/sh:and/sh:xone/sh:not,
-/// inlining value-level or property constraints from `PropertyShapeData`
-/// when the member is an anonymous shape.
+/// Build a `NestedShape` for a member of sh:or/sh:and/sh:xone/sh:not/sh:node
+/// or a qualified value shape, inlining value-level or property constraints
+/// from `PropertyShapeData` when the member is an anonymous shape.
 fn build_nested_shape(sid: &ShapeId, ps_map: &HashMap<ShapeId, PropertyShapeData>) -> NestedShape {
-    if let Some(ps_data) = ps_map.get(sid) {
-        if ps_data.path.is_none() {
-            // Anonymous shape with constraints but no sh:path — these are
-            // value-level constraints (e.g. sh:datatype on the value node).
-            let value_constraints = build_constraints_from_ps_data(ps_data);
-            return NestedShape {
-                id: sid.clone(),
-                property_constraints: Vec::new(),
-                node_constraints: Vec::new(),
-                value_constraints,
-            };
-        }
-        // Has sh:path — inline as a property constraint on the nested shape,
-        // carrying the compiled path AST (so complex paths on a nested member
-        // are evaluated, not scanned as a bare blank-node predicate).
-        let constraints = build_constraints_from_ps_data(ps_data);
-        return NestedShape {
-            id: sid.clone(),
-            property_constraints: vec![(resolved_path_of(ps_data), constraints)],
-            node_constraints: Vec::new(),
-            value_constraints: Vec::new(),
-        };
-    }
-    // Named shape reference — constraints will be resolved at validation time
-    NestedShape {
+    build_nested_shape_inner(sid, ps_map, &mut HashSet::new())
+}
+
+/// Recursive worker for [`build_nested_shape`]. `seen` holds the shape ids on
+/// the current inlining stack: a qualified-shape reference cycle between
+/// anonymous property shapes would otherwise inline forever. On re-entry the
+/// member is left bare, deferring to named-ref resolution at validation time
+/// (where the runtime recursion guard applies).
+fn build_nested_shape_inner(
+    sid: &ShapeId,
+    ps_map: &HashMap<ShapeId, PropertyShapeData>,
+    seen: &mut HashSet<ShapeId>,
+) -> NestedShape {
+    let bare = || NestedShape {
         id: sid.clone(),
         property_constraints: Vec::new(),
         node_constraints: Vec::new(),
         value_constraints: Vec::new(),
+    };
+    if !seen.insert(sid.clone()) {
+        return bare();
     }
+
+    let nested = if let Some(ps_data) = ps_map.get(sid) {
+        if ps_data.path.is_none() {
+            // Anonymous shape with constraints but no sh:path — these are
+            // value-level constraints (e.g. sh:datatype on the value node).
+            let value_constraints = build_constraints_from_ps_data(ps_data);
+            NestedShape {
+                id: sid.clone(),
+                property_constraints: Vec::new(),
+                node_constraints: Vec::new(),
+                value_constraints,
+            }
+        } else {
+            // Has sh:path — inline as a property constraint on the nested
+            // shape, carrying the compiled path AST (so complex paths on a
+            // nested member are evaluated, not scanned as a bare blank-node
+            // predicate).
+            let mut constraints = build_constraints_from_ps_data(ps_data);
+            if let Some(q) = qualified_constraint(ps_data, ps_map, seen) {
+                constraints.push(q);
+            }
+            NestedShape {
+                id: sid.clone(),
+                property_constraints: vec![(resolved_path_of(ps_data), constraints)],
+                node_constraints: Vec::new(),
+                value_constraints: Vec::new(),
+            }
+        }
+    } else {
+        // Named shape reference — constraints resolve at validation time.
+        bare()
+    };
+
+    seen.remove(sid);
+    nested
+}
+
+/// The `sh:qualifiedValueShape` constraint for a property shape, if declared.
+fn qualified_constraint(
+    ps_data: &PropertyShapeData,
+    ps_map: &HashMap<ShapeId, PropertyShapeData>,
+    seen: &mut HashSet<ShapeId>,
+) -> Option<Constraint> {
+    ps_data
+        .qualified_shape
+        .as_ref()
+        .map(|q_ref| Constraint::QualifiedValueShape {
+            shape: Arc::new(build_nested_shape_inner(q_ref, ps_map, seen)),
+            min_count: ps_data.qualified_min,
+            max_count: ps_data.qualified_max,
+        })
 }
 
 /// Build shape-based and logical `NodeConstraint`s (sh:node, sh:not, sh:and,

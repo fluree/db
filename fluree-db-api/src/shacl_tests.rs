@@ -3075,3 +3075,193 @@ async fn shacl_pattern_on_integer_literal() {
         .unwrap_err();
     assert_shacl_violation(err, "does not match pattern");
 }
+
+// ===========================================================================
+// sh:class / sh:qualifiedValueShape inside nested shapes
+// ===========================================================================
+
+/// `sh:class` inside an inline `sh:or` member was a silent no-op (the nested
+/// property-constraint loop skipped db-access constraints).
+#[tokio::test]
+async fn shacl_class_inside_or_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:OwnedShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Asset"},
+        "sh:or": [
+            {
+                "@id": "ex:or_owner_person",
+                "sh:path": {"@id": "ex:owner"},
+                "sh:minCount": 1,
+                "sh:class": {"@id": "ex:Person"}
+            }
+        ]
+    });
+
+    // Valid: owner is a Person.
+    let ledger_ok = fluree.create_ledger("shacl/orclass-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:asset1", "@type": "ex:Asset", "ex:owner": {"@id": "ex:alice"}},
+                    {"@id": "ex:alice", "@type": "ex:Person"}
+                ]
+            }),
+        )
+        .await
+        .expect("Person owner satisfies the sh:or member");
+
+    // Invalid: owner exists but is not a Person — pre-fix the sh:class check
+    // silently passed, so the member (and the sh:or) conformed.
+    let ledger_bad = fluree
+        .create_ledger("shacl/orclass-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:asset2", "@type": "ex:Asset", "ex:owner": {"@id": "ex:acme"}},
+                    {"@id": "ex:acme", "@type": "ex:Company"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:or");
+}
+
+/// `sh:qualifiedValueShape` on a property shape used as an `sh:or` member —
+/// nested members now count conforming values instead of silently no-oping.
+#[tokio::test]
+async fn shacl_qualified_inside_or_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@graph": [
+            {
+                "@id": "ex:BadgedShape2",
+                "@type": "sh:NodeShape",
+                "sh:property": [{
+                    "@id": "ex:pshape_badge2",
+                    "sh:path": {"@id": "ex:badge"},
+                    "sh:minCount": 1
+                }]
+            },
+            {
+                "@id": "ex:TeamShape2",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Squad"},
+                "sh:or": [{
+                    "@id": "ex:or_badged_member",
+                    "sh:path": {"@id": "ex:member"},
+                    "sh:qualifiedValueShape": {"@id": "ex:BadgedShape2"},
+                    "sh:qualifiedMinCount": 1
+                }]
+            }
+        ]
+    });
+
+    let ledger_ok = fluree.create_ledger("shacl/orqual-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:squadA", "@type": "ex:Squad", "ex:member": {"@id": "ex:sm1"}},
+                    {"@id": "ex:sm1", "ex:badge": "B-9"}
+                ]
+            }),
+        )
+        .await
+        .expect("badged member satisfies the qualified count in the sh:or member");
+
+    let ledger_bad = fluree.create_ledger("shacl/orqual-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:squadB", "@type": "ex:Squad", "ex:member": {"@id": "ex:sm2"}},
+                    {"@id": "ex:sm2", "ex:role": "guest"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:or");
+}
+
+/// `sh:node` with an inline anonymous value shape carrying `sh:class`: the
+/// value must be an instance of the class (needs db access in the
+/// value-constraint path).
+#[tokio::test]
+async fn shacl_node_inline_class_value_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:CuratedShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Exhibit"},
+        "sh:property": [{
+            "@id": "ex:pshape_artifact",
+            "sh:path": {"@id": "ex:artifact"},
+            "sh:node": {"@id": "ex:anon_artifact_class", "sh:class": {"@id": "ex:Artifact"}}
+        }]
+    });
+
+    let ledger_ok = fluree
+        .create_ledger("shacl/nodeclass-ok:main")
+        .await
+        .unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:ex1", "@type": "ex:Exhibit", "ex:artifact": {"@id": "ex:vase"}},
+                    {"@id": "ex:vase", "@type": "ex:Artifact"}
+                ]
+            }),
+        )
+        .await
+        .expect("artifact typed ex:Artifact conforms to the inline sh:node class shape");
+
+    let ledger_bad = fluree
+        .create_ledger("shacl/nodeclass-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:ex2", "@type": "ex:Exhibit", "ex:artifact": {"@id": "ex:rock"}},
+                    {"@id": "ex:rock", "@type": "ex:Pebble"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:node");
+}
