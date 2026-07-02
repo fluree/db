@@ -3265,3 +3265,144 @@ async fn shacl_node_inline_class_value_shape() {
         .unwrap_err();
     assert_shacl_violation(err, "sh:node");
 }
+
+// ===========================================================================
+// Language constraints (sh:languageIn, sh:uniqueLang)
+// ===========================================================================
+
+/// `sh:languageIn` — labels must carry a language tag matching one of the
+/// allowed basic ranges ("en" also matches "en-US").
+#[tokio::test]
+async fn shacl_language_in() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:LabelShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Labeled"},
+        "sh:property": [{
+            "@id": "ex:pshape_lang_label",
+            "sh:path": {"@id": "ex:label"},
+            "sh:languageIn": ["en", "fr"]
+        }]
+    });
+
+    // Valid: en, fr, and en-US (basic language-range match) labels.
+    let ledger_ok = fluree.create_ledger("shacl/langin-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:thing1",
+                "@type": "ex:Labeled",
+                "ex:label": [
+                    {"@value": "colour", "@language": "en"},
+                    {"@value": "couleur", "@language": "fr"},
+                    {"@value": "color", "@language": "en-US"}
+                ]
+            }),
+        )
+        .await
+        .expect("en / fr / en-US labels are all within sh:languageIn (en fr)");
+
+    // Invalid: a German label.
+    let ledger_bad = fluree.create_ledger("shacl/langin-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:thing2",
+                "@type": "ex:Labeled",
+                "ex:label": {"@value": "Farbe", "@language": "de"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "not in the allowed set");
+
+    // Invalid: a plain (untagged) string.
+    let ledger_plain = fluree
+        .create_ledger("shacl/langin-plain:main")
+        .await
+        .unwrap();
+    let ledger_plain = fluree
+        .upsert(ledger_plain, &shape_txn)
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .upsert(
+            ledger_plain,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:thing3",
+                "@type": "ex:Labeled",
+                "ex:label": "no language"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "no language tag");
+}
+
+/// `sh:uniqueLang` — no two values of the property may share a language tag.
+#[tokio::test]
+async fn shacl_unique_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UniqueLabelShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Translated"},
+        "sh:property": [{
+            "@id": "ex:pshape_unique_label",
+            "sh:path": {"@id": "ex:label"},
+            "sh:uniqueLang": true
+        }]
+    });
+
+    // Valid: one label per language.
+    let ledger_ok = fluree.create_ledger("shacl/uniq-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc1",
+                "@type": "ex:Translated",
+                "ex:label": [
+                    {"@value": "colour", "@language": "en"},
+                    {"@value": "couleur", "@language": "fr"}
+                ]
+            }),
+        )
+        .await
+        .expect("distinct language tags satisfy sh:uniqueLang");
+
+    // Invalid: two English labels.
+    let ledger_bad = fluree.create_ledger("shacl/uniq-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc2",
+                "@type": "ex:Translated",
+                "ex:label": [
+                    {"@value": "colour", "@language": "en"},
+                    {"@value": "color", "@language": "en"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "more than one value");
+}

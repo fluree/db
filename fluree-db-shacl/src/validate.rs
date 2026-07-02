@@ -7,6 +7,7 @@ use crate::cache::{ShaclCache, ShaclCacheKey};
 use crate::compile::{CompiledShape, PropertyShape, Severity, ShapeCompiler, ShapeId, TargetType};
 use crate::constraints::cardinality::{validate_max_count, validate_min_count};
 use crate::constraints::datatype::{validate_datatype, validate_node_kind};
+use crate::constraints::lang::{validate_language_in, validate_unique_lang};
 use crate::constraints::pattern::{validate_max_length, validate_min_length, validate_pattern};
 use crate::constraints::value::{
     validate_has_value, validate_in, validate_max_exclusive, validate_max_inclusive,
@@ -712,7 +713,7 @@ async fn validate_node_value_constraints<'a>(
                 }
             }
             _ => {
-                for violation in validate_constraint(constraint, &values, &datatypes)? {
+                for violation in validate_constraint(constraint, &values, &datatypes, &[None])? {
                     push(violation, &mut results);
                 }
             }
@@ -1069,7 +1070,7 @@ fn validate_nested_shape<'a>(
 
             // Value nodes reached by the member's path. Simple predicate → SPOT
             // scan; complex path → evaluate the AST (same as top-level shapes).
-            let (values, datatypes): (Vec<FlakeValue>, Vec<Sid>) =
+            let (values, datatypes, langs): (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) =
                 if let Some(pred) = path.as_predicate() {
                     let flakes = db
                         .range(
@@ -1081,12 +1082,15 @@ fn validate_nested_shape<'a>(
                     (
                         flakes.iter().map(|f| f.o.clone()).collect(),
                         flakes.iter().map(|f| f.dt.clone()).collect(),
+                        flakes
+                            .iter()
+                            .map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
+                            .collect(),
                     )
                 } else {
-                    crate::path::eval_path(db, focus_node, path)
-                        .await?
-                        .into_iter()
-                        .unzip()
+                    crate::path::split_path_values(
+                        crate::path::eval_path(db, focus_node, path).await?,
+                    )
                 };
 
             let result_path = path.as_predicate().cloned();
@@ -1159,6 +1163,7 @@ fn validate_nested_shape<'a>(
                                 db,
                                 value,
                                 datatypes.get(i),
+                                langs.get(i).and_then(|l| l.as_deref()),
                                 shape,
                                 parent_shape,
                                 all_shapes,
@@ -1192,7 +1197,8 @@ fn validate_nested_shape<'a>(
                         }
                     }
                     _ => {
-                        let violations = validate_constraint(constraint, &values, &datatypes)?;
+                        let violations =
+                            validate_constraint(constraint, &values, &datatypes, &langs)?;
                         for violation in violations {
                             results.push(ValidationResult {
                                 focus_node: focus_node.clone(),
@@ -1260,8 +1266,9 @@ async fn validate_property_shape<'a>(
 
     // Get all value nodes reached by this property shape's path on the focus node.
     // Simple single-predicate paths take the plain SPOT scan; complex paths
-    // (inverse/sequence/alternative/transitive) evaluate the path AST.
-    let (values, datatypes): (Vec<FlakeValue>, Vec<Sid>) =
+    // (inverse/sequence/alternative/transitive) evaluate the path AST. The
+    // language column feeds sh:uniqueLang / sh:languageIn.
+    let (values, datatypes, langs): (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) =
         if let Some(pred) = prop_shape.path.as_predicate() {
             let flakes = db
                 .range(
@@ -1273,12 +1280,15 @@ async fn validate_property_shape<'a>(
             (
                 flakes.iter().map(|f| f.o.clone()).collect(),
                 flakes.iter().map(|f| f.dt.clone()).collect(),
+                flakes
+                    .iter()
+                    .map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
+                    .collect(),
             )
         } else {
-            crate::path::eval_path(db, focus_node, &prop_shape.path)
-                .await?
-                .into_iter()
-                .unzip()
+            crate::path::split_path_values(
+                crate::path::eval_path(db, focus_node, &prop_shape.path).await?,
+            )
         };
 
     // Validate each constraint
@@ -1346,6 +1356,7 @@ async fn validate_property_shape<'a>(
                         db,
                         value,
                         datatypes.get(i),
+                        langs.get(i).and_then(|l| l.as_deref()),
                         shape,
                         parent_shape,
                         all_shapes,
@@ -1390,7 +1401,7 @@ async fn validate_property_shape<'a>(
             }
             _ => {
                 // Handle other constraints
-                let violations = validate_constraint(constraint, &values, &datatypes)?;
+                let violations = validate_constraint(constraint, &values, &datatypes, &langs)?;
 
                 for violation in violations {
                     results.push(ValidationResult {
@@ -1416,6 +1427,7 @@ async fn validate_property_shape<'a>(
             focus_node,
             &values,
             &datatypes,
+            &langs,
             structural,
             prop_shape,
             parent_shape,
@@ -1441,6 +1453,7 @@ async fn validate_property_value_structural_constraint<'a>(
     focus_node: &Sid,
     values: &[FlakeValue],
     datatypes: &[Sid],
+    langs: &[Option<String>],
     constraint: &'a NodeConstraint,
     prop_shape: &PropertyShape,
     parent_shape: &'a CompiledShape,
@@ -1463,6 +1476,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         db,
                         value,
                         dt,
+                        langs.get(i).and_then(|l| l.as_deref()),
                         nested,
                         parent_shape,
                         all_shapes,
@@ -1507,6 +1521,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         db,
                         value,
                         dt,
+                        langs.get(i).and_then(|l| l.as_deref()),
                         nested,
                         parent_shape,
                         all_shapes,
@@ -1546,6 +1561,7 @@ async fn validate_property_value_structural_constraint<'a>(
                         db,
                         value,
                         dt,
+                        langs.get(i).and_then(|l| l.as_deref()),
                         nested,
                         parent_shape,
                         all_shapes,
@@ -1598,6 +1614,7 @@ async fn validate_property_value_structural_constraint<'a>(
                     db,
                     value,
                     dt,
+                    langs.get(i).and_then(|l| l.as_deref()),
                     nested,
                     parent_shape,
                     all_shapes,
@@ -1633,6 +1650,7 @@ async fn validate_property_value_structural_constraint<'a>(
                     db,
                     value,
                     dt,
+                    langs.get(i).and_then(|l| l.as_deref()),
                     nested,
                     parent_shape,
                     all_shapes,
@@ -1680,6 +1698,7 @@ async fn check_value_against_nested_shape<'a>(
     db: GraphDbRef<'a>,
     value: &FlakeValue,
     datatype: Option<&Sid>,
+    lang: Option<&str>,
     nested: &'a NestedShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
@@ -1713,10 +1732,12 @@ async fn check_value_against_nested_shape<'a>(
             }
             None => &[],
         };
+        let lang_arr = [lang.map(str::to_string)];
         let violations = validate_constraint_set(
             &nested.value_constraints,
             std::slice::from_ref(value),
             dt_slice,
+            &lang_arr,
         )?;
         return Ok(violations.is_empty());
     }
@@ -1742,10 +1763,11 @@ fn validate_constraint_set(
     constraints: &[Constraint],
     values: &[FlakeValue],
     datatypes: &[Sid],
+    langs: &[Option<String>],
 ) -> Result<Vec<ConstraintViolation>> {
     let mut all_violations = Vec::new();
     for constraint in constraints {
-        let violations = validate_constraint(constraint, values, datatypes)?;
+        let violations = validate_constraint(constraint, values, datatypes, langs)?;
         all_violations.extend(violations);
     }
     Ok(all_violations)
@@ -1756,6 +1778,7 @@ fn validate_constraint(
     constraint: &Constraint,
     values: &[FlakeValue],
     datatypes: &[Sid],
+    langs: &[Option<String>],
 ) -> Result<Vec<ConstraintViolation>> {
     let mut violations = Vec::new();
 
@@ -1866,17 +1889,19 @@ fn validate_constraint(
         | Constraint::LessThan(_)
         | Constraint::LessThanOrEquals(_) => {}
 
-        // Language constraints
-        // Note: Language tags are stored in the flake's datatype field (rdf:langString)
-        // with the language as a separate attribute. Full validation requires access to
-        // language metadata which is not available in this simplified validation path.
-        Constraint::UniqueLang(_unique) => {
-            // TODO: Implement when language metadata is available
-            // Requires checking the language tag from flake metadata, not FlakeValue
+        // Language constraints (tags come from flake metadata via `langs`)
+        Constraint::UniqueLang(unique) => {
+            if *unique {
+                violations.extend(validate_unique_lang(values, langs));
+            }
         }
-        Constraint::LanguageIn(_allowed_langs) => {
-            // TODO: Implement when language metadata is available
-            // Requires checking the language tag from flake metadata, not FlakeValue
+        Constraint::LanguageIn(allowed) => {
+            for (i, value) in values.iter().enumerate() {
+                let lang = langs.get(i).and_then(|l| l.as_deref());
+                if let Some(v) = validate_language_in(value, lang, allowed) {
+                    violations.push(v);
+                }
+            }
         }
 
         // Qualified value shape needs db access for nested-shape conformance

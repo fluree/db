@@ -50,9 +50,25 @@ pub enum PropertyPath {
     Unresolvable(String),
 }
 
-/// A value node reached by a path: `(value, datatype)`, mirroring a flake's
-/// object + datatype columns.
-pub type PathValue = (FlakeValue, Sid);
+/// A value node reached by a path: `(value, datatype, language tag)`,
+/// mirroring a flake's object, datatype, and metadata language columns.
+pub type PathValue = (FlakeValue, Sid, Option<String>);
+
+/// Split path values into the parallel `(values, datatypes, langs)` columns
+/// the constraint validators consume.
+pub fn split_path_values(
+    values: Vec<PathValue>,
+) -> (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) {
+    let mut vs = Vec::with_capacity(values.len());
+    let mut dts = Vec::with_capacity(values.len());
+    let mut langs = Vec::with_capacity(values.len());
+    for (v, dt, lang) in values {
+        vs.push(v);
+        dts.push(dt);
+        langs.push(lang);
+    }
+    (vs, dts, langs)
+}
 
 /// Boxed future returned by the recursive async path helpers.
 type PathFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -296,8 +312,8 @@ async fn ordered_objects(
 }
 
 /// Evaluate a property path from `focus`, returning the reached value nodes as
-/// `(value, datatype)` pairs — the direct analogue of the objects of a single
-/// `SPOT` scan for a simple predicate.
+/// `(value, datatype, language)` tuples — the direct analogue of the objects
+/// of a single `SPOT` scan for a simple predicate.
 pub fn eval_path<'a>(
     db: GraphDbRef<'a>,
     focus: &'a Sid,
@@ -316,13 +332,13 @@ pub fn eval_path<'a>(
                 Ok(dedup(out))
             }
             PropertyPath::ZeroOrMore(inner) => {
-                let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid())];
+                let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid(), None)];
                 out.extend(closure(db, focus, inner).await?);
                 Ok(dedup(out))
             }
             PropertyPath::OneOrMore(inner) => Ok(dedup(closure(db, focus, inner).await?)),
             PropertyPath::ZeroOrOne(inner) => {
-                let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid())];
+                let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid(), None)];
                 out.extend(eval_path(db, focus, inner).await?);
                 Ok(dedup(out))
             }
@@ -334,7 +350,7 @@ pub fn eval_path<'a>(
 }
 
 /// Forward single-predicate step: objects of `(focus, p, ?)`.
-async fn forward_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<(FlakeValue, Sid)>> {
+async fn forward_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<PathValue>> {
     let flakes = db
         .range(
             IndexType::Spot,
@@ -342,11 +358,20 @@ async fn forward_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<(F
             RangeMatch::subject_predicate(focus.clone(), p.clone()),
         )
         .await?;
-    Ok(flakes.iter().map(|f| (f.o.clone(), f.dt.clone())).collect())
+    Ok(flakes
+        .iter()
+        .map(|f| {
+            (
+                f.o.clone(),
+                f.dt.clone(),
+                f.m.as_ref().and_then(|m| m.lang.clone()),
+            )
+        })
+        .collect())
 }
 
 /// Inverse single-predicate step: subjects of `(?, p, focus)`.
-async fn inverse_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<(FlakeValue, Sid)>> {
+async fn inverse_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<PathValue>> {
     let flakes = db
         .range(
             IndexType::Opst,
@@ -356,7 +381,7 @@ async fn inverse_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<(F
         .await?;
     Ok(flakes
         .iter()
-        .map(|f| (FlakeValue::Ref(f.s.clone()), id_datatype_sid()))
+        .map(|f| (FlakeValue::Ref(f.s.clone()), id_datatype_sid(), None))
         .collect())
 }
 
@@ -366,12 +391,12 @@ async fn eval_sequence(
     db: GraphDbRef<'_>,
     focus: &Sid,
     steps: &[PropertyPath],
-) -> Result<Vec<(FlakeValue, Sid)>> {
+) -> Result<Vec<PathValue>> {
     let mut frontier: Vec<Sid> = vec![focus.clone()];
 
     for (i, step) in steps.iter().enumerate() {
         let is_last = i + 1 == steps.len();
-        let mut reached: Vec<(FlakeValue, Sid)> = Vec::new();
+        let mut reached: Vec<PathValue> = Vec::new();
         for node in &frontier {
             reached.extend(eval_path(db, node, step).await?);
         }
@@ -382,7 +407,7 @@ async fn eval_sequence(
         }
         frontier = reached
             .into_iter()
-            .filter_map(|(v, _)| match v {
+            .filter_map(|(v, _, _)| match v {
                 FlakeValue::Ref(sid) => Some(sid),
                 _ => None,
             })
@@ -398,33 +423,29 @@ async fn eval_sequence(
 
 /// Transitive closure of `inner` from `focus` (one or more steps), BFS over the
 /// reference nodes reached. Non-reference values are terminal value nodes.
-async fn closure(
-    db: GraphDbRef<'_>,
-    focus: &Sid,
-    inner: &PropertyPath,
-) -> Result<Vec<(FlakeValue, Sid)>> {
-    let mut out: Vec<(FlakeValue, Sid)> = Vec::new();
+async fn closure(db: GraphDbRef<'_>, focus: &Sid, inner: &PropertyPath) -> Result<Vec<PathValue>> {
+    let mut out: Vec<PathValue> = Vec::new();
     // Seed `visited` with the focus so a cycle back to it isn't re-expanded.
     let mut visited: HashSet<Sid> = HashSet::from([focus.clone()]);
     let mut queue: Vec<Sid> = vec![focus.clone()];
 
     while let Some(node) = queue.pop() {
-        for (value, dt) in eval_path(db, &node, inner).await? {
+        for (value, dt, lang) in eval_path(db, &node, inner).await? {
             if let FlakeValue::Ref(sid) = &value {
                 if visited.insert(sid.clone()) {
                     queue.push(sid.clone());
                 }
             }
-            out.push((value, dt));
+            out.push((value, dt, lang));
         }
     }
     Ok(dedup(out))
 }
 
 /// Deduplicate value nodes (SHACL value nodes are a set).
-fn dedup(mut values: Vec<(FlakeValue, Sid)>) -> Vec<(FlakeValue, Sid)> {
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-    values.retain(|(v, dt)| seen.insert((format!("{v:?}"), format!("{dt:?}"))));
+fn dedup(mut values: Vec<PathValue>) -> Vec<PathValue> {
+    let mut seen: HashSet<String> = HashSet::new();
+    values.retain(|(v, dt, lang)| seen.insert(format!("{v:?}|{dt:?}|{lang:?}")));
     values
 }
 

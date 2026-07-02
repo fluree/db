@@ -157,6 +157,9 @@ struct PropertyShapeData {
     pattern_string: Option<String>,
     /// sh:in list values (accumulated from RDF list traversal)
     in_values: Vec<FlakeValue>,
+    /// sh:languageIn values (String tags from JSON-LD @list flattening, or a
+    /// single Ref to a Turtle RDF-list head expanded in expand_rdf_lists)
+    language_in_values: Vec<FlakeValue>,
     /// sh:deactivated — a deactivated property shape is skipped entirely
     deactivated: bool,
     /// sh:qualifiedValueShape — reference to the shape conforming values are
@@ -383,11 +386,18 @@ impl ShapeCompiler {
         // If in_values contains a single Ref, it might be an RDF list head that needs expansion
         let mut in_list_expansions: Vec<(Sid, Sid)> = Vec::new(); // (property_shape_id, list_head)
 
+        let mut lang_list_expansions: Vec<(Sid, Sid)> = Vec::new();
         for (ps_id, ps_data) in &self.property_shapes {
             // Check if in_values has a single Ref value (potential RDF list head)
             if ps_data.in_values.len() == 1 {
                 if let FlakeValue::Ref(list_head) = &ps_data.in_values[0] {
                     in_list_expansions.push((ps_id.clone(), list_head.clone()));
+                }
+            }
+            // Same Turtle encoding for sh:languageIn.
+            if ps_data.language_in_values.len() == 1 {
+                if let FlakeValue::Ref(list_head) = &ps_data.language_in_values[0] {
+                    lang_list_expansions.push((ps_id.clone(), list_head.clone()));
                 }
             }
         }
@@ -399,6 +409,14 @@ impl ShapeCompiler {
                 if let Some(ps_data) = self.property_shapes.get_mut(&ps_id) {
                     // Replace the single Ref with the expanded values
                     ps_data.in_values = values;
+                }
+            }
+        }
+        for (ps_id, list_head) in lang_list_expansions {
+            let values = traverse_rdf_list(db, &list_head, &rdf_first, &rdf_rest, &rdf_nil).await?;
+            if !values.is_empty() {
+                if let Some(ps_data) = self.property_shapes.get_mut(&ps_id) {
+                    ps_data.language_in_values = values;
                 }
             }
         }
@@ -699,13 +717,9 @@ impl ShapeCompiler {
                 }
             }
             name if name == predicates::LANGUAGE_IN => {
-                // Points to an RDF list of language tags - simplified for now
-                if let FlakeValue::String(lang) = &flake.o {
-                    self.add_property_constraint(
-                        &flake.s,
-                        Constraint::LanguageIn(vec![lang.clone()]),
-                    );
-                }
+                self.get_or_create_property_shape(&flake.s)
+                    .language_in_values
+                    .push(flake.o.clone());
             }
 
             // Shape-based constraints
@@ -938,6 +952,21 @@ fn build_constraints_from_ps_data(ps_data: &PropertyShapeData) -> Vec<Constraint
             // Skip In constraints — will be replaced with expanded values below
             Constraint::In(_) => {}
             other => constraints.push(other.clone()),
+        }
+    }
+
+    // Add LanguageIn with all accumulated tags (one constraint, not one per tag)
+    if !ps_data.language_in_values.is_empty() {
+        let langs: Vec<String> = ps_data
+            .language_in_values
+            .iter()
+            .filter_map(|v| match v {
+                FlakeValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        if !langs.is_empty() {
+            constraints.push(Constraint::LanguageIn(langs));
         }
     }
 

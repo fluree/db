@@ -202,6 +202,23 @@ ex:UserShape a sh:NodeShape ;
 
 `sh:pattern` accepts an optional `sh:flags` string (e.g. `"i"` for case-insensitive).
 
+### Language constraints
+
+`sh:languageIn` restricts values to language-tagged literals whose tag matches
+one of the given basic language ranges (`"en"` also matches `"en-US"`, per
+SPARQL `langMatches`); untagged values violate. `sh:uniqueLang true` forbids
+two values of the property from sharing a language tag.
+
+```turtle
+ex:LabelShape a sh:NodeShape ;
+  sh:targetClass ex:Labeled ;
+  sh:property [
+    sh:path ex:label ;
+    sh:languageIn ( "en" "fr" ) ;
+    sh:uniqueLang true
+  ] .
+```
+
 ### Node kind
 
 ```turtle
@@ -570,9 +587,6 @@ All three routes go through the same post-stage helper, so the ledger's configur
 
 ## Not yet supported
 
-The following SHACL constructs are parsed/compiled but currently **no-ops** at validation time. Shapes using them load without error but don't constrain data:
-
-- `sh:uniqueLang`, `sh:languageIn` — require language-tag metadata on flakes, which isn't yet threaded through the validation path.
 - `sh:qualifiedValueShapesDisjoint` — sibling-shape disjointness for qualified value shapes (the counting form of `sh:qualifiedValueShape` is supported).
 
 These are tracked in the SHACL compliance effort.

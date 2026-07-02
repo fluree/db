@@ -5,6 +5,7 @@
 
 pub mod cardinality;
 pub mod datatype;
+pub mod lang;
 pub mod pair;
 pub mod pattern;
 pub mod value;

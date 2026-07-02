@@ -22,6 +22,8 @@
 //! - Value: `sh:hasValue`, `sh:in`
 //! - Closed: `sh:closed`, `sh:ignoredProperties`
 //! - Pair: `sh:equals`, `sh:disjoint`, `sh:lessThan`, `sh:lessThanOrEquals`
+//! - Language: `sh:uniqueLang`, `sh:languageIn` (basic language-range matching
+//!   per SPARQL `langMatches`; tags come from flake metadata)
 //! - Logical: `sh:not`, `sh:and`, `sh:or`, `sh:xone`
 //! - Shape-based: `sh:node` — on a property shape each value node must conform
 //!   to the referenced node shape; on a node shape the focus node itself must.
@@ -69,13 +71,6 @@
 //!
 //! # Not Yet Supported
 //!
-//! The following constraints are parsed/compiled but are **not enforced** at
-//! validation time. Shapes using these will load without error but their
-//! constraints will silently pass. Plan to fix under the SHACL compliance
-//! effort tracked in the repo.
-//!
-//! - `sh:uniqueLang`, `sh:languageIn` — require access to language-tag metadata
-//!   on flakes, which is not yet threaded through the validation path.
 //! - `sh:qualifiedValueShapesDisjoint` — sibling-shape disjointness for
 //!   qualified value shapes (the counting form of `sh:qualifiedValueShape` is
 //!   supported).
