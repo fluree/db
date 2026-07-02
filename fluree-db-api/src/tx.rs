@@ -366,7 +366,7 @@ async fn resolve_cross_ledger_shapes_for_tx(
 /// same mechanism — schema, policy, and SHACL shapes can live in any graph
 /// the ledger knows about, including the config graph itself.
 #[cfg(feature = "shacl")]
-fn resolve_shapes_source_g_ids(
+pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {

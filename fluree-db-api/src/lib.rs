@@ -83,6 +83,8 @@ pub mod server_defaults;
 mod time_resolve;
 pub mod tx;
 pub mod tx_builder;
+#[cfg(feature = "shacl")]
+pub mod validate;
 #[cfg(feature = "vector")]
 pub mod vector_worker;
 pub mod view;

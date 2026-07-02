@@ -57,6 +57,28 @@ pub(crate) fn parse_inline_shapes_to_bundle(
         TransactError::Parse(format!("inline shapes JSON-LD event conversion error: {e}"))
     })?;
 
+    bundle_from_sink(sink)
+}
+
+/// Parse a Turtle inline shapes document into a `SchemaBundleFlakes`.
+///
+/// Turtle counterpart of [`parse_inline_shapes_to_bundle`]; `@prefix`
+/// declarations register through the sink's `on_prefix` events, so no
+/// separate prefix pre-registration pass is needed.
+pub(crate) fn parse_inline_shapes_turtle_to_bundle(
+    turtle: &str,
+    staged_ns: &mut NamespaceRegistry,
+    t: i64,
+    ledger_id: &str,
+) -> Result<Option<Arc<SchemaBundleFlakes>>, TransactError> {
+    let txn_id = format!("inline-shapes-{ledger_id}-{t}");
+    let mut sink = FlakeSink::new(staged_ns, t, txn_id);
+    fluree_graph_turtle::parse(turtle, &mut sink)
+        .map_err(|e| TransactError::Parse(format!("inline shapes Turtle parse error: {e}")))?;
+    bundle_from_sink(sink)
+}
+
+fn bundle_from_sink(sink: FlakeSink<'_>) -> Result<Option<Arc<SchemaBundleFlakes>>, TransactError> {
     let flakes: Vec<Flake> = sink.finish()?;
     if flakes.is_empty() {
         return Ok(None);

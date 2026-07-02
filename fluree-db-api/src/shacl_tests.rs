@@ -3849,3 +3849,287 @@ async fn shacl_inverse_of_sequence_path() {
         .unwrap_err();
     assert_shacl_violation(err, "at least 1");
 }
+
+// ============================================================
+// Validation reports (fluree validate core — crate::validate)
+// ============================================================
+
+#[tokio::test]
+async fn validate_report_attached_shapes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/validate-report:main")
+        .await
+        .unwrap();
+    // Data first (no shapes yet, so staging enforcement doesn't run), then
+    // the shape — leaving the ledger in a non-conforming state that only a
+    // full-state validation pass can surface.
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:nameless",
+                "@type": "ex:User",
+                "schema:email": "nameless@example.org"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:UserShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:User"},
+                "sh:property": [{
+                    "@id": "ex:vr-name-ps",
+                    "sh:path": {"@id": "schema:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+    let options = crate::validate::ValidateOptions::default();
+    let report = crate::validate::validate_view(&view, "shacl/validate-report:main", &options)
+        .await
+        .unwrap();
+
+    assert!(!report.conforms);
+    assert_eq!(report.violation_count(), 1);
+    assert!(report.shape_count >= 1);
+    let result = &report.results[0];
+    assert_eq!(result.focus_node, "http://example.org/ns/nameless");
+    assert_eq!(
+        result.result_path.as_deref(),
+        Some("http://schema.org/name")
+    );
+    assert_eq!(
+        result.constraint_component,
+        "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+    );
+    assert_eq!(result.severity, "http://www.w3.org/ns/shacl#Violation");
+
+    let doc = report.to_jsonld();
+    assert_eq!(doc["sh:conforms"], json!(false));
+    let results = doc["sh:result"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["sh:sourceConstraintComponent"]["@id"],
+        json!("sh:MinCountConstraintComponent")
+    );
+    assert_eq!(
+        results[0]["sh:focusNode"]["@id"],
+        json!("http://example.org/ns/nameless")
+    );
+}
+
+#[tokio::test]
+async fn validate_report_conforming_state() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/validate-conforms:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:UserShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:User"},
+                "sh:property": [{
+                    "@id": "ex:vc-name-ps",
+                    "sh:path": {"@id": "schema:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:alice",
+                "@type": "ex:User",
+                "schema:name": "Alice"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+    let options = crate::validate::ValidateOptions::default();
+    let report = crate::validate::validate_view(&view, "shacl/validate-conforms:main", &options)
+        .await
+        .unwrap();
+    assert!(report.conforms);
+    assert!(report.results.is_empty());
+    assert!(report.shape_count >= 1);
+}
+
+#[tokio::test]
+async fn validate_report_inline_turtle_replaces_attached() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/validate-inline:main")
+        .await
+        .unwrap();
+    // Non-conforming against the ATTACHED shape (missing schema:name),
+    // conforming against the inline shape (has schema:email).
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bob",
+                "@type": "ex:User",
+                "schema:email": "bob@example.org"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:NameShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:User"},
+                "sh:property": [{
+                    "@id": "ex:vi-name-ps",
+                    "sh:path": {"@id": "schema:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+
+    let email_shapes_turtle = r#"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix schema: <http://schema.org/> .
+        @prefix ex: <http://example.org/ns/> .
+        ex:EmailShape a sh:NodeShape ;
+            sh:targetClass ex:User ;
+            sh:property [ sh:path schema:email ; sh:minCount 1 ] .
+    "#;
+
+    // Replace (default): only the inline shape runs — bob conforms.
+    let options = crate::validate::ValidateOptions {
+        shapes: crate::validate::ShapesSource::InlineTurtle(email_shapes_turtle.to_string()),
+        ..Default::default()
+    };
+    let report = crate::validate::validate_view(&view, "shacl/validate-inline:main", &options)
+        .await
+        .unwrap();
+    assert!(
+        report.conforms,
+        "inline shapes must REPLACE attached shapes by default: {:?}",
+        report.results
+    );
+
+    // include_attached: union — the attached name shape now fires.
+    let options = crate::validate::ValidateOptions {
+        shapes: crate::validate::ShapesSource::InlineTurtle(email_shapes_turtle.to_string()),
+        include_attached: true,
+        ..Default::default()
+    };
+    let report = crate::validate::validate_view(&view, "shacl/validate-inline:main", &options)
+        .await
+        .unwrap();
+    assert!(!report.conforms);
+    assert_eq!(report.violation_count(), 1);
+    assert_eq!(
+        report.results[0].result_path.as_deref(),
+        Some("http://schema.org/name")
+    );
+}
+
+#[tokio::test]
+async fn validate_report_inline_jsonld_shapes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/validate-inline-jsonld:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:carol",
+                "@type": "ex:User",
+                "schema:name": "Carol"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+
+    let shapes_doc = json!({
+        "@context": context.clone(),
+        "@id": "ex:EmailShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{
+            "@id": "ex:vj-email-ps",
+            "sh:path": {"@id": "schema:email"},
+            "sh:minCount": 1
+        }]
+    });
+    let options = crate::validate::ValidateOptions {
+        shapes: crate::validate::ShapesSource::InlineJsonLd(shapes_doc),
+        ..Default::default()
+    };
+    let report =
+        crate::validate::validate_view(&view, "shacl/validate-inline-jsonld:main", &options)
+            .await
+            .unwrap();
+    assert!(!report.conforms);
+    assert_eq!(report.violation_count(), 1);
+    assert_eq!(report.results[0].focus_node, "http://example.org/ns/carol");
+    assert_eq!(
+        report.results[0].constraint_component,
+        "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+    );
+}
+
+#[tokio::test]
+async fn validate_report_unknown_graph_is_not_found() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("shacl/validate-nograph:main")
+        .await
+        .unwrap();
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+    let options = crate::validate::ValidateOptions {
+        graph: Some("http://example.org/graphs/missing".to_string()),
+        ..Default::default()
+    };
+    let err = crate::validate::validate_view(&view, "shacl/validate-nograph:main", &options)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
+}
