@@ -1126,10 +1126,12 @@ fn validate_nested_shape<'a>(
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
-                                message: format!(
-                                    "Value set for {} does not equal value set for {}",
-                                    path_label, target_prop.name
-                                ),
+                                message: nested.message.clone().unwrap_or_else(|| {
+                                    format!(
+                                        "Value set for {} does not equal value set for {}",
+                                        path_label, target_prop.name
+                                    )
+                                }),
                                 value: None,
                                 graph_id: None,
                             });
@@ -1146,7 +1148,7 @@ fn validate_nested_shape<'a>(
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
-                                message: violation.message,
+                                message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
                                 graph_id: None,
                             });
@@ -1184,13 +1186,15 @@ fn validate_nested_shape<'a>(
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
-                                message: format!(
-                                    "Found {} value(s) conforming to shape {} (expected {}..{})",
-                                    conforming,
-                                    shape.id.name,
-                                    min_count.map_or_else(|| "0".into(), |n| n.to_string()),
-                                    max_count.map_or_else(|| "*".into(), |n| n.to_string()),
-                                ),
+                                message: nested.message.clone().unwrap_or_else(|| {
+                                    format!(
+                                        "Found {} value(s) conforming to shape {} (expected {}..{})",
+                                        conforming,
+                                        shape.id.name,
+                                        min_count.map_or_else(|| "0".into(), |n| n.to_string()),
+                                        max_count.map_or_else(|| "*".into(), |n| n.to_string()),
+                                    )
+                                }),
                                 value: None,
                                 graph_id: None,
                             });
@@ -1211,7 +1215,7 @@ fn validate_nested_shape<'a>(
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
-                                message: violation.message,
+                                message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
                                 graph_id: None,
                             });
@@ -1227,7 +1231,7 @@ fn validate_nested_shape<'a>(
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
-                                message: violation.message,
+                                message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
                                 graph_id: None,
                             });

@@ -3497,3 +3497,38 @@ async fn shacl_pattern_on_iri_values() {
         .unwrap_err();
     assert_shacl_violation(err, "Pattern constraint");
 }
+
+/// `sh:message` on an anonymous member inside a logical constraint surfaces in
+/// the violation (via the sh:and wrapper here).
+#[tokio::test]
+async fn shacl_custom_message_on_nested_member() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:CheckedShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Checked"},
+        "sh:and": [{
+            "@id": "ex:and_member_code",
+            "sh:path": {"@id": "ex:code"},
+            "sh:minCount": 1,
+            "sh:message": "A Checked record always needs a code"
+        }]
+    });
+
+    let ledger = fluree.create_ledger("shacl/nestmsg:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:rec1",
+                "@type": "ex:Checked"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "A Checked record always needs a code");
+}

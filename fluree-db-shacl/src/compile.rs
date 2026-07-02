@@ -1028,6 +1028,7 @@ fn build_nested_shape_inner(
         property_constraints: Vec::new(),
         node_constraints: Vec::new(),
         value_constraints: Vec::new(),
+        message: None,
     };
     if !seen.insert(sid.clone()) {
         return bare();
@@ -1043,6 +1044,7 @@ fn build_nested_shape_inner(
                 property_constraints: Vec::new(),
                 node_constraints: Vec::new(),
                 value_constraints,
+                message: ps_data.message.clone(),
             }
         } else {
             // Has sh:path — inline as a property constraint on the nested
@@ -1058,6 +1060,7 @@ fn build_nested_shape_inner(
                 property_constraints: vec![(resolved_path_of(ps_data), constraints)],
                 node_constraints: Vec::new(),
                 value_constraints: Vec::new(),
+                message: ps_data.message.clone(),
             }
         }
     } else {

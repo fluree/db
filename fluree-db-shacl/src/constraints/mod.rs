@@ -125,6 +125,9 @@ pub struct NestedShape {
     /// Value-level constraints (e.g. sh:datatype on an anonymous shape without sh:path).
     /// These constrain the focus node's own value/datatype rather than a nested property.
     pub value_constraints: Vec<Constraint>,
+    /// sh:message declared on an anonymous member shape. Named references get
+    /// their message from the referenced CompiledShape at validation time.
+    pub message: Option<String>,
 }
 
 impl Constraint {
