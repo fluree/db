@@ -15,13 +15,14 @@ pub fn validate_unique_lang(
     values: &[FlakeValue],
     langs: &[Option<String>],
 ) -> Vec<ConstraintViolation> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    // BCP 47 language tags are case-insensitive ("en" and "EN" collide).
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for lang in langs.iter().flatten() {
-        *counts.entry(lang.as_str()).or_default() += 1;
+        *counts.entry(lang.to_ascii_lowercase()).or_default() += 1;
     }
 
     let mut out = Vec::new();
-    let mut duplicated: Vec<&str> = counts
+    let mut duplicated: Vec<String> = counts
         .into_iter()
         .filter(|(_, n)| *n > 1)
         .map(|(lang, _)| lang)
@@ -31,7 +32,7 @@ pub fn validate_unique_lang(
         // Report the first value carrying the duplicated tag.
         let value = langs
             .iter()
-            .position(|l| l.as_deref() == Some(lang))
+            .position(|l| l.as_deref().is_some_and(|t| t.eq_ignore_ascii_case(&lang)))
             .and_then(|i| values.get(i))
             .cloned();
         out.push(ConstraintViolation {
@@ -107,6 +108,13 @@ mod tests {
         let violations = validate_unique_lang(&values, &langs);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].message.contains("\"en\""));
+    }
+
+    #[test]
+    fn unique_lang_is_case_insensitive() {
+        let values = [s("colour"), s("color")];
+        let langs = [Some("en".to_string()), Some("EN".to_string())];
+        assert_eq!(validate_unique_lang(&values, &langs).len(), 1);
     }
 
     #[test]

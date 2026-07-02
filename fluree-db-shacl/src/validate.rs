@@ -667,12 +667,11 @@ async fn validate_node_value_constraints<'a>(
     shape: &'a CompiledShape,
     class_ctx: Option<ClassMembershipCtx<'a>>,
 ) -> Result<Vec<ValidationResult>> {
-    let mut results = Vec::new();
-    let values = [FlakeValue::Ref(focus_node.clone())];
-    let datatypes = [fluree_db_core::id_datatype_sid()];
-
-    let push = |violation: ConstraintViolation, results: &mut Vec<ValidationResult>| {
-        results.push(ValidationResult {
+    let violations =
+        focus_value_violations(db, focus_node, &shape.node_constraints, class_ctx).await?;
+    Ok(violations
+        .into_iter()
+        .map(|violation| ValidationResult {
             focus_node: focus_node.clone(),
             result_path: None,
             source_shape: shape.id.clone(),
@@ -681,10 +680,25 @@ async fn validate_node_value_constraints<'a>(
             message: shape.message.clone().unwrap_or(violation.message),
             value: violation.value,
             graph_id: None,
-        });
-    };
+        })
+        .collect())
+}
 
-    for constraint in &shape.node_constraints {
+/// Evaluate value constraints against the focus node itself — the shared core
+/// for constraints declared directly on a node shape and for anonymous
+/// value-only members of logical constraints (`sh:or ([ sh:class ex:C ])`).
+/// The focus is an IRI ref, so string facets match its full decoded IRI.
+async fn focus_value_violations<'a>(
+    db: GraphDbRef<'a>,
+    focus_node: &Sid,
+    constraints: &[Constraint],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+) -> Result<Vec<ConstraintViolation>> {
+    let mut violations = Vec::new();
+    let values = [FlakeValue::Ref(focus_node.clone())];
+    let datatypes = [fluree_db_core::id_datatype_sid()];
+
+    for constraint in constraints {
         match constraint {
             Constraint::Equals(target_prop)
             | Constraint::Disjoint(target_prop)
@@ -699,28 +713,39 @@ async fn validate_node_value_constraints<'a>(
                     .await?;
                 let target_values: Vec<FlakeValue> =
                     target_flakes.iter().map(|f| f.o.clone()).collect();
-                for violation in
-                    validate_pair_constraint(constraint, &values, &target_values, &target_prop.name)
-                {
-                    push(violation, &mut results);
-                }
+                violations.extend(validate_pair_constraint(
+                    constraint,
+                    &values,
+                    &target_values,
+                    &target_prop.name,
+                ));
             }
             Constraint::Class(expected_class) => {
-                for violation in
-                    validate_class_constraint(db, &values, expected_class, class_ctx).await?
-                {
-                    push(violation, &mut results);
-                }
+                violations.extend(
+                    validate_class_constraint(db, &values, expected_class, class_ctx).await?,
+                );
+            }
+            Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_) => {
+                let effective = stringify_iri_values(db, &values);
+                violations.extend(validate_constraint(
+                    constraint,
+                    &effective,
+                    &datatypes,
+                    &[None],
+                )?);
             }
             _ => {
-                for violation in validate_constraint(constraint, &values, &datatypes, &[None])? {
-                    push(violation, &mut results);
-                }
+                violations.extend(validate_constraint(
+                    constraint,
+                    &values,
+                    &datatypes,
+                    &[None],
+                )?);
             }
         }
     }
 
-    Ok(results)
+    Ok(violations)
 }
 
 /// Validate a structural (node-level) constraint
@@ -1051,6 +1076,28 @@ fn validate_nested_shape<'a>(
 
         let mut results = Vec::new();
 
+        // Value constraints on an anonymous member apply to the focus node
+        // itself (no sh:path — the member's value-node set is the focus).
+        // Without this, a value-only member like `sh:or ([ sh:class ex:C ])`
+        // would be treated as conforming with no checks.
+        if !nested.value_constraints.is_empty() {
+            let violations =
+                focus_value_violations(db, focus_node, &nested.value_constraints, class_ctx)
+                    .await?;
+            for violation in violations {
+                results.push(ValidationResult {
+                    focus_node: focus_node.clone(),
+                    result_path: None,
+                    source_shape: parent_shape.id.clone(),
+                    source_constraint: Some(nested.id.clone()),
+                    severity: Severity::Violation,
+                    message: nested.message.clone().unwrap_or(violation.message),
+                    value: violation.value,
+                    graph_id: None,
+                });
+            }
+        }
+
         // Validate property constraints
         for (path, constraints) in &nested.property_constraints {
             // A path that never compiled surfaces as a violation on this member.
@@ -1158,11 +1205,12 @@ fn validate_nested_shape<'a>(
                         shape,
                         min_count,
                         max_count,
-                        ..
+                        disjoint,
+                        sibling_shapes,
                     } => {
                         let mut conforming = 0usize;
                         for (i, value) in values.iter().enumerate() {
-                            let conforms = check_value_against_nested_shape(
+                            let mut conforms = check_value_against_nested_shape(
                                 db,
                                 value,
                                 datatypes.get(i),
@@ -1174,6 +1222,26 @@ fn validate_nested_shape<'a>(
                                 active,
                             )
                             .await?;
+                            if conforms && *disjoint {
+                                for sibling in sibling_shapes {
+                                    if check_value_against_nested_shape(
+                                        db,
+                                        value,
+                                        datatypes.get(i),
+                                        langs.get(i).and_then(|l| l.as_deref()),
+                                        sibling,
+                                        parent_shape,
+                                        all_shapes,
+                                        class_ctx,
+                                        active,
+                                    )
+                                    .await?
+                                    {
+                                        conforms = false;
+                                        break;
+                                    }
+                                }
+                            }
                             if conforms {
                                 conforming += 1;
                             }
@@ -1777,22 +1845,6 @@ async fn check_value_against_nested_shape<'a>(
     // If the nested shape has value-level constraints (e.g. sh:datatype without sh:path),
     // check them directly against the value/datatype.
     if !nested.value_constraints.is_empty() {
-        // sh:class on an anonymous value shape needs db access for the
-        // rdf:type lookup; the pure constraint-set path below skips it.
-        for constraint in &nested.value_constraints {
-            if let Constraint::Class(expected_class) = constraint {
-                let violations = validate_class_constraint(
-                    db,
-                    std::slice::from_ref(value),
-                    expected_class,
-                    class_ctx,
-                )
-                .await?;
-                if !violations.is_empty() {
-                    return Ok(false);
-                }
-            }
-        }
         let dt_arr: [Sid; 1];
         let dt_slice: &[Sid] = match datatype {
             Some(dt) => {
@@ -1802,13 +1854,35 @@ async fn check_value_against_nested_shape<'a>(
             None => &[],
         };
         let lang_arr = [lang.map(str::to_string)];
-        let violations = validate_constraint_set(
-            &nested.value_constraints,
-            std::slice::from_ref(value),
-            dt_slice,
-            &lang_arr,
-        )?;
-        return Ok(violations.is_empty());
+        for constraint in &nested.value_constraints {
+            let conforms = match constraint {
+                // sh:class needs db access for the rdf:type lookup.
+                Constraint::Class(expected_class) => validate_class_constraint(
+                    db,
+                    std::slice::from_ref(value),
+                    expected_class,
+                    class_ctx,
+                )
+                .await?
+                .is_empty(),
+                // String facets match STR(iri) for IRI values.
+                Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_) => {
+                    let effective = stringify_iri_values(db, std::slice::from_ref(value));
+                    validate_constraint(constraint, &effective, dt_slice, &lang_arr)?.is_empty()
+                }
+                _ => validate_constraint(
+                    constraint,
+                    std::slice::from_ref(value),
+                    dt_slice,
+                    &lang_arr,
+                )?
+                .is_empty(),
+            };
+            if !conforms {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
     }
 
     // For IRI/blank-node values, evaluate the nested shape against the value as a focus node
@@ -1852,21 +1926,6 @@ fn has_iri_ref(values: &[FlakeValue]) -> bool {
     values
         .iter()
         .any(|v| matches!(v, FlakeValue::Ref(sid) if sid.namespace_code != BLANK_NODE))
-}
-
-/// Apply multiple constraints to a set of values and collect all violations.
-fn validate_constraint_set(
-    constraints: &[Constraint],
-    values: &[FlakeValue],
-    datatypes: &[Sid],
-    langs: &[Option<String>],
-) -> Result<Vec<ConstraintViolation>> {
-    let mut all_violations = Vec::new();
-    for constraint in constraints {
-        let violations = validate_constraint(constraint, values, datatypes, langs)?;
-        all_violations.extend(violations);
-    }
-    Ok(all_violations)
 }
 
 /// Validate a constraint against a set of values

@@ -962,11 +962,17 @@ impl ShapeCompiler {
             let mut node_constraints = data.node_constraints.clone();
             let mut message = data.message.clone();
             let mut name = data.name.clone();
+            let mut severity = data.severity;
             if let Some(own_ps) = ps_map.get(id) {
                 if own_ps.path.is_none() {
                     node_constraints.extend(build_constraints_from_ps_data(own_ps));
                     message = message.or_else(|| own_ps.message.clone());
                     name = name.or_else(|| own_ps.name.clone());
+                    // sh:severity routes to the path-less entry too (the
+                    // metadata arms prefer the property-shape map).
+                    if severity == Severity::Violation {
+                        severity = own_ps.severity;
+                    }
                 }
             }
 
@@ -976,7 +982,7 @@ impl ShapeCompiler {
                 property_shapes: prop_shapes,
                 node_constraints,
                 structural_constraints,
-                severity: data.severity,
+                severity,
                 name,
                 message,
                 deactivated: data.deactivated,

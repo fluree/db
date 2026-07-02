@@ -3641,3 +3641,156 @@ async fn shacl_qualified_value_shapes_disjoint() {
         .await
         .expect("without disjointness a dual-role member satisfies both counts");
 }
+
+// ===========================================================================
+// Review fixes: value-only nested members, focus string facets, severity
+// ===========================================================================
+
+/// A value-only anonymous member of a node-level logical constraint
+/// (`sh:or ([ sh:class ex:Person ])`) must be evaluated against the focus
+/// node — previously it produced no checks and always conformed.
+#[tokio::test]
+async fn shacl_value_only_member_in_node_level_or() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:ActorShape",
+        "@type": "sh:NodeShape",
+        "sh:targetObjectsOf": {"@id": "ex:actor"},
+        "sh:or": [
+            {"@id": "ex:or_person", "sh:class": {"@id": "ex:Person"}},
+            {"@id": "ex:or_org", "sh:class": {"@id": "ex:Organization"}}
+        ]
+    });
+
+    let ledger_ok = fluree.create_ledger("shacl/valmem-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:event1", "ex:actor": {"@id": "ex:alice"}},
+                    {"@id": "ex:alice", "@type": "ex:Person"}
+                ]
+            }),
+        )
+        .await
+        .expect("a Person actor satisfies the value-only sh:or member");
+
+    let ledger_bad = fluree.create_ledger("shacl/valmem-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:event2", "ex:actor": {"@id": "ex:hal"}},
+                    {"@id": "ex:hal", "@type": "ex:Robot"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:or");
+}
+
+/// String facets declared directly on a node shape apply to the focus node's
+/// full decoded IRI, not reject it as a non-literal.
+#[tokio::test]
+async fn shacl_pattern_on_node_shape_focus_iri() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // Anything used as an ex:ref must be an example.org IRI.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:RefShape",
+        "@type": "sh:NodeShape",
+        "sh:targetObjectsOf": {"@id": "ex:ref"},
+        "sh:pattern": "^http://example\\.org/"
+    });
+
+    let ledger_ok = fluree
+        .create_ledger("shacl/focuspat-ok:main")
+        .await
+        .unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc1",
+                "ex:ref": {"@id": "ex:target1"}
+            }),
+        )
+        .await
+        .expect("focus IRI under example.org matches the node-shape pattern");
+
+    // Register the foreign namespace first so the violating focus decodes.
+    let ledger_bad = fluree
+        .create_ledger("shacl/focuspat-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let ledger_bad = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "http://elsewhere.example.net/thing",
+                "ex:note": "registers namespace"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc2",
+                "ex:ref": {"@id": "http://elsewhere.example.net/thing"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "does not match pattern");
+}
+
+/// `sh:severity sh:Warning` on a node shape carrying direct value constraints
+/// must not reject (severity routes through the path-less metadata entry).
+#[tokio::test]
+async fn shacl_warning_severity_on_node_value_constraint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:AdvisoryStatusShape",
+        "@type": "sh:NodeShape",
+        "sh:targetObjectsOf": {"@id": "ex:state"},
+        "sh:severity": {"@id": "sh:Warning"},
+        "sh:in": [{"@id": "ex:on"}, {"@id": "ex:off"}]
+    });
+
+    let ledger = fluree.create_ledger("shacl/warnval:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // Out-of-set value — would reject under Violation severity (covered by
+    // shacl_value_constraint_on_node_shape); Warning must not.
+    fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:device1",
+                "ex:state": {"@id": "ex:standby"}
+            }),
+        )
+        .await
+        .expect("warn-severity node value constraint must not reject");
+}

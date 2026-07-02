@@ -89,8 +89,17 @@ pub fn validate_pattern(
 }
 
 /// Validate sh:minLength constraint
+///
+/// Applies to the value's lexical form (per SPARQL `STR()`); non-literals
+/// (blank nodes, undecodable IRIs) violate per spec.
 pub fn validate_min_length(value: &FlakeValue, min: usize) -> Option<ConstraintViolation> {
-    let len = string_length(value);
+    let Some(len) = lexical_length(value) else {
+        return Some(ConstraintViolation {
+            constraint: Constraint::MinLength(min),
+            value: Some(value.clone()),
+            message: "Length constraint cannot be applied to a non-literal value".to_string(),
+        });
+    };
 
     if len < min {
         Some(ConstraintViolation {
@@ -104,8 +113,17 @@ pub fn validate_min_length(value: &FlakeValue, min: usize) -> Option<ConstraintV
 }
 
 /// Validate sh:maxLength constraint
+///
+/// Applies to the value's lexical form (per SPARQL `STR()`); non-literals
+/// (blank nodes, undecodable IRIs) violate per spec.
 pub fn validate_max_length(value: &FlakeValue, max: usize) -> Option<ConstraintViolation> {
-    let len = string_length(value);
+    let Some(len) = lexical_length(value) else {
+        return Some(ConstraintViolation {
+            constraint: Constraint::MaxLength(max),
+            value: Some(value.clone()),
+            message: "Length constraint cannot be applied to a non-literal value".to_string(),
+        });
+    };
 
     if len > max {
         Some(ConstraintViolation {
@@ -118,38 +136,9 @@ pub fn validate_max_length(value: &FlakeValue, max: usize) -> Option<ConstraintV
     }
 }
 
-/// Get the length of a value as a string
-fn string_length(value: &FlakeValue) -> usize {
-    match value {
-        FlakeValue::String(s) => s.chars().count(),
-        FlakeValue::Long(n) => n.to_string().len(),
-        FlakeValue::Double(n) => n.to_string().len(),
-        FlakeValue::Boolean(b) => {
-            if *b {
-                4
-            } else {
-                5
-            }
-        } // "true" or "false"
-        FlakeValue::Ref(sid) => sid.name.len(),
-        FlakeValue::Vector(v) => v.len(), // Length of vector
-        FlakeValue::Null => 0,
-        FlakeValue::Json(s) => s.chars().count(),
-        FlakeValue::BigInt(n) => n.to_string().len(),
-        FlakeValue::Decimal(d) => d.to_string().len(),
-        FlakeValue::DateTime(dt) => dt.original().len(),
-        FlakeValue::Date(d) => d.original().len(),
-        FlakeValue::Time(t) => t.original().len(),
-        FlakeValue::GYear(v) => v.original().len(),
-        FlakeValue::GYearMonth(v) => v.original().len(),
-        FlakeValue::GMonth(v) => v.original().len(),
-        FlakeValue::GDay(v) => v.original().len(),
-        FlakeValue::GMonthDay(v) => v.original().len(),
-        FlakeValue::YearMonthDuration(v) => v.original().len(),
-        FlakeValue::DayTimeDuration(v) => v.original().len(),
-        FlakeValue::Duration(v) => v.original().len(),
-        FlakeValue::GeoPoint(v) => v.to_string().len(), // "POINT(lng lat)"
-    }
+/// Character count of the value's lexical form; `None` for non-literals.
+fn lexical_length(value: &FlakeValue) -> Option<usize> {
+    pattern_lexical_form(value).map(|s| s.chars().count())
 }
 
 #[cfg(test)]
