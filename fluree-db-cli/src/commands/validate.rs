@@ -207,7 +207,7 @@ fn finish(report: &ValidateReport, format: ReportFormat, fail_on: FailOn) -> Cli
     };
     if failing > 0 {
         std::io::stdout().flush().ok();
-        std::process::exit(EXIT_ERROR);
+        return Err(CliError::ExitCode(EXIT_ERROR));
     }
     Ok(())
 }
