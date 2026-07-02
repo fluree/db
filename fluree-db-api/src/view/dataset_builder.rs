@@ -201,11 +201,19 @@ impl Fluree {
     ) -> Result<GraphDb> {
         let view = match &source.time_spec {
             None => {
-                let result = self.db(&source.identifier).await;
+                // Box the ledger-load future: the load chain (get_or_load →
+                // load → load_novelty → bulk_apply_commits) is deep, and in
+                // debug builds its inline future would balloon this frame — and
+                // every dispatcher frame above it that materializes this future
+                // before awaiting — pushing the plain `select *` connection
+                // query past the default ~2 MB worker stack (fluree/db#1408).
+                // Boxing keeps the load future's state on the heap so it costs
+                // O(1) stack here and in the callers above.
+                let result = Box::pin(self.db(&source.identifier)).await;
                 match result {
                     Ok(v) => v,
                     Err(ref e) if e.is_not_found() => {
-                        self.resolve_as_graph_source(&source.identifier).await?
+                        Box::pin(self.resolve_as_graph_source(&source.identifier)).await?
                     }
                     Err(e) => {
                         return Err(e);
@@ -214,7 +222,7 @@ impl Fluree {
             }
             Some(time_spec) => {
                 let ts = convert_time_spec(time_spec)?;
-                match self.db_at(&source.identifier, ts).await {
+                match Box::pin(self.db_at(&source.identifier, ts)).await {
                     Ok(v) => v,
                     Err(ref e) if e.is_not_found() => {
                         // Check if it's a graph source — reject time travel explicitly

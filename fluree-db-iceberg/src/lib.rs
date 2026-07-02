@@ -5,8 +5,8 @@
 //!
 //! # Features
 //!
-//! - `aws` - Enables AWS SDK integration (S3 storage + credential provider)
-//! - `arrow` - Enables Arrow RecordBatch output (OFF by default for Lambda size)
+//! - `aws` - Enables AWS SDK integration (S3 storage + credential provider) and
+//!   the Send Parquet reader used by the query engine.
 //!
 //! # Architecture
 //!

@@ -21,7 +21,7 @@ use parquet::column::reader::ColumnReader;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::RowGroupReader;
 use parquet::file::serialized_reader::SerializedFileReader;
-use parquet::schema::types::Type as SchemaType;
+use parquet::schema::types::{SchemaDescriptor, Type as SchemaType};
 use tokio::sync::Mutex;
 
 use std::collections::HashMap;
@@ -1311,6 +1311,42 @@ pub fn build_field_id_to_column_mapping(
     mapping
 }
 
+/// Map each top-level (root) field index to its first Parquet **leaf** column
+/// index.
+///
+/// [`build_field_id_to_column_mapping`] and [`build_batch_schema`] index
+/// `Type::get_fields()`, i.e. root fields. But leaf-column consumers —
+/// `RowGroupMetaData::column` (statistics) and `ProjectionMask::leaves`
+/// (projection) — index the flat leaf-column space. The two coincide only for a
+/// fully flat schema; a nested column (struct/list/map/VARIANT) before a
+/// projected primitive shifts later leaf indices. Translate a root index through
+/// this map before handing it to a leaf-column API. The primitives this crate
+/// projects each own exactly one leaf, so the first leaf under a root is it.
+pub fn build_root_to_leaf_map(schema_descr: &SchemaDescriptor) -> HashMap<usize, usize> {
+    let mut map = HashMap::new();
+    for leaf in 0..schema_descr.num_columns() {
+        map.entry(schema_descr.get_column_root_idx(leaf))
+            .or_insert(leaf);
+    }
+    map
+}
+
+/// Iceberg field ID → Parquet **leaf** column index, composing
+/// [`build_field_id_to_column_mapping`] (field ID → root) with
+/// [`build_root_to_leaf_map`] (root → leaf). This is the mapping leaf-indexed
+/// consumers (row-group statistics, projection) must use; see
+/// [`build_root_to_leaf_map`] for why root ≠ leaf under nested schemas.
+pub fn build_field_id_to_leaf_mapping(
+    metadata: &ParquetMetaData,
+    iceberg_schema: Option<&Schema>,
+) -> HashMap<i32, usize> {
+    let root_to_leaf = build_root_to_leaf_map(metadata.file_metadata().schema_descr());
+    build_field_id_to_column_mapping(metadata.file_metadata().schema(), iceberg_schema)
+        .into_iter()
+        .filter_map(|(field_id, root)| root_to_leaf.get(&root).map(|&leaf| (field_id, leaf)))
+        .collect()
+}
+
 /// Build batch schema from Parquet metadata, Iceberg schema, and projected field IDs.
 ///
 /// This function uses the Iceberg schema as the source of truth for field metadata
@@ -1811,6 +1847,73 @@ mod tests {
             mapping.is_empty(),
             "Mapping should be empty without field IDs or schema"
         );
+    }
+
+    #[test]
+    fn test_root_to_leaf_diverges_under_nested_column() {
+        use parquet::basic::Repetition;
+        use parquet::schema::types::SchemaDescriptor;
+
+        // A struct (2 leaves) precedes two top-level primitives. Root indices are
+        // {addr:0, year:1, name:2}; leaf indices are {street:0, zip:1, year:2,
+        // name:3}. A flat schema hides the bug because root == leaf; here they
+        // diverge, so treating a root index as a leaf index would select the
+        // wrong column (`year`'s root 1 is leaf 2, not leaf 1 = `zip`).
+        let addr = Arc::new(
+            SchemaType::group_type_builder("addr")
+                .with_id(Some(1))
+                .with_repetition(Repetition::REQUIRED)
+                .with_fields(vec![
+                    Arc::new(
+                        SchemaType::primitive_type_builder("street", PhysicalType::BYTE_ARRAY)
+                            .with_id(Some(10))
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        SchemaType::primitive_type_builder("zip", PhysicalType::INT32)
+                            .with_id(Some(11))
+                            .with_repetition(Repetition::REQUIRED)
+                            .build()
+                            .unwrap(),
+                    ),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let year = Arc::new(
+            SchemaType::primitive_type_builder("year", PhysicalType::INT32)
+                .with_id(Some(2))
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let name = Arc::new(
+            SchemaType::primitive_type_builder("name", PhysicalType::BYTE_ARRAY)
+                .with_id(Some(3))
+                .with_repetition(Repetition::REQUIRED)
+                .build()
+                .unwrap(),
+        );
+        let schema = SchemaType::group_type_builder("schema")
+            .with_fields(vec![addr, year, name])
+            .build()
+            .unwrap();
+        let descr = SchemaDescriptor::new(Arc::new(schema.clone()));
+
+        // Root → first leaf: the struct owns leaves 0,1 so the primitives shift.
+        let root_to_leaf = build_root_to_leaf_map(&descr);
+        assert_eq!(root_to_leaf.get(&0), Some(&0)); // addr → leaf 0
+        assert_eq!(root_to_leaf.get(&1), Some(&2)); // year → leaf 2 (not 1!)
+        assert_eq!(root_to_leaf.get(&2), Some(&3)); // name → leaf 3
+
+        // field_id → root (embedded ids), composed to field_id → leaf.
+        let field_to_root = build_field_id_to_column_mapping(&schema, None);
+        assert_eq!(field_to_root.get(&2), Some(&1)); // year is root field 1
+        let year_leaf = root_to_leaf[&field_to_root[&2]];
+        assert_eq!(year_leaf, 2, "year must resolve to leaf 2, not its root 1");
+        assert_eq!(root_to_leaf[&field_to_root[&3]], 3); // name → leaf 3
     }
 
     #[test]

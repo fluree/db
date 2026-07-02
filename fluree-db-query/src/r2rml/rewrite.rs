@@ -27,9 +27,11 @@
 use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
-use crate::r2rml::{ScanCmpOp, ScanValue};
+use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
-use fluree_db_core::{FlakeValue, LedgerSnapshot};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
+use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
@@ -54,6 +56,11 @@ pub struct R2rmlRewriteResult {
 /// * `patterns` - The patterns to rewrite
 /// * `graph_source_id` - The graph source alias (e.g., "airlines-gs:main")
 /// * `snapshot` - Database for Sid-to-IRI conversion
+/// * `mapping` - The compiled R2RML mapping, when available. Used to decide
+///   whether a same-subject `rdf:type` may be safely fused into a star scan
+///   (see [`class_fusion_is_safe`]). `None` disables class fusion — always
+///   correct, just less optimal — so callers that can cheaply load the mapping
+///   should pass it.
 ///
 /// # Returns
 ///
@@ -62,6 +69,7 @@ pub fn rewrite_patterns_for_r2rml(
     patterns: &[Pattern],
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
+    mapping: Option<&CompiledR2rmlMapping>,
 ) -> R2rmlRewriteResult {
     let mut result_patterns = Vec::with_capacity(patterns.len());
     let mut converted = 0;
@@ -71,6 +79,11 @@ pub fn rewrite_patterns_for_r2rml(
     // (const predicate + fresh object var) by subject so they can be merged into
     // a single scan, eliminating the O(N^2) self-join. First-seen order preserved.
     let mut star_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
+    // Same-subject `rdf:type` patterns, by subject. A single class per subject is
+    // fused into that subject's star (constraining its TriplesMap resolution to
+    // the class and dropping a redundant correlated re-scan); a subject with no
+    // star members, or multiple classes, is emitted as a subject-only scan.
+    let mut class_groups: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
 
     for pattern in patterns {
         match pattern {
@@ -78,14 +91,21 @@ pub fn rewrite_patterns_for_r2rml(
                 if let Some(r2rml_pattern) = convert_triple_to_r2rml(tp, graph_source_id, snapshot)
                 {
                     converted += 1;
-                    if is_star_eligible(&r2rml_pattern) {
-                        match star_groups
-                            .iter_mut()
-                            .find(|(s, _)| *s == r2rml_pattern.subject_var)
-                        {
+                    // Only variable-subject patterns are grouped by shared
+                    // subject; a bound-subject pattern (subject_var = None) is
+                    // never star/class eligible and falls to standalone emit.
+                    if let Some(sv) = star_member_subject(&r2rml_pattern) {
+                        match star_groups.iter_mut().find(|(s, _)| *s == sv) {
                             Some((_, members)) => members.push(r2rml_pattern),
                             None => {
-                                star_groups.push((r2rml_pattern.subject_var, vec![r2rml_pattern]));
+                                star_groups.push((sv, vec![r2rml_pattern]));
+                            }
+                        }
+                    } else if let Some(sv) = class_only_subject(&r2rml_pattern) {
+                        match class_groups.iter_mut().find(|(s, _)| *s == sv) {
+                            Some((_, members)) => members.push(r2rml_pattern),
+                            None => {
+                                class_groups.push((sv, vec![r2rml_pattern]));
                             }
                         }
                     } else {
@@ -107,7 +127,7 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
-                    let r = rewrite_patterns_for_r2rml(&inner, graph_source_id, snapshot);
+                    let r = rewrite_patterns_for_r2rml(&inner, graph_source_id, snapshot, mapping);
                     converted += r.converted_count;
                     unconverted += r.unconverted_count;
                     r.patterns
@@ -138,33 +158,65 @@ pub fn rewrite_patterns_for_r2rml(
 
     // Emit star groups. Single-member groups stay on the normal single-object
     // path; multi-member groups with distinct object vars merge into one scan.
-    for (_subject, mut members) in star_groups {
-        if members.len() == 1 {
-            result_patterns.push(Pattern::R2rml(members.pop().unwrap()));
-            continue;
-        }
-        let mut seen_obj = HashSet::new();
-        let distinct = members
-            .iter()
-            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
-        if !distinct {
-            // Shared object var implies a self-join constraint; keep separate.
-            for m in members {
+    // A same-subject `rdf:type` is fused into the base by setting its
+    // `class_filter`, which constrains TriplesMap resolution to the class and
+    // removes the separate class operator's correlated re-scan.
+    for (subject, members) in star_groups {
+        // Split into object-var members (produce bindings) and constant-object
+        // members (equality existence constraints fused into the same scan).
+        let (mut var_members, const_members): (Vec<R2rmlPattern>, Vec<R2rmlPattern>) =
+            members.into_iter().partition(|m| m.object_var.is_some());
+
+        if var_members.is_empty() {
+            // No var-object base to fuse the constraints onto: each constant-object
+            // pattern is already correct as its own standalone scan.
+            for m in const_members {
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
         }
-        let mut base = members.remove(0);
-        base.star_bindings = members
+
+        // Var-object members need distinct object vars to fuse; a shared object
+        // var is a self-join constraint, not a star. If not distinct, keep every
+        // member separate (var and constant alike).
+        let mut seen_obj = HashSet::new();
+        let distinct = var_members
+            .iter()
+            .all(|m| m.object_var.is_some_and(|v| seen_obj.insert(v)));
+        if !distinct {
+            for m in var_members.into_iter().chain(const_members) {
+                result_patterns.push(Pattern::R2rml(m));
+            }
+            continue;
+        }
+
+        let star_constraints: Vec<(String, ObjectConstant)> = const_members
+            .into_iter()
+            .filter_map(|m| Some((m.predicate_filter?, m.object_constant?)))
+            .collect();
+
+        let mut base = var_members.remove(0);
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
+        base.star_bindings = var_members
             .into_iter()
             .map(|m| {
                 (
-                    m.predicate_filter.expect("star-eligible has predicate"),
-                    m.object_var.expect("star-eligible has object var"),
+                    m.predicate_filter.expect("star member has predicate"),
+                    m.object_var.expect("var member has object var"),
                 )
             })
             .collect();
+        base.star_constraints = star_constraints;
         result_patterns.push(Pattern::R2rml(base));
+    }
+
+    // Class patterns not fused into a star (no same-subject star members, or
+    // multiple classes on one subject) become subject-only scans: the operator
+    // projects only the subject columns and scans no RefObjectMap parents.
+    for (_subject, members) in class_groups {
+        for m in members {
+            result_patterns.push(Pattern::R2rml(m));
+        }
     }
 
     // Attach pushable FILTER comparisons to the R2RML pattern that produces
@@ -183,7 +235,7 @@ pub fn rewrite_patterns_for_r2rml(
                 for (var, op, value) in &pushdowns {
                     // Only object-position vars map to columns (the subject is an
                     // IRI template, not a scannable column).
-                    if *var != rp.subject_var && produced.contains(var) {
+                    if Some(*var) != rp.subject_var && produced.contains(var) {
                         rp.scan_filters.push(ScanPushdown {
                             var: *var,
                             op: *op,
@@ -195,10 +247,120 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
+    // Consume a fully scan-local FILTER into the single R2RML scan so the
+    // downstream LIMIT row budget can reach it. Narrow and safe: only when the
+    // group is purely R2RML scans and FILTERs (no OPTIONAL / UNION / BIND /
+    // multi-scan join) and there is exactly one R2RML pattern, so a filter whose
+    // variables are all produced by that scan cannot depend on any other pattern.
+    // The operator re-applies the moved filter with the same evaluator (results
+    // unchanged); removing the `Pattern::Filter` is what lets the budget flow.
+    consume_scan_local_filters(&mut result_patterns);
+
     R2rmlRewriteResult {
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
+    }
+}
+
+/// Whether scan-local FILTER consumption is enabled. Read once from
+/// `FLUREE_R2RML_FILTER_CONSUMPTION` (only `0`/`false`/`off` disable it). The
+/// kill switch keeps the FILTER in the plan (no LIMIT flow) for A/B validation.
+fn filter_consumption_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_FILTER_CONSUMPTION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Move scan-local top-level FILTERs into the single R2RML scan's
+/// `consumed_filter`, removing them from the pattern list. See the call site for
+/// the safety conditions.
+fn consume_scan_local_filters(patterns: &mut Vec<Pattern>) {
+    if !filter_consumption_enabled() {
+        return;
+    }
+    let all_scan_or_filter = patterns
+        .iter()
+        .all(|p| matches!(p, Pattern::R2rml(_) | Pattern::Filter(_)));
+    let scan_count = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::R2rml(_)))
+        .count();
+    if !all_scan_or_filter || scan_count != 1 {
+        return;
+    }
+
+    let produced: HashSet<VarId> = patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp.produced_vars().into_iter().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut consumed: Vec<Expression> = Vec::new();
+    patterns.retain(|p| {
+        if let Pattern::Filter(expr) = p {
+            let mut vars = HashSet::new();
+            // A Cypher metadata read (`type`/`labels`/`keys`/...) is a `Call`
+            // that `collect_expr_vars` would accept, but the consumed path applies
+            // it via synchronous `filter_batch`, bypassing the policy-aware async
+            // resolver the standalone `FilterOperator` uses under a view policy.
+            // Leave it in place so authority — and fail-closed behavior — stays
+            // with the in-engine FILTER.
+            if crate::eval::metadata_resolve::contains_metadata_read(expr) {
+                return true;
+            }
+            // A variable-free filter (constant), one this analysis can't fully
+            // understand, or one touching a var the scan does not produce is
+            // left in place for the in-engine FILTER.
+            if collect_expr_vars(expr, &mut vars)
+                && !vars.is_empty()
+                && vars.iter().all(|v| produced.contains(v))
+            {
+                consumed.push(expr.clone());
+                return false;
+            }
+        }
+        true
+    });
+
+    if consumed.is_empty() {
+        return;
+    }
+    let combined = if consumed.len() == 1 {
+        consumed.pop().unwrap()
+    } else {
+        Expression::and(consumed)
+    };
+    for p in patterns.iter_mut() {
+        if let Pattern::R2rml(rp) = p {
+            rp.consumed_filter = Some(combined);
+            break;
+        }
+    }
+}
+
+/// Collect all variables referenced by an expression into `out`, returning
+/// `false` if the expression contains a construct this analysis does not fully
+/// understand (EXISTS, comprehensions, maps, resolved bindings, ...). A `false`
+/// result means the filter must NOT be consumed: it may reference variables — or
+/// carry scoping semantics — this walk cannot see, so the in-engine FILTER keeps
+/// authority. Only plain `Call` trees over `Var`/`Const` are consumable.
+fn collect_expr_vars(expr: &Expression, out: &mut HashSet<VarId>) -> bool {
+    match expr {
+        Expression::Var(v) => {
+            out.insert(*v);
+            true
+        }
+        Expression::Const(_) => true,
+        Expression::Call { args, .. } => args.iter().all(|a| collect_expr_vars(a, out)),
+        _ => false,
     }
 }
 
@@ -260,27 +422,160 @@ fn cmp_op(func: &Function, reversed: bool) -> Option<ScanCmpOp> {
 
 /// Convert a constant literal to a prunable `ScanValue`. Only date, integer and
 /// boolean are pushed; everything else stays with the in-engine FILTER.
+/// Whether a triple's object datatype constraint permits a loose (value-only)
+/// constant-object match. The product matches untyped literals loosely, and a
+/// literal written without an explicit `^^type` carries its natural XSD datatype
+/// (`xsd:string`, `xsd:integer`, ...), so any XSD-namespaced datatype qualifies.
+/// A language tag or a custom (non-XSD) datatype requires strict matching and is
+/// excluded from this path.
+fn is_loose_matchable_datatype(dtc: &Option<DatatypeConstraint>) -> bool {
+    match dtc {
+        None => true,
+        Some(DatatypeConstraint::Explicit(sid)) => sid.namespace_code == XSD,
+        Some(DatatypeConstraint::LangTag(_)) => false,
+    }
+}
+
+/// The operator-enforced constant for an object literal, or `None` for value
+/// types not supported as constant objects (refs, temporal types beyond date,
+/// durations, vectors, JSON, geo).
+///
+/// String / integer / boolean / date go through `Scalar` and additionally emit a
+/// scan filter for pruning. Decimal / big-integer / double are numeric matches
+/// enforced by the operator only (no scan pushdown yet).
+fn const_object(value: &FlakeValue) -> Option<ObjectConstant> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
+    match value {
+        FlakeValue::String(s) => Some(ObjectConstant::Scalar(ScanValue::Str(s.clone()))),
+        FlakeValue::Long(n) => Some(ObjectConstant::Scalar(ScanValue::Int(*n))),
+        FlakeValue::Boolean(b) => Some(ObjectConstant::Scalar(ScanValue::Bool(*b))),
+        FlakeValue::Date(d) => Some(ObjectConstant::Scalar(ScanValue::Date(
+            d.days_since_epoch(),
+        ))),
+        FlakeValue::Decimal(d) => Some(ObjectConstant::Decimal((**d).clone())),
+        FlakeValue::Double(f) => Some(ObjectConstant::Double(*f)),
+        // Big integers compare numerically as exact decimals.
+        FlakeValue::BigInt(n) => BigDecimal::from_str(&n.to_string())
+            .ok()
+            .map(ObjectConstant::Decimal),
+        _ => None,
+    }
+}
+
 fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     match value {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
         FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
         FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
+        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
         _ => None,
     }
 }
 
-/// A regular-predicate R2RML pattern that can join via the subject: constant
-/// predicate, a fresh object var distinct from the subject, no class/TM filter.
-/// These are the patterns that can be merged into a same-subject star scan.
-fn is_star_eligible(p: &R2rmlPattern) -> bool {
-    p.predicate_filter.is_some()
+/// The subject var of a regular-predicate R2RML pattern that can join a
+/// same-subject star: variable subject, constant predicate, no class/TM filter,
+/// and either a fresh object var (distinct from the subject) or a constant-object
+/// equality. `None` (not eligible) for bound-subject patterns. Constant-object
+/// members become existence constraints on the star; var-object members produce
+/// bindings.
+fn star_member_subject(p: &R2rmlPattern) -> Option<VarId> {
+    let subject_var = p.subject_var?;
+    let base_ok = p.predicate_filter.is_some()
         && p.class_filter.is_none()
         && p.triples_map_iri.is_none()
-        && p.star_bindings.is_empty()
-        && match p.object_var {
-            Some(obj) => obj != p.subject_var,
-            None => false,
+        && p.star_bindings.is_empty();
+    if !base_ok {
+        return None;
+    }
+    let var_object = p.object_var.is_some_and(|obj| obj != subject_var);
+    let const_object = p.object_var.is_none() && p.object_constant.is_some();
+    (var_object || const_object).then_some(subject_var)
+}
+
+/// The subject var of a pure `rdf:type` pattern (`?s a ex:Class`): variable
+/// subject, a class filter, no object var, no predicate, no star members. `None`
+/// (not eligible) for bound-subject patterns. Candidates to fuse into a
+/// same-subject star (or, failing that, to run as a subject-only scan).
+fn class_only_subject(p: &R2rmlPattern) -> Option<VarId> {
+    let subject_var = p.subject_var?;
+    let eligible = p.class_filter.is_some()
+        && p.object_var.is_none()
+        && p.predicate_filter.is_none()
+        && p.triples_map_iri.is_none()
+        && p.star_bindings.is_empty();
+    eligible.then_some(subject_var)
+}
+
+/// Fuse a subject's lone `rdf:type` into its star `base` by setting
+/// `base.class_filter`, but only when doing so cannot change the result set.
+///
+/// Fusion constrains TriplesMap resolution in
+/// [`operator::build_progress`](super::operator) to maps that satisfy the class
+/// **and** the star's base predicate. That is only equivalent to the pre-fusion
+/// two-pattern plan (a subject-only class scan joined with the predicate scan)
+/// when the class and predicate co-locate in the same TriplesMap. A vertically
+/// partitioned mapping (`TM_A` = subject+class, `TM_B` = subject+predicate, same
+/// subject template) has no single map with both, so a fused scan resolves zero
+/// maps and silently returns no rows (fluree/db#1406 review).
+///
+/// So fuse only when [`class_fusion_is_safe`] holds; otherwise leave the class
+/// pattern in `class_groups` to be emitted as its own subject-only scan, which
+/// the engine joins on the shared subject — the always-correct pre-fusion path.
+/// Fusion is also skipped when the subject carries more than one class (a single
+/// `class_filter` cannot represent them) or when the mapping is unavailable.
+fn fuse_class_if_safe(
+    base: &mut R2rmlPattern,
+    class_groups: &mut Vec<(VarId, Vec<R2rmlPattern>)>,
+    subject: VarId,
+    mapping: Option<&CompiledR2rmlMapping>,
+) {
+    let Some(idx) = class_groups.iter().position(|(s, _)| *s == subject) else {
+        return;
+    };
+    if class_groups[idx].1.len() != 1 {
+        return;
+    }
+    let Some(class) = class_groups[idx].1[0].class_filter.clone() else {
+        return;
+    };
+    // The base predicate drives TriplesMap selection; a star always has one.
+    let Some(base_pred) = base.predicate_filter.as_deref() else {
+        return;
+    };
+    if !mapping.is_some_and(|m| class_fusion_is_safe(m, &class, base_pred)) {
+        return;
+    }
+    class_groups.remove(idx);
+    base.class_filter = Some(class);
+}
+
+/// Whether fusing `class_iri` into the star for `base_predicate` preserves the
+/// result set: every TriplesMap that resolves `base_predicate` must also declare
+/// the class. Then adding the class as a TriplesMap-selection constraint cannot
+/// drop any map the predicate scan would otherwise select, and every scanned row
+/// genuinely carries the class. If some predicate map lacks the class (the
+/// vertically partitioned / split-TriplesMap shape), fusion is unsafe.
+fn class_fusion_is_safe(
+    mapping: &CompiledR2rmlMapping,
+    class_iri: &str,
+    base_predicate: &str,
+) -> bool {
+    let mut saw_predicate_map = false;
+    for tm in mapping.triples_maps.values() {
+        let has_predicate = tm
+            .predicate_object_maps
+            .iter()
+            .any(|pom| pom.predicate_map.as_constant() == Some(base_predicate));
+        if !has_predicate {
+            continue;
         }
+        saw_predicate_map = true;
+        if !tm.classes().iter().any(|c| c == class_iri) {
+            return false;
+        }
+    }
+    saw_predicate_map
 }
 
 /// Convert a triple pattern to an R2RML pattern.
@@ -291,14 +586,25 @@ pub fn convert_triple_to_r2rml(
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
 ) -> Option<R2rmlPattern> {
-    // Extract subject variable (must be a variable for basic R2RML support)
-    let subject_var = match &tp.s {
-        Ref::Var(v) => *v,
-        Ref::Sid(_) | Ref::Iri(_) => {
-            // Subject is bound - we could support this with a filter,
-            // but for now we return None to preserve the original pattern.
-            // The GraphOperator will handle this case differently.
-            return None;
+    // Extract the subject: a variable, or a constant (bound) IRI the operator
+    // matches against each row's materialized subject. Exactly one is set.
+    let (subject_var, subject_constant): (Option<VarId>, Option<String>) = match &tp.s {
+        Ref::Var(v) => (Some(*v), None),
+        Ref::Iri(iri) => (None, Some(iri.to_string())),
+        // A bound SID subject we cannot decode to an IRI is left unconverted.
+        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
+            Some(iri) => (None, Some(iri)),
+            None => return None,
+        },
+    };
+
+    // Build a pattern for `object_var`, carrying either the subject variable or
+    // the constant subject IRI (exactly one of the pair above is set).
+    let make_pattern = |object_var: Option<VarId>| -> R2rmlPattern {
+        match (subject_var, subject_constant.as_deref()) {
+            (Some(sv), _) => R2rmlPattern::new(graph_source_id, sv, object_var),
+            (None, Some(sc)) => R2rmlPattern::new_bound_subject(graph_source_id, sc, object_var),
+            (None, None) => unreachable!("subject is always a var or a constant IRI"),
         }
     };
 
@@ -319,7 +625,7 @@ pub fn convert_triple_to_r2rml(
 
         // For rdf:type, we create an R2RML pattern with class_filter and no object_var
         // (the type binding is implicit in the class_filter)
-        let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, None);
+        let mut pattern = make_pattern(None);
         if let Some(class_iri) = class_filter {
             pattern = pattern.with_class(class_iri);
         }
@@ -334,25 +640,51 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(_) => None, // Predicate is variable - no filter
     };
 
-    // Extract object variable
-    // If object is bound (constant), don't rewrite - we can't currently push
-    // object value constraints into the R2RML scan, so the original pattern
-    // needs to be preserved for correct filtering.
-    let object_var = match &tp.o {
-        Term::Var(v) => Some(*v),
-        Term::Sid(_) | Term::Iri(_) | Term::Value(_) => {
-            // Object is bound - don't rewrite this pattern.
-            // The R2RML scan cannot filter by object value, and rewriting
-            // would drop the constraint, returning incorrect results.
-            // Preserve the original triple pattern for normal evaluation.
-            return None;
+    // Extract the object: a variable, or a constant equality constraint the
+    // operator enforces. A constant predicate is required (to resolve the map).
+    //   - Literal (string/integer/boolean/date, loose-matchable datatype) →
+    //     Scalar (also emits a scan filter for pruning).
+    //   - Decimal / big-integer / double literal → numeric operator-only match.
+    //   - Bound IRI / ref object (`?s edw:geography <geo/1>`) → Iri.
+    // Language-tagged / custom-typed literals need strict matching and are left
+    // unconverted rather than mismatched.
+    let object_constant: Option<ObjectConstant> = match &tp.o {
+        // A ref object can arrive as a typed value (`FlakeValue::Ref`); decode it
+        // to an IRI so it takes the same operator-enforced path as Term::Sid/Iri.
+        Term::Value(FlakeValue::Ref(sid)) if predicate_filter.is_some() => {
+            snapshot.decode_sid(sid).map(ObjectConstant::Iri)
         }
+        Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
+            const_object(v)
+        }
+        Term::Iri(iri) if predicate_filter.is_some() => Some(ObjectConstant::Iri(iri.to_string())),
+        Term::Sid(sid) if predicate_filter.is_some() => {
+            snapshot.decode_sid(sid).map(ObjectConstant::Iri)
+        }
+        _ => None,
+    };
+    let object_var = match (&tp.o, &object_constant) {
+        (Term::Var(v), _) => Some(*v),
+        (_, Some(_)) => None,
+        // Bound object we cannot yet convert.
+        _ => return None,
     };
 
-    let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, object_var);
+    // A bound subject with a variable predicate (`<store/5> ?p ?o`) has no
+    // `predicate_filter` to resolve the POM and no predicate-var field to bind
+    // `?p`, so materialization would bind `?o` across every predicate with `?p`
+    // left unbound (`?p = NULL`). This PR newly routes bound subjects here, so
+    // leave that shape unconverted for normal evaluation. (The var-subject
+    // wildcard `?s ?p ?o` keeps its existing all-maps scan behavior.)
+    if subject_constant.is_some() && predicate_filter.is_none() && object_var.is_some() {
+        return None;
+    }
+
+    let mut pattern = make_pattern(object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
     }
+    pattern.object_constant = object_constant;
 
     Some(pattern)
 }
@@ -385,5 +717,182 @@ mod tests {
         assert!(tp.s.is_var());
         assert!(tp.p.is_var());
         assert!(tp.o.is_var());
+    }
+
+    // subject=VarId(0), object=VarId(1) → produced vars {0, 1}.
+    fn scan() -> Pattern {
+        Pattern::R2rml(R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))))
+    }
+
+    fn consumed_of(patterns: &[Pattern]) -> Option<&Expression> {
+        patterns.iter().find_map(|p| match p {
+            Pattern::R2rml(rp) => rp.consumed_filter.as_ref(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn loose_matchable_datatype_gate() {
+        use fluree_vocab::xsd_names;
+        // Untyped or any XSD datatype (string, integer, ...) → loose value match.
+        assert!(is_loose_matchable_datatype(&None));
+        assert!(is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::STRING))
+        )));
+        assert!(is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::INTEGER))
+        )));
+        // A language tag or a custom (non-XSD) datatype → strict; excluded (so
+        // `"chat"@fr` or `"x"^^custom` never loose-match).
+        assert!(!is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::LangTag("fr".into())
+        )));
+        assert!(!is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(100, "myType"))
+        )));
+    }
+
+    #[test]
+    fn consumes_scan_local_filter() {
+        // FILTER references only ?o (produced by the single scan): consumed.
+        let mut patterns = vec![scan(), Pattern::Filter(Expression::Var(VarId(1)))];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 1, "Filter pattern should be removed");
+        assert!(consumed_of(&patterns).is_some());
+    }
+
+    #[test]
+    fn keeps_filter_on_unproduced_var() {
+        // ?2 is not produced by the scan: leave the FILTER in place.
+        let mut patterns = vec![scan(), Pattern::Filter(Expression::Var(VarId(2)))];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_when_multiple_scans() {
+        // Two scans: a filter could depend on a join, so never consume.
+        let mut patterns = vec![
+            scan(),
+            Pattern::R2rml(R2rmlPattern::new("gs:main", VarId(2), Some(VarId(3)))),
+            Pattern::Filter(Expression::Var(VarId(1))),
+        ];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 3);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_when_non_scan_pattern_present() {
+        // A BIND (or any non-scan/non-filter pattern) could produce or reorder
+        // vars, so consumption is disabled for the whole group.
+        let mut patterns = vec![
+            scan(),
+            Pattern::Bind {
+                var: VarId(5),
+                expr: Expression::Var(VarId(1)),
+            },
+            Pattern::Filter(Expression::Var(VarId(1))),
+        ];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 3);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_with_unanalyzable_expression() {
+        // A Resolved binding (stand-in for EXISTS/comprehension constructs) is
+        // fail-closed: even though ?1 is produced, the filter is not consumed.
+        let expr = Expression::and(vec![
+            Expression::Var(VarId(1)),
+            Expression::Resolved(Box::new(crate::binding::Binding::Unbound)),
+        ]);
+        let mut patterns = vec![scan(), Pattern::Filter(expr)];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_metadata_read_filter() {
+        // FILTER(labels(?o) = ...) references only the scan-produced ?1, but a
+        // metadata read must route through the policy-aware async resolver, not
+        // the consumed sync path — so it stays with the in-engine FILTER.
+        use crate::ir::expression::Function;
+        let expr = Expression::Call {
+            func: Function::Labels,
+            args: vec![Expression::Var(VarId(1))],
+        };
+        let mut patterns = vec![scan(), Pattern::Filter(expr)];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap};
+
+    const CLASS: &str = "http://example.org/Person";
+    const PRED: &str = "http://example.org/name";
+
+    fn pom(pred: &str, col: &str) -> PredicateObjectMap {
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant(pred),
+            object_map: ObjectMap::column(col),
+        }
+    }
+
+    #[test]
+    fn class_fusion_safe_when_class_and_predicate_colocate() {
+        // One TriplesMap declares the class and the predicate — the star-schema
+        // shape fusion optimizes for.
+        let tm = TriplesMap::new("#TM", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        assert!(class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    #[test]
+    fn class_fusion_unsafe_when_split_across_triples_maps() {
+        // Vertically partitioned: TM_A holds the class, TM_B holds the predicate,
+        // sharing a subject template. No single map has both, so fusing the class
+        // into the predicate star would resolve zero maps → silent empty result.
+        let tm_class = TriplesMap::new("#TM_A", "people_class")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS);
+        let tm_pred = TriplesMap::new("#TM_B", "people_name")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "name"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_class, tm_pred]);
+        assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    #[test]
+    fn class_fusion_unsafe_when_a_predicate_map_lacks_the_class() {
+        // One predicate map co-locates the class, another resolves the same
+        // predicate without it. Fusing would drop rows from the classless map.
+        let tm_both = TriplesMap::new("#TM_both", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let tm_pred_only = TriplesMap::new("#TM_pred", "aliases")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "alias"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_both, tm_pred_only]);
+        assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    #[test]
+    fn class_fusion_unsafe_when_no_map_resolves_the_predicate() {
+        // Guards against fusing (and thus dropping the separate class scan) when
+        // the predicate resolves nowhere — the result must stay whatever the
+        // unfused plan produces, not silently collapse.
+        let tm = TriplesMap::new("#TM", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS);
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
     }
 }

@@ -112,6 +112,9 @@ mod result;
 mod vector;
 
 #[cfg(feature = "iceberg")]
+mod catalog_session;
+
+#[cfg(feature = "iceberg")]
 mod r2rml;
 
 // Re-export configuration types

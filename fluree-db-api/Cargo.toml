@@ -12,7 +12,9 @@ default = ["native"]
 native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice).
 aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws"]
-# Iceberg / R2RML graph source support (pulls in AWS SDK + native deps)
+# Iceberg / R2RML graph source support (pulls in AWS SDK + native deps). The
+# Arrow columnar reader is the single graph-source read path (native predicate
+# pushdown: row-group skipping + exact row filtering).
 iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
@@ -226,6 +228,10 @@ required-features = ["vector"]
 name = "it_vector_flatrank"
 path = "tests/it_vector_flatrank.rs"
 required-features = ["vector"]
+
+[[test]]
+name = "it_select_star_deep_crawl_stack"
+path = "tests/it_select_star_deep_crawl_stack.rs"
 
 [[bench]]
 name = "vector_query"

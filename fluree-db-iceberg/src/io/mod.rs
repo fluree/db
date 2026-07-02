@@ -15,6 +15,11 @@ pub mod parquet;
 pub mod send_parquet;
 pub mod storage;
 
+/// Arrow-based Parquet decode path (native projection / pruning / row filtering)
+/// — the single decode path for the Send reader.
+#[cfg(feature = "aws")]
+pub(crate) mod arrow_reader;
+
 pub use batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 pub use storage::{IcebergStorage, MemoryStorage, RangeOnlyStorage};
 

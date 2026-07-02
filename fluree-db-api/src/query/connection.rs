@@ -50,8 +50,11 @@ impl Fluree {
         spec: &DatasetSpec,
         qc_opts: &GovernanceOptions,
     ) -> TrackedResult<Option<GraphDb>> {
-        let view = self
-            .try_single_view_from_spec(spec)
+        // Box the view-load future: it drives the deep ledger-load / novelty-
+        // rebuild chain, whose inline future would otherwise inflate this frame
+        // (and the dispatcher frames above it) enough to overflow the default
+        // ~2 MB worker stack on a plain `select *` query (fluree/db#1408).
+        let view = Box::pin(self.try_single_view_from_spec(spec))
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
 
@@ -60,8 +63,7 @@ impl Fluree {
         };
 
         let source = &spec.default_graphs[0];
-        let view = self
-            .apply_source_or_global_policy(view, source, qc_opts)
+        let view = Box::pin(self.apply_source_or_global_policy(view, source, qc_opts))
             .await
             .map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))?;
         let view = self.apply_config_defaults(view, None);
@@ -307,33 +309,35 @@ impl Fluree {
             ));
         }
 
-        if let Some(view) = self
-            .prepare_single_view_for_connection_tracked(&spec, &qc_opts)
-            .await?
+        // Box each downstream future (view prep, query execution, dataset
+        // build): both the load-side (view prep) and the execute-side (query
+        // run + hydration crawl) are deep async chains, and inlining their
+        // futures here — plus in the dispatcher frames above — overflowed the
+        // default ~2 MB worker stack on a plain `select *` query
+        // (fluree/db#1408). Boxing keeps each on the heap so this frame is O(1).
+        if let Some(view) =
+            Box::pin(self.prepare_single_view_for_connection_tracked(&spec, &qc_opts)).await?
         {
-            return self
-                .query_tracked_with_options(
-                    &view,
-                    query_json,
-                    format_config,
-                    tracking_override,
-                    options,
-                )
-                .await;
+            return Box::pin(self.query_tracked_with_options(
+                &view,
+                query_json,
+                format_config,
+                tracking_override,
+                options,
+            ))
+            .await;
         }
 
         // Multi-ledger: use DataSetDb
-        let dataset = self
-            .build_dataset_for_connection_tracked(&spec, &qc_opts)
-            .await?;
+        let dataset = Box::pin(self.build_dataset_for_connection_tracked(&spec, &qc_opts)).await?;
 
-        self.query_dataset_tracked_with_options(
+        Box::pin(self.query_dataset_tracked_with_options(
             &dataset,
             query_json,
             format_config,
             tracking_override,
             options,
-        )
+        ))
         .await
     }
 

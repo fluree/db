@@ -6,6 +6,7 @@
 //! Iceberg table reachable via R2RML mappings — and gives it a plug shape
 //! that fits where a `Pattern::Triple` would otherwise sit.
 
+use crate::ir::Expression;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
@@ -594,8 +595,19 @@ pub struct R2rmlPattern {
     /// Graph source alias (e.g., "airlines-r2rml:main")
     pub graph_source_id: String,
 
-    /// Variable to bind the subject IRI
-    pub subject_var: VarId,
+    /// Variable to bind the subject IRI.
+    ///
+    /// `None` when the triple has a constant (bound) subject — see
+    /// `subject_constant`. Exactly one of `subject_var` / `subject_constant`
+    /// is set.
+    pub subject_var: Option<VarId>,
+
+    /// A constant (bound) subject in the triple pattern (`<store/5> <pred> ?o`):
+    /// the subject is a fixed IRI, not a variable. The operator materializes each
+    /// row's subject and keeps only rows whose subject equals this IRI, binding
+    /// no subject variable. Enforced as the pattern's semantics (independent of
+    /// scan pushdown).
+    pub subject_constant: Option<String>,
 
     /// Variable to bind the object value (optional)
     ///
@@ -633,6 +645,30 @@ pub struct R2rmlPattern {
     /// product over multi-valued predicates) binding the subject and every
     /// object var, instead of producing one pattern per triple and joining them.
     pub star_bindings: Vec<(String, VarId)>,
+
+    /// Same-subject star: additional `(predicate IRI, required constant)` equality
+    /// constraints checked in the SAME table scan, fused from constant-object
+    /// triples (`?s <pred> <const>`) that share `subject_var` with a star base.
+    /// A row survives only when, for every entry, the predicate produces at least
+    /// one object equal to the constant — an existence filter that produces no
+    /// variable, avoiding a separate scan + self-join.
+    pub star_constraints: Vec<(String, crate::r2rml::ObjectConstant)>,
+
+    /// A scan-local FILTER fully consumed into this scan by the planner: every
+    /// variable it references is produced by this pattern alone. The operator
+    /// applies it to its output rows (same evaluator as the in-engine FILTER, so
+    /// results are unchanged), which lets the downstream LIMIT row budget reach
+    /// the scan — the standalone `FilterOperator` that would otherwise block the
+    /// budget is dropped. `None` when no filter was consumed.
+    pub consumed_filter: Option<Expression>,
+
+    /// A constant object in the triple pattern (`?s <pred> <const>`): the object
+    /// is not a variable but a required literal or IRI. `object_var` is `None`;
+    /// the operator keeps a subject only when this predicate's object equals the
+    /// constant (enforced as the pattern's semantics, independent of scan
+    /// pushdown). A scalar literal also emits a `ScanFilter` for row-group + row
+    /// pruning; IRI constants are operator-enforced only.
+    pub object_constant: Option<crate::r2rml::ObjectConstant>,
 }
 
 impl R2rmlPattern {
@@ -644,13 +680,42 @@ impl R2rmlPattern {
     ) -> Self {
         Self {
             graph_source_id: graph_source_id.into(),
-            subject_var,
+            subject_var: Some(subject_var),
+            subject_constant: None,
             object_var,
             triples_map_iri: None,
             predicate_filter: None,
             class_filter: None,
             star_bindings: Vec::new(),
+            star_constraints: Vec::new(),
             scan_filters: Vec::new(),
+            consumed_filter: None,
+            object_constant: None,
+        }
+    }
+
+    /// Create a new R2RML pattern with a constant (bound) subject IRI.
+    ///
+    /// The subject is not a variable; the operator keeps only table rows whose
+    /// materialized subject equals `subject_constant` and binds no subject var.
+    pub fn new_bound_subject(
+        graph_source_id: impl Into<String>,
+        subject_constant: impl Into<String>,
+        object_var: Option<VarId>,
+    ) -> Self {
+        Self {
+            graph_source_id: graph_source_id.into(),
+            subject_var: None,
+            subject_constant: Some(subject_constant.into()),
+            object_var,
+            triples_map_iri: None,
+            predicate_filter: None,
+            class_filter: None,
+            star_bindings: Vec::new(),
+            star_constraints: Vec::new(),
+            scan_filters: Vec::new(),
+            consumed_filter: None,
+            object_constant: None,
         }
     }
 
@@ -676,7 +741,10 @@ impl R2rmlPattern {
     /// variables (only the static graph_source_id and metadata filters), so
     /// referenced and produced are the same set.
     pub fn produced_vars(&self) -> Vec<VarId> {
-        let mut vars = vec![self.subject_var];
+        let mut vars = Vec::new();
+        if let Some(sv) = self.subject_var {
+            vars.push(sv);
+        }
         if let Some(obj_var) = self.object_var {
             vars.push(obj_var);
         }

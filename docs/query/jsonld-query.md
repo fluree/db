@@ -83,7 +83,7 @@ Specifies what to return in results. The shape of `select` determines the shape 
 }
 ```
 
-The array value is the selection spec — `"*"` for all forward properties, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
+The array value is the selection spec — `"*"` for all forward properties, `"@id"` for the subject IRI, `"@type"` (equivalently `"rdf:type"`) for the subject's types, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
 
 **Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
 

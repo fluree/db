@@ -17,6 +17,10 @@ mod term;
 // HashMap-based API (for testing and simple use)
 pub use term::{expand_template, materialize_object, materialize_subject, RdfTerm};
 
+// Subject-template reversal (constant IRI → raw column values), for pushing a
+// bound-subject predicate down to the Iceberg scan.
+pub use term::reverse_subject_template;
+
 // ColumnBatch-based API (for production efficiency)
 pub use term::{
     expand_template_from_batch, get_join_key_from_batch, materialize_object_from_batch,
