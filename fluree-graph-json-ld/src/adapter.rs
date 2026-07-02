@@ -209,6 +209,14 @@ fn process_value<S: GraphSink>(value: &Value, sink: &mut S) -> Result<ProcessedV
         Value::Object(obj) => {
             // Check for @id (reference to another node)
             if let Some(id_val) = obj.get("@id") {
+                // An embedded node object carrying more than a bare `@id`
+                // asserts its own triples (JSON-LD embedded-node semantics);
+                // recurse so they aren't silently dropped. A `{"@id": ...}`
+                // singleton is a pure reference.
+                if obj.len() > 1 {
+                    let subject_id = process_node(value, sink, None)?;
+                    return Ok(ProcessedValue::Single(subject_id));
+                }
                 let id_str = id_val.as_str().ok_or_else(|| {
                     AdapterError::InvalidStructure("@id must be a string".to_string())
                 })?;
@@ -1121,5 +1129,34 @@ mod tests {
                 other => panic!("Expected literal, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn embedded_node_with_id_asserts_its_own_triples() {
+        // {"@id": ..., <props>} nested as a value is an embedded node, not a
+        // bare reference — its own triples must be emitted, not dropped.
+        let expanded = json!([{
+            "@id": "http://example.org/shape",
+            "http://example.org/ns#property": [{
+                "@id": "http://example.org/ps1",
+                "http://example.org/ns#minCount": [{"@value": 1}]
+            }]
+        }]);
+
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+
+        let graph = sink.graph();
+        // shape →property→ ps1, plus ps1 →minCount→ 1
+        assert_eq!(graph.len(), 2);
+
+        let mut sink = GraphCollectorSink::new();
+        // A bare {"@id": ...} singleton stays a pure reference.
+        let expanded = json!([{
+            "@id": "http://example.org/shape",
+            "http://example.org/ns#property": [{"@id": "http://example.org/ps1"}]
+        }]);
+        to_graph_events(&expanded, &mut sink).unwrap();
+        assert_eq!(sink.graph().len(), 1);
     }
 }
