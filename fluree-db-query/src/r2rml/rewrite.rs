@@ -27,10 +27,11 @@
 use crate::ir::adapters::ScanPushdown;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
-use crate::r2rml::{ScanCmpOp, ScanValue};
+use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
-use fluree_db_core::{FlakeValue, LedgerSnapshot};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
 /// Result of rewriting patterns for R2RML.
@@ -234,10 +235,120 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
+    // Consume a fully scan-local FILTER into the single R2RML scan so the
+    // downstream LIMIT row budget can reach it. Narrow and safe: only when the
+    // group is purely R2RML scans and FILTERs (no OPTIONAL / UNION / BIND /
+    // multi-scan join) and there is exactly one R2RML pattern, so a filter whose
+    // variables are all produced by that scan cannot depend on any other pattern.
+    // The operator re-applies the moved filter with the same evaluator (results
+    // unchanged); removing the `Pattern::Filter` is what lets the budget flow.
+    consume_scan_local_filters(&mut result_patterns);
+
     R2rmlRewriteResult {
         patterns: result_patterns,
         converted_count: converted,
         unconverted_count: unconverted,
+    }
+}
+
+/// Whether scan-local FILTER consumption is enabled. Read once from
+/// `FLUREE_R2RML_FILTER_CONSUMPTION` (only `0`/`false`/`off` disable it). The
+/// kill switch keeps the FILTER in the plan (no LIMIT flow) for A/B validation.
+fn filter_consumption_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_FILTER_CONSUMPTION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Move scan-local top-level FILTERs into the single R2RML scan's
+/// `consumed_filter`, removing them from the pattern list. See the call site for
+/// the safety conditions.
+fn consume_scan_local_filters(patterns: &mut Vec<Pattern>) {
+    if !filter_consumption_enabled() {
+        return;
+    }
+    let all_scan_or_filter = patterns
+        .iter()
+        .all(|p| matches!(p, Pattern::R2rml(_) | Pattern::Filter(_)));
+    let scan_count = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::R2rml(_)))
+        .count();
+    if !all_scan_or_filter || scan_count != 1 {
+        return;
+    }
+
+    let produced: HashSet<VarId> = patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp.produced_vars().into_iter().collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut consumed: Vec<Expression> = Vec::new();
+    patterns.retain(|p| {
+        if let Pattern::Filter(expr) = p {
+            let mut vars = HashSet::new();
+            // A Cypher metadata read (`type`/`labels`/`keys`/...) is a `Call`
+            // that `collect_expr_vars` would accept, but the consumed path applies
+            // it via synchronous `filter_batch`, bypassing the policy-aware async
+            // resolver the standalone `FilterOperator` uses under a view policy.
+            // Leave it in place so authority — and fail-closed behavior — stays
+            // with the in-engine FILTER.
+            if crate::eval::metadata_resolve::contains_metadata_read(expr) {
+                return true;
+            }
+            // A variable-free filter (constant), one this analysis can't fully
+            // understand, or one touching a var the scan does not produce is
+            // left in place for the in-engine FILTER.
+            if collect_expr_vars(expr, &mut vars)
+                && !vars.is_empty()
+                && vars.iter().all(|v| produced.contains(v))
+            {
+                consumed.push(expr.clone());
+                return false;
+            }
+        }
+        true
+    });
+
+    if consumed.is_empty() {
+        return;
+    }
+    let combined = if consumed.len() == 1 {
+        consumed.pop().unwrap()
+    } else {
+        Expression::and(consumed)
+    };
+    for p in patterns.iter_mut() {
+        if let Pattern::R2rml(rp) = p {
+            rp.consumed_filter = Some(combined);
+            break;
+        }
+    }
+}
+
+/// Collect all variables referenced by an expression into `out`, returning
+/// `false` if the expression contains a construct this analysis does not fully
+/// understand (EXISTS, comprehensions, maps, resolved bindings, ...). A `false`
+/// result means the filter must NOT be consumed: it may reference variables — or
+/// carry scoping semantics — this walk cannot see, so the in-engine FILTER keeps
+/// authority. Only plain `Call` trees over `Var`/`Const` are consumable.
+fn collect_expr_vars(expr: &Expression, out: &mut HashSet<VarId>) -> bool {
+    match expr {
+        Expression::Var(v) => {
+            out.insert(*v);
+            true
+        }
+        Expression::Const(_) => true,
+        Expression::Call { args, .. } => args.iter().all(|a| collect_expr_vars(a, out)),
+        _ => false,
     }
 }
 
@@ -299,11 +410,37 @@ fn cmp_op(func: &Function, reversed: bool) -> Option<ScanCmpOp> {
 
 /// Convert a constant literal to a prunable `ScanValue`. Only date, integer and
 /// boolean are pushed; everything else stays with the in-engine FILTER.
+/// Whether a triple's object datatype constraint permits a loose (value-only)
+/// constant-object match. The product matches untyped literals loosely, and a
+/// literal written without an explicit `^^type` carries its natural XSD datatype
+/// (`xsd:string`, `xsd:integer`, ...), so any XSD-namespaced datatype qualifies.
+/// A language tag or a custom (non-XSD) datatype requires strict matching and is
+/// excluded from this path.
+fn is_loose_matchable_datatype(dtc: &Option<DatatypeConstraint>) -> bool {
+    match dtc {
+        None => true,
+        Some(DatatypeConstraint::Explicit(sid)) => sid.namespace_code == XSD,
+        Some(DatatypeConstraint::LangTag(_)) => false,
+    }
+}
+
+/// The scan value for a constant object literal, or `None` for value types not
+/// yet supported as constant objects (float/decimal/date, refs).
+fn const_object_scan_value(value: &FlakeValue) -> Option<ScanValue> {
+    match value {
+        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
+        FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
+        FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
+        _ => None,
+    }
+}
+
 fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     match value {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
         FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
         FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
+        FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
         _ => None,
     }
 }
@@ -455,25 +592,35 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(_) => None, // Predicate is variable - no filter
     };
 
-    // Extract object variable
-    // If object is bound (constant), don't rewrite - we can't currently push
-    // object value constraints into the R2RML scan, so the original pattern
-    // needs to be preserved for correct filtering.
-    let object_var = match &tp.o {
-        Term::Var(v) => Some(*v),
-        Term::Sid(_) | Term::Iri(_) | Term::Value(_) => {
-            // Object is bound - don't rewrite this pattern.
-            // The R2RML scan cannot filter by object value, and rewriting
-            // would drop the constraint, returning incorrect results.
-            // Preserve the original triple pattern for normal evaluation.
-            return None;
+    // Extract the object: a variable, or a constant equality constraint the
+    // operator enforces. A constant predicate is required (to resolve the map).
+    //   - Literal (string/integer/boolean, loose-matchable datatype) → Scalar.
+    //   - Bound IRI / ref object (`?s edw:geography <geo/1>`) → Iri.
+    // Language-tagged / custom-typed literals need strict matching, and
+    // float/decimal/date literals are not pushed yet — all left unconverted
+    // (rejected as unsupported) rather than mismatched.
+    let object_constant: Option<ObjectConstant> = match &tp.o {
+        Term::Value(v) if predicate_filter.is_some() && is_loose_matchable_datatype(&tp.dtc) => {
+            const_object_scan_value(v).map(ObjectConstant::Scalar)
         }
+        Term::Iri(iri) if predicate_filter.is_some() => Some(ObjectConstant::Iri(iri.to_string())),
+        Term::Sid(sid) if predicate_filter.is_some() => {
+            snapshot.decode_sid(sid).map(ObjectConstant::Iri)
+        }
+        _ => None,
+    };
+    let object_var = match (&tp.o, &object_constant) {
+        (Term::Var(v), _) => Some(*v),
+        (_, Some(_)) => None,
+        // Bound object we cannot yet convert.
+        _ => return None,
     };
 
     let mut pattern = R2rmlPattern::new(graph_source_id, subject_var, object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
     }
+    pattern.object_constant = object_constant;
 
     Some(pattern)
 }
@@ -506,6 +653,117 @@ mod tests {
         assert!(tp.s.is_var());
         assert!(tp.p.is_var());
         assert!(tp.o.is_var());
+    }
+
+    // subject=VarId(0), object=VarId(1) → produced vars {0, 1}.
+    fn scan() -> Pattern {
+        Pattern::R2rml(R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1))))
+    }
+
+    fn consumed_of(patterns: &[Pattern]) -> Option<&Expression> {
+        patterns.iter().find_map(|p| match p {
+            Pattern::R2rml(rp) => rp.consumed_filter.as_ref(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn loose_matchable_datatype_gate() {
+        use fluree_vocab::xsd_names;
+        // Untyped or any XSD datatype (string, integer, ...) → loose value match.
+        assert!(is_loose_matchable_datatype(&None));
+        assert!(is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::STRING))
+        )));
+        assert!(is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::INTEGER))
+        )));
+        // A language tag or a custom (non-XSD) datatype → strict; excluded (so
+        // `"chat"@fr` or `"x"^^custom` never loose-match).
+        assert!(!is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::LangTag("fr".into())
+        )));
+        assert!(!is_loose_matchable_datatype(&Some(
+            DatatypeConstraint::Explicit(Sid::new(100, "myType"))
+        )));
+    }
+
+    #[test]
+    fn consumes_scan_local_filter() {
+        // FILTER references only ?o (produced by the single scan): consumed.
+        let mut patterns = vec![scan(), Pattern::Filter(Expression::Var(VarId(1)))];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 1, "Filter pattern should be removed");
+        assert!(consumed_of(&patterns).is_some());
+    }
+
+    #[test]
+    fn keeps_filter_on_unproduced_var() {
+        // ?2 is not produced by the scan: leave the FILTER in place.
+        let mut patterns = vec![scan(), Pattern::Filter(Expression::Var(VarId(2)))];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_when_multiple_scans() {
+        // Two scans: a filter could depend on a join, so never consume.
+        let mut patterns = vec![
+            scan(),
+            Pattern::R2rml(R2rmlPattern::new("gs:main", VarId(2), Some(VarId(3)))),
+            Pattern::Filter(Expression::Var(VarId(1))),
+        ];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 3);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_when_non_scan_pattern_present() {
+        // A BIND (or any non-scan/non-filter pattern) could produce or reorder
+        // vars, so consumption is disabled for the whole group.
+        let mut patterns = vec![
+            scan(),
+            Pattern::Bind {
+                var: VarId(5),
+                expr: Expression::Var(VarId(1)),
+            },
+            Pattern::Filter(Expression::Var(VarId(1))),
+        ];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 3);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_filter_with_unanalyzable_expression() {
+        // A Resolved binding (stand-in for EXISTS/comprehension constructs) is
+        // fail-closed: even though ?1 is produced, the filter is not consumed.
+        let expr = Expression::and(vec![
+            Expression::Var(VarId(1)),
+            Expression::Resolved(Box::new(crate::binding::Binding::Unbound)),
+        ]);
+        let mut patterns = vec![scan(), Pattern::Filter(expr)];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
+    }
+
+    #[test]
+    fn keeps_metadata_read_filter() {
+        // FILTER(labels(?o) = ...) references only the scan-produced ?1, but a
+        // metadata read must route through the policy-aware async resolver, not
+        // the consumed sync path — so it stays with the in-engine FILTER.
+        use crate::ir::expression::Function;
+        let expr = Expression::Call {
+            func: Function::Labels,
+            args: vec![Expression::Var(VarId(1))],
+        };
+        let mut patterns = vec![scan(), Pattern::Filter(expr)];
+        consume_scan_local_filters(&mut patterns);
+        assert_eq!(patterns.len(), 2);
+        assert!(consumed_of(&patterns).is_none());
     }
 
     use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap};

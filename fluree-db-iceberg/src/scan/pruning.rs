@@ -205,29 +205,30 @@ fn bounds_can_contain(
 
 /// Row-group-level pruning: can this Parquet row group contain a row matching
 /// `expr`? Conservative — returns `true` unless the row group's column
-/// statistics prove no row can match. `field_to_col` maps an Iceberg field id to
-/// the Parquet column index in this file.
+/// statistics prove no row can match. `field_id_to_leaf` maps an Iceberg field
+/// id to the Parquet **leaf** column index in this file (what
+/// `RowGroupMetaData::column` indexes; root ≠ leaf under nested schemas).
 pub fn row_group_can_contain(
     expr: &Expression,
     row_group: &RowGroupMetaData,
-    field_to_col: &HashMap<i32, usize>,
+    field_id_to_leaf: &HashMap<i32, usize>,
 ) -> bool {
     match expr {
         Expression::AlwaysTrue => true,
         Expression::AlwaysFalse => false,
         Expression::And(exprs) => exprs
             .iter()
-            .all(|e| row_group_can_contain(e, row_group, field_to_col)),
+            .all(|e| row_group_can_contain(e, row_group, field_id_to_leaf)),
         Expression::Or(exprs) => exprs
             .iter()
-            .any(|e| row_group_can_contain(e, row_group, field_to_col)),
+            .any(|e| row_group_can_contain(e, row_group, field_id_to_leaf)),
         Expression::Comparison {
             field_id,
             op,
             value,
             ..
         } => {
-            let Some(&col_idx) = field_to_col.get(field_id) else {
+            let Some(&col_idx) = field_id_to_leaf.get(field_id) else {
                 return true;
             };
             let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
@@ -240,7 +241,7 @@ pub fn row_group_can_contain(
         Expression::In {
             field_id, values, ..
         } => {
-            let Some(&col_idx) = field_to_col.get(field_id) else {
+            let Some(&col_idx) = field_id_to_leaf.get(field_id) else {
                 return true;
             };
             let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
@@ -304,6 +305,17 @@ fn stat_bounds(stats: &Statistics, like: &TypedValue) -> (Option<TypedValue>, Op
             s.min_opt().map(|&v| TypedValue::Int64(v)),
             s.max_opt().map(|&v| TypedValue::Int64(v)),
         ),
+        // UTF-8 string min/max. Parquet stats are valid bounds even when the
+        // writer truncates them (min truncated down, max up), so lexicographic
+        // pruning stays conservative. Non-UTF-8 bytes fall through to no bound.
+        (Statistics::ByteArray(s), TypedValue::String(_)) => {
+            let to_str = |b: &parquet::data_type::ByteArray| {
+                std::str::from_utf8(b.data())
+                    .ok()
+                    .map(|v| TypedValue::String(v.to_string()))
+            };
+            (s.min_opt().and_then(to_str), s.max_opt().and_then(to_str))
+        }
         _ => (None, None),
     }
 }
@@ -731,5 +743,102 @@ mod tests {
         // A field the query does not map is conservative — keep the row group.
         let unmapped = HashMap::from([(2i32, 0usize)]);
         assert!(row_group_can_contain(&ge, meta.row_group(0), &unmapped));
+    }
+
+    /// Two row groups with disjoint UTF-8 string ranges, for `ByteArray`-stats
+    /// pruning: rg0 = [apple, cherry], rg1 = [mango, peach].
+    fn two_row_group_string_parquet() -> bytes::Bytes {
+        use parquet::data_type::{ByteArray, ByteArrayType};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let schema =
+            Arc::new(parse_message_type("message s { REQUIRED BYTE_ARRAY v (UTF8); }").unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            for vals in [["apple", "banana", "cherry"], ["mango", "orange", "peach"]] {
+                let arr: Vec<ByteArray> = vals.iter().map(|s| ByteArray::from(*s)).collect();
+                let mut rg = writer.next_row_group().unwrap();
+                let mut col = rg.next_column().unwrap().unwrap();
+                col.typed::<ByteArrayType>()
+                    .write_batch(&arr, None, None)
+                    .unwrap();
+                col.close().unwrap();
+                rg.close().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn row_group_pruning_uses_string_stats() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(two_row_group_string_parquet()).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 2);
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let cmp = |op, v: &str| Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op,
+            value: LiteralValue::String(v.to_string()),
+        };
+
+        // = "banana": only rg0 (in [apple, cherry]); rg1 (min mango) pruned.
+        let eq_b = cmp(ComparisonOp::Eq, "banana");
+        assert!(row_group_can_contain(
+            &eq_b,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &eq_b,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // = "orange": rg0 (max cherry) pruned; only rg1 can contain it.
+        let eq_o = cmp(ComparisonOp::Eq, "orange");
+        assert!(!row_group_can_contain(
+            &eq_o,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &eq_o,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // >= "m": rg0 (max cherry < m) pruned; rg1 kept.
+        let ge_m = cmp(ComparisonOp::GtEq, "m");
+        assert!(!row_group_can_contain(
+            &ge_m,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &ge_m,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // < "m": rg0 kept; rg1 (min mango > m) pruned.
+        let lt_m = cmp(ComparisonOp::Lt, "m");
+        assert!(row_group_can_contain(
+            &lt_m,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &lt_m,
+            meta.row_group(1),
+            &field_to_col
+        ));
     }
 }

@@ -35,15 +35,31 @@ pub enum ScanCmpOp {
 
 /// A literal value for a pushed-down scan filter.
 ///
-/// Intentionally limited to the types that prune safely against Iceberg column
-/// min/max bounds in the MVP (date partition pruning is the target). Decimal /
-/// float / string predicates are left to the in-engine FILTER.
+/// Limited to types that prune safely against Iceberg column min/max bounds and
+/// that the Arrow row filter can evaluate: date/int/bool, plus strings
+/// (lexicographic, e.g. equality on a name/code column). Decimal / float
+/// predicates are left to the in-engine FILTER.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanValue {
     Bool(bool),
     Int(i64),
     /// Days since 1970-01-01 (matches Iceberg date storage).
     Date(i32),
+    /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
+    Str(String),
+}
+
+/// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the
+/// R2RML operator so results are correct regardless of scan pushdown.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ObjectConstant {
+    /// A literal object — loose value match (string/integer/boolean).
+    Scalar(ScanValue),
+    /// A bound IRI object — exact IRI match, e.g. a reference to a parent entity
+    /// (`?s edw:geography <geo/1>`). Compared against the materialized IRI; the
+    /// column-level scan filter is not applied to these yet (a FK-key pushdown
+    /// needs subject-template reversal), so only the operator enforces them.
+    Iri(String),
 }
 
 /// A predicate pushed down to the Iceberg scan for file pruning.

@@ -96,6 +96,7 @@ fn build_iceberg_filter(
                 },
                 _ => LiteralValue::Int64(*n),
             },
+            ScanValue::Str(s) => LiteralValue::String(s.clone()),
         };
         comparisons.push(Expression::Comparison {
             field_id: field.id,

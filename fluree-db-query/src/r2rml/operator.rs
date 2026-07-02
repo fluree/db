@@ -33,6 +33,8 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::eval::PreparedBoolExpression;
+use crate::filter::filter_batch;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -43,7 +45,7 @@ use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateObjectM
 use fluree_db_r2rml::materialize::{
     get_join_key_from_batch, materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
 };
-use fluree_db_tabular::ColumnBatch;
+use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -172,6 +174,12 @@ pub struct R2rmlScanOperator {
     row_budget: Option<usize>,
     /// Output rows emitted so far, counted against `row_budget`.
     emitted: usize,
+    /// A scan-local FILTER the planner folded into this scan (see
+    /// [`R2rmlPattern::consumed_filter`]). Applied to each output batch with the
+    /// same evaluator the dropped `FilterOperator` would use, so results are
+    /// unchanged — but now the LIMIT budget and the filter live in one operator,
+    /// so a `FILTER + LIMIT` scan can stop after enough *matching* rows.
+    consumed_filter: Option<PreparedBoolExpression>,
     /// State
     state: OperatorState,
 }
@@ -213,6 +221,11 @@ impl R2rmlScanOperator {
 
         let schema = Arc::from(schema_vars);
 
+        let consumed_filter = pattern
+            .consumed_filter
+            .clone()
+            .map(PreparedBoolExpression::new);
+
         Self {
             child,
             pattern,
@@ -224,7 +237,26 @@ impl R2rmlScanOperator {
             scan_cache: HashMap::new(),
             row_budget: None,
             emitted: 0,
+            consumed_filter,
             state: OperatorState::Created,
+        }
+    }
+
+    /// Build the output batch from accumulated `columns`, applying the consumed
+    /// scan-local filter when present. Returns `None` when nothing survives (an
+    /// empty window, or every row filtered out), so the caller keeps pulling.
+    fn finalize_batch(
+        &self,
+        columns: Vec<Vec<Binding>>,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Batch>> {
+        let batch = Batch::new(Arc::clone(&self.schema), columns)?;
+        if batch.is_empty() {
+            return Ok(None);
+        }
+        match &self.consumed_filter {
+            Some(prepared) => filter_batch(&batch, prepared, &self.schema, ctx),
+            None => Ok(Some(batch)),
         }
     }
 
@@ -256,8 +288,8 @@ impl R2rmlScanOperator {
 
     /// Resolve this pattern's pushdown predicates (keyed by query variable) to
     /// table columns for the given TriplesMap, producing scan filters. A
-    /// variable maps to a column via its predicate IRI; predicates backed by a
-    /// RefObjectMap (an IRI join, not a scalar column) are skipped.
+    /// variable maps to a column via its predicate IRI; only plain `rr:column`
+    /// scalar object maps are pushable (see [`value_pushdown_column`]).
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
         let mut out = Vec::new();
         for pd in &self.pattern.scan_filters {
@@ -284,18 +316,36 @@ impl R2rmlScanOperator {
             let (Some(pom), None) = (matching.next(), matching.next()) else {
                 continue;
             };
-            if matches!(pom.object_map, ObjectMap::RefObjectMap(_)) {
-                continue;
-            }
-            let cols = pom.object_map.referenced_columns();
-            let [col] = cols.as_slice() else {
+            let Some(col) = value_pushdown_column(&pom.object_map) else {
                 continue;
             };
             out.push(crate::r2rml::ScanFilter {
-                column: (*col).to_string(),
+                column: col.to_string(),
                 op: pd.op,
                 value: pd.value.clone(),
             });
+        }
+
+        // A scalar constant-object equality pushes as a scan filter too
+        // (optimization; the operator enforces correctness). IRI constants are
+        // operator-enforced only — a FK-key pushdown needs template reversal.
+        if let (Some(crate::r2rml::ObjectConstant::Scalar(value)), Some(pred_iri)) = (
+            &self.pattern.object_constant,
+            self.pattern.predicate_filter.as_deref(),
+        ) {
+            let mut matching = triples_map
+                .predicate_object_maps
+                .iter()
+                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+            if let (Some(pom), None) = (matching.next(), matching.next()) {
+                if let Some(col) = value_pushdown_column(&pom.object_map) {
+                    out.push(crate::r2rml::ScanFilter {
+                        column: col.to_string(),
+                        op: crate::r2rml::ScanCmpOp::Eq,
+                        value: value.clone(),
+                    });
+                }
+            }
         }
         out
     }
@@ -670,6 +720,12 @@ impl R2rmlScanOperator {
         // Under a LIMIT, cap the materialize window at the remaining budget so a
         // `LIMIT n` does not explode a full 512K-row window into bindings before
         // the first output row.
+        // Cap the window to the remaining LIMIT budget. This holds for a
+        // consumed filter too: the budget counts *matching* rows while a window
+        // materializes unfiltered rows, but the `next_batch` loop re-checks the
+        // post-filter `emitted` and keeps pulling more windows until the budget
+        // is met, so a bounded window can never under-return — it only avoids
+        // materializing a full window before the filter runs.
         let window_rows = match self.row_budget {
             Some(b) => materialize_window_rows().min(b.saturating_sub(self.emitted).max(1)),
             None => materialize_window_rows(),
@@ -1050,6 +1106,21 @@ impl LiteralEncoder {
     }
 }
 
+/// The backing column of an object map whose materialized literal value is the
+/// raw column value *verbatim*, so a column-level scan filter comparing that
+/// value cannot drop a row the operator would keep. Only plain `rr:column`
+/// qualifies: `Template` transforms the value (`"PREFIX-{code}"` ≠ `code`),
+/// `Constant` ignores the row, and `RefObjectMap` is an IRI join. Pushing a
+/// filter for those compares the raw column against a transformed constant and
+/// silently prunes matching rows, violating the pushdown-is-only-an-optimization
+/// invariant.
+fn value_pushdown_column(om: &ObjectMap) -> Option<&str> {
+    match om {
+        ObjectMap::Column { column, .. } => Some(column.as_str()),
+        _ => None,
+    }
+}
+
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
 fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
     use fluree_db_r2rml::mapping::ConstantValue;
@@ -1102,6 +1173,73 @@ fn materialize_pom_object(
             table_row_idx,
         )?)
     }
+}
+
+/// Whether a materialized object term equals a constant-object constraint.
+/// IRI constants match exactly; literal (scalar) constants are loose-matched
+/// (gated in `convert_triple_to_r2rml`), comparing the value and ignoring the
+/// materialized term's datatype/language.
+///
+/// Integer comparison never uses `f64` (which would admit false positives across
+/// adjacent large integers). It matches an exact integer lexical form always,
+/// and a decimal lexical form (`"100.00"`) only when `numeric_column` — i.e. the
+/// object's backing column is Decimal/Float. The Arrow scan filter casts the
+/// pushed integer literal into the column's own type, so it keeps `100.00` for a
+/// numeric column but drops a text `"100.00"` cell; mirroring that here keeps the
+/// operator match a superset of the scan filter (pushdown never drops a kept row)
+/// while still answering `?s :amount 100` against a `DECIMAL(10,2)` column.
+fn rdf_term_eq_object_constant(
+    term: &RdfTerm,
+    constant: &crate::r2rml::ObjectConstant,
+    numeric_column: bool,
+) -> bool {
+    use crate::r2rml::{ObjectConstant, ScanValue};
+    match constant {
+        // Bound IRI / ref object: exact IRI match.
+        ObjectConstant::Iri(iri) => matches!(term, RdfTerm::Iri(v) if v == iri),
+        // Literal object: loose value match, ignoring datatype/language.
+        ObjectConstant::Scalar(value) => {
+            let RdfTerm::Literal { value: v, .. } = term else {
+                return false;
+            };
+            match value {
+                ScanValue::Str(s) => v == s,
+                ScanValue::Int(n) => {
+                    v.parse::<i64>().is_ok_and(|x| x == *n)
+                        || (numeric_column && decimal_lexical_eq_int(v, *n))
+                }
+                ScanValue::Bool(b) => match v.as_str() {
+                    "true" | "1" => *b,
+                    "false" | "0" => !*b,
+                    _ => false,
+                },
+                // Date constant objects are not produced by convert yet.
+                ScanValue::Date(_) => false,
+            }
+        }
+    }
+}
+
+/// Whether a decimal lexical form (`"100.00"`, `"-100.0"`) equals integer `n`
+/// exactly: the fractional digits are all zero and the integer part parses to
+/// `n`. Uses no `f64`, so it stays exact for integers beyond `2^53`.
+fn decimal_lexical_eq_int(v: &str, n: i64) -> bool {
+    let (int_part, frac_part) = v.split_once('.').unwrap_or((v, ""));
+    frac_part.bytes().all(|b| b == b'0') && int_part.parse::<i64>().is_ok_and(|x| x == n)
+}
+
+/// Whether the object's backing column is a numeric (Decimal/Float) physical
+/// type, so an integer constant may match a decimal lexical form. Only a plain
+/// `rr:column` object qualifies — anything else does not push a scan filter (see
+/// [`value_pushdown_column`]), so the strict lexical match already suffices.
+fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
+    let ObjectMap::Column { column, .. } = &pom.object_map else {
+        return false;
+    };
+    matches!(
+        batch.column_by_name(column),
+        Some(Column::Decimal { .. } | Column::Float32(_) | Column::Float64(_))
+    )
 }
 
 /// Materialize one column batch into produced variable assignments (subject +
@@ -1185,6 +1323,34 @@ fn materialize_batch(
         }
 
         let Some(obj_var) = pattern.object_var else {
+            // Constant-object (`?s <pred> "value"`): keep the subject only when
+            // this predicate has an object equal to the required constant. The
+            // equality is the pattern's semantics, so it is enforced here
+            // regardless of scan pushdown; the pushed ScanFilter is only an
+            // optimization on top.
+            if let Some(required) = &pattern.object_constant {
+                let mut matched = false;
+                for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
+                    pattern
+                        .predicate_filter
+                        .as_deref()
+                        .is_some_and(|pf| pom.predicate_map.as_constant() == Some(pf))
+                }) {
+                    if let Some(t) =
+                        materialize_pom_object(pom, iceberg_batch, table_row_idx, parent_lookups)?
+                    {
+                        let numeric = object_column_is_numeric(pom, iceberg_batch);
+                        if rdf_term_eq_object_constant(&t, required, numeric) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if matched {
+                    produced.push(vec![(pattern.subject_var, subject_binding)]);
+                }
+                continue;
+            }
             produced.push(vec![(pattern.subject_var, subject_binding)]);
             continue;
         };
@@ -1333,17 +1499,41 @@ impl Operator for R2rmlScanOperator {
                 }
             }
             // Emit once a full batch is accumulated, or once the LIMIT budget is
-            // met — the latter stops the scan early without pulling/materializing
-            // more (the downstream LIMIT truncates to the exact count).
+            // (optimistically) met. With a consumed filter the pre-filter count
+            // over-estimates matches, so this only triggers an emit *attempt* —
+            // `finalize_batch` filters and `emitted` counts the survivors; if
+            // that leaves the budget unmet the loop keeps pulling. Enabling it
+            // for the consumed case is what stops the scan after ~one window
+            // instead of accumulating a full `batch_size` before filtering.
             let budget_met = self
                 .row_budget
                 .is_some_and(|b| self.emitted + columns[0].len() >= b);
             if columns[0].len() >= ctx.batch_size || (budget_met && !columns[0].is_empty()) {
-                self.emitted += columns[0].len();
-                if self.row_budget.is_some_and(|b| self.emitted >= b) {
-                    self.state = OperatorState::Exhausted;
+                // Fast path (no consumed filter): emit the accumulated columns
+                // directly, exactly as before — no extra allocation.
+                if self.consumed_filter.is_none() {
+                    self.emitted += columns[0].len();
+                    if self.row_budget.is_some_and(|b| self.emitted >= b) {
+                        self.state = OperatorState::Exhausted;
+                    }
+                    return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
                 }
-                return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+                // Consumed-filter path: filter this window, count matching rows,
+                // and keep pulling if the whole window is filtered out.
+                let taken = std::mem::replace(
+                    &mut columns,
+                    (0..num_cols)
+                        .map(|_| Vec::with_capacity(ctx.batch_size))
+                        .collect(),
+                );
+                if let Some(out) = self.finalize_batch(taken, ctx)? {
+                    self.emitted += out.len();
+                    if self.row_budget.is_some_and(|b| self.emitted >= b) {
+                        self.state = OperatorState::Exhausted;
+                    }
+                    return Ok(Some(out));
+                }
+                continue;
             }
 
             // 2. Advance an in-flight scan by one materialization window. The
@@ -1372,8 +1562,20 @@ impl Operator for R2rmlScanOperator {
                         self.state = OperatorState::Exhausted;
                         return Ok(None);
                     }
-                    self.emitted += columns[0].len();
-                    return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+                    // Fast path (no consumed filter): emit directly, unchanged.
+                    if self.consumed_filter.is_none() {
+                        self.emitted += columns[0].len();
+                        return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
+                    }
+                    // The child is exhausted, so this is the terminal batch
+                    // whether or not any row survives the consumed filter.
+                    self.state = OperatorState::Exhausted;
+                    let taken = std::mem::take(&mut columns);
+                    if let Some(out) = self.finalize_batch(taken, ctx)? {
+                        self.emitted += out.len();
+                        return Ok(Some(out));
+                    }
+                    return Ok(None);
                 }
             }
         }
@@ -1391,5 +1593,173 @@ impl Operator for R2rmlScanOperator {
     fn estimated_rows(&self) -> Option<usize> {
         // Could use Iceberg table statistics in the future
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::r2rml::{ObjectConstant, ScanValue};
+    use fluree_db_r2rml::materialize::RdfTerm;
+
+    #[test]
+    fn object_constant_matching() {
+        // IRI constant: exact IRI match only.
+        let iri = ObjectConstant::Iri("http://ex/geo/1".to_string());
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::iri("http://ex/geo/1"),
+            &iri,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::iri("http://ex/geo/2"),
+            &iri,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("http://ex/geo/1"),
+            &iri,
+            false
+        ));
+
+        // String constant: loose lexical match, datatype/language-agnostic — a
+        // plain-string query object matches a lang-tagged materialized literal.
+        let s = ObjectConstant::Scalar(ScanValue::Str("chat".to_string()));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("chat"),
+            &s,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::lang_string("chat", "fr"),
+            &s,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("dog"),
+            &s,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::iri("chat"),
+            &s,
+            false
+        ));
+
+        // Integer constant against a NON-numeric (text) column: EXACT — "2024"
+        // matches; a decimal lexical does not (the scan filter casts the int to
+        // text and drops "2024.0", so the operator must too).
+        let n = ObjectConstant::Scalar(ScanValue::Int(2024));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("2024"),
+            &n,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("2024.0"),
+            &n,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("2025"),
+            &n,
+            false
+        ));
+
+        // Integer constant against a numeric (Decimal/Float) column: a
+        // zero-fraction decimal lexical matches (`?s :amount 100` vs 100.00),
+        // a non-zero fraction does not.
+        let amount = ObjectConstant::Scalar(ScanValue::Int(100));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("100.00"),
+            &amount,
+            true
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("100"),
+            &amount,
+            true
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("100.50"),
+            &amount,
+            true
+        ));
+        // Exactness holds beyond 2^53 (no f64): trailing-zero decimal matches,
+        // the adjacent integer does not.
+        let big = ObjectConstant::Scalar(ScanValue::Int(9_007_199_254_740_993));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("9007199254740993"),
+            &big,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("9007199254740993.00"),
+            &big,
+            true
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("9007199254740992"),
+            &big,
+            false
+        ));
+
+        // Boolean constant: true/1 vs false/0.
+        let b = ObjectConstant::Scalar(ScanValue::Bool(true));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("true"),
+            &b,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("1"),
+            &b,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("false"),
+            &b,
+            false
+        ));
+    }
+
+    #[test]
+    fn only_plain_columns_are_value_pushable() {
+        use fluree_db_r2rml::mapping::{ObjectMap, RefObjectMap};
+
+        // Plain rr:column → materialized value is the raw column, so a
+        // column-level scan filter is a sound optimization.
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::column("code")),
+            Some("code")
+        );
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::column_typed(
+                "year",
+                "http://www.w3.org/2001/XMLSchema#integer"
+            )),
+            Some("year")
+        );
+
+        // A single-column template transforms the value ("PREFIX-{code}" ≠ code):
+        // pushing Eq(code, "PREFIX-A") would drop every row the operator keeps.
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::template(
+                "PREFIX-{code}",
+                vec!["code".to_string()]
+            )),
+            None
+        );
+        // Constant ignores the row; RefObjectMap is an IRI join — neither pushable.
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::constant_literal("x")),
+            None
+        );
+        assert_eq!(
+            value_pushdown_column(&ObjectMap::RefObjectMap(RefObjectMap::new(
+                "gs:other", "fk", "id"
+            ))),
+            None
+        );
     }
 }
