@@ -66,8 +66,10 @@ impl Default for ValidateOptions {
 /// One validation result with all identifiers resolved to IRIs.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReportResult {
-    /// The node that failed validation (`sh:focusNode`).
-    pub focus_node: String,
+    /// The node that failed validation (`sh:focusNode`): a JSON string for
+    /// IRIs / blank-node labels, or a JSON-LD value object (or native
+    /// scalar) for literal `sh:targetNode` targets.
+    pub focus_node: JsonValue,
     /// The property path, when it is a single predicate (`sh:resultPath`).
     /// Complex paths are omitted rather than misrepresented.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,7 +133,11 @@ impl ValidateReport {
             .map(|r| {
                 let mut obj = serde_json::Map::new();
                 obj.insert("@type".into(), json!("sh:ValidationResult"));
-                obj.insert("sh:focusNode".into(), json!({"@id": r.focus_node}));
+                let focus = match r.focus_node.as_str() {
+                    Some(iri) => json!({"@id": iri}),
+                    None => r.focus_node.clone(),
+                };
+                obj.insert("sh:focusNode".into(), focus);
                 if let Some(path) = &r.result_path {
                     obj.insert("sh:resultPath".into(), json!({"@id": path}));
                 }
@@ -170,10 +176,11 @@ impl ValidateReport {
         out.push_str(&format!("    sh:conforms {}", self.conforms));
         for r in &self.results {
             out.push_str(" ;\n    sh:result [\n        a sh:ValidationResult ;\n");
-            out.push_str(&format!(
-                "        sh:focusNode {} ;\n",
-                turtle_term(&r.focus_node)
-            ));
+            let focus_term = match r.focus_node.as_str() {
+                Some(iri) => turtle_term(iri),
+                None => turtle_value_term(&r.focus_node),
+            };
+            out.push_str(&format!("        sh:focusNode {focus_term} ;\n"));
             if let Some(path) = &r.result_path {
                 out.push_str(&format!("        sh:resultPath {} ;\n", turtle_term(path)));
             }
@@ -454,7 +461,22 @@ pub async fn validate_view(
         .results
         .iter()
         .map(|r| ReportResult {
-            focus_node: resolve(&r.focus_node),
+            focus_node: match &r.focus_node {
+                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
+                fluree_db_shacl::FocusNode::Literal(lit) => {
+                    match value_json(
+                        &lit.value,
+                        Some(&lit.datatype),
+                        lit.lang.as_deref(),
+                        &resolve,
+                    ) {
+                        // A bare string would be ambiguous with an IRI focus —
+                        // wrap plain string literals as a value object.
+                        JsonValue::String(s) => json!({"@value": s}),
+                        other => other,
+                    }
+                }
+            },
             result_path: r.result_path.as_ref().map(&resolve),
             source_shape: resolve(&r.source_shape),
             source_constraint: r.source_constraint.as_ref().map(&resolve),
@@ -472,11 +494,16 @@ pub async fn validate_view(
         })
         .collect();
     results.sort_by(|a, b| {
-        (&a.focus_node, &a.constraint_component, &a.message).cmp(&(
-            &b.focus_node,
-            &b.constraint_component,
-            &b.message,
-        ))
+        (
+            a.focus_node.to_string(),
+            &a.constraint_component,
+            &a.message,
+        )
+            .cmp(&(
+                b.focus_node.to_string(),
+                &b.constraint_component,
+                &b.message,
+            ))
     });
 
     Ok(ValidateReport {

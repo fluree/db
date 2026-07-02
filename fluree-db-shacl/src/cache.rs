@@ -95,6 +95,9 @@ impl ShaclCache {
                             by_target_node.entry(node.clone()).or_default().push(idx);
                         }
                     }
+                    // Literal targets have no Sid to index; validate_all
+                    // walks them straight off the shape's target list.
+                    crate::compile::TargetType::LiteralNode(_) => {}
                     crate::compile::TargetType::SubjectsOf(pred) => {
                         by_target_subjects_of
                             .entry(pred.clone())

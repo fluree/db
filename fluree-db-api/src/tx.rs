@@ -630,11 +630,7 @@ fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String
     );
     for (i, v) in violations.iter().enumerate() {
         let _ = writeln!(out, "  {}. {}", i + 1, v.message);
-        let _ = writeln!(
-            out,
-            "     Focus node: {}{}",
-            v.focus_node.namespace_code, v.focus_node.name
-        );
+        let _ = writeln!(out, "     Focus node: {}", v.focus_node);
         if let Some(path) = &v.result_path {
             let _ = writeln!(out, "     Path: {}{}", path.namespace_code, path.name);
         }

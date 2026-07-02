@@ -4279,3 +4279,61 @@ async fn validate_report_value_term_fidelity() {
         "{turtle}"
     );
 }
+
+#[tokio::test]
+async fn validate_report_literal_target_nodes() {
+    // sh:targetNode with literal targets: the focus is the literal itself,
+    // validated directly against the shape's value constraints and reported
+    // with a value-object focus in the report.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("shacl/validate-literal-target:main")
+        .await
+        .unwrap();
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+
+    let shapes_turtle = r#"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/ns/> .
+        ex:MinLengthShape a sh:NodeShape ;
+            sh:minLength 4 ;
+            sh:targetNode "Hel" ;
+            sh:targetNode "Hello" ;
+            sh:targetNode "Hell"@en ;
+            sh:targetNode 123 .
+    "#;
+    let options = crate::validate::ValidateOptions {
+        shapes: crate::validate::ShapesSource::InlineTurtle(shapes_turtle.to_string()),
+        ..Default::default()
+    };
+    let report =
+        crate::validate::validate_view(&view, "shacl/validate-literal-target:main", &options)
+            .await
+            .unwrap();
+
+    // "Hel" (3) and 123 (3) violate; "Hello", "Hell"@en conform.
+    assert_eq!(report.violation_count(), 2, "{:?}", report.results);
+    let focuses: Vec<&JsonValue> = report.results.iter().map(|r| &r.focus_node).collect();
+    assert!(
+        focuses.contains(&&json!({"@value": "Hel"})),
+        "string literal focus reported as value object: {focuses:?}"
+    );
+    assert!(focuses.contains(&&json!(123)), "{focuses:?}");
+    // sh:value = the focus literal. Unlike the focus field (where a bare
+    // string would be ambiguous with an IRI), value strings stay native —
+    // IRIs are always {"@id"} objects there.
+    let values: Vec<&JsonValue> = report.results.iter().flat_map(|r| &r.value).collect();
+    assert!(values.contains(&&json!("Hel")), "{values:?}");
+    assert!(values.contains(&&json!(123)), "{values:?}");
+    for result in &report.results {
+        assert_eq!(
+            result.constraint_component,
+            "http://www.w3.org/ns/shacl#MinLengthConstraintComponent"
+        );
+    }
+
+    // Turtle report renders literal focus nodes as literals.
+    let turtle = report.to_turtle();
+    assert!(turtle.contains("sh:focusNode \"Hel\""), "{turtle}");
+    assert!(turtle.contains("sh:focusNode 123"), "{turtle}");
+}

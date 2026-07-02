@@ -46,7 +46,8 @@ pub fn compare_report(
         None
     } else {
         Some(Mismatch(format!(
-            "results do not match expected set (actual: {})",
+            "results do not match expected set (expected: {:?} | actual: {})",
+            expected,
             summarize(&actual.results),
         )))
     }
@@ -69,12 +70,25 @@ fn match_all(expected: &[ExpectedResult], actual: &[ReportResult], used: &mut [b
 }
 
 fn matches(exp: &ExpectedResult, act: &ReportResult) -> bool {
-    // Focus node: actual is an IRI string, or a skolemized blank-node label.
+    // Focus node: a JSON string for IRIs / skolemized blank-node labels,
+    // or a JSON-LD value form for literal sh:targetNode targets.
     let focus_ok = match &exp.focus {
         TermPat::Absent | TermPat::Any => true,
-        TermPat::Json(j) => {
-            !act.focus_node.starts_with("_:") && *j == json!({"@id": act.focus_node})
-        }
+        TermPat::Json(j) => match act.focus_node.as_str() {
+            Some(s) if s.starts_with("_:") => false,
+            Some(s) => *j == json!({"@id": s}),
+            // Literal focus: a bare {"@value": s} wraps a plain string to
+            // keep it distinct from an IRI — unwrap it for comparison.
+            None => {
+                let unwrapped = act
+                    .focus_node
+                    .as_object()
+                    .filter(|o| o.len() == 1)
+                    .and_then(|o| o.get("@value"))
+                    .unwrap_or(&act.focus_node);
+                *j == *unwrapped
+            }
+        },
     };
     if !focus_ok {
         return false;

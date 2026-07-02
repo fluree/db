@@ -2454,12 +2454,7 @@ fn format_shacl_report(report: &ValidationReport) -> String {
         .enumerate()
     {
         writeln!(&mut output, "  {}. {}", i + 1, result.message).ok();
-        writeln!(
-            &mut output,
-            "     Focus node: {}{}",
-            result.focus_node.namespace_code, result.focus_node.name
-        )
-        .ok();
+        writeln!(&mut output, "     Focus node: {}", result.focus_node).ok();
         if let Some(path) = &result.result_path {
             writeln!(
                 &mut output,

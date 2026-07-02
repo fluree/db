@@ -625,7 +625,6 @@ with per-result constraint-component IRIs, severities, and messages, plus
 
 ## Not yet supported
 
-- `sh:targetNode` with a literal value — only IRI/blank-node targets are compiled.
 - `sh:sparql` (SPARQL-based constraints).
 
 These are tracked in the SHACL compliance effort.

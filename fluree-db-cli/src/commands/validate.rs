@@ -216,7 +216,10 @@ fn print_table(report: &ValidateReport) {
     for result in &report.results {
         let severity = short_iri(&result.severity);
         let component = short_iri(&result.constraint_component);
-        println!("{severity}: {}", result.focus_node);
+        match result.focus_node.as_str() {
+            Some(iri) => println!("{severity}: {iri}"),
+            None => println!("{severity}: {}", result.focus_node),
+        }
         if let Some(path) = &result.result_path {
             println!("    path:      {path}");
         }

@@ -23,12 +23,24 @@ pub enum TargetType {
     Class(Sid),
     /// sh:targetNode - specific node(s)
     Node(Vec<Sid>),
+    /// sh:targetNode with literal targets — the focus "node" is a literal
+    /// value, validated directly against the shape's value constraints.
+    LiteralNode(Vec<LiteralTarget>),
     /// sh:targetSubjectsOf - subjects of triples with this predicate
     SubjectsOf(Sid),
     /// sh:targetObjectsOf - objects of triples with this predicate
     ObjectsOf(Sid),
     /// Implicit class targeting (shape is also a class)
     ImplicitClass(Sid),
+}
+
+/// A literal `sh:targetNode` target: the value plus the datatype / language
+/// needed to validate and report it faithfully.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiteralTarget {
+    pub value: FlakeValue,
+    pub datatype: Sid,
+    pub lang: Option<String>,
 }
 
 /// Severity level for constraint violations
@@ -303,6 +315,26 @@ impl ShapeCompiler {
                 class_typed.extend(flakes.iter().map(|f| f.s.clone()));
             }
 
+            // Register subjects explicitly typed sh:NodeShape. A shape whose
+            // only markers are `rdf:type sh:NodeShape` plus value constraints
+            // (e.g. an implicit-class-target shape carrying just sh:in) would
+            // otherwise never be created — no target/property predicate ever
+            // calls get_or_create_shape for it.
+            let node_shape_type = Sid::new(SHACL, "NodeShape");
+            let flakes = db
+                .range(
+                    IndexType::Opst,
+                    RangeTest::Eq,
+                    RangeMatch::predicate_object(
+                        rdf_type.clone(),
+                        FlakeValue::Ref(node_shape_type),
+                    ),
+                )
+                .await?;
+            for flake in &flakes {
+                compiler.get_or_create_shape(&flake.s);
+            }
+
             // Expand rdf:first/rdf:rest lists referenced by sh:in / sh:and /
             // sh:or / sh:xone / sh:ignoredProperties. Run after each graph so
             // that lists whose head lives in this graph can resolve — a list
@@ -556,6 +588,25 @@ impl ShapeCompiler {
                     }
                     if !found {
                         shape.targets.push(TargetType::Node(vec![node.clone()]));
+                    }
+                } else {
+                    // Literal target node: the focus is the literal itself.
+                    let lit = LiteralTarget {
+                        value: flake.o.clone(),
+                        datatype: flake.dt.clone(),
+                        lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+                    };
+                    let shape = self.get_or_create_shape(&flake.s);
+                    let mut found = false;
+                    for target in &mut shape.targets {
+                        if let TargetType::LiteralNode(lits) = target {
+                            lits.push(lit.clone());
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        shape.targets.push(TargetType::LiteralNode(vec![lit]));
                     }
                 }
             }

@@ -59,13 +59,22 @@ match exactly.
 
 Failures are expected in these areas (honest gaps, not harness bugs):
 
-- `sh:targetNode` with **literal** targets — unsupported; dominates the
-  `node` category, whose tests target literals directly.
-- Node-shape constraint results don't set `sh:value` to the focus node
-  (the spec requires `sh:value` = focus for node-shape constraints).
 - Complex `sh:resultPath` serialization (sequence/inverse path structures)
   is omitted from reports.
+- `sh:equals` reports one aggregate violation instead of one per
+  missing/extra value.
+- `xsd:dateTime` range comparison does not implement the spec's
+  timezone partial order (`minInclusive-002/003`).
 - `sh:sparql` (the whole `sparql/` section of the suite is not wired in).
+
+A few expectations are unachievable by design — Fluree's value-centric
+store differs from RDF term identity:
+
+- `4` and `4.0` are the same value in flake space, so they collapse into
+  one `sh:targetNode` target (`minExclusive-001` / `maxExclusive-001`).
+- Ill-formed typed literals (`"aldi"^^xsd:integer`) are rejected at ingest
+  and can never be present to validate (`datatype-001`).
+- Duplicate values in an RDF list collapse (`xone-duplicate`).
 
 Track the current pass rate with `make count` before and after engine
 changes; regressions in previously-passing categories are the signal to

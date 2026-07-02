@@ -215,11 +215,23 @@ fn literal_json(
     if let Some(lang) = lang {
         return json!({"@value": value.lexical(), "@language": lang});
     }
+    // The Turtle parser may keep explicitly-typed literals as lexical
+    // strings (`"true"^^xsd:boolean` → String("true")) — normalize the
+    // JSON-native XSD types the same way the report core does.
     match (value, dt_iri.strip_prefix(ns::XSD)) {
         (LV::String(s), Some("string")) => json!(s.to_string()),
         (LV::Boolean(b), Some("boolean")) => json!(b),
         (LV::Integer(i), Some("integer")) => json!(i),
         (LV::Double(d), Some("double")) => json!(d),
+        (LV::String(s), Some("boolean")) if s.parse::<bool>().is_ok() => {
+            json!(s.parse::<bool>().unwrap())
+        }
+        (LV::String(s), Some("integer")) if s.parse::<i64>().is_ok() => {
+            json!(s.parse::<i64>().unwrap())
+        }
+        (LV::String(s), Some("double")) if s.parse::<f64>().is_ok() => {
+            json!(s.parse::<f64>().unwrap())
+        }
         _ => json!({"@value": value.lexical(), "@type": dt_iri}),
     }
 }
