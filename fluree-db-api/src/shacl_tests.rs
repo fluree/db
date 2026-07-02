@@ -2089,21 +2089,6 @@ async fn shacl_and_with_inline_anonymous_shapes() {
 // Property Paths (sh:path expressions)
 // ===========================================================================
 
-/// Assert that an error is a SHACL *compile/shape* error (not a data violation)
-/// whose message contains `expected`.
-fn assert_shacl_shape_error(err: ApiError, expected: &str) {
-    match err {
-        ApiError::Transact(TransactError::Shacl(inner)) => {
-            let message = inner.to_string();
-            assert!(
-                message.contains(expected),
-                "expected shape error to contain '{expected}', got: {message}"
-            );
-        }
-        other => panic!("expected SHACL shape error, got {other:?}"),
-    }
-}
-
 /// `sh:inversePath` — a Parent must be pointed at by at least one `ex:parent`.
 #[tokio::test]
 async fn shacl_inverse_path() {
@@ -2334,8 +2319,9 @@ async fn shacl_unsupported_path_rejected() {
     let ledger = fluree.create_ledger("shacl/badpath:main").await.unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
-    // Compilation runs when a targetable instance triggers validation; the
-    // unsupported path must surface as a shape error rather than pass silently.
+    // The unsupported path surfaces as a violation when the shape fires on a
+    // targeted focus node — scoped to the shape's targets, not a ledger-wide
+    // compile failure — and must not silently pass.
     let err = fluree
         .upsert(
             ledger,
@@ -2347,7 +2333,105 @@ async fn shacl_unsupported_path_rejected() {
         )
         .await
         .unwrap_err();
-    assert_shacl_shape_error(err, "sh:inversePath");
+    assert_shacl_violation(err, "inversePath");
+}
+
+/// An unsupported path on a node that the shape does **not** target must not
+/// block unrelated writes — the failure is scoped to the shape's focus nodes.
+#[tokio::test]
+async fn shacl_unsupported_path_scoped_to_targets() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:BadPathShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Thing"},
+        "sh:property": [{
+            "@id": "ex:pshape_bad",
+            "sh:path": {"sh:inversePath": {"sh:oneOrMorePath": {"@id": "ex:a"}}},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree
+        .create_ledger("shacl/badpath-scoped:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // A subject that is not an ex:Thing is unaffected by the broken shape.
+    fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:unrelated",
+                "@type": "ex:Widget",
+                "schema:name": "fine"
+            }),
+        )
+        .await
+        .expect("writes to non-targeted subjects must not be blocked by a broken shape");
+}
+
+/// A complex path on a member of `sh:or` must be *evaluated*, not scanned as a
+/// bare blank-node predicate. Here a Doc conforms if it has a title OR is cited
+/// by something (`^ex:cites`); a doc satisfied only via the inverse-path member
+/// must pass — the pre-fix bug scanned the path bnode and never matched.
+#[tokio::test]
+async fn shacl_complex_path_in_nested_or() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:DocShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Doc"},
+        "sh:or": {"@list": [
+            {"sh:path": {"@id": "ex:title"}, "sh:minCount": 1},
+            {"sh:path": {"sh:inversePath": {"@id": "ex:cites"}}, "sh:minCount": 1}
+        ]}
+    });
+
+    // Valid: doc1 has no title but IS cited → satisfied via the inverse-path member.
+    let ledger_ok = fluree
+        .create_ledger("shacl/nested-path-ok:main")
+        .await
+        .unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:doc1", "@type": "ex:Doc"},
+                    {"@id": "ex:paper", "ex:cites": {"@id": "ex:doc1"}}
+                ]
+            }),
+        )
+        .await
+        .expect("a Doc satisfied only via the inverse-path sh:or member should pass");
+
+    // Invalid: doc2 has no title and is cited by nothing → both members fail.
+    let ledger_bad = fluree
+        .create_ledger("shacl/nested-path-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc2",
+                "@type": "ex:Doc"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "sh:or");
 }
 
 // ===========================================================================

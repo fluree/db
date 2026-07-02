@@ -34,8 +34,10 @@
 //! by [`path::eval_path`]): `sh:inversePath` (over a single predicate), sequence
 //! paths (RDF lists), `sh:alternativePath`, `sh:zeroOrMorePath`,
 //! `sh:oneOrMorePath`, and `sh:zeroOrOnePath` — including nesting of these.
-//! The one unsupported form, the inverse of a composite path (`^(p1/p2)`), is
-//! rejected at shape-compile time rather than silently misbehaving.
+//! The one unsupported form, the inverse of a composite path (`^(p1/p2)`),
+//! compiles to [`PropertyPath::Unresolvable`] and surfaces as a violation when
+//! the owning shape fires on a focus node — scoped to that shape's targets
+//! rather than failing every transaction on the ledger.
 //!
 //! # Target Selection
 //!

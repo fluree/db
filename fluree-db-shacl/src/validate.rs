@@ -896,17 +896,48 @@ fn validate_nested_shape<'a>(
 
         // Validate property constraints
         for (path, constraints) in &nested.property_constraints {
-            // Get all values for this property on the focus node
-            let flakes = db
-                .range(
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::subject_predicate(focus_node.clone(), path.clone()),
-                )
-                .await?;
+            // A path that never compiled surfaces as a violation on this member.
+            if let Some(reason) = path.unresolvable_reason() {
+                results.push(ValidationResult {
+                    focus_node: focus_node.clone(),
+                    result_path: None,
+                    source_shape: parent_shape.id.clone(),
+                    source_constraint: Some(nested.id.clone()),
+                    severity: Severity::Violation,
+                    message: format!("Unsupported sh:path expression: {reason}"),
+                    value: None,
+                    graph_id: None,
+                });
+                continue;
+            }
 
-            let values: Vec<FlakeValue> = flakes.iter().map(|f| f.o.clone()).collect();
-            let datatypes: Vec<Sid> = flakes.iter().map(|f| f.dt.clone()).collect();
+            // Value nodes reached by the member's path. Simple predicate → SPOT
+            // scan; complex path → evaluate the AST (same as top-level shapes).
+            let (values, datatypes): (Vec<FlakeValue>, Vec<Sid>) =
+                if let Some(pred) = path.as_predicate() {
+                    let flakes = db
+                        .range(
+                            IndexType::Spot,
+                            RangeTest::Eq,
+                            RangeMatch::subject_predicate(focus_node.clone(), pred.clone()),
+                        )
+                        .await?;
+                    (
+                        flakes.iter().map(|f| f.o.clone()).collect(),
+                        flakes.iter().map(|f| f.dt.clone()).collect(),
+                    )
+                } else {
+                    crate::path::eval_path(db, focus_node, path)
+                        .await?
+                        .into_iter()
+                        .unzip()
+                };
+
+            let result_path = path.as_predicate().cloned();
+            let path_label = path
+                .as_predicate()
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| "path".to_string());
 
             // Validate each constraint
             for constraint in constraints {
@@ -931,13 +962,13 @@ fn validate_nested_shape<'a>(
                         if source_values != target_values {
                             results.push(ValidationResult {
                                 focus_node: focus_node.clone(),
-                                result_path: Some(path.clone()),
+                                result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
                                 message: format!(
                                     "Value set for {} does not equal value set for {}",
-                                    path.name, target_prop.name
+                                    path_label, target_prop.name
                                 ),
                                 value: None,
                                 graph_id: None,
@@ -949,7 +980,7 @@ fn validate_nested_shape<'a>(
                         for violation in violations {
                             results.push(ValidationResult {
                                 focus_node: focus_node.clone(),
-                                result_path: Some(path.clone()),
+                                result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
                                 severity: Severity::Violation,
@@ -990,6 +1021,22 @@ async fn validate_property_shape<'a>(
     class_ctx: Option<ClassMembershipCtx<'a>>,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
+
+    // A path that never compiled surfaces here (only for focus nodes this shape
+    // actually targets) rather than as a ledger-wide compile failure.
+    if let Some(reason) = prop_shape.path.unresolvable_reason() {
+        results.push(ValidationResult {
+            focus_node: focus_node.clone(),
+            result_path: None,
+            source_shape: parent_shape.id.clone(),
+            source_constraint: Some(prop_shape.id.clone()),
+            severity: prop_shape.severity,
+            message: format!("Unsupported sh:path expression: {reason}"),
+            value: None,
+            graph_id: None,
+        });
+        return Ok(results);
+    }
 
     // Get all value nodes reached by this property shape's path on the focus node.
     // Simple single-predicate paths take the plain SPOT scan; complex paths

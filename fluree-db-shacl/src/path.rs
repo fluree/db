@@ -9,13 +9,17 @@
 //! focus node to produce the set of *value nodes* the path reaches — the same set
 //! that a simple predicate would produce via a single `SPOT` scan.
 //!
-//! Unsupported forms (e.g. the inverse of a composite path, `^(p1/p2)`) are
-//! rejected at compile time with a clear error rather than silently misbehaving.
+//! Unsupported forms (e.g. the inverse of a composite path, `^(p1/p2)`) compile
+//! to [`PropertyPath::Unresolvable`] rather than silently misbehaving; the
+//! reason is surfaced as a violation when the owning shape fires on a focus
+//! node, keeping the failure scoped to that shape's targets.
 
 use crate::error::{Result, ShaclError};
 use crate::predicates;
-use fluree_db_core::{FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid};
-use fluree_vocab::namespaces::{JSON_LD, RDF, SHACL};
+use fluree_db_core::{
+    id_datatype_sid, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid,
+};
+use fluree_vocab::namespaces::{BLANK_NODE, RDF, SHACL};
 use fluree_vocab::rdf_names;
 use std::collections::HashSet;
 use std::future::Future;
@@ -39,6 +43,11 @@ pub enum PropertyPath {
     OneOrMore(Box<PropertyPath>),
     /// `sh:zeroOrOnePath`: `p?`.
     ZeroOrOne(Box<PropertyPath>),
+    /// A path that could not be compiled (unsupported form, or a blank-node
+    /// expression whose structure never resolved). Carries the reason. Rather
+    /// than failing shape compilation for the whole ledger, this is surfaced as
+    /// a violation only when the owning shape actually fires on a focus node.
+    Unresolvable(String),
 }
 
 /// A value node reached by a path: `(value, datatype)`, mirroring a flake's
@@ -64,11 +73,30 @@ impl PropertyPath {
     pub fn is_simple(&self) -> bool {
         matches!(self, PropertyPath::Predicate(_))
     }
-}
 
-/// Datatype SID carried by reference (node) value nodes: `$id`.
-fn ref_dt() -> Sid {
-    Sid::new(JSON_LD, "id")
+    /// The unresolvable reason, if this path failed to compile.
+    pub fn unresolvable_reason(&self) -> Option<&str> {
+        match self {
+            PropertyPath::Unresolvable(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// Whether any predicate anywhere in the AST is a blank node — i.e. the
+    /// path structure was not fully resolved (its sub-structure lives in a
+    /// graph not yet scanned). Used as a belt-and-braces resolution check.
+    pub fn references_blank_node(&self) -> bool {
+        match self {
+            PropertyPath::Predicate(p) | PropertyPath::Inverse(p) => p.namespace_code == BLANK_NODE,
+            PropertyPath::Sequence(steps) | PropertyPath::Alternative(steps) => {
+                steps.iter().any(PropertyPath::references_blank_node)
+            }
+            PropertyPath::ZeroOrMore(inner)
+            | PropertyPath::OneOrMore(inner)
+            | PropertyPath::ZeroOrOne(inner) => inner.references_blank_node(),
+            PropertyPath::Unresolvable(_) => false,
+        }
+    }
 }
 
 fn shacl(name: &str) -> Sid {
@@ -104,8 +132,16 @@ pub fn resolve_sh_path<'a>(
                 // JSON-LD @list sequence: each ordered object is a path step.
                 let mut steps = Vec::new();
                 for obj in members {
-                    if let FlakeValue::Ref(sid) = obj {
-                        steps.push(resolve_path_node(db, &sid).await?);
+                    match obj {
+                        FlakeValue::Ref(sid) => steps.push(resolve_path_node(db, &sid).await?),
+                        // A literal in a sequence path is invalid; reject rather
+                        // than silently dropping the step.
+                        _ => {
+                            return Err(unsupported(
+                                ps_subject,
+                                "sh:path sequence step is a literal",
+                            ))
+                        }
                     }
                 }
                 Ok(Some(PropertyPath::Sequence(steps)))
@@ -247,16 +283,16 @@ async fn ordered_objects(
             RangeMatch::subject_predicate(subject.clone(), predicate.clone()),
         )
         .await?;
-    let mut items: Vec<(i32, FlakeValue)> = flakes
+    // Order by the JSON-LD list index when present; unindexed flakes keep their
+    // scan order and sort after indexed ones (never interleaved). JSON-LD `@list`
+    // always stamps `m.i`, so in practice all-or-none carry an index.
+    let mut items: Vec<(Option<i32>, usize, FlakeValue)> = flakes
         .iter()
         .enumerate()
-        .map(|(pos, f)| {
-            let idx = f.m.as_ref().and_then(|m| m.i).unwrap_or(pos as i32);
-            (idx, f.o.clone())
-        })
+        .map(|(pos, f)| (f.m.as_ref().and_then(|m| m.i), pos, f.o.clone()))
         .collect();
-    items.sort_by_key(|(i, _)| *i);
-    Ok(items.into_iter().map(|(_, v)| v).collect())
+    items.sort_by_key(|(idx, pos, _)| (idx.is_none(), idx.unwrap_or(0), *pos));
+    Ok(items.into_iter().map(|(_, _, v)| v).collect())
 }
 
 /// Evaluate a property path from `focus`, returning the reached value nodes as
@@ -280,16 +316,19 @@ pub fn eval_path<'a>(
                 Ok(dedup(out))
             }
             PropertyPath::ZeroOrMore(inner) => {
-                let mut out = vec![(FlakeValue::Ref(focus.clone()), ref_dt())];
+                let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid())];
                 out.extend(closure(db, focus, inner).await?);
                 Ok(dedup(out))
             }
             PropertyPath::OneOrMore(inner) => Ok(dedup(closure(db, focus, inner).await?)),
             PropertyPath::ZeroOrOne(inner) => {
-                let mut out = vec![(FlakeValue::Ref(focus.clone()), ref_dt())];
+                let mut out = vec![(FlakeValue::Ref(focus.clone()), id_datatype_sid())];
                 out.extend(eval_path(db, focus, inner).await?);
                 Ok(dedup(out))
             }
+            // Never evaluated: validation surfaces a violation for the owning
+            // shape before reaching value evaluation. Defensive empty set.
+            PropertyPath::Unresolvable(_) => Ok(Vec::new()),
         }
     })
 }
@@ -317,7 +356,7 @@ async fn inverse_step(db: GraphDbRef<'_>, focus: &Sid, p: &Sid) -> Result<Vec<(F
         .await?;
     Ok(flakes
         .iter()
-        .map(|f| (FlakeValue::Ref(f.s.clone()), ref_dt()))
+        .map(|f| (FlakeValue::Ref(f.s.clone()), id_datatype_sid()))
         .collect())
 }
 
@@ -365,7 +404,8 @@ async fn closure(
     inner: &PropertyPath,
 ) -> Result<Vec<(FlakeValue, Sid)>> {
     let mut out: Vec<(FlakeValue, Sid)> = Vec::new();
-    let mut visited: HashSet<Sid> = HashSet::new();
+    // Seed `visited` with the focus so a cycle back to it isn't re-expanded.
+    let mut visited: HashSet<Sid> = HashSet::from([focus.clone()]);
     let mut queue: Vec<Sid> = vec![focus.clone()];
 
     while let Some(node) = queue.pop() {

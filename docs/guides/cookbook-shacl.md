@@ -148,7 +148,7 @@ In **JSON-LD**, a sequence path is written with `@list`, and the blank-node form
 }
 ```
 
-**Not supported:** the inverse of a composite path (e.g. `[ sh:inversePath ( ex:a ex:b ) ]`). `sh:inversePath` may only wrap a single predicate. An unsupported or unresolvable path is rejected when the shape is compiled — the transaction fails with a shape error rather than silently passing.
+**Not supported:** the inverse of a composite path (e.g. `[ sh:inversePath ( ex:a ex:b ) ]`). `sh:inversePath` may only wrap a single predicate. An unsupported or unresolvable path doesn't silently pass — it produces a violation whenever the owning shape validates a focus node, so any transaction touching data that shape targets is rejected with a clear message. A broken path only affects the shape's own targets, not unrelated writes.
 
 ## Constraint patterns
 

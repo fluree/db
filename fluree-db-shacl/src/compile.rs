@@ -4,11 +4,11 @@
 //! efficient `CompiledShape` structures that can be used for validation.
 
 use crate::constraints::{Constraint, NestedShape, NodeConstraint};
-use crate::error::{Result, ShaclError};
+use crate::error::Result;
 use crate::path::{resolve_sh_path, PropertyPath};
 use crate::predicates;
 use fluree_db_core::{Flake, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid};
-use fluree_vocab::namespaces::{BLANK_NODE, RDF, SHACL};
+use fluree_vocab::namespaces::{RDF, SHACL};
 use fluree_vocab::rdf_names;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -288,16 +288,25 @@ impl ShapeCompiler {
             .collect();
 
         for ps_id in pending {
-            let Some(resolved) = resolve_sh_path(db, &ps_id).await? else {
-                continue;
+            let resolved = match resolve_sh_path(db, &ps_id).await {
+                Ok(Some(path)) => path,
+                // No usable sh:path in this graph — leave for a later pass.
+                Ok(None) => continue,
+                // Unsupported form (e.g. inverse of a composite path). Record the
+                // reason as an `Unresolvable` path — surfaced as a violation when
+                // the shape fires, not as a ledger-wide compile failure. The error
+                // only fires once the structure is present, so it's graph-correct.
+                Err(err) => {
+                    if let Some(ps) = self.property_shapes.get_mut(&ps_id) {
+                        ps.resolved_path = Some(PropertyPath::Unresolvable(err.to_string()));
+                    }
+                    continue;
+                }
             };
-            // A blank node resolving to `Predicate(itself)` means no path
-            // structure was found in this graph — leave it for a later pass.
-            let meaningful = match &resolved {
-                PropertyPath::Predicate(sid) => sid.namespace_code != BLANK_NODE,
-                _ => true,
-            };
-            if meaningful {
+            // A path still referencing a blank node anywhere in its AST wasn't
+            // fully resolved here (its structure lives in a graph not yet
+            // scanned) — leave it for a later pass.
+            if !resolved.references_blank_node() {
                 if let Some(ps) = self.property_shapes.get_mut(&ps_id) {
                     ps.resolved_path = Some(resolved);
                 }
@@ -709,16 +718,11 @@ impl ShapeCompiler {
             for ps_id in &data.property_shape_ids {
                 if let Some(ps_data) = ps_map.get(ps_id) {
                     if ps_data.path.is_some() {
-                        // `sh:path` present but no AST => a blank-node path
-                        // expression we could not resolve. Reject loudly instead
-                        // of silently scanning a non-existent predicate.
-                        let path = ps_data.resolved_path.clone().ok_or_else(|| {
-                            ShaclError::InvalidConstraint {
-                                shape_id: ps_id.clone(),
-                                message: "unsupported or unresolvable sh:path expression"
-                                    .to_string(),
-                            }
-                        })?;
+                        // `sh:path` present. If it never resolved to an AST it
+                        // becomes an `Unresolvable` path, surfaced as a violation
+                        // only when this shape fires — not a compile error that
+                        // would wedge every transaction on the ledger.
+                        let path = resolved_path_of(ps_data);
                         let constraints = build_constraints_from_ps_data(ps_data);
 
                         // Check if this property shape's subject also has structural
@@ -812,6 +816,16 @@ fn build_constraints_from_ps_data(ps_data: &PropertyShapeData) -> Vec<Constraint
     constraints
 }
 
+/// The compiled path for a property shape, or an `Unresolvable` placeholder
+/// when `sh:path` was present but never resolved. Keeping this off the error
+/// path means one broken shape can't fail every transaction on the ledger — the
+/// failure is scoped to focus nodes the owning shape actually targets.
+fn resolved_path_of(ps_data: &PropertyShapeData) -> PropertyPath {
+    ps_data.resolved_path.clone().unwrap_or_else(|| {
+        PropertyPath::Unresolvable("unsupported or unresolvable sh:path expression".to_string())
+    })
+}
+
 /// Build a `NestedShape` for a member of sh:or/sh:and/sh:xone/sh:not,
 /// inlining value-level or property constraints from `PropertyShapeData`
 /// when the member is an anonymous shape.
@@ -828,11 +842,13 @@ fn build_nested_shape(sid: &ShapeId, ps_map: &HashMap<ShapeId, PropertyShapeData
                 value_constraints,
             };
         }
-        // Has sh:path — inline as a property constraint on the nested shape
+        // Has sh:path — inline as a property constraint on the nested shape,
+        // carrying the compiled path AST (so complex paths on a nested member
+        // are evaluated, not scanned as a bare blank-node predicate).
         let constraints = build_constraints_from_ps_data(ps_data);
         return NestedShape {
             id: sid.clone(),
-            property_constraints: vec![(ps_data.path.clone().unwrap(), constraints)],
+            property_constraints: vec![(resolved_path_of(ps_data), constraints)],
             node_constraints: Vec::new(),
             value_constraints: Vec::new(),
         };

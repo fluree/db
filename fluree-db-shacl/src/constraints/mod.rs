@@ -10,6 +10,7 @@ pub mod pattern;
 pub mod value;
 
 use crate::compile::NodeKind;
+use crate::path::PropertyPath;
 use fluree_db_core::{FlakeValue, Sid};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -120,7 +121,7 @@ pub struct NestedShape {
     /// The shape ID
     pub id: Sid,
     /// Property constraints (path → constraints on values at that path)
-    pub property_constraints: Vec<(Sid, Vec<Constraint>)>,
+    pub property_constraints: Vec<(PropertyPath, Vec<Constraint>)>,
     /// Node-level constraints
     pub node_constraints: Vec<NodeConstraint>,
     /// Value-level constraints (e.g. sh:datatype on an anonymous shape without sh:path).
