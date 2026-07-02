@@ -2349,3 +2349,80 @@ async fn shacl_unsupported_path_rejected() {
         .unwrap_err();
     assert_shacl_shape_error(err, "sh:inversePath");
 }
+
+// ===========================================================================
+// Custom violation messages (sh:message)
+// ===========================================================================
+
+/// `sh:message` on a property shape replaces the generated message.
+#[tokio::test]
+async fn shacl_custom_message_property_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:PersonShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Person"},
+        "sh:property": [{
+            "@id": "ex:pshape_name",
+            "sh:path": {"@id": "schema:name"},
+            "sh:minCount": 1,
+            "sh:message": "Every person must have a name"
+        }]
+    });
+
+    let ledger = fluree.create_ledger("shacl/msg-prop:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:nameless",
+                "@type": "ex:Person"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "Every person must have a name");
+}
+
+/// `sh:message` on a node shape replaces the generated message for node-level
+/// constraints (`sh:closed` here).
+#[tokio::test]
+async fn shacl_custom_message_node_shape_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:StrictShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Strict"},
+        "sh:closed": true,
+        "sh:message": "Only declared properties are allowed on a Strict record",
+        "sh:property": [{
+            "@id": "ex:pshape_label",
+            "sh:path": {"@id": "ex:label"}
+        }]
+    });
+
+    let ledger = fluree.create_ledger("shacl/msg-closed:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:record1",
+                "@type": "ex:Strict",
+                "ex:label": "ok",
+                "ex:extra": "not allowed"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "Only declared properties are allowed");
+}

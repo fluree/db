@@ -23,6 +23,9 @@
 //! - Closed: `sh:closed`, `sh:ignoredProperties`
 //! - Pair: `sh:equals`, `sh:disjoint`, `sh:lessThan`, `sh:lessThanOrEquals`
 //! - Logical: `sh:not`, `sh:and`, `sh:or`, `sh:xone`
+//! - Messages: `sh:message` on a property shape (or on the node shape for
+//!   `sh:closed` and node-level logical constraints) replaces the generated
+//!   violation message
 //!
 //! # Property Paths (`sh:path`)
 //!
