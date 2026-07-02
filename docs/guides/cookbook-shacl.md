@@ -373,7 +373,7 @@ ex:StrictPersonShape a sh:NodeShape ;
   sh:property [ sh:path schema:name ; sh:minCount 1 ] .
 ```
 
-A closed shape forbids any property not explicitly declared (or listed in `sh:ignoredProperties`). `rdf:type` is implicitly ignored per the SHACL spec.
+A closed shape forbids any property not explicitly declared (or listed in `sh:ignoredProperties`). Per the SHACL spec, `rdf:type` is **not** implicitly ignored — a closed shape with `sh:targetClass` (whose instances necessarily carry `rdf:type`) must list it in `sh:ignoredProperties`, as above.
 
 ## RDFS subclass reasoning for `sh:class`
 

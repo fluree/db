@@ -484,6 +484,7 @@ async fn shacl_closed_constraint() {
         "@type": "sh:NodeShape",
         "sh:targetClass": {"@id": "ex:Person"},
         "sh:closed": true,
+        "sh:ignoredProperties": { "@list": [{"@id": "rdf:type"}] },
         "sh:property": [
             {
                 "@id": "ex:pshape1",
@@ -2921,12 +2922,13 @@ async fn shacl_ignored_properties_turtle_list() {
     let context = shacl_context();
     let shapes_ttl = r"
         @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
         @prefix ex: <http://example.org/ns/> .
 
         ex:AuditedShape a sh:NodeShape ;
           sh:targetClass ex:Audited ;
           sh:closed true ;
-          sh:ignoredProperties ( ex:internal ex:auditLog ) ;
+          sh:ignoredProperties ( rdf:type ex:internal ex:auditLog ) ;
           sh:property [ sh:path ex:label ] .
     ";
 

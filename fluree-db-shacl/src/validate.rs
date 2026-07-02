@@ -695,7 +695,9 @@ async fn validate_node_value_constraints<'a>(
             constraint_component: violation.constraint.component(),
             severity: shape.severity,
             message: shape.message.clone().unwrap_or(violation.message),
-            value: violation.value,
+            value: violation
+                .value
+                .or_else(|| Some(FlakeValue::Ref(focus_node.clone()))),
             value_datatype: None,
             value_lang: None,
             graph_id: None,
@@ -745,13 +747,17 @@ async fn focus_value_violations<'a>(
                 );
             }
             Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_) => {
+                // String facets evaluate STR(focus), but the reported value
+                // node is the focus itself — not its stringified IRI.
                 let effective = stringify_iri_values(db, &values);
-                violations.extend(validate_constraint(
-                    constraint,
-                    &effective,
-                    &datatypes,
-                    &[None],
-                )?);
+                violations.extend(
+                    validate_constraint(constraint, &effective, &datatypes, &[None])?
+                        .into_iter()
+                        .map(|mut v| {
+                            v.value = Some(FlakeValue::Ref(focus_node.clone()));
+                            v
+                        }),
+                );
             }
             _ => {
                 violations.extend(validate_constraint(
@@ -810,15 +816,13 @@ fn validate_structural_constraint<'a>(
                         .filter_map(|ps| ps.path.as_predicate())
                         .collect();
 
-                    // Per SHACL spec section 4.8.1, rdf:type is implicitly ignored
-                    let rdf_type_sid = Sid::new(RDF, rdf_names::TYPE);
-                    let mut effective_ignored = ignored_properties.clone();
-                    effective_ignored.insert(rdf_type_sid);
-
+                    // Per spec, rdf:type is NOT implicitly ignored — shapes
+                    // must declare `sh:ignoredProperties (rdf:type)` (W3C
+                    // core/node/closed-001 pins this).
                     // Check each property on the node
                     for flake in node_flakes {
                         let prop = &flake.p;
-                        if !declared_properties.contains(prop) && !effective_ignored.contains(prop)
+                        if !declared_properties.contains(prop) && !ignored_properties.contains(prop)
                         {
                             results.push(ValidationResult {
                                 focus_node: focus_node.clone(),
@@ -831,8 +835,8 @@ fn validate_structural_constraint<'a>(
                                     format!("Property {} not allowed by closed shape", prop.name)
                                 }),
                                 value: Some(flake.o.clone()),
-                                value_datatype: None,
-                                value_lang: None,
+                                value_datatype: Some(flake.dt.clone()),
+                                value_lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
                                 graph_id: None,
                             });
                         }
@@ -869,7 +873,7 @@ fn validate_structural_constraint<'a>(
                                 nested_shape.id.name
                             )
                         }),
-                        value: None,
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
                         value_datatype: None,
                         value_lang: None,
                         graph_id: None,
@@ -909,7 +913,7 @@ fn validate_structural_constraint<'a>(
                                 nested_shape.id.name
                             )
                         }),
-                        value: None,
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
                         value_datatype: None,
                         value_lang: None,
                         graph_id: None,
@@ -918,7 +922,11 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::And(nested_shapes) => {
-                // sh:and - ALL nested shapes must match (no violations)
+                // sh:and - ALL nested shapes must match (no violations).
+                // Per spec, a failed conjunction produces ONE result per value
+                // node (= the focus node) with sh:value = focus; the nested
+                // violations' messages are aggregated for diagnostics.
+                let mut failure_messages = Vec::new();
                 for nested in nested_shapes {
                     let nested_results = validate_nested_shape(
                         db,
@@ -930,26 +938,28 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    // Include violations from the nested shape
                     for r in nested_results {
                         if r.severity == Severity::Violation {
-                            results.push(ValidationResult {
-                                focus_node: focus_node.clone(),
-                                result_path: r.result_path,
-                                source_shape: parent_shape.id.clone(),
-                                source_constraint: None,
-                                constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
-                                severity: parent_shape.severity,
-                                message: parent_shape.message.clone().unwrap_or_else(|| {
-                                    format!("sh:and constraint - {}", r.message)
-                                }),
-                                value: r.value,
-                                value_datatype: r.value_datatype,
-                                value_lang: r.value_lang,
-                                graph_id: None,
-                            });
+                            failure_messages.push(r.message);
                         }
                     }
+                }
+                if !failure_messages.is_empty() {
+                    results.push(ValidationResult {
+                        focus_node: focus_node.clone(),
+                        result_path: None,
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: None,
+                        constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!("sh:and constraint - {}", failure_messages.join("; "))
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
+                        graph_id: None,
+                    });
                 }
             }
 
@@ -998,7 +1008,7 @@ fn validate_structural_constraint<'a>(
                                 all_messages.join("; ")
                             )
                         }),
-                        value: None,
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
                         value_datatype: None,
                         value_lang: None,
                         graph_id: None,
@@ -1042,7 +1052,7 @@ fn validate_structural_constraint<'a>(
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             "Node does not conform to any shape in sh:xone".to_string()
                         }),
-                        value: None,
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
                         value_datatype: None,
                         value_lang: None,
                         graph_id: None,
@@ -1062,7 +1072,7 @@ fn validate_structural_constraint<'a>(
                                 conforming_shapes.join(", ")
                             )
                         }),
-                        value: None,
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
                         value_datatype: None,
                         value_lang: None,
                         graph_id: None,
