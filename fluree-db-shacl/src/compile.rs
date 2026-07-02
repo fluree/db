@@ -925,14 +925,19 @@ impl ShapeCompiler {
                 for (i, ps) in prop_shapes.iter_mut().enumerate() {
                     for constraint in &mut ps.constraints {
                         if let Constraint::QualifiedValueShape {
+                            shape,
                             disjoint: true,
                             sibling_shapes,
                             ..
                         } = constraint
                         {
+                            // Per spec the sibling set excludes the
+                            // constraint's own qualified shape by value, not
+                            // just by position.
+                            let own_id = shape.id.clone();
                             *sibling_shapes = all_qualified
                                 .iter()
-                                .filter(|(j, _)| *j != i)
+                                .filter(|(j, s)| *j != i && s.id != own_id)
                                 .map(|(_, s)| Arc::clone(s))
                                 .collect();
                         }
