@@ -3018,3 +3018,60 @@ async fn shacl_warning_severity_on_closed_shape_does_not_reject() {
         .await
         .expect("warn-severity closed shape must not reject the transaction");
 }
+
+/// `sh:pattern` matches the lexical form of non-string literals (SPARQL
+/// `STR()` semantics) — an integer year matches `^\d{4}$` instead of being
+/// rejected as "not a string".
+#[tokio::test]
+async fn shacl_pattern_on_integer_literal() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:VintageShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Wine"},
+        "sh:property": [{
+            "@id": "ex:pshape_vintage",
+            "sh:path": {"@id": "ex:vintage"},
+            "sh:pattern": "^\\d{4}$"
+        }]
+    });
+
+    let ledger_ok = fluree
+        .create_ledger("shacl/pattern-int-ok:main")
+        .await
+        .unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:wine1",
+                "@type": "ex:Wine",
+                "ex:vintage": 2024
+            }),
+        )
+        .await
+        .expect("4-digit integer must match ^\\d{4}$ via its lexical form");
+
+    let ledger_bad = fluree
+        .create_ledger("shacl/pattern-int-bad:main")
+        .await
+        .unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:wine2",
+                "@type": "ex:Wine",
+                "ex:vintage": 12345
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "does not match pattern");
+}
