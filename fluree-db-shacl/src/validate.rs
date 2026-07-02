@@ -19,7 +19,7 @@ use fluree_db_core::{
     FlakeValue, GraphDbRef, GraphId, IndexType, LedgerSnapshot, NoOverlay, RangeMatch, RangeTest,
     SchemaHierarchy, Sid,
 };
-use fluree_vocab::namespaces::RDF;
+use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::rdf_names;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -1196,6 +1196,27 @@ fn validate_nested_shape<'a>(
                             });
                         }
                     }
+                    Constraint::Pattern(..)
+                    | Constraint::MinLength(_)
+                    | Constraint::MaxLength(_)
+                        if has_iri_ref(&values) =>
+                    {
+                        let effective = stringify_iri_values(db, &values);
+                        let violations =
+                            validate_constraint(constraint, &effective, &datatypes, &langs)?;
+                        for violation in violations {
+                            results.push(ValidationResult {
+                                focus_node: focus_node.clone(),
+                                result_path: result_path.clone(),
+                                source_shape: parent_shape.id.clone(),
+                                source_constraint: Some(nested.id.clone()),
+                                severity: Severity::Violation,
+                                message: violation.message,
+                                value: violation.value,
+                                graph_id: None,
+                            });
+                        }
+                    }
                     _ => {
                         let violations =
                             validate_constraint(constraint, &values, &datatypes, &langs)?;
@@ -1395,6 +1416,25 @@ async fn validate_property_shape<'a>(
                         severity: prop_shape.severity,
                         message: prop_shape.message.clone().unwrap_or(message),
                         value: None,
+                        graph_id: None,
+                    });
+                }
+            }
+            Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_)
+                if has_iri_ref(&values) =>
+            {
+                // String facets apply to STR(iri) — decode IRI refs first.
+                let effective = stringify_iri_values(db, &values);
+                let violations = validate_constraint(constraint, &effective, &datatypes, &langs)?;
+                for violation in violations {
+                    results.push(ValidationResult {
+                        focus_node: focus_node.clone(),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or(violation.message),
+                        value: violation.value,
                         graph_id: None,
                     });
                 }
@@ -1756,6 +1796,33 @@ async fn check_value_against_nested_shape<'a>(
     // Literal value with no value_constraints — can't evaluate meaningfully.
     // Treat as non-conforming (the nested shape presumably expects something specific).
     Ok(false)
+}
+
+/// Replace IRI refs with their full-IRI string form for the string facets
+/// (`sh:pattern` / `sh:minLength` / `sh:maxLength`), per SPARQL `STR()`.
+/// Blank nodes stay refs (string facets fail on them, per spec); an IRI whose
+/// namespace can't be decoded (e.g. allocated in this very transaction) also
+/// stays a ref and fails closed.
+fn stringify_iri_values(db: GraphDbRef<'_>, values: &[FlakeValue]) -> Vec<FlakeValue> {
+    values
+        .iter()
+        .map(|v| match v {
+            FlakeValue::Ref(sid) if sid.namespace_code != BLANK_NODE => db
+                .snapshot
+                .decode_sid(sid)
+                .map(FlakeValue::String)
+                .unwrap_or_else(|| v.clone()),
+            _ => v.clone(),
+        })
+        .collect()
+}
+
+/// Whether any value is a non-blank IRI ref (candidate for
+/// [`stringify_iri_values`]).
+fn has_iri_ref(values: &[FlakeValue]) -> bool {
+    values
+        .iter()
+        .any(|v| matches!(v, FlakeValue::Ref(sid) if sid.namespace_code != BLANK_NODE))
 }
 
 /// Apply multiple constraints to a set of values and collect all violations.

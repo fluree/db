@@ -3406,3 +3406,94 @@ async fn shacl_unique_lang() {
         .unwrap_err();
     assert_shacl_violation(err, "more than one value");
 }
+
+/// `sh:pattern` on IRI values matches the full decoded IRI (SPARQL `STR()`),
+/// not the SID name fragment — and non-matching IRIs violate.
+#[tokio::test]
+async fn shacl_pattern_on_iri_values() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // Links must point into example.org.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:LinkShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Bookmark"},
+        "sh:property": [{
+            "@id": "ex:pshape_link",
+            "sh:path": {"@id": "ex:link"},
+            "sh:pattern": "^http://example\\.org/"
+        }]
+    });
+
+    let ledger_ok = fluree.create_ledger("shacl/iripat-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bm1",
+                "@type": "ex:Bookmark",
+                "ex:link": {"@id": "http://example.org/ns/page1"}
+            }),
+        )
+        .await
+        .expect("IRI under example.org must match the pattern via its full IRI");
+
+    // Violating IRI in a namespace committed by an earlier transaction — the
+    // full IRI decodes and fails the pattern with the precise message.
+    let ledger_bad = fluree.create_ledger("shacl/iripat-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let ledger_bad = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "http://other.example.com/page",
+                "ex:note": "registers the foreign namespace"
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bm2",
+                "@type": "ex:Bookmark",
+                "ex:link": {"@id": "http://other.example.com/page"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "does not match pattern");
+
+    // An IRI whose namespace is first seen in this very transaction can't be
+    // decoded against the base snapshot — pattern fails closed (still a
+    // violation, with the generic non-literal message).
+    let ledger_fresh = fluree
+        .create_ledger("shacl/iripat-fresh:main")
+        .await
+        .unwrap();
+    let ledger_fresh = fluree
+        .upsert(ledger_fresh, &shape_txn)
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree
+        .upsert(
+            ledger_fresh,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:bm3",
+                "@type": "ex:Bookmark",
+                "ex:link": {"@id": "http://brand-new.example.net/page"}
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "Pattern constraint");
+}

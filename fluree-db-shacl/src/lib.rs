@@ -18,7 +18,11 @@
 //! - Cardinality: `sh:minCount`, `sh:maxCount`
 //! - Value type: `sh:datatype`, `sh:nodeKind`, `sh:class` (with RDFS subclass reasoning)
 //! - Value range: `sh:minInclusive`, `sh:maxInclusive`, `sh:minExclusive`, `sh:maxExclusive`
-//! - String: `sh:pattern`, `sh:minLength`, `sh:maxLength`
+//! - String: `sh:pattern`, `sh:minLength`, `sh:maxLength` — literals match on
+//!   their lexical form and IRIs on the full decoded IRI (per SPARQL `STR()`).
+//!   An IRI whose namespace was allocated in the same transaction can't be
+//!   decoded against the base snapshot and fails closed; blank nodes fail per
+//!   spec.
 //! - Value: `sh:hasValue`, `sh:in`
 //! - Closed: `sh:closed`, `sh:ignoredProperties`
 //! - Pair: `sh:equals`, `sh:disjoint`, `sh:lessThan`, `sh:lessThanOrEquals`
