@@ -227,5 +227,6 @@
   - [Dev setup](contributing/dev-setup.md)
   - [Tests](contributing/tests.md)
   - [W3C SPARQL compliance suite](contributing/sparql-compliance.md)
+  - [W3C SHACL compliance suite](contributing/shacl-compliance.md)
   - [Adding tracing spans](contributing/tracing-guide.md)
   - [Releasing](contributing/releasing.md)
