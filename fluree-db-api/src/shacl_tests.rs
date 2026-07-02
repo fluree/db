@@ -2978,3 +2978,43 @@ async fn shacl_ignored_properties_turtle_list() {
         .unwrap_err();
     assert_shacl_violation(err, "not allowed by closed shape");
 }
+
+/// `sh:severity sh:Warning` on a node shape must apply to node-level
+/// structural constraints too — a warn-severity closed shape must not reject
+/// the transaction (property constraints already honored severity).
+#[tokio::test]
+async fn shacl_warning_severity_on_closed_shape_does_not_reject() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:AdvisoryClosedShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Advisory"},
+        "sh:closed": true,
+        "sh:severity": {"@id": "sh:Warning"},
+        "sh:property": [{
+            "@id": "ex:pshape_advisory_label",
+            "sh:path": {"@id": "ex:label"}
+        }]
+    });
+
+    let ledger = fluree.create_ledger("shacl/warnsev:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // ex:extra is undeclared — a Violation-severity closed shape would reject
+    // this (covered by shacl_closed_constraint); Warning severity must not.
+    fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:adv1",
+                "@type": "ex:Advisory",
+                "ex:label": "ok",
+                "ex:extra": "advisory only"
+            }),
+        )
+        .await
+        .expect("warn-severity closed shape must not reject the transaction");
+}

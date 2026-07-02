@@ -779,7 +779,7 @@ fn validate_structural_constraint<'a>(
                                 result_path: Some(prop.clone()),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: None,
-                                severity: Severity::Violation,
+                                severity: parent_shape.severity,
                                 message: parent_shape.message.clone().unwrap_or_else(|| {
                                     format!("Property {} not allowed by closed shape", prop.name)
                                 }),
@@ -811,7 +811,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
+                        severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
                                 "Node does not conform to shape {} (sh:node)",
@@ -847,7 +847,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
+                        severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
                                 "Node conforms to shape {} which is not allowed (sh:not)",
@@ -880,7 +880,7 @@ fn validate_structural_constraint<'a>(
                                 result_path: r.result_path,
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: None,
-                                severity: Severity::Violation,
+                                severity: parent_shape.severity,
                                 message: parent_shape.message.clone().unwrap_or_else(|| {
                                     format!("sh:and constraint - {}", r.message)
                                 }),
@@ -928,7 +928,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
+                        severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
                                 "Node does not conform to any shape in sh:or. Violations: {}",
@@ -971,7 +971,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
+                        severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             "Node does not conform to any shape in sh:xone".to_string()
                         }),
@@ -984,7 +984,7 @@ fn validate_structural_constraint<'a>(
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
+                        severity: parent_shape.severity,
                         message: parent_shape.message.clone().unwrap_or_else(|| {
                             format!(
                                 "Node conforms to {} shapes in sh:xone (must be exactly 1): {}",
