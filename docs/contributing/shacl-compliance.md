@@ -71,10 +71,15 @@ A few expectations are unachievable by design — Fluree's value-centric
 store differs from RDF term identity:
 
 - `4` and `4.0` are the same value in flake space, so they collapse into
-  one `sh:targetNode` target (`minExclusive-001` / `maxExclusive-001`).
+  one `sh:targetNode` target (`minExclusive-001` / `maxExclusive-001`);
+  likewise `"1"^^xsd:boolean` canonicalizes to `true`, so a spec-pedantic
+  `sh:uniqueLang "1"^^xsd:boolean` (which must be ignored — only the term
+  `true` activates the component) is indistinguishable from `true` and
+  fires (`uniqueLang-002`).
 - Ill-formed typed literals (`"aldi"^^xsd:integer`) are rejected at ingest
   and can never be present to validate (`datatype-001`).
-- Duplicate values in an RDF list collapse (`xone-duplicate`).
+- Duplicate values in an RDF list collapse (`xone-duplicate`,
+  `path-complex-002`'s `( _:pinv _:pinv )` sequence).
 
 Track the current pass rate with `make count` before and after engine
 changes; regressions in previously-passing categories are the signal to

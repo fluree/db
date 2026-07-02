@@ -179,9 +179,19 @@ fn parse_entry(graph: &Graph, entry_iri: &str, manifest_path: &Path) -> Result<O
 
 fn parse_expected_result(graph: &Graph, result: &Term) -> ExpectedResult {
     let get = |local: &str| object_for(graph, result, &format!("{}{local}", ns::SH));
+    // A list-valued sh:resultPath (sequence/alternative path structure) is a
+    // complex path — matched leniently, like blank-node path structures.
+    let path_pred = format!("{}resultPath", ns::SH);
+    let path_is_list = graph.iter().any(|t| {
+        t.s == *result && t.p.as_iri() == Some(path_pred.as_str()) && t.list_index.is_some()
+    });
     ExpectedResult {
         focus: term_pat(get("focusNode")),
-        path: term_pat(get("resultPath")),
+        path: if path_is_list {
+            TermPat::Any
+        } else {
+            term_pat(get("resultPath"))
+        },
         severity: get("resultSeverity").and_then(|t| t.as_iri().map(String::from)),
         component: get("sourceConstraintComponent").and_then(|t| t.as_iri().map(String::from)),
         value: term_pat(get("value")),

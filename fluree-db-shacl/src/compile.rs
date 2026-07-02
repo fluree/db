@@ -913,7 +913,18 @@ impl ShapeCompiler {
         for (id, data) in &shapes {
             // Resolve property shapes
             let mut prop_shapes = Vec::new();
-            for ps_id in &data.property_shape_ids {
+            // A property shape can carry its own targets (`ex:S a
+            // sh:PropertyShape ; sh:path ... ; sh:targetNode ...`) with no
+            // wrapping node shape — the shape then validates its own focus
+            // nodes: attach its own path-bearing entry alongside any
+            // sh:property references.
+            let mut ps_ids: Vec<&Sid> = data.property_shape_ids.iter().collect();
+            if ps_map.get(id).is_some_and(|own| own.path.is_some())
+                && !data.property_shape_ids.contains(id)
+            {
+                ps_ids.push(id);
+            }
+            for ps_id in ps_ids {
                 if let Some(ps_data) = ps_map.get(ps_id) {
                     if ps_data.deactivated {
                         continue;

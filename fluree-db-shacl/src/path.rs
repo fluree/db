@@ -195,6 +195,20 @@ pub fn resolve_sh_path<'a>(
 /// blank node) into a [`PropertyPath`].
 fn resolve_path_node<'a>(db: GraphDbRef<'a>, node: &'a Sid) -> PathFuture<'a, PropertyPath> {
     Box::pin(async move {
+        // Bare RDF list → sequence path. Checked before the operator keys:
+        // an (ill-formed) node carrying both a list structure and an
+        // operator reads as the sequence, matching the W3C suite's
+        // path-strange-001/002 expectations.
+        let rdf_first = Sid::new(RDF, rdf_names::FIRST);
+        if has_object(db, node, &rdf_first).await? {
+            let members = resolve_rdf_list(db, node).await?;
+            match members.len() {
+                0 => return Err(unsupported(node, "sh:path sequence list is empty")),
+                1 => return Ok(members.into_iter().next().unwrap()),
+                _ => return Ok(PropertyPath::Sequence(members)),
+            }
+        }
+
         // sh:inversePath — inverse of any path, rewritten into the AST
         // (inverse of a sequence = reversed sequence of inverses, etc.).
         if let Some(inner) = operand_path(db, node, &shacl(predicates::INVERSE_PATH)).await? {
@@ -221,17 +235,6 @@ fn resolve_path_node<'a>(db: GraphDbRef<'a>, node: &'a Sid) -> PathFuture<'a, Pr
         ] {
             if let Some(inner) = operand_path(db, node, &shacl(pred)).await? {
                 return Ok(wrap(Box::new(inner)));
-            }
-        }
-
-        // Bare RDF list → sequence path.
-        let rdf_first = Sid::new(RDF, rdf_names::FIRST);
-        if has_object(db, node, &rdf_first).await? {
-            let members = resolve_rdf_list(db, node).await?;
-            match members.len() {
-                0 => return Err(unsupported(node, "sh:path sequence list is empty")),
-                1 => return Ok(members.into_iter().next().unwrap()),
-                _ => return Ok(PropertyPath::Sequence(members)),
             }
         }
 
