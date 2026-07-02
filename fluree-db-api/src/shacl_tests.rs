@@ -4025,14 +4025,14 @@ async fn validate_report_inline_turtle_replaces_attached() {
         .ledger;
     let view = crate::ledger_view::LedgerView::from_state(&ledger);
 
-    let email_shapes_turtle = r#"
+    let email_shapes_turtle = r"
         @prefix sh: <http://www.w3.org/ns/shacl#> .
         @prefix schema: <http://schema.org/> .
         @prefix ex: <http://example.org/ns/> .
         ex:EmailShape a sh:NodeShape ;
             sh:targetClass ex:User ;
             sh:property [ sh:path schema:email ; sh:minCount 1 ] .
-    "#;
+    ";
 
     // Replace (default): only the inline shape runs — bob conforms.
     let options = crate::validate::ValidateOptions {

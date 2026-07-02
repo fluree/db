@@ -2638,14 +2638,14 @@ fn update_via_stdin() {
 // Validate command (file mode — no .fluree required)
 // ============================================================================
 
-const VALIDATE_SHAPES_TTL: &str = r#"
+const VALIDATE_SHAPES_TTL: &str = r"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix ex: <http://example.org/ns/> .
 @prefix schema: <http://schema.org/> .
 ex:UserShape a sh:NodeShape ;
     sh:targetClass ex:User ;
     sh:property [ sh:path schema:name ; sh:minCount 1 ] .
-"#;
+";
 
 #[test]
 fn validate_file_with_shapes_reports_violation() {

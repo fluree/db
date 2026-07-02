@@ -90,14 +90,14 @@ async fn seed_nonconforming(state: &Arc<AppState>, ledger: &str) {
     assert!(status.is_success(), "insert shape into {ledger}: {status}");
 }
 
-const EMAIL_SHAPES_TTL: &str = r#"
+const EMAIL_SHAPES_TTL: &str = r"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix ex: <http://example.org/ns/> .
 @prefix schema: <http://schema.org/> .
 ex:EmailShape a sh:NodeShape ;
     sh:targetClass ex:User ;
     sh:property [ sh:path schema:email ; sh:minCount 1 ] .
-"#;
+";
 
 #[tokio::test]
 async fn validate_attached_shapes_json_envelope() {
