@@ -3532,3 +3532,112 @@ async fn shacl_custom_message_on_nested_member() {
         .unwrap_err();
     assert_shacl_violation(err, "A Checked record always needs a code");
 }
+
+/// `sh:qualifiedValueShapesDisjoint` — a value conforming to a sibling
+/// qualified shape doesn't count. A crew needs a pilot and a navigator as
+/// distinct members: one member holding both roles satisfies the counts only
+/// without disjointness.
+#[tokio::test]
+async fn shacl_qualified_value_shapes_disjoint() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let crew_shape = |disjoint: bool| {
+        json!({
+            "@context": context.clone(),
+            "@graph": [
+                {
+                    "@id": "ex:PilotShape",
+                    "@type": "sh:NodeShape",
+                    "sh:property": [{
+                        "@id": "ex:pshape_license",
+                        "sh:path": {"@id": "ex:license"},
+                        "sh:minCount": 1
+                    }]
+                },
+                {
+                    "@id": "ex:NavigatorShape",
+                    "@type": "sh:NodeShape",
+                    "sh:property": [{
+                        "@id": "ex:pshape_chart",
+                        "sh:path": {"@id": "ex:chart"},
+                        "sh:minCount": 1
+                    }]
+                },
+                {
+                    "@id": "ex:CrewShape",
+                    "@type": "sh:NodeShape",
+                    "sh:targetClass": {"@id": "ex:Crew"},
+                    "sh:property": [
+                        {
+                            "@id": "ex:pshape_pilot",
+                            "sh:path": {"@id": "ex:member"},
+                            "sh:qualifiedValueShape": {"@id": "ex:PilotShape"},
+                            "sh:qualifiedMinCount": 1,
+                            "sh:qualifiedValueShapesDisjoint": disjoint
+                        },
+                        {
+                            "@id": "ex:pshape_navigator",
+                            "sh:path": {"@id": "ex:member"},
+                            "sh:qualifiedValueShape": {"@id": "ex:NavigatorShape"},
+                            "sh:qualifiedMinCount": 1,
+                            "sh:qualifiedValueShapesDisjoint": disjoint
+                        }
+                    ]
+                }
+            ]
+        })
+    };
+    // One member holds a license, a different member holds a chart.
+    let distinct_crew = json!({
+        "@context": context.clone(),
+        "@graph": [
+            {"@id": "ex:crew1", "@type": "ex:Crew",
+             "ex:member": [{"@id": "ex:p1"}, {"@id": "ex:n1"}]},
+            {"@id": "ex:p1", "ex:license": "L-1"},
+            {"@id": "ex:n1", "ex:chart": "C-1"}
+        ]
+    });
+    // A single member holds both the license and the chart.
+    let dual_role_crew = json!({
+        "@context": context.clone(),
+        "@graph": [
+            {"@id": "ex:crew2", "@type": "ex:Crew", "ex:member": {"@id": "ex:b1"}},
+            {"@id": "ex:b1", "ex:license": "L-2", "ex:chart": "C-2"}
+        ]
+    });
+
+    // Distinct members satisfy both qualified counts under disjointness.
+    let ledger = fluree.create_ledger("shacl/disj-ok:main").await.unwrap();
+    let ledger = fluree
+        .upsert(ledger, &crew_shape(true))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .upsert(ledger, &distinct_crew)
+        .await
+        .expect("distinct pilot and navigator satisfy disjoint qualified counts");
+
+    // A dual-role member conforms to the sibling shape too, so it counts for
+    // neither → both qualifiedMinCounts fail.
+    let ledger = fluree.create_ledger("shacl/disj-bad:main").await.unwrap();
+    let ledger = fluree
+        .upsert(ledger, &crew_shape(true))
+        .await
+        .unwrap()
+        .ledger;
+    let err = fluree.upsert(ledger, &dual_role_crew).await.unwrap_err();
+    assert_shacl_violation(err, "at least 1 value(s) conforming");
+
+    // Control: without disjointness the dual-role member counts for both.
+    let ledger = fluree.create_ledger("shacl/disj-off:main").await.unwrap();
+    let ledger = fluree
+        .upsert(ledger, &crew_shape(false))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .upsert(ledger, &dual_role_crew)
+        .await
+        .expect("without disjointness a dual-role member satisfies both counts");
+}

@@ -83,6 +83,12 @@ pub enum Constraint {
         min_count: Option<usize>,
         /// sh:qualifiedMaxCount
         max_count: Option<usize>,
+        /// sh:qualifiedValueShapesDisjoint — when true, a value only counts
+        /// if it does NOT conform to any sibling qualified shape.
+        disjoint: bool,
+        /// Qualified shapes of the other property shapes of the same node
+        /// shape (filled during finalize; consulted only when `disjoint`).
+        sibling_shapes: Vec<Arc<NestedShape>>,
     },
 }
 

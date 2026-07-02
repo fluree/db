@@ -332,7 +332,9 @@ ex:TeamShape a sh:NodeShape ;
   ] .
 ```
 
-(`sh:qualifiedValueShapesDisjoint` is not supported.)
+`sh:qualifiedValueShapesDisjoint true` additionally excludes values that
+conform to a *sibling* qualified shape — e.g. a crew needing one pilot and one
+navigator as distinct members rejects a single member holding both roles.
 
 ### Constraints on the node itself
 
@@ -587,7 +589,8 @@ All three routes go through the same post-stage helper, so the ledger's configur
 
 ## Not yet supported
 
-- `sh:qualifiedValueShapesDisjoint` — sibling-shape disjointness for qualified value shapes (the counting form of `sh:qualifiedValueShape` is supported).
+- `sh:targetNode` with a literal value — only IRI/blank-node targets are compiled.
+- `sh:sparql` (SPARQL-based constraints).
 
 These are tracked in the SHACL compliance effort.
 

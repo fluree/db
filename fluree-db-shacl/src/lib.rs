@@ -36,8 +36,9 @@
 //!   being validated on the call stack is assumed conforming.
 //! - Qualified: `sh:qualifiedValueShape` with `sh:qualifiedMinCount` /
 //!   `sh:qualifiedMaxCount` — counts the values conforming to the qualified
-//!   shape, including on property shapes used as logical-constraint members
-//!   (`sh:qualifiedValueShapesDisjoint` is not supported)
+//!   shape, including on property shapes used as logical-constraint members.
+//!   `sh:qualifiedValueShapesDisjoint` excludes values that conform to a
+//!   sibling qualified shape (top-level property shapes)
 //! - Node-shape value constraints: per-value constraints declared directly on
 //!   a node shape (no `sh:path`) apply to the focus node itself
 //! - `sh:deactivated` — a deactivated shape is ignored entirely, including
@@ -75,9 +76,9 @@
 //!
 //! # Not Yet Supported
 //!
-//! - `sh:qualifiedValueShapesDisjoint` — sibling-shape disjointness for
-//!   qualified value shapes (the counting form of `sh:qualifiedValueShape` is
-//!   supported).
+//! - `sh:targetNode` with a literal value — only IRI/blank-node targets are
+//!   compiled (focus nodes are subject ids throughout the engine).
+//! - `sh:sparql` (SPARQL-based constraints).
 //!
 //! # Example
 //!

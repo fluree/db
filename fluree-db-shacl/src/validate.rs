@@ -1158,6 +1158,7 @@ fn validate_nested_shape<'a>(
                         shape,
                         min_count,
                         max_count,
+                        ..
                     } => {
                         let mut conforming = 0usize;
                         for (i, value) in values.iter().enumerate() {
@@ -1374,10 +1375,12 @@ async fn validate_property_shape<'a>(
                 shape,
                 min_count,
                 max_count,
+                disjoint,
+                sibling_shapes,
             } => {
                 let mut conforming = 0usize;
                 for (i, value) in values.iter().enumerate() {
-                    let conforms = check_value_against_nested_shape(
+                    let mut conforms = check_value_against_nested_shape(
                         db,
                         value,
                         datatypes.get(i),
@@ -1389,6 +1392,28 @@ async fn validate_property_shape<'a>(
                         active,
                     )
                     .await?;
+                    // Disjointness: a value conforming to a sibling qualified
+                    // shape does not count toward this one.
+                    if conforms && *disjoint {
+                        for sibling in sibling_shapes {
+                            if check_value_against_nested_shape(
+                                db,
+                                value,
+                                datatypes.get(i),
+                                langs.get(i).and_then(|l| l.as_deref()),
+                                sibling,
+                                parent_shape,
+                                all_shapes,
+                                class_ctx,
+                                active,
+                            )
+                            .await?
+                            {
+                                conforms = false;
+                                break;
+                            }
+                        }
+                    }
                     if conforms {
                         conforming += 1;
                     }

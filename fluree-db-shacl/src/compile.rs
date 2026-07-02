@@ -169,6 +169,8 @@ struct PropertyShapeData {
     qualified_min: Option<usize>,
     /// sh:qualifiedMaxCount
     qualified_max: Option<usize>,
+    /// sh:qualifiedValueShapesDisjoint
+    qualified_disjoint: bool,
 }
 
 impl ShapeCompiler {
@@ -251,6 +253,7 @@ impl ShapeCompiler {
             predicates::QUALIFIED_VALUE_SHAPE,
             predicates::QUALIFIED_MIN_COUNT,
             predicates::QUALIFIED_MAX_COUNT,
+            predicates::QUALIFIED_VALUE_SHAPES_DISJOINT,
             // Logical constraints
             predicates::NOT,
             predicates::AND,
@@ -746,6 +749,12 @@ impl ShapeCompiler {
                     self.get_or_create_property_shape(&flake.s).qualified_max = Some(*n as usize);
                 }
             }
+            name if name == predicates::QUALIFIED_VALUE_SHAPES_DISJOINT => {
+                if let FlakeValue::Boolean(v) = &flake.o {
+                    self.get_or_create_property_shape(&flake.s)
+                        .qualified_disjoint = *v;
+                }
+            }
 
             // Logical constraints (node-level)
             name if name == predicates::NOT => {
@@ -891,6 +900,42 @@ impl ShapeCompiler {
                             name: ps_data.name.clone(),
                             message: ps_data.message.clone(),
                         });
+                    }
+                }
+            }
+
+            // Sibling disjointness: a disjoint qualified constraint consults
+            // the qualified shapes declared by the OTHER property shapes of
+            // this node shape.
+            let all_qualified: Vec<(usize, Arc<NestedShape>)> = prop_shapes
+                .iter()
+                .enumerate()
+                .flat_map(|(i, ps)| {
+                    ps.constraints
+                        .iter()
+                        .filter_map(move |constraint| match constraint {
+                            Constraint::QualifiedValueShape { shape, .. } => {
+                                Some((i, Arc::clone(shape)))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect();
+            if all_qualified.len() > 1 {
+                for (i, ps) in prop_shapes.iter_mut().enumerate() {
+                    for constraint in &mut ps.constraints {
+                        if let Constraint::QualifiedValueShape {
+                            disjoint: true,
+                            sibling_shapes,
+                            ..
+                        } = constraint
+                        {
+                            *sibling_shapes = all_qualified
+                                .iter()
+                                .filter(|(j, _)| *j != i)
+                                .map(|(_, s)| Arc::clone(s))
+                                .collect();
+                        }
                     }
                 }
             }
@@ -1085,6 +1130,8 @@ fn qualified_constraint(
             shape: Arc::new(build_nested_shape_inner(q_ref, ps_map, seen)),
             min_count: ps_data.qualified_min,
             max_count: ps_data.qualified_max,
+            disjoint: ps_data.qualified_disjoint,
+            sibling_shapes: Vec::new(),
         })
 }
 
