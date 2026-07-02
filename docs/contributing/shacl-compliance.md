@@ -61,11 +61,18 @@ Failures are expected in these areas (honest gaps, not harness bugs):
 
 - Complex `sh:resultPath` serialization (sequence/inverse path structures)
   is omitted from reports.
-- `sh:equals` reports one aggregate violation instead of one per
-  missing/extra value.
+- `sh:equals` / `sh:lessThan` report one aggregate violation instead of one
+  per missing/extra value (`equals-001`, `lessThan-002`).
 - `xsd:dateTime` range comparison does not implement the spec's
   timezone partial order (`minInclusive-002/003`).
+- `sh:property` nested on a *property* shape (validating each value against
+  child property shapes) is not implemented (`property-001`,
+  `validation-reports/shared`).
+- Custom severity IRIs (`sh:severity ex:MySeverity`) collapse to
+  `sh:Violation` (`severity-002`).
 - `sh:sparql` (the whole `sparql/` section of the suite is not wired in).
+- `complex/shacl-shacl` (validating shapes against the SHACL-SHACL meta
+  shapes) depends on several of the above.
 
 A few expectations are unachievable by design — Fluree's value-centric
 store differs from RDF term identity:
@@ -76,8 +83,9 @@ store differs from RDF term identity:
   `sh:uniqueLang "1"^^xsd:boolean` (which must be ignored — only the term
   `true` activates the component) is indistinguishable from `true` and
   fires (`uniqueLang-002`).
-- Ill-formed typed literals (`"aldi"^^xsd:integer`) are rejected at ingest
-  and can never be present to validate (`datatype-001`).
+- Ill-formed typed literals (`"aldi"^^xsd:integer`, `"none"^^xsd:boolean`)
+  are rejected at ingest and can never be present to validate
+  (`datatype-001`, `datatype-ill-formed`, `or-datatypes-001`).
 - Duplicate values in an RDF list collapse (`xone-duplicate`,
   `path-complex-002`'s `( _:pinv _:pinv )` sequence).
 

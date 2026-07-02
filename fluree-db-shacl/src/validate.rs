@@ -307,7 +307,9 @@ impl ShaclEngine {
             results.extend(shape_results);
         }
 
-        let conforms = results.iter().all(|r| r.severity != Severity::Violation);
+        // Spec: sh:conforms is true iff there are NO validation results
+        // (warnings and infos included), not merely no violations.
+        let conforms = results.is_empty();
 
         Ok(ValidationReport { conforms, results })
     }
@@ -369,29 +371,55 @@ impl ShaclEngine {
                 all_results.extend(results);
             }
 
-            // Literal sh:targetNode targets: the focus is the literal itself.
+            // Literal focus nodes: explicit literal sh:targetNode targets, plus
+            // literal objects reached via sh:targetObjectsOf (a target
+            // predicate's objects may be literals). De-duplicated by value —
+            // the focus set is a set of nodes.
+            let mut literal_targets: Vec<crate::compile::LiteralTarget> = Vec::new();
             for target in &shape.targets {
-                if let crate::compile::TargetType::LiteralNode(lits) = target {
-                    for lit in lits {
-                        let active = ActiveShapeChecks::default();
-                        let results = validate_literal_focus(
-                            db,
-                            lit,
-                            shape,
-                            &all_shapes,
-                            Some(class_ctx),
-                            &active,
-                        )
-                        .await?;
-                        all_results.extend(results);
+                match target {
+                    crate::compile::TargetType::LiteralNode(lits) => {
+                        for lit in lits {
+                            if !literal_targets.contains(lit) {
+                                literal_targets.push(lit.clone());
+                            }
+                        }
                     }
+                    crate::compile::TargetType::ObjectsOf(predicate) => {
+                        let flakes = db
+                            .range(
+                                IndexType::Psot,
+                                RangeTest::Eq,
+                                RangeMatch::predicate(predicate.clone()),
+                            )
+                            .await?;
+                        for flake in &flakes {
+                            if matches!(flake.o, FlakeValue::Ref(_)) {
+                                continue;
+                            }
+                            let lit = crate::compile::LiteralTarget {
+                                value: flake.o.clone(),
+                                datatype: flake.dt.clone(),
+                                lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+                            };
+                            if !literal_targets.contains(&lit) {
+                                literal_targets.push(lit);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
+            }
+            for lit in &literal_targets {
+                let active = ActiveShapeChecks::default();
+                let results =
+                    validate_literal_focus(db, lit, shape, &all_shapes, Some(class_ctx), &active)
+                        .await?;
+                all_results.extend(results);
             }
         }
 
-        let conforms = all_results
-            .iter()
-            .all(|r| r.severity != Severity::Violation);
+        let conforms = all_results.is_empty();
 
         Ok(ValidationReport {
             conforms,
@@ -501,9 +529,7 @@ impl ShaclEngine {
             all_results.extend(report.results);
         }
 
-        let conforms = all_results
-            .iter()
-            .all(|r| r.severity != Severity::Violation);
+        let conforms = all_results.is_empty();
 
         Ok(ValidationReport {
             conforms,
@@ -522,7 +548,9 @@ impl ShaclEngine {
     ) -> Result<()> {
         let report = self.validate_staged(db, modified_subjects).await?;
 
-        if report.conforms {
+        // Enforcement rejects on violations only — spec-level `conforms`
+        // is also false for warnings/infos, which must not block a commit.
+        if report.violation_count() == 0 {
             Ok(())
         } else {
             // Build detailed error messages (limit to first 10 to avoid huge errors)
@@ -567,10 +595,35 @@ async fn get_focus_nodes(
     for target in &shape.targets {
         match target {
             TargetType::Class(class) | TargetType::ImplicitClass(class) => {
-                // Build list of classes to query: target class + all subclasses
+                // Build list of classes to query: target class + all subclasses.
+                // The indexed hierarchy misses novelty-added subclass relations,
+                // so a live rdfs:subClassOf descendant walk unions them in
+                // (mirrors the live walk sh:class membership already does).
                 let mut classes_to_query = vec![class.clone()];
                 if let Some(h) = hierarchy {
                     classes_to_query.extend(h.subclasses_of(class).iter().cloned());
+                }
+                let sub_class_of = Sid::new(fluree_vocab::namespaces::RDFS, "subClassOf");
+                let mut queue: std::collections::VecDeque<Sid> =
+                    classes_to_query.iter().cloned().collect();
+                let mut visited: HashSet<Sid> = classes_to_query.iter().cloned().collect();
+                while let Some(cls) = queue.pop_front() {
+                    let sub_flakes = db
+                        .range(
+                            IndexType::Opst,
+                            RangeTest::Eq,
+                            RangeMatch::predicate_object(
+                                sub_class_of.clone(),
+                                FlakeValue::Ref(cls),
+                            ),
+                        )
+                        .await?;
+                    for flake in &sub_flakes {
+                        if visited.insert(flake.s.clone()) {
+                            classes_to_query.push(flake.s.clone());
+                            queue.push_back(flake.s.clone());
+                        }
+                    }
                 }
 
                 // Find all instances of each class
@@ -1990,9 +2043,12 @@ async fn validate_property_value_structural_constraint<'a>(
         }
 
         NodeConstraint::And(nested_shapes) => {
-            // For each value, ALL nested shapes must accept it
+            // For each value, ALL nested shapes must accept it. Per spec a
+            // failed conjunction produces ONE result per value node, however
+            // many members rejected it.
             for (i, value) in values.iter().enumerate() {
                 let dt = datatypes.get(i);
+                let mut failed_members = Vec::new();
                 for nested in nested_shapes {
                     let conforms = check_value_against_nested_shape(
                         db,
@@ -2007,25 +2063,29 @@ async fn validate_property_value_structural_constraint<'a>(
                     )
                     .await?;
                     if !conforms {
-                        results.push(ValidationResult {
-                            focus_node: FocusNode::Node(focus_node.clone()),
-                            result_path: prop_shape.path.as_predicate().cloned(),
-                            source_shape: parent_shape.id.clone(),
-                            source_constraint: Some(prop_shape.id.clone()),
-                            constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
-                            severity: prop_shape.severity,
-                            message: prop_shape.message.clone().unwrap_or_else(|| {
-                                format!(
-                                    "Value {:?} does not conform to shape {} (sh:and)",
-                                    value, nested.id.name
-                                )
-                            }),
-                            value: Some(value.clone()),
-                            value_datatype: datatypes.get(i).cloned(),
-                            value_lang: langs.get(i).and_then(std::clone::Clone::clone),
-                            graph_id: None,
-                        });
+                        failed_members.push(nested.id.name.to_string());
                     }
+                }
+                if !failed_members.is_empty() {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {:?} does not conform to shape(s) {} (sh:and)",
+                                value,
+                                failed_members.join(", ")
+                            )
+                        }),
+                        value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
+                        graph_id: None,
+                    });
                 }
             }
         }

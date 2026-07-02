@@ -2167,7 +2167,9 @@ pub async fn stage_with_shacl(
     let report =
         validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
 
-    if !report.conforms {
+    // Reject on violations only — spec-level `conforms` is also false for
+    // warnings/infos, which must not block a commit.
+    if report.violation_count() > 0 {
         return Err(TransactError::ShaclViolation(format_shacl_report(&report)));
     }
 
