@@ -23,6 +23,12 @@ Fluree decides whether to run SHACL validation on each transaction using this or
 
 This means you can start using SHACL **without writing any config** — just transact shapes and they're enforced.
 
+**Bulk import is deliberately exempt.** The bulk-import pipeline never runs
+SHACL — it is a trusted, high-throughput load path. If your source data must
+conform, validate it *before* importing (e.g. run a SHACL report over the
+source with your shapes) so the ledger starts clean; transaction-time
+validation keeps it clean from there.
+
 The `shacl` feature must be enabled at build time (it's on by default for the server and CLI binaries). See [Standards and feature flags](../reference/compatibility.md).
 
 ## Enabling SHACL via the config graph
