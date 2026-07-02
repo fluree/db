@@ -53,11 +53,12 @@
 //!
 //! Besides a single predicate IRI, `sh:path` supports property path expressions
 //! (compiled by [`path::resolve_sh_path`] into a [`PropertyPath`] AST and evaluated
-//! by [`path::eval_path`]): `sh:inversePath` (over a single predicate), sequence
-//! paths (RDF lists), `sh:alternativePath`, `sh:zeroOrMorePath`,
+//! by [`path::eval_path`]): `sh:inversePath` (over any path — the inverse of a
+//! composite rewrites into the AST, e.g. `^(p1/p2)` becomes `^p2/^p1`),
+//! sequence paths (RDF lists), `sh:alternativePath`, `sh:zeroOrMorePath`,
 //! `sh:oneOrMorePath`, and `sh:zeroOrOnePath` — including nesting of these.
-//! The one unsupported form, the inverse of a composite path (`^(p1/p2)`),
-//! compiles to [`PropertyPath::Unresolvable`] and surfaces as a violation when
+//! Malformed paths (a literal step, multiple un-listed values for an operator)
+//! compile to [`PropertyPath::Unresolvable`] and surface as a violation when
 //! the owning shape fires on a focus node — scoped to that shape's targets
 //! rather than failing every transaction on the ledger.
 //!

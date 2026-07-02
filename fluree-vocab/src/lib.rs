@@ -874,6 +874,27 @@ pub mod shacl {
     /// sh:path IRI
     pub const PATH: &str = "http://www.w3.org/ns/shacl#path";
 
+    /// sh:inversePath IRI
+    pub const INVERSE_PATH: &str = "http://www.w3.org/ns/shacl#inversePath";
+
+    /// sh:alternativePath IRI
+    pub const ALTERNATIVE_PATH: &str = "http://www.w3.org/ns/shacl#alternativePath";
+
+    /// sh:zeroOrMorePath IRI
+    pub const ZERO_OR_MORE_PATH: &str = "http://www.w3.org/ns/shacl#zeroOrMorePath";
+
+    /// sh:oneOrMorePath IRI
+    pub const ONE_OR_MORE_PATH: &str = "http://www.w3.org/ns/shacl#oneOrMorePath";
+
+    /// sh:zeroOrOnePath IRI
+    pub const ZERO_OR_ONE_PATH: &str = "http://www.w3.org/ns/shacl#zeroOrOnePath";
+
+    /// sh:node IRI
+    pub const NODE: &str = "http://www.w3.org/ns/shacl#node";
+
+    /// sh:deactivated IRI
+    pub const DEACTIVATED: &str = "http://www.w3.org/ns/shacl#deactivated";
+
     // ========================================================================
     // Cardinality Constraints
     // ========================================================================

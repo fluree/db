@@ -119,6 +119,26 @@ fn shacl(name: &str) -> Sid {
     Sid::new(SHACL, name)
 }
 
+/// Rewrite a path into its inverse: `^(p1/p2)` becomes `^p2/^p1`,
+/// `^(p1|p2)` becomes `^p1|^p2`, `^(p*)` becomes `(^p)*`, and `^^p`
+/// collapses back to `p`. `Unresolvable` passes through unchanged.
+fn invert(path: PropertyPath) -> PropertyPath {
+    match path {
+        PropertyPath::Predicate(p) => PropertyPath::Inverse(p),
+        PropertyPath::Inverse(p) => PropertyPath::Predicate(p),
+        PropertyPath::Sequence(steps) => {
+            PropertyPath::Sequence(steps.into_iter().rev().map(invert).collect())
+        }
+        PropertyPath::Alternative(alts) => {
+            PropertyPath::Alternative(alts.into_iter().map(invert).collect())
+        }
+        PropertyPath::ZeroOrMore(inner) => PropertyPath::ZeroOrMore(Box::new(invert(*inner))),
+        PropertyPath::OneOrMore(inner) => PropertyPath::OneOrMore(Box::new(invert(*inner))),
+        PropertyPath::ZeroOrOne(inner) => PropertyPath::ZeroOrOne(Box::new(invert(*inner))),
+        PropertyPath::Unresolvable(reason) => PropertyPath::Unresolvable(reason),
+    }
+}
+
 /// Resolve the `sh:path` of a property shape subject into a [`PropertyPath`].
 ///
 /// Handles all three encodings of `sh:path`:
@@ -136,7 +156,8 @@ pub fn resolve_sh_path<'a>(
     ps_subject: &'a Sid,
 ) -> PathFuture<'a, Option<PropertyPath>> {
     Box::pin(async move {
-        let members = ordered_objects(db, ps_subject, &shacl(predicates::PATH)).await?;
+        let (members, all_indexed) =
+            ordered_objects(db, ps_subject, &shacl(predicates::PATH)).await?;
         match members.len() {
             0 => Ok(None),
             1 => match &members[0] {
@@ -144,6 +165,10 @@ pub fn resolve_sh_path<'a>(
                 // sh:path with a literal object is invalid; skip.
                 _ => Ok(None),
             },
+            // Multiple sh:path objects are only a sequence under the JSON-LD
+            // @list encoding (every flake carries a list index). Un-indexed
+            // multiples are distinct sh:path assertions — a malformed shape.
+            _ if !all_indexed => Err(unsupported(ps_subject, "multiple sh:path values")),
             _ => {
                 // JSON-LD @list sequence: each ordered object is a path step.
                 let mut steps = Vec::new();
@@ -170,16 +195,10 @@ pub fn resolve_sh_path<'a>(
 /// blank node) into a [`PropertyPath`].
 fn resolve_path_node<'a>(db: GraphDbRef<'a>, node: &'a Sid) -> PathFuture<'a, PropertyPath> {
     Box::pin(async move {
-        // sh:inversePath
-        if let Some(obj) = single_ref(db, node, &shacl(predicates::INVERSE_PATH)).await? {
-            let inner = resolve_path_node(db, &obj).await?;
-            return match inner {
-                PropertyPath::Predicate(p) => Ok(PropertyPath::Inverse(p)),
-                _ => Err(unsupported(
-                    node,
-                    "sh:inversePath is only supported over a single predicate",
-                )),
-            };
+        // sh:inversePath — inverse of any path, rewritten into the AST
+        // (inverse of a sequence = reversed sequence of inverses, etc.).
+        if let Some(inner) = operand_path(db, node, &shacl(predicates::INVERSE_PATH)).await? {
+            return Ok(invert(inner));
         }
 
         // sh:alternativePath (RDF list or JSON-LD @list of sub-paths)
@@ -200,8 +219,7 @@ fn resolve_path_node<'a>(db: GraphDbRef<'a>, node: &'a Sid) -> PathFuture<'a, Pr
             (predicates::ONE_OR_MORE_PATH, PropertyPath::OneOrMore),
             (predicates::ZERO_OR_ONE_PATH, PropertyPath::ZeroOrOne),
         ] {
-            if let Some(obj) = single_ref(db, node, &shacl(pred)).await? {
-                let inner = resolve_path_node(db, &obj).await?;
+            if let Some(inner) = operand_path(db, node, &shacl(pred)).await? {
                 return Ok(wrap(Box::new(inner)));
             }
         }
@@ -232,7 +250,7 @@ fn resolve_members<'a>(
     predicate: &'a Sid,
 ) -> PathFuture<'a, Vec<PropertyPath>> {
     Box::pin(async move {
-        let objects = ordered_objects(db, subject, predicate).await?;
+        let (objects, all_indexed) = ordered_objects(db, subject, predicate).await?;
 
         // Turtle RDF-list form: a single object that is itself a list head.
         if let [FlakeValue::Ref(head)] = objects.as_slice() {
@@ -240,6 +258,15 @@ fn resolve_members<'a>(
             if has_object(db, head, &rdf_first).await? {
                 return resolve_rdf_list(db, head).await;
             }
+        }
+        if objects.len() > 1 && !all_indexed {
+            return Err(unsupported(
+                subject,
+                &format!(
+                    "multiple values for {} in a path expression",
+                    predicate.name
+                ),
+            ));
         }
 
         // JSON-LD @list form (or a single direct member).
@@ -271,12 +298,12 @@ fn resolve_rdf_list<'a>(
             if current == rdf_nil {
                 break;
             }
-            let Some(first) = single_ref(db, &current, &rdf_first).await? else {
+            let Some(first) = sole_ref(db, &current, &rdf_first).await? else {
                 break;
             };
             members.push(resolve_path_node(db, &first).await?);
 
-            match single_ref(db, &current, &rdf_rest).await? {
+            match sole_ref(db, &current, &rdf_rest).await? {
                 Some(next) => current = next,
                 None => break,
             }
@@ -286,12 +313,14 @@ fn resolve_rdf_list<'a>(
 }
 
 /// All objects of `(subject, predicate)`, ordered by the JSON-LD list index in
-/// flake metadata (falling back to scan order when unindexed).
+/// flake metadata (falling back to scan order when unindexed). The flag
+/// reports whether every flake carried a list index — multiple objects
+/// WITHOUT indexes are separate assertions, not a list encoding.
 async fn ordered_objects(
     db: GraphDbRef<'_>,
     subject: &Sid,
     predicate: &Sid,
-) -> Result<Vec<FlakeValue>> {
+) -> Result<(Vec<FlakeValue>, bool)> {
     let flakes = db
         .range(
             IndexType::Spot,
@@ -308,7 +337,8 @@ async fn ordered_objects(
         .map(|(pos, f)| (f.m.as_ref().and_then(|m| m.i), pos, f.o.clone()))
         .collect();
     items.sort_by_key(|(idx, pos, _)| (idx.is_none(), idx.unwrap_or(0), *pos));
-    Ok(items.into_iter().map(|(_, _, v)| v).collect())
+    let all_indexed = items.iter().all(|(idx, _, _)| idx.is_some());
+    Ok((items.into_iter().map(|(_, _, v)| v).collect(), all_indexed))
 }
 
 /// Evaluate a property path from `focus`, returning the reached value nodes as
@@ -449,8 +479,55 @@ fn dedup(mut values: Vec<PathValue>) -> Vec<PathValue> {
     values
 }
 
-/// Fetch the single reference object of `(subject, predicate, ?)`, if any.
-async fn single_ref(db: GraphDbRef<'_>, subject: &Sid, predicate: &Sid) -> Result<Option<Sid>> {
+/// Resolve a path operator's operand: a single reference resolves as one
+/// sub-path; multiple references are a sequence only under the JSON-LD @list
+/// encoding (every flake indexed) — un-indexed multiples are a malformed path.
+fn operand_path<'a>(
+    db: GraphDbRef<'a>,
+    subject: &'a Sid,
+    predicate: &'a Sid,
+) -> PathFuture<'a, Option<PropertyPath>> {
+    Box::pin(async move {
+        let (objects, all_indexed) = ordered_objects(db, subject, predicate).await?;
+        match objects.len() {
+            0 => Ok(None),
+            1 => match &objects[0] {
+                FlakeValue::Ref(obj) => Ok(Some(resolve_path_node(db, obj).await?)),
+                _ => Err(unsupported(
+                    subject,
+                    &format!("{} operand is a literal", predicate.name),
+                )),
+            },
+            _ if !all_indexed => Err(unsupported(
+                subject,
+                &format!(
+                    "multiple values for {} in a path expression",
+                    predicate.name
+                ),
+            )),
+            _ => {
+                let mut steps = Vec::new();
+                for obj in objects {
+                    match obj {
+                        FlakeValue::Ref(sid) => steps.push(resolve_path_node(db, &sid).await?),
+                        _ => {
+                            return Err(unsupported(
+                                subject,
+                                &format!("{} sequence step is a literal", predicate.name),
+                            ))
+                        }
+                    }
+                }
+                Ok(Some(PropertyPath::Sequence(steps)))
+            }
+        }
+    })
+}
+
+/// Fetch the sole reference object of `(subject, predicate, ?)`, if any.
+/// Path operators take exactly one value — multiple distinct references are a
+/// malformed path and error rather than compiling nondeterministically.
+async fn sole_ref(db: GraphDbRef<'_>, subject: &Sid, predicate: &Sid) -> Result<Option<Sid>> {
     let flakes = db
         .range(
             IndexType::Spot,
@@ -458,10 +535,23 @@ async fn single_ref(db: GraphDbRef<'_>, subject: &Sid, predicate: &Sid) -> Resul
             RangeMatch::subject_predicate(subject.clone(), predicate.clone()),
         )
         .await?;
-    Ok(flakes.iter().find_map(|f| match &f.o {
+    let mut refs = flakes.iter().filter_map(|f| match &f.o {
         FlakeValue::Ref(sid) => Some(sid.clone()),
         _ => None,
-    }))
+    });
+    let first = refs.next();
+    if let Some(first) = &first {
+        if refs.any(|other| &other != first) {
+            return Err(unsupported(
+                subject,
+                &format!(
+                    "multiple values for {} in a path expression",
+                    predicate.name
+                ),
+            ));
+        }
+    }
+    Ok(first)
 }
 
 /// Whether `(subject, predicate, ?)` has any object (regardless of type).

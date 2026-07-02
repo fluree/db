@@ -108,7 +108,7 @@ See [Predicate-target shapes](#predicate-target-shapes) for notes on how the sta
 | Path form | Turtle syntax | Reaches |
 |-----------|---------------|---------|
 | Predicate | `sh:path ex:knows` | objects of `ex:knows` |
-| Inverse | `sh:path [ sh:inversePath ex:parent ]` | subjects that point at the focus via `ex:parent` |
+| Inverse | `sh:path [ sh:inversePath ex:parent ]` | subjects that point at the focus via `ex:parent` (works over any path: `[ sh:inversePath ( ex:a ex:b ) ]` reaches nodes two hops upstream) |
 | Sequence | `sh:path ( ex:knows schema:name )` | names of the people the focus knows |
 | Alternative | `sh:path [ sh:alternativePath ( ex:email ex:altEmail ) ]` | values via **either** predicate |
 | Zero-or-more | `sh:path [ sh:zeroOrMorePath ex:parent ]` | the focus **and** all transitive `ex:parent` ancestors |

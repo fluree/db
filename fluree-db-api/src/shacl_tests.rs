@@ -2298,8 +2298,8 @@ async fn shacl_one_or_more_path() {
     assert_shacl_violation(err, "at least 2");
 }
 
-/// An unsupported path form — the inverse of a composite path (`^(ex:a+)`) —
-/// must be rejected loudly at shape-compile time, not silently misbehave.
+/// A malformed path — a literal step inside a sequence — must surface as a
+/// violation when the shape fires, not silently misbehave.
 #[tokio::test]
 async fn shacl_unsupported_path_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -2311,7 +2311,7 @@ async fn shacl_unsupported_path_rejected() {
         "sh:targetClass": {"@id": "ex:Thing"},
         "sh:property": [{
             "@id": "ex:pshape_bad",
-            "sh:path": {"sh:inversePath": {"sh:oneOrMorePath": {"@id": "ex:a"}}},
+            "sh:path": {"@list": [{"@id": "ex:a"}, "not-a-path"]},
             "sh:minCount": 1
         }]
     });
@@ -2333,7 +2333,7 @@ async fn shacl_unsupported_path_rejected() {
         )
         .await
         .unwrap_err();
-    assert_shacl_violation(err, "inversePath");
+    assert_shacl_violation(err, "literal");
 }
 
 /// An unsupported path on a node that the shape does **not** target must not
@@ -2349,7 +2349,7 @@ async fn shacl_unsupported_path_scoped_to_targets() {
         "sh:targetClass": {"@id": "ex:Thing"},
         "sh:property": [{
             "@id": "ex:pshape_bad",
-            "sh:path": {"sh:inversePath": {"sh:oneOrMorePath": {"@id": "ex:a"}}},
+            "sh:path": {"@list": [{"@id": "ex:a"}, "not-a-path"]},
             "sh:minCount": 1
         }]
     });
@@ -3793,4 +3793,59 @@ async fn shacl_warning_severity_on_node_value_constraint() {
         )
         .await
         .expect("warn-severity node value constraint must not reject");
+}
+
+/// Inverse of a composite path — `^(ex:parent/ex:parent)` — is valid SHACL and
+/// now rewrites into the AST: a Grandparent must have at least one grandchild.
+#[tokio::test]
+async fn shacl_inverse_of_sequence_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:GrandparentShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Grandparent"},
+        "sh:property": [{
+            "@id": "ex:pshape_grandkids",
+            "sh:path": {"sh:inversePath": {"@list": [{"@id": "ex:parent"}, {"@id": "ex:parent"}]}},
+            "sh:minCount": 1
+        }]
+    });
+
+    // Valid: child → mom → grandma, so grandma has a grandchild via ^(parent/parent).
+    let ledger_ok = fluree.create_ledger("shacl/invseq-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:grandma", "@type": "ex:Grandparent"},
+                    {"@id": "ex:mom", "ex:parent": {"@id": "ex:grandma"}},
+                    {"@id": "ex:kid", "ex:parent": {"@id": "ex:mom"}}
+                ]
+            }),
+        )
+        .await
+        .expect("grandchild reachable via inverse sequence path should pass");
+
+    // Invalid: grandma has a child but no grandchild.
+    let ledger_bad = fluree.create_ledger("shacl/invseq-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:gran2", "@type": "ex:Grandparent"},
+                    {"@id": "ex:son", "ex:parent": {"@id": "ex:gran2"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
 }
