@@ -89,7 +89,11 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     // absent from this file → always null).
     let field_to_leaf: Vec<Option<usize>> = column_indices
         .iter()
-        .map(|&idx| (idx != NULL_COLUMN_SENTINEL).then(|| root_to_leaf.get(&idx).copied()).flatten())
+        .map(|&idx| {
+            (idx != NULL_COLUMN_SENTINEL)
+                .then(|| root_to_leaf.get(&idx).copied())
+                .flatten()
+        })
         .collect();
 
     // Real (non-null-sentinel) parquet leaf indices this projection needs.
@@ -232,15 +236,23 @@ fn arrow_column_to_values(
         DataType::Float64 => column!(Float64Array, ColumnValue::Float64),
         DataType::Utf8 => column!(StringArray, |s: &str| ColumnValue::String(s.to_string())),
         DataType::LargeUtf8 => {
-            column!(LargeStringArray, |s: &str| ColumnValue::String(s.to_string()))
+            column!(LargeStringArray, |s: &str| ColumnValue::String(
+                s.to_string()
+            ))
         }
         DataType::Binary => column!(BinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec())),
-        DataType::LargeBinary => column!(LargeBinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec())),
+        DataType::LargeBinary => {
+            column!(LargeBinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec()))
+        }
         DataType::FixedSizeBinary(_) => {
-            column!(FixedSizeBinaryArray, |b: &[u8]| ColumnValue::Bytes(b.to_vec()))
+            column!(FixedSizeBinaryArray, |b: &[u8]| ColumnValue::Bytes(
+                b.to_vec()
+            ))
         }
         DataType::Date32 => column!(Date32Array, ColumnValue::Date),
-        DataType::Date64 => column!(Date64Array, |ms| ColumnValue::Date((ms / 86_400_000) as i32)),
+        DataType::Date64 => column!(Date64Array, |ms| ColumnValue::Date(
+            (ms / 86_400_000) as i32
+        )),
         DataType::Decimal128(_, _) => column!(Decimal128Array, ColumnValue::Decimal),
         DataType::Timestamp(unit, _tz) => {
             let to_value = |m: i64| match field_type {
@@ -249,7 +261,9 @@ fn arrow_column_to_values(
             };
             match unit {
                 TimeUnit::Second => column!(TimestampSecondArray, |v| to_value(v * 1_000_000)),
-                TimeUnit::Millisecond => column!(TimestampMillisecondArray, |v| to_value(v * 1_000)),
+                TimeUnit::Millisecond => {
+                    column!(TimestampMillisecondArray, |v| to_value(v * 1_000))
+                }
                 TimeUnit::Microsecond => column!(TimestampMicrosecondArray, to_value),
                 TimeUnit::Nanosecond => column!(TimestampNanosecondArray, |v| to_value(v / 1_000)),
             }

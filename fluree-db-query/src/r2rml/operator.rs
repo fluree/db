@@ -1625,26 +1625,46 @@ mod tests {
         // String constant: loose lexical match, datatype/language-agnostic — a
         // plain-string query object matches a lang-tagged materialized literal.
         let s = ObjectConstant::Scalar(ScanValue::Str("chat".to_string()));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("chat"), &s, false));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("chat"),
+            &s,
+            false
+        ));
         assert!(rdf_term_eq_object_constant(
             &RdfTerm::lang_string("chat", "fr"),
             &s,
             false
         ));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("dog"), &s, false));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::iri("chat"), &s, false));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("dog"),
+            &s,
+            false
+        ));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::iri("chat"),
+            &s,
+            false
+        ));
 
         // Integer constant against a NON-numeric (text) column: EXACT — "2024"
         // matches; a decimal lexical does not (the scan filter casts the int to
         // text and drops "2024.0", so the operator must too).
         let n = ObjectConstant::Scalar(ScanValue::Int(2024));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("2024"), &n, false));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("2024"),
+            &n,
+            false
+        ));
         assert!(!rdf_term_eq_object_constant(
             &RdfTerm::string("2024.0"),
             &n,
             false
         ));
-        assert!(!rdf_term_eq_object_constant(&RdfTerm::string("2025"), &n, false));
+        assert!(!rdf_term_eq_object_constant(
+            &RdfTerm::string("2025"),
+            &n,
+            false
+        ));
 
         // Integer constant against a numeric (Decimal/Float) column: a
         // zero-fraction decimal lexical matches (`?s :amount 100` vs 100.00),
@@ -1655,7 +1675,11 @@ mod tests {
             &amount,
             true
         ));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("100"), &amount, true));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("100"),
+            &amount,
+            true
+        ));
         assert!(!rdf_term_eq_object_constant(
             &RdfTerm::string("100.50"),
             &amount,
@@ -1682,8 +1706,16 @@ mod tests {
 
         // Boolean constant: true/1 vs false/0.
         let b = ObjectConstant::Scalar(ScanValue::Bool(true));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("true"), &b, false));
-        assert!(rdf_term_eq_object_constant(&RdfTerm::string("1"), &b, false));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("true"),
+            &b,
+            false
+        ));
+        assert!(rdf_term_eq_object_constant(
+            &RdfTerm::string("1"),
+            &b,
+            false
+        ));
         assert!(!rdf_term_eq_object_constant(
             &RdfTerm::string("false"),
             &b,
