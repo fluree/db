@@ -22,6 +22,8 @@ mod stream_query;
 mod stubs;
 mod submissions;
 mod transact;
+#[cfg(feature = "shacl")]
+mod validate;
 
 use crate::state::AppState;
 use axum::{
@@ -260,6 +262,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Stub endpoints (not yet implemented)
         .route("/subscribe", get(stubs::subscribe))
         .route("/remote/:path", get(stubs::remote).post(stubs::remote));
+
+    // SHACL validation report (read endpoint; see routes/validate.rs)
+    #[cfg(feature = "shacl")]
+    let v1 = v1.route(
+        "/validate/*ledger",
+        get(validate::validate_ledger_tail).post(validate::validate_ledger_tail),
+    );
 
     let mut router = Router::new()
         // Health check

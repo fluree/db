@@ -615,7 +615,10 @@ Ad-hoc shapes (`--shacl`) **replace** the attached shapes by default so
 0 = conforms, 1 = findings at/above `--fail-on` (default `violation`).
 See the [`fluree validate` reference](../cli/validate.md).
 
-The same core is exposed in Rust as `fluree_db_api::validate` —
+The same core is served over HTTP as
+[`GET|POST /validate/{ledger}`](../api/endpoints.md#getpost-validateledger)
+(JSON summary by default; `Accept: application/ld+json` or `text/turtle`
+for the W3C report), and exposed in Rust as `fluree_db_api::validate` —
 `Fluree::validate_ledger(alias, &ValidateOptions)` returns a `ValidateReport`
 with per-result constraint-component IRIs, severities, and messages, plus
 `to_jsonld()` / `to_turtle()` serializers.

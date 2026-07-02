@@ -95,8 +95,9 @@ and a warning is printed to stderr.
 
 ## Current limitations
 
-- Local ledgers only; validating a remote (tracked) ledger over HTTP is not
-  yet supported.
+- The CLI validates local ledgers; for a remote server, call the
+  [`/validate` HTTP endpoint](../api/endpoints.md#getpost-validateledger)
+  directly (CLI `--remote` wiring is not yet implemented).
 - Shapes from a *different* ledger must be exported to a file first.
 
 ## Related

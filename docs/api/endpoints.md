@@ -1406,6 +1406,83 @@ curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   -d '{"select":["?s"],"where":{"@id":"?s"}}'
 ```
 
+### GET/POST /validate/{ledger...}
+
+Validate the current state of a ledger (or one of its named graphs) against SHACL shapes and return a **validation report** — the HTTP surface of `fluree validate`. Unlike transaction-time enforcement, this never rejects anything; it reports every result it finds. Requires the `shacl` build feature (on by default).
+
+**URL:**
+```
+GET  /validate/{ledger...}
+POST /validate/{ledger...}
+```
+
+**Request body** (POST; all fields optional — an empty body validates the default graph against the attached shapes):
+
+```json
+{
+  "graph": "http://example.org/graphs/data",
+  "shapes": { "...JSON-LD shapes document..." },
+  "shapesGraph": "http://example.org/graphs/shapes",
+  "includeAttached": false
+}
+```
+
+- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
+- `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
+- `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
+
+**Response** (negotiated via `Accept`):
+
+- Default / `application/json` — summary envelope:
+
+```json
+{
+  "conforms": false,
+  "violations": 1,
+  "warnings": 0,
+  "infos": 0,
+  "shapesChecked": 1,
+  "results": [{
+    "focus_node": "http://example.org/ns/bob",
+    "result_path": "http://schema.org/name",
+    "source_shape": "http://example.org/ns/UserShape",
+    "source_constraint": "http://example.org/ns/name-ps",
+    "constraint_component": "http://www.w3.org/ns/shacl#MinCountConstraintComponent",
+    "severity": "http://www.w3.org/ns/shacl#Violation",
+    "message": "Expected at least 1 value(s) but found 0"
+  }]
+}
+```
+
+- `application/ld+json` — a W3C `sh:ValidationReport` JSON-LD document.
+- `text/turtle` — the same report as Turtle.
+
+`result_path` is present only when the path is a single predicate; complex paths are omitted rather than misrepresented.
+
+**Auth:** same read gate as `/query` (Bearer `can_read` on the ledger). Note that validation reads the full graph — results are **not** policy-filtered, so access to this endpoint implies read access to the data it reports on.
+
+**Status Codes:**
+- `200 OK` — report returned (conforming or not; non-conformance is not an error)
+- `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
+- `401 Unauthorized` — authentication required and missing
+- `404 Not Found` — ledger or named graph not found (or not authorized)
+
+**Examples:**
+
+```bash
+# Validate against the ledger's attached shapes
+curl http://localhost:8090/v1/fluree/validate/mydb
+
+# Trial ad-hoc Turtle shapes (replaces attached shapes)
+curl -X POST http://localhost:8090/v1/fluree/validate/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"shapes": "@prefix sh: <http://www.w3.org/ns/shacl#> . ..."}'
+
+# W3C report as Turtle
+curl http://localhost:8090/v1/fluree/validate/mydb -H "Accept: text/turtle"
+```
+
 ## Nameservice Metadata
 
 The standalone server does not expose a general-purpose `POST /nameservice/query`
