@@ -94,6 +94,62 @@ ex:PersonShape a sh:NodeShape ;
 
 See [Predicate-target shapes](#predicate-target-shapes) for notes on how the staged-path validator discovers focus nodes for `sh:targetSubjectsOf` / `sh:targetObjectsOf`.
 
+## Property paths
+
+`sh:path` is usually a single predicate, but it can also be a **property path expression**. The path is evaluated against the focus node to produce the set of *value nodes* the constraints then apply to — so `sh:minCount`, `sh:datatype`, `sh:class`, etc. all work over a path exactly as they do over a plain predicate.
+
+| Path form | Turtle syntax | Reaches |
+|-----------|---------------|---------|
+| Predicate | `sh:path ex:knows` | objects of `ex:knows` |
+| Inverse | `sh:path [ sh:inversePath ex:parent ]` | subjects that point at the focus via `ex:parent` |
+| Sequence | `sh:path ( ex:knows schema:name )` | names of the people the focus knows |
+| Alternative | `sh:path [ sh:alternativePath ( ex:email ex:altEmail ) ]` | values via **either** predicate |
+| Zero-or-more | `sh:path [ sh:zeroOrMorePath ex:parent ]` | the focus **and** all transitive `ex:parent` ancestors |
+| One-or-more | `sh:path [ sh:oneOrMorePath ex:parent ]` | all transitive `ex:parent` ancestors (excludes the focus) |
+| Zero-or-one | `sh:path [ sh:zeroOrOnePath ex:parent ]` | the focus and its direct parents |
+
+These nest: `sh:path ( [ sh:inversePath ex:parent ] schema:name )` reaches the names of the focus's children.
+
+```turtle
+# Every Parent must have at least one child (something points at it via ex:parent),
+# and each place a Person knows-of must be named.
+ex:ParentShape a sh:NodeShape ;
+  sh:targetClass ex:Parent ;
+  sh:property [
+    sh:path [ sh:inversePath ex:parent ] ;
+    sh:minCount 1 ;
+    sh:message "A Parent must have at least one child"
+  ] .
+
+ex:SocialiteShape a sh:NodeShape ;
+  sh:targetClass ex:Socialite ;
+  sh:property [
+    sh:path ( ex:knows schema:name ) ;
+    sh:datatype xsd:string ;
+    sh:minCount 1
+  ] .
+```
+
+In **JSON-LD**, a sequence path is written with `@list`, and the blank-node forms are written as nested objects:
+
+```json
+{
+  "@id": "ex:SocialiteShape",
+  "@type": "sh:NodeShape",
+  "sh:targetClass": { "@id": "ex:Socialite" },
+  "sh:property": [{
+    "sh:path": { "@list": [ { "@id": "ex:knows" }, { "@id": "schema:name" } ] },
+    "sh:datatype": { "@id": "xsd:string" },
+    "sh:minCount": 1
+  }, {
+    "sh:path": { "sh:inversePath": { "@id": "ex:parent" } },
+    "sh:minCount": 1
+  }]
+}
+```
+
+**Not supported:** the inverse of a composite path (e.g. `[ sh:inversePath ( ex:a ex:b ) ]`). `sh:inversePath` may only wrap a single predicate. An unsupported or unresolvable path is rejected when the shape is compiled — the transaction fails with a shape error rather than silently passing.
+
 ## Constraint patterns
 
 ### Cardinality — required and multi-valued
@@ -457,7 +513,7 @@ The following SHACL constructs are parsed/compiled but currently **no-ops** at v
 - `sh:uniqueLang`, `sh:languageIn` — require language-tag metadata on flakes, which isn't yet threaded through the validation path.
 - `sh:qualifiedValueShape` (+ `sh:qualifiedMinCount` / `sh:qualifiedMaxCount`) — requires recursive nested-shape counting.
 
-These are tracked in the SHACL compliance effort. Contributors: see [Contributing / SHACL implementation](../contributing/shacl-implementation.md).
+These are tracked in the SHACL compliance effort.
 
 ## Shapes are data
 
@@ -481,4 +537,3 @@ Because shapes live as regular RDF in your ledger:
 - [Setting Groups — SHACL](../ledger-config/setting-groups.md#shacl-defaults) — Configuration reference for `f:shaclDefaults`
 - [Override Control](../ledger-config/override-control.md) — Per-graph / query-time override rules
 - [Writing Config Data](../ledger-config/writing-config.md) — How to transact into the config graph
-- [Contributing / SHACL implementation](../contributing/shacl-implementation.md) — How the pipeline works internally (for contributors)
