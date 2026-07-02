@@ -765,6 +765,7 @@ async fn stage_with_config_shacl(
                         m_db.t,
                     ),
                     data_ns_map: ns_map,
+                    same_term_space: false,
                 })
         }
         _ => None,

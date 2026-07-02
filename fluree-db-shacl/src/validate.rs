@@ -60,6 +60,12 @@ type ActiveShapeChecks = Mutex<HashSet<(Sid, ShapeId)>>;
 pub struct CrossLedgerMembership<'a> {
     /// `GraphDbRef` into M's value-set graph at the resolved `t`.
     pub model_db: GraphDbRef<'a>,
+    /// When true, `model_db` shares the data ledger's term space (e.g. an
+    /// inline-shapes bundle encoded against the data ledger's namespace
+    /// registry): membership probes use the data-side Sids directly instead
+    /// of the decode-to-IRI / re-encode-against-M translation — which would
+    /// always miss against a bundle backed by an empty genesis snapshot.
+    pub same_term_space: bool,
     /// D's namespace codes → IRI prefixes (base + this transaction's staged
     /// allocations). Used to decode a D-term Sid to its full IRI before
     /// re-encoding it against M (whose split mode may differ), because the
@@ -320,6 +326,17 @@ impl ShaclEngine {
 
     /// Validate all focus nodes targeted by shapes
     pub async fn validate_all(&self, db: GraphDbRef<'_>) -> Result<ValidationReport> {
+        self.validate_all_with_membership(db, None).await
+    }
+
+    /// [`Self::validate_all`] with an optional external `sh:class`
+    /// value-membership source (a model ledger or a same-term-space
+    /// inline-shapes bundle), consulted when the local lookup misses.
+    pub async fn validate_all_with_membership(
+        &self,
+        db: GraphDbRef<'_>,
+        cross_ledger: Option<CrossLedgerMembership<'_>>,
+    ) -> Result<ValidationReport> {
         let mut all_results = Vec::new();
 
         // Collect all shapes for logical constraint resolution
@@ -328,9 +345,7 @@ impl ShaclEngine {
         let class_ctx = ClassMembershipCtx {
             membership_g_ids: &self.membership_g_ids,
             cache: &self.class_cache,
-            // Full-db validation (`validate_all`) has no cross-ledger model
-            // context; `sh:class` uses the local lookup only.
-            cross_ledger: None,
+            cross_ledger,
         };
         for shape in self.cache.all_shapes() {
             if shape.deactivated {
@@ -2356,19 +2371,27 @@ async fn value_conforms_cross_ledger(
     expected_class: &Sid,
 ) -> Result<bool> {
     let m_db = cl.model_db;
-    // D term -> IRI (via D's staged ns map) -> M term. A missing decode/encode
-    // means the value/class is simply not known to M -> not a member there.
-    let (Some(value_iri), Some(class_iri)) = (
-        decode_sid_with_ns_map(cl.data_ns_map, value_ref),
-        decode_sid_with_ns_map(cl.data_ns_map, expected_class),
-    ) else {
-        return Ok(false);
-    };
-    let (Some(m_value), Some(m_class)) = (
-        m_db.snapshot.encode_iri_strict(&value_iri),
-        m_db.snapshot.encode_iri_strict(&class_iri),
-    ) else {
-        return Ok(false);
+    let (m_value, m_class) = if cl.same_term_space {
+        // The membership source shares the data ledger's term space (inline
+        // shapes bundle) — probe with the data-side Sids directly.
+        (value_ref.clone(), expected_class.clone())
+    } else {
+        // D term -> IRI (via D's staged ns map) -> M term. A missing
+        // decode/encode means the value/class is simply not known to M ->
+        // not a member there.
+        let (Some(value_iri), Some(class_iri)) = (
+            decode_sid_with_ns_map(cl.data_ns_map, value_ref),
+            decode_sid_with_ns_map(cl.data_ns_map, expected_class),
+        ) else {
+            return Ok(false);
+        };
+        let (Some(m_value), Some(m_class)) = (
+            m_db.snapshot.encode_iri_strict(&value_iri),
+            m_db.snapshot.encode_iri_strict(&class_iri),
+        ) else {
+            return Ok(false);
+        };
+        (m_value, m_class)
     };
 
     let rdf_type = Sid::new(RDF, rdf_names::TYPE);

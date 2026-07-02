@@ -317,6 +317,7 @@ pub async fn validate_view(
     let mut inline_snapshot: Option<LedgerSnapshot> = None;
     #[allow(unused_assignments)]
     let mut inline_overlay = None;
+    let mut inline_membership: Option<fluree_db_shacl::CrossLedgerMembership<'_>> = None;
 
     let mut shape_dbs: Vec<GraphDbRef<'_>> = Vec::new();
     let mut membership: Vec<GraphId> = Vec::new();
@@ -384,12 +385,24 @@ pub async fn validate_view(
                 &NO_OVERLAY,
                 bundle,
             ));
-            shape_dbs.push(GraphDbRef::new(
+            let bundle_db = GraphDbRef::new(
                 inline_snapshot.as_ref().expect("just set above"),
                 0u16,
                 inline_overlay.as_ref().expect("just set above"),
                 to_t,
-            ));
+            );
+            shape_dbs.push(bundle_db);
+            // The bundle may carry value-set facts alongside the shapes
+            // (e.g. `ex:CA rdf:type ex:State` for a `sh:class ex:State`
+            // constraint) — matching the documented f:shapesSource
+            // semantics where vocabulary lives with the shapes. It shares
+            // the data ledger's term space, so membership probes use the
+            // data-side Sids directly.
+            inline_membership = Some(fluree_db_shacl::CrossLedgerMembership {
+                model_db: bundle_db,
+                data_ns_map: snapshot.namespaces(),
+                same_term_space: true,
+            });
         }
     }
 
@@ -421,7 +434,7 @@ pub async fn validate_view(
 
     let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t);
     let raw = engine
-        .validate_all(data_db)
+        .validate_all_with_membership(data_db, inline_membership)
         .await
         .map_err(TransactError::from)?;
 

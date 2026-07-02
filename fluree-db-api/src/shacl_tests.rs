@@ -4133,3 +4133,58 @@ async fn validate_report_unknown_graph_is_not_found() {
         .unwrap_err();
     assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
 }
+
+#[tokio::test]
+async fn validate_report_inline_shapes_carry_class_value_set() {
+    // An ad-hoc shapes doc may ship both a sh:class constraint AND the
+    // controlled vocabulary it refers to (`ex:CA rdf:type ex:State`) —
+    // matching f:shapesSource semantics where value-sets live with the
+    // shapes. Membership checks must see those bundle facts even though
+    // the bundle never touches the ledger.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = fluree
+        .create_ledger("shacl/validate-valueset:main")
+        .await
+        .unwrap();
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:addr1", "@type": "ex:Address", "ex:state": {"@id": "ex:CA"}},
+                    {"@id": "ex:addr2", "@type": "ex:Address", "ex:state": {"@id": "ex:XX"}}
+                ]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+
+    let shapes_turtle = r"
+        @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix ex: <http://example.org/ns/> .
+        ex:AddressShape a sh:NodeShape ;
+            sh:targetClass ex:Address ;
+            sh:property [ sh:path ex:state ; sh:class ex:State ] .
+        ex:CA a ex:State .
+    ";
+    let options = crate::validate::ValidateOptions {
+        shapes: crate::validate::ShapesSource::InlineTurtle(shapes_turtle.to_string()),
+        ..Default::default()
+    };
+    let report = crate::validate::validate_view(&view, "shacl/validate-valueset:main", &options)
+        .await
+        .unwrap();
+
+    // ex:CA is typed in the bundle -> conforms; ex:XX is typed nowhere -> violation.
+    assert_eq!(report.violation_count(), 1, "{:?}", report.results);
+    let result = &report.results[0];
+    assert_eq!(result.focus_node, "http://example.org/ns/addr2");
+    assert_eq!(
+        result.constraint_component,
+        "http://www.w3.org/ns/shacl#ClassConstraintComponent"
+    );
+}
