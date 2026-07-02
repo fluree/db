@@ -516,6 +516,24 @@ impl IcebergConnectionConfig {
         self
     }
 
+    /// Set Google metadata-server authentication (REST mode only).
+    ///
+    /// Mints and refreshes short-lived Google OAuth tokens from the GCE/GKE
+    /// metadata server (Workload Identity) — for Google Iceberg REST catalogs
+    /// (BigLake), where a static bearer expires after ~1h. `scopes` is optional
+    /// (defaults to cloud-platform).
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        if let CatalogMode::Rest(ref mut rest) = self.catalog_mode {
+            rest.auth = fluree_db_iceberg::auth::AuthConfig::GoogleMetadata {
+                scopes,
+                metadata_url: None,
+            };
+        } else {
+            tracing::warn!("with_auth_google_metadata has no effect in Direct catalog mode");
+        }
+        self
+    }
+
     /// Set OAuth2 client credentials authentication (REST mode only).
     pub fn with_auth_oauth2(
         mut self,
@@ -719,6 +737,17 @@ impl IcebergCreateConfig {
     /// Set bearer token authentication (REST mode only).
     pub fn with_auth_bearer(mut self, token: impl Into<String>) -> Self {
         self.connection = self.connection.with_auth_bearer(token);
+        self
+    }
+
+    /// Set Google metadata-server authentication (REST mode only).
+    ///
+    /// Mints and refreshes short-lived Google OAuth tokens from the GCE/GKE
+    /// metadata server (Workload Identity) — for Google Iceberg REST catalogs
+    /// (BigLake), where a static bearer expires after ~1h. `scopes` is optional
+    /// (defaults to cloud-platform).
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.connection = self.connection.with_auth_google_metadata(scopes);
         self
     }
 
@@ -1015,6 +1044,13 @@ impl R2rmlCreateConfig {
     /// Set bearer token authentication.
     pub fn with_auth_bearer(mut self, token: impl Into<String>) -> Self {
         self.iceberg = self.iceberg.with_auth_bearer(token);
+        self
+    }
+
+    /// Set Google metadata-server authentication (GKE Workload Identity), with
+    /// automatic token refresh. See [`IcebergCreateConfig::with_auth_google_metadata`].
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.iceberg = self.iceberg.with_auth_google_metadata(scopes);
         self
     }
 
