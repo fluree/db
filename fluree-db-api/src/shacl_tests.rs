@@ -2084,3 +2084,268 @@ async fn shacl_and_with_inline_anonymous_shapes() {
         .unwrap_err();
     assert_shacl_violation(err, "sh:and");
 }
+
+// ===========================================================================
+// Property Paths (sh:path expressions)
+// ===========================================================================
+
+/// Assert that an error is a SHACL *compile/shape* error (not a data violation)
+/// whose message contains `expected`.
+fn assert_shacl_shape_error(err: ApiError, expected: &str) {
+    match err {
+        ApiError::Transact(TransactError::Shacl(inner)) => {
+            let message = inner.to_string();
+            assert!(
+                message.contains(expected),
+                "expected shape error to contain '{expected}', got: {message}"
+            );
+        }
+        other => panic!("expected SHACL shape error, got {other:?}"),
+    }
+}
+
+/// `sh:inversePath` — a Parent must be pointed at by at least one `ex:parent`.
+#[tokio::test]
+async fn shacl_inverse_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:ParentShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Parent"},
+        "sh:property": [{
+            "@id": "ex:pshape_children",
+            "sh:path": {"sh:inversePath": {"@id": "ex:parent"}},
+            "sh:minCount": 1
+        }]
+    });
+
+    // Valid: ex:mom is a Parent and ex:kid points at her via ex:parent.
+    let ledger_ok = fluree.create_ledger("shacl/inv-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:mom", "@type": "ex:Parent"},
+                    {"@id": "ex:kid", "ex:parent": {"@id": "ex:mom"}}
+                ]
+            }),
+        )
+        .await
+        .expect("parent with an inbound ex:parent edge should pass");
+
+    // Invalid: ex:childless is a Parent nobody points at → 0 inverse values.
+    let ledger_bad = fluree.create_ledger("shacl/inv-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:childless",
+                "@type": "ex:Parent"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
+}
+
+/// Sequence path (`ex:knows / schema:name`) via the JSON-LD `@list` encoding.
+#[tokio::test]
+async fn shacl_sequence_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:KnowsNamedShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Socialite"},
+        "sh:property": [{
+            "@id": "ex:pshape_knows_name",
+            "sh:path": {"@list": [{"@id": "ex:knows"}, {"@id": "schema:name"}]},
+            "sh:minCount": 1,
+            "sh:datatype": {"@id": "xsd:string"}
+        }]
+    });
+
+    // Valid: alice knows bob, bob has a (string) name → sequence reaches "Bob".
+    let ledger_ok = fluree.create_ledger("shacl/seq-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:Socialite", "ex:knows": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "schema:name": "Bob"}
+                ]
+            }),
+        )
+        .await
+        .expect("sequence path reaching a named acquaintance should pass");
+
+    // Invalid: carol is a Socialite who knows nobody → sequence reaches nothing.
+    let ledger_bad = fluree.create_ledger("shacl/seq-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:carol",
+                "@type": "ex:Socialite"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
+}
+
+/// Alternative path (`ex:email | ex:altEmail`) — a contact reached via *either*
+/// branch satisfies the shape.
+#[tokio::test]
+async fn shacl_alternative_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:ContactShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Contact"},
+        "sh:property": [{
+            "@id": "ex:pshape_any_email",
+            "sh:path": {"sh:alternativePath": {"@list": [{"@id": "ex:email"}, {"@id": "ex:altEmail"}]}},
+            "sh:minCount": 1
+        }]
+    });
+
+    // Valid: dave has only ex:altEmail — the second branch must be evaluated.
+    let ledger_ok = fluree.create_ledger("shacl/alt-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:dave",
+                "@type": "ex:Contact",
+                "ex:altEmail": "dave@example.org"
+            }),
+        )
+        .await
+        .expect("alternative path reaching a value via the second branch should pass");
+
+    // Invalid: eve has neither email predicate.
+    let ledger_bad = fluree.create_ledger("shacl/alt-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:eve",
+                "@type": "ex:Contact"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 1");
+}
+
+/// Transitive path (`ex:parent+`, `sh:oneOrMorePath`) reaches all ancestors.
+#[tokio::test]
+async fn shacl_one_or_more_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    // ex:child must have at least 2 ancestors reachable through ex:parent+.
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:AncestryShape",
+        "@type": "sh:NodeShape",
+        "sh:targetNode": {"@id": "ex:child"},
+        "sh:property": [{
+            "@id": "ex:pshape_ancestors",
+            "sh:path": {"sh:oneOrMorePath": {"@id": "ex:parent"}},
+            "sh:minCount": 2
+        }]
+    });
+
+    // Valid: child → mom → grandma gives 2 transitive ancestors.
+    let ledger_ok = fluree.create_ledger("shacl/oom-ok:main").await.unwrap();
+    let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
+    fluree
+        .upsert(
+            ledger_ok,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:child", "ex:parent": {"@id": "ex:mom"}},
+                    {"@id": "ex:mom", "ex:parent": {"@id": "ex:grandma"}},
+                    {"@id": "ex:grandma"}
+                ]
+            }),
+        )
+        .await
+        .expect("two-hop ancestry should satisfy minCount 2");
+
+    // Invalid: child has a single (direct) parent only.
+    let ledger_bad = fluree.create_ledger("shacl/oom-bad:main").await.unwrap();
+    let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger_bad,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    {"@id": "ex:child", "ex:parent": {"@id": "ex:mom"}},
+                    {"@id": "ex:mom"}
+                ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "at least 2");
+}
+
+/// An unsupported path form — the inverse of a composite path (`^(ex:a+)`) —
+/// must be rejected loudly at shape-compile time, not silently misbehave.
+#[tokio::test]
+async fn shacl_unsupported_path_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:BadPathShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Thing"},
+        "sh:property": [{
+            "@id": "ex:pshape_bad",
+            "sh:path": {"sh:inversePath": {"sh:oneOrMorePath": {"@id": "ex:a"}}},
+            "sh:minCount": 1
+        }]
+    });
+
+    let ledger = fluree.create_ledger("shacl/badpath:main").await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+
+    // Compilation runs when a targetable instance triggers validation; the
+    // unsupported path must surface as a shape error rather than pass silently.
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:thing1",
+                "@type": "ex:Thing"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_shape_error(err, "sh:inversePath");
+}

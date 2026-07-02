@@ -641,10 +641,13 @@ fn validate_structural_constraint<'a>(
                         .await?;
 
                     // Collect declared properties from the shape's property shapes
+                    // Only single-predicate property shapes declare a property
+                    // for closed-shape purposes; complex paths have no single
+                    // predicate to exempt.
                     let declared_properties: std::collections::HashSet<&Sid> = parent_shape
                         .property_shapes
                         .iter()
-                        .map(|ps| &ps.path)
+                        .filter_map(|ps| ps.path.as_predicate())
                         .collect();
 
                     // Per SHACL spec section 4.8.1, rdf:type is implicitly ignored
@@ -979,17 +982,28 @@ async fn validate_property_shape<'a>(
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
 
-    // Get all values for this property on the focus node
-    let flakes = db
-        .range(
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::subject_predicate(focus_node.clone(), prop_shape.path.clone()),
-        )
-        .await?;
-
-    let values: Vec<FlakeValue> = flakes.iter().map(|f| f.o.clone()).collect();
-    let datatypes: Vec<Sid> = flakes.iter().map(|f| f.dt.clone()).collect();
+    // Get all value nodes reached by this property shape's path on the focus node.
+    // Simple single-predicate paths take the plain SPOT scan; complex paths
+    // (inverse/sequence/alternative/transitive) evaluate the path AST.
+    let (values, datatypes): (Vec<FlakeValue>, Vec<Sid>) =
+        if let Some(pred) = prop_shape.path.as_predicate() {
+            let flakes = db
+                .range(
+                    IndexType::Spot,
+                    RangeTest::Eq,
+                    RangeMatch::subject_predicate(focus_node.clone(), pred.clone()),
+                )
+                .await?;
+            (
+                flakes.iter().map(|f| f.o.clone()).collect(),
+                flakes.iter().map(|f| f.dt.clone()).collect(),
+            )
+        } else {
+            crate::path::eval_path(db, focus_node, &prop_shape.path)
+                .await?
+                .into_iter()
+                .unzip()
+        };
 
     // Validate each constraint
     for constraint in &prop_shape.constraints {
@@ -1019,7 +1033,7 @@ async fn validate_property_shape<'a>(
                 for violation in violations {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,
@@ -1035,7 +1049,7 @@ async fn validate_property_shape<'a>(
                 for violation in class_violations {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,
@@ -1052,7 +1066,7 @@ async fn validate_property_shape<'a>(
                 for violation in violations {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,
@@ -1131,7 +1145,7 @@ async fn validate_property_value_structural_constraint<'a>(
                 if !any_conforms && !nested_shapes.is_empty() {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,
@@ -1164,7 +1178,7 @@ async fn validate_property_value_structural_constraint<'a>(
                     if !conforms {
                         results.push(ValidationResult {
                             focus_node: focus_node.clone(),
-                            result_path: Some(prop_shape.path.clone()),
+                            result_path: prop_shape.path.as_predicate().cloned(),
                             source_shape: parent_shape.id.clone(),
                             source_constraint: Some(prop_shape.id.clone()),
                             severity: prop_shape.severity,
@@ -1204,7 +1218,7 @@ async fn validate_property_value_structural_constraint<'a>(
                 if conforming_count == 0 {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,
@@ -1217,7 +1231,7 @@ async fn validate_property_value_structural_constraint<'a>(
                 } else if conforming_count > 1 {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,
@@ -1247,7 +1261,7 @@ async fn validate_property_value_structural_constraint<'a>(
                 if conforms {
                     results.push(ValidationResult {
                         focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
                         severity: prop_shape.severity,

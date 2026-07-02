@@ -153,6 +153,18 @@ Why the live db check for steps 3/4 instead of precomputed staged-flake hints? T
 
 Cost is bounded by the number of predicate-targeted shapes in the cache, not by data size — typically 0–10 per ledger.
 
+## Property paths (`sh:path`)
+
+`sh:path` is not limited to a single predicate. `fluree-db-shacl/src/path.rs` compiles it into a `PropertyPath` AST and evaluates that AST to the set of *value nodes* a path reaches — the same set a plain predicate would produce via one `SPOT` scan.
+
+Supported forms: single predicate, `sh:inversePath` (over a single predicate), sequence paths, `sh:alternativePath`, `sh:zeroOrMorePath`, `sh:oneOrMorePath`, `sh:zeroOrOnePath`, and nesting of these.
+
+- **Compile** (`resolve_sh_path`): walks the `sh:path` object. It handles all three RDF encodings a path can arrive in — a bare predicate IRI, a Turtle blank-node expression (`sh:inversePath`, an `rdf:first`/`rdf:rest` sequence list, `sh:alternativePath` → list, the transitive `*Path` predicates), and the JSON-LD `@list` encoding (multiple ordered `sh:path`/`sh:alternativePath` flakes carrying a list index in flake metadata `m.i`).
+- **Evaluate** (`eval_path`): forward step = `SPOT` scan; inverse step = `OPST` scan; sequence = chained steps over the reference frontier; alternative = union; `*/+/?` = BFS closure over reference nodes (reflexive for `*` and `?`). Value nodes are deduplicated (SHACL value nodes are a set).
+- **Validation fast path**: `validate_property_shape` keeps the single-predicate `SPOT` scan when `PropertyPath::as_predicate()` is `Some`, so simple paths pay nothing for the AST. `sh:resultPath` in a violation is only populated for single-predicate paths.
+
+The one form deliberately **not** supported is the inverse of a composite path (`^(p1/p2)`); `resolve_sh_path` rejects it at compile time with a `ShaclError::InvalidConstraint` rather than silently misbehaving. A blank-node path whose structure lives in another graph is left unresolved so a later graph pass can complete it — and, failing that, `finalize` rejects it rather than treating the blank node as a predicate (the old silent-misbehavior mode).
+
 ## Staged validation loop
 
 `validate_staged_nodes` in `fluree-db-transact/src/stage.rs`:
@@ -295,6 +307,7 @@ This is how we guard against tests that pass trivially but don't actually exerci
 | What | File |
 |------|------|
 | Shape compilation (Turtle/JSON-LD → `CompiledShape`) | `fluree-db-shacl/src/compile.rs` |
+| Property path compile + evaluation (`sh:path`) | `fluree-db-shacl/src/path.rs` |
 | Shape cache with target indexes | `fluree-db-shacl/src/cache.rs` |
 | Per-focus validation engine | `fluree-db-shacl/src/validate.rs` |
 | Per-constraint validators (pure values) | `fluree-db-shacl/src/constraints/` |

@@ -4,10 +4,11 @@
 //! efficient `CompiledShape` structures that can be used for validation.
 
 use crate::constraints::{Constraint, NestedShape, NodeConstraint};
-use crate::error::Result;
+use crate::error::{Result, ShaclError};
+use crate::path::{resolve_sh_path, PropertyPath};
 use crate::predicates;
 use fluree_db_core::{Flake, FlakeValue, GraphDbRef, IndexType, RangeMatch, RangeTest, Sid};
-use fluree_vocab::namespaces::{RDF, SHACL};
+use fluree_vocab::namespaces::{BLANK_NODE, RDF, SHACL};
 use fluree_vocab::rdf_names;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,8 +45,8 @@ pub enum Severity {
 pub struct PropertyShape {
     /// The shape ID (blank node or IRI)
     pub id: ShapeId,
-    /// The property path (simplified: just a predicate for now)
-    pub path: Sid,
+    /// The compiled `sh:path` expression (a single predicate or a path AST).
+    pub path: PropertyPath,
     /// Constraints on this property
     pub constraints: Vec<Constraint>,
     /// Per-value structural constraints (sh:or/sh:and/sh:xone/sh:not on a property shape).
@@ -139,7 +140,10 @@ struct ShapeData {
 /// Intermediate representation for property shapes
 #[derive(Default)]
 struct PropertyShapeData {
+    /// Raw `sh:path` object (a predicate IRI or a path-expression blank node).
     path: Option<Sid>,
+    /// `path` compiled into a [`PropertyPath`] AST (filled by `resolve_paths`).
+    resolved_path: Option<PropertyPath>,
     constraints: Vec<Constraint>,
     severity: Severity,
     name: Option<String>,
@@ -258,9 +262,48 @@ impl ShapeCompiler {
             // spanning multiple graphs will still resolve on a later pass
             // because `expand_rdf_lists` walks transitively via `db.range`.
             compiler.expand_rdf_lists(*db).await?;
+
+            // Resolve each property shape's `sh:path` into a path AST. Runs per
+            // graph so a path whose blank-node structure lives in this graph can
+            // resolve; a plain-predicate path resolves trivially on any graph.
+            compiler.resolve_paths(*db).await?;
         }
 
         compiler.finalize()
+    }
+
+    /// Resolve raw `sh:path` objects into [`PropertyPath`] ASTs.
+    ///
+    /// A plain predicate IRI resolves to [`PropertyPath::Predicate`]; a blank-node
+    /// path expression is walked into the full AST. A blank node that carries no
+    /// recognizable path structure in the current graph is left unresolved so a
+    /// later graph pass can complete it (and, failing that, `finalize` reports it
+    /// rather than silently treating the blank node as a predicate).
+    async fn resolve_paths(&mut self, db: GraphDbRef<'_>) -> Result<()> {
+        let pending: Vec<Sid> = self
+            .property_shapes
+            .iter()
+            .filter(|(_, ps)| ps.resolved_path.is_none() && ps.path.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for ps_id in pending {
+            let Some(resolved) = resolve_sh_path(db, &ps_id).await? else {
+                continue;
+            };
+            // A blank node resolving to `Predicate(itself)` means no path
+            // structure was found in this graph — leave it for a later pass.
+            let meaningful = match &resolved {
+                PropertyPath::Predicate(sid) => sid.namespace_code != BLANK_NODE,
+                _ => true,
+            };
+            if meaningful {
+                if let Some(ps) = self.property_shapes.get_mut(&ps_id) {
+                    ps.resolved_path = Some(resolved);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Expand RDF lists that were referenced by sh:in, sh:and, sh:or, sh:xone
@@ -665,7 +708,17 @@ impl ShapeCompiler {
             let mut prop_shapes = Vec::new();
             for ps_id in &data.property_shape_ids {
                 if let Some(ps_data) = ps_map.get(ps_id) {
-                    if let Some(path) = &ps_data.path {
+                    if ps_data.path.is_some() {
+                        // `sh:path` present but no AST => a blank-node path
+                        // expression we could not resolve. Reject loudly instead
+                        // of silently scanning a non-existent predicate.
+                        let path = ps_data.resolved_path.clone().ok_or_else(|| {
+                            ShaclError::InvalidConstraint {
+                                shape_id: ps_id.clone(),
+                                message: "unsupported or unresolvable sh:path expression"
+                                    .to_string(),
+                            }
+                        })?;
                         let constraints = build_constraints_from_ps_data(ps_data);
 
                         // Check if this property shape's subject also has structural
@@ -678,7 +731,7 @@ impl ShapeCompiler {
 
                         prop_shapes.push(PropertyShape {
                             id: ps_id.clone(),
-                            path: path.clone(),
+                            path,
                             constraints,
                             value_structural_constraints,
                             severity: ps_data.severity,

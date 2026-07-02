@@ -1148,6 +1148,25 @@ pub mod shacl_names {
     pub const PATH: &str = "path";
 
     // ========================================================================
+    // Property Path Expressions
+    // ========================================================================
+
+    /// sh:inversePath local name (inverse path `^p`)
+    pub const INVERSE_PATH: &str = "inversePath";
+
+    /// sh:alternativePath local name (alternative path `p1|p2`, points to an RDF list)
+    pub const ALTERNATIVE_PATH: &str = "alternativePath";
+
+    /// sh:zeroOrMorePath local name (`p*`)
+    pub const ZERO_OR_MORE_PATH: &str = "zeroOrMorePath";
+
+    /// sh:oneOrMorePath local name (`p+`)
+    pub const ONE_OR_MORE_PATH: &str = "oneOrMorePath";
+
+    /// sh:zeroOrOnePath local name (`p?`)
+    pub const ZERO_OR_ONE_PATH: &str = "zeroOrOnePath";
+
+    // ========================================================================
     // Cardinality Constraints
     // ========================================================================
 

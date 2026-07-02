@@ -24,6 +24,16 @@
 //! - Pair: `sh:equals`, `sh:disjoint`, `sh:lessThan`, `sh:lessThanOrEquals`
 //! - Logical: `sh:not`, `sh:and`, `sh:or`, `sh:xone`
 //!
+//! # Property Paths (`sh:path`)
+//!
+//! Besides a single predicate IRI, `sh:path` supports property path expressions
+//! (compiled by [`path::resolve_sh_path`] into a [`PropertyPath`] AST and evaluated
+//! by [`path::eval_path`]): `sh:inversePath` (over a single predicate), sequence
+//! paths (RDF lists), `sh:alternativePath`, `sh:zeroOrMorePath`,
+//! `sh:oneOrMorePath`, and `sh:zeroOrOnePath` — including nesting of these.
+//! The one unsupported form, the inverse of a composite path (`^(p1/p2)`), is
+//! rejected at shape-compile time rather than silently misbehaving.
+//!
 //! # Target Selection
 //!
 //! All five SHACL target types select focus nodes:
@@ -71,12 +81,14 @@ pub mod cache;
 pub mod compile;
 pub mod constraints;
 pub mod error;
+pub mod path;
 pub mod validate;
 
 pub use cache::{ShaclCache, ShaclCacheKey};
 pub use compile::{CompiledShape, PropertyShape, Severity, ShapeId, TargetType};
 pub use constraints::Constraint;
 pub use error::{Result, ShaclError};
+pub use path::PropertyPath;
 pub use validate::{CrossLedgerMembership, ShaclEngine, ValidationReport, ValidationResult};
 
 /// SHACL namespace code (re-exported from fluree-vocab)
