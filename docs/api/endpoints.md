@@ -2766,8 +2766,10 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
 | `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
 | `branch` | string | Branch name (default: `main`) |
-| `auth_bearer` | string | Bearer token for catalog auth |
-| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog |
+| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h) |
+| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes) |
+| `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
+| `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
 | `warehouse` | string | Warehouse identifier |
 | `no_vended_credentials` | bool | Disable vended credentials |
 | `s3_region`, `s3_endpoint`, `s3_path_style` | | S3 overrides for `direct` mode |

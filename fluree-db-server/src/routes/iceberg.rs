@@ -48,6 +48,13 @@ pub struct IcebergMapRequest {
     pub oauth2_scope: Option<String>,
     /// OAuth2 audience
     pub oauth2_audience: Option<String>,
+    /// Use Google metadata-server auth (GKE Workload Identity / GCE) for the REST
+    /// catalog, minting + auto-refreshing short-lived tokens — for Google Iceberg
+    /// REST catalogs (BigLake), where a static `auth_bearer` would expire.
+    #[serde(default)]
+    pub auth_google_metadata: bool,
+    /// Optional OAuth scopes for `auth_google_metadata` (defaults to cloud-platform).
+    pub auth_google_scopes: Option<String>,
     /// Warehouse identifier
     pub warehouse: Option<String>,
     /// Disable vended credentials
@@ -533,6 +540,11 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
         if let Some(ref audience) = req.oauth2_audience {
             config = config.with_oauth2_audience(audience);
         }
+    }
+    // Google metadata-server auth (refreshable) — for BigLake / GKE Workload
+    // Identity. Overrides any static bearer configured above.
+    if req.auth_google_metadata {
+        config = config.with_auth_google_metadata(req.auth_google_scopes.clone());
     }
     if let Some(ref wh) = req.warehouse {
         config = config.with_warehouse(wh);
