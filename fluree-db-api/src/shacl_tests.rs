@@ -2919,7 +2919,7 @@ async fn shacl_qualified_value_shape_min_count() {
 async fn shacl_ignored_properties_turtle_list() {
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let shapes_ttl = r#"
+    let shapes_ttl = r"
         @prefix sh: <http://www.w3.org/ns/shacl#> .
         @prefix ex: <http://example.org/ns/> .
 
@@ -2928,7 +2928,7 @@ async fn shacl_ignored_properties_turtle_list() {
           sh:closed true ;
           sh:ignoredProperties ( ex:internal ex:auditLog ) ;
           sh:property [ sh:path ex:label ] .
-    "#;
+    ";
 
     let ledger_ok = fluree.create_ledger("shacl/ignored-ok:main").await.unwrap();
     let ledger_ok = fluree
