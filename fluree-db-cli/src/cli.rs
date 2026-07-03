@@ -743,6 +743,52 @@ pub enum Commands {
         #[command(subcommand)]
         action: ContextAction,
     },
+    /// Validate data against SHACL shapes and print a validation report
+    ///
+    /// Ledger mode validates the current state of a local ledger against its
+    /// attached shapes (or ad-hoc shapes via --shacl / --shacl-graph).
+    /// File mode validates an RDF file in an ephemeral in-memory ledger —
+    /// nothing persists. Exits 1 when results at or above --fail-on exist.
+    ///
+    /// Examples:
+    ///   fluree validate mydb
+    ///   fluree validate mydb --shacl proposed-shapes.ttl
+    ///   fluree validate data.ttl --shacl shapes.ttl
+    ///   fluree validate data.jsonld --format jsonld
+    #[cfg(feature = "shacl")]
+    Validate {
+        /// Ledger name (with optional :branch) or an RDF data file
+        /// (.ttl / .jsonld / .json). Defaults to the active ledger.
+        #[arg(num_args = 0..=1)]
+        target: Option<String>,
+
+        /// IRI of a named data graph to validate (defaults to the default graph)
+        #[arg(long)]
+        graph: Option<String>,
+
+        /// SHACL shapes file (Turtle or JSON-LD). Replaces the ledger's
+        /// attached shapes unless --include-attached is also set.
+        #[arg(long, value_name = "FILE")]
+        shacl: Option<PathBuf>,
+
+        /// IRI of a named graph in the target ledger holding the shapes
+        #[arg(long, value_name = "IRI", conflicts_with = "shacl")]
+        shacl_graph: Option<String>,
+
+        /// Union ad-hoc shapes with the ledger's attached shapes instead of
+        /// replacing them
+        #[arg(long)]
+        include_attached: bool,
+
+        /// Output format: table (human), jsonld, or turtle (W3C report)
+        #[arg(long, default_value = "table")]
+        format: String,
+
+        /// Exit non-zero when results at or above this severity exist:
+        /// violation, warning, or info
+        #[arg(long, default_value = "violation", value_name = "SEVERITY")]
+        fail_on: String,
+    },
 
     /// Export ledger data as RDF (Turtle, N-Triples, N-Quads, TriG, JSON-LD) or as a `.flpack` archive
     Export {

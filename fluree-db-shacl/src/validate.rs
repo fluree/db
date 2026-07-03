@@ -4,9 +4,10 @@
 //! against SHACL shapes.
 
 use crate::cache::{ShaclCache, ShaclCacheKey};
-use crate::compile::{CompiledShape, PropertyShape, Severity, ShapeCompiler, TargetType};
+use crate::compile::{CompiledShape, PropertyShape, Severity, ShapeCompiler, ShapeId, TargetType};
 use crate::constraints::cardinality::{validate_max_count, validate_min_count};
 use crate::constraints::datatype::{validate_datatype, validate_node_kind};
+use crate::constraints::lang::{validate_language_in, validate_unique_lang};
 use crate::constraints::pattern::{validate_max_length, validate_min_length, validate_pattern};
 use crate::constraints::value::{
     validate_has_value, validate_in, validate_max_exclusive, validate_max_inclusive,
@@ -18,8 +19,9 @@ use fluree_db_core::{
     FlakeValue, GraphDbRef, GraphId, IndexType, LedgerSnapshot, NoOverlay, RangeMatch, RangeTest,
     SchemaHierarchy, Sid,
 };
-use fluree_vocab::namespaces::RDF;
+use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::rdf_names;
+use fluree_vocab::shacl as sh_vocab;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 
@@ -35,6 +37,17 @@ use std::collections::{HashMap, HashSet};
 /// data graph.
 type ClassMembershipCache = Mutex<HashMap<(Sid, Sid, GraphId), bool>>;
 
+/// `(focus node, shape id)` pairs currently being validated on the call stack.
+///
+/// Recursive shape references are legal SHACL (`FriendShape → sh:node
+/// FriendShape` via a property) and cyclic *data* would otherwise recurse
+/// forever. On re-entry of an already-active pair the engine assumes
+/// conformance — the standard terminating interpretation, since the spec
+/// leaves recursive validation undefined. One set is created per top-level
+/// validation entry point; entries are removed on exit, so the set only
+/// reflects the live call stack.
+type ActiveShapeChecks = Mutex<HashSet<(Sid, ShapeId)>>;
+
 /// Threaded context for resolving `sh:class` value membership: the extra
 /// vocabulary graphs to union into the `rdf:type` / `rdfs:subClassOf` lookup
 /// (the `f:shapesSource` graph[s]) plus the per-transaction memo. `Copy`
@@ -47,6 +60,12 @@ type ClassMembershipCache = Mutex<HashMap<(Sid, Sid, GraphId), bool>>;
 pub struct CrossLedgerMembership<'a> {
     /// `GraphDbRef` into M's value-set graph at the resolved `t`.
     pub model_db: GraphDbRef<'a>,
+    /// When true, `model_db` shares the data ledger's term space (e.g. an
+    /// inline-shapes bundle encoded against the data ledger's namespace
+    /// registry): membership probes use the data-side Sids directly instead
+    /// of the decode-to-IRI / re-encode-against-M translation — which would
+    /// always miss against a bundle backed by an empty genesis snapshot.
+    pub same_term_space: bool,
     /// D's namespace codes → IRI prefixes (base + this transaction's staged
     /// allocations). Used to decode a D-term Sid to its full IRI before
     /// re-encoding it against M (whose split mode may differ), because the
@@ -276,17 +295,21 @@ impl ShaclEngine {
             cache: &self.class_cache,
             cross_ledger,
         };
+        let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
             if shape.deactivated {
                 continue;
             }
 
             let shape_results =
-                validate_shape(db, focus_node, shape, &all_shapes, Some(class_ctx)).await?;
+                validate_shape(db, focus_node, shape, &all_shapes, Some(class_ctx), &active)
+                    .await?;
             results.extend(shape_results);
         }
 
-        let conforms = results.iter().all(|r| r.severity != Severity::Violation);
+        // Spec: sh:conforms is true iff there are NO validation results
+        // (warnings and infos included), not merely no violations.
+        let conforms = results.is_empty();
 
         Ok(ValidationReport { conforms, results })
     }
@@ -305,6 +328,17 @@ impl ShaclEngine {
 
     /// Validate all focus nodes targeted by shapes
     pub async fn validate_all(&self, db: GraphDbRef<'_>) -> Result<ValidationReport> {
+        self.validate_all_with_membership(db, None).await
+    }
+
+    /// [`Self::validate_all`] with an optional external `sh:class`
+    /// value-membership source (a model ledger or a same-term-space
+    /// inline-shapes bundle), consulted when the local lookup misses.
+    pub async fn validate_all_with_membership(
+        &self,
+        db: GraphDbRef<'_>,
+        cross_ledger: Option<CrossLedgerMembership<'_>>,
+    ) -> Result<ValidationReport> {
         let mut all_results = Vec::new();
 
         // Collect all shapes for logical constraint resolution
@@ -313,9 +347,7 @@ impl ShaclEngine {
         let class_ctx = ClassMembershipCtx {
             membership_g_ids: &self.membership_g_ids,
             cache: &self.class_cache,
-            // Full-db validation (`validate_all`) has no cross-ledger model
-            // context; `sh:class` uses the local lookup only.
-            cross_ledger: None,
+            cross_ledger,
         };
         for shape in self.cache.all_shapes() {
             if shape.deactivated {
@@ -326,15 +358,68 @@ impl ShaclEngine {
             let focus_nodes = get_focus_nodes(db, shape, self.hierarchy.as_ref()).await?;
 
             for focus_node in focus_nodes {
+                let active = ActiveShapeChecks::default();
+                let results = validate_shape(
+                    db,
+                    &focus_node,
+                    shape,
+                    &all_shapes,
+                    Some(class_ctx),
+                    &active,
+                )
+                .await?;
+                all_results.extend(results);
+            }
+
+            // Literal focus nodes: explicit literal sh:targetNode targets, plus
+            // literal objects reached via sh:targetObjectsOf (a target
+            // predicate's objects may be literals). De-duplicated by value —
+            // the focus set is a set of nodes.
+            let mut literal_targets: Vec<crate::compile::LiteralTarget> = Vec::new();
+            for target in &shape.targets {
+                match target {
+                    crate::compile::TargetType::LiteralNode(lits) => {
+                        for lit in lits {
+                            if !literal_targets.contains(lit) {
+                                literal_targets.push(lit.clone());
+                            }
+                        }
+                    }
+                    crate::compile::TargetType::ObjectsOf(predicate) => {
+                        let flakes = db
+                            .range(
+                                IndexType::Psot,
+                                RangeTest::Eq,
+                                RangeMatch::predicate(predicate.clone()),
+                            )
+                            .await?;
+                        for flake in &flakes {
+                            if matches!(flake.o, FlakeValue::Ref(_)) {
+                                continue;
+                            }
+                            let lit = crate::compile::LiteralTarget {
+                                value: flake.o.clone(),
+                                datatype: flake.dt.clone(),
+                                lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
+                            };
+                            if !literal_targets.contains(&lit) {
+                                literal_targets.push(lit);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for lit in &literal_targets {
+                let active = ActiveShapeChecks::default();
                 let results =
-                    validate_shape(db, &focus_node, shape, &all_shapes, Some(class_ctx)).await?;
+                    validate_literal_focus(db, lit, shape, &all_shapes, Some(class_ctx), &active)
+                        .await?;
                 all_results.extend(results);
             }
         }
 
-        let conforms = all_results
-            .iter()
-            .all(|r| r.severity != Severity::Violation);
+        let conforms = all_results.is_empty();
 
         Ok(ValidationReport {
             conforms,
@@ -444,9 +529,7 @@ impl ShaclEngine {
             all_results.extend(report.results);
         }
 
-        let conforms = all_results
-            .iter()
-            .all(|r| r.severity != Severity::Violation);
+        let conforms = all_results.is_empty();
 
         Ok(ValidationReport {
             conforms,
@@ -465,7 +548,9 @@ impl ShaclEngine {
     ) -> Result<()> {
         let report = self.validate_staged(db, modified_subjects).await?;
 
-        if report.conforms {
+        // Enforcement rejects on violations only — spec-level `conforms`
+        // is also false for warnings/infos, which must not block a commit.
+        if report.violation_count() == 0 {
             Ok(())
         } else {
             // Build detailed error messages (limit to first 10 to avoid huge errors)
@@ -478,10 +563,10 @@ impl ShaclEngine {
                     if let Some(ref path) = r.result_path {
                         format!(
                             "Node {}: property {}: {}",
-                            r.focus_node.name, path.name, r.message
+                            r.focus_node, path.name, r.message
                         )
                     } else {
-                        format!("Node {}: {}", r.focus_node.name, r.message)
+                        format!("Node {}: {}", r.focus_node, r.message)
                     }
                 })
                 .collect();
@@ -510,10 +595,35 @@ async fn get_focus_nodes(
     for target in &shape.targets {
         match target {
             TargetType::Class(class) | TargetType::ImplicitClass(class) => {
-                // Build list of classes to query: target class + all subclasses
+                // Build list of classes to query: target class + all subclasses.
+                // The indexed hierarchy misses novelty-added subclass relations,
+                // so a live rdfs:subClassOf descendant walk unions them in
+                // (mirrors the live walk sh:class membership already does).
                 let mut classes_to_query = vec![class.clone()];
                 if let Some(h) = hierarchy {
                     classes_to_query.extend(h.subclasses_of(class).iter().cloned());
+                }
+                let sub_class_of = Sid::new(fluree_vocab::namespaces::RDFS, "subClassOf");
+                let mut queue: std::collections::VecDeque<Sid> =
+                    classes_to_query.iter().cloned().collect();
+                let mut visited: HashSet<Sid> = classes_to_query.iter().cloned().collect();
+                while let Some(cls) = queue.pop_front() {
+                    let sub_flakes = db
+                        .range(
+                            IndexType::Opst,
+                            RangeTest::Eq,
+                            RangeMatch::predicate_object(
+                                sub_class_of.clone(),
+                                FlakeValue::Ref(cls),
+                            ),
+                        )
+                        .await?;
+                    for flake in &sub_flakes {
+                        if visited.insert(flake.s.clone()) {
+                            classes_to_query.push(flake.s.clone());
+                            queue.push_back(flake.s.clone());
+                        }
+                    }
                 }
 
                 // Find all instances of each class
@@ -535,6 +645,9 @@ async fn get_focus_nodes(
             TargetType::Node(nodes) => {
                 focus_nodes.extend(nodes.iter().cloned());
             }
+            // Literal targets are not graph nodes — validated directly via
+            // `validate_literal_focus` in `validate_all_with_membership`.
+            TargetType::LiteralNode(_) => {}
             TargetType::SubjectsOf(predicate) => {
                 // Find all subjects that have this predicate
                 let flakes = db
@@ -584,29 +697,329 @@ fn validate_shape<'a>(
     shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
     class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
+        // A deactivated shape is ignored entirely — including when reached via
+        // sh:node / logical shape references, not just from target selection.
+        if shape.deactivated {
+            return Ok(Vec::new());
+        }
+
+        // Recursion guard: a (focus, shape) pair already on the call stack
+        // (via sh:node / logical shape references over cyclic data) is assumed
+        // conforming so validation terminates.
+        let guard_key = (focus_node.clone(), shape.id.clone());
+        if !active.lock().insert(guard_key.clone()) {
+            return Ok(Vec::new());
+        }
+
         let mut results = Vec::new();
 
         // Validate property shapes
         for prop_shape in &shape.property_shapes {
-            let prop_results =
-                validate_property_shape(db, focus_node, prop_shape, shape, all_shapes, class_ctx)
-                    .await?;
+            let prop_results = validate_property_shape(
+                db, focus_node, prop_shape, shape, all_shapes, class_ctx, active,
+            )
+            .await?;
             results.extend(prop_results);
+        }
+
+        // Value constraints declared directly on the node shape apply to the
+        // focus node itself (a node shape's value nodes = the focus node).
+        if !shape.node_constraints.is_empty() {
+            let node_results =
+                validate_node_value_constraints(db, focus_node, shape, class_ctx).await?;
+            results.extend(node_results);
         }
 
         // Validate structural constraints (closed, logical)
         for constraint in &shape.structural_constraints {
-            let constraint_results =
-                validate_structural_constraint(db, focus_node, constraint, shape, all_shapes)
-                    .await?;
+            let constraint_results = validate_structural_constraint(
+                db, focus_node, constraint, shape, all_shapes, class_ctx, active,
+            )
+            .await?;
             results.extend(constraint_results);
         }
 
+        active.lock().remove(&guard_key);
         Ok(results)
     })
+}
+
+/// Validate a literal `sh:targetNode` target against a shape.
+///
+/// A literal has no graph presence: value constraints evaluate against the
+/// literal directly (the value node IS the focus), structural constraints
+/// test the literal's conformance to the nested shapes, and property shapes
+/// see an empty value set (so only `sh:minCount` / `sh:qualifiedMinCount`
+/// can fire).
+async fn validate_literal_focus<'a>(
+    db: GraphDbRef<'a>,
+    lit: &crate::compile::LiteralTarget,
+    shape: &'a CompiledShape,
+    all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
+) -> Result<Vec<ValidationResult>> {
+    let mut results = Vec::new();
+    let focus = FocusNode::Literal(lit.clone());
+    let values = [lit.value.clone()];
+    let datatypes = [lit.datatype.clone()];
+    let langs = [lit.lang.clone()];
+
+    let mut push = |component: &'static str, message: String| {
+        results.push(ValidationResult {
+            focus_node: focus.clone(),
+            result_path: None,
+            source_shape: shape.id.clone(),
+            source_constraint: None,
+            constraint_component: component,
+            severity: shape.severity,
+            message: shape.message.clone().unwrap_or(message),
+            value: Some(lit.value.clone()),
+            value_datatype: Some(lit.datatype.clone()),
+            value_lang: lit.lang.clone(),
+            graph_id: None,
+        });
+    };
+
+    // Direct value constraints: the value node is the literal itself.
+    for constraint in &shape.node_constraints {
+        let violations = match constraint {
+            Constraint::Class(expected_class) => {
+                validate_class_constraint(db, &values, expected_class, class_ctx).await?
+            }
+            _ => validate_constraint(constraint, &values, &datatypes, &langs)?,
+        };
+        for violation in violations {
+            push(violation.constraint.component(), violation.message);
+        }
+    }
+
+    // Structural constraints: test the literal against the nested shapes.
+    for constraint in &shape.structural_constraints {
+        let conforms_to = |nested: &'a std::sync::Arc<crate::constraints::NestedShape>| {
+            check_value_against_nested_shape(
+                db,
+                &lit.value,
+                Some(&lit.datatype),
+                lit.lang.as_deref(),
+                nested,
+                shape,
+                all_shapes,
+                class_ctx,
+                active,
+            )
+        };
+        match constraint {
+            // A literal has no properties to close over.
+            NodeConstraint::Closed { .. } => {}
+            NodeConstraint::Node(nested) => {
+                if !conforms_to(nested).await? {
+                    push(
+                        sh_vocab::NODE_CONSTRAINT_COMPONENT,
+                        format!(
+                            "Node does not conform to shape {} (sh:node)",
+                            nested.id.name
+                        ),
+                    );
+                }
+            }
+            NodeConstraint::Not(nested) => {
+                if conforms_to(nested).await? {
+                    push(
+                        sh_vocab::NOT_CONSTRAINT_COMPONENT,
+                        format!(
+                            "Node conforms to shape {} which is not allowed (sh:not)",
+                            nested.id.name
+                        ),
+                    );
+                }
+            }
+            NodeConstraint::And(nested_shapes) => {
+                let mut all_conform = true;
+                for nested in nested_shapes {
+                    if !conforms_to(nested).await? {
+                        all_conform = false;
+                    }
+                }
+                if !all_conform {
+                    push(
+                        sh_vocab::AND_CONSTRAINT_COMPONENT,
+                        "Node does not conform to all shapes in sh:and".to_string(),
+                    );
+                }
+            }
+            NodeConstraint::Or(nested_shapes) => {
+                let mut any_conforms = nested_shapes.is_empty();
+                for nested in nested_shapes {
+                    if conforms_to(nested).await? {
+                        any_conforms = true;
+                        break;
+                    }
+                }
+                if !any_conforms {
+                    push(
+                        sh_vocab::OR_CONSTRAINT_COMPONENT,
+                        "Node does not conform to any shape in sh:or".to_string(),
+                    );
+                }
+            }
+            NodeConstraint::Xone(nested_shapes) => {
+                let mut conforming = 0usize;
+                for nested in nested_shapes {
+                    if conforms_to(nested).await? {
+                        conforming += 1;
+                    }
+                }
+                if conforming != 1 {
+                    push(
+                        sh_vocab::XONE_CONSTRAINT_COMPONENT,
+                        format!(
+                            "Node conforms to {conforming} shapes in sh:xone (must be exactly 1)"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    // Property shapes: any path over a literal yields no values, so only the
+    // minimum-count constraints can fire.
+    for prop_shape in &shape.property_shapes {
+        for constraint in &prop_shape.constraints {
+            let fired = match constraint {
+                Constraint::MinCount(min) => *min > 0,
+                Constraint::QualifiedValueShape {
+                    min_count: Some(min),
+                    ..
+                } => *min > 0,
+                _ => continue,
+            };
+            if fired {
+                results.push(ValidationResult {
+                    focus_node: focus.clone(),
+                    result_path: prop_shape.path.as_predicate().cloned(),
+                    source_shape: shape.id.clone(),
+                    source_constraint: Some(prop_shape.id.clone()),
+                    constraint_component: constraint.component(),
+                    severity: prop_shape.severity,
+                    message: prop_shape
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Expected at least 1 value(s) but found 0".to_string()),
+                    value: None,
+                    value_datatype: None,
+                    value_lang: None,
+                    graph_id: None,
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Validate value constraints declared directly on a node shape (no `sh:path`)
+/// against the focus node itself. Per spec, a node shape's value-node set is
+/// exactly the focus node, so per-value constraints (`sh:in`, `sh:hasValue`,
+/// `sh:nodeKind`, `sh:class`, ranges, …) evaluate over `[focus]`.
+async fn validate_node_value_constraints<'a>(
+    db: GraphDbRef<'a>,
+    focus_node: &Sid,
+    shape: &'a CompiledShape,
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+) -> Result<Vec<ValidationResult>> {
+    let violations =
+        focus_value_violations(db, focus_node, &shape.node_constraints, class_ctx).await?;
+    Ok(violations
+        .into_iter()
+        .map(|violation| ValidationResult {
+            focus_node: FocusNode::Node(focus_node.clone()),
+            result_path: None,
+            source_shape: shape.id.clone(),
+            source_constraint: None,
+            constraint_component: violation.constraint.component(),
+            severity: shape.severity,
+            message: shape.message.clone().unwrap_or(violation.message),
+            value: violation
+                .value
+                .or_else(|| Some(FlakeValue::Ref(focus_node.clone()))),
+            value_datatype: None,
+            value_lang: None,
+            graph_id: None,
+        })
+        .collect())
+}
+
+/// Evaluate value constraints against the focus node itself — the shared core
+/// for constraints declared directly on a node shape and for anonymous
+/// value-only members of logical constraints (`sh:or ([ sh:class ex:C ])`).
+/// The focus is an IRI ref, so string facets match its full decoded IRI.
+async fn focus_value_violations<'a>(
+    db: GraphDbRef<'a>,
+    focus_node: &Sid,
+    constraints: &[Constraint],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+) -> Result<Vec<ConstraintViolation>> {
+    let mut violations = Vec::new();
+    let values = [FlakeValue::Ref(focus_node.clone())];
+    let datatypes = [fluree_db_core::id_datatype_sid()];
+
+    for constraint in constraints {
+        match constraint {
+            Constraint::Equals(target_prop)
+            | Constraint::Disjoint(target_prop)
+            | Constraint::LessThan(target_prop)
+            | Constraint::LessThanOrEquals(target_prop) => {
+                let target_flakes = db
+                    .range(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject_predicate(focus_node.clone(), target_prop.clone()),
+                    )
+                    .await?;
+                let target_values: Vec<FlakeValue> =
+                    target_flakes.iter().map(|f| f.o.clone()).collect();
+                violations.extend(validate_pair_constraint(
+                    constraint,
+                    &values,
+                    &target_values,
+                    &target_prop.name,
+                ));
+            }
+            Constraint::Class(expected_class) => {
+                violations.extend(
+                    validate_class_constraint(db, &values, expected_class, class_ctx).await?,
+                );
+            }
+            Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_) => {
+                // String facets evaluate STR(focus), but the reported value
+                // node is the focus itself — not its stringified IRI.
+                let effective = stringify_iri_values(db, &values);
+                violations.extend(
+                    validate_constraint(constraint, &effective, &datatypes, &[None])?
+                        .into_iter()
+                        .map(|mut v| {
+                            v.value = Some(FlakeValue::Ref(focus_node.clone()));
+                            v
+                        }),
+                );
+            }
+            _ => {
+                violations.extend(validate_constraint(
+                    constraint,
+                    &values,
+                    &datatypes,
+                    &[None],
+                )?);
+            }
+        }
+    }
+
+    Ok(violations)
 }
 
 /// Validate a structural (node-level) constraint
@@ -618,6 +1031,8 @@ fn validate_structural_constraint<'a>(
     constraint: &'a crate::constraints::NodeConstraint,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -641,37 +1056,77 @@ fn validate_structural_constraint<'a>(
                         .await?;
 
                     // Collect declared properties from the shape's property shapes
+                    // Only single-predicate property shapes declare a property
+                    // for closed-shape purposes; complex paths have no single
+                    // predicate to exempt.
                     let declared_properties: std::collections::HashSet<&Sid> = parent_shape
                         .property_shapes
                         .iter()
-                        .map(|ps| &ps.path)
+                        .filter_map(|ps| ps.path.as_predicate())
                         .collect();
 
-                    // Per SHACL spec section 4.8.1, rdf:type is implicitly ignored
-                    let rdf_type_sid = Sid::new(RDF, rdf_names::TYPE);
-                    let mut effective_ignored = ignored_properties.clone();
-                    effective_ignored.insert(rdf_type_sid);
-
+                    // Per spec, rdf:type is NOT implicitly ignored — shapes
+                    // must declare `sh:ignoredProperties (rdf:type)` (W3C
+                    // core/node/closed-001 pins this).
                     // Check each property on the node
                     for flake in node_flakes {
                         let prop = &flake.p;
-                        if !declared_properties.contains(prop) && !effective_ignored.contains(prop)
+                        if !declared_properties.contains(prop) && !ignored_properties.contains(prop)
                         {
                             results.push(ValidationResult {
-                                focus_node: focus_node.clone(),
+                                focus_node: FocusNode::Node(focus_node.clone()),
                                 result_path: Some(prop.clone()),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: None,
-                                severity: Severity::Violation,
-                                message: format!(
-                                    "Property {} not allowed by closed shape",
-                                    prop.name
-                                ),
+                                constraint_component: sh_vocab::CLOSED_CONSTRAINT_COMPONENT,
+                                severity: parent_shape.severity,
+                                message: parent_shape.message.clone().unwrap_or_else(|| {
+                                    format!("Property {} not allowed by closed shape", prop.name)
+                                }),
                                 value: Some(flake.o.clone()),
+                                value_datatype: Some(flake.dt.clone()),
+                                value_lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
                                 graph_id: None,
                             });
                         }
                     }
+                }
+            }
+
+            NodeConstraint::Node(nested_shape) => {
+                // sh:node - the focus node must conform to the referenced shape
+                let nested_results = validate_nested_shape(
+                    db,
+                    focus_node,
+                    nested_shape.as_ref(),
+                    parent_shape,
+                    all_shapes,
+                    class_ctx,
+                    active,
+                )
+                .await?;
+                let has_violations = nested_results
+                    .iter()
+                    .any(|r| r.severity == Severity::Violation);
+                if has_violations {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: None,
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: None,
+                        constraint_component: sh_vocab::NODE_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Node does not conform to shape {} (sh:node)",
+                                nested_shape.id.name
+                            )
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
+                        graph_id: None,
+                    });
                 }
             }
 
@@ -683,6 +1138,8 @@ fn validate_structural_constraint<'a>(
                     nested_shape.as_ref(),
                     parent_shape,
                     all_shapes,
+                    class_ctx,
+                    active,
                 )
                 .await?;
                 // If the nested shape has NO violations, that's a violation of sh:not.
@@ -693,23 +1150,32 @@ fn validate_structural_constraint<'a>(
                     .any(|r| r.severity == Severity::Violation);
                 if !has_violations {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
+                        focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
-                        message: format!(
-                            "Node conforms to shape {} which is not allowed (sh:not)",
-                            nested_shape.id.name
-                        ),
-                        value: None,
+                        constraint_component: sh_vocab::NOT_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Node conforms to shape {} which is not allowed (sh:not)",
+                                nested_shape.id.name
+                            )
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
             }
 
             NodeConstraint::And(nested_shapes) => {
-                // sh:and - ALL nested shapes must match (no violations)
+                // sh:and - ALL nested shapes must match (no violations).
+                // Per spec, a failed conjunction produces ONE result per value
+                // node (= the focus node) with sh:value = focus; the nested
+                // violations' messages are aggregated for diagnostics.
+                let mut failure_messages = Vec::new();
                 for nested in nested_shapes {
                     let nested_results = validate_nested_shape(
                         db,
@@ -717,23 +1183,32 @@ fn validate_structural_constraint<'a>(
                         nested.as_ref(),
                         parent_shape,
                         all_shapes,
+                        class_ctx,
+                        active,
                     )
                     .await?;
-                    // Include violations from the nested shape
                     for r in nested_results {
                         if r.severity == Severity::Violation {
-                            results.push(ValidationResult {
-                                focus_node: focus_node.clone(),
-                                result_path: r.result_path,
-                                source_shape: parent_shape.id.clone(),
-                                source_constraint: None,
-                                severity: Severity::Violation,
-                                message: format!("sh:and constraint - {}", r.message),
-                                value: r.value,
-                                graph_id: None,
-                            });
+                            failure_messages.push(r.message);
                         }
                     }
+                }
+                if !failure_messages.is_empty() {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: None,
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: None,
+                        constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!("sh:and constraint - {}", failure_messages.join("; "))
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
+                        graph_id: None,
+                    });
                 }
             }
 
@@ -749,6 +1224,8 @@ fn validate_structural_constraint<'a>(
                         nested.as_ref(),
                         parent_shape,
                         all_shapes,
+                        class_ctx,
+                        active,
                     )
                     .await?;
                     let has_violations = nested_results
@@ -768,16 +1245,21 @@ fn validate_structural_constraint<'a>(
 
                 if !any_conforms && !nested_shapes.is_empty() {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
+                        focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
-                        message: format!(
-                            "Node does not conform to any shape in sh:or. Violations: {}",
-                            all_messages.join("; ")
-                        ),
-                        value: None,
+                        constraint_component: sh_vocab::OR_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Node does not conform to any shape in sh:or. Violations: {}",
+                                all_messages.join("; ")
+                            )
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -795,6 +1277,8 @@ fn validate_structural_constraint<'a>(
                         nested.as_ref(),
                         parent_shape,
                         all_shapes,
+                        class_ctx,
+                        active,
                     )
                     .await?;
                     let has_violations = nested_results
@@ -808,28 +1292,38 @@ fn validate_structural_constraint<'a>(
 
                 if conforming_count == 0 {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
+                        focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
-                        message: "Node does not conform to any shape in sh:xone".to_string(),
-                        value: None,
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            "Node does not conform to any shape in sh:xone".to_string()
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 } else if conforming_count > 1 {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
+                        focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
                         source_shape: parent_shape.id.clone(),
                         source_constraint: None,
-                        severity: Severity::Violation,
-                        message: format!(
-                            "Node conforms to {} shapes in sh:xone (must be exactly 1): {}",
-                            conforming_count,
-                            conforming_shapes.join(", ")
-                        ),
-                        value: None,
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
+                        severity: parent_shape.severity,
+                        message: parent_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Node conforms to {} shapes in sh:xone (must be exactly 1): {}",
+                                conforming_count,
+                                conforming_shapes.join(", ")
+                            )
+                        }),
+                        value: Some(FlakeValue::Ref(focus_node.clone())),
+                        value_datatype: None,
+                        value_lang: None,
                         graph_id: None,
                     });
                 }
@@ -850,6 +1344,8 @@ fn validate_nested_shape<'a>(
     nested: &'a NestedShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -860,41 +1356,104 @@ fn validate_nested_shape<'a>(
             && nested.value_constraints.is_empty()
         {
             if let Some(ref_shape) = all_shapes.iter().find(|s| s.id == nested.id) {
-                // `sh:class` reached via a referenced/nested shape keeps the
-                // legacy data-graph lookup (no `f:shapesSource` vocabulary union
-                // and no shared memo) — the value-set feature targets top-level
-                // property shapes.
-                return validate_shape(db, focus_node, ref_shape, all_shapes, None).await;
+                return validate_shape(db, focus_node, ref_shape, all_shapes, class_ctx, active)
+                    .await;
             }
             // Shape not found and no inline constraints — treat as unresolved.
             // Return a violation to prevent sh:or from being trivially true.
             return Ok(vec![ValidationResult {
-                focus_node: focus_node.clone(),
+                focus_node: FocusNode::Node(focus_node.clone()),
                 result_path: None,
                 source_shape: parent_shape.id.clone(),
                 source_constraint: Some(nested.id.clone()),
+                constraint_component: sh_vocab::NODE_CONSTRAINT_COMPONENT,
                 severity: Severity::Violation,
                 message: format!("Referenced shape {} could not be resolved", nested.id.name),
                 value: None,
+                value_datatype: None,
+                value_lang: None,
                 graph_id: None,
             }]);
         }
 
         let mut results = Vec::new();
 
+        // Value constraints on an anonymous member apply to the focus node
+        // itself (no sh:path — the member's value-node set is the focus).
+        // Without this, a value-only member like `sh:or ([ sh:class ex:C ])`
+        // would be treated as conforming with no checks.
+        if !nested.value_constraints.is_empty() {
+            let violations =
+                focus_value_violations(db, focus_node, &nested.value_constraints, class_ctx)
+                    .await?;
+            for violation in violations {
+                results.push(ValidationResult {
+                    focus_node: FocusNode::Node(focus_node.clone()),
+                    result_path: None,
+                    source_shape: parent_shape.id.clone(),
+                    source_constraint: Some(nested.id.clone()),
+                    constraint_component: violation.constraint.component(),
+                    severity: Severity::Violation,
+                    message: nested.message.clone().unwrap_or(violation.message),
+                    value: violation.value,
+                    value_datatype: None,
+                    value_lang: None,
+                    graph_id: None,
+                });
+            }
+        }
+
         // Validate property constraints
         for (path, constraints) in &nested.property_constraints {
-            // Get all values for this property on the focus node
-            let flakes = db
-                .range(
-                    IndexType::Spot,
-                    RangeTest::Eq,
-                    RangeMatch::subject_predicate(focus_node.clone(), path.clone()),
-                )
-                .await?;
+            // A path that never compiled surfaces as a violation on this member.
+            if let Some(reason) = path.unresolvable_reason() {
+                results.push(ValidationResult {
+                    focus_node: FocusNode::Node(focus_node.clone()),
+                    result_path: None,
+                    source_shape: parent_shape.id.clone(),
+                    source_constraint: Some(nested.id.clone()),
+                    constraint_component:
+                        fluree_vocab::fluree::UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT,
+                    severity: Severity::Violation,
+                    message: format!("Unsupported sh:path expression: {reason}"),
+                    value: None,
+                    value_datatype: None,
+                    value_lang: None,
+                    graph_id: None,
+                });
+                continue;
+            }
 
-            let values: Vec<FlakeValue> = flakes.iter().map(|f| f.o.clone()).collect();
-            let datatypes: Vec<Sid> = flakes.iter().map(|f| f.dt.clone()).collect();
+            // Value nodes reached by the member's path. Simple predicate → SPOT
+            // scan; complex path → evaluate the AST (same as top-level shapes).
+            let (values, datatypes, langs): (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) =
+                if let Some(pred) = path.as_predicate() {
+                    let flakes = db
+                        .range(
+                            IndexType::Spot,
+                            RangeTest::Eq,
+                            RangeMatch::subject_predicate(focus_node.clone(), pred.clone()),
+                        )
+                        .await?;
+                    (
+                        flakes.iter().map(|f| f.o.clone()).collect(),
+                        flakes.iter().map(|f| f.dt.clone()).collect(),
+                        flakes
+                            .iter()
+                            .map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
+                            .collect(),
+                    )
+                } else {
+                    crate::path::split_path_values(
+                        crate::path::eval_path(db, focus_node, path).await?,
+                    )
+                };
+
+            let result_path = path.as_predicate().cloned();
+            let path_label = path
+                .as_predicate()
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| "path".to_string());
 
             // Validate each constraint
             for constraint in constraints {
@@ -918,31 +1477,173 @@ fn validate_nested_shape<'a>(
 
                         if source_values != target_values {
                             results.push(ValidationResult {
-                                focus_node: focus_node.clone(),
-                                result_path: Some(path.clone()),
+                                focus_node: FocusNode::Node(focus_node.clone()),
+                                result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: sh_vocab::EQUALS_CONSTRAINT_COMPONENT,
                                 severity: Severity::Violation,
-                                message: format!(
-                                    "Value set for {} does not equal value set for {}",
-                                    path.name, target_prop.name
-                                ),
+                                message: nested.message.clone().unwrap_or_else(|| {
+                                    format!(
+                                        "Value set for {} does not equal value set for {}",
+                                        path_label, target_prop.name
+                                    )
+                                }),
                                 value: None,
+                                value_datatype: None,
+                                value_lang: None,
+                                graph_id: None,
+                            });
+                        }
+                    }
+                    Constraint::Class(expected_class) => {
+                        let violations =
+                            validate_class_constraint(db, &values, expected_class, class_ctx)
+                                .await?;
+                        for violation in violations {
+                            results.push(ValidationResult {
+                                focus_node: FocusNode::Node(focus_node.clone()),
+                                result_path: result_path.clone(),
+                                source_shape: parent_shape.id.clone(),
+                                source_constraint: Some(nested.id.clone()),
+                                constraint_component: sh_vocab::CLASS_CONSTRAINT_COMPONENT,
+                                severity: Severity::Violation,
+                                message: nested.message.clone().unwrap_or(violation.message),
+                                value: violation.value,
+                                value_datatype: violation
+                                    .value_index
+                                    .and_then(|i| datatypes.get(i))
+                                    .cloned(),
+                                value_lang: violation
+                                    .value_index
+                                    .and_then(|i| langs.get(i))
+                                    .and_then(std::clone::Clone::clone),
+                                graph_id: None,
+                            });
+                        }
+                    }
+                    Constraint::QualifiedValueShape {
+                        shape,
+                        min_count,
+                        max_count,
+                        disjoint,
+                        sibling_shapes,
+                    } => {
+                        let mut conforming = 0usize;
+                        for (i, value) in values.iter().enumerate() {
+                            let mut conforms = check_value_against_nested_shape(
+                                db,
+                                value,
+                                datatypes.get(i),
+                                langs.get(i).and_then(|l| l.as_deref()),
+                                shape,
+                                parent_shape,
+                                all_shapes,
+                                class_ctx,
+                                active,
+                            )
+                            .await?;
+                            if conforms && *disjoint {
+                                for sibling in sibling_shapes {
+                                    if check_value_against_nested_shape(
+                                        db,
+                                        value,
+                                        datatypes.get(i),
+                                        langs.get(i).and_then(|l| l.as_deref()),
+                                        sibling,
+                                        parent_shape,
+                                        all_shapes,
+                                        class_ctx,
+                                        active,
+                                    )
+                                    .await?
+                                    {
+                                        conforms = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if conforms {
+                                conforming += 1;
+                            }
+                        }
+                        let below = min_count.map(|min| conforming < min).unwrap_or(false);
+                        let above = max_count.map(|max| conforming > max).unwrap_or(false);
+                        if below || above {
+                            results.push(ValidationResult {
+                                focus_node: FocusNode::Node(focus_node.clone()),
+                                result_path: result_path.clone(),
+                                source_shape: parent_shape.id.clone(),
+                                source_constraint: Some(nested.id.clone()),
+                                constraint_component: if below { sh_vocab::QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT } else { sh_vocab::QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT },
+                                severity: Severity::Violation,
+                                message: nested.message.clone().unwrap_or_else(|| {
+                                    format!(
+                                        "Found {} value(s) conforming to shape {} (expected {}..{})",
+                                        conforming,
+                                        shape.id.name,
+                                        min_count.map_or_else(|| "0".into(), |n| n.to_string()),
+                                        max_count.map_or_else(|| "*".into(), |n| n.to_string()),
+                                    )
+                                }),
+                                value: None,
+                                value_datatype: None,
+                                value_lang: None,
+                                graph_id: None,
+                            });
+                        }
+                    }
+                    Constraint::Pattern(..)
+                    | Constraint::MinLength(_)
+                    | Constraint::MaxLength(_)
+                        if has_iri_ref(&values) =>
+                    {
+                        let effective = stringify_iri_values(db, &values);
+                        let violations =
+                            validate_constraint(constraint, &effective, &datatypes, &langs)?;
+                        for violation in violations {
+                            results.push(ValidationResult {
+                                focus_node: FocusNode::Node(focus_node.clone()),
+                                result_path: result_path.clone(),
+                                source_shape: parent_shape.id.clone(),
+                                source_constraint: Some(nested.id.clone()),
+                                constraint_component: violation.constraint.component(),
+                                severity: Severity::Violation,
+                                message: nested.message.clone().unwrap_or(violation.message),
+                                value: violation.value,
+                                value_datatype: violation
+                                    .value_index
+                                    .and_then(|i| datatypes.get(i))
+                                    .cloned(),
+                                value_lang: violation
+                                    .value_index
+                                    .and_then(|i| langs.get(i))
+                                    .and_then(std::clone::Clone::clone),
                                 graph_id: None,
                             });
                         }
                     }
                     _ => {
-                        let violations = validate_constraint(constraint, &values, &datatypes)?;
+                        let violations =
+                            validate_constraint(constraint, &values, &datatypes, &langs)?;
                         for violation in violations {
                             results.push(ValidationResult {
-                                focus_node: focus_node.clone(),
-                                result_path: Some(path.clone()),
+                                focus_node: FocusNode::Node(focus_node.clone()),
+                                result_path: result_path.clone(),
                                 source_shape: parent_shape.id.clone(),
                                 source_constraint: Some(nested.id.clone()),
+                                constraint_component: violation.constraint.component(),
                                 severity: Severity::Violation,
-                                message: violation.message,
+                                message: nested.message.clone().unwrap_or(violation.message),
                                 value: violation.value,
+                                value_datatype: violation
+                                    .value_index
+                                    .and_then(|i| datatypes.get(i))
+                                    .cloned(),
+                                value_lang: violation
+                                    .value_index
+                                    .and_then(|i| langs.get(i))
+                                    .and_then(std::clone::Clone::clone),
                                 graph_id: None,
                             });
                         }
@@ -959,6 +1660,8 @@ fn validate_nested_shape<'a>(
                 node_constraint,
                 parent_shape,
                 all_shapes,
+                class_ctx,
+                active,
             )
             .await?;
             results.extend(nested_results);
@@ -969,6 +1672,7 @@ fn validate_nested_shape<'a>(
 }
 
 /// Validate a focus node against a property shape
+#[allow(clippy::too_many_arguments)]
 async fn validate_property_shape<'a>(
     db: GraphDbRef<'a>,
     focus_node: &Sid,
@@ -976,20 +1680,55 @@ async fn validate_property_shape<'a>(
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
     class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
 
-    // Get all values for this property on the focus node
-    let flakes = db
-        .range(
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::subject_predicate(focus_node.clone(), prop_shape.path.clone()),
-        )
-        .await?;
+    // A path that never compiled surfaces here (only for focus nodes this shape
+    // actually targets) rather than as a ledger-wide compile failure.
+    if let Some(reason) = prop_shape.path.unresolvable_reason() {
+        results.push(ValidationResult {
+            focus_node: FocusNode::Node(focus_node.clone()),
+            result_path: None,
+            source_shape: parent_shape.id.clone(),
+            source_constraint: Some(prop_shape.id.clone()),
+            constraint_component: fluree_vocab::fluree::UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT,
+            severity: prop_shape.severity,
+            message: format!("Unsupported sh:path expression: {reason}"),
+            value: None,
+            value_datatype: None,
+            value_lang: None,
+            graph_id: None,
+        });
+        return Ok(results);
+    }
 
-    let values: Vec<FlakeValue> = flakes.iter().map(|f| f.o.clone()).collect();
-    let datatypes: Vec<Sid> = flakes.iter().map(|f| f.dt.clone()).collect();
+    // Get all value nodes reached by this property shape's path on the focus node.
+    // Simple single-predicate paths take the plain SPOT scan; complex paths
+    // (inverse/sequence/alternative/transitive) evaluate the path AST. The
+    // language column feeds sh:uniqueLang / sh:languageIn.
+    let (values, datatypes, langs): (Vec<FlakeValue>, Vec<Sid>, Vec<Option<String>>) =
+        if let Some(pred) = prop_shape.path.as_predicate() {
+            let flakes = db
+                .range(
+                    IndexType::Spot,
+                    RangeTest::Eq,
+                    RangeMatch::subject_predicate(focus_node.clone(), pred.clone()),
+                )
+                .await?;
+            (
+                flakes.iter().map(|f| f.o.clone()).collect(),
+                flakes.iter().map(|f| f.dt.clone()).collect(),
+                flakes
+                    .iter()
+                    .map(|f| f.m.as_ref().and_then(|m| m.lang.clone()))
+                    .collect(),
+            )
+        } else {
+            crate::path::split_path_values(
+                crate::path::eval_path(db, focus_node, &prop_shape.path).await?,
+            )
+        };
 
     // Validate each constraint
     for constraint in &prop_shape.constraints {
@@ -1018,13 +1757,22 @@ async fn validate_property_shape<'a>(
                 );
                 for violation in violations {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: constraint.component(),
                         severity: prop_shape.severity,
-                        message: violation.message,
+                        message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1034,30 +1782,163 @@ async fn validate_property_shape<'a>(
                     validate_class_constraint(db, &values, expected_class, class_ctx).await?;
                 for violation in class_violations {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::CLASS_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
-                        message: violation.message,
+                        message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
+                        graph_id: None,
+                    });
+                }
+            }
+            Constraint::QualifiedValueShape {
+                shape,
+                min_count,
+                max_count,
+                disjoint,
+                sibling_shapes,
+            } => {
+                let mut conforming = 0usize;
+                for (i, value) in values.iter().enumerate() {
+                    let mut conforms = check_value_against_nested_shape(
+                        db,
+                        value,
+                        datatypes.get(i),
+                        langs.get(i).and_then(|l| l.as_deref()),
+                        shape,
+                        parent_shape,
+                        all_shapes,
+                        class_ctx,
+                        active,
+                    )
+                    .await?;
+                    // Disjointness: a value conforming to a sibling qualified
+                    // shape does not count toward this one.
+                    if conforms && *disjoint {
+                        for sibling in sibling_shapes {
+                            if check_value_against_nested_shape(
+                                db,
+                                value,
+                                datatypes.get(i),
+                                langs.get(i).and_then(|l| l.as_deref()),
+                                sibling,
+                                parent_shape,
+                                all_shapes,
+                                class_ctx,
+                                active,
+                            )
+                            .await?
+                            {
+                                conforms = false;
+                                break;
+                            }
+                        }
+                    }
+                    if conforms {
+                        conforming += 1;
+                    }
+                }
+
+                let mut qualified_messages: Vec<(String, &'static str)> = Vec::new();
+                if let Some(min) = min_count {
+                    if conforming < *min {
+                        qualified_messages.push((
+                            format!(
+                                "Expected at least {} value(s) conforming to shape {} but found {}",
+                                min, shape.id.name, conforming
+                            ),
+                            sh_vocab::QUALIFIED_MIN_COUNT_CONSTRAINT_COMPONENT,
+                        ));
+                    }
+                }
+                if let Some(max) = max_count {
+                    if conforming > *max {
+                        qualified_messages.push((
+                            format!(
+                                "Expected at most {} value(s) conforming to shape {} but found {}",
+                                max, shape.id.name, conforming
+                            ),
+                            sh_vocab::QUALIFIED_MAX_COUNT_CONSTRAINT_COMPONENT,
+                        ));
+                    }
+                }
+                for (message, component) in qualified_messages {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: component,
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or(message),
+                        value: None,
+                        value_datatype: None,
+                        value_lang: None,
+                        graph_id: None,
+                    });
+                }
+            }
+            Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_)
+                if has_iri_ref(&values) =>
+            {
+                // String facets apply to STR(iri) — decode IRI refs first.
+                let effective = stringify_iri_values(db, &values);
+                let violations = validate_constraint(constraint, &effective, &datatypes, &langs)?;
+                for violation in violations {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: violation.constraint.component(),
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or(violation.message),
+                        value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
             }
             _ => {
                 // Handle other constraints
-                let violations = validate_constraint(constraint, &values, &datatypes)?;
+                let violations = validate_constraint(constraint, &values, &datatypes, &langs)?;
 
                 for violation in violations {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: violation.constraint.component(),
                         severity: prop_shape.severity,
-                        message: violation.message,
+                        message: prop_shape.message.clone().unwrap_or(violation.message),
                         value: violation.value,
+                        value_datatype: violation
+                            .value_index
+                            .and_then(|i| datatypes.get(i))
+                            .cloned(),
+                        value_lang: violation
+                            .value_index
+                            .and_then(|i| langs.get(i))
+                            .and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1073,10 +1954,13 @@ async fn validate_property_shape<'a>(
             focus_node,
             &values,
             &datatypes,
+            &langs,
             structural,
             prop_shape,
             parent_shape,
             all_shapes,
+            class_ctx,
+            active,
         )
         .await?;
         results.extend(structural_results);
@@ -1096,10 +1980,13 @@ async fn validate_property_value_structural_constraint<'a>(
     focus_node: &Sid,
     values: &[FlakeValue],
     datatypes: &[Sid],
+    langs: &[Option<String>],
     constraint: &'a NodeConstraint,
     prop_shape: &PropertyShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
 
@@ -1116,9 +2003,12 @@ async fn validate_property_value_structural_constraint<'a>(
                         db,
                         value,
                         dt,
+                        langs.get(i).and_then(|l| l.as_deref()),
                         nested,
                         parent_shape,
                         all_shapes,
+                        class_ctx,
+                        active,
                     )
                     .await?;
                     if conforms {
@@ -1130,17 +2020,22 @@ async fn validate_property_value_structural_constraint<'a>(
 
                 if !any_conforms && !nested_shapes.is_empty() {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::OR_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
-                        message: format!(
-                            "Value {:?} does not conform to any shape in sh:or (tried: {})",
-                            value,
-                            all_messages.join(", ")
-                        ),
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {:?} does not conform to any shape in sh:or (tried: {})",
+                                value,
+                                all_messages.join(", ")
+                            )
+                        }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1148,34 +2043,49 @@ async fn validate_property_value_structural_constraint<'a>(
         }
 
         NodeConstraint::And(nested_shapes) => {
-            // For each value, ALL nested shapes must accept it
+            // For each value, ALL nested shapes must accept it. Per spec a
+            // failed conjunction produces ONE result per value node, however
+            // many members rejected it.
             for (i, value) in values.iter().enumerate() {
                 let dt = datatypes.get(i);
+                let mut failed_members = Vec::new();
                 for nested in nested_shapes {
                     let conforms = check_value_against_nested_shape(
                         db,
                         value,
                         dt,
+                        langs.get(i).and_then(|l| l.as_deref()),
                         nested,
                         parent_shape,
                         all_shapes,
+                        class_ctx,
+                        active,
                     )
                     .await?;
                     if !conforms {
-                        results.push(ValidationResult {
-                            focus_node: focus_node.clone(),
-                            result_path: Some(prop_shape.path.clone()),
-                            source_shape: parent_shape.id.clone(),
-                            source_constraint: Some(prop_shape.id.clone()),
-                            severity: prop_shape.severity,
-                            message: format!(
-                                "Value {:?} does not conform to shape {} (sh:and)",
-                                value, nested.id.name
-                            ),
-                            value: Some(value.clone()),
-                            graph_id: None,
-                        });
+                        failed_members.push(nested.id.name.to_string());
                     }
+                }
+                if !failed_members.is_empty() {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::AND_CONSTRAINT_COMPONENT,
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {:?} does not conform to shape(s) {} (sh:and)",
+                                value,
+                                failed_members.join(", ")
+                            )
+                        }),
+                        value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
+                        graph_id: None,
+                    });
                 }
             }
         }
@@ -1191,9 +2101,12 @@ async fn validate_property_value_structural_constraint<'a>(
                         db,
                         value,
                         dt,
+                        langs.get(i).and_then(|l| l.as_deref()),
                         nested,
                         parent_shape,
                         all_shapes,
+                        class_ctx,
+                        active,
                     )
                     .await?;
                     if conforms {
@@ -1203,28 +2116,75 @@ async fn validate_property_value_structural_constraint<'a>(
 
                 if conforming_count == 0 {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
-                        message: format!(
-                            "Value {value:?} does not conform to any shape in sh:xone"
-                        ),
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!("Value {value:?} does not conform to any shape in sh:xone")
+                        }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 } else if conforming_count > 1 {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::XONE_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
-                        message: format!(
-                            "Value {value:?} conforms to {conforming_count} shapes in sh:xone (must be exactly 1)"
-                        ),
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {value:?} conforms to {conforming_count} shapes in sh:xone (must be exactly 1)"
+                            )
+                        }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
+                        graph_id: None,
+                    });
+                }
+            }
+        }
+
+        NodeConstraint::Node(nested) => {
+            // sh:node - each value must conform to the referenced shape
+            for (i, value) in values.iter().enumerate() {
+                let dt = datatypes.get(i);
+                let conforms = check_value_against_nested_shape(
+                    db,
+                    value,
+                    dt,
+                    langs.get(i).and_then(|l| l.as_deref()),
+                    nested,
+                    parent_shape,
+                    all_shapes,
+                    class_ctx,
+                    active,
+                )
+                .await?;
+                if !conforms {
+                    results.push(ValidationResult {
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
+                        source_shape: parent_shape.id.clone(),
+                        source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::NODE_CONSTRAINT_COMPONENT,
+                        severity: prop_shape.severity,
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {:?} does not conform to shape {} (sh:node)",
+                                value, nested.id.name
+                            )
+                        }),
+                        value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1239,23 +2199,31 @@ async fn validate_property_value_structural_constraint<'a>(
                     db,
                     value,
                     dt,
+                    langs.get(i).and_then(|l| l.as_deref()),
                     nested,
                     parent_shape,
                     all_shapes,
+                    class_ctx,
+                    active,
                 )
                 .await?;
                 if conforms {
                     results.push(ValidationResult {
-                        focus_node: focus_node.clone(),
-                        result_path: Some(prop_shape.path.clone()),
+                        focus_node: FocusNode::Node(focus_node.clone()),
+                        result_path: prop_shape.path.as_predicate().cloned(),
                         source_shape: parent_shape.id.clone(),
                         source_constraint: Some(prop_shape.id.clone()),
+                        constraint_component: sh_vocab::NOT_CONSTRAINT_COMPONENT,
                         severity: prop_shape.severity,
-                        message: format!(
-                            "Value {:?} conforms to shape {} which is not allowed (sh:not)",
-                            value, nested.id.name
-                        ),
+                        message: prop_shape.message.clone().unwrap_or_else(|| {
+                            format!(
+                                "Value {:?} conforms to shape {} which is not allowed (sh:not)",
+                                value, nested.id.name
+                            )
+                        }),
                         value: Some(value.clone()),
+                        value_datatype: datatypes.get(i).cloned(),
+                        value_lang: langs.get(i).and_then(std::clone::Clone::clone),
                         graph_id: None,
                     });
                 }
@@ -1277,13 +2245,17 @@ async fn validate_property_value_structural_constraint<'a>(
 /// the value and datatype. For IRI/blank-node values (`FlakeValue::Ref`),
 /// delegates to `validate_nested_shape` which can look up the value as a
 /// focus node in the database.
+#[allow(clippy::too_many_arguments)]
 async fn check_value_against_nested_shape<'a>(
     db: GraphDbRef<'a>,
     value: &FlakeValue,
     datatype: Option<&Sid>,
+    lang: Option<&str>,
     nested: &'a NestedShape,
     parent_shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
+    class_ctx: Option<ClassMembershipCtx<'a>>,
+    active: &'a ActiveShapeChecks,
 ) -> Result<bool> {
     // If the nested shape has value-level constraints (e.g. sh:datatype without sh:path),
     // check them directly against the value/datatype.
@@ -1296,18 +2268,43 @@ async fn check_value_against_nested_shape<'a>(
             }
             None => &[],
         };
-        let violations = validate_constraint_set(
-            &nested.value_constraints,
-            std::slice::from_ref(value),
-            dt_slice,
-        )?;
-        return Ok(violations.is_empty());
+        let lang_arr = [lang.map(str::to_string)];
+        for constraint in &nested.value_constraints {
+            let conforms = match constraint {
+                // sh:class needs db access for the rdf:type lookup.
+                Constraint::Class(expected_class) => validate_class_constraint(
+                    db,
+                    std::slice::from_ref(value),
+                    expected_class,
+                    class_ctx,
+                )
+                .await?
+                .is_empty(),
+                // String facets match STR(iri) for IRI values.
+                Constraint::Pattern(..) | Constraint::MinLength(_) | Constraint::MaxLength(_) => {
+                    let effective = stringify_iri_values(db, std::slice::from_ref(value));
+                    validate_constraint(constraint, &effective, dt_slice, &lang_arr)?.is_empty()
+                }
+                _ => validate_constraint(
+                    constraint,
+                    std::slice::from_ref(value),
+                    dt_slice,
+                    &lang_arr,
+                )?
+                .is_empty(),
+            };
+            if !conforms {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
     }
 
     // For IRI/blank-node values, evaluate the nested shape against the value as a focus node
     if let FlakeValue::Ref(sid) = value {
         let nested_results =
-            validate_nested_shape(db, sid, nested, parent_shape, all_shapes).await?;
+            validate_nested_shape(db, sid, nested, parent_shape, all_shapes, class_ctx, active)
+                .await?;
         let has_violations = nested_results
             .iter()
             .any(|r| r.severity == Severity::Violation);
@@ -1319,18 +2316,31 @@ async fn check_value_against_nested_shape<'a>(
     Ok(false)
 }
 
-/// Apply multiple constraints to a set of values and collect all violations.
-fn validate_constraint_set(
-    constraints: &[Constraint],
-    values: &[FlakeValue],
-    datatypes: &[Sid],
-) -> Result<Vec<ConstraintViolation>> {
-    let mut all_violations = Vec::new();
-    for constraint in constraints {
-        let violations = validate_constraint(constraint, values, datatypes)?;
-        all_violations.extend(violations);
-    }
-    Ok(all_violations)
+/// Replace IRI refs with their full-IRI string form for the string facets
+/// (`sh:pattern` / `sh:minLength` / `sh:maxLength`), per SPARQL `STR()`.
+/// Blank nodes stay refs (string facets fail on them, per spec); an IRI whose
+/// namespace can't be decoded (e.g. allocated in this very transaction) also
+/// stays a ref and fails closed.
+fn stringify_iri_values(db: GraphDbRef<'_>, values: &[FlakeValue]) -> Vec<FlakeValue> {
+    values
+        .iter()
+        .map(|v| match v {
+            FlakeValue::Ref(sid) if sid.namespace_code != BLANK_NODE => db
+                .snapshot
+                .decode_sid(sid)
+                .map(FlakeValue::String)
+                .unwrap_or_else(|| v.clone()),
+            _ => v.clone(),
+        })
+        .collect()
+}
+
+/// Whether any value is a non-blank IRI ref (candidate for
+/// [`stringify_iri_values`]).
+fn has_iri_ref(values: &[FlakeValue]) -> bool {
+    values
+        .iter()
+        .any(|v| matches!(v, FlakeValue::Ref(sid) if sid.namespace_code != BLANK_NODE))
 }
 
 /// Validate a constraint against a set of values
@@ -1338,6 +2348,7 @@ fn validate_constraint(
     constraint: &Constraint,
     values: &[FlakeValue],
     datatypes: &[Sid],
+    langs: &[Option<String>],
 ) -> Result<Vec<ConstraintViolation>> {
     let mut violations = Vec::new();
 
@@ -1365,15 +2376,17 @@ fn validate_constraint(
         Constraint::Datatype(expected_dt) => {
             for (i, value) in values.iter().enumerate() {
                 if let Some(actual_dt) = datatypes.get(i) {
-                    if let Some(v) = validate_datatype(value, actual_dt, expected_dt) {
+                    if let Some(mut v) = validate_datatype(value, actual_dt, expected_dt) {
+                        v.value_index = Some(i);
                         violations.push(v);
                     }
                 }
             }
         }
         Constraint::NodeKind(kind) => {
-            for value in values {
-                if let Some(v) = validate_node_kind(value, *kind) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_node_kind(value, *kind) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
@@ -1384,57 +2397,65 @@ fn validate_constraint(
             // pure-values path without a snapshot).
         }
         Constraint::MinInclusive(min) => {
-            for value in values {
-                if let Some(v) = validate_min_inclusive(value, min) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_min_inclusive(value, min) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MaxInclusive(max) => {
-            for value in values {
-                if let Some(v) = validate_max_inclusive(value, max) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_max_inclusive(value, max) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MinExclusive(min) => {
-            for value in values {
-                if let Some(v) = validate_min_exclusive(value, min) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_min_exclusive(value, min) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MaxExclusive(max) => {
-            for value in values {
-                if let Some(v) = validate_max_exclusive(value, max) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_max_exclusive(value, max) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::Pattern(pattern, flags) => {
-            for value in values {
-                if let Some(v) = validate_pattern(value, pattern, flags.as_deref())? {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_pattern(value, pattern, flags.as_deref())? {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MinLength(min) => {
-            for value in values {
-                if let Some(v) = validate_min_length(value, *min) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_min_length(value, *min) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::MaxLength(max) => {
-            for value in values {
-                if let Some(v) = validate_max_length(value, *max) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_max_length(value, *max) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
         }
         Constraint::In(allowed) => {
-            for value in values {
-                if let Some(v) = validate_in(value, allowed) {
+            for (i, value) in values.iter().enumerate() {
+                if let Some(mut v) = validate_in(value, allowed) {
+                    v.value_index = Some(i);
                     violations.push(v);
                 }
             }
@@ -1448,24 +2469,26 @@ fn validate_constraint(
         | Constraint::LessThan(_)
         | Constraint::LessThanOrEquals(_) => {}
 
-        // Language constraints
-        // Note: Language tags are stored in the flake's datatype field (rdf:langString)
-        // with the language as a separate attribute. Full validation requires access to
-        // language metadata which is not available in this simplified validation path.
-        Constraint::UniqueLang(_unique) => {
-            // TODO: Implement when language metadata is available
-            // Requires checking the language tag from flake metadata, not FlakeValue
+        // Language constraints (tags come from flake metadata via `langs`)
+        Constraint::UniqueLang(unique) => {
+            if *unique {
+                violations.extend(validate_unique_lang(values, langs));
+            }
         }
-        Constraint::LanguageIn(_allowed_langs) => {
-            // TODO: Implement when language metadata is available
-            // Requires checking the language tag from flake metadata, not FlakeValue
+        Constraint::LanguageIn(allowed) => {
+            for (i, value) in values.iter().enumerate() {
+                let lang = langs.get(i).and_then(|l| l.as_deref());
+                if let Some(mut v) = validate_language_in(value, lang, allowed) {
+                    v.value_index = Some(i);
+                    violations.push(v);
+                }
+            }
         }
 
-        // Qualified value shape - requires nested validation
-        Constraint::QualifiedValueShape { .. } => {
-            // TODO: Implement qualified value shape validation
-            // This requires recursive shape validation
-        }
+        // Qualified value shape needs db access for nested-shape conformance
+        // counting — handled in `validate_property_shape` (this function is
+        // the pure-values path without a snapshot).
+        Constraint::QualifiedValueShape { .. } => {}
     }
 
     Ok(violations)
@@ -1518,6 +2541,18 @@ fn validate_pair_constraint(
         // Caller is responsible for only passing pair-constraint variants.
         _ => {}
     }
+    // Backfill value indices by position so result construction can recover
+    // the datatype / language of the offending source value. Equality lookup
+    // is exact for the per-value helpers (the violation value IS values[i]).
+    for v in &mut out {
+        if v.value_index.is_none() {
+            v.value_index = v
+                .value
+                .as_ref()
+                .and_then(|val| values.iter().position(|x| x == val));
+        }
+    }
+
     out
 }
 
@@ -1567,13 +2602,14 @@ async fn validate_class_constraint(
         }
     }
 
-    for value in values {
+    for (value_index, value) in values.iter().enumerate() {
         let value_ref = match value {
             FlakeValue::Ref(r) => r,
             other => {
                 out.push(ConstraintViolation {
                     constraint: Constraint::Class(expected_class.clone()),
                     value: Some(other.clone()),
+                    value_index: Some(value_index),
                     message: format!(
                         "Value {:?} is a literal and cannot be an instance of class {}",
                         other, expected_class.name
@@ -1616,6 +2652,7 @@ async fn validate_class_constraint(
             out.push(ConstraintViolation {
                 constraint: Constraint::Class(expected_class.clone()),
                 value: Some(value.clone()),
+                value_index: Some(value_index),
                 message: format!(
                     "Value {} is not an instance of class {}",
                     value_ref.name, expected_class.name
@@ -1723,19 +2760,27 @@ async fn value_conforms_cross_ledger(
     expected_class: &Sid,
 ) -> Result<bool> {
     let m_db = cl.model_db;
-    // D term -> IRI (via D's staged ns map) -> M term. A missing decode/encode
-    // means the value/class is simply not known to M -> not a member there.
-    let (Some(value_iri), Some(class_iri)) = (
-        decode_sid_with_ns_map(cl.data_ns_map, value_ref),
-        decode_sid_with_ns_map(cl.data_ns_map, expected_class),
-    ) else {
-        return Ok(false);
-    };
-    let (Some(m_value), Some(m_class)) = (
-        m_db.snapshot.encode_iri_strict(&value_iri),
-        m_db.snapshot.encode_iri_strict(&class_iri),
-    ) else {
-        return Ok(false);
+    let (m_value, m_class) = if cl.same_term_space {
+        // The membership source shares the data ledger's term space (inline
+        // shapes bundle) — probe with the data-side Sids directly.
+        (value_ref.clone(), expected_class.clone())
+    } else {
+        // D term -> IRI (via D's staged ns map) -> M term. A missing
+        // decode/encode means the value/class is simply not known to M ->
+        // not a member there.
+        let (Some(value_iri), Some(class_iri)) = (
+            decode_sid_with_ns_map(cl.data_ns_map, value_ref),
+            decode_sid_with_ns_map(cl.data_ns_map, expected_class),
+        ) else {
+            return Ok(false);
+        };
+        let (Some(m_value), Some(m_class)) = (
+            m_db.snapshot.encode_iri_strict(&value_iri),
+            m_db.snapshot.encode_iri_strict(&class_iri),
+        ) else {
+            return Ok(false);
+        };
+        (m_value, m_class)
     };
 
     let rdf_type = Sid::new(RDF, rdf_names::TYPE);
@@ -1887,23 +2932,61 @@ impl ValidationReport {
     }
 }
 
+/// The node (or literal, for literal `sh:targetNode` targets) a validation
+/// result is about.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FocusNode {
+    /// An IRI or blank node in the graph.
+    Node(Sid),
+    /// A literal target from `sh:targetNode` — validated directly, since a
+    /// literal has no graph presence to probe.
+    Literal(crate::compile::LiteralTarget),
+}
+
+impl FocusNode {
+    /// The Sid when the focus is a graph node.
+    pub fn as_sid(&self) -> Option<&Sid> {
+        match self {
+            FocusNode::Node(sid) => Some(sid),
+            FocusNode::Literal(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FocusNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FocusNode::Node(sid) => write!(f, "{}{}", sid.namespace_code, sid.name),
+            FocusNode::Literal(lit) => write!(f, "{}", lit.value),
+        }
+    }
+}
+
 /// Individual validation result
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
     /// The focus node that was validated
-    pub focus_node: Sid,
+    pub focus_node: FocusNode,
     /// The property path (if property constraint)
     pub result_path: Option<Sid>,
     /// The shape that produced this result
     pub source_shape: Sid,
     /// The constraint component that produced this result
     pub source_constraint: Option<Sid>,
+    /// IRI of the SHACL constraint component that produced this result
+    /// (`sh:sourceConstraintComponent` in W3C validation reports)
+    pub constraint_component: &'static str,
     /// Severity level
     pub severity: Severity,
     /// Human-readable message
     pub message: String,
     /// The value that caused the violation (if applicable)
     pub value: Option<FlakeValue>,
+    /// Datatype of `value`, when the violation concerns a single value whose
+    /// datatype is known (resolves to the `sh:value` literal's `@type`)
+    pub value_datatype: Option<Sid>,
+    /// Language tag of `value`, when it is a language-tagged literal
+    pub value_lang: Option<String>,
     /// The graph where the focus node was being validated. Populated by the
     /// staged-validation path (`validate_staged_nodes`) so that callers can
     /// apply per-graph SHACL policy (e.g. warn vs reject, enable/disable).

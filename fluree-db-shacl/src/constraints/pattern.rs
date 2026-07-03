@@ -5,25 +5,55 @@ use crate::error::{Result, ShaclError};
 use fluree_db_core::FlakeValue;
 use regex::Regex;
 
+/// The lexical form a literal is matched against for `sh:pattern`, mirroring
+/// SPARQL `STR()`. `None` for non-literals: blank nodes always violate per
+/// spec, and IRI matching would need namespace decoding that this pure path
+/// doesn't have.
+fn pattern_lexical_form(value: &FlakeValue) -> Option<String> {
+    match value {
+        FlakeValue::String(s) => Some(s.clone()),
+        FlakeValue::Long(n) => Some(n.to_string()),
+        FlakeValue::Double(n) => Some(n.to_string()),
+        FlakeValue::Boolean(b) => Some(b.to_string()),
+        FlakeValue::BigInt(n) => Some(n.to_string()),
+        FlakeValue::Decimal(d) => Some(d.to_string()),
+        FlakeValue::DateTime(v) => Some(v.original().to_string()),
+        FlakeValue::Date(v) => Some(v.original().to_string()),
+        FlakeValue::Time(v) => Some(v.original().to_string()),
+        FlakeValue::GYear(v) => Some(v.original().to_string()),
+        FlakeValue::GYearMonth(v) => Some(v.original().to_string()),
+        FlakeValue::GMonth(v) => Some(v.original().to_string()),
+        FlakeValue::GDay(v) => Some(v.original().to_string()),
+        FlakeValue::GMonthDay(v) => Some(v.original().to_string()),
+        FlakeValue::YearMonthDuration(v) => Some(v.original().to_string()),
+        FlakeValue::DayTimeDuration(v) => Some(v.original().to_string()),
+        FlakeValue::Duration(v) => Some(v.original().to_string()),
+        FlakeValue::Json(s) => Some(s.clone()),
+        FlakeValue::GeoPoint(v) => Some(v.to_string()),
+        FlakeValue::Ref(_) | FlakeValue::Vector(_) | FlakeValue::Null => None,
+    }
+}
+
 /// Validate sh:pattern constraint
 ///
-/// Checks that a string value matches the regular expression pattern.
+/// Matches the value's lexical form (per SPARQL `STR()`) against the regular
+/// expression — so numeric, boolean, and date/time literals participate, not
+/// just strings.
 pub fn validate_pattern(
     value: &FlakeValue,
     pattern: &str,
     flags: Option<&str>,
 ) -> Result<Option<ConstraintViolation>> {
-    let string_value = match value {
-        FlakeValue::String(s) => s.as_str(),
-        _ => {
-            // Non-string values fail pattern matching
-            return Ok(Some(ConstraintViolation {
-                constraint: Constraint::Pattern(pattern.to_string(), flags.map(String::from)),
-                value: Some(value.clone()),
-                message: "Pattern constraint requires a string value".to_string(),
-            }));
-        }
+    let Some(string_value) = pattern_lexical_form(value) else {
+        // Blank nodes / IRIs / non-literals fail pattern matching
+        return Ok(Some(ConstraintViolation {
+            constraint: Constraint::Pattern(pattern.to_string(), flags.map(String::from)),
+            value: Some(value.clone()),
+            value_index: None,
+            message: "Pattern constraint cannot be applied to a non-literal value".to_string(),
+        }));
     };
+    let string_value = string_value.as_str();
 
     // Build regex with optional flags
     let regex_pattern = if let Some(f) = flags {
@@ -54,19 +84,31 @@ pub fn validate_pattern(
         Ok(Some(ConstraintViolation {
             constraint: Constraint::Pattern(pattern.to_string(), flags.map(String::from)),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("Value '{string_value}' does not match pattern '{pattern}'"),
         }))
     }
 }
 
 /// Validate sh:minLength constraint
+///
+/// Applies to the value's lexical form (per SPARQL `STR()`); non-literals
+/// (blank nodes, undecodable IRIs) violate per spec.
 pub fn validate_min_length(value: &FlakeValue, min: usize) -> Option<ConstraintViolation> {
-    let len = string_length(value);
+    let Some(len) = lexical_length(value) else {
+        return Some(ConstraintViolation {
+            constraint: Constraint::MinLength(min),
+            value: Some(value.clone()),
+            value_index: None,
+            message: "Length constraint cannot be applied to a non-literal value".to_string(),
+        });
+    };
 
     if len < min {
         Some(ConstraintViolation {
             constraint: Constraint::MinLength(min),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("String length {len} is less than minimum {min}"),
         })
     } else {
@@ -75,13 +117,24 @@ pub fn validate_min_length(value: &FlakeValue, min: usize) -> Option<ConstraintV
 }
 
 /// Validate sh:maxLength constraint
+///
+/// Applies to the value's lexical form (per SPARQL `STR()`); non-literals
+/// (blank nodes, undecodable IRIs) violate per spec.
 pub fn validate_max_length(value: &FlakeValue, max: usize) -> Option<ConstraintViolation> {
-    let len = string_length(value);
+    let Some(len) = lexical_length(value) else {
+        return Some(ConstraintViolation {
+            constraint: Constraint::MaxLength(max),
+            value: Some(value.clone()),
+            value_index: None,
+            message: "Length constraint cannot be applied to a non-literal value".to_string(),
+        });
+    };
 
     if len > max {
         Some(ConstraintViolation {
             constraint: Constraint::MaxLength(max),
             value: Some(value.clone()),
+            value_index: None,
             message: format!("String length {len} exceeds maximum {max}"),
         })
     } else {
@@ -89,38 +142,9 @@ pub fn validate_max_length(value: &FlakeValue, max: usize) -> Option<ConstraintV
     }
 }
 
-/// Get the length of a value as a string
-fn string_length(value: &FlakeValue) -> usize {
-    match value {
-        FlakeValue::String(s) => s.chars().count(),
-        FlakeValue::Long(n) => n.to_string().len(),
-        FlakeValue::Double(n) => n.to_string().len(),
-        FlakeValue::Boolean(b) => {
-            if *b {
-                4
-            } else {
-                5
-            }
-        } // "true" or "false"
-        FlakeValue::Ref(sid) => sid.name.len(),
-        FlakeValue::Vector(v) => v.len(), // Length of vector
-        FlakeValue::Null => 0,
-        FlakeValue::Json(s) => s.chars().count(),
-        FlakeValue::BigInt(n) => n.to_string().len(),
-        FlakeValue::Decimal(d) => d.to_string().len(),
-        FlakeValue::DateTime(dt) => dt.original().len(),
-        FlakeValue::Date(d) => d.original().len(),
-        FlakeValue::Time(t) => t.original().len(),
-        FlakeValue::GYear(v) => v.original().len(),
-        FlakeValue::GYearMonth(v) => v.original().len(),
-        FlakeValue::GMonth(v) => v.original().len(),
-        FlakeValue::GDay(v) => v.original().len(),
-        FlakeValue::GMonthDay(v) => v.original().len(),
-        FlakeValue::YearMonthDuration(v) => v.original().len(),
-        FlakeValue::DayTimeDuration(v) => v.original().len(),
-        FlakeValue::Duration(v) => v.original().len(),
-        FlakeValue::GeoPoint(v) => v.to_string().len(), // "POINT(lng lat)"
-    }
+/// Character count of the value's lexical form; `None` for non-literals.
+fn lexical_length(value: &FlakeValue) -> Option<usize> {
+    pattern_lexical_form(value).map(|s| s.chars().count())
 }
 
 #[cfg(test)]
@@ -139,6 +163,24 @@ mod tests {
         let value = FlakeValue::String("hello".to_string());
         let result = validate_pattern(&value, r"^\d+$", None).unwrap();
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_pattern_numeric_literal_matches_lexical_form() {
+        // Non-string literals match on their lexical form (SPARQL STR()),
+        // not unconditionally violate.
+        let year = FlakeValue::Long(2024);
+        assert!(validate_pattern(&year, r"^\d{4}$", None).unwrap().is_none());
+        let too_long = FlakeValue::Long(12345);
+        assert!(validate_pattern(&too_long, r"^\d{4}$", None)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_pattern_ref_still_violates() {
+        let value = FlakeValue::Ref(fluree_db_core::Sid::new(100, "thing"));
+        assert!(validate_pattern(&value, ".*", None).unwrap().is_some());
     }
 
     #[test]

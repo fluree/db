@@ -457,8 +457,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse a triple statement.
     fn parse_triples(&mut self) -> Result<()> {
+        let bnode_list_subject = matches!(self.current().kind, TokenKind::LBracket);
         let subject = self.parse_subject()?;
-        self.parse_predicate_object_list(subject)?;
+        // Turtle grammar: `blankNodePropertyList predicateObjectList? '.'` —
+        // the predicate-object list is optional when the subject is a
+        // `[...]` property list (its triples were emitted inside the list).
+        if !(bnode_list_subject && matches!(self.current().kind, TokenKind::Dot)) {
+            self.parse_predicate_object_list(subject)?;
+        }
         self.expect(&TokenKind::Dot)?;
         Ok(())
     }
@@ -1532,5 +1538,20 @@ mod tests {
                 "reference {reference} should resolve to {expected}"
             );
         }
+    }
+
+    #[test]
+    fn bare_blank_node_property_list_statement() {
+        // Turtle grammar allows `[ ... ] .` with no outer predicate list.
+        let turtle = r"
+            @prefix ex: <http://example.org/> .
+            [
+              ex:p ex:A ;
+              ex:p ex:B ;
+            ].
+        ";
+        let mut sink = GraphCollectorSink::new();
+        parse(turtle, &mut sink).expect("bare [ ... ] . statement must parse");
+        assert_eq!(sink.finish().len(), 2);
     }
 }

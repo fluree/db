@@ -31,6 +31,11 @@ pub enum CliError {
     Remote(String),
     /// Server lifecycle error (start/stop/status).
     Server(String),
+    /// Terminate with a specific exit code and no error message — the
+    /// command already wrote its output (e.g. `validate` printed a
+    /// non-conforming report). Library consumers of `run()` receive this
+    /// as a typed outcome instead of a `process::exit`.
+    ExitCode(i32),
 }
 
 impl fmt::Display for CliError {
@@ -57,6 +62,7 @@ impl fmt::Display for CliError {
             CliError::Credential(e) => write!(f, "{} {e}", "error:".red().bold()),
             CliError::Remote(msg) => write!(f, "{} {msg}", "error:".red().bold()),
             CliError::Server(msg) => write!(f, "{} {msg}", "error:".red().bold()),
+            CliError::ExitCode(code) => write!(f, "exit code {code}"),
         }
     }
 }
@@ -135,6 +141,10 @@ impl From<fluree_db_core::ledger_id::LedgerIdParseError> for CliError {
 
 /// Print error and exit with the appropriate code.
 pub fn exit_with_error(err: CliError) -> ! {
+    // A typed exit carries no message — the command already wrote its output.
+    if let CliError::ExitCode(code) = &err {
+        process::exit(*code);
+    }
     eprintln!("{err}");
     let code = match &err {
         CliError::Usage(_) => EXIT_USAGE,

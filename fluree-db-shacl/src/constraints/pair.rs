@@ -42,6 +42,7 @@ pub fn validate_equals(
                 name: other_path.into(),
             }),
             value: None,
+            value_index: None,
             message: format!(
                 "Value set does not equal value set for {}: {}",
                 other_path,
@@ -74,6 +75,7 @@ pub fn validate_disjoint(
                 name: other_path.into(),
             }),
             value: intersection.first().map(|v| (**v).clone()),
+            value_index: None,
             message: format!(
                 "Values must be disjoint from {other_path}, but found common values: {intersection:?}"
             ),
@@ -101,6 +103,7 @@ pub fn validate_less_than(
                         name: other_path.into(),
                     }),
                     value: Some(value.clone()),
+                    value_index: None,
                     message: format!(
                         "Value {value:?} is not less than {other:?} from {other_path}"
                     ),
@@ -114,6 +117,7 @@ pub fn validate_less_than(
                     name: other_path.into(),
                 }),
                 value: Some(value.clone()),
+                value_index: None,
                 message: format!(
                     "Cannot compare value {value:?} with {other:?} from {other_path} (incompatible types)"
                 ),
@@ -142,6 +146,7 @@ pub fn validate_less_than_or_equals(
                         name: other_path.into(),
                     }),
                     value: Some(value.clone()),
+                    value_index: None,
                     message: format!(
                         "Value {value:?} is not less than or equal to {other:?} from {other_path}"
                     ),
@@ -155,6 +160,7 @@ pub fn validate_less_than_or_equals(
                     name: other_path.into(),
                 }),
                 value: Some(value.clone()),
+                value_index: None,
                 message: format!(
                     "Cannot compare value {value:?} with {other:?} from {other_path} (incompatible types)"
                 ),

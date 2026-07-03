@@ -366,7 +366,7 @@ async fn resolve_cross_ledger_shapes_for_tx(
 /// same mechanism — schema, policy, and SHACL shapes can live in any graph
 /// the ledger knows about, including the config graph itself.
 #[cfg(feature = "shacl")]
-fn resolve_shapes_source_g_ids(
+pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
 ) -> std::result::Result<Vec<GraphId>, fluree_db_transact::TransactError> {
@@ -630,11 +630,7 @@ fn format_violations(violations: &[fluree_db_shacl::ValidationResult]) -> String
     );
     for (i, v) in violations.iter().enumerate() {
         let _ = writeln!(out, "  {}. {}", i + 1, v.message);
-        let _ = writeln!(
-            out,
-            "     Focus node: {}{}",
-            v.focus_node.namespace_code, v.focus_node.name
-        );
+        let _ = writeln!(out, "     Focus node: {}", v.focus_node);
         if let Some(path) = &v.result_path {
             let _ = writeln!(out, "     Path: {}{}", path.namespace_code, path.name);
         }
@@ -765,6 +761,7 @@ async fn stage_with_config_shacl(
                         m_db.t,
                     ),
                     data_ns_map: ns_map,
+                    same_term_space: false,
                 })
         }
         _ => None,

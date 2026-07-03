@@ -41,19 +41,6 @@ Guide to the manifest-driven W3C compliance test suite:
 - Using Claude Code for compliance work
 - Architecture overview
 
-### [SHACL Implementation](shacl-implementation.md)
-
-How SHACL validation is wired into Fluree, for contributors adding
-constraints or fixing bugs:
-- Pipeline: compile → cache → validate
-- Crate layout (`fluree-db-shacl` / `-transact` / `-api`)
-- Shared post-stage helper and its call sites
-- Per-graph config, `f:shapesSource`, target-type resolution
-- Adding a new constraint (walkthrough)
-- Testing patterns (unit + integration + temp-revert regression trick)
-- Known gaps (`sh:uniqueLang`, `sh:qualifiedValueShape`, cross-txn cache)
-
-
 ## How to Contribute
 
 ### Ways to Contribute

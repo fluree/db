@@ -35,3 +35,5 @@ pub mod update;
 pub mod upsert;
 pub mod upstream;
 pub mod use_cmd;
+#[cfg(feature = "shacl")]
+pub mod validate;

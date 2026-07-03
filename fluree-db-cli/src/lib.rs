@@ -398,6 +398,29 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             }
         }
 
+        #[cfg(feature = "shacl")]
+        Commands::Validate {
+            target,
+            graph,
+            shacl,
+            shacl_graph,
+            include_attached,
+            format,
+            fail_on,
+        } => {
+            commands::validate::run(
+                target.as_deref(),
+                graph.as_deref(),
+                shacl.as_deref(),
+                shacl_graph.as_deref(),
+                include_attached,
+                &format,
+                &fail_on,
+                config_path,
+            )
+            .await
+        }
+
         Commands::Export {
             ledger,
             format,

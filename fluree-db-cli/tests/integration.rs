@@ -2633,3 +2633,89 @@ fn update_via_stdin() {
         .success()
         .stdout(predicate::str::contains("Committed t=1"));
 }
+
+// ============================================================================
+// Validate command (file mode — no .fluree required)
+// ============================================================================
+
+const VALIDATE_SHAPES_TTL: &str = r"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:UserShape a sh:NodeShape ;
+    sh:targetClass ex:User ;
+    sh:property [ sh:path schema:name ; sh:minCount 1 ] .
+";
+
+#[test]
+fn validate_file_with_shapes_reports_violation() {
+    let work = TempDir::new().unwrap();
+    std::fs::write(
+        work.path().join("data.ttl"),
+        r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:bob a ex:User ; schema:email "bob@example.org" .
+"#,
+    )
+    .unwrap();
+    std::fs::write(work.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+
+    fluree_cmd(&work)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("MinCountConstraintComponent"))
+        .stdout(predicate::str::contains("Conforms: false"));
+}
+
+#[test]
+fn validate_conforming_file_exits_zero() {
+    let work = TempDir::new().unwrap();
+    std::fs::write(
+        work.path().join("data.ttl"),
+        r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+ex:alice a ex:User ; schema:name "Alice" .
+"#,
+    )
+    .unwrap();
+    std::fs::write(work.path().join("shapes.ttl"), VALIDATE_SHAPES_TTL).unwrap();
+
+    fluree_cmd(&work)
+        .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Conforms: true"));
+}
+
+#[test]
+fn validate_file_with_embedded_shapes() {
+    // Shapes and violating data in one file: the loader must not reject the
+    // load (staging-time SHACL is disabled in the ephemeral ledger) — the
+    // violation surfaces in the report instead.
+    let work = TempDir::new().unwrap();
+    let mut doc = String::from(VALIDATE_SHAPES_TTL);
+    doc.push_str("\nex:carol a ex:User ; schema:email \"carol@example.org\" .\n");
+    std::fs::write(work.path().join("embedded.ttl"), doc).unwrap();
+
+    fluree_cmd(&work)
+        .args(["validate", "embedded.ttl", "--format", "turtle"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains("sh:ValidationReport"))
+        .stdout(predicate::str::contains("sh:conforms false"))
+        .stdout(predicate::str::contains("carol"));
+}
+
+#[test]
+fn validate_rejects_unknown_fail_on() {
+    let work = TempDir::new().unwrap();
+    std::fs::write(work.path().join("data.ttl"), "@prefix ex: <http://e/> .").unwrap();
+    fluree_cmd(&work)
+        .args(["validate", "data.ttl", "--fail-on", "nope"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown --fail-on"));
+}
