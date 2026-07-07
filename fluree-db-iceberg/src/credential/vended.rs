@@ -119,6 +119,65 @@ impl VendedCredentials {
         }))
     }
 
+    /// Parse vended credentials from a full REST `loadTable` response.
+    ///
+    /// Honors the standardized top-level `storage-credentials` array
+    /// (apache/iceberg #10722): per spec a client MUST check `storage-credentials`
+    /// **before** the legacy top-level `config` map. Among entries whose `prefix`
+    /// matches `metadata_location`, the **longest** prefix that yields usable
+    /// static creds wins — a remote-signing-only entry carries no `s3.*` keys, so
+    /// [`Self::from_config_map`] returns `None` and it is skipped. Falls back to
+    /// the flat top-level `config` map when no usable storage-credential is found
+    /// (the shape AWS Lake Formation and older catalogs still emit).
+    pub fn from_load_table_response(
+        response: &serde_json::Value,
+        metadata_location: &str,
+    ) -> Result<Option<Self>> {
+        if let Some(entries) = response
+            .get("storage-credentials")
+            .and_then(|v| v.as_array())
+        {
+            let mut best: Option<(usize, Self)> = None;
+            for entry in entries {
+                let prefix = entry.get("prefix").and_then(|p| p.as_str()).unwrap_or("");
+                // An empty/absent prefix applies to everything; a present prefix
+                // must be a prefix of this table's metadata_location.
+                if !prefix.is_empty() && !metadata_location.starts_with(prefix) {
+                    continue;
+                }
+                let Some(cfg_obj) = entry.get("config").and_then(|c| c.as_object()) else {
+                    continue;
+                };
+                let cfg: HashMap<String, serde_json::Value> = cfg_obj
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                // Skip entries with no usable static creds (e.g. remote-signing).
+                if let Some(creds) = Self::from_config_map(&cfg)? {
+                    let len = prefix.len();
+                    let better = match &best {
+                        None => true,
+                        Some((best_len, _)) => len >= *best_len,
+                    };
+                    if better {
+                        best = Some((len, creds));
+                    }
+                }
+            }
+            if let Some((_, creds)) = best {
+                return Ok(Some(creds));
+            }
+        }
+
+        // Fall back to the legacy flat top-level `config` map.
+        let config: HashMap<String, serde_json::Value> = response
+            .get("config")
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        Self::from_config_map(&config)
+    }
+
     /// Check if credentials are expired or will expire within buffer.
     ///
     /// Uses a 30-second buffer to ensure we refresh before actual expiration.
@@ -508,5 +567,117 @@ mod tests {
         );
         // The access key ID (an identifier, unusable without the secret) is shown.
         assert!(dbg.contains("AKIAEXAMPLE"));
+    }
+
+    // ── from_load_table_response: standardized `storage-credentials` array
+    //    (apache/iceberg #10722), precedence + longest-usable-prefix + fallback ──
+
+    const ML: &str = "s3://bucket/db/tbl/metadata/v1.json";
+
+    fn creds_config(ak: &str) -> serde_json::Value {
+        serde_json::json!({
+            "s3.access-key-id": ak,
+            "s3.secret-access-key": "secret",
+            "s3.session-token": "token",
+            "client.region": "us-east-1",
+        })
+    }
+
+    fn load_creds(resp: &serde_json::Value) -> Option<VendedCredentials> {
+        VendedCredentials::from_load_table_response(resp, ML).unwrap()
+    }
+
+    #[test]
+    fn storage_credentials_array_is_parsed() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": creds_config("AKIA_SC") }
+            ],
+        });
+        let c = load_creds(&resp).expect("creds");
+        assert_eq!(c.access_key_id, "AKIA_SC");
+        assert_eq!(c.region.as_deref(), Some("us-east-1"));
+    }
+
+    #[test]
+    fn storage_credentials_take_precedence_over_config() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": creds_config("AKIA_CONFIG"),
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db/tbl", "config": creds_config("AKIA_SC") }
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_SC");
+    }
+
+    #[test]
+    fn longest_matching_prefix_wins() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://bucket", "config": creds_config("AKIA_SHORT") },
+                { "prefix": "s3://bucket/db/tbl", "config": creds_config("AKIA_LONG") }
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_LONG");
+    }
+
+    #[test]
+    fn longest_prefix_without_usable_keys_is_skipped() {
+        // The longest-prefix entry is remote-signing-only (no static s3.* keys);
+        // the shorter entry that actually carries keys must be chosen.
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://bucket/db", "config": creds_config("AKIA_USABLE") },
+                { "prefix": "s3://bucket/db/tbl", "config": { "s3.remote-signing-enabled": "true" } }
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_USABLE");
+    }
+
+    #[test]
+    fn non_matching_prefix_falls_back_to_config() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                { "prefix": "s3://other-bucket/x", "config": creds_config("AKIA_OTHER") }
+            ],
+            "config": creds_config("AKIA_CONFIG"),
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_CONFIG");
+    }
+
+    #[test]
+    fn falls_back_to_legacy_config_map() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": creds_config("AKIA_CONFIG"),
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_CONFIG");
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped_gracefully() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "storage-credentials": [
+                "not-an-object",
+                { "prefix": "s3://bucket/db/tbl" },            // no config
+                { "config": creds_config("AKIA_NOPREFIX") }    // no prefix -> applies to all
+            ],
+        });
+        assert_eq!(load_creds(&resp).unwrap().access_key_id, "AKIA_NOPREFIX");
+    }
+
+    #[test]
+    fn no_credentials_yields_none() {
+        let resp = serde_json::json!({
+            "metadata-location": ML,
+            "config": { "table_type": "ICEBERG" },
+        });
+        assert!(load_creds(&resp).is_none());
     }
 }
