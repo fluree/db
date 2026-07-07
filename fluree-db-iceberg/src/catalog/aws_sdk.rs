@@ -30,6 +30,25 @@ async fn sdk_config(region: Option<&str>) -> aws_config::SdkConfig {
     loader.load().await
 }
 
+/// Extract the Iceberg `metadata_location` from a Glue table's `Parameters`.
+/// Factored out so the (SDK-free) extraction — the one bit of the Glue path with
+/// no other automated coverage — is unit-testable without live AWS.
+fn glue_metadata_location(
+    parameters: Option<&HashMap<String, String>>,
+    namespace: &str,
+    table: &str,
+) -> Result<String> {
+    parameters
+        .and_then(|p| p.get("metadata_location"))
+        .cloned()
+        .ok_or_else(|| {
+            IcebergError::Metadata(format!(
+                "Glue table {namespace}.{table} has no `metadata_location` parameter \
+                 (not an Iceberg table?)"
+            ))
+        })
+}
+
 // ---------------------------------------------------------------------------
 // AWS Glue Data Catalog
 // ---------------------------------------------------------------------------
@@ -125,16 +144,8 @@ impl SendCatalogClient for GlueSdkCatalogClient {
         })?;
 
         // Iceberg tables registered in Glue carry `metadata_location` in Parameters.
-        let metadata_location = table
-            .parameters()
-            .and_then(|p| p.get("metadata_location"))
-            .cloned()
-            .ok_or_else(|| {
-                IcebergError::Metadata(format!(
-                    "Glue table {}.{} has no `metadata_location` parameter (not an Iceberg table?)",
-                    table_id.namespace, table_id.table
-                ))
-            })?;
+        let metadata_location =
+            glue_metadata_location(table.parameters(), &table_id.namespace, &table_id.table)?;
 
         Ok(LoadTableResponse {
             metadata_location,
@@ -243,5 +254,37 @@ impl SendCatalogClient for S3TablesSdkCatalogClient {
             credentials: None,
             metadata: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glue_metadata_location_extracted_from_parameters() {
+        let mut params = HashMap::new();
+        params.insert("table_type".to_string(), "ICEBERG".to_string());
+        params.insert(
+            "metadata_location".to_string(),
+            "s3://bucket/dim_store/metadata/00001-abc.metadata.json".to_string(),
+        );
+        assert_eq!(
+            glue_metadata_location(Some(&params), "enterprise_dw", "dim_store").unwrap(),
+            "s3://bucket/dim_store/metadata/00001-abc.metadata.json"
+        );
+    }
+
+    #[test]
+    fn glue_metadata_location_missing_is_a_clear_error() {
+        // A non-Iceberg Glue table (e.g. the Hive/Parquet `fuel_events` table) has
+        // no `metadata_location` — must be a clear error, not a panic.
+        let params = HashMap::from([("classification".to_string(), "parquet".to_string())]);
+        let err = glue_metadata_location(Some(&params), "db", "t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata_location"), "unhelpful error: {err}");
+        assert!(err.contains("db.t"), "error should name the table: {err}");
+        assert!(glue_metadata_location(None, "db", "t").is_err());
     }
 }
