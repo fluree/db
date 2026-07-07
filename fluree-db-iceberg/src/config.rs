@@ -132,6 +132,23 @@ impl IcebergGsConfig {
                     ));
                 }
             }
+            CatalogConfig::Glue { .. } => {
+                // Namespace + table must be explicit (cannot derive from a path).
+                // `vended_credentials` is ignored: the AWS SDK reads S3 with the
+                // ambient credential chain.
+                self.table_identifier()?;
+            }
+            CatalogConfig::S3Tables {
+                table_bucket_arn, ..
+            } => {
+                if !table_bucket_arn.starts_with("arn:aws:s3tables:") {
+                    return Err(IcebergError::Config(format!(
+                        "S3Tables catalog.table_bucket_arn must be an S3 Tables bucket ARN \
+                         (arn:aws:s3tables:...), got: {table_bucket_arn}"
+                    )));
+                }
+                self.table_identifier()?;
+            }
         }
 
         Ok(())
@@ -177,6 +194,35 @@ pub enum CatalogConfig {
         /// Example: "s3://bucket/warehouse/my_namespace/my_table"
         table_location: String,
     },
+
+    /// AWS Glue Data Catalog via the native AWS SDK (`aws-sdk-glue`).
+    ///
+    /// Resolves the table's `metadata_location` from Glue `GetTable`, then reads
+    /// metadata/manifests/data from S3 with the ambient AWS credential chain. The
+    /// Glue *database* is the table identifier's namespace. No REST/SigV4/vended
+    /// credentials are involved — the SDK signs its own calls.
+    Glue {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        #[serde(default)]
+        region: Option<String>,
+        /// Glue catalog id for cross-account access (`None` = the caller's account).
+        #[serde(default)]
+        catalog_id: Option<String>,
+    },
+
+    /// AWS S3 Tables via the native AWS SDK (`aws-sdk-s3tables`).
+    ///
+    /// Resolves the table's metadata location from `GetTableMetadataLocation`,
+    /// then reads from the managed table bucket with the ambient AWS credential
+    /// chain.
+    S3Tables {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        #[serde(default)]
+        region: Option<String>,
+        /// The S3 Tables table-bucket ARN
+        /// (`arn:aws:s3tables:<region>:<account>:bucket/<name>`).
+        table_bucket_arn: String,
+    },
 }
 
 impl CatalogConfig {
@@ -202,6 +248,19 @@ impl CatalogConfig {
         }
         CatalogConfig::Direct {
             table_location: loc,
+        }
+    }
+
+    /// Create an AWS Glue Data Catalog config.
+    pub fn glue(region: Option<String>, catalog_id: Option<String>) -> Self {
+        CatalogConfig::Glue { region, catalog_id }
+    }
+
+    /// Create an AWS S3 Tables catalog config from a table-bucket ARN.
+    pub fn s3_tables(region: Option<String>, table_bucket_arn: impl Into<String>) -> Self {
+        CatalogConfig::S3Tables {
+            region,
+            table_bucket_arn: table_bucket_arn.into(),
         }
     }
 }
@@ -237,6 +296,17 @@ enum TaggedCatalogConfig {
     },
     Direct {
         table_location: String,
+    },
+    Glue {
+        #[serde(default)]
+        region: Option<String>,
+        #[serde(default)]
+        catalog_id: Option<String>,
+    },
+    S3Tables {
+        #[serde(default)]
+        region: Option<String>,
+        table_bucket_arn: String,
     },
 }
 
@@ -279,6 +349,16 @@ impl From<CatalogConfigHelper> for CatalogConfig {
             CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location }) => {
                 CatalogConfig::Direct { table_location }
             }
+            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Glue { region, catalog_id }) => {
+                CatalogConfig::Glue { region, catalog_id }
+            }
+            CatalogConfigHelper::Tagged(TaggedCatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            }) => CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            },
         }
     }
 }
@@ -300,6 +380,16 @@ impl From<CatalogConfig> for CatalogConfigHelper {
             CatalogConfig::Direct { table_location } => {
                 CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location })
             }
+            CatalogConfig::Glue { region, catalog_id } => {
+                CatalogConfigHelper::Tagged(TaggedCatalogConfig::Glue { region, catalog_id })
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => CatalogConfigHelper::Tagged(TaggedCatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            }),
         }
     }
 }
@@ -494,6 +584,129 @@ mod tests {
         let table_id = config.table_identifier().unwrap();
         assert_eq!(table_id.namespace, "ns");
         assert_eq!(table_id.table, "table");
+    }
+
+    #[test]
+    fn test_parse_tagged_glue_config() {
+        let json = r#"{
+            "catalog": { "type": "glue", "region": "us-east-1" },
+            "table": "enterprise_dw.dim_geography",
+            "io": { "vended_credentials": false }
+        }"#;
+        let config: IcebergGsConfig = serde_json::from_str(json).unwrap();
+        match &config.catalog {
+            CatalogConfig::Glue { region, catalog_id } => {
+                assert_eq!(region, &Some("us-east-1".to_string()));
+                assert_eq!(catalog_id, &None);
+            }
+            other => panic!("Expected Glue variant, got {other:?}"),
+        }
+        let table_id = config.table_identifier().unwrap();
+        assert_eq!(table_id.namespace, "enterprise_dw");
+        assert_eq!(table_id.table, "dim_geography");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_parse_tagged_s3tables_config() {
+        let json = r#"{
+            "catalog": {
+                "type": "s3tables",
+                "region": "us-east-1",
+                "table_bucket_arn": "arn:aws:s3tables:us-east-1:767398143329:bucket/demo"
+            },
+            "table": "enterprise_dw.dim_geography",
+            "io": { "vended_credentials": false }
+        }"#;
+        let config: IcebergGsConfig = serde_json::from_str(json).unwrap();
+        match &config.catalog {
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                assert_eq!(region, &Some("us-east-1".to_string()));
+                assert_eq!(
+                    table_bucket_arn,
+                    "arn:aws:s3tables:us-east-1:767398143329:bucket/demo"
+                );
+            }
+            other => panic!("Expected S3Tables variant, got {other:?}"),
+        }
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_glue_config_roundtrips_and_tags() {
+        // Serializes with the `glue` discriminator, and round-trips through JSON.
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::glue(Some("us-east-1".to_string()), None),
+            table: TableConfig::Identifier("enterprise_dw.dim_store".to_string()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+        };
+        let json = config.to_json().unwrap();
+        assert!(
+            json.contains("\"type\":\"glue\""),
+            "expected glue tag in {json}"
+        );
+        let back = IcebergGsConfig::from_json(&json).unwrap();
+        assert!(matches!(back.catalog, CatalogConfig::Glue { .. }));
+    }
+
+    #[test]
+    fn test_s3tables_config_roundtrips_and_tags() {
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::s3_tables(
+                None,
+                "arn:aws:s3tables:us-east-1:767398143329:bucket/demo",
+            ),
+            table: TableConfig::Identifier("enterprise_dw.dim_store".to_string()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+        };
+        let json = config.to_json().unwrap();
+        assert!(
+            json.contains("\"type\":\"s3tables\""),
+            "expected s3tables tag in {json}"
+        );
+        let back = IcebergGsConfig::from_json(&json).unwrap();
+        assert!(matches!(back.catalog, CatalogConfig::S3Tables { .. }));
+    }
+
+    #[test]
+    fn test_validate_glue_requires_table_identifier() {
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::glue(Some("us-east-1".to_string()), None),
+            table: TableConfig::Identifier(String::new()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_s3tables_rejects_non_arn() {
+        let config = IcebergGsConfig {
+            catalog: CatalogConfig::s3_tables(None, "not-an-arn"),
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ARN"));
     }
 
     // ── Validation ──

@@ -15,6 +15,8 @@ default = []
 aws = [
     "dep:aws-credential-types",
     "dep:aws-sdk-s3",
+    "dep:aws-sdk-glue",
+    "dep:aws-sdk-s3tables",
     "dep:aws-config",
     "dep:aws-smithy-http-client",
     "dep:hyper-rustls",
@@ -79,6 +81,8 @@ dashmap.workspace = true
 # Optional: AWS SDK (credential provider + S3 storage)
 aws-credential-types = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-glue = { workspace = true, optional = true }
+aws-sdk-s3tables = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 # HTTP/1.1-pinned transport for the S3 SDK when reading GCS-backed tables (avoids
 # the smithy-rs HTTP/2 range-read bug against the GCS S3-interop endpoint). The
@@ -101,6 +105,10 @@ required-features = ["aws"]
 
 [[example]]
 name = "read_local_iceberg"
+required-features = ["aws"]
+
+[[example]]
+name = "read_glue"
 required-features = ["aws"]
 
 [lints]

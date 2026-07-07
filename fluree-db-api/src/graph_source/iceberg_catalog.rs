@@ -146,6 +146,12 @@ fn rest_catalog_client(
                  Provide a REST connection (catalog_uri + auth)."
             )));
         }
+        CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+            return Err(crate::ApiError::config(format!(
+                "catalog browse is not supported for Glue/S3Tables mode yet ({op}). \
+                 Map a specific table with `fluree iceberg map --mode glue|s3tables --table ns.table`."
+            )));
+        }
     };
 
     let auth = rest

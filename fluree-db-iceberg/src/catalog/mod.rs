@@ -14,6 +14,11 @@ pub use table_identifier::{encode_namespace_for_rest, parse_table_identifier, Ta
 #[cfg(feature = "aws")]
 pub use direct::SendDirectCatalogClient;
 
+#[cfg(feature = "aws")]
+mod aws_sdk;
+#[cfg(feature = "aws")]
+pub use aws_sdk::{GlueSdkCatalogClient, S3TablesSdkCatalogClient};
+
 use crate::credential::VendedCredentials;
 use crate::error::Result;
 use async_trait::async_trait;

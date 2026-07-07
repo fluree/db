@@ -93,6 +93,8 @@ aws-config = "1.8.15"
 aws-sdk-s3 = "1.124.0"
 aws-sdk-dynamodb = "1.109.0"
 aws-sdk-sts = "1.101.0"
+aws-sdk-glue = "1.153.0"
+aws-sdk-s3tables = "1.59.0"
 aws-credential-types = "1.2"
 aws-smithy-types = "1.4.7"
 # HTTP/1.1-pinned transport for the S3 SDK. GCS's S3-interop endpoint negotiates

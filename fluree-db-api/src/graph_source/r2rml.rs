@@ -321,6 +321,12 @@ impl crate::Fluree {
                     "Connection test is not supported for Direct catalog mode".to_string(),
                 ));
             }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                // Glue / S3Tables validate at query time via the ambient AWS
+                // credential chain; a pre-flight check would require live AWS
+                // calls, so treat the connection as OK here.
+                return Ok(());
+            }
         };
 
         // Create auth provider
@@ -931,6 +937,86 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 info!(
                     metadata_location = %load_response.metadata_location,
                     "Resolved table metadata via version-hint.text"
+                );
+
+                (load_response, storage)
+            }
+            CatalogConfig::Glue { region, catalog_id } => {
+                info!(
+                    ?region,
+                    ?catalog_id,
+                    "Loading table via AWS Glue Data Catalog (SDK)"
+                );
+
+                // Ambient AWS credential chain reads S3 (Glue in IAM mode does not
+                // vend credentials); same reader as Direct mode.
+                let storage: Arc<S3IcebergStorage> = Arc::new(
+                    S3IcebergStorage::from_default_chain(
+                        region.as_deref().or(iceberg_config.io.s3_region.as_deref()),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?,
+                );
+
+                let catalog = fluree_db_iceberg::catalog::GlueSdkCatalogClient::new(
+                    region.as_deref(),
+                    catalog_id.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create Glue catalog client: {e}"))
+                })?;
+
+                let load_response = catalog.load_table(&table_id, false).await.map_err(|e| {
+                    QueryError::Internal(format!("Failed to load table from AWS Glue: {e}"))
+                })?;
+
+                info!(
+                    metadata_location = %load_response.metadata_location,
+                    "Resolved table metadata via AWS Glue Data Catalog"
+                );
+
+                (load_response, storage)
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                info!(?region, table_bucket_arn = %table_bucket_arn,
+                    "Loading table via AWS S3 Tables (SDK)");
+
+                let storage: Arc<S3IcebergStorage> = Arc::new(
+                    S3IcebergStorage::from_default_chain(
+                        region.as_deref().or(iceberg_config.io.s3_region.as_deref()),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?,
+                );
+
+                let catalog = fluree_db_iceberg::catalog::S3TablesSdkCatalogClient::new(
+                    region.as_deref(),
+                    table_bucket_arn.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create S3 Tables catalog client: {e}"))
+                })?;
+
+                let load_response = catalog.load_table(&table_id, false).await.map_err(|e| {
+                    QueryError::Internal(format!("Failed to load table from AWS S3 Tables: {e}"))
+                })?;
+
+                info!(
+                    metadata_location = %load_response.metadata_location,
+                    "Resolved table metadata via AWS S3 Tables"
                 );
 
                 (load_response, storage)
