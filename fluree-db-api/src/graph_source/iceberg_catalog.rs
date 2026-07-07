@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use crate::graph_source::config::{CatalogMode, IcebergConnectionConfig};
 use crate::Result;
 
-use fluree_db_iceberg::catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient};
+use fluree_db_iceberg::catalog::{
+    GlueSdkCatalogClient, RestCatalogClient, RestCatalogConfig, S3TablesSdkCatalogClient,
+    SendCatalogClient,
+};
 use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
 use fluree_db_iceberg::io::S3IcebergStorage;
 use fluree_db_iceberg::metadata::{
@@ -132,65 +135,101 @@ pub struct CatalogBrowse {
     pub tables: Vec<TableRef>,
 }
 
-/// Build a REST catalog client from a connection, or a clear typed error for
-/// Direct mode (which has no catalog to browse/list).
-fn rest_catalog_client(
+/// Build a catalog client from a connection, or a clear typed error for Direct
+/// mode (which has no catalog to browse/list).
+///
+/// Returns a boxed [`SendCatalogClient`] (REST, AWS Glue, or S3 Tables — all
+/// three implement the trait), a display label (the catalog URI for REST, the
+/// Glue catalog id / S3 Tables bucket ARN otherwise), and the warehouse (REST
+/// only). Async because the AWS SDK catalog clients build from the ambient
+/// credential chain (`GlueSdkCatalogClient::new` / `S3TablesSdkCatalogClient::new`
+/// are async), mirroring the scan path's catalog dispatch.
+async fn catalog_client(
     conn: &IcebergConnectionConfig,
     op: &str,
-) -> Result<(RestCatalogClient, String, Option<String>)> {
-    let rest = match &conn.catalog_mode {
-        CatalogMode::Rest(rest) => rest,
-        CatalogMode::Direct { .. } => {
-            return Err(crate::ApiError::config(format!(
-                "Direct catalog mode cannot be used for {op}: there is no REST catalog to query. \
-                 Provide a REST connection (catalog_uri + auth)."
-            )));
+) -> Result<(Box<dyn SendCatalogClient>, String, Option<String>)> {
+    match &conn.catalog_mode {
+        CatalogMode::Rest(rest) => {
+            let auth = rest.auth.create_provider_arc().map_err(|e| {
+                crate::ApiError::config(format!("Failed to create auth provider: {e}"))
+            })?;
+
+            let catalog_config = RestCatalogConfig {
+                uri: rest.catalog_uri.clone(),
+                warehouse: rest.warehouse.clone(),
+                ..Default::default()
+            };
+
+            let catalog = RestCatalogClient::new(catalog_config, auth).map_err(|e| {
+                crate::ApiError::config(format!("Failed to create catalog client: {e}"))
+            })?;
+
+            Ok((
+                Box::new(catalog),
+                rest.catalog_uri.clone(),
+                rest.warehouse.clone(),
+            ))
         }
-        CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
-            return Err(crate::ApiError::config(format!(
-                "catalog browse is not supported for Glue/S3Tables mode yet ({op}). \
-                 Map a specific table with `fluree iceberg map --mode glue|s3tables --table ns.table`."
-            )));
+        CatalogMode::Glue { region, catalog_id } => {
+            // Region precedence mirrors the scan path: the Glue mode's `region`,
+            // then `io.s3_region`, else the SDK default chain.
+            let catalog = GlueSdkCatalogClient::new(
+                region.as_deref().or(conn.io.s3_region.as_deref()),
+                catalog_id.clone(),
+            )
+            .await
+            .map_err(|e| {
+                crate::ApiError::config(format!("Failed to create Glue catalog client: {e}"))
+            })?;
+
+            Ok((
+                Box::new(catalog),
+                conn.catalog_uri_or_location().to_string(),
+                None,
+            ))
         }
-    };
+        CatalogMode::S3Tables {
+            region,
+            table_bucket_arn,
+        } => {
+            let catalog = S3TablesSdkCatalogClient::new(
+                region.as_deref().or(conn.io.s3_region.as_deref()),
+                table_bucket_arn.clone(),
+            )
+            .await
+            .map_err(|e| {
+                crate::ApiError::config(format!("Failed to create S3 Tables catalog client: {e}"))
+            })?;
 
-    let auth = rest
-        .auth
-        .create_provider_arc()
-        .map_err(|e| crate::ApiError::config(format!("Failed to create auth provider: {e}")))?;
-
-    let catalog_config = RestCatalogConfig {
-        uri: rest.catalog_uri.clone(),
-        warehouse: rest.warehouse.clone(),
-        ..Default::default()
-    };
-
-    let catalog = RestCatalogClient::new(catalog_config, auth)
-        .map_err(|e| crate::ApiError::config(format!("Failed to create catalog client: {e}")))?;
-
-    Ok((catalog, rest.catalog_uri.clone(), rest.warehouse.clone()))
+            Ok((Box::new(catalog), table_bucket_arn.clone(), None))
+        }
+        CatalogMode::Direct { .. } => Err(crate::ApiError::config(format!(
+            "Direct catalog mode cannot be used for {op}: there is no catalog to query. \
+             Provide a REST connection (catalog_uri + auth) or an AWS Glue / S3 Tables catalog."
+        ))),
+    }
 }
 
-/// Browse an Iceberg REST catalog: list namespaces and, at `depth = Tables`,
-/// the tables in each namespace.
+/// Browse an Iceberg catalog (REST, AWS Glue, or S3 Tables): list namespaces
+/// and, at `depth = Tables`, the tables in each namespace.
 ///
-/// **Metadata-only** and stateless — it needs no `Fluree` instance and touches
-/// no S3. Direct catalog mode returns a clear [`crate::ApiError::Config`] (there
-/// is nothing to browse).
+/// **Metadata-only** and stateless — it needs no `Fluree` instance and reads no
+/// S3 objects (Glue / S3 Tables list via their native SDK APIs). Direct catalog
+/// mode returns a clear [`crate::ApiError::Config`] (there is nothing to browse).
 pub async fn browse_iceberg_catalog(
     conn: IcebergConnectionConfig,
     depth: BrowseDepth,
 ) -> Result<CatalogBrowse> {
-    let (catalog, catalog_uri, warehouse) = rest_catalog_client(&conn, "catalog browse")?;
+    let (catalog, catalog_uri, warehouse) = catalog_client(&conn, "catalog browse").await?;
 
-    let namespaces = SendCatalogClient::list_namespaces(&catalog)
+    let namespaces = SendCatalogClient::list_namespaces(&*catalog)
         .await
         .map_err(|e| crate::ApiError::config(format!("Failed to list namespaces: {e}")))?;
 
     let mut tables = Vec::new();
     if depth == BrowseDepth::Tables {
         for ns in &namespaces {
-            let ns_tables = SendCatalogClient::list_tables(&catalog, ns)
+            let ns_tables = SendCatalogClient::list_tables(&*catalog, ns)
                 .await
                 .map_err(|e| {
                     crate::ApiError::config(format!("Failed to list tables in namespace {ns}: {e}"))
@@ -590,33 +629,35 @@ pub(crate) fn table_schema_from_metadata(
 /// Preview an Iceberg table's schema (Tier-A) and, at `tier = Stats`, its
 /// per-column statistics (Tier-B).
 ///
-/// **Metadata-only**: Tier-A reads the inline REST `loadTable` metadata (no S3);
-/// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files
-/// (never a Parquet/data file). Direct catalog mode and a catalog that omits the
-/// inline metadata both return a clear typed error.
+/// **Metadata-only**: Tier-A reads the table metadata JSON — inline from the
+/// REST `loadTable` response, or (for the AWS SDK catalogs, which return only a
+/// `metadata_location`) fetched + parsed from S3 — never a Parquet/data file.
+/// Tier-B additionally reads the snapshot's manifest-list + manifest Avro files.
+/// Direct catalog mode returns a clear typed error (there is no catalog to load).
 pub async fn preview_iceberg_table(
     conn: IcebergConnectionConfig,
     table: TableIdentifier,
     tier: StatsTier,
 ) -> Result<TablePreview> {
-    let (catalog, _uri, _wh) = rest_catalog_client(&conn, "table preview")?;
+    let (catalog, _uri, _wh) = catalog_client(&conn, "table preview").await?;
     let table_id = table.to_catalog();
 
-    let load = SendCatalogClient::load_table(&catalog, &table_id, conn.io.vended_credentials)
+    let mut load = SendCatalogClient::load_table(&*catalog, &table_id, conn.io.vended_credentials)
         .await
         .map_err(|e| {
             crate::ApiError::config(format!("Failed to load table {}: {e}", table.qualified()))
         })?;
 
-    let metadata = load.metadata.as_ref().ok_or_else(|| {
-        crate::ApiError::config(format!(
-            "Catalog did not return inline table metadata for {} — metadata preview requires a \
-             REST catalog whose loadTable response includes the `metadata` object.",
-            table.qualified()
-        ))
-    })?;
+    // REST `loadTable` carries the metadata inline; the AWS SDK catalogs
+    // (Glue / S3 Tables) return only a `metadata_location`, so fetch + parse the
+    // metadata JSON from S3 (the same read the scan path performs) when the
+    // inline object is absent.
+    let metadata = match load.metadata.take() {
+        Some(m) => m,
+        None => fetch_metadata_from_s3(&conn, &load.metadata_location).await?,
+    };
 
-    let mut schema = table_schema_from_metadata(&table, metadata)?;
+    let mut schema = table_schema_from_metadata(&table, &metadata)?;
 
     match tier {
         StatsTier::Schema => Ok(TablePreview {
@@ -708,6 +749,29 @@ pub async fn preview_iceberg_table(
             })
         }
     }
+}
+
+/// Fetch + parse the table metadata JSON from S3 via its `metadata_location`.
+///
+/// REST `loadTable` carries the metadata inline, but the AWS SDK catalogs
+/// (Glue / S3 Tables) return only a `metadata_location`, so the preview lane
+/// reads + parses it from S3 with the ambient AWS credential chain — the same
+/// fetch the scan path performs (`read` → [`TableMetadata::from_json`]). Those
+/// catalogs never vend credentials, so ambient (`credentials = None`) is the
+/// correct policy here.
+async fn fetch_metadata_from_s3(
+    conn: &IcebergConnectionConfig,
+    metadata_location: &str,
+) -> Result<TableMetadata> {
+    use fluree_db_iceberg::io::SendIcebergStorage;
+
+    let storage = build_preview_storage(conn, None).await?;
+    let bytes = storage
+        .read(metadata_location)
+        .await
+        .map_err(|e| crate::ApiError::config(format!("Failed to read table metadata: {e}")))?;
+    TableMetadata::from_json(&bytes)
+        .map_err(|e| crate::ApiError::config(format!("Failed to parse table metadata: {e}")))
 }
 
 /// Build S3 storage for reading manifests during a Tier-B preview, mirroring the

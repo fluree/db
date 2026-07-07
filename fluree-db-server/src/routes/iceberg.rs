@@ -314,13 +314,19 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
 /// (a subset of [`IcebergMapRequest`], minus `name`/`table`/`r2rml`).
 #[derive(Deserialize)]
 pub struct IcebergConnectionRequest {
-    /// Catalog mode: "rest" (default) or "direct"
+    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
     #[serde(default = "default_mode")]
     pub mode: String,
     /// REST catalog URI
     pub catalog_uri: Option<String>,
     /// S3 table location (direct mode)
     pub table_location: Option<String>,
+    /// AWS region (glue / s3tables mode)
+    pub region: Option<String>,
+    /// AWS Glue catalog id for cross-account access (glue mode)
+    pub catalog_id: Option<String>,
+    /// AWS S3 Tables table-bucket ARN (s3tables mode)
+    pub table_bucket_arn: Option<String>,
     /// Bearer token for catalog auth
     pub auth_bearer: Option<String>,
     /// OAuth2 token URL
@@ -367,9 +373,16 @@ fn build_iceberg_connection(
             })?;
             IcebergConnectionConfig::direct(location)
         }
+        "glue" => IcebergConnectionConfig::glue(req.region.clone(), req.catalog_id.clone()),
+        "s3tables" => {
+            let arn = req.table_bucket_arn.as_ref().ok_or_else(|| {
+                ServerError::bad_request("table_bucket_arn is required for s3tables mode")
+            })?;
+            IcebergConnectionConfig::s3_tables(req.region.clone(), arn)
+        }
         other => {
             return Err(ServerError::bad_request(format!(
-                "unknown catalog mode '{other}'. Use 'rest' or 'direct'."
+                "unknown catalog mode '{other}'. Use 'rest', 'direct', 'glue', or 's3tables'."
             )));
         }
     };
@@ -862,6 +875,40 @@ mod tests {
         assert!(req.depth.is_none());
         let conn = build_iceberg_connection(&req.connection).unwrap();
         assert!(conn.is_direct());
+    }
+
+    #[test]
+    fn browse_request_glue_mode_builds_glue_connection() {
+        // The connection builder must accept the glue mode + its region/catalog_id
+        // fields (browse/preview/generate/validate parity with iceberg/map).
+        let body = serde_json::json!({
+            "mode": "glue",
+            "region": "us-east-1",
+            "catalog_id": "123456789012"
+        });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_glue());
+    }
+
+    #[test]
+    fn browse_request_s3tables_mode_builds_s3tables_connection() {
+        let body = serde_json::json!({
+            "mode": "s3tables",
+            "region": "us-east-1",
+            "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+        });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_s3tables());
+    }
+
+    #[test]
+    fn build_iceberg_connection_s3tables_requires_arn() {
+        // s3tables mode without an ARN is a 400, mirroring build_iceberg_config.
+        let body = serde_json::json!({ "mode": "s3tables" });
+        let req: IcebergBrowseRequest = serde_json::from_value(body).unwrap();
+        assert!(build_iceberg_connection(&req.connection).is_err());
     }
 
     #[test]

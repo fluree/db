@@ -241,6 +241,10 @@ required-features = ["vector"]
 name = "it_select_star_deep_crawl_stack"
 path = "tests/it_select_star_deep_crawl_stack.rs"
 
+[[example]]
+name = "glue_onboarding"
+required-features = ["iceberg"]
+
 [[bench]]
 name = "vector_query"
 harness = false
