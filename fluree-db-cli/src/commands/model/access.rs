@@ -112,6 +112,14 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
         ModelAccessAction::Show { dataset, remote } => {
             run_show(dataset, remote.as_deref(), dirs, direct).await
         }
+        ModelAccessAction::Verify { dataset, remote } => {
+            run_verify(dataset, remote.as_deref(), dirs, direct).await
+        }
+        ModelAccessAction::Sync {
+            dataset,
+            dry_run,
+            remote,
+        } => run_sync(dataset, *dry_run, remote.as_deref(), dirs, direct).await,
     }
 }
 
@@ -214,6 +222,8 @@ async fn run_enable(
         &allowed,
         connected_steps.as_deref(),
         connected,
+        derivation,
+        allow_shared,
     );
 
     // 4. Report.
@@ -582,6 +592,12 @@ fn compile_path_where(steps: &[PathStep]) -> Vec<Value> {
 }
 
 /// Compile the profile into its JSON-LD artifacts.
+///
+/// `derivation` and `allow_shared` are recorded on the intent node so
+/// `sync` knows whether (and how) the property surface may be re-derived:
+/// explicit lists are authored and never touched; shape/observed lists
+/// re-derive with the same shared-property choice the author made.
+#[allow(clippy::too_many_arguments)]
 fn compile(
     class_iri: &str,
     entity: &str,
@@ -589,6 +605,8 @@ fn compile(
     allowed: &[String],
     connected_steps: Option<&[PathStep]>,
     connected_raw: Option<&str>,
+    derivation: &str,
+    allow_shared: bool,
 ) -> Value {
     let mut nodes: Vec<Value> = Vec::new();
 
@@ -609,6 +627,8 @@ fn compile(
         format!("{FM}property"): allowed.iter().map(|p| json!({"@id": p})).collect::<Vec<_>>(),
         format!("{FM}policyClass"): {"@id": class_iri},
         format!("{FM}compilerVersion"): COMPILER_VERSION,
+        format!("{FM}derivation"): derivation,
+        format!("{FM}allowShared"): allow_shared,
     });
     if let Some(path) = connected_raw {
         profile_node[format!("{FM}connected")] = json!(path);
@@ -689,6 +709,455 @@ async fn run_show(
     Ok(())
 }
 
+// ── verify / sync ───────────────────────────────────────────────────────
+
+/// A stored `fm:AccessProfile` intent node, decoded.
+struct StoredProfile {
+    class_iri: String,
+    profile: Profile,
+    entity: String,
+    /// Full allow-list as stored (rdf:type included).
+    allowed: Vec<String>,
+    connected: Option<String>,
+    /// How the property surface was derived at enable time. Absent on
+    /// nodes written by older compilers or other front ends — treated as
+    /// `explicit` (the safest reading: never rewrite an authored list).
+    derivation: Option<String>,
+    allow_shared: bool,
+}
+
+async fn fetch_profiles(mode: &LedgerMode) -> CliResult<Vec<StoredProfile>> {
+    let q = json!({
+        "@context": {"fm": FM},
+        "select": {"?profile": ["*"]},
+        "where": [{"@id": "?profile", "@type": "fm:AccessProfile"}]
+    });
+    let result = query(mode, &q).await?;
+    let rows = result.as_array().cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for row in &rows {
+        let Some(class_iri) = value_id(row.get("fm:policyClass")) else {
+            continue;
+        };
+        let Some(profile_str) = value_str(row.get("fm:profile")) else {
+            continue;
+        };
+        let Ok(profile) = Profile::parse(&profile_str) else {
+            continue;
+        };
+        let Some(entity) = value_id(row.get("fm:onType")) else {
+            continue;
+        };
+        out.push(StoredProfile {
+            class_iri,
+            profile,
+            entity,
+            allowed: value_ids(row.get("fm:property")),
+            connected: value_str(row.get("fm:connected")),
+            derivation: value_str(row.get("fm:derivation")),
+            allow_shared: value_bool(row.get("fm:allowShared")).unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// Read a subject's properties; `None` when the subject has no triples.
+async fn fetch_node(mode: &LedgerMode, id: &str) -> CliResult<Option<Value>> {
+    let q = json!({
+        "@context": {"f": F},
+        "select": {id: ["*"]},
+    });
+    let result = query(mode, &q).await?;
+    let node = match result {
+        Value::Array(mut a) => {
+            if a.is_empty() {
+                return Ok(None);
+            }
+            a.remove(0)
+        }
+        other => other,
+    };
+    let Some(obj) = node.as_object() else {
+        return Ok(None);
+    };
+    if obj.keys().all(|k| k == "@id") {
+        return Ok(None);
+    }
+    Ok(Some(node))
+}
+
+async fn run_verify(
+    dataset: &str,
+    remote: Option<&str>,
+    dirs: &FlureeDir,
+    direct: bool,
+) -> CliResult<()> {
+    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    let profiles = fetch_profiles(&mode).await?;
+    if profiles.is_empty() {
+        println!("No access profiles on '{dataset}' — nothing to verify.");
+        return Ok(());
+    }
+
+    let mut drifted = 0usize;
+    for sp in &profiles {
+        println!("• {} ({} {})", sp.class_iri, sp.profile.as_str(), sp.entity);
+        let steps = match &sp.connected {
+            Some(path) => Some(parse_property_path(path)?),
+            None => None,
+        };
+        let expected = compile(
+            &sp.class_iri,
+            &sp.entity,
+            sp.profile,
+            &sp.allowed,
+            steps.as_deref(),
+            sp.connected.as_deref(),
+            sp.derivation.as_deref().unwrap_or("explicit"),
+            sp.allow_shared,
+        );
+        let nodes = expected["@graph"].as_array().expect("compile emits @graph");
+
+        let mut profile_drifted = false;
+        for kind in ["view", "modify"] {
+            let id = format!("{}/{kind}", sp.class_iri);
+            let want = nodes
+                .iter()
+                .find(|n| n["@id"].as_str() == Some(id.as_str()));
+            let have = fetch_node(&mode, &id).await?;
+            match (want, have) {
+                (Some(w), Some(h)) => {
+                    let drift = diff_policy(w, &h);
+                    if drift.is_empty() {
+                        println!("    {kind}:   OK");
+                    } else {
+                        profile_drifted = true;
+                        for d in drift {
+                            println!("    {kind}:   DRIFT — {d}");
+                        }
+                    }
+                }
+                (Some(_), None) => {
+                    profile_drifted = true;
+                    println!("    {kind}:   MISSING — re-run `enable` (or `sync`) to recompile");
+                }
+                (None, Some(_)) => {
+                    profile_drifted = true;
+                    println!(
+                        "    {kind}:   UNEXPECTED — the {} profile compiles no {kind} policy, \
+                         but one exists in the ledger",
+                        sp.profile.as_str()
+                    );
+                }
+                (None, None) => {}
+            }
+        }
+        if profile_drifted {
+            drifted += 1;
+        }
+    }
+
+    println!(
+        "\n{} profile{} checked, {drifted} drifted",
+        profiles.len(),
+        if profiles.len() == 1 { "" } else { "s" }
+    );
+    if drifted > 0 {
+        Err(CliError::Config(format!(
+            "{drifted} profile(s) drifted from their declared intent — \
+             `fluree model access sync` recompiles derivable ones; re-run `enable` for the rest"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_sync(
+    dataset: &str,
+    dry_run: bool,
+    remote: Option<&str>,
+    dirs: &FlureeDir,
+    direct: bool,
+) -> CliResult<()> {
+    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    let profiles = fetch_profiles(&mode).await?;
+    if profiles.is_empty() {
+        println!("No access profiles on '{dataset}' — nothing to sync.");
+        return Ok(());
+    }
+
+    for sp in &profiles {
+        let derivation = sp.derivation.as_deref().unwrap_or("explicit");
+        println!("• {} ({derivation})", sp.class_iri);
+
+        let derived = match derivation {
+            "shacl-shape" => derive_from_shacl(&mode, &sp.entity).await?,
+            "observed-data" => derive_from_observed(&mode, &sp.entity).await?,
+            _ => {
+                println!("    explicit property list — skipped (re-run `enable` to change)");
+                continue;
+            }
+        };
+        if derived.is_empty() {
+            println!(
+                "    derivation source vanished (no shape / no instances) — left \
+                 unchanged; re-run `enable` to redeclare"
+            );
+            continue;
+        }
+
+        // Same uniqueness partition as `enable`, honoring the stored choice.
+        let mut new_allowed: Vec<String> = vec![RDF_TYPE.to_string()];
+        for prop in &derived {
+            if prop == RDF_TYPE {
+                continue;
+            }
+            let others = classes_sharing_property(&mode, prop, &sp.entity).await?;
+            if others.is_empty() || sp.allow_shared {
+                new_allowed.push(prop.clone());
+            } else {
+                println!(
+                    "    shared: {prop} — also used by {} — EXCLUDED",
+                    others.join(", ")
+                );
+            }
+        }
+
+        let mut want = new_allowed.clone();
+        want.sort();
+        let mut have = sp.allowed.clone();
+        have.sort();
+        if want == have {
+            println!("    unchanged");
+            continue;
+        }
+        let added: Vec<&String> = want.iter().filter(|p| !have.contains(p)).collect();
+        let removed: Vec<&String> = have.iter().filter(|p| !want.contains(p)).collect();
+        if !added.is_empty() {
+            println!(
+                "    + {}",
+                added
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !removed.is_empty() {
+            println!(
+                "    - {}",
+                removed
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let steps = match &sp.connected {
+            Some(path) => Some(parse_property_path(path)?),
+            None => None,
+        };
+        let graph = compile(
+            &sp.class_iri,
+            &sp.entity,
+            sp.profile,
+            &new_allowed,
+            steps.as_deref(),
+            sp.connected.as_deref(),
+            derivation,
+            sp.allow_shared,
+        );
+        if dry_run {
+            println!("    (dry run — not transacted)");
+            continue;
+        }
+        upsert(&mode, &graph).await?;
+        println!("    recompiled");
+    }
+    Ok(())
+}
+
+/// Semantic comparison of a compiled policy node against the node actually
+/// in the ledger. Tolerates compacted keys/values in query results
+/// (`f:action` vs the full IRI) — drift means a REAL difference.
+fn diff_policy(expected: &Value, actual: &Value) -> Vec<String> {
+    let mut drift = Vec::new();
+
+    let want_types: Vec<String> = value_ids(expected.get("@type"));
+    let have_types: Vec<String> = value_ids(actual.get("@type"))
+        .iter()
+        .map(|t| expand(t))
+        .collect();
+    for t in &want_types {
+        if !have_types.contains(t) {
+            drift.push(format!("missing @type {t}"));
+        }
+    }
+
+    for key in [format!("{F}action"), format!("{F}onClass")] {
+        if let Some(want) = expected.get(&key) {
+            let want_id = value_id(Some(want)).map(|s| expand(&s));
+            let have_id = get_prop(actual, &key)
+                .and_then(|v| value_id(Some(v)))
+                .map(|s| expand(&s));
+            if want_id != have_id {
+                drift.push(format!(
+                    "{key}: expected {}, found {}",
+                    want_id.as_deref().unwrap_or("(none)"),
+                    have_id.as_deref().unwrap_or("(none)")
+                ));
+            }
+        }
+    }
+
+    let on_property = format!("{F}onProperty");
+    if let Some(want) = expected.get(&on_property) {
+        let mut want_props: Vec<String> = value_ids(Some(want)).iter().map(|s| expand(s)).collect();
+        let mut have_props: Vec<String> = get_prop(actual, &on_property)
+            .map(|v| value_ids(Some(v)))
+            .unwrap_or_default()
+            .iter()
+            .map(|s| expand(s))
+            .collect();
+        want_props.sort();
+        have_props.sort();
+        if want_props != have_props {
+            let extra: Vec<&String> = have_props
+                .iter()
+                .filter(|p| !want_props.contains(p))
+                .collect();
+            let missing: Vec<&String> = want_props
+                .iter()
+                .filter(|p| !have_props.contains(p))
+                .collect();
+            let mut parts = Vec::new();
+            if !extra.is_empty() {
+                parts.push(format!(
+                    "extra in ledger: {}",
+                    extra
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !missing.is_empty() {
+                parts.push(format!(
+                    "missing: {}",
+                    missing
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            drift.push(format!("allow-list differs ({})", parts.join("; ")));
+        }
+    }
+
+    let query_key = format!("{F}query");
+    let allow_key = format!("{F}allow");
+    if let Some(want_q) = expected.get(&query_key) {
+        let want_parsed: Option<Value> =
+            value_str(Some(want_q)).and_then(|s| serde_json::from_str(&s).ok());
+        let have_parsed: Option<Value> = get_prop(actual, &query_key)
+            .and_then(|v| value_str(Some(v)))
+            .and_then(|s| serde_json::from_str(&s).ok());
+        if want_parsed != have_parsed {
+            drift.push("relationship gate (f:query) differs".into());
+        }
+    } else if expected.get(&allow_key).is_some()
+        && get_prop(actual, &allow_key).and_then(|v| value_bool(Some(v))) != Some(true)
+    {
+        drift.push("f:allow is not true".into());
+    }
+
+    drift
+}
+
+// ── JSON-LD value helpers (query results come back compacted) ───────────
+
+/// Expand a compacted IRI back to its full form for comparisons.
+fn expand(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("f:") {
+        format!("{F}{rest}")
+    } else if let Some(rest) = s.strip_prefix("fm:") {
+        format!("{FM}{rest}")
+    } else {
+        s.to_string()
+    }
+}
+
+/// Look up a property on a result node by full IRI, tolerating the
+/// compacted key form the query's @context produces.
+fn get_prop<'a>(node: &'a Value, full: &str) -> Option<&'a Value> {
+    if let Some(v) = node.get(full) {
+        return Some(v);
+    }
+    let local = full.rsplit(['#', '/']).next().unwrap_or(full);
+    for prefix in ["f:", "fm:"] {
+        if let Some(v) = node.get(format!("{prefix}{local}")) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn value_id(v: Option<&Value>) -> Option<String> {
+    let ids = value_ids(v);
+    ids.into_iter().next()
+}
+
+fn value_ids(v: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(v) = v else { return out };
+    let items: Vec<&Value> = match v {
+        Value::Array(a) => a.iter().collect(),
+        other => vec![other],
+    };
+    for item in items {
+        match item {
+            Value::String(s) => out.push(s.clone()),
+            Value::Object(o) => {
+                if let Some(id) = o.get("@id").and_then(|x| x.as_str()) {
+                    out.push(id.to_string());
+                } else if let Some(val) = o.get("@value").and_then(|x| x.as_str()) {
+                    out.push(val.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn value_str(v: Option<&Value>) -> Option<String> {
+    let v = v?;
+    let item = match v {
+        Value::Array(a) => a.first()?,
+        other => other,
+    };
+    match item {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => o.get("@value").and_then(|x| x.as_str()).map(String::from),
+        _ => None,
+    }
+}
+
+fn value_bool(v: Option<&Value>) -> Option<bool> {
+    let v = v?;
+    let item = match v {
+        Value::Array(a) => a.first()?,
+        other => other,
+    };
+    match item {
+        Value::Bool(b) => Some(*b),
+        Value::Object(o) => o.get("@value").and_then(serde_json::Value::as_bool),
+        _ => None,
+    }
+}
+
 fn render_value(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -720,6 +1189,8 @@ mod tests {
             &allowed,
             None,
             None,
+            "explicit",
+            false,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 4, "class + profile + view + modify");
@@ -751,6 +1222,8 @@ mod tests {
             &[RDF_TYPE.to_string()],
             None,
             None,
+            "explicit",
+            false,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 3, "class + profile + view (no modify)");
@@ -768,6 +1241,8 @@ mod tests {
             &[RDF_TYPE.to_string()],
             None,
             None,
+            "explicit",
+            false,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 3, "class + profile + modify (no view)");
@@ -843,6 +1318,8 @@ mod connected_tests {
             &[RDF_TYPE.to_string()],
             Some(&steps),
             Some("^<https://example.org/owner>"),
+            "explicit",
+            false,
         );
         let nodes = g["@graph"].as_array().unwrap();
         let view = nodes
@@ -862,5 +1339,123 @@ mod connected_tests {
             profile["https://ns.flur.ee/model#connected"],
             "^<https://example.org/owner>"
         );
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    fn compiled_write_nodes() -> Vec<Value> {
+        let allowed = vec![RDF_TYPE.to_string(), "https://example.org/name".to_string()];
+        let g = compile(
+            "https://example.org/Lead/access/write",
+            "https://example.org/Lead",
+            Profile::Write,
+            &allowed,
+            None,
+            None,
+            "shacl-shape",
+            false,
+        );
+        g["@graph"].as_array().unwrap().clone()
+    }
+
+    fn node(nodes: &[Value], suffix: &str) -> Value {
+        nodes
+            .iter()
+            .find(|n| n["@id"].as_str().unwrap().ends_with(suffix))
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn identical_nodes_have_no_drift() {
+        let nodes = compiled_write_nodes();
+        let modify = node(&nodes, "/modify");
+        assert!(diff_policy(&modify, &modify).is_empty());
+    }
+
+    #[test]
+    fn compacted_actual_matches_full_expected() {
+        let nodes = compiled_write_nodes();
+        let view = node(&nodes, "/view");
+        // The same node as a query result would render it: compact keys/values.
+        let actual = serde_json::json!({
+            "@id": "https://example.org/Lead/access/write/view",
+            "@type": ["f:AccessPolicy", "https://example.org/Lead/access/write"],
+            "f:action": {"@id": "f:view"},
+            "f:onClass": {"@id": "https://example.org/Lead"},
+            "f:allow": true,
+        });
+        assert!(diff_policy(&view, &actual).is_empty());
+    }
+
+    #[test]
+    fn hand_widened_allow_list_is_drift() {
+        let nodes = compiled_write_nodes();
+        let modify = node(&nodes, "/modify");
+        let mut actual = modify.clone();
+        actual[format!("{F}onProperty")] = serde_json::json!([
+            {"@id": RDF_TYPE},
+            {"@id": "https://example.org/name"},
+            {"@id": "https://example.org/salary"}
+        ]);
+        let drift = diff_policy(&modify, &actual);
+        assert_eq!(drift.len(), 1);
+        assert!(drift[0].contains("salary"), "{drift:?}");
+        assert!(drift[0].contains("extra in ledger"), "{drift:?}");
+    }
+
+    #[test]
+    fn flipped_allow_is_drift() {
+        let nodes = compiled_write_nodes();
+        let view = node(&nodes, "/view");
+        let mut actual = view.clone();
+        actual[format!("{F}allow")] = serde_json::json!(false);
+        let drift = diff_policy(&view, &actual);
+        assert!(drift.iter().any(|d| d.contains("f:allow")), "{drift:?}");
+    }
+
+    #[test]
+    fn retargeted_class_is_drift() {
+        let nodes = compiled_write_nodes();
+        let view = node(&nodes, "/view");
+        let mut actual = view.clone();
+        actual[format!("{F}onClass")] = serde_json::json!({"@id": "https://example.org/Invoice"});
+        let drift = diff_policy(&view, &actual);
+        assert!(drift.iter().any(|d| d.contains("onClass")), "{drift:?}");
+    }
+
+    #[test]
+    fn profile_node_records_derivation_and_shared_choice() {
+        let nodes = compiled_write_nodes();
+        let profile = node(&nodes, "/profile");
+        assert_eq!(profile[format!("{FM}derivation")], "shacl-shape");
+        assert_eq!(profile[format!("{FM}allowShared")], false);
+    }
+
+    #[test]
+    fn value_helpers_tolerate_all_shapes() {
+        assert_eq!(
+            value_id(Some(&serde_json::json!({"@id": "https://x/A"}))),
+            Some("https://x/A".to_string())
+        );
+        assert_eq!(
+            value_ids(Some(
+                &serde_json::json!([{"@id": "https://x/A"}, "https://x/B"])
+            )),
+            vec!["https://x/A", "https://x/B"]
+        );
+        assert_eq!(
+            value_str(Some(&serde_json::json!(["write"]))),
+            Some("write".to_string())
+        );
+        assert_eq!(
+            value_bool(Some(&serde_json::json!({"@value": true}))),
+            Some(true)
+        );
+        assert_eq!(expand("f:allow"), format!("{F}allow"));
+        assert_eq!(expand("https://x/A"), "https://x/A");
     }
 }

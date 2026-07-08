@@ -290,7 +290,11 @@ async fn run_show(
             if p.get("sh:nodeKind").is_some() {
                 notes.push("iri".into());
             }
-            if p.get("sh:minCount").and_then(serde_json::Value::as_i64).unwrap_or(0) >= 1 {
+            if p.get("sh:minCount")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+                >= 1
+            {
                 notes.push("required".into());
             }
             println!(

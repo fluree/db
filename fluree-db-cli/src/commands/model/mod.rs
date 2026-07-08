@@ -12,6 +12,7 @@
 //! stacks.
 
 pub mod access;
+pub mod class;
 pub mod entity;
 
 use crate::cli::ModelAction;
@@ -24,6 +25,7 @@ pub async fn run(action: &ModelAction, dirs: &FlureeDir, direct: bool) -> CliRes
     match action {
         ModelAction::Access { action } => access::run(action, dirs, direct).await,
         ModelAction::Entity { action } => entity::run(action, dirs, direct).await,
+        ModelAction::Class { action } => class::run(action, dirs, direct).await,
     }
 }
 

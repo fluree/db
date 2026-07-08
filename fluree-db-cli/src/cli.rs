@@ -1503,6 +1503,53 @@ pub enum ModelAction {
         #[command(subcommand)]
         action: ModelEntityAction,
     },
+
+    /// Class hierarchy — RDFS subclass relations (the reasoning facet's
+    /// vocabulary; entailment follows rdfs:subClassOf in query and policy)
+    Class {
+        #[command(subcommand)]
+        action: ModelClassAction,
+    },
+}
+
+/// Class-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelClassAction {
+    /// Define (or update) a class and its place in the hierarchy
+    Define {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        class: String,
+
+        /// Parent class IRI (repeatable) — becomes rdfs:subClassOf
+        #[arg(long = "subclass-of")]
+        subclass_of: Vec<String>,
+
+        /// Human label for the class
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show the class hierarchy on a dataset (policy classes excluded)
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 /// Entity-facet subcommands of `fluree model`.
@@ -1615,6 +1662,38 @@ pub enum ModelAccessAction {
     Show {
         /// Target dataset (ledger alias)
         dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Verify compiled policies still match their declared profiles
+    ///
+    /// Recompiles every stored profile from its intent node and compares
+    /// against the policies actually in the ledger — hand-edited or missing
+    /// policies are reported as drift.
+    Verify {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Re-derive profiles whose property surface came from a source that
+    /// can change (SHACL shape, observed data) and recompile on drift
+    ///
+    /// Explicit profiles (authored property lists) are left untouched —
+    /// re-run `enable` to change them.
+    Sync {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Print planned changes without transacting
+        #[arg(long)]
+        dry_run: bool,
 
         /// Remote to run against
         #[arg(long)]
