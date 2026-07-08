@@ -1496,6 +1496,58 @@ pub enum ModelAction {
         #[command(subcommand)]
         action: ModelAccessAction,
     },
+
+    /// Entity definitions — author SHACL shapes (the single source of truth
+    /// that access profiles, validation, and codegen derive from)
+    Entity {
+        #[command(subcommand)]
+        action: ModelEntityAction,
+    },
+}
+
+/// Entity-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelEntityAction {
+    /// Define (or update) an entity: compiles to a SHACL node shape
+    ///
+    /// NOTE: Fluree enforces SHACL at transaction time once any shapes exist
+    /// in a ledger (reject mode by default) — defining an entity activates
+    /// validation for its class.
+    Define {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Entity class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        entity: String,
+
+        /// Property spec: "<iri> [string|integer|decimal|boolean|date|datetime|iri] [required] [in[v1,v2,...]]"
+        /// (repeatable; type omitted = untyped)
+        #[arg(long = "property", required = true)]
+        properties: Vec<String>,
+
+        /// Human label for the class
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show entity definitions (SHACL node shapes) on a dataset
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
 }
 
 /// Access-facet subcommands of `fluree model`.
