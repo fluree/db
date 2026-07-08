@@ -554,3 +554,104 @@ async fn required_policies_are_and_gated() {
         "required AND gate must be order-independent, got {rows_b:?}"
     );
 }
+
+/// Tests that a `@path` context term (property path) works inside `f:query`,
+/// exercised through the production shape: policies STORED in the ledger
+/// under a policy class, request carrying `identity` (bind-only) +
+/// `policy-class` (selects the policy set).
+///
+/// This is the storage form governance tooling uses for relationship gates
+/// ("I can see entities I'm connected to via path P"): the author's path
+/// expression is kept verbatim as an `@path` term in the policy query's own
+/// `@context`, instead of being pre-expanded client-side into anchored
+/// where-patterns. Enforcement must follow the path — here
+/// `ex:memberOf/^ex:team`: the identity is a member of a team, and the
+/// entity belongs (via `ex:team`) to that same team.
+#[tokio::test]
+async fn policy_fquery_with_path_context_term() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "policy/fquery-path:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let u1 = "http://example.org/identity/u1";
+    let u2 = "http://example.org/identity/u2";
+
+    let gate = serde_json::to_string(&json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "connected": { "@path": "ex:memberOf/^ex:team" }
+        },
+        "where": [
+            { "@id": "?$identity", "connected": { "@id": "?$this" } }
+        ]
+    }))
+    .unwrap();
+
+    let txn = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            { "@id": "ex:teamA", "@type": "ex:Team", "ex:name": "Alpha" },
+            { "@id": "ex:teamB", "@type": "ex:Team", "ex:name": "Beta" },
+            { "@id": u1, "ex:memberOf": { "@id": "ex:teamA" } },
+            { "@id": u2, "ex:memberOf": { "@id": "ex:teamB" } },
+            {
+                "@id": "ex:item-alpha",
+                "@type": "ex:Item",
+                "ex:name": "Alpha Item",
+                "ex:team": { "@id": "ex:teamA" }
+            },
+            {
+                "@id": "ex:item-beta",
+                "@type": "ex:Item",
+                "ex:name": "Beta Item",
+                "ex:team": { "@id": "ex:teamB" }
+            },
+            // The gate as governance tooling stores it: a classed view
+            // policy whose f:query holds ONE triple over an @path term —
+            // the author's path string survives verbatim in the artifact.
+            {
+                "@id": "ex:connected-view",
+                "@type": ["f:AccessPolicy", "ex:ConnectedAccess"],
+                "f:action": { "@id": "f:view" },
+                "f:query": gate
+            }
+        ]
+    });
+    let _ = fluree.insert(ledger0, &txn).await.expect("insert");
+
+    let items_visible_to = |identity: &'static str| {
+        let query = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "from": ledger_id,
+            "opts": {
+                "identity": identity,
+                "policy-class": ["http://example.org/ns/ConnectedAccess"],
+                "default-allow": false
+            },
+            "select": "?name",
+            "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+        });
+        let fluree = &fluree;
+        async move {
+            let result = fluree.query_connection(&query).await.expect("query");
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+            normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
+        }
+    };
+
+    assert_eq!(
+        items_visible_to(u1).await,
+        normalize_rows(&json!(["Alpha Item"])),
+        "u1 (member of teamA) must see only teamA's item through the path gate"
+    );
+    assert_eq!(
+        items_visible_to(u2).await,
+        normalize_rows(&json!(["Beta Item"])),
+        "u2 (member of teamB) must see only teamB's item through the path gate"
+    );
+}
