@@ -7,21 +7,21 @@
 //! * a **policy class** (`rdfs:Class`) — the assignment unit grants and
 //!   tokens carry;
 //! * a **view policy** (`f:onClass` — exact for reads);
-//! * a **modify policy** as a **property whitelist** (`f:onProperty` +
+//! * a **modify policy** as a **property allow-list** (`f:onProperty` +
 //!   `f:allow`) — class-targeted modify cannot cover new-subject inserts and
-//!   `f:query` evaluates against pre-state, so the whitelist is the correct
+//!   `f:query` evaluates against pre-state, so the allow-list is the correct
 //!   (and cheapest) write shape today;
 //! * a declarative **profile node** recording the intent (type, properties,
 //!   compiler version) so `enable` is idempotent and future `sync`/`verify`
 //!   re-derive instead of reverse-engineering.
 //!
-//! Exactness honesty: a property whitelist is only class-exact when the
+//! Exactness honesty: a property allow-list is only class-exact when the
 //! properties are unique to the class. The compiler partitions derived
 //! properties by observed usage, discloses shared-property blast radius, and
 //! requires `--allow-shared` to include them. `rdf:type` is always included
 //! (required for creation) and always flagged: until the engine supports
-//! object-value constraints on type flakes, a whitelist holder can assert
-//! other types using only whitelisted properties.
+//! object-value constraints on type flakes, a allow_list holder can assert
+//! other types using only allowed properties.
 
 use serde_json::{json, Value};
 
@@ -229,10 +229,10 @@ async fn run_enable(
             shared.push((prop.clone(), others));
         }
     }
-    let mut whitelist: Vec<String> = vec![RDF_TYPE.to_string()];
-    whitelist.extend(included.iter().cloned());
+    let mut allowed: Vec<String> = vec![RDF_TYPE.to_string()];
+    allowed.extend(included.iter().cloned());
     if allow_shared {
-        whitelist.extend(shared.iter().map(|(p, _)| p.clone()));
+        allowed.extend(shared.iter().map(|(p, _)| p.clone()));
     }
 
     // 3. Compile.
@@ -243,11 +243,11 @@ async fn run_enable(
             profile.as_str()
         )
     });
-    let graph = compile(&class_iri, entity, profile, &whitelist);
+    let graph = compile(&class_iri, entity, profile, &allowed);
 
     // 4. Report.
     let exactness = if shared.is_empty() || !allow_shared {
-        "class-exact (all whitelisted properties are unique to this class)"
+        "class-exact (all allowed properties are unique to this class)"
     } else {
         "property-approximate (shared properties included — see below)"
     };
@@ -256,14 +256,11 @@ async fn run_enable(
     println!("Derivation: {derivation}");
     println!("Exactness:  {exactness}");
     if profile.wants_modify() {
-        println!(
-            "Whitelist:  {} properties (+ rdf:type)",
-            whitelist.len() - 1
-        );
+        println!("Allowed:    {} properties (+ rdf:type)", allowed.len() - 1);
         println!(
             "  note: rdf:type is required for creation; until the engine constrains type\n\
-             \x20 object values, whitelist holders can assert other types using only\n\
-             \x20 whitelisted properties."
+             \x20 object values, allow-list holders can assert other types using only\n\
+             \x20 allowed properties."
         );
     }
     for (prop, others) in &shared {
@@ -519,7 +516,7 @@ fn iri_rows(result: &Value) -> Vec<String> {
 }
 
 /// Compile the profile into its JSON-LD artifacts.
-fn compile(class_iri: &str, entity: &str, profile: Profile, whitelist: &[String]) -> Value {
+fn compile(class_iri: &str, entity: &str, profile: Profile, allowed: &[String]) -> Value {
     let mut nodes: Vec<Value> = Vec::new();
 
     // The policy class — the assignment unit grants and tokens carry.
@@ -536,7 +533,7 @@ fn compile(class_iri: &str, entity: &str, profile: Profile, whitelist: &[String]
         "@type": format!("{FM}AccessProfile"),
         format!("{FM}profile"): profile.as_str(),
         format!("{FM}onType"): {"@id": entity},
-        format!("{FM}property"): whitelist.iter().map(|p| json!({"@id": p})).collect::<Vec<_>>(),
+        format!("{FM}property"): allowed.iter().map(|p| json!({"@id": p})).collect::<Vec<_>>(),
         format!("{FM}policyClass"): {"@id": class_iri},
         format!("{FM}compilerVersion"): COMPILER_VERSION,
     }));
@@ -556,7 +553,7 @@ fn compile(class_iri: &str, entity: &str, profile: Profile, whitelist: &[String]
             "@type": [format!("{F}AccessPolicy"), class_iri],
             format!("{F}action"): {"@id": format!("{F}modify")},
             format!("{F}allow"): true,
-            format!("{F}onProperty"): whitelist.iter().map(|p| json!({"@id": p})).collect::<Vec<_>>(),
+            format!("{F}onProperty"): allowed.iter().map(|p| json!({"@id": p})).collect::<Vec<_>>(),
         }));
     }
 
@@ -623,13 +620,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compile_write_profile_emits_class_profile_view_and_whitelist() {
-        let whitelist = vec![RDF_TYPE.to_string(), "https://example.org/name".to_string()];
+    fn compile_write_profile_emits_class_profile_view_and_allow_list() {
+        let allowed = vec![RDF_TYPE.to_string(), "https://example.org/name".to_string()];
         let graph = compile(
             "https://example.org/Lead/access/write",
             "https://example.org/Lead",
             Profile::Write,
-            &whitelist,
+            &allowed,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 4, "class + profile + view + modify");
