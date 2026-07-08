@@ -89,6 +89,7 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
             allow_shared,
             class_iri,
             space,
+            connected,
             dry_run,
             remote,
         } => {
@@ -100,6 +101,7 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
                 *allow_shared,
                 class_iri.as_deref(),
                 space.as_deref(),
+                connected.as_deref(),
                 *dry_run,
                 remote.as_deref(),
                 dirs,
@@ -124,6 +126,7 @@ async fn run_enable(
     allow_shared: bool,
     class_iri_override: Option<&str>,
     space: Option<&str>,
+    connected: Option<&str>,
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
@@ -139,6 +142,21 @@ async fn run_enable(
             "--space attaches the policy class to a hosted stack's grant; pass --remote <r>".into(),
         ));
     }
+    let connected_steps = match connected {
+        Some(path) => {
+            if profile != Profile::Read {
+                return Err(CliError::Usage(
+                    "--connected is supported with --profile read only: relationship gates \
+                     evaluate against pre-transaction state, so gating writes would deny \
+                     every create (the connection triples are not visible yet). Engine \
+                     support for staged-state gates lifts this later."
+                        .into(),
+                ));
+            }
+            Some(parse_property_path(path)?)
+        }
+        None => None,
+    };
 
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
 
@@ -189,7 +207,14 @@ async fn run_enable(
             profile.as_str()
         )
     });
-    let graph = compile(&class_iri, entity, profile, &allowed);
+    let graph = compile(
+        &class_iri,
+        entity,
+        profile,
+        &allowed,
+        connected_steps.as_deref(),
+        connected,
+    );
 
     // 4. Report.
     let exactness = if shared.is_empty() || !allow_shared {
@@ -201,6 +226,9 @@ async fn run_enable(
     println!("Class:      {class_iri}");
     println!("Derivation: {derivation}");
     println!("Exactness:  {exactness}");
+    if let Some(path) = connected {
+        println!("Connected:  {path} (view gated by relationship to the requesting identity)");
+    }
     if profile.wants_modify() {
         println!("Allowed:    {} properties (+ rdf:type)", allowed.len() - 1);
         println!(
@@ -461,8 +489,107 @@ fn iri_rows(result: &Value) -> Vec<String> {
         .collect()
 }
 
+/// One step of a `--connected` property path.
+#[derive(Debug, PartialEq)]
+struct PathStep {
+    iri: String,
+    inverse: bool,
+}
+
+/// Parse a SPARQL property-path subset: sequence (`/`) of optionally
+/// inverse (`^`) angle-bracketed absolute IRIs.
+///
+/// `"<https://x/memberOf>/^<https://x/team>"` →
+/// identity —memberOf→ ?v0 ←team— subject.
+fn parse_property_path(path: &str) -> CliResult<Vec<PathStep>> {
+    // Split on '/' outside angle brackets (IRIs contain slashes).
+    let mut raw_steps: Vec<String> = vec![String::new()];
+    let mut in_iri = false;
+    for c in path.chars() {
+        match c {
+            '<' => {
+                in_iri = true;
+                raw_steps.last_mut().unwrap().push(c);
+            }
+            '>' => {
+                in_iri = false;
+                raw_steps.last_mut().unwrap().push(c);
+            }
+            '/' if !in_iri => raw_steps.push(String::new()),
+            _ => raw_steps.last_mut().unwrap().push(c),
+        }
+    }
+
+    raw_steps
+        .iter()
+        .map(|raw| {
+            let raw = raw.trim();
+            let (inverse, rest) = match raw.strip_prefix('^') {
+                Some(r) => (true, r.trim()),
+                None => (false, raw),
+            };
+            let iri = rest
+                .strip_prefix('<')
+                .and_then(|r| r.strip_suffix('>'))
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "--connected step '{raw}' must be an angle-bracketed IRI, optionally \
+                         inverse: ^<iri>. Supported subset: sequence (/) and inverse (^) — \
+                         alternatives (|) and transitive (+/*) are not supported yet."
+                    ))
+                })?;
+            if !(iri.starts_with("http://")
+                || iri.starts_with("https://")
+                || iri.starts_with("urn:"))
+            {
+                return Err(CliError::Usage(format!(
+                    "--connected step IRI must be absolute (got '{iri}')"
+                )));
+            }
+            Ok(PathStep {
+                iri: iri.to_string(),
+                inverse,
+            })
+        })
+        .collect()
+}
+
+/// Expand path steps into `f:query` where-patterns anchored
+/// `?$identity` —path→ `?$this`.
+fn compile_path_where(steps: &[PathStep]) -> Vec<Value> {
+    let n = steps.len();
+    let node = |i: usize| -> String {
+        if i == 0 {
+            "?$identity".to_string()
+        } else if i == n {
+            "?$this".to_string()
+        } else {
+            format!("?v{}", i - 1)
+        }
+    };
+    steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (from, to) = (node(i), node(i + 1));
+            if s.inverse {
+                json!({"@id": to, s.iri.clone(): {"@id": from}})
+            } else {
+                json!({"@id": from, s.iri.clone(): {"@id": to}})
+            }
+        })
+        .collect()
+}
+
 /// Compile the profile into its JSON-LD artifacts.
-fn compile(class_iri: &str, entity: &str, profile: Profile, allowed: &[String]) -> Value {
+fn compile(
+    class_iri: &str,
+    entity: &str,
+    profile: Profile,
+    allowed: &[String],
+    connected_steps: Option<&[PathStep]>,
+    connected_raw: Option<&str>,
+) -> Value {
     let mut nodes: Vec<Value> = Vec::new();
 
     // The policy class — the assignment unit grants and tokens carry.
@@ -474,7 +601,7 @@ fn compile(class_iri: &str, entity: &str, profile: Profile, allowed: &[String]) 
 
     // The declarative profile node — intent, not artifact. `sync`/`verify`
     // re-derive from this; the compiler version makes upgrades a recompile.
-    nodes.push(json!({
+    let mut profile_node = json!({
         "@id": format!("{class_iri}/profile"),
         "@type": format!("{FM}AccessProfile"),
         format!("{FM}profile"): profile.as_str(),
@@ -482,16 +609,34 @@ fn compile(class_iri: &str, entity: &str, profile: Profile, allowed: &[String]) 
         format!("{FM}property"): allowed.iter().map(|p| json!({"@id": p})).collect::<Vec<_>>(),
         format!("{FM}policyClass"): {"@id": class_iri},
         format!("{FM}compilerVersion"): COMPILER_VERSION,
-    }));
+    });
+    if let Some(path) = connected_raw {
+        profile_node[format!("{FM}connected")] = json!(path);
+    }
+    nodes.push(profile_node);
 
     if profile.wants_view() {
-        nodes.push(json!({
+        let mut view = json!({
             "@id": format!("{class_iri}/view"),
             "@type": [format!("{F}AccessPolicy"), class_iri],
             format!("{F}action"): {"@id": format!("{F}view")},
-            format!("{F}allow"): true,
             format!("{F}onClass"): {"@id": entity},
-        }));
+        });
+        match connected_steps {
+            Some(steps) => {
+                // Relationship gate: the flake is visible when the query
+                // returns rows — `f:query` REPLACES `f:allow` (they are
+                // alternative decision modes in the policy model).
+                let where_patterns = compile_path_where(steps);
+                view[format!("{F}query")] =
+                    json!(serde_json::to_string(&json!({"where": where_patterns}))
+                        .expect("static JSON serializes"));
+            }
+            None => {
+                view[format!("{F}allow")] = json!(true);
+            }
+        }
+        nodes.push(view);
     }
     if profile.wants_modify() {
         nodes.push(json!({
@@ -573,6 +718,8 @@ mod tests {
             "https://example.org/Lead",
             Profile::Write,
             &allowed,
+            None,
+            None,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 4, "class + profile + view + modify");
@@ -602,6 +749,8 @@ mod tests {
             "https://example.org/Lead",
             Profile::Read,
             &[RDF_TYPE.to_string()],
+            None,
+            None,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 3, "class + profile + view (no modify)");
@@ -617,6 +766,8 @@ mod tests {
             "https://example.org/Lead",
             Profile::Intake,
             &[RDF_TYPE.to_string()],
+            None,
+            None,
         );
         let nodes = graph["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 3, "class + profile + modify (no view)");
@@ -635,5 +786,81 @@ mod tests {
         assert!(require_absolute_iri("--entity", "https://example.org/Lead").is_ok());
         assert!(require_absolute_iri("--entity", "urn:example:Lead").is_ok());
         assert!(require_absolute_iri("--entity", "ex:Lead").is_err());
+    }
+}
+
+#[cfg(test)]
+mod connected_tests {
+    use super::*;
+
+    #[test]
+    fn parses_single_inverse_step() {
+        let steps = parse_property_path("^<https://example.org/owner>").unwrap();
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].inverse);
+        assert_eq!(steps[0].iri, "https://example.org/owner");
+    }
+
+    #[test]
+    fn parses_sequence_with_inverse_tail() {
+        let steps =
+            parse_property_path("<https://example.org/memberOf>/^<https://example.org/team>")
+                .unwrap();
+        assert_eq!(steps.len(), 2);
+        assert!(!steps[0].inverse);
+        assert!(steps[1].inverse);
+    }
+
+    #[test]
+    fn rejects_unbracketed_and_transitive() {
+        assert!(parse_property_path("https://example.org/owner").is_err());
+        assert!(parse_property_path("<https://example.org/parent>+").is_err());
+        assert!(parse_property_path("ex:owner").is_err());
+    }
+
+    #[test]
+    fn path_expands_to_anchored_patterns() {
+        let steps =
+            parse_property_path("<https://example.org/memberOf>/^<https://example.org/team>")
+                .unwrap();
+        let patterns = compile_path_where(&steps);
+        assert_eq!(patterns.len(), 2);
+        // identity —memberOf→ ?v0
+        assert_eq!(patterns[0]["@id"], "?$identity");
+        assert_eq!(patterns[0]["https://example.org/memberOf"]["@id"], "?v0");
+        // ?$this —team→ ?v0 (inverse step targets ?$this as subject)
+        assert_eq!(patterns[1]["@id"], "?$this");
+        assert_eq!(patterns[1]["https://example.org/team"]["@id"], "?v0");
+    }
+
+    #[test]
+    fn connected_view_policy_uses_query_not_allow() {
+        let steps = parse_property_path("^<https://example.org/owner>").unwrap();
+        let g = compile(
+            "https://example.org/Lead/access/read",
+            "https://example.org/Lead",
+            Profile::Read,
+            &[RDF_TYPE.to_string()],
+            Some(&steps),
+            Some("^<https://example.org/owner>"),
+        );
+        let nodes = g["@graph"].as_array().unwrap();
+        let view = nodes
+            .iter()
+            .find(|n| n["@id"].as_str().unwrap().ends_with("/view"))
+            .expect("view policy");
+        assert!(view.get("https://ns.flur.ee/db#allow").is_none());
+        let q = view["https://ns.flur.ee/db#query"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(q).unwrap();
+        assert_eq!(parsed["where"][0]["@id"], "?$this");
+        // profile node records the raw path
+        let profile = nodes
+            .iter()
+            .find(|n| n["@id"].as_str().unwrap().ends_with("/profile"))
+            .unwrap();
+        assert_eq!(
+            profile["https://ns.flur.ee/model#connected"],
+            "^<https://example.org/owner>"
+        );
     }
 }

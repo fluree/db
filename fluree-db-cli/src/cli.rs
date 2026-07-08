@@ -1593,6 +1593,15 @@ pub enum ModelAccessAction {
         #[arg(long)]
         space: Option<String>,
 
+        /// Relationship gate (read profile only): a SPARQL property path
+        /// from the requesting identity to the entity, with angle-bracketed
+        /// IRIs. e.g. "^<https://example.org/owner>" (I see what I own) or
+        /// "<https://example.org/memberOf>/^<https://example.org/team>"
+        /// (I see entities whose team I'm a member of). Sequence (/) and
+        /// inverse (^) steps only.
+        #[arg(long)]
+        connected: Option<String>,
+
         /// Print the compiled JSON-LD without transacting
         #[arg(long)]
         dry_run: bool,
