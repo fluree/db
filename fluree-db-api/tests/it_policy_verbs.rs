@@ -729,3 +729,119 @@ async fn post_state_condition_sees_staged_flakes() {
         "pre-state (default) condition must not see staged flakes"
     );
 }
+
+/// End-to-end contract for `fluree model access enable --profile write`:
+/// the scaffolder's exact output — a policy class + a thin view policy +
+/// one create/update/delete policy on the class, STORED in the ledger and
+/// selected via `policy-class` with a bind-only identity — grants full
+/// instance ownership of the class and nothing else. No property
+/// allow-list, no rdf:type entry: verb semantics alone make it exact.
+#[tokio::test]
+async fn scaffolder_write_profile_grants_class_ownership_only() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "verbs_scaffolder_write").await;
+
+    // Byte-for-byte the shape `fluree model access enable` emits.
+    let class = "http://example.org/ns/Lead/access/write";
+    let stored = json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@graph": [
+            {
+                "@id": class,
+                "@type": "http://www.w3.org/2000/01/rdf-schema#Class",
+                "http://www.w3.org/2000/01/rdf-schema#label": "write access: http://example.org/ns/Lead"
+            },
+            {
+                "@id": format!("{class}/view"),
+                "@type": ["f:AccessPolicy", class],
+                "f:action": {"@id": "f:view"},
+                "f:onClass": {"@id": "http://example.org/ns/Lead"},
+                "f:allow": true
+            },
+            {
+                "@id": format!("{class}/write"),
+                "@type": ["f:AccessPolicy", class],
+                "f:action": [
+                    {"@id": "f:create"},
+                    {"@id": "f:update"},
+                    {"@id": "f:delete"}
+                ],
+                "f:onClass": {"@id": "http://example.org/ns/Lead"},
+                "f:allow": true
+            }
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger, &stored)
+        .await
+        .expect("store scaffolder policies")
+        .ledger;
+
+    // Production selection shape: bind-only identity + policy-class.
+    let qc_opts = GovernanceOptions {
+        identity: Some("app-user@example.com".to_string()),
+        policy_class: Some(vec![class.to_string()]),
+        default_allow: false,
+        ..Default::default()
+    };
+    let ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    // 1. Creating a new Lead (with a never-seen property) is allowed.
+    let create_lead = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead9",
+        "@type": "ex:Lead",
+        "ex:name": "Scaffolded",
+        "ex:score": 42
+    });
+    let ledger = try_txn(&fluree, ledger, TxnType::Insert, &create_lead, &ctx)
+        .await
+        .expect("write profile must allow creating a Lead");
+
+    // 2. Updating an existing Lead is allowed.
+    let update_lead = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": [{"@id": "ex:lead1", "ex:stage": "?s"}],
+        "delete": [{"@id": "ex:lead1", "ex:stage": "?s"}],
+        "insert": [{"@id": "ex:lead1", "ex:stage": "qualified"}]
+    });
+    let ledger = try_txn(&fluree, ledger, TxnType::Update, &update_lead, &ctx)
+        .await
+        .expect("write profile must allow updating a Lead");
+
+    // 3. Minting a different class is denied (class-mint constraint).
+    let create_person = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:mallory",
+        "@type": "ex:Person",
+        "ex:nickname": "Mallory"
+    });
+    let denied = try_txn(&fluree, ledger.clone(), TxnType::Insert, &create_person, &ctx).await;
+    assert!(
+        denied.is_err(),
+        "Lead write profile must NOT mint a Person: {denied:?}"
+    );
+
+    // 4. Updating an instance of another class is denied.
+    let update_person = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": [{"@id": "ex:bob", "ex:nickname": "?n"}],
+        "delete": [{"@id": "ex:bob", "ex:nickname": "?n"}],
+        "insert": [{"@id": "ex:bob", "ex:nickname": "Robert"}]
+    });
+    let denied = try_txn(&fluree, ledger, TxnType::Update, &update_person, &ctx).await;
+    assert!(
+        denied.is_err(),
+        "Lead write profile must NOT edit a Person: {denied:?}"
+    );
+}

@@ -578,10 +578,13 @@ async fn policy_fquery_with_path_context_term() {
     let u1 = "http://example.org/identity/u1";
     let u2 = "http://example.org/identity/u2";
 
+    // Angle-bracket absolute-IRI form — exactly what `fluree model access
+    // enable --connected` stores (the path survives verbatim in @path).
     let gate = serde_json::to_string(&json!({
         "@context": {
-            "ex": "http://example.org/ns/",
-            "connected": { "@path": "ex:memberOf/^ex:team" }
+            "connected": {
+                "@path": "<http://example.org/ns/memberOf>/^<http://example.org/ns/team>"
+            }
         },
         "where": [
             { "@id": "?$identity", "connected": { "@id": "?$this" } }

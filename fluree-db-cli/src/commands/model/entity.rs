@@ -1,10 +1,10 @@
 //! `fluree model entity` — entity definitions as SHACL shapes.
 //!
 //! The entity shape is the governance model's single source of truth: the
-//! property list is written ONCE here, and everything else derives — access
-//! profiles compile their allow-lists from it (`model access enable` prefers
-//! shape-derivation), validation enforces it, and SDK types / form fields
-//! can be generated from it.
+//! property list is written ONCE here. Validation enforces it (use
+//! `--closed` so instances may carry ONLY declared properties), SDK types /
+//! form fields can be generated from it, and access policies stay thin
+//! class-verb grants because the shape owns the property surface.
 //!
 //! Enforcement note: Fluree runs SHACL at transaction time once any shapes
 //! exist in a ledger (reject mode by default — the "shapes-exist"
@@ -95,7 +95,7 @@ fn local_name(iri: &str) -> &str {
 }
 
 /// Compile the entity definition into its JSON-LD artifacts.
-fn compile(entity: &str, label: Option<&str>, specs: &[PropertySpec]) -> Value {
+fn compile(entity: &str, label: Option<&str>, specs: &[PropertySpec], closed: bool) -> Value {
     let shape_iri = format!("{}/shape", entity.trim_end_matches('/'));
 
     let mut class_node = json!({
@@ -129,12 +129,22 @@ fn compile(entity: &str, label: Option<&str>, specs: &[PropertySpec]) -> Value {
         })
         .collect();
 
-    let shape = json!({
+    let mut shape = json!({
         "@id": shape_iri,
         "@type": format!("{SH}NodeShape"),
         format!("{SH}targetClass"): {"@id": entity},
         format!("{SH}property"): property_shapes,
     });
+    if closed {
+        // Closed shape: instances may carry ONLY the declared properties —
+        // validation owns the property surface, so access policies never
+        // need property allow-lists. rdf:type must be carved out or the
+        // typing triple itself would violate closure.
+        shape[format!("{SH}closed")] = json!(true);
+        shape[format!("{SH}ignoredProperties")] = json!({
+            "@list": [{"@id": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"}]
+        });
+    }
 
     json!({"@graph": [class_node, shape]})
 }
@@ -146,6 +156,7 @@ pub async fn run(action: &ModelEntityAction, dirs: &FlureeDir, direct: bool) -> 
             entity,
             properties,
             label,
+            closed,
             dry_run,
             remote,
         } => {
@@ -154,6 +165,7 @@ pub async fn run(action: &ModelEntityAction, dirs: &FlureeDir, direct: bool) -> 
                 entity,
                 properties,
                 label.as_deref(),
+                *closed,
                 *dry_run,
                 remote.as_deref(),
                 dirs,
@@ -173,6 +185,7 @@ async fn run_define(
     entity: &str,
     property_specs: &[String],
     label: Option<&str>,
+    closed: bool,
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
@@ -191,7 +204,7 @@ async fn run_define(
         .map(|s| parse_property_spec(s))
         .collect::<CliResult<_>>()?;
 
-    let graph = compile(entity, label, &specs);
+    let graph = compile(entity, label, &specs, closed);
 
     println!("Entity:     {entity}");
     println!("Shape:      {}/shape", entity.trim_end_matches('/'));
@@ -238,7 +251,8 @@ async fn run_define(
     );
     println!(
         "next: fluree model access enable {dataset} --profile write --entity {entity}\n\
-         \x20     will derive its allowed properties from this shape."
+         \x20     grants create/update/delete on the class — the shape above governs\n\
+         \x20     what valid instances look like."
     );
     Ok(())
 }
@@ -362,7 +376,7 @@ mod tests {
             parse_property_spec("https://example.org/name string required").unwrap(),
             parse_property_spec("https://example.org/owner iri").unwrap(),
         ];
-        let g = compile("https://example.org/Lead", Some("Lead"), &specs);
+        let g = compile("https://example.org/Lead", Some("Lead"), &specs, false);
         let nodes = g["@graph"].as_array().unwrap();
         assert_eq!(nodes.len(), 2, "class + shape");
 
@@ -387,9 +401,24 @@ mod tests {
     }
 
     #[test]
+    fn closed_shape_carves_out_rdf_type() {
+        let specs = vec![parse_property_spec("https://example.org/name string required").unwrap()];
+        let g = compile("https://example.org/Lead", None, &specs, true);
+        let shape = &g["@graph"][1];
+        assert_eq!(shape[format!("{SH}closed")], true);
+        assert_eq!(
+            shape[format!("{SH}ignoredProperties")]["@list"][0]["@id"],
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+        );
+        // Open by default.
+        let g2 = compile("https://example.org/Lead", None, &specs, false);
+        assert!(g2["@graph"][1].get(format!("{SH}closed")).is_none());
+    }
+
+    #[test]
     fn stable_property_shape_ids_for_idempotent_upsert() {
         let specs = vec![parse_property_spec("https://example.org/name string").unwrap()];
-        let g = compile("https://example.org/Lead", None, &specs);
+        let g = compile("https://example.org/Lead", None, &specs, false);
         let props = g["@graph"][1]["http://www.w3.org/ns/shacl#property"]
             .as_array()
             .unwrap();

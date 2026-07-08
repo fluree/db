@@ -1577,6 +1577,13 @@ pub enum ModelEntityAction {
         #[arg(long)]
         label: Option<String>,
 
+        /// Closed shape: instances may carry ONLY the declared properties
+        /// (rdf:type excepted). Recommended for app-writable entities —
+        /// validation owns the property surface, so access grants stay
+        /// thin class policies.
+        #[arg(long)]
+        closed: bool,
+
         /// Print the compiled JSON-LD without transacting
         #[arg(long)]
         dry_run: bool,
@@ -1600,13 +1607,17 @@ pub enum ModelEntityAction {
 /// Access-facet subcommands of `fluree model`.
 #[derive(Subcommand)]
 pub enum ModelAccessAction {
-    /// Enable an access profile on a dataset (compiles to policies)
+    /// Enable an access profile on a dataset (emits thin verb policies)
     ///
-    /// Declares WHAT apps and other policy-classed principals may do with
-    /// entities of a class, and compiles that intent into stored policies:
-    /// a policy class, a view policy, and a property-whitelist modify
-    /// policy. The intent is stored as a declarative profile node so
-    /// re-running is idempotent and `sync`/`verify` can re-derive later.
+    /// Declares WHO may cause which state transitions on a class, in the
+    /// engine's own vocabulary: read → a view policy; write → view +
+    /// create/update/delete on the class; intake → create-only. Verb
+    /// semantics are exact (class targeting matches pre ∪ post state and
+    /// rdf:type writes match the class they mint), so no property
+    /// allow-list is needed — the property SURFACE of the class belongs
+    /// to its SHACL shape (`model entity define --closed`). Re-running is
+    /// idempotent (deterministic policy ids); there is no stored intent
+    /// node and nothing to sync.
     Enable {
         /// Target dataset (ledger alias)
         dataset: String,
@@ -1619,17 +1630,11 @@ pub enum ModelAccessAction {
         #[arg(long)]
         entity: String,
 
-        /// Property IRIs to permit (absolute). If omitted, derived from the
-        /// entity's SHACL shape, else from observed data (fail-closed if
-        /// neither exists).
+        /// Optional COLUMN narrowing for the write policy (absolute IRIs):
+        /// the grant covers only these properties of the class ("may edit
+        /// status of Leads, nothing else"). Omit for whole-instance access.
         #[arg(long = "property")]
         properties: Vec<String>,
-
-        /// Include properties that other classes also use (the compiler
-        /// discloses the blast radius; without this flag shared properties
-        /// are excluded — fail closed on precision)
-        #[arg(long)]
-        allow_shared: bool,
 
         /// Policy class IRI override (default: {entity}/access/{profile})
         #[arg(long)]
@@ -1644,8 +1649,8 @@ pub enum ModelAccessAction {
         /// from the requesting identity to the entity, with angle-bracketed
         /// IRIs. e.g. "^<https://example.org/owner>" (I see what I own) or
         /// "<https://example.org/memberOf>/^<https://example.org/team>"
-        /// (I see entities whose team I'm a member of). Sequence (/) and
-        /// inverse (^) steps only.
+        /// (I see entities whose team I'm a member of). Stored verbatim in
+        /// the policy via the engine's @path context term.
         #[arg(long)]
         connected: Option<String>,
 
@@ -1658,42 +1663,10 @@ pub enum ModelAccessAction {
         remote: Option<String>,
     },
 
-    /// Show access profiles and their compiled policies on a dataset
+    /// Show compiled access policies on a dataset (grouped by policy class)
     Show {
         /// Target dataset (ledger alias)
         dataset: String,
-
-        /// Remote to run against
-        #[arg(long)]
-        remote: Option<String>,
-    },
-
-    /// Verify compiled policies still match their declared profiles
-    ///
-    /// Recompiles every stored profile from its intent node and compares
-    /// against the policies actually in the ledger — hand-edited or missing
-    /// policies are reported as drift.
-    Verify {
-        /// Target dataset (ledger alias)
-        dataset: String,
-
-        /// Remote to run against
-        #[arg(long)]
-        remote: Option<String>,
-    },
-
-    /// Re-derive profiles whose property surface came from a source that
-    /// can change (SHACL shape, observed data) and recompile on drift
-    ///
-    /// Explicit profiles (authored property lists) are left untouched —
-    /// re-run `enable` to change them.
-    Sync {
-        /// Target dataset (ledger alias)
-        dataset: String,
-
-        /// Print planned changes without transacting
-        #[arg(long)]
-        dry_run: bool,
 
         /// Remote to run against
         #[arg(long)]
