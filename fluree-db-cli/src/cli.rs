@@ -1093,6 +1093,12 @@ pub enum Commands {
         action: ServerAction,
     },
 
+    /// Governance model tooling — access profiles, entities, reasoning
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+
     /// Developer memory — store and recall facts, decisions, constraints
     Memory {
         #[command(subcommand)]
@@ -1479,6 +1485,74 @@ pub enum ClusterAction {
         /// Admin URL of the node to query.
         #[arg(long)]
         addr: String,
+    },
+}
+
+/// Governance model subcommands.
+#[derive(Subcommand)]
+pub enum ModelAction {
+    /// Access control — compile intent into ledger policies
+    Access {
+        #[command(subcommand)]
+        action: ModelAccessAction,
+    },
+}
+
+/// Access-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelAccessAction {
+    /// Enable an access profile on a dataset (compiles to policies)
+    ///
+    /// Declares WHAT apps and other policy-classed principals may do with
+    /// entities of a class, and compiles that intent into stored policies:
+    /// a policy class, a view policy, and a property-whitelist modify
+    /// policy. The intent is stored as a declarative profile node so
+    /// re-running is idempotent and `sync`/`verify` can re-derive later.
+    Enable {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Profile: read | write | intake
+        #[arg(long)]
+        profile: String,
+
+        /// Entity class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        entity: String,
+
+        /// Property IRIs to permit (absolute). If omitted, derived from the
+        /// entity's SHACL shape, else from observed data (fail-closed if
+        /// neither exists).
+        #[arg(long = "property")]
+        properties: Vec<String>,
+
+        /// Include properties that other classes also use (the compiler
+        /// discloses the blast radius; without this flag shared properties
+        /// are excluded — fail closed on precision)
+        #[arg(long)]
+        allow_shared: bool,
+
+        /// Policy class IRI override (default: {entity}/access/{profile})
+        #[arg(long)]
+        class_iri: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show access profiles and their compiled policies on a dataset
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 
