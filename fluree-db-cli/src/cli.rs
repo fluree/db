@@ -1536,6 +1536,11 @@ pub enum ModelAccessAction {
         #[arg(long)]
         class_iri: Option<String>,
 
+        /// Attach the policy class to this space's grant on the dataset
+        /// (hosted stacks; requires --remote). Merges with existing classes.
+        #[arg(long)]
+        space: Option<String>,
+
         /// Print the compiled JSON-LD without transacting
         #[arg(long)]
         dry_run: bool,

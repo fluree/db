@@ -87,6 +87,7 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
             properties,
             allow_shared,
             class_iri,
+            space,
             dry_run,
             remote,
         } => {
@@ -97,6 +98,7 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
                 properties,
                 *allow_shared,
                 class_iri.as_deref(),
+                space.as_deref(),
                 *dry_run,
                 remote.as_deref(),
                 dirs,
@@ -175,6 +177,7 @@ async fn run_enable(
     explicit_properties: &[String],
     allow_shared: bool,
     class_iri_override: Option<&str>,
+    space: Option<&str>,
     dry_run: bool,
     remote: Option<&str>,
     dirs: &FlureeDir,
@@ -184,6 +187,11 @@ async fn run_enable(
     require_absolute_iri("--entity", entity)?;
     for p in explicit_properties {
         require_absolute_iri("--property", p)?;
+    }
+    if space.is_some() && remote.is_none() {
+        return Err(CliError::Usage(
+            "--space attaches the policy class to a hosted stack's grant; pass --remote <r>".into(),
+        ));
     }
 
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
@@ -276,14 +284,160 @@ async fn run_enable(
         return Ok(());
     }
 
-    // 5. Transact (data plane — policies live in the ledger).
+    // 5. Transact (data plane — policies live in the ledger). Policies land
+    //    BEFORE the grant so a partial failure leaves unused policies
+    //    (harmless) rather than a grant naming classes that don't exist.
     upsert(&mode, &graph).await?;
     println!("\nEnabled. Policies written to '{dataset}'.");
+
+    // 6. Grant attachment (hosted stacks): merge the class into the space's
+    //    grant so minted tokens carry it.
+    if let (Some(space_id), Some(remote_name)) = (space, remote) {
+        attach_grant(
+            dirs,
+            remote_name,
+            dataset,
+            space_id,
+            &class_iri,
+            profile.wants_modify(),
+        )
+        .await?;
+    } else {
+        println!(
+            "Attach to a grant so tokens carry it (or re-run with --space <id>):\n\
+             \x20 POST /v1/datasets/{dataset}/grants\n\
+             \x20 {{\"scopeType\": \"space\", \"scopeRef\": \"<spaceId>\", \"access\": \"{}\", \"policyClasses\": [\"{class_iri}\"]}}",
+            if profile.wants_modify() { "write" } else { "read" },
+        );
+    }
+    Ok(())
+}
+
+// ── grant attachment (hosted stacks) ────────────────────────────────────
+
+/// Merge `class_iri` into the space's grant on the dataset via the stack's
+/// grants API. System-plane state (grants) is the one place the compiler
+/// talks to an API instead of the data plane — grants are router-owned
+/// invariants (scope validation, membership checks).
+async fn attach_grant(
+    dirs: &FlureeDir,
+    remote_name: &str,
+    dataset: &str,
+    space_id: &str,
+    class_iri: &str,
+    wants_write: bool,
+) -> CliResult<()> {
+    use crate::config::TomlSyncConfigStore;
+    use fluree_db_nameservice::RemoteName;
+    use fluree_db_nameservice_sync::{RemoteEndpoint, SyncConfigStore};
+
+    let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+    let remote = store
+        .get_remote(&RemoteName::new(remote_name))
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .ok_or_else(|| CliError::NotFound(format!("remote '{remote_name}' not found")))?;
+    let base_url = match &remote.endpoint {
+        RemoteEndpoint::Http { base_url } => base_url.clone(),
+        _ => {
+            return Err(CliError::Config(format!(
+                "remote '{remote_name}' is not an HTTP remote"
+            )));
+        }
+    };
+
+    // The remote points at the data plane (…/v1/fluree); the grants API
+    // lives at the stack root.
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1/fluree").ok_or_else(|| {
+        CliError::Config(format!(
+            "remote '{remote_name}' ({base_url}) does not look like a hosted stack \
+             (expected a …/v1/fluree data-plane URL); attach the grant manually"
+        ))
+    })?;
+    let token = remote.auth.token.clone().ok_or_else(|| {
+        CliError::Config(format!(
+            "remote '{remote_name}' has no auth token; run `fluree auth login` first"
+        ))
+    })?;
+
+    // Base ledger name (no branch) is the dataset id on the stack.
+    let dataset_id = dataset.split(':').next().unwrap_or(dataset);
+    let grants_url = format!("{root}/v1/datasets/{dataset_id}/grants");
+    let http = reqwest::Client::new();
+
+    // Read existing grants: merge classes, never clobber; keep (or upgrade)
+    // the access level.
+    let list: Value = http
+        .get(&grants_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| CliError::Config(format!("grants read failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| CliError::Config(format!("grants read failed: {e}")))?
+        .json()
+        .await
+        .map_err(|e| CliError::Config(format!("grants read returned non-JSON: {e}")))?;
+    let existing = list["grants"]
+        .as_array()
+        .map(|grants| {
+            grants
+                .iter()
+                .find(|g| {
+                    g["scopeType"].as_str() == Some("space")
+                        && g["scopeRef"].as_str() == Some(space_id)
+                })
+                .cloned()
+        })
+        .unwrap_or(None);
+
+    let mut classes: Vec<String> = existing
+        .as_ref()
+        .and_then(|g| g["policyClasses"].as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !classes.iter().any(|c| c == class_iri) {
+        classes.push(class_iri.to_string());
+    }
+
+    let existing_access = existing
+        .as_ref()
+        .and_then(|g| g["access"].as_str())
+        .map(String::from);
+    let access = match (&existing_access, wants_write) {
+        (Some(a), true) if a == "read" => {
+            println!("  grant access upgraded read → write (profile requires writes)");
+            "write".to_string()
+        }
+        (Some(a), _) => a.clone(),
+        (None, true) => "write".to_string(),
+        (None, false) => "read".to_string(),
+    };
+
+    let body = json!({
+        "scopeType": "space",
+        "scopeRef": space_id,
+        "access": access,
+        "policyClasses": classes,
+    });
+    http.post(&grants_url)
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| CliError::Config(format!("grant upsert failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| CliError::Config(format!("grant upsert rejected: {e}")))?;
+
     println!(
-        "Attach to a grant so tokens carry it:\n\
-         \x20 POST /v1/datasets/{dataset}/grants\n\
-         \x20 {{\"scopeType\": \"space\", \"scopeRef\": \"<spaceId>\", \"access\": \"{}\", \"policyClasses\": [\"{class_iri}\"]}}",
-        if profile.wants_modify() { "write" } else { "read" },
+        "Grant attached: space {space_id} → {dataset_id} ({access}, {} class{})",
+        classes.len(),
+        if classes.len() == 1 { "" } else { "es" }
     );
     Ok(())
 }
