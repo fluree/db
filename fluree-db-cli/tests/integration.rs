@@ -517,7 +517,14 @@ fn query_cypher_remote_rejects_time_travel() {
 
     fluree_cmd(&tmp)
         .args([
-            "query", "mydb", "--cypher", "--remote", "origin", "--at", "1", "-e",
+            "query",
+            "mydb",
+            "--cypher",
+            "--remote",
+            "origin",
+            "--at",
+            "1",
+            "-e",
             "MATCH (n) RETURN n",
         ])
         .assert()

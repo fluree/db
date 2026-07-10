@@ -160,9 +160,7 @@ pub async fn run(
                 // Send the body verbatim (raw Cypher or a `{cypher, params}`
                 // envelope); the server extracts the envelope itself, exactly
                 // like the read path and `fluree load --cypher --remote`.
-                UpdateFormat::Cypher => {
-                    client.update_cypher_body(&remote_alias, &content).await?
-                }
+                UpdateFormat::Cypher => client.update_cypher_body(&remote_alias, &content).await?,
             };
 
             context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
