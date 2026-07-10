@@ -476,6 +476,90 @@ fn query_connection_remote_routes_to_named_remote() {
 }
 
 #[test]
+fn query_cypher_remote_rejects_non_cypher_json_format() {
+    // The remote Cypher endpoint renders cypher-json only; RDF JSON-LD /
+    // typed-json / delimited shapes are client-side on the local path. The CLI
+    // rejects them before any network call (the remote here is never reached).
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:1"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "mydb",
+            "--cypher",
+            "--remote",
+            "origin",
+            "--format",
+            "json",
+            "-e",
+            "MATCH (n) RETURN n",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cypher-json"))
+        .stderr(predicate::str::contains("--direct"));
+}
+
+#[test]
+fn query_cypher_remote_rejects_time_travel() {
+    // `--at` has no remote Cypher handling; rejected before any network call.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:1"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "query", "mydb", "--cypher", "--remote", "origin", "--at", "1", "-e",
+            "MATCH (n) RETURN n",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--at"))
+        .stderr(predicate::str::contains("--direct"));
+}
+
+#[test]
+fn update_cypher_remote_rejects_policy() {
+    // Cypher writes have no policy enforcement on either transport; the remote
+    // arm rejects `--policy*` before any network call (rather than silently
+    // dropping it). Proves the arm reaches policy validation instead of the old
+    // "HTTP Cypher endpoint not yet available" bail.
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://127.0.0.1:1"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "mydb",
+            "--format",
+            "cypher",
+            "--remote",
+            "origin",
+            "--policy-class",
+            "http://example.org/PolicyClass",
+            "-e",
+            "CREATE (n:Person {name: \"x\"})",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "policy enforcement is not yet supported for Cypher writes",
+        ));
+}
+
+#[test]
 fn query_bare_connection_keeps_positional_query() {
     // A bare `--connection` (no `=value`) must not swallow the following query
     // string: the SPARQL stays the positional input and is executed via the
