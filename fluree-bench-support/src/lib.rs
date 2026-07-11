@@ -29,9 +29,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod baseline;
 pub mod budget;
 pub mod fixtures;
 pub mod gen;
+pub mod mem;
 pub mod ledger;
 pub mod normalize;
 pub mod report;
