@@ -224,16 +224,16 @@ enum AggState {
     },
     Avg {
         required_otype: Option<u16>,
-        // Exactly one of these accumulates, selected by required_otype's
-        // decode kind. The integer lane sums exactly in i64 (checked; falls
-        // back on overflow) and finalizes via BigDecimal division so the
+        // Only the integer lane fast-paths. It sums exactly in i64 (checked;
+        // falls back on overflow) and finalizes via BigDecimal division, so the
         // output is byte-identical to the generic pipeline's finalize_avg
-        // (SPARQL: AVG over integers is xsd:decimal). The double lane uses
-        // plain summation — NOT Kahan — to bit-match the generic
-        // accumulator; cross-path indistinguishability outranks the extra
-        // float accuracy (differential harness FD-1).
+        // (SPARQL: AVG over integers is xsd:decimal; differential harness FD-1).
+        // xsd:double and other numeric encodings decline in fold_row: f64
+        // addition is non-associative and this lane folds in POST (value) order
+        // while the generic pipeline folds in scan order, so a fast double sum
+        // is NOT guaranteed to match the generic one (harness `avg_double`).
+        // Integer arithmetic is exact and order-free, so it is safe to fast-path.
         int_sum: i64,
-        dbl_sum: f64,
         count: u64,
     },
     CountDistinct {
@@ -249,7 +249,6 @@ impl AggState {
             ScalarAggKind::AvgNumeric => AggState::Avg {
                 required_otype: None,
                 int_sum: 0,
-                dbl_sum: 0.0,
                 count: 0,
             },
             ScalarAggKind::CountDistinctObject => AggState::CountDistinct {
@@ -262,48 +261,24 @@ impl AggState {
     fn finalize(self) -> Result<AggOutput> {
         Ok(match self {
             AggState::Sum { sum, .. } => AggOutput::Integer(sum),
-            AggState::Avg {
-                required_otype,
-                int_sum,
-                dbl_sum,
-                count,
-            } => {
+            AggState::Avg { int_sum, count, .. } => {
                 if count == 0 {
                     // AVG of the empty multiset is the identity `"0"^^xsd:integer`
                     // (SPARQL 1.1 §18.5.1.4), matching the generic aggregate path.
                     AggOutput::Integer(0)
                 } else {
-                    // Mirror aggregate.rs finalize_avg per number kind so the
-                    // fast path is byte-identical to the generic pipeline
-                    // (differential harness FD-1): integer inputs finalize as
-                    // exact xsd:decimal, doubles as xsd:double.
-                    let kind = required_otype
-                        .map(|ot| OType::from_u16(ot).decode_kind())
-                        .ok_or_else(|| {
-                            QueryError::execution("AVG fast-path: count > 0 without o_type")
-                        })?;
-                    match kind {
-                        DecodeKind::I64 => {
-                            let avg = (bigdecimal::BigDecimal::from(int_sum)
-                                / bigdecimal::BigDecimal::from(count as i64))
-                            .with_prec(crate::aggregate::AVG_DECIMAL_PRECISION)
-                            .normalized();
-                            AggOutput::Binding(Binding::lit(
-                                FlakeValue::Decimal(Box::new(avg)),
-                                Sid::xsd_decimal(),
-                            ))
-                        }
-                        DecodeKind::F64 => AggOutput::Binding(Binding::lit(
-                            FlakeValue::Double(dbl_sum / count as f64),
-                            Sid::xsd_double(),
-                        )),
-                        // fold_row only admits I64/F64 kinds.
-                        other => {
-                            return Err(QueryError::execution(format!(
-                                "AVG fast-path: unexpected decode kind {other:?}"
-                            )))
-                        }
-                    }
+                    // Only the integer lane accumulates (fold_row declines every
+                    // other numeric encoding), so the result is always exact
+                    // xsd:decimal — byte-identical to the generic finalize_avg
+                    // for integer inputs (differential harness FD-1).
+                    let avg = (bigdecimal::BigDecimal::from(int_sum)
+                        / bigdecimal::BigDecimal::from(count as i64))
+                    .with_prec(crate::aggregate::AVG_DECIMAL_PRECISION)
+                    .normalized();
+                    AggOutput::Binding(Binding::lit(
+                        FlakeValue::Decimal(Box::new(avg)),
+                        Sid::xsd_decimal(),
+                    ))
                 }
             }
             AggState::CountDistinct { distinct, .. } => {
@@ -341,7 +316,6 @@ impl AggState {
             AggState::Avg {
                 required_otype,
                 int_sum,
-                dbl_sum,
                 count,
             } => {
                 if !OType::from_u16(o_type).is_numeric() {
@@ -352,23 +326,22 @@ impl AggState {
                     Some(existing) if existing != o_type => return Ok(false),
                     Some(_) => {}
                 }
-                let key = ObjKey::from_u64(o_key);
                 match OType::from_u16(o_type).decode_kind() {
                     DecodeKind::I64 => {
-                        // Exact integer accumulation; overflow → generic
-                        // pipeline (which sums in BigDecimal).
-                        let Some(next) = int_sum.checked_add(key.decode_i64()) else {
+                        // Exact, order-free integer accumulation; overflow →
+                        // generic pipeline (which sums in BigDecimal).
+                        let Some(next) = int_sum.checked_add(ObjKey::from_u64(o_key).decode_i64())
+                        else {
                             return Ok(false);
                         };
                         *int_sum = next;
                     }
-                    DecodeKind::F64 => {
-                        // Plain summation to match the generic accumulator
-                        // bit-for-bit (see AggState::Avg field docs).
-                        *dbl_sum += key.decode_f64();
-                    }
-                    // Other numeric encodings (e.g. dict-backed decimals) need
-                    // exact decimal arithmetic — defer to the generic pipeline.
+                    // xsd:double and every other numeric encoding decline to the
+                    // generic pipeline. f64 addition is non-associative and this
+                    // lane folds in POST (value) order while the generic pipeline
+                    // folds in scan order, so a fast double sum is NOT guaranteed
+                    // to match (differential harness `avg_double`). Only the exact
+                    // integer lane is order-free and safe to fast-path.
                     _ => return Ok(false),
                 }
                 *count = count.saturating_add(1);
