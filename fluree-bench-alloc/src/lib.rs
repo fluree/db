@@ -17,10 +17,11 @@
 //! static ALLOC: TrackingAllocator = TrackingAllocator::new();
 //!
 //! // around a scenario:
-//! fluree_bench_alloc::reset_peak();
+//! let base = fluree_bench_alloc::reset_peak();
 //! run_scenario();
 //! let m = fluree_bench_alloc::snapshot();
-//! eprintln!("peak={}B churn={}B", m.peak_bytes, m.total_allocated_bytes);
+//! // scenario-attributable peak excludes bytes live before the region:
+//! eprintln!("peak={}B churn={}B", m.peak_bytes - base, m.total_allocated_bytes);
 //! ```
 //!
 //! ## Measurement honesty
@@ -129,10 +130,17 @@ pub struct AllocSnapshot {
 
 /// Reset `peak` to the current live size and `total` to zero. Call before
 /// the measured region of a scenario.
-pub fn reset_peak() {
+///
+/// Returns the live-bytes baseline it rebased to (`current_at_reset`). Report
+/// a scenario-attributable peak as `snapshot().peak_bytes - reset_peak()`
+/// rather than the raw `peak_bytes`, which still includes whatever was live
+/// before the measured region (e.g. a loaded snapshot) and would let a
+/// setup-side change mask a scenario-side regression.
+pub fn reset_peak() -> usize {
     let cur = CURRENT.load(Ordering::Relaxed);
     PEAK.store(cur, Ordering::Relaxed);
     TOTAL.store(0, Ordering::Relaxed);
+    cur
 }
 
 /// Read the counters. Call after the measured region of a scenario.

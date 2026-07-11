@@ -20,9 +20,12 @@ use serde::{Deserialize, Serialize};
 
 /// Memory metrics for one bench scenario.
 ///
-/// `peak_bytes` is the live-bytes high-water mark across the scenario's
-/// measured iterations; `total_allocated_bytes` is cumulative allocation
-/// (churn). Both come from `fluree_bench_alloc::snapshot()` semantics.
+/// `peak_bytes` is the **scenario-attributable** live-bytes high-water mark
+/// across the scenario's measured iterations — the raw
+/// `fluree_bench_alloc::snapshot().peak_bytes` minus the bytes live at
+/// `reset_peak()` (the loaded snapshot / setup), so it isolates the measured
+/// region and a setup-side change can't mask a scenario-side regression.
+/// `total_allocated_bytes` is cumulative allocation since reset (churn).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemMetrics {
     pub peak_bytes: u64,

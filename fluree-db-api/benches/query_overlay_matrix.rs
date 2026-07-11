@@ -236,7 +236,7 @@ fn bench_query_overlay_matrix(c: &mut Criterion) {
     // under the same `<group>/<fn_id>/<scale>` ID the baseline tool uses.
     macro_rules! scenario {
         ($snapshot:expr, $fn_id:expr, $query:expr) => {{
-            fluree_bench_alloc::reset_peak();
+            let reset_base = fluree_bench_alloc::reset_peak();
             group.bench_with_input(BenchmarkId::new($fn_id, scale.as_str()), &(), |b, ()| {
                 b.iter(|| {
                     rt.block_on(async {
@@ -255,7 +255,10 @@ fn bench_query_overlay_matrix(c: &mut Criterion) {
                 GROUP,
                 &format!("{GROUP}/{}/{}", $fn_id, scale.as_str()),
                 MemMetrics {
-                    peak_bytes: m.peak_bytes as u64,
+                    // Scenario-attributable peak: high-water mark minus the bytes
+                    // live at reset (the loaded snapshot), so a query-side memory
+                    // regression can't be masked by a setup-side improvement.
+                    peak_bytes: (m.peak_bytes as u64).saturating_sub(reset_base as u64),
                     total_allocated_bytes: m.total_allocated_bytes as u64,
                 },
             );
