@@ -116,3 +116,43 @@ jobs:
         working-directory: testsuite-sparql
         timeout-minutes: 45
         run: cargo test
+
+  bench-compare:
+    # Cheap per-PR perf gate (speed-first repo — a real gate, not advisory).
+    # Runs only the two cheapest benches at tiny/quick and compares against the
+    # committed baseline; exit 1 on any regression-budget.json breach. The full
+    # workspace compare (all benches, +medium) runs nightly in bench.yml. The
+    # committed baseline (bench-baselines/guardrails-pre.json) contains exactly
+    # this cheap subset, so `compare` needs no `--only` filter.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FLUREE_BENCH_PROFILE: quick
+      FLUREE_BENCH_SCALE: tiny
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Run the two cheap benches (writes criterion timings + memory sidecars).
+      - name: Run cheap benches (tiny, quick)
+        run: |
+          cargo bench -p fluree-db-api --bench query_overlay_matrix
+          cargo bench -p fluree-db-api --bench query_hot_bsbm
+
+      # Compare against the committed baseline; exits 1 on any budget breach.
+      - name: Compare against committed baseline
+        run: |
+          cargo run -p fluree-bench-support --bin bench-baseline -- \
+            compare --baseline bench-baselines/guardrails-pre.json

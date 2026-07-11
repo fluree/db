@@ -72,3 +72,17 @@ jobs:
       # broken setup, missing API surface).
       - name: Smoke-run benches at tiny scale
         run: cargo bench --workspace -- --test
+
+      # Real per-bench compare of the captured subset against the committed
+      # baseline (the nightly perf-regression gate). `if: always()` so it runs
+      # even when an unrelated workspace bench trips the smoke step above.
+      # Follow-up (ROADMAP.md §7 cost caveat): the full workspace compare at
+      # +medium against a phase post-baseline needs the 45-min cap raised or the
+      # workflow split, so it is deliberately NOT wired here yet.
+      - name: Compare captured subset against committed baseline
+        if: always()
+        run: |
+          cargo bench -p fluree-db-api --bench query_overlay_matrix
+          cargo bench -p fluree-db-api --bench query_hot_bsbm
+          cargo run -p fluree-bench-support --bin bench-baseline -- \
+            compare --baseline bench-baselines/guardrails-pre.json
