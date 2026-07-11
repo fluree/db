@@ -62,7 +62,37 @@ pub struct BaselineFile {
     /// knobs.
     pub profile: String,
     pub scale: String,
+    /// Runner class the baseline was captured on (env `FLUREE_BENCH_RUNNER_CLASS`,
+    /// default `"local"`). Load-bearing for the gate: cross-machine wall-clock
+    /// TIME is not comparable (shared CI runners flap; local silicon differs),
+    /// so when this differs from the comparing runner's class `compare` reports
+    /// time breaches as ADVISORY and enforces only memory (which the reviewer
+    /// measured within ±2.2% cross-machine). `#[serde(default)]` so pre-field
+    /// baselines still load (treated as `"local"`).
+    #[serde(default = "default_runner_class")]
+    pub runner_class: String,
+    /// Host the baseline was captured on — informational provenance.
+    #[serde(default)]
+    pub host: String,
     pub entries: BTreeMap<String, BaselineEntry>,
+}
+
+fn default_runner_class() -> String {
+    "local".to_string()
+}
+
+/// The runner class of the current environment, from `FLUREE_BENCH_RUNNER_CLASS`
+/// (default `"local"`). CI capture/compare jobs set it (e.g.
+/// `ci-ubuntu-latest`); a match between baseline and current enables time
+/// enforcement, a mismatch makes time advisory.
+pub fn runner_class() -> String {
+    std::env::var("FLUREE_BENCH_RUNNER_CLASS").unwrap_or_else(|_| default_runner_class())
+}
+
+fn host() -> String {
+    std::env::var("FLUREE_BENCH_HOST")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +176,8 @@ pub fn capture(
         captured_at,
         profile: std::env::var("FLUREE_BENCH_PROFILE").unwrap_or_else(|_| "quick".into()),
         scale: std::env::var("FLUREE_BENCH_SCALE").unwrap_or_else(|_| "small".into()),
+        runner_class: runner_class(),
+        host: host(),
         entries,
     }
 }
@@ -188,6 +220,10 @@ pub struct Comparison {
     pub change_pct: f64,
     pub budget_pct: f64,
     pub status: CompareStatus,
+    /// Whether an `Exceeded` here fails the gate. Memory is always enforced
+    /// (sound cross-machine); time is enforced only when the baseline and the
+    /// comparing runner share a runner class — otherwise it is advisory.
+    pub enforced: bool,
 }
 
 #[derive(Debug, Default)]
@@ -201,10 +237,19 @@ pub struct CompareReport {
 }
 
 impl CompareReport {
+    /// Enforced breaches — an `Exceeded` on an enforced metric. These fail the
+    /// gate (nonzero exit).
     pub fn breaches(&self) -> impl Iterator<Item = &Comparison> {
         self.comparisons
             .iter()
-            .filter(|c| c.status == CompareStatus::Exceeded)
+            .filter(|c| c.status == CompareStatus::Exceeded && c.enforced)
+    }
+    /// Advisory breaches — an `Exceeded` on a non-enforced metric (cross-machine
+    /// time). Reported as annotations; they do NOT fail the gate.
+    pub fn advisories(&self) -> impl Iterator<Item = &Comparison> {
+        self.comparisons
+            .iter()
+            .filter(|c| c.status == CompareStatus::Exceeded && !c.enforced)
     }
     pub fn passed(&self) -> bool {
         self.breaches().next().is_none()
@@ -263,11 +308,17 @@ fn classify(baseline: f64, observed: f64, budget_pct: f64) -> (f64, CompareStatu
 ///
 /// `only` restricts the comparison to scenario IDs containing the given
 /// substring (PR-scoped subset runs).
+///
+/// `time_advisory` marks TIME comparisons as non-enforced (breaches reported
+/// but not gate-failing) — memory stays enforced. Callers set it when the
+/// baseline's runner class differs from the comparing runner's (cross-machine
+/// wall-clock is not comparable) or via an explicit override.
 pub fn compare(
     baseline: &BaselineFile,
     current: &BTreeMap<String, BaselineEntry>,
     budget: &RegressionBudget,
     only: Option<&str>,
+    time_advisory: bool,
 ) -> CompareReport {
     let selected = |id: &str| only.is_none_or(|f| id.contains(f));
     let mut report = CompareReport::default();
@@ -280,9 +331,19 @@ pub fn compare(
             report.missing.push(id.clone());
             continue;
         };
+        // A sidecar-only current entry (no fresh criterion estimate this run,
+        // mean_ns == 0) means the bench was NOT rerun this session — its mem
+        // sidecar is stale from a previous run (rust-cache persists target/).
+        // Treat it as not-rerun rather than silently comparing stale memory
+        // (review item 10). The CI compare step also clears the sidecar dir
+        // before the run as belt-and-suspenders.
+        if cur.mean_ns <= 0.0 {
+            report.missing.push(id.clone());
+            continue;
+        }
         let budget_pct = budget_for_id(budget, id);
 
-        if base.mean_ns > 0.0 && cur.mean_ns > 0.0 {
+        if base.mean_ns > 0.0 {
             let (change_pct, status) = classify(base.mean_ns, cur.mean_ns, budget_pct);
             report.comparisons.push(Comparison {
                 id: id.clone(),
@@ -292,6 +353,7 @@ pub fn compare(
                 change_pct,
                 budget_pct,
                 status,
+                enforced: !time_advisory,
             });
         }
         if let (Some(bm), Some(cm)) = (base.mem, cur.mem) {
@@ -305,6 +367,8 @@ pub fn compare(
                 change_pct,
                 budget_pct,
                 status,
+                // Memory is comparable cross-machine — always enforced.
+                enforced: true,
             });
         }
     }
@@ -345,10 +409,23 @@ mod tests {
             captured_at: "2026-01-01T00:00:00Z".into(),
             profile: "quick".into(),
             scale: "small".into(),
+            runner_class: "local".into(),
+            host: "test".into(),
             entries: entries
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),
+        }
+    }
+
+    fn mem_entry(mean: f64, peak: u64) -> BaselineEntry {
+        BaselineEntry {
+            mean_ns: mean,
+            median_ns: mean,
+            mem: Some(MemMetrics {
+                peak_bytes: peak,
+                total_allocated_bytes: peak * 2,
+            }),
         }
     }
 
@@ -390,7 +467,7 @@ mod tests {
         current.insert("g/q3/small".to_string(), entry(1100.0)); // +10%
         let budget = RegressionBudget::empty(5.0);
 
-        let report = compare(&base, &current, &budget, None);
+        let report = compare(&base, &current, &budget, None, false);
         assert!(!report.passed());
         let by_id = |id: &str| {
             report
@@ -416,12 +493,12 @@ mod tests {
         let budget = RegressionBudget::empty(5.0);
 
         // Unfiltered: h/q1 is missing (informational, not a failure).
-        let report = compare(&base, &current, &budget, None);
+        let report = compare(&base, &current, &budget, None, false);
         assert!(report.passed());
         assert_eq!(report.missing, vec!["h/q1/small".to_string()]);
 
         // Filtered to g/: nothing missing.
-        let report = compare(&base, &current, &budget, Some("g/"));
+        let report = compare(&base, &current, &budget, Some("g/"), false);
         assert!(report.missing.is_empty());
         assert_eq!(report.comparisons.len(), 1);
     }
@@ -442,10 +519,80 @@ mod tests {
         current.insert("g/q1/small".to_string(), cur_entry);
 
         let budget = RegressionBudget::empty(5.0);
-        let report = compare(&base, &current, &budget, None);
+        let report = compare(&base, &current, &budget, None, false);
         assert!(!report.passed());
         let breach = report.breaches().next().unwrap();
         assert_eq!(breach.metric, "peak_mem");
+    }
+
+    #[test]
+    fn time_advisory_reports_but_only_memory_gates() {
+        // +100% on BOTH time and mem for the one scenario.
+        let base = baseline_with(vec![("g/q1/small", mem_entry(1000.0, 1_000_000))]);
+        let mut current = BTreeMap::new();
+        current.insert("g/q1/small".to_string(), mem_entry(2000.0, 2_000_000));
+        let budget = RegressionBudget::empty(5.0);
+
+        // Enforced time: both breaches gate.
+        let strict = compare(&base, &current, &budget, None, false);
+        assert!(!strict.passed());
+        assert_eq!(strict.breaches().count(), 2);
+
+        // Advisory time: mem still gates (fail), time is advisory only.
+        let advisory = compare(&base, &current, &budget, None, true);
+        assert!(!advisory.passed(), "mem breach must still fail the gate");
+        assert_eq!(advisory.breaches().count(), 1);
+        assert_eq!(advisory.breaches().next().unwrap().metric, "peak_mem");
+        assert_eq!(advisory.advisories().count(), 1);
+        assert_eq!(advisory.advisories().next().unwrap().metric, "time");
+    }
+
+    #[test]
+    fn advisory_time_only_breach_passes() {
+        // Only TIME regresses; MEM flat. Under advisory time the gate passes.
+        let base = baseline_with(vec![("g/q1/small", mem_entry(1000.0, 1_000_000))]);
+        let mut current = BTreeMap::new();
+        current.insert("g/q1/small".to_string(), mem_entry(2000.0, 1_000_000));
+        let budget = RegressionBudget::empty(5.0);
+
+        let report = compare(&base, &current, &budget, None, true);
+        assert!(report.passed(), "advisory time breach must not fail the gate");
+        assert_eq!(report.advisories().count(), 1);
+    }
+
+    #[test]
+    fn stale_sidecar_only_entry_is_not_compared() {
+        // Current has ONLY a mem sidecar (mean_ns == 0): the bench was not rerun
+        // this session, so its mem is stale and must not be compared (item 10);
+        // it counts as missing.
+        let base = baseline_with(vec![("g/q1/small", mem_entry(1000.0, 1_000_000))]);
+        let stale = BaselineEntry {
+            mean_ns: 0.0,
+            median_ns: 0.0,
+            mem: Some(MemMetrics {
+                peak_bytes: 9_000_000,
+                total_allocated_bytes: 0,
+            }),
+        };
+        let mut current = BTreeMap::new();
+        current.insert("g/q1/small".to_string(), stale);
+        let budget = RegressionBudget::empty(5.0);
+
+        let report = compare(&base, &current, &budget, None, false);
+        assert!(
+            report.comparisons.is_empty(),
+            "stale sidecar must not be compared"
+        );
+        assert_eq!(report.missing, vec!["g/q1/small".to_string()]);
+    }
+
+    #[test]
+    fn baseline_without_provenance_fields_loads() {
+        // Pre-field baselines must still parse (serde default → "local").
+        let json = r#"{"schema_version":1,"label":"old","captured_at":"2026-01-01T00:00:00Z","profile":"quick","scale":"small","entries":{}}"#;
+        let read: BaselineFile = serde_json::from_str(json).unwrap();
+        assert_eq!(read.runner_class, "local");
+        assert_eq!(read.host, "");
     }
 
     #[test]

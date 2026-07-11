@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use fluree_bench_support::baseline::{
-    capture, compare, default_criterion_dir, load_baseline, save_baseline, BaselineEntry,
-    CompareStatus,
+    capture, compare, default_criterion_dir, load_baseline, runner_class, save_baseline,
+    BaselineEntry, CompareStatus,
 };
 use fluree_bench_support::budget;
 use fluree_bench_support::mem;
@@ -59,7 +59,10 @@ fn print_usage() {
         "bench-baseline — capture and compare performance baselines\n\n\
          USAGE:\n  \
          bench-baseline capture --label <name> --out <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--clean-mem]\n  \
-         bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--budget <file>] [--only <substr>]\n\n\
+         bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--budget <file>] [--only <substr>] [--time-advisory]\n\n\
+         Memory is always enforced; TIME is enforced only when the baseline's\n\
+         runner_class matches this runner's (env FLUREE_BENCH_RUNNER_CLASS,\n\
+         default \"local\") — else advisory. --time-advisory forces advisory.\n\n\
          Run the benches first (`cargo bench ...`); this tool reads criterion's\n\
          output from target/criterion and memory sidecars from\n\
          target/fluree-bench-mem. See BENCHMARKING.md (\"Baselines\")."
@@ -168,7 +171,7 @@ fn run_capture(args: &[String]) -> ExitCode {
     }
     let with_mem = file.entries.values().filter(|e| e.mem.is_some()).count();
     println!(
-        "captured {} scenarios ({} with memory metrics) → {} [label={} sha={} profile={} scale={}]",
+        "captured {} scenarios ({} with memory metrics) → {} [label={} sha={} profile={} scale={} runner_class={} host={}]",
         file.entries.len(),
         with_mem,
         out_path.display(),
@@ -176,6 +179,8 @@ fn run_capture(args: &[String]) -> ExitCode {
         file.git_sha.as_deref().unwrap_or("?"),
         file.profile,
         file.scale,
+        file.runner_class,
+        file.host,
     );
     if flags.contains_key("--clean-mem") {
         mem::clear_sidecars(&mem_d);
@@ -193,7 +198,7 @@ fn run_compare(args: &[String]) -> ExitCode {
             "--budget",
             "--only",
         ],
-        &[],
+        &["--time-advisory"],
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -214,6 +219,12 @@ fn run_compare(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // TIME is not comparable across machine classes; enforce it only when the
+    // baseline and this runner share a runner class (or when neither opts out).
+    // MEMORY is always enforced. `--time-advisory` forces advisory regardless.
+    let current_rc = runner_class();
+    let time_advisory = flags.contains_key("--time-advisory") || baseline.runner_class != current_rc;
     let budgets = match flags.get("--budget") {
         Some(p) => budget::load_from(PathBuf::from(p).as_path()),
         None => budget::load(),
@@ -237,15 +248,27 @@ fn run_compare(args: &[String]) -> ExitCode {
         &current,
         &budgets,
         flags.get("--only").map(String::as_str),
+        time_advisory,
     );
 
     println!(
-        "comparing against '{}' (sha={} captured={} profile={} scale={})",
+        "comparing against '{}' (sha={} captured={} profile={} scale={} runner_class={})",
         baseline.label,
         baseline.git_sha.as_deref().unwrap_or("?"),
         baseline.captured_at,
         baseline.profile,
         baseline.scale,
+        baseline.runner_class,
+    );
+    println!(
+        "runner_class: baseline={} current={} → TIME {} (memory always enforced)",
+        baseline.runner_class,
+        current_rc,
+        if time_advisory {
+            "ADVISORY (cross-machine or overridden; not gating)"
+        } else {
+            "enforced"
+        },
     );
     println!();
     println!(
@@ -256,7 +279,8 @@ fn run_compare(args: &[String]) -> ExitCode {
         let status = match c.status {
             CompareStatus::Improved => "improved",
             CompareStatus::Within => "ok",
-            CompareStatus::Exceeded => "EXCEEDED",
+            CompareStatus::Exceeded if c.enforced => "EXCEEDED",
+            CompareStatus::Exceeded => "advisory",
         };
         let (baseline_s, observed_s) = if c.metric == "time" {
             (format_ns(c.baseline), format_ns(c.observed))
@@ -286,6 +310,20 @@ fn run_compare(args: &[String]) -> ExitCode {
         );
     }
 
+    let advisories: Vec<_> = report.advisories().collect();
+    if !advisories.is_empty() {
+        println!(
+            "\n::warning::advisory time regressions (not gating — runner_class {} != {}): {}",
+            baseline.runner_class,
+            current_rc,
+            advisories
+                .iter()
+                .map(|c| format!("{} {:+.1}%", c.id, c.change_pct))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let improved = report
         .comparisons
         .iter()
@@ -293,16 +331,17 @@ fn run_compare(args: &[String]) -> ExitCode {
         .count();
     let breaches: Vec<_> = report.breaches().collect();
     println!(
-        "\n{} compared, {} improved, {} breached",
+        "\n{} compared, {} improved, {} enforced-breach, {} advisory",
         report.comparisons.len(),
         improved,
-        breaches.len()
+        breaches.len(),
+        advisories.len(),
     );
     if breaches.is_empty() {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "FAIL: budget exceeded for {} scenario metric(s)",
+            "FAIL: enforced budget exceeded for {} scenario metric(s)",
             breaches.len()
         );
         ExitCode::FAILURE
