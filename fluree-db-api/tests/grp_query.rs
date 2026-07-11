@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_differential_fastpath.rs"]
+mod it_differential_fastpath;
 #[path = "it_query_agent_json.rs"]
 mod it_query_agent_json;
 #[path = "it_query_aggregates.rs"]
