@@ -22,6 +22,7 @@ use crate::fast_group_count_firsts::{
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
 use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::fast_path_plus_count_all::{
     property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
 };
@@ -55,7 +56,6 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::stats_query::stats_count_by_predicate_operator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;

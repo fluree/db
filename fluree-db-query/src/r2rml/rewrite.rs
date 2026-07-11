@@ -595,7 +595,7 @@ pub fn convert_triple_to_r2rml(
         Ref::Sid(sid) => {
             let iri = snapshot.decode_sid(sid)?;
             (None, Some(iri))
-        },
+        }
     };
 
     // Build a pattern for `object_var`, carrying either the subject variable or
