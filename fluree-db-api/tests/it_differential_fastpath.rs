@@ -46,14 +46,12 @@
 //!   `aggregate::finalize_avg` per number kind (exact `xsd:decimal` for
 //!   integers, plain `xsd:double` for doubles) so the two paths are
 //!   byte-identical.
-//! - **FD-2 `max_label` / `min_label`** (base): wrong answers. With
-//!   `bsbm:label` on vendors and products, generic MAX is
-//!   `"Vendor 000003"` (lexicographic), fast returns `"Product 000219"`
-//!   — the last-inserted label, consistent with assuming string-ID order
-//!   is lexicographic order. That invariant (`lex_sorted_string_ids`)
-//!   only holds after bulk import and is cleared by incremental writes;
-//!   this ledger was reindex-built. Suspect: `fast_min_max_string`
-//!   missing the lex-order gate.
+//! - **FD-2 `max_label` / `min_label`** — FIXED on main independently (not by
+//!   this PR), now enforced. The MIN/MAX-string fast path had returned the
+//!   last-inserted label (assuming string-ID order is lexicographic order, an
+//!   invariant cleared by incremental writes); main's `fast_min_max_string`
+//!   work added the lex-order gate before this harness landed. Removing the
+//!   marker upgrades it from reported-only to enforced, guarding that fix.
 //! - **FD-3 `group_by_predicate_count`** — FIXED (PR-1 L2), now enforced.
 //!   The stats-answered path returned `StatsView` estimates as answers,
 //!   which (a) counted duplicate re-asserts that set-semantics novelty
@@ -330,17 +328,18 @@ fn catalog() -> Vec<Case> {
         },
         // detect_predicate_minmax_string — churned labels sort after
         // "Product ..." ("Churned ..." sorts before), and MAX over labels
-        // includes tail products' novelty-only strings.
+        // includes tail products' novelty-only strings. FD-2 was fixed on main
+        // independently (fast_min_max_string gained the lex-order gate); enforced.
         Case {
             name: "max_label",
             ordered: false,
-            known_divergence: Some("FD-2"),
+            known_divergence: None,
             sparql: "SELECT (MAX(?o) AS ?m) WHERE { ?s bsbm:label ?o }",
         },
         Case {
             name: "min_label",
             ordered: false,
-            known_divergence: Some("FD-2"),
+            known_divergence: None,
             sparql: "SELECT (MIN(?o) AS ?m) WHERE { ?s bsbm:label ?o }",
         },
         // detect_post_order_desc_limit — reverse-POST tail walk. The seven
