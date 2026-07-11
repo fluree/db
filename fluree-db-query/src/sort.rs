@@ -317,8 +317,8 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (Binding::EncodedPid { p_id: a }, Binding::EncodedPid { p_id: b }) => a.cmp(b),
         // Cross-IRI type comparisons: Sid < IriMatch/Iri < EncodedSid/EncodedPid
         // (Prefer materialized over encoded for consistent ordering)
-        (Binding::Sid { sid: _, .. }, Binding::IriMatch { .. } | Binding::Iri(_)) => Ordering::Less,
-        (Binding::IriMatch { .. } | Binding::Iri(_), Binding::Sid { sid: _, .. }) => {
+        (Binding::Sid { .. }, Binding::IriMatch { .. } | Binding::Iri(_)) => Ordering::Less,
+        (Binding::IriMatch { .. } | Binding::Iri(_), Binding::Sid { .. }) => {
             Ordering::Greater
         }
         (Binding::IriMatch { iri: a, .. }, Binding::Iri(b)) => a.as_ref().cmp(b.as_ref()),

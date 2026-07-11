@@ -2180,53 +2180,38 @@ fn test_order_by_bare_builtin_call() {
 #[test]
 fn test_order_by_bare_expression_not_absorbed_as_key() {
     // `OrderCondition`'s bare form is `Constraint | Var`, never an arbitrary
-    // expression. A trailing operator after a var key must NOT become a second
-    // (spurious) key: pre-fix `ORDER BY ?x - 1` silently parsed as two keys
-    // `[?x, -1]`, corrupting the sort. The `- 1` is not a Constraint, so it is
-    // no longer absorbed — the ORDER BY keeps the single key `?x` (the stray
-    // tail is left for the parser, which currently ignores trailing tokens; a
-    // bare BuiltInCall like `ORDER BY str(?o)` stays valid, see
-    // test_order_by_bare_builtin_call). Regression guard for fluree/db#1452.
+    // expression. A trailing operator after a var key must NOT become a
+    // second (spurious) key: pre-fix `ORDER BY ?x - 1` silently parsed as
+    // two keys `[?x, -1]`, corrupting the sort (fluree/db#1452). The `- 1`
+    // is not a Constraint, so it is not absorbed — and under the wave-1
+    // trailing-token guard (#1438/D-10a) the unconsumed tail is a loud
+    // parse error instead of silently ignored input. If absorption ever
+    // regressed, these would parse CLEANLY again (two keys, no trailing
+    // error) and this test would fail. A bare BuiltInCall like
+    // `ORDER BY str(?o)` stays valid, see test_order_by_bare_builtin_call.
     for q in [
         "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x - 1",
         "SELECT * WHERE { ?s ?p ?o } ORDER BY ?x + ?y",
     ] {
-        let ast = assert_parses(q);
-        let QueryBody::Select(sel) = &ast.body else {
-            panic!("expected SELECT query for {q}");
-        };
-        let ob = sel.modifiers.order_by.as_ref().expect("ORDER BY clause");
-        assert_eq!(ob.conditions.len(), 1, "{q}: arithmetic must not add a key");
-        assert!(
-            matches!(ob.conditions[0].expr, OrderExpr::Var(_)),
-            "{q}: the sole key must be the bare var, got {:?}",
-            ob.conditions[0].expr
-        );
+        assert_parse_error_no_ast(q, "unexpected trailing tokens");
     }
-    // A *leading* bare arithmetic is not a Constraint at all, so no condition
-    // parses and ORDER BY is empty — a hard error.
-    assert!(
-        parse("SELECT * WHERE { ?s ?p ?o } ORDER BY str(?x) - 1").has_errors(),
-        "a bare arithmetic must be rejected as an order condition"
-    );
 }
 
 #[test]
 fn test_group_by_bare_expression_not_absorbed_as_key() {
     // `GroupCondition`'s bare form is `BuiltInCall | FunctionCall` (or a
     // parenthesized `( … )`, or a Var) — never a bare arithmetic. Kept
-    // consistent with ORDER BY (fluree/db#1452): a trailing `- 1` after a var
-    // is not absorbed as a second group key, and a leading bare arithmetic is
-    // rejected. The parenthesized `GROUP BY (?x + 1 AS ?y)` form stays valid
+    // consistent with ORDER BY (fluree/db#1452): a trailing `- 1` after a
+    // var key is not absorbed as a second group key — and under the wave-1
+    // trailing-token guard the unconsumed tail is a loud parse error
+    // instead of silently ignored input (absorption regressing would parse
+    // cleanly with two keys, failing this). The parenthesized
+    // `GROUP BY (?x + 1 AS ?y)` form stays valid
     // (see test_group_by_with_expression).
-    let ast = assert_parses("SELECT ?x WHERE { ?s :p ?x } GROUP BY ?x - 1");
-    let QueryBody::Select(sel) = &ast.body else {
-        panic!("expected SELECT query");
-    };
-    let gb = sel.modifiers.group_by.as_ref().expect("GROUP BY clause");
-    assert_eq!(gb.conditions.len(), 1, "`- 1` must not add a group key");
-    assert!(matches!(gb.conditions[0], GroupCondition::Var(_)));
-
+    assert_parse_error_no_ast(
+        "SELECT ?x WHERE { ?s :p ?x } GROUP BY ?x - 1",
+        "unexpected trailing tokens",
+    );
     assert!(
         parse("SELECT ?x WHERE { ?s :p ?x } GROUP BY str(?x) - 1").has_errors(),
         "a bare arithmetic must be rejected as a group condition"
@@ -2352,6 +2337,10 @@ fn test_service_fluree_ledger_endpoint() {
 const RDF_PREFIX: &str = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 const EX_PREFIX: &str = "PREFIX ex: <http://example.org/> ";
 
+fn unit(ann: &crate::ast::Annotation) -> &crate::ast::AnnotationUnit {
+    ann.single_unit().expect("a single annotation unit")
+}
+
 fn first_bgp(ast: &SparqlAst) -> &Vec<crate::ast::TriplePattern> {
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern {
@@ -2407,8 +2396,11 @@ fn annotation_block_anonymous_parses_and_attaches_to_triple() {
         .annotation
         .as_ref()
         .expect("annotation tail should be attached to the triple");
-    assert!(ann.reifier.is_none(), "anonymous form has no reifier id");
-    let block = ann.block.as_ref().expect("block should be present");
+    assert!(
+        unit(ann).reifier.is_none(),
+        "anonymous form has no reifier id"
+    );
+    let block = unit(ann).block.as_ref().expect("block should be present");
     assert_eq!(block.entries.len(), 1);
 }
 
@@ -2419,13 +2411,13 @@ fn annotation_block_with_named_blank_reifier() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    match ann.reifier.as_ref().expect("reifier id") {
+    match unit(ann).reifier.as_ref().expect("reifier id") {
         crate::ast::ReifierId::BlankNode(b) => {
             assert!(matches!(b.value, BlankNodeValue::Labeled(ref l) if l.as_ref() == "ann"));
         }
         other => panic!("expected blank-node reifier, got {other:?}"),
     }
-    assert!(ann.block.is_some());
+    assert!(unit(ann).block.is_some());
 }
 
 #[test]
@@ -2435,7 +2427,10 @@ fn annotation_block_with_named_iri_reifier() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    matches!(ann.reifier.as_ref(), Some(crate::ast::ReifierId::Iri(_)));
+    matches!(
+        unit(ann).reifier.as_ref(),
+        Some(crate::ast::ReifierId::Iri(_))
+    );
 }
 
 #[test]
@@ -2445,7 +2440,10 @@ fn annotation_block_with_var_reifier() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    matches!(ann.reifier.as_ref(), Some(crate::ast::ReifierId::Var(_)));
+    matches!(
+        unit(ann).reifier.as_ref(),
+        Some(crate::ast::ReifierId::Var(_))
+    );
 }
 
 #[test]
@@ -2455,8 +2453,8 @@ fn bare_tilde_reifier_no_block_parses() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    assert!(ann.reifier.is_some());
-    assert!(ann.block.is_none(), "bare reifier carries no block");
+    assert!(unit(ann).reifier.is_some());
+    assert!(unit(ann).block.is_none(), "bare reifier carries no block");
 }
 
 #[test]
@@ -2466,7 +2464,7 @@ fn empty_annotation_block_parses() {
     ));
     let bgp = first_bgp(&ast);
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
-    let block = ann.block.as_ref().expect("block");
+    let block = unit(ann).block.as_ref().expect("block");
     assert_eq!(block.entries.len(), 0);
 }
 
@@ -2476,7 +2474,8 @@ fn annotation_block_with_multiple_predicate_object_pairs() {
         "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"Engineer\" ; ex:since \"2024\" |}} . }}"
     ));
     let bgp = first_bgp(&ast);
-    let block = bgp[0].annotation.as_ref().unwrap().block.as_ref().unwrap();
+    let ann = bgp[0].annotation.as_ref().unwrap();
+    let block = unit(ann).block.as_ref().unwrap();
     assert_eq!(block.entries.len(), 2);
 }
 
@@ -2540,7 +2539,7 @@ fn rdf_reifies_followed_by_sibling_triples_keeps_them_in_bgp() {
 
 // ----- Deferred / rejected shapes ------------------------------------------
 
-fn assert_parse_error(input: &str, needle: &str) {
+fn assert_parse_error(input: &str, needle: &str) -> ParseOutput<SparqlAst> {
     let result = parse(input);
     assert!(
         result.has_errors(),
@@ -2556,6 +2555,20 @@ fn assert_parse_error(input: &str, needle: &str) {
         }
         panic!("expected diagnostic containing {needle:?}");
     }
+    result
+}
+
+/// Like [`assert_parse_error`], but for rejections that must also suppress
+/// AST production (unconsumed trailing input; parse-time semantic rejects):
+/// a diagnostics-ignoring caller — e.g. the public `lower_sparql_update_ast`
+/// entry — must never receive an AST covering only a prefix of the request
+/// (issue #1438).
+fn assert_parse_error_no_ast(input: &str, needle: &str) {
+    let result = assert_parse_error(input, needle);
+    assert!(
+        result.ast.is_none(),
+        "AST must be suppressed, not recovered, for input: {input}"
+    );
 }
 
 #[test]
@@ -2616,23 +2629,55 @@ fn nested_annotation_in_block_is_rejected() {
 }
 
 #[test]
-fn duplicate_reifier_in_tail_is_rejected() {
-    assert_parse_error(
-        &format!(
-            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?a ~ ?b {{| ex:role \"x\" |}} . }}"
-        ),
-        "at most one reifier",
-    );
+fn multiple_reifiers_in_tail_group_into_units() {
+    // RDF 1.2: each `~ reifier` starts a new reification unit; the
+    // block attaches to the immediately preceding reifier (`?b` here).
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme ~ ?a ~ ?b {{| ex:role \"x\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert_eq!(ann.units.len(), 2);
+    assert!(matches!(
+        ann.units[0].reifier,
+        Some(crate::ast::ReifierId::Var(ref v)) if v.name.as_ref() == "a"
+    ));
+    assert!(ann.units[0].block.is_none());
+    assert!(matches!(
+        ann.units[1].reifier,
+        Some(crate::ast::ReifierId::Var(ref v)) if v.name.as_ref() == "b"
+    ));
+    assert!(ann.units[1].block.is_some(), "block attaches to `~ ?b`");
 }
 
 #[test]
-fn duplicate_block_in_tail_is_rejected() {
-    assert_parse_error(
-        &format!(
-            "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"x\" |}} {{| ex:since \"y\" |}} . }}"
-        ),
-        "at most one annotation block",
-    );
+fn multiple_blocks_in_tail_mint_fresh_reifiers() {
+    // Two blocks with no preceding reifiers = two fresh reifiers
+    // (W3C annotation-anonreifier-multiple-01).
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:alice ex:worksFor ex:acme {{| ex:role \"x\" |}} {{| ex:since \"y\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert_eq!(ann.units.len(), 2);
+    assert!(ann.units.iter().all(|u| u.reifier.is_none()));
+    assert!(ann.units.iter().all(|u| u.block.is_some()));
+}
+
+#[test]
+fn interleaved_reifiers_and_blocks_follow_attachment_rule() {
+    // `~ :r1 ~ :r2 {| b1 |} {| b2 |} ~ :r3 {| b3 |}` →
+    // [r1], [r2+b1], [fresh+b2], [r3+b3] (annotation-reifier-multiple-05).
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?s ?p ?o ~ ex:r1 ~ ex:r2 {{| ex:a \"1\" |}} {{| ex:b \"2\" |}} ~ ex:r3 {{| ex:c \"3\" |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    assert_eq!(ann.units.len(), 4);
+    assert!(ann.units[0].reifier.is_some() && ann.units[0].block.is_none());
+    assert!(ann.units[1].reifier.is_some() && ann.units[1].block.is_some());
+    assert!(ann.units[2].reifier.is_none() && ann.units[2].block.is_some());
+    assert!(ann.units[3].reifier.is_some() && ann.units[3].block.is_some());
 }
 
 // ----- Existing legacy `<< s p ?o >> f:t ?t` form regression check ---------
@@ -2675,6 +2720,96 @@ fn legacy_quoted_triple_in_subject_position_still_parses() {
     assert_eq!(bgp.len(), 1);
     // The subject should be a QuotedTriple, NOT confused with a triple term.
     assert!(matches!(&bgp[0].subject, SubjectTerm::QuotedTriple(_)));
+}
+
+// ----- PR-W2A: RDF 1.2 reified-triple forms ---------------------------------
+
+#[test]
+fn reified_triple_in_object_position_parses() {
+    // W3C basic-anonreifier-02: `:s :p << :a :b "c" >> .`
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:s ex:p << ex:a ex:b \"c\" >> . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    assert_eq!(bgp.len(), 1);
+    assert!(matches!(&bgp[0].object, crate::ast::Term::QuotedTriple(_)));
+}
+
+#[test]
+fn reifier_inside_quoted_triple_parses() {
+    // W3C basic-reifier-02: `:s :p << :a :b "c" ~ :iri >> .`
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ex:s ex:p << ex:a ex:b \"c\" ~ ex:iri >> . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let crate::ast::Term::QuotedTriple(qt) = &bgp[0].object else {
+        panic!("expected reified-triple object");
+    };
+    let reifier = qt.reifier.as_ref().expect("in-triple reifier");
+    assert!(matches!(reifier.id, Some(crate::ast::ReifierId::Iri(_))));
+}
+
+#[test]
+fn standalone_reified_triple_desugars_to_annotation_target() {
+    // W3C basic-anonreifier-08: `<< ?s ?p ?o >> .` standalone —
+    // desugars to `_:r rdf:reifies <<( ?s ?p ?o )>>`.
+    let ast = assert_parses("SELECT * WHERE { << ?s ?p ?o >> . }");
+    assert_eq!(first_pattern_kinds(&ast), vec!["AnnotationTarget"]);
+}
+
+#[test]
+fn nested_reified_triple_parses() {
+    // W3C basic-anonreifier-10 / basic-reifier-10.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ << ex:s ex:p << ?s ex:p2 ex:o2 ~ ex:iri2 >> ~ ex:iri1 >> . }}"
+    ));
+}
+
+#[test]
+fn annotation_block_with_path_verb_parses() {
+    // W3C annotation-anonreifier-06: `{| :r/:q 'ABC' |}`.
+    let ast = assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?s ?p ?o {{| ex:r/ex:q 'ABC' |}} . }}"
+    ));
+    let bgp = first_bgp(&ast);
+    let ann = bgp[0].annotation.as_ref().expect("annotation tail");
+    let block = unit(ann).block.as_ref().expect("block");
+    assert!(matches!(
+        block.entries[0].verb,
+        crate::ast::AnnotationVerb::Path(_)
+    ));
+}
+
+#[test]
+fn standalone_triple_term_still_rejected() {
+    // W3C NEGATIVE tripleterm-separate-01: `<<( ?s ?p ?o )>> .` — a
+    // bare triple term is a value, not a statement (contrast the
+    // standalone REIFIED triple, which is valid).
+    assert_parse_error("SELECT * WHERE { <<( ?s ?p ?o )>> . }", "unexpected token");
+}
+
+#[test]
+fn annotation_on_path_verb_still_rejected() {
+    // W3C NEGATIVE annotated-anonreifier-path: annotation tails attach
+    // to simple-verb triples only, never to path patterns.
+    assert_parse_error(
+        &format!("{EX_PREFIX}SELECT * WHERE {{ ?s ex:p/ex:q ?o {{| ?pp ?oo |}} . }}"),
+        "unexpected token",
+    );
+}
+
+#[test]
+fn version_long_string_rejected() {
+    // W3C NEGATIVE version-bad-01/02: VersionSpecifier is a SHORT
+    // quoted string only.
+    assert_parse_error(
+        "VERSION \"\"\"1.2\"\"\" SELECT * WHERE { }",
+        "short quoted string",
+    );
+    assert_parse_error(
+        "VERSION \'\'\'1.2\'\'\' SELECT * WHERE { }",
+        "short quoted string",
+    );
 }
 
 #[test]
@@ -2727,4 +2862,376 @@ fn test_pragma_in_trailing_comment_honored() {
     // A genuine trailing comment is a comment; the lexer identifies it.
     let ast = assert_parses("SELECT * WHERE { } # PRAGMA reasoning: rdfs");
     assert_eq!(ast.pragmas.reasoning, Some(vec!["rdfs".to_string()]));
+}
+
+// =============================================================================
+// V5 — BIND scope (SPARQL 1.1 §10.1 / grammar note 12)
+//
+// This check is parse-time by necessity: the single-pattern group
+// simplification makes `{ ... { BIND } }` and `{ ... BIND }` produce
+// identical ASTs, so `validate()` cannot distinguish them.
+// =============================================================================
+
+fn assert_bind_scope_rejected(input: &str) {
+    let result = parse(input);
+    assert!(
+        result.ast.is_none(),
+        "expected AST production to be refused: {input}"
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagCode::BindTargetAlreadyInScope && d.is_error()),
+        "expected BindTargetAlreadyInScope: {:?}",
+        result.diagnostics
+    );
+}
+
+fn assert_bind_scope_accepted(input: &str) {
+    let result = parse(input);
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagCode::BindTargetAlreadyInScope),
+        "unexpected BindTargetAlreadyInScope: {:?}",
+        result.diagnostics
+    );
+    assert!(result.ast.is_some(), "expected AST: {input}");
+}
+
+#[test]
+fn test_bind_scope_prior_triple_rejected() {
+    // W3C syntax-BINDscope6 (test_60): ?o1 bound by a preceding triple in
+    // the same group.
+    assert_bind_scope_rejected(
+        "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . :s :q ?o1 . BIND((1+?o) AS ?o1) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_nested_group_propagates_rejected() {
+    // W3C syntax-BINDscope7 (test_61a): in-scope propagates out of a
+    // nested group to the BIND in the outer group.
+    assert_bind_scope_rejected(
+        "PREFIX : <http://example.org/> SELECT * WHERE { { :s :p ?o . :s :q ?o1 . } BIND((1+?o) AS ?o1) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_union_branch_propagates_rejected() {
+    // W3C syntax-BINDscope8 (test_62a): a UNION contributes both branches'
+    // in-scope variables.
+    assert_bind_scope_rejected(
+        "PREFIX : <http://example.org/> SELECT * { { { :s :p ?Y } UNION { :s :p ?Z } } BIND(1 AS ?Y) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_use_after_bind_accepted() {
+    // W3C syntax-BINDscope1 (positive, test_55): only elements BEFORE the
+    // BIND count.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . BIND((1+?o) AS ?o1) :s :q ?o1 }",
+    );
+}
+
+#[test]
+fn test_bind_scope_braced_bind_accepted() {
+    // W3C syntax-BINDscope2/3 (positive): a `{ BIND ... }` group is its own
+    // scope — the outer group's earlier triples don't apply.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { :s :p ?o . :s :q ?o1 { BIND((1+?o) AS ?o1) } }",
+    );
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { { :s :p ?o . :s :q ?o1 } { BIND((1+?o) AS ?o1) } }",
+    );
+}
+
+#[test]
+fn test_bind_scope_union_branches_independent_accepted() {
+    // W3C syntax-BINDscope4/5 (positive): UNION branches are separate
+    // groups.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * { { BIND(1 AS ?Y) } UNION { :s :p ?Y } }",
+    );
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * { { :s :p ?Y } UNION { BIND(1 AS ?Y) } }",
+    );
+}
+
+#[test]
+fn test_bind_scope_values_rejected() {
+    // VALUES contributes its variables to the in-scope set.
+    assert_bind_scope_rejected("SELECT * WHERE { VALUES ?x { 1 2 } BIND(3 AS ?x) }");
+}
+
+#[test]
+fn test_bind_scope_minus_right_not_in_scope_accepted() {
+    // MINUS's right side does not project variables out (§18.2.1).
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { ?s :p ?o MINUS { ?s :q ?m } BIND(1 AS ?m) }",
+    );
+}
+
+#[test]
+fn test_bind_scope_filter_var_not_in_scope_accepted() {
+    // FILTER contributes nothing to the in-scope set.
+    assert_bind_scope_accepted(
+        "PREFIX : <http://example.org/> SELECT * WHERE { ?s :p ?o FILTER(?f) BIND(1 AS ?f) }",
+    );
+}
+
+// =========================================================================
+// V1: dot structure inside group graph patterns (W3C syn-bad-02..14)
+// =========================================================================
+
+#[test]
+fn test_v1_legal_dot_usage_still_parses() {
+    // Trailing dot after the last triple is optional but legal.
+    assert_parses("SELECT * WHERE { ?s ?p ?o . }");
+    // Mandatory dot between two same-subject blocks.
+    assert_parses("SELECT * WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o . ?s2 ?p2 ?o2 . }");
+    // One optional dot may follow a GraphPatternNotTriples.
+    assert_parses("SELECT * WHERE { OPTIONAL { ?s ?p ?o } . ?a ?b ?c }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o . FILTER(?o) . }");
+    assert_parses("SELECT * WHERE { BIND(1 AS ?x) . ?s ?p ?x }");
+    assert_parses("SELECT * WHERE { { ?s ?p ?o } . ?a ?b ?c }");
+    assert_parses("SELECT * WHERE { GRAPH ?g { ?s ?p ?o } . ?a ?b ?c }");
+    // No dot needed between a TriplesBlock and a keyword pattern.
+    assert_parses("SELECT * WHERE { ?s ?p ?o OPTIONAL { ?a ?b ?c } }");
+}
+
+#[test]
+fn test_v1_standalone_dot_rejected() {
+    // syn-bad-05 / syn-bad-06
+    assert_parse_error("SELECT * WHERE { . }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { . . }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_leading_dot_rejected() {
+    // syn-bad-07 / syn-bad-14
+    assert_parse_error("SELECT * WHERE { . ?s ?p ?o }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { . FILTER(?x) }", "unexpected '.'");
+}
+
+#[test]
+fn test_v1_doubled_dot_rejected() {
+    // syn-bad-08..13
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o . . }", "unexpected '.'");
+    assert_parse_error("SELECT * WHERE { ?s ?p ?o .. }", "unexpected '.'");
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o . . ?s1 ?p1 ?o1 }",
+        "unexpected '.'",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o .. ?s1 ?p1 ?o1 }",
+        "unexpected '.'",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o . ?s1 ?p1 ?o1 .. }",
+        "unexpected '.'",
+    );
+    // A doubled dot after a GraphPatternNotTriples: only ONE optional dot.
+    assert_parse_error(
+        "SELECT * WHERE { OPTIONAL { ?s ?p ?o } . . }",
+        "unexpected '.'",
+    );
+}
+
+#[test]
+fn test_v1_missing_dot_between_triples_rejected() {
+    // syn-bad-02 / syn-bad-03
+    assert_parse_error(
+        "PREFIX : <http://example/ns#> SELECT * { :s1 :p1 :o1 :s2 :p2 :o2 . }",
+        "expected '.' between triple patterns",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o ?s2 ?p2 ?o2 }",
+        "expected '.' between triple patterns",
+    );
+}
+
+// =========================================================================
+// V2: FILTER requires a Constraint (W3C filter-missing-parens)
+// =========================================================================
+
+#[test]
+fn test_v2_filter_constraint_forms_still_parse() {
+    // BrackettedExpression
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER (?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER (?o > 5) }");
+    // BuiltInCall
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER bound(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER regex(?o, \"x\") }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER isIRI(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER EXISTS { ?o ?q ?v } }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER NOT EXISTS { ?o ?q ?v } }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER IF(?o, true, false) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER COALESCE(?o, false) }");
+    // FunctionCall (extension function by IRI / prefixed name)
+    assert_parses("PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:f(?o) }");
+    assert_parses("SELECT * WHERE { ?s ?p ?o FILTER <http://example.org/f>(?o) }");
+}
+
+#[test]
+fn test_v2_filter_bare_term_rejected() {
+    // W3C filter-missing-parens: a bare Var is not a Constraint.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER ?x }",
+        "FILTER requires a bracketted expression",
+    );
+    // Bare literals and IRIs are not Constraints either.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER true }",
+        "FILTER requires a bracketted expression",
+    );
+    assert_parse_error(
+        "PREFIX ex: <http://example.org/> SELECT * WHERE { ?s ?p ?o FILTER ex:c }",
+        "FILTER requires a bracketted expression",
+    );
+}
+
+#[test]
+fn test_v2_filter_unparenthesized_operator_expression_rejected() {
+    // Relational / boolean operator expressions need the parens too.
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER ?o > 5 }",
+        "FILTER requires a bracketted expression",
+    );
+    assert_parse_error(
+        "SELECT * WHERE { ?s ?p ?o FILTER !bound(?o) }",
+        "FILTER requires a bracketted expression",
+    );
+}
+
+// =========================================================================
+// Accepts-valid gaps unmasked by making parse errors authoritative:
+// bare ORDER BY constraints, VALUES row shape, sub-select VALUES clause
+// =========================================================================
+
+#[test]
+fn test_order_by_bare_builtin_and_function_call() {
+    // OrderCondition ::= ( 'ASC' | 'DESC' ) BrackettedExpression | ( Constraint | Var )
+    // W3C sort#dawg-sort-builtin / dawg-sort-function / syntax-order-06.
+    assert_parses("SELECT ?s WHERE { ?s ?p ?o . } ORDER BY str(?o)");
+    assert_parses(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+         SELECT ?s WHERE { ?s ?p ?o . } ORDER BY xsd:integer(?o)",
+    );
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/ns#> \
+         SELECT * { ?s ?p ?o } ORDER BY DESC(?o+57) :func2(?o) ASC(?s)",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let order_by = q.modifiers.order_by.as_ref().expect("ORDER BY clause");
+        assert_eq!(order_by.conditions.len(), 3, "all three conditions kept");
+    } else {
+        panic!("expected SELECT");
+    }
+}
+
+#[test]
+fn test_values_parenthesized_single_var_takes_parenthesized_rows() {
+    // InlineDataFull row shape follows the var-LIST shape, not the count
+    // (W3C bindings#values7 / inline2).
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/> \
+         SELECT * { ?s ?p ?o } VALUES (?o) { (:b) (UNDEF) }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        let values = q.values.as_ref().expect("post-query VALUES");
+        if let GraphPattern::Values { vars, data, .. } = values.as_ref() {
+            assert_eq!(vars.len(), 1);
+            assert_eq!(data.len(), 2);
+            assert!(data[0][0].is_some());
+            assert!(data[1][0].is_none(), "UNDEF row");
+        } else {
+            panic!("expected Values pattern");
+        }
+    }
+    // A bare (unparenthesized) var list still takes bare values.
+    assert_parses("PREFIX : <http://example.org/> SELECT * {{ ?s ?p ?o }} VALUES ?o { :b :c }");
+}
+
+#[test]
+fn test_subselect_trailing_values_clause() {
+    // SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause
+    // (W3C bindings#inline2).
+    let ast = assert_parses(
+        "PREFIX : <http://example.org/> \
+         SELECT ?s ?o { { SELECT * WHERE { ?s ?p ?o . } VALUES (?o) { (:b) } } }",
+    );
+    if let QueryBody::Select(q) = &ast.body {
+        if let GraphPattern::SubSelect { query, .. } = &q.where_clause.pattern {
+            let values = query.values.as_ref().expect("subselect VALUES clause");
+            assert!(matches!(values.as_ref(), GraphPattern::Values { .. }));
+        } else {
+            panic!("expected SubSelect, got {:?}", q.where_clause.pattern);
+        }
+    }
+}
+
+// =========================================================================
+// Trailing-token / EOF assertion at the parse entry (issue #1438 / D-10a)
+// =========================================================================
+
+#[test]
+fn test_trailing_tokens_after_query_rejected() {
+    // Trailing input means the parsed AST covers only a prefix of the
+    // request, so the parser also suppresses AST production — a caller
+    // that never consults diagnostics must not be able to execute the
+    // truncated request.
+    assert_parse_error_no_ast(
+        "SELECT * WHERE { ?s ?p ?o } ?x",
+        "unexpected trailing tokens",
+    );
+    assert_parse_error_no_ast(
+        "SELECT * WHERE { ?s ?p ?o } <http://example.org/trailing>",
+        "unexpected trailing tokens",
+    );
+    // A stray ';' after a query form is trailing content too.
+    assert_parse_error_no_ast(
+        "SELECT * WHERE { ?s ?p ?o } ;",
+        "unexpected trailing tokens",
+    );
+    assert_parse_error_no_ast(
+        "ASK { ?s ?p ?o } SELECT * WHERE { ?s ?p ?o }",
+        "unexpected trailing tokens",
+    );
+}
+
+#[test]
+fn test_multi_operation_update_rejected_loudly() {
+    // Issue #1438: `INSERT ...; DELETE ...` used to parse as the INSERT
+    // alone, silently discarding every following operation (silent data
+    // loss at commit time). Until PR-U2 adds real multi-op support, the
+    // request must fail loudly (D-10a interim guard) — and the AST must be
+    // suppressed, or a caller of the public `lower_sparql_update_ast` that
+    // skips `has_errors()` would still stage the first operation alone.
+    assert_parse_error_no_ast(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { ex:s ex:p 1 } ; DELETE DATA { ex:s ex:p 1 }",
+        "multi-operation SPARQL UPDATE",
+    );
+    assert_parse_error_no_ast(
+        "PREFIX ex: <http://example.org/> \
+         INSERT DATA { ex:s ex:p 1 } ; INSERT DATA { ex:s ex:p 2 }",
+        "multi-operation SPARQL UPDATE",
+    );
+}
+
+#[test]
+fn test_single_trailing_semicolon_after_update_is_legal() {
+    // Update ::= Prologue ( Update1 ( ';' Update )? )? — the recursive
+    // Update may be empty, so one trailing ';' is valid SPARQL.
+    assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
+    // ...but only one.
+    assert_parse_error_no_ast(
+        "PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ; ;",
+        "multi-operation SPARQL UPDATE",
+    );
 }

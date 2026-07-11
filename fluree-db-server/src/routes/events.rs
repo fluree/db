@@ -101,7 +101,7 @@ fn graph_source_event_id(resource_id: &str, record: &GraphSourceRecord) -> Strin
     let config_hash = sha256_short(&record.config);
     format!(
         "graph-source:{}:{}:{}",
-        resource_id, record.index_t, &config_hash
+        resource_id, record.index_t, config_hash
     )
 }
 

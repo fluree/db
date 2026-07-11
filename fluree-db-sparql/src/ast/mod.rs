@@ -31,7 +31,10 @@ pub mod term;
 pub mod update;
 
 // Re-export commonly used types at the ast module level
-pub use annotation::{Annotation, AnnotationBlock, AnnotationEntry, ReifierId, TripleTerm};
+pub use annotation::{
+    Annotation, AnnotationBlock, AnnotationEntry, AnnotationUnit, AnnotationVerb, ReifierId,
+    TripleTerm,
+};
 pub use expr::{AggregateFunction, BinaryOp, Expression, FunctionName, UnaryOp};
 pub use path::{NegatedPredicate, PropertyPath};
 pub use pattern::{GraphName, GraphPattern, TriplePattern};
@@ -44,7 +47,7 @@ pub use query::{
 };
 pub use term::{
     BlankNode, BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm,
-    QuotedTriple, Spanned, SubjectTerm, Term, Var,
+    QtReifier, QuotedTriple, Spanned, SubjectTerm, Term, Var,
 };
 pub use update::{
     DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,

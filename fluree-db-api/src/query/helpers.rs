@@ -448,10 +448,22 @@ macro_rules! r2rml_provider {
 pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
     let parse_output = fluree_db_sparql::parse_sparql(sparql);
 
-    // Parse errors: no AST, return ApiError::sparql with structured diagnostics.
+    // Parse errors: return ApiError::sparql with structured diagnostics.
+    //
+    // Error-severity diagnostics are authoritative EVEN WHEN the parser's
+    // error recovery produced an AST. A recovered AST silently drops or
+    // rewrites exactly the parts of the query the parser flagged, so
+    // executing it answers a different question than the user asked
+    // (docs/audit/burn-down/ROADMAP.md §1 addendum: the API previously
+    // swallowed these diagnostics whenever an AST survived recovery).
+    // Recovery itself is unchanged — `parse_sparql` still returns the AST
+    // plus diagnostics for tooling — and warning-severity diagnostics never
+    // reject. The SPARQL UPDATE path (tx_builder::parse_and_lower_sparql_update)
+    // already enforces the same rule.
+    let has_parse_errors = parse_output.has_errors();
     let ast = match parse_output.ast {
-        Some(ast) => ast,
-        None => {
+        Some(ast) if !has_parse_errors => ast,
+        _ => {
             let errors: Vec<_> = parse_output
                 .diagnostics
                 .into_iter()

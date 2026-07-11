@@ -90,6 +90,11 @@ impl super::Parser<'_> {
         }
 
         let mut triples: Vec<TriplePattern> = Vec::new();
+        // Standalone reified triples (`<< s p o ~ r? >> .`) desugar to
+        // `GraphPattern::AnnotationTarget` nodes; they ride alongside
+        // the plain-triples BGP (SPARQL 1.2 allows `ReifiedTriple` with
+        // an empty property list inside the shorthand's TriplesTemplate).
+        let mut reified_targets: Vec<GraphPattern> = Vec::new();
 
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
             let subject = match self.parse_subject() {
@@ -101,7 +106,15 @@ impl super::Parser<'_> {
                 }
             };
 
-            self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            if matches!(&subject, crate::ast::SubjectTerm::QuotedTriple(_)) && !self.is_verb_start()
+            {
+                let crate::ast::SubjectTerm::QuotedTriple(qt) = subject else {
+                    unreachable!("matched QuotedTriple above")
+                };
+                reified_targets.push(self.reified_triple_to_annotation_target(qt));
+            } else {
+                self.parse_construct_predicate_object_list(&subject, &mut triples)?;
+            }
 
             // Optional triple separator
             self.stream.match_token(&TokenKind::Dot);
@@ -114,11 +127,30 @@ impl super::Parser<'_> {
         }
 
         let span = start.union(self.stream.previous_span());
-        let bgp = GraphPattern::Bgp {
-            patterns: triples,
-            span,
+        let pattern = if reified_targets.is_empty() {
+            GraphPattern::Bgp {
+                patterns: triples,
+                span,
+            }
+        } else {
+            // Mirror `parse_group_graph_pattern`'s shape: the Group
+            // corresponds to the shorthand's explicit `{ }` braces.
+            let mut patterns: Vec<GraphPattern> = Vec::new();
+            if !triples.is_empty() {
+                let bgp_span = super::span_of_triples(&triples);
+                patterns.push(GraphPattern::Bgp {
+                    patterns: triples,
+                    span: bgp_span,
+                });
+            }
+            patterns.append(&mut reified_targets);
+            if patterns.len() == 1 {
+                patterns.remove(0)
+            } else {
+                GraphPattern::Group { patterns, span }
+            }
         };
-        Some(WhereClause::new(bgp, true, span))
+        Some(WhereClause::new(pattern, true, span))
     }
 
     /// Parse a CONSTRUCT template (the triples to build).

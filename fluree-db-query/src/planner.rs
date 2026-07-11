@@ -3274,7 +3274,7 @@ mod tests {
         assert!(
             matches!(&reordered[2], Pattern::Minus(_)),
             "MINUS should be placed after sources, got: {:?}",
-            &reordered[2]
+            reordered[2]
         );
     }
 
@@ -3369,7 +3369,7 @@ mod tests {
         assert!(
             matches!(&reordered[0], Pattern::Union(_)),
             "Selective UNION should be placed before unselective triple, got: {:?}",
-            &reordered[0]
+            reordered[0]
         );
     }
 

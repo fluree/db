@@ -52,7 +52,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     /// Dispatch on path type to produce the appropriate pattern(s).
-    fn lower_path_dispatch(
+    ///
+    /// `pub(super)` so the annotation-block lowering can reuse it for
+    /// path verbs inside `{| ... |}` bodies (subject = the reifier).
+    pub(super) fn lower_path_dispatch(
         &mut self,
         s: &Ref,
         path: &SparqlPropertyPath,

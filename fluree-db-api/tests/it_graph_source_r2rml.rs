@@ -491,8 +491,8 @@ async fn e2e_r2rml_query_iceberg_table() {
                         eprintln!(
                             "  Row {}: name={:?}, country={:?}",
                             batch_idx * 1000 + row_idx,
-                            &name_col[row_idx],
-                            &country_col[row_idx]
+                            name_col[row_idx],
+                            country_col[row_idx]
                         );
                     }
                 }
@@ -694,8 +694,8 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
                         eprintln!(
                             "  Row {}: name={:?}, country={:?}",
                             i * 1000 + row_idx,
-                            &name_col[row_idx],
-                            &country_col[row_idx]
+                            name_col[row_idx],
+                            country_col[row_idx]
                         );
                     }
                 }

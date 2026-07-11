@@ -25,6 +25,8 @@ mod it_query_fulltext;
 mod it_query_geo;
 #[path = "it_query_geo_search.rs"]
 mod it_query_geo_search;
+#[path = "it_query_grouping.rs"]
+mod it_query_grouping;
 #[path = "it_query_jsonld.rs"]
 mod it_query_jsonld;
 #[path = "it_query_jsonld_basic.rs"]

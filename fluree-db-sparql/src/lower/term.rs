@@ -88,25 +88,28 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Ref::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:b{}", self.vars.len()));
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Ref::Var(var_id))
                 }
             },
             SubjectTerm::QuotedTriple(_qt) => {
-                // This path is reached when a quoted triple appears in a context
-                // other than a top-level BGP subject with f:t/f:op predicates.
+                // This path is reached when a quoted triple appears in a
+                // context without a reified-triple desugaring hook.
                 //
-                // Supported case (handled in lower_bgp_with_rdf_star):
-                //   << ex:s ex:p ?o >> f:t ?t ; f:op ?op .
+                // Supported cases (handled elsewhere):
+                //   - legacy history form `<< s p ?o >> f:t ?t` and RDF 1.2
+                //     reified-triple subjects/objects in BGPs
+                //     (lower_bgp_with_rdf_star / lower/annotation.rs);
+                //   - standalone reified triples (`GraphPattern::
+                //     AnnotationTarget`).
                 //
-                // Unsupported cases that reach this error:
-                //   - Nested quoted triples: << << ex:s ex:p ?o >> ex:annotatedBy ?who >> ...
-                //   - Quoted triples in property paths: ?s ex:path+/<< ex:s ex:p ?o >> ...
-                //   - Quoted triples converted to generic Term in unsupported contexts
-                //
-                // Full RDF-star support would require reifying quoted triples.
+                // Unsupported cases that reach this error (deferred per
+                // burn-down decision D-1, accept-then-defer):
+                //   - quoted triples as property-path subjects;
+                //   - quoted triples as the reifier subject of rdf:reifies;
+                //   - CONSTRUCT/UPDATE template positions.
                 Err(LowerError::not_implemented(
-                    "RDF-star quoted triples in this context (only top-level BGP with f:t/f:op annotations supported)",
+                    "RDF-star quoted triples in this position",
                     term.span(),
                 ))
             }
@@ -140,10 +143,21 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Term::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:b{}", self.vars.len()));
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Term::Var(var_id))
                 }
             },
+            SparqlTerm::QuotedTriple(qt) => {
+                // Reified-triple objects are desugared by
+                // `lower_object_desugared` before this is reached on
+                // the BGP/annotation paths; positions without a
+                // desugaring context (e.g. property-path objects)
+                // defer cleanly.
+                Err(LowerError::not_implemented(
+                    "RDF 1.2 reified triples (`<< s p o >>`) in this position",
+                    qt.span,
+                ))
+            }
         }
     }
 
@@ -173,6 +187,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::Iri(iri) => Ok((self.lower_iri(iri)?, None)),
             SparqlTerm::Literal(lit) => self.lower_literal_with_constraint(lit),
             SparqlTerm::BlankNode(_) => Ok((self.lower_object(term)?, None)),
+            SparqlTerm::QuotedTriple(_) => Ok((self.lower_object(term)?, None)),
         }
     }
 
@@ -500,6 +515,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // Blank nodes in VALUES treated as unbound
                 Ok(Binding::Unbound)
             }
+            SparqlTerm::QuotedTriple(qt) => Err(LowerError::not_implemented(
+                "RDF 1.2 reified triples (`<< s p o >>`) as VALUES data",
+                qt.span,
+            )),
         }
     }
 }

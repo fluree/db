@@ -30,9 +30,16 @@ use fluree_db_transact::{
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
 
-/// Parse a SPARQL UPDATE string and lower it to the transaction IR against
-/// a snapshot's namespace registry. Errors map to HTTP 400 with the same
-/// shape the two builder paths previously emitted.
+/// Parse, validate, and lower a SPARQL UPDATE string to the transaction IR
+/// against a snapshot's namespace registry. Parse/lowering errors map to
+/// HTTP 400 with the same shape the two builder paths previously emitted;
+/// validation errors use the query seam's structured [`ApiError::sparql`]
+/// shape (the server maps both to 400).
+///
+/// This is the single production funnel for SPARQL UPDATE (both transact
+/// builders, and through them the HTTP route, consensus appliers, and CLI),
+/// so running `validate()` here means validator-side UPDATE rules apply to
+/// real updates — not only inside the W3C harness's own `validate()` call.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
     snapshot: &LedgerSnapshot,
@@ -49,6 +56,30 @@ pub(crate) fn parse_and_lower_sparql_update(
     let ast = parsed
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
+
+    // Validation errors: the same `validate()` pass the query seam runs
+    // (helpers::parse_and_validate_sparql), differing only in admitting
+    // Fluree's documented DELETE WHERE extensions (existential blank nodes;
+    // anonymous annotation tails), which the strict W3C default rejects but
+    // the transact surface has always supported. Error-severity diagnostics
+    // reject before lowering — so validator-only rules (e.g. variables in
+    // INSERT/DELETE DATA, which previously lowered to never-bindable
+    // template variables and silently no-op'd) fail loudly; warnings never
+    // reject. The lowering keeps its own mirrors as defense-in-depth for
+    // direct `lower_sparql_update_ast` callers.
+    let capabilities = fluree_db_sparql::Capabilities::with_delete_where_extensions();
+    let errors: Vec<_> = fluree_db_sparql::validate(&ast, &capabilities)
+        .into_iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .collect();
+    if !errors.is_empty() {
+        let message = errors
+            .first()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "SPARQL UPDATE validation error".to_string());
+        return Err(ApiError::sparql(message, errors));
+    }
+
     let mut ns = NamespaceRegistry::from_db(snapshot);
     lower_sparql_update_ast(&ast, &mut ns, txn_opts)
         .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))

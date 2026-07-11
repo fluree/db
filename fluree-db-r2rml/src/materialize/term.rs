@@ -832,9 +832,9 @@ pub fn get_join_key_from_batch(
 ) -> Option<Vec<String>> {
     let mut key_values = Vec::with_capacity(child_columns.len());
     for col_name in child_columns {
-        match column_value_as_string(batch, col_name, row_idx) {
-            Some(v) => key_values.push(v),
-            None => return None, // Null in join key means no match
+        {
+            let v = column_value_as_string(batch, col_name, row_idx)?;
+            key_values.push(v);
         }
     }
     Some(key_values)

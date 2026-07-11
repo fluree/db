@@ -177,6 +177,139 @@ impl Expression {
             _ => self,
         }
     }
+
+    /// Walk this expression tree pre-order (visiting `self` first), calling
+    /// `f` on every nested sub-expression.
+    ///
+    /// Does **not** descend into `EXISTS` / `NOT EXISTS` graph patterns:
+    /// those introduce a pattern scope, not an expression scope, so their
+    /// contents are never sub-expressions of the surrounding expression
+    /// (an aggregate inside an EXISTS filter belongs to the inner scope,
+    /// and its variables are not free variables of this expression).
+    pub fn walk<'a>(&'a self, f: &mut impl FnMut(&'a Expression)) {
+        f(self);
+        match self {
+            Expression::Var(_) | Expression::Literal(_) | Expression::Iri(_) => {}
+            Expression::Binary { left, right, .. } => {
+                left.walk(f);
+                right.walk(f);
+            }
+            Expression::Unary { operand, .. } => operand.walk(f),
+            Expression::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.walk(f);
+                }
+            }
+            Expression::If {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                condition.walk(f);
+                then_expr.walk(f);
+                else_expr.walk(f);
+            }
+            Expression::Coalesce { args, .. } => {
+                for arg in args {
+                    arg.walk(f);
+                }
+            }
+            Expression::In { expr, list, .. } => {
+                expr.walk(f);
+                for item in list {
+                    item.walk(f);
+                }
+            }
+            Expression::Exists { .. } | Expression::NotExists { .. } => {}
+            Expression::Aggregate { expr, .. } => {
+                if let Some(inner) = expr {
+                    inner.walk(f);
+                }
+            }
+            Expression::Bracketed { inner, .. } => inner.walk(f),
+        }
+    }
+
+    /// True if this expression contains an aggregate call (`COUNT`, `SUM`,
+    /// `AVG`, `MIN`, `MAX`, `GROUP_CONCAT`, `SAMPLE`) at this expression's
+    /// scope level. Does not look inside `EXISTS`/`NOT EXISTS` patterns
+    /// (see [`Expression::walk`]).
+    pub fn contains_aggregate(&self) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| {
+            if matches!(e, Expression::Aggregate { .. }) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    /// Collect every variable referenced by this expression, including
+    /// variables inside aggregate arguments. Variables inside
+    /// `EXISTS`/`NOT EXISTS` patterns are excluded (see
+    /// [`Expression::walk`]). Duplicates are preserved in visit order.
+    pub fn variables(&self) -> Vec<&Var> {
+        let mut vars = Vec::new();
+        self.walk(&mut |e| {
+            if let Expression::Var(v) = e {
+                vars.push(v);
+            }
+        });
+        vars
+    }
+
+    /// Collect the variables of this expression that appear **outside** any
+    /// aggregate call. These are the variables that, in a grouped query,
+    /// must each be a group key for the expression to be valid in a
+    /// projection (SPARQL 1.1 §18.2.4 / grammar note on `SelectClause`).
+    pub fn unaggregated_variables(&self) -> Vec<&Var> {
+        let mut vars = Vec::new();
+        self.collect_unaggregated_variables(&mut vars);
+        vars
+    }
+
+    fn collect_unaggregated_variables<'a>(&'a self, out: &mut Vec<&'a Var>) {
+        match self {
+            Expression::Var(v) => out.push(v),
+            Expression::Literal(_) | Expression::Iri(_) => {}
+            Expression::Binary { left, right, .. } => {
+                left.collect_unaggregated_variables(out);
+                right.collect_unaggregated_variables(out);
+            }
+            Expression::Unary { operand, .. } => operand.collect_unaggregated_variables(out),
+            Expression::FunctionCall { args, .. } => {
+                for arg in args {
+                    arg.collect_unaggregated_variables(out);
+                }
+            }
+            Expression::If {
+                condition,
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                condition.collect_unaggregated_variables(out);
+                then_expr.collect_unaggregated_variables(out);
+                else_expr.collect_unaggregated_variables(out);
+            }
+            Expression::Coalesce { args, .. } => {
+                for arg in args {
+                    arg.collect_unaggregated_variables(out);
+                }
+            }
+            Expression::In { expr, list, .. } => {
+                expr.collect_unaggregated_variables(out);
+                for item in list {
+                    item.collect_unaggregated_variables(out);
+                }
+            }
+            Expression::Exists { .. } | Expression::NotExists { .. } => {}
+            // Variables inside an aggregate argument are aggregated — skip.
+            Expression::Aggregate { .. } => {}
+            Expression::Bracketed { inner, .. } => inner.collect_unaggregated_variables(out),
+        }
+    }
 }
 
 /// Binary operators.
@@ -512,6 +645,138 @@ mod tests {
 
         // Unknown returns None
         assert_eq!(FunctionName::parse("UNKNOWN"), None);
+    }
+
+    fn var_expr(name: &str) -> Expression {
+        Expression::var(Var::new(name, test_span()))
+    }
+
+    fn count_of(expr: Expression) -> Expression {
+        Expression::Aggregate {
+            function: AggregateFunction::Count,
+            expr: Some(Box::new(expr)),
+            distinct: false,
+            separator: None,
+            span: test_span(),
+        }
+    }
+
+    #[test]
+    fn test_contains_aggregate() {
+        // Plain variable: no aggregate
+        assert!(!var_expr("x").contains_aggregate());
+
+        // Aggregate directly
+        assert!(count_of(var_expr("x")).contains_aggregate());
+
+        // Aggregate nested under arithmetic: (1 + COUNT(?x))
+        let sum = Expression::binary(
+            BinaryOp::Add,
+            Expression::literal(Literal::integer(1, test_span())),
+            count_of(var_expr("x")),
+            test_span(),
+        );
+        assert!(sum.contains_aggregate());
+
+        // Aggregate nested inside a function call argument
+        let call = Expression::function_call(
+            FunctionName::Str,
+            vec![count_of(var_expr("x"))],
+            test_span(),
+        );
+        assert!(call.contains_aggregate());
+
+        // COUNT(*) (no argument) is still an aggregate
+        let count_star = Expression::Aggregate {
+            function: AggregateFunction::Count,
+            expr: None,
+            distinct: false,
+            separator: None,
+            span: test_span(),
+        };
+        assert!(count_star.contains_aggregate());
+    }
+
+    #[test]
+    fn test_variables_collects_all_references() {
+        // (?a + COUNT(?b)) — both ?a and ?b are referenced
+        let expr = Expression::binary(
+            BinaryOp::Add,
+            var_expr("a"),
+            count_of(var_expr("b")),
+            test_span(),
+        );
+        let names: Vec<_> = expr.variables().iter().map(|v| v.name.as_ref()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_unaggregated_variables_skips_aggregate_args() {
+        // (?a + COUNT(?b)) — only ?a is unaggregated
+        let expr = Expression::binary(
+            BinaryOp::Add,
+            var_expr("a"),
+            count_of(var_expr("b")),
+            test_span(),
+        );
+        let names: Vec<_> = expr
+            .unaggregated_variables()
+            .iter()
+            .map(|v| v.name.as_ref())
+            .collect();
+        assert_eq!(names, vec!["a"]);
+
+        // Fully aggregated: COUNT(?b) has no unaggregated variables
+        assert!(count_of(var_expr("b")).unaggregated_variables().is_empty());
+
+        // Bracketed wrapper is transparent: ((?a)) -> [?a]
+        let bracketed = Expression::Bracketed {
+            inner: Box::new(Expression::Bracketed {
+                inner: Box::new(var_expr("a")),
+                span: test_span(),
+            }),
+            span: test_span(),
+        };
+        let names: Vec<_> = bracketed
+            .unaggregated_variables()
+            .iter()
+            .map(|v| v.name.as_ref())
+            .collect();
+        assert_eq!(names, vec!["a"]);
+    }
+
+    #[test]
+    fn test_walk_detects_nested_aggregate() {
+        // COUNT(COUNT(?x)) — walking the outer aggregate's argument finds
+        // the inner aggregate (the SPARQL 1.2 nested-aggregate error case).
+        let nested = count_of(count_of(var_expr("x")));
+        let mut inner_aggregate_in_arg = false;
+        nested.walk(&mut |e| {
+            if let Expression::Aggregate {
+                expr: Some(inner), ..
+            } = e
+            {
+                if inner.contains_aggregate() {
+                    inner_aggregate_in_arg = true;
+                }
+            }
+        });
+        assert!(inner_aggregate_in_arg);
+
+        // Non-nested aggregate does not trip the detector
+        let flat = count_of(var_expr("x"));
+        let mut found = false;
+        flat.walk(&mut |e| {
+            if let Expression::Aggregate {
+                expr: Some(inner), ..
+            } = e
+            {
+                if inner.contains_aggregate() {
+                    found = true;
+                }
+            }
+        });
+        assert!(!found);
     }
 
     #[test]

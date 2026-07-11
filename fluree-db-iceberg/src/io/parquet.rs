@@ -33,7 +33,7 @@ use crate::metadata::Schema;
 use crate::scan::FileScanTask;
 
 /// Parquet magic bytes (footer ends with "PAR1").
-const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 
 /// Maximum file size for sparse buffer allocation (64MB).
 ///

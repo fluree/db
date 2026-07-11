@@ -635,20 +635,26 @@ async fn sparql_order_by_expression_dedup_only_group_by() {
 
 #[tokio::test]
 async fn sparql_group_by_datatype_expression_collapses() {
-    // Issue #1362: `GROUP BY DATATYPE(?v)` directly on an expression must collapse
-    // to one row per distinct datatype (here all favNums are xsd:integer, so a
-    // single group), matching the behavior of `GROUP BY (LCASE(?x))` and of
-    // `BIND(DATATYPE(?v) AS ?dt) ... GROUP BY ?dt`. Previously it returned one row
-    // per binding (group key not collapsed) and LIMIT did not cap the output.
+    // Issue #1362: grouping by a DATATYPE(?v) expression must collapse to one
+    // row per distinct datatype (here all favNums are xsd:integer, so a
+    // single group), matching `BIND(DATATYPE(?v) AS ?dt) ... GROUP BY ?dt`.
+    // Previously it returned one row per binding (group key not collapsed)
+    // and LIMIT did not cap the output.
+    //
+    // PR-2 (V4) note: the original unaliased form — `GROUP BY DATATYPE(?v)`
+    // with `SELECT (DATATYPE(?v) AS ?dt)` re-projecting the key expression —
+    // is the W3C agg08 negative-syntax shape and is now rejected (see
+    // sparql_group_by_reprojected_key_expression_rejected below). The
+    // spec-valid spelling aliases the key: `GROUP BY (expr AS ?dt)`.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "people:main").await;
 
     let query = r"
         PREFIX person: <http://example.org/Person#>
-        SELECT (DATATYPE(?favNum) AS ?dt) (COUNT(?favNum) AS ?n)
+        SELECT ?dt (COUNT(?favNum) AS ?n)
         WHERE { ?person person:favNums ?favNum }
-        GROUP BY DATATYPE(?favNum)
+        GROUP BY (DATATYPE(?favNum) AS ?dt)
         LIMIT 10
     ";
 
@@ -661,6 +667,35 @@ async fn sparql_group_by_datatype_expression_collapses() {
         rows.len(),
         1,
         "GROUP BY DATATYPE(?v) should collapse to one group, got: {jsonld}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_group_by_reprojected_key_expression_rejected() {
+    // PR-2 (V4) migration pin: re-projecting an UNALIASED GROUP BY key
+    // expression (`GROUP BY (expr)` + `SELECT (expr AS ?k)`) is the W3C
+    // agg08 negative-syntax shape — the expression is the key, not its
+    // variables — and is now a hard validation error. The migration is to
+    // alias the key in GROUP BY (see the two tests around this one).
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "people:main").await;
+
+    let query = r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT (DATATYPE(?favNum) AS ?dt) (COUNT(?favNum) AS ?n)
+        WHERE { ?person person:favNums ?favNum }
+        GROUP BY DATATYPE(?favNum)
+        LIMIT 10
+    ";
+
+    let err = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect_err("re-projected unaliased group-key expression must be rejected");
+    assert!(
+        err.to_string()
+            .contains("neither a GROUP BY key nor aggregated"),
+        "unexpected error: {err}"
     );
 }
 
@@ -690,11 +725,13 @@ async fn sparql_group_by_datatype_expression_collapses_decimal() {
         .expect("insert+commit should succeed")
         .ledger;
 
+    // Spec-valid spelling (PR-2 / V4): the key expression is aliased in
+    // GROUP BY and the alias is projected.
     let query = r"
         PREFIX ex: <http://example.org/>
-        SELECT (DATATYPE(?v) AS ?dt) (COUNT(?v) AS ?n)
+        SELECT ?dt (COUNT(?v) AS ?n)
         WHERE { ?s ex:amount ?v }
-        GROUP BY DATATYPE(?v)
+        GROUP BY (DATATYPE(?v) AS ?dt)
         LIMIT 10
     ";
 
@@ -2137,7 +2174,16 @@ async fn sparql_optional_multi_pattern_requires_conjunctive_match() {
 }
 
 #[tokio::test]
-async fn sparql_group_by_with_optional_preserves_grouped_lists() {
+async fn sparql_group_by_with_optional_ungrouped_projection_rejected() {
+    // PR-2 (V4) migration pin: this test previously asserted Fluree's
+    // grouped-list extension on the SPARQL surface — `SELECT ?person
+    // ?favNums ... GROUP BY ?person` returning ?favNums as a per-group
+    // list. That is the W3C group06 negative-syntax shape (a projected
+    // variable that is neither a group key nor aggregated) and is now a
+    // hard validation error on the SPARQL surface. Grouped-list projection
+    // remains available on the JSON-LD analytical surface (pinned in
+    // it_query_grouping.rs / it_query_aggregates.rs); SPARQL callers
+    // aggregate explicitly (GROUP_CONCAT / SAMPLE / COUNT).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "people:main";
@@ -2154,16 +2200,39 @@ async fn sparql_group_by_with_optional_preserves_grouped_lists() {
         GROUP BY ?person
     ";
 
+    let err = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect_err("ungrouped projected variable must be rejected");
+    assert!(
+        err.to_string()
+            .contains("neither a GROUP BY key nor aggregated"),
+        "unexpected error: {err}"
+    );
+
+    // Spec-valid equivalent of the original intent: OPTIONAL-produced
+    // unbound values flow through grouping — COUNT over the optional var is
+    // 0 for the group with no bindings, not a dropped row.
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?person (COUNT(?favNums) AS ?n)
+        WHERE {
+          ?person person:handle ?handle .
+          OPTIONAL { ?person person:favNums ?favNums . }
+        }
+        GROUP BY ?person
+    ";
+
     let result = support::query_sparql(&fluree, &ledger, query)
         .await
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
     let expected = json!([
-        ["ex:bbob", [23]],
-        ["ex:fbueller", [null]],
-        ["ex:jbob", [0, 3, 5, 6, 7, 8, 9]],
-        ["ex:jdoe", [3, 7, 42, 99]]
+        ["ex:bbob", 1],
+        ["ex:fbueller", 0],
+        ["ex:jbob", 7],
+        ["ex:jdoe", 4]
     ]);
 
     assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected));
@@ -2450,15 +2519,43 @@ async fn sparql_concat_function_formats_strings() {
 
 #[tokio::test]
 async fn sparql_mix_of_grouped_values_and_aggregates() {
+    // PR-2 (V4) migration pin: this test previously ALSO projected the raw
+    // ?favNums alongside the aggregates (Fluree's grouped-list extension on
+    // the SPARQL surface) — the W3C group06/agg09 negative-syntax shape,
+    // now a hard validation error (asserted below). The multi-key grouping
+    // with multiple aggregates it pinned remains, spec-valid, here; the
+    // grouped-list projection remains available on the JSON-LD analytical
+    // surface (it_query_grouping.rs / it_query_aggregates.rs).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "people:main";
     let ledger = seed_people(&fluree, ledger_id).await;
 
+    let err = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"
+        PREFIX person: <http://example.org/Person#>
+        SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
+        WHERE {
+          ?person person:handle ?handle .
+          ?person person:favNums ?favNums .
+        }
+        GROUP BY ?person ?handle
+    ",
+    )
+    .await
+    .expect_err("ungrouped ?favNums projection must be rejected");
+    assert!(
+        err.to_string()
+            .contains("neither a GROUP BY key nor aggregated"),
+        "unexpected error: {err}"
+    );
+
     let query = r"
         PREFIX ex: <http://example.org/ns/>
         PREFIX person: <http://example.org/Person#>
-        SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
+        SELECT (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
         WHERE {
           ?person person:handle ?handle .
           ?person person:favNums ?favNums .
@@ -2471,60 +2568,40 @@ async fn sparql_mix_of_grouped_values_and_aggregates() {
         .unwrap();
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
 
-    let mut rows: Vec<(String, String, Vec<i64>, f64, i64)> = normalize_rows(&jsonld)
+    let mut rows: Vec<(String, String, f64, i64)> = normalize_rows(&jsonld)
         .into_iter()
         .map(|row| {
-            let fav_nums = row[0]
-                .as_array()
-                .expect("favNums array")
-                .iter()
-                .map(|v| v.as_i64().expect("favNum"))
-                .collect::<Vec<_>>();
             // AVG of integers → xsd:decimal (JSON string).
-            let avg: f64 = row[1]
+            let avg: f64 = row[0]
                 .as_str()
                 .expect("avg as decimal string")
                 .parse()
                 .expect("parses");
-            let person = row[2].as_str().expect("person").to_string();
-            let handle = row[3].as_str().expect("handle").to_string();
-            let max = row[4].as_i64().expect("max");
-            (person, handle, fav_nums, avg, max)
+            let person = row[1].as_str().expect("person").to_string();
+            let handle = row[2].as_str().expect("handle").to_string();
+            let max = row[3].as_i64().expect("max");
+            (person, handle, avg, max)
         })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
 
     let expected = [
-        (
-            "ex:bbob".to_string(),
-            "bbob".to_string(),
-            vec![23],
-            23.0,
-            23,
-        ),
+        ("ex:bbob".to_string(), "bbob".to_string(), 23.0, 23),
         (
             "ex:jbob".to_string(),
             "jbob".to_string(),
-            vec![0, 3, 5, 6, 7, 8, 9],
             5.428_571_428_571_429,
             9,
         ),
-        (
-            "ex:jdoe".to_string(),
-            "jdoe".to_string(),
-            vec![3, 7, 42, 99],
-            37.75,
-            99,
-        ),
+        ("ex:jdoe".to_string(), "jdoe".to_string(), 37.75, 99),
     ];
 
     assert_eq!(rows.len(), expected.len());
     for (actual, target) in rows.iter().zip(expected.iter()) {
         assert_eq!(actual.0, target.0);
         assert_eq!(actual.1, target.1);
-        assert_eq!(actual.2, target.2);
-        assert!((actual.3 - target.3).abs() < 1e-12);
-        assert_eq!(actual.4, target.4);
+        assert!((actual.2 - target.2).abs() < 1e-12);
+        assert_eq!(actual.3, target.3);
     }
 }
 
@@ -5453,19 +5530,26 @@ async fn seed_currency_line_items(fluree: &MemoryFluree, ledger_id: &str) -> Mem
 
 #[tokio::test]
 async fn sparql_group_by_expression_collapses_and_honors_limit() {
-    // Field P0 repro: `GROUP BY (LCASE(?cur))` with the same expression aliased
-    // in the SELECT must collapse to one row per distinct expression value, and
-    // LIMIT must bound the result. The buggy behavior returned one row per input
-    // binding (10 rows) with LIMIT ignored.
+    // Field P0 repro: grouping by an `LCASE(?cur)` expression must collapse
+    // to one row per distinct expression value, and LIMIT must bound the
+    // result. The buggy behavior returned one row per input binding (10
+    // rows) with LIMIT ignored.
+    //
+    // PR-2 (V4) note: the field's original spelling — `GROUP BY (LCASE(?cur))`
+    // re-projected as `SELECT (LCASE(?cur) AS ?k)` — is the W3C agg08
+    // negative-syntax shape and is now a hard validation error (see
+    // sparql_group_by_reprojected_key_expression_rejected). The spec-valid
+    // migration aliases the key in GROUP BY, asserted here; the
+    // BIND-then-GROUP-BY control below is also still valid.
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_currency_line_items(&fluree, "currency:main").await;
 
     let query = r"
         PREFIX ex: <http://example.org/ns/>
-        SELECT (LCASE(?cur) AS ?k) (COUNT(?s) AS ?n)
+        SELECT ?k (COUNT(?s) AS ?n)
         WHERE { ?s a ex:LineItem ; ex:currency ?cur }
-        GROUP BY (LCASE(?cur))
+        GROUP BY (LCASE(?cur) AS ?k)
         ORDER BY DESC(?n)
         LIMIT 15
     ";

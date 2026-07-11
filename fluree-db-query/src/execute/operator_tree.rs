@@ -1582,10 +1582,9 @@ fn detect_predicate_sum_string_fn(query: &Query) -> Option<(Ref, StringFoldAgg, 
             Expression::Call { .. } => {
                 if let Some(needle) = var_const_args(Function::StrBefore, args) {
                     StringFoldAgg::SumStrlenBefore { needle }
-                } else if let Some(needle) = var_const_args(Function::StrAfter, args) {
-                    StringFoldAgg::SumStrlenAfter { needle }
                 } else {
-                    return None;
+                    let needle = var_const_args(Function::StrAfter, args)?;
+                    StringFoldAgg::SumStrlenAfter { needle }
                 }
             }
             _ => return None,
