@@ -118,17 +118,24 @@ jobs:
         run: cargo test
 
   bench-compare:
-    # Cheap per-PR perf gate (speed-first repo — a real gate, not advisory).
-    # Runs only the two cheapest benches at tiny/quick and compares against the
-    # committed baseline; exit 1 on any regression-budget.json breach. The full
-    # workspace compare (all benches, +medium) runs nightly in bench.yml. The
-    # committed baseline (bench-baselines/guardrails-pre.json) contains exactly
-    # this cheap subset, so `compare` needs no `--only` filter.
+    # Cheap per-PR perf gate. Runs the two cheapest benches at tiny/quick and
+    # compares against the committed baseline. MEMORY breaches FAIL the job
+    # (peak_mem is comparable cross-machine — reviewer measured ±2.2%); wall-clock
+    # TIME breaches are ADVISORY (::warning:: annotations, non-gating) because the
+    # committed baseline is runner_class=local and shared ubuntu-latest runners
+    # flap — a 10% time budget on a single PR run false-positives (BENCHMARKING.md,
+    # "Baselines: capture & compare"). Once a ci-* baseline is committed (via
+    # bench.yml's workflow_dispatch capture job) the runner classes match and time
+    # enforces automatically. The committed baseline contains exactly this cheap
+    # subset, so `compare` needs no `--only`. Full workspace + medium: nightly.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
+      # CI-class marker: baseline is runner_class=local, so compare auto-treats
+      # time as advisory and enforces only memory.
+      FLUREE_BENCH_RUNNER_CLASS: ci-ubuntu-latest
     steps:
       - name: Free disk space
         run: |
@@ -145,13 +152,18 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Run the two cheap benches (writes criterion timings + memory sidecars).
+      # Clear stale memory sidecars first: rust-cache persists target/ across
+      # runs, and compare must not merge a mem number from a bench not rerun
+      # this session (review item 10). Then run the two cheap benches (writes
+      # criterion timings + fresh memory sidecars).
       - name: Run cheap benches (tiny, quick)
         run: |
+          rm -rf target/fluree-bench-mem
           cargo bench -p fluree-db-api --bench query_overlay_matrix
           cargo bench -p fluree-db-api --bench query_hot_bsbm
 
-      # Compare against the committed baseline; exits 1 on any budget breach.
+      # Compare against the committed baseline: exit 1 on any MEMORY breach;
+      # cross-machine time breaches print as ::warning:: annotations only.
       - name: Compare against committed baseline
         run: |
           cargo run -p fluree-bench-support --bin bench-baseline -- \
