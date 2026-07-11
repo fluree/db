@@ -3716,12 +3716,27 @@ impl Operator for FastPathOperator {
 
         if let Some(compute) = self.compute.take() {
             if let Some(batch) = compute(ctx)? {
+                // Kept for existing span-capture consumers (it_minmax_fast_path_fired
+                // asserts on this message + `label`).
                 tracing::debug!(label = self.label, "fast path produced result");
+                // EXPLAIN seed (PR-1): structured runtime Proceed on the
+                // fluree::fastpath target.
+                crate::fast_path_outcome::stamp_fast_path(
+                    self.label,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
                 self.state = OperatorState::Open;
                 self.fallback = Some(Box::new(PrecomputedSingleBatchOperator::new(batch)));
                 return Ok(());
             }
             tracing::debug!(label = self.label, "fast path declined; running fallback");
+            // EXPLAIN seed (PR-1): structured runtime Fallback(GateDeclined).
+            crate::fast_path_outcome::stamp_fast_path(
+                self.label,
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                ),
+            );
         }
 
         let Some(fallback) = &mut self.fallback else {

@@ -55,6 +55,7 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::stats_query::stats_count_by_predicate_operator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -2274,6 +2275,17 @@ fn build_operator_tree_inner(
     // below alike.
     let fast_paths_globally_disabled = fast_paths_disabled();
     let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // EXPLAIN seed (PR-1): record whether the kill switch suppressed the fused
+    // fast-path chain at this gate. TODO(PR-3): per-detector verdicts, not one
+    // aggregate chain stamp.
+    stamp_fast_path(
+        "fused_chain",
+        if fast_paths_globally_disabled {
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
+        } else {
+            FastPathOutcome::Proceed
+        },
+    );
 
     // Phase 5 of the planner-mode refactor: fast paths emit current-state
     // bindings (no `op` channel, no retract events) and don't consult the
@@ -2816,6 +2828,7 @@ fn build_operator_tree_inner(
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
+            stamp_fast_path("group_by_object_count_topk", FastPathOutcome::Proceed);
             return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
                 s_var,
                 o_var,
@@ -2844,6 +2857,7 @@ fn build_operator_tree_inner(
     // Skipped in `History` mode (current-state count semantics).
     if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
+            stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
                 pred,
                 s_var,
@@ -2893,67 +2907,71 @@ fn build_operator_tree_inner(
     // open()-time gate (`fast_path_store`) is the real guard, declining to the
     // generic fallback under overlay novelty, time-travel, a non-root policy, or
     // multi-ledger.
-    if !planning.is_history() && !fast_paths_globally_disabled {
-        if stats.is_some() {
-            if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
-                // Build the fallback: the same query as a generic GROUP BY,
-                // producing the operator's internal `[pred, count]` schema (output
-                // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
-                // since those wrap the operator below). Recurse with stats=None so
-                // this fast path isn't re-entered. The operator streams from this
-                // fallback whenever the directory-count gate declines (overlay,
-                // time-travel, policy, multi-ledger) — which also keeps a non-root
-                // policy's restricted predicates from leaking through stale counts.
-                let mut fallback_query = query.clone();
-                fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
-                fallback_query.ordering = Vec::new();
-                fallback_query.order_binds = Vec::new();
-                fallback_query.limit = None;
-                fallback_query.offset = None;
-                let fallback = build_operator_tree_inner(
-                    &fallback_query,
-                    None,
-                    enable_fused_fast_paths,
-                    planning,
-                )?;
+    // `stats.is_some()` keeps the probe to plausibly-indexed ledgers and is the
+    // re-entry guard: the fallback below recurses with `stats = None`, so a
+    // false here on that recursion stops this fast path re-wrapping itself.
+    if !planning.is_history() && !fast_paths_globally_disabled && stats.is_some() {
+        if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
+            // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
+            // stamps the runtime Proceed/Fallback(GateDeclined) at open().
+            stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            // Build the fallback: the same query as a generic GROUP BY,
+            // producing the operator's internal `[pred, count]` schema (output
+            // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
+            // since those wrap the operator below). Recurse with stats=None so
+            // this fast path isn't re-entered. The operator streams from this
+            // fallback whenever the directory-count gate declines (overlay,
+            // time-travel, policy, multi-ledger) — which also keeps a non-root
+            // policy's restricted predicates from leaking through stale counts.
+            let mut fallback_query = query.clone();
+            fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let fallback = build_operator_tree_inner(
+                &fallback_query,
+                None,
+                enable_fused_fast_paths,
+                planning,
+            )?;
 
-                let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
-                    pred_var,
-                    count_var,
-                    Some(fallback),
-                ));
+            let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
+                pred_var,
+                count_var,
+                Some(fallback),
+            ));
 
-                // ORDER BY (on predicate or count)
-                if !query.ordering.is_empty() {
-                    operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
-                }
-
-                // PROJECT (select specific columns)
-                if let Some(vars) = query.output.projected_vars() {
-                    if !vars.is_empty() {
-                        operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
-                    }
-                }
-
-                // DISTINCT
-                if query.output.is_distinct() {
-                    operator = Box::new(crate::distinct::DistinctOperator::new(operator));
-                }
-
-                // OFFSET
-                if let Some(offset) = query.offset {
-                    if offset > 0 {
-                        operator = Box::new(OffsetOperator::new(operator, offset));
-                    }
-                }
-
-                // LIMIT
-                if let Some(limit) = query.limit {
-                    operator = Box::new(LimitOperator::new(operator, limit));
-                }
-
-                return Ok(operator);
+            // ORDER BY (on predicate or count)
+            if !query.ordering.is_empty() {
+                operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
             }
+
+            // PROJECT (select specific columns)
+            if let Some(vars) = query.output.projected_vars() {
+                if !vars.is_empty() {
+                    operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
+                }
+            }
+
+            // DISTINCT
+            if query.output.is_distinct() {
+                operator = Box::new(crate::distinct::DistinctOperator::new(operator));
+            }
+
+            // OFFSET
+            if let Some(offset) = query.offset {
+                if offset > 0 {
+                    operator = Box::new(OffsetOperator::new(operator, offset));
+                }
+            }
+
+            // LIMIT
+            if let Some(limit) = query.limit {
+                operator = Box::new(LimitOperator::new(operator, limit));
+            }
+
+            return Ok(operator);
         }
     }
 
