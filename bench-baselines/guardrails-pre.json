@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "label": "guardrails-pre",
+  "git_sha": "8b237b934",
+  "captured_at": "2026-07-11T20:45:34.164134+00:00",
+  "profile": "quick",
+  "scale": "small",
+  "entries": {
+    "query_hot_bsbm/q3/small": {
+      "mean_ns": 444503.6155495979,
+      "median_ns": 443809.0746201966
+    },
+    "query_hot_bsbm/q3/tiny": {
+      "mean_ns": 94638.7844448655,
+      "median_ns": 94650.43188707843
+    },
+    "query_hot_bsbm/q5/small": {
+      "mean_ns": 580381.3300349243,
+      "median_ns": 579365.8568102445
+    },
+    "query_hot_bsbm/q5/tiny": {
+      "mean_ns": 52189.314544123794,
+      "median_ns": 52183.94505437056
+    },
+    "query_hot_bsbm/q9/small": {
+      "mean_ns": 866190.9053448277,
+      "median_ns": 865956.0706896551
+    },
+    "query_hot_bsbm/q9/tiny": {
+      "mean_ns": 131994.92145366117,
+      "median_ns": 130457.246960281
+    },
+    "query_overlay_matrix/count_base/small": {
+      "mean_ns": 20538.12821089023,
+      "median_ns": 20776.857528089888,
+      "mem": {
+        "peak_bytes": 5470460,
+        "total_allocated_bytes": 32643222525
+      }
+    },
+    "query_overlay_matrix/count_base/tiny": {
+      "mean_ns": 23532.96816963431,
+      "median_ns": 25180.498731571897,
+      "mem": {
+        "peak_bytes": 5470831,
+        "total_allocated_bytes": 20158606846
+      }
+    },
+    "query_overlay_matrix/count_novelty/small": {
+      "mean_ns": 9134142.47368421,
+      "median_ns": 9088443.350877192,
+      "mem": {
+        "peak_bytes": 28020243,
+        "total_allocated_bytes": 22650087239
+      }
+    },
+    "query_overlay_matrix/count_novelty/tiny": {
+      "mean_ns": 1307743.121132075,
+      "median_ns": 1295656.879245283,
+      "mem": {
+        "peak_bytes": 7712831,
+        "total_allocated_bytes": 18200388858
+      }
+    },
+    "query_overlay_matrix/count_overlay/small": {
+      "mean_ns": 767973.5622900763,
+      "median_ns": 766905.724427481,
+      "mem": {
+        "peak_bytes": 8776171,
+        "total_allocated_bytes": 9675333348
+      }
+    },
+    "query_overlay_matrix/count_overlay/tiny": {
+      "mean_ns": 169759.12009987514,
+      "median_ns": 161638.98642322098,
+      "mem": {
+        "peak_bytes": 6141044,
+        "total_allocated_bytes": 18737155372
+      }
+    },
+    "query_overlay_matrix/groupby_base/small": {
+      "mean_ns": 904131.263146998,
+      "median_ns": 897937.4565217391,
+      "mem": {
+        "peak_bytes": 6061662,
+        "total_allocated_bytes": 50009962961
+      }
+    },
+    "query_overlay_matrix/groupby_base/tiny": {
+      "mean_ns": 305081.32970350405,
+      "median_ns": 301405.79514824797,
+      "mem": {
+        "peak_bytes": 5572482,
+        "total_allocated_bytes": 31444954594
+      }
+    },
+    "query_overlay_matrix/groupby_novelty/small": {
+      "mean_ns": 13906615.070588237,
+      "median_ns": 13910906.86764706,
+      "mem": {
+        "peak_bytes": 28390092,
+        "total_allocated_bytes": 26391847557
+      }
+    },
+    "query_overlay_matrix/groupby_novelty/tiny": {
+      "mean_ns": 44561278.266666666,
+      "median_ns": 42418687.5,
+      "mem": {
+        "peak_bytes": 7713791,
+        "total_allocated_bytes": 28424269350
+      }
+    },
+    "query_overlay_matrix/groupby_overlay/small": {
+      "mean_ns": 6136051.080246915,
+      "median_ns": 6140432.87037037,
+      "mem": {
+        "peak_bytes": 9243550,
+        "total_allocated_bytes": 10173266635
+      }
+    },
+    "query_overlay_matrix/groupby_overlay/tiny": {
+      "mean_ns": 422991.9564304462,
+      "median_ns": 405329.8884514435,
+      "mem": {
+        "peak_bytes": 6191972,
+        "total_allocated_bytes": 15283025885
+      }
+    },
+    "query_overlay_matrix/star_base/small": {
+      "mean_ns": 727567.833580705,
+      "median_ns": 644637.1363636364,
+      "mem": {
+        "peak_bytes": 5631589,
+        "total_allocated_bytes": 42252664627
+      }
+    },
+    "query_overlay_matrix/star_base/tiny": {
+      "mean_ns": 142932.47416486422,
+      "median_ns": 120812.940519106,
+      "mem": {
+        "peak_bytes": 5484164,
+        "total_allocated_bytes": 23870675003
+      }
+    },
+    "query_overlay_matrix/star_novelty/small": {
+      "mean_ns": 9188356666.5,
+      "median_ns": 8926627062.0,
+      "mem": {
+        "peak_bytes": 30213425,
+        "total_allocated_bytes": 446901649747
+      }
+    },
+    "query_overlay_matrix/star_novelty/tiny": {
+      "mean_ns": 1888412.8728434504,
+      "median_ns": 1703602.7028753995,
+      "mem": {
+        "peak_bytes": 7713465,
+        "total_allocated_bytes": 14268161302
+      }
+    },
+    "query_overlay_matrix/star_overlay/small": {
+      "mean_ns": 2049652.091902834,
+      "median_ns": 2049273.617408907,
+      "mem": {
+        "peak_bytes": 9131413,
+        "total_allocated_bytes": 22102643695
+      }
+    },
+    "query_overlay_matrix/star_overlay/tiny": {
+      "mean_ns": 244685.7212290503,
+      "median_ns": 240222.3677839851,
+      "mem": {
+        "peak_bytes": 6189902,
+        "total_allocated_bytes": 74171498812
+      }
+    }
+  }
+}
