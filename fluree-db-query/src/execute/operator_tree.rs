@@ -2202,6 +2202,14 @@ static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Disable (or re-enable) planner fast paths process-wide. Test/triage use.
+///
+/// Env-override footgun: [`fast_paths_disabled`] OR's this flag with the
+/// `FLUREE_DISABLE_QUERY_FAST_PATHS` env var (read once per process), so when
+/// that env var is set `set_fast_paths_disabled(false)` CANNOT re-enable fast
+/// paths. A harness that toggles fast paths on and off to compare their results
+/// (the differential harness) must run with the env var UNSET — otherwise its
+/// fast-paths-on phase silently runs generically and every fast-vs-generic
+/// assertion passes vacuously. That harness guards against this at startup.
 pub fn set_fast_paths_disabled(disabled: bool) {
     FAST_PATHS_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
 }
@@ -2901,14 +2909,13 @@ fn build_operator_tree_inner(
     // Fast-path: per-predicate count answered from POST leaf-directory metadata
     // (exact — see stats_query.rs for why the old IndexStats numbers were wrong
     // answers, differential harness FD-3). Skipped in `History` mode (directory
-    // rows are current-state only) and under the kill switch. The `stats.is_some()`
-    // trigger keeps the probe to plausibly-indexed ledgers; the operator's
+    // rows are current-state only) and under the kill switch. `stats.is_some()`
+    // both keeps the probe to plausibly-indexed ledgers AND is the re-entry
+    // guard — the fallback below recurses with `stats = None`, so a false here on
+    // that recursion stops this fast path re-wrapping itself. The operator's
     // open()-time gate (`fast_path_store`) is the real guard, declining to the
     // generic fallback under overlay novelty, time-travel, a non-root policy, or
     // multi-ledger.
-    // `stats.is_some()` keeps the probe to plausibly-indexed ledgers and is the
-    // re-entry guard: the fallback below recurses with `stats = None`, so a
-    // false here on that recursion stops this fast path re-wrapping itself.
     if !planning.is_history() && !fast_paths_globally_disabled && stats.is_some() {
         if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
             // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
@@ -2958,12 +2965,15 @@ fn build_operator_tree_inner(
                 operator = Box::new(crate::distinct::DistinctOperator::new(operator));
             }
 
-            // OFFSET
-            if let Some(offset) = query.offset {
-                if offset > 0 {
-                    operator = Box::new(OffsetOperator::new(operator, offset));
-                }
-            }
+            // OFFSET: unreachable. detect_stats_count_by_predicate declines any
+            // query with `offset.is_some()` (~:1690) — OFFSET is not idempotent
+            // when the fallback re-applies the full modifier stack — so it is
+            // always None here. Asserted rather than wrapped so the next reader
+            // need not re-derive the double-OFFSET analysis.
+            debug_assert!(
+                query.offset.is_none(),
+                "stats-count dispatch reached with OFFSET set; the detector must decline it"
+            );
 
             // LIMIT
             if let Some(limit) = query.limit {

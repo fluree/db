@@ -91,8 +91,12 @@ pub fn stats_count_by_predicate_operator(
 ///
 /// Homogeneous leaflets (`p_const = Some(p)`) contribute `row_count` without
 /// any payload read; mixed-predicate leaflets decode only the `PId` column.
-/// Returns `Ok(None)` when the graph has no POST branch — the caller falls
-/// back rather than asserting emptiness from absence.
+/// Returns `Ok(None)` when the graph has no POST branch, or when a leaf read
+/// fails — either way the caller declines to the generic scan (the fast-path
+/// "degrade to the correct slower path" contract) rather than asserting
+/// emptiness from absence or hard-failing on a transient IO fault. Declining is
+/// lossless here: this function only accumulates a local map and has emitted
+/// nothing, and a genuine IO fault will resurface in the generic scan.
 fn exact_count_by_predicate_post(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -112,9 +116,17 @@ fn exact_count_by_predicate_post(
 
     let mut counts: BTreeMap<u32, i64> = BTreeMap::new();
     for leaf_entry in &branch.leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        let handle = match store.open_leaf_handle(
+            &leaf_entry.leaf_cid,
+            leaf_entry.sidecar_cid.as_ref(),
+            false,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, "stats count-by-predicate: leaf open failed; declining to generic scan");
+                return Ok(None);
+            }
+        };
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 {
@@ -123,9 +135,14 @@ fn exact_count_by_predicate_post(
             if let Some(p) = entry.p_const {
                 *counts.entry(p).or_insert(0) += i64::from(entry.row_count);
             } else {
-                let batch = handle
-                    .load_columns(leaflet_idx, &pid_projection, RunSortOrder::Post)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch =
+                    match handle.load_columns(leaflet_idx, &pid_projection, RunSortOrder::Post) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "stats count-by-predicate: load columns failed; declining to generic scan");
+                            return Ok(None);
+                        }
+                    };
                 for row in 0..batch.row_count {
                     *counts.entry(batch.p_id.get(row)).or_insert(0) += 1;
                 }
