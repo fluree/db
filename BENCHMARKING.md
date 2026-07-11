@@ -88,43 +88,97 @@ percentage regression that CI's gated job will accept once the gate is in
 its final shape. The default is 5% for any (crate, bench, scale) tuple
 not explicitly listed.
 
-### CI gate — two phases
+### CI gate — phases
 
-The gate runs in two phases, defined separately in CI:
+The gate runs across `ci.yml` (per-PR) and `bench.yml` (nightly +
+on-demand):
 
-1. **`bench-gate` (this PR's contribution)** — runs on every PR and push to
-   `main`. Two checks:
+1. **Reconcile + smoke (`bench.yml` `bench-gate`, nightly).**
    - **Reconcile.** `cargo test -p fluree-bench-support --test workspace_reconcile`
      asserts every `[[bench]]` declared in a workspace member's `Cargo.toml`
      has a matching entry in `regression-budget.json`, and vice versa. A
-     missing or stale entry fails the gate with a message naming the
-     `crate/bench` pair to fix.
+     missing or stale entry fails with a message naming the `crate/bench` pair.
    - **Smoke.** `cargo bench --workspace -- --test` runs each bench's
-     scenarios once at `tiny` scale. Catches benches that compile but
-     panic at runtime (bad SPARQL, broken setup, missing API surface).
+     scenarios once at `tiny` scale — catches benches that compile but panic
+     at runtime (bad SPARQL, broken setup, missing API surface).
 
-   This phase **does not** compare against runner-stable baselines, so a
-   2× regression that still completes successfully won't fail the gate.
-   That comparison is phase 2.
+2. **Per-PR compare (`ci.yml` `bench-compare`).** Runs the cheap subset
+   (`query_overlay_matrix` + `query_hot_bsbm`) at `tiny`/`quick` and compares
+   against the committed baseline via the `bench-baseline` bin. **Memory
+   breaches fail the job; wall-clock time breaches are advisory** (see
+   [Baselines](#baselines-capture--compare) for why). The nightly `bench-gate`
+   runs the same compare over a larger sample.
 
-2. **`bench-nightly` (separate PR — `bench-nightly`)** — runs on a cron
-   schedule with `FLUREE_BENCH_PROFILE=full` against the canonical
-   `bench-baselines.json` committed in the repo. Compares observed
-   nanoseconds to `baseline × (1 + budget_pct/100)` for each
-   `(crate, bench, scale)` tuple and fails the job if any bench exceeds
-   its budget.
+3. **CI-class capture (`bench.yml` `bench-capture`, `workflow_dispatch`).**
+   Captures the cheap subset on `ubuntu-latest` (`runner_class=ci-ubuntu-latest`)
+   and uploads it as an artifact; committing it lands a CI-class baseline that
+   makes the per-PR time half enforce.
 
 To intentionally accept a regression (or tighten a budget), edit
 `regression-budget.json` in the same PR and explain in the PR body.
 
-### Why two phases
+## Baselines: capture & compare
 
-`ubuntu-latest` shared runners flap; a 5% threshold on a single PR run
-would produce false positives every few PRs. Phase 2 amortizes noise
-across the nightly's larger sample (`Full` profile = ~30 samples per
-bench) and uses dedicated 4-core runners for stability. Phase 1 catches
-the regressions that don't depend on baseline comparison: API breakage,
-panics, missing budgets.
+Committed performance reference points live in
+[`bench-baselines/`](bench-baselines/README.md) as one JSON file per phase
+reference (`guardrails-pre.json`, …), captured and compared by the
+`bench-baseline` bin. (This supersedes the earlier single `bench-baselines.json`
+scheme — it is now a directory plus a bin.)
+
+**Capture** — run the benches, then snapshot criterion's estimates plus the
+memory sidecars into a git-stamped baseline:
+
+```bash
+cargo bench -p fluree-db-api --bench query_overlay_matrix
+cargo run -p fluree-bench-support --bin bench-baseline -- \
+    capture --label guardrails-pre --out bench-baselines/guardrails-pre.json
+```
+
+The baseline records provenance: `git_sha`, `captured_at`, `profile`, `scale`,
+and — load-bearing for the gate — `runner_class` (env
+`FLUREE_BENCH_RUNNER_CLASS`, default `local`) and `host`. The `"pre"` reference
+for a phase is captured at the branch's **merge-base** (see
+`bench-baselines/README.md`).
+
+**Compare** — after a change, rerun the benches and compare:
+
+```bash
+cargo run -p fluree-bench-support --bin bench-baseline -- \
+    compare --baseline bench-baselines/guardrails-pre.json [--only <substr>] [--time-advisory]
+```
+
+Each scenario present in both runs is checked against `baseline × (1 +
+budget_pct/100)` from `regression-budget.json`, **per metric**:
+
+- **Memory (`peak_bytes`) is always enforced.** Peak allocation is comparable
+  across machine classes (measured within ±2.2% local-vs-CI), and the recorded
+  value is scenario-attributable (`peak − live-at-reset`), so a real memory
+  regression gates regardless of where the baseline was captured.
+- **Wall-clock time is enforced only when the baseline's `runner_class` matches
+  the comparing runner's**; otherwise it is **advisory** (`::warning::`
+  annotations, non-gating). `--time-advisory` forces advisory.
+
+### Why time can't gate cross-machine
+
+`ubuntu-latest` shared runners flap; a 5–10% threshold on a single PR run
+comparing absolute nanoseconds against a baseline captured on different (local
+Apple-silicon) hardware false-positives every few PRs. So the committed
+`guardrails-pre.json` is `runner_class=local` and the per-PR gate enforces only
+memory until a CI-class baseline exists. Two ways to make time enforce:
+
+1. **Committed CI-class baseline (implemented).** Run `bench.yml`'s
+   `workflow_dispatch` `bench-capture` job, download the artifact, and commit it
+   — its `runner_class=ci-ubuntu-latest` matches CI, so the per-PR time half
+   enforces automatically.
+2. **Same-runner interleaved base-vs-HEAD (documented future option).** Measure
+   merge-base and HEAD in the *same* job on the *same* runner and compare those,
+   instead of any committed cross-machine file — the only design that survives
+   shared-runner variance at a tight time budget. Deliberately not wired: it
+   doubles the per-PR build cost, the exact eviction risk that had removed an
+   earlier per-PR compare.
+
+The nightly reconcile + smoke still catches the regressions that don't depend on
+baseline comparison: API breakage, panics, missing budgets.
 
 ## Architecture
 

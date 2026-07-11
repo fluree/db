@@ -18,8 +18,18 @@ Conventions:
 - Ad-hoc local baselines (validation runs, experiments) should live
   outside the repo or be cleaned up before merge — only phase reference
   points belong here.
+- Each baseline records its `runner_class` (env `FLUREE_BENCH_RUNNER_CLASS`,
+  default `local`) and `host`. `compare` enforces **memory** across any runner
+  class but treats **wall-clock time** as advisory when the baseline's runner
+  class differs from the comparing runner's (cross-machine time can't gate).
+  Commit a CI-class baseline (`runner_class=ci-*`, via `bench.yml`'s
+  `bench-capture` job) to make the per-PR time half enforce.
 
-Capture:
+`guardrails-pre.json` is the PR-1 (guardrails net) reference — captured at the
+merge-base engine, quick profile, tiny+small, `runner_class=local`.
+
+Capture (the `--label`/`--out` name the phase reference; capture at the
+merge-base commit):
 
 ```bash
 cargo run -p fluree-bench-support --bin bench-baseline -- \
