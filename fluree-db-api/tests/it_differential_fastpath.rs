@@ -76,6 +76,9 @@ use serde_json::Value;
 const N_PRODUCTS: usize = 200;
 const N_TAIL: usize = 20;
 const N_CHURNED: usize = 5;
+/// Number of `±1e16 / 1.0 / 3.5` groups in the xsd:double AVG dataset (4 rows
+/// each). Chosen to stress f64 non-associativity across the two fold orders.
+const N_DOUBLE_GROUPS: usize = 4;
 
 // -----------------------------------------------------------------------------
 // Dataset: base + churn (upsert retract/replace) + tail (novelty-only subjects)
@@ -83,6 +86,31 @@ const N_CHURNED: usize = 5;
 
 fn base_turtle() -> String {
     bsbm_data_to_turtle(&generate_dataset(N_PRODUCTS))
+}
+
+/// Homogeneous `xsd:double` predicate (`ex:dscore`) whose values stress f64
+/// non-associativity. The AVG fast path folds in POST (value-ascending) order;
+/// the generic pipeline folds in its scan's order. Subject-insertion order puts
+/// each `1e16 / -1e16` cancelling pair adjacent to the small `1.0 / 3.5` values,
+/// so a scan-order fold keeps the smalls (≈4.5) while a value-order fold loses
+/// them between the two extremes (≈0). If the two lanes fold in different
+/// orders the AVG diverges — the case exists to pin whichever way it resolves.
+fn double_agg_turtle() -> String {
+    let mut buf = String::from(
+        "@prefix ex: <http://example.org/ns/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n",
+    );
+    let pattern = ["1.0e16", "-1.0e16", "1.0", "3.5"];
+    let mut idx = 0usize;
+    for _ in 0..N_DOUBLE_GROUPS {
+        for v in pattern {
+            buf.push_str(&format!(
+                "ex:dnode-{idx:06} ex:dscore \"{v}\"^^xsd:double .\n"
+            ));
+            idx += 1;
+        }
+    }
+    buf
 }
 
 /// Upsert that retracts and replaces price + label on the first
@@ -189,6 +217,21 @@ async fn setup(cond: Condition) -> (tempfile::TempDir, Fluree, String) {
         )
         .await
         .expect("insert base");
+    ledger = r.ledger;
+
+    // xsd:double AVG dataset — part of the base so it is indexed (and thus
+    // fast-path-eligible) in the Base condition, exercising the double lane.
+    let r = fluree
+        .insert_turtle_with_opts(
+            ledger,
+            &double_agg_turtle(),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &index_config,
+            None,
+        )
+        .await
+        .expect("insert double-agg");
     ledger = r.ledger;
 
     if cond == Condition::Overlay {
@@ -326,6 +369,16 @@ fn catalog() -> Vec<Case> {
             known_divergence: None,
             sparql: "SELECT (AVG(?o) AS ?avg) WHERE { ?s bsbm:price ?o }",
         },
+        // detect_predicate_avg_numeric over xsd:double — pins the double lane's
+        // fold-order behaviour (review item 2). ex:dscore holds mixed-magnitude
+        // doubles engineered to diverge IF the fast (POST/value-order) and
+        // generic (scan-order) folds differ; if they agree, this pins that too.
+        Case {
+            name: "avg_double",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT (AVG(?o) AS ?avg) WHERE { ?s <http://example.org/ns/dscore> ?o }",
+        },
         // detect_predicate_minmax_string — churned labels sort after
         // "Product ..." ("Churned ..." sorts before), and MAX over labels
         // includes tail products' novelty-only strings. FD-2 was fixed on main
@@ -437,6 +490,13 @@ async fn run_query(fluree: &Fluree, alias: &str, sparql: &str) -> Value {
 
 /// RAII guard: the kill switch is process-global; restore on every exit
 /// path (including panics) so a failure here can't poison other tests.
+///
+/// Global-state hazard: under plain `cargo test` threads share the process
+/// (unlike nextest's process-per-test), so any concurrent test in THIS binary
+/// runs generically during the switched window. Benign today — results stay
+/// correct and the only routing-asserting test (`it_minmax_fast_path_fired`)
+/// lives in `grp_misc`, a different binary. Keep it that way: tests asserting
+/// fast-path *routing* must not share this binary (`grp_query`).
 struct FastPathGuard;
 impl Drop for FastPathGuard {
     fn drop(&mut self) {
@@ -446,6 +506,16 @@ impl Drop for FastPathGuard {
 
 #[tokio::test]
 async fn differential_fastpath_and_condition_matrix() {
+    // The whole harness rests on toggling the process-global kill switch, but
+    // `fast_paths_disabled()` OR's it with FLUREE_DISABLE_QUERY_FAST_PATHS (read
+    // once per process). If that env var is set, the fast-paths-ON phase below
+    // silently runs GENERICALLY, degrading every case to a vacuous
+    // generic-vs-generic pass. Fail loudly rather than pass for nothing.
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "FLUREE_DISABLE_QUERY_FAST_PATHS is set — the differential harness cannot \
+         enable fast paths and would pass vacuously (generic-vs-generic). Unset it."
+    );
     let _guard = FastPathGuard;
     let conditions = [Condition::Base, Condition::Overlay, Condition::Novelty];
     let cases = catalog();
