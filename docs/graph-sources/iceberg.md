@@ -17,10 +17,14 @@ Apache Iceberg is an open table format for huge analytical datasets. It provides
 
 ### Catalog Modes
 
-Fluree supports two ways to discover Iceberg metadata:
+Fluree supports four ways to discover Iceberg metadata:
 
-- **REST catalog**: discover table metadata via an Iceberg REST catalog API (e.g., Polaris).
+- **REST catalog**: discover table metadata via an Iceberg REST catalog API (e.g., Polaris, Snowflake Horizon).
 - **Direct S3 (no catalog server)**: bypass REST discovery and read `version-hint.text` from the table’s `metadata/` directory to resolve the current metadata file.
+- **AWS Glue Data Catalog** (`--mode glue`): resolve the table's `metadata_location` through the native AWS SDK (`aws-sdk-glue`), then read metadata and data from S3 with the ambient AWS credential chain. No REST catalog and no request signing — the SDK signs its own calls. The Glue *database* is the table identifier's namespace (`<database>.<table>`).
+- **AWS S3 Tables** (`--mode s3tables`): the same native-SDK approach via `aws-sdk-s3tables` against an S3 Tables table bucket (`--table-bucket-arn`).
+
+Glue and S3 Tables use the **ambient** AWS credential chain (env vars, `~/.aws/credentials`, IAM role / SSO) — the same as Direct mode; they do not use vended credentials. Vended-credential catalogs (Snowflake Horizon / Polaris, or Lake-Formation-governed Glue) go through REST mode.
 
 ### CLI
 
@@ -38,6 +42,21 @@ fluree iceberg map execution-log \
   --mode direct \
   --table-location s3://bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl
+
+# AWS Glue Data Catalog (native SDK, ambient AWS credentials)
+fluree iceberg map warehouse-orders \
+  --mode glue \
+  --table sales.orders \
+  --region us-east-1 \
+  --r2rml mappings/orders.ttl
+
+# AWS S3 Tables (native SDK, ambient AWS credentials)
+fluree iceberg map warehouse-orders \
+  --mode s3tables \
+  --table analytics_ns.orders \
+  --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/analytics \
+  --region us-east-1 \
+  --r2rml mappings/orders.ttl
 
 # Google Cloud Storage — see "Google Cloud Storage (GCS)" below
 fluree iceberg map orders \

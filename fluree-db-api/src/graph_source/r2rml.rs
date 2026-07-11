@@ -142,6 +142,116 @@ fn build_iceberg_filter(
     }
 }
 
+/// Which AWS-SDK catalog to build on a `loadTable` cache miss.
+enum SdkCatalog {
+    Glue {
+        region: Option<String>,
+        catalog_id: Option<String>,
+    },
+    S3Tables {
+        region: Option<String>,
+        table_bucket_arn: String,
+    },
+}
+
+impl SdkCatalog {
+    fn label(&self) -> &'static str {
+        match self {
+            SdkCatalog::Glue { .. } => "AWS Glue Data Catalog",
+            SdkCatalog::S3Tables { .. } => "AWS S3 Tables",
+        }
+    }
+
+    async fn build(&self) -> QueryResult<Box<dyn SendCatalogClient>> {
+        Ok(match self {
+            SdkCatalog::Glue { region, catalog_id } => Box::new(
+                fluree_db_iceberg::catalog::GlueSdkCatalogClient::new(
+                    region.as_deref(),
+                    catalog_id.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create Glue catalog client: {e}"))
+                })?,
+            ),
+            SdkCatalog::S3Tables {
+                region,
+                table_bucket_arn,
+            } => Box::new(
+                fluree_db_iceberg::catalog::S3TablesSdkCatalogClient::new(
+                    region.as_deref(),
+                    table_bucket_arn.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create S3 Tables catalog client: {e}"))
+                })?,
+            ),
+        })
+    }
+}
+
+/// Resolve an AWS-SDK catalog's `loadTable` with the same per-query snapshot pin
+/// (one Iceberg snapshot for the whole query — a correctness guarantee the raw
+/// per-scan SDK path lacked) and cross-query `loadTable` cache the REST path uses.
+/// Glue/S3Tables return `credentials: None`, so the credential-expiry gating is a
+/// no-op. The SDK client is built only on a genuine miss, so warm scans skip the
+/// per-scan credential-chain resolution + `GetTable`/`GetTableMetadataLocation`.
+async fn sdk_resolve_load_table(
+    session: &super::catalog_session::IcebergCatalogSession,
+    cache: &R2rmlCache,
+    graph_source_id: &str,
+    table_id: &fluree_db_iceberg::catalog::TableIdentifier,
+    kind: &SdkCatalog,
+) -> QueryResult<fluree_db_iceberg::catalog::LoadTableResponse> {
+    use super::catalog_session::{CachedLoadTable, IcebergCatalogSession};
+    let lt_key = IcebergCatalogSession::load_table_key(
+        graph_source_id,
+        &table_id.namespace,
+        &table_id.table,
+    );
+
+    if let Some(cached) = session.cached_load_table(&lt_key) {
+        debug!(namespace = %table_id.namespace, table = %table_id.table,
+            "loadTable pin hit (query-scoped)");
+        return Ok(cached);
+    }
+    let pinned = session.pinned_metadata_location(&lt_key);
+    let cross_query = if pinned.is_none() {
+        cache.get_rest_load_table(&lt_key)
+    } else {
+        None
+    };
+    let mut resp = if let Some(cq) = cross_query {
+        debug!(namespace = %table_id.namespace, table = %table_id.table,
+            "loadTable cache hit (cross-query)");
+        cq.to_response()
+    } else {
+        info!(namespace = %table_id.namespace, table = %table_id.table,
+            catalog = kind.label(), "Loading table via AWS SDK catalog");
+        let catalog = kind.build().await?;
+        let actual = catalog.load_table(table_id, false).await.map_err(|e| {
+            QueryError::Internal(format!("Failed to load table from {}: {e}", kind.label()))
+        })?;
+        cache.put_rest_load_table(
+            lt_key.clone(),
+            std::sync::Arc::new(CachedLoadTable::from_response(&actual)),
+        );
+        actual
+    };
+    // Keep the query on its pinned snapshot even if the table committed since.
+    if let Some(ref pinned_loc) = pinned {
+        if *pinned_loc != resp.metadata_location {
+            resp.metadata_location = pinned_loc.clone();
+        }
+    }
+    session.store_load_table(lt_key.clone(), &resp);
+    if let Some(pinned_loc) = session.pinned_metadata_location(&lt_key) {
+        resp.metadata_location = pinned_loc;
+    }
+    Ok(resp)
+}
+
 // =============================================================================
 // Iceberg/R2RML Graph Source Creation
 // =============================================================================
@@ -320,6 +430,12 @@ impl crate::Fluree {
                 return Err(crate::ApiError::Config(
                     "Connection test is not supported for Direct catalog mode".to_string(),
                 ));
+            }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                // Glue / S3Tables validate at query time via the ambient AWS
+                // credential chain; a pre-flight check would require live AWS
+                // calls, so treat the connection as OK here.
+                return Ok(());
             }
         };
 
@@ -931,6 +1047,67 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 info!(
                     metadata_location = %load_response.metadata_location,
                     "Resolved table metadata via version-hint.text"
+                );
+
+                (load_response, storage)
+            }
+            CatalogConfig::Glue { region, catalog_id } => {
+                // Resolve metadata_location through the shared per-query snapshot
+                // pin + cross-query cache (builds the SDK client only on a miss),
+                // then read S3 with the ambient chain — Glue in IAM mode does not
+                // vend credentials, so this is the same reader as Direct mode.
+                let load_response = sdk_resolve_load_table(
+                    &self.session,
+                    self.fluree.r2rml_cache(),
+                    graph_source_id,
+                    &table_id,
+                    &SdkCatalog::Glue {
+                        region: region.clone(),
+                        catalog_id: catalog_id.clone(),
+                    },
+                )
+                .await?;
+
+                let storage: Arc<S3IcebergStorage> = Arc::new(
+                    S3IcebergStorage::from_default_chain(
+                        region.as_deref().or(iceberg_config.io.s3_region.as_deref()),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?,
+                );
+
+                (load_response, storage)
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                let load_response = sdk_resolve_load_table(
+                    &self.session,
+                    self.fluree.r2rml_cache(),
+                    graph_source_id,
+                    &table_id,
+                    &SdkCatalog::S3Tables {
+                        region: region.clone(),
+                        table_bucket_arn: table_bucket_arn.clone(),
+                    },
+                )
+                .await?;
+
+                let storage: Arc<S3IcebergStorage> = Arc::new(
+                    S3IcebergStorage::from_default_chain(
+                        region.as_deref().or(iceberg_config.io.s3_region.as_deref()),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                    })?,
                 );
 
                 (load_response, storage)

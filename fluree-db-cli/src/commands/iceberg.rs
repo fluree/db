@@ -370,6 +370,15 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(ref v) = args.table_location {
         obj.insert("table_location".into(), v.clone().into());
     }
+    if let Some(ref v) = args.region {
+        obj.insert("region".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.catalog_id {
+        obj.insert("catalog_id".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.table_bucket_arn {
+        obj.insert("table_bucket_arn".into(), v.clone().into());
+    }
     if let Some(ref v) = args.r2rml {
         // Read file content and send it (not the path)
         let content = std::fs::read_to_string(v).map_err(|e| {
@@ -730,9 +739,47 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
             })?;
             fluree_db_api::IcebergCreateConfig::new_direct(&args.name, location)
         }
+        "glue" => {
+            let table = args.table.as_deref().unwrap_or_default();
+            if table.is_empty() {
+                return Err(CliError::Usage(
+                    "--table is required for glue mode (namespace.table, e.g. enterprise_dw.dim_geography)"
+                        .into(),
+                ));
+            }
+            let connection = fluree_db_api::IcebergConnectionConfig::glue(
+                args.region.clone(),
+                args.catalog_id.clone(),
+            );
+            fluree_db_api::IcebergCreateConfig {
+                name: args.name.clone(),
+                branch: None,
+                connection,
+                table_identifier: table.to_string(),
+            }
+        }
+        "s3tables" => {
+            let arn = args.table_bucket_arn.as_ref().ok_or_else(|| {
+                CliError::Usage("--table-bucket-arn is required for s3tables mode".into())
+            })?;
+            let table = args.table.as_deref().unwrap_or_default();
+            if table.is_empty() {
+                return Err(CliError::Usage(
+                    "--table is required for s3tables mode (namespace.table)".into(),
+                ));
+            }
+            let connection =
+                fluree_db_api::IcebergConnectionConfig::s3_tables(args.region.clone(), arn);
+            fluree_db_api::IcebergCreateConfig {
+                name: args.name.clone(),
+                branch: None,
+                connection,
+                table_identifier: table.to_string(),
+            }
+        }
         other => {
             return Err(CliError::Usage(format!(
-                "unknown catalog mode '{other}'. Use 'rest' or 'direct'."
+                "unknown catalog mode '{other}'. Use 'rest', 'direct', 'glue', or 's3tables'."
             )));
         }
     };
@@ -821,6 +868,9 @@ mod tests {
             catalog_uri: Some("https://catalog.example.com".to_string()),
             table: Some("ns.tbl".to_string()),
             table_location: None,
+            region: None,
+            catalog_id: None,
+            table_bucket_arn: None,
             r2rml: None,
             r2rml_type: None,
             branch: None,

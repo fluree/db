@@ -234,6 +234,11 @@ path = "tests/it_graph_source_r2rml.rs"
 required-features = ["iceberg"]
 
 [[test]]
+name = "it_glue_live"
+path = "tests/it_glue_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
 name = "it_iceberg_direct"
 path = "tests/it_iceberg_direct.rs"
 required-features = ["iceberg", "aws-testcontainers"]
@@ -266,6 +271,10 @@ required-features = ["vector"]
 [[test]]
 name = "it_select_star_deep_crawl_stack"
 path = "tests/it_select_star_deep_crawl_stack.rs"
+
+[[example]]
+name = "glue_onboarding"
+required-features = ["iceberg"]
 
 [[bench]]
 name = "vector_query"

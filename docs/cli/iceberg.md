@@ -33,7 +33,7 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--mode <MODE>` | Catalog mode: `rest` (default) or `direct` |
+| `--mode <MODE>` | Catalog mode: `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables) |
 
 **REST catalog mode options:**
 
@@ -49,6 +49,15 @@ fluree iceberg map <NAME> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--table-location <URI>` | S3 table location (required for direct mode, e.g., `s3://bucket/warehouse/ns/table`) |
+
+**AWS Glue / S3 Tables mode options** (native AWS SDK; reads S3 with the ambient AWS credential chain — no vended credentials):
+
+| Option | Description |
+|--------|-------------|
+| `--table <ID>` | Table identifier `namespace.table` (required). For `glue`, `namespace` is the Glue database. |
+| `--region <REGION>` | AWS region (falls back to the SDK default chain if omitted) |
+| `--catalog-id <ID>` | Glue catalog id for cross-account access (`glue` mode; defaults to the caller's account) |
+| `--table-bucket-arn <ARN>` | S3 Tables table-bucket ARN (required for `s3tables` mode) |
 
 **R2RML mapping:**
 

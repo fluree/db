@@ -437,6 +437,27 @@ pub enum CatalogMode {
         /// Example: "s3://bucket/warehouse/my_namespace/my_table"
         table_location: String,
     },
+    /// Resolve tables via the AWS Glue Data Catalog using the native AWS SDK.
+    ///
+    /// The Glue *database* is the table identifier's namespace. Credentials come
+    /// from the ambient AWS credential chain — no REST/SigV4 or vended
+    /// credentials are involved.
+    Glue {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        region: Option<String>,
+        /// Glue catalog id for cross-account access (`None` = the caller's account).
+        catalog_id: Option<String>,
+    },
+    /// Resolve tables via AWS S3 Tables using the native AWS SDK.
+    ///
+    /// Credentials come from the ambient AWS credential chain.
+    S3Tables {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        region: Option<String>,
+        /// The S3 Tables table-bucket ARN
+        /// (`arn:aws:s3tables:<region>:<account>:bucket/<name>`).
+        table_bucket_arn: String,
+    },
 }
 
 /// REST catalog mode configuration.
@@ -476,6 +497,35 @@ impl IcebergConnectionConfig {
         Self {
             catalog_mode: CatalogMode::Direct {
                 table_location: table_location.into(),
+            },
+            io: fluree_db_iceberg::config::IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create an AWS Glue Data Catalog connection (native AWS SDK). Vended
+    /// credentials are forced off — the SDK reads S3 with the ambient/IAM
+    /// credential chain.
+    pub fn glue(region: Option<String>, catalog_id: Option<String>) -> Self {
+        Self {
+            catalog_mode: CatalogMode::Glue { region, catalog_id },
+            io: fluree_db_iceberg::config::IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Create an AWS S3 Tables connection (native AWS SDK) from a table-bucket
+    /// ARN. Vended credentials are forced off — the SDK reads the managed table
+    /// bucket with the ambient/IAM credential chain.
+    pub fn s3_tables(region: Option<String>, table_bucket_arn: impl Into<String>) -> Self {
+        Self {
+            catalog_mode: CatalogMode::S3Tables {
+                region,
+                table_bucket_arn: table_bucket_arn.into(),
             },
             io: fluree_db_iceberg::config::IoConfig {
                 vended_credentials: false,
@@ -543,6 +593,9 @@ impl IcebergConnectionConfig {
             CatalogMode::Direct { .. } => {
                 tracing::warn!("with_oauth2_scope has no effect in Direct catalog mode");
             }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                tracing::warn!("with_oauth2_scope has no effect in Glue/S3Tables catalog mode");
+            }
         }
         self
     }
@@ -569,6 +622,9 @@ impl IcebergConnectionConfig {
             }
             CatalogMode::Direct { .. } => {
                 tracing::warn!("with_oauth2_audience has no effect in Direct catalog mode");
+            }
+            CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                tracing::warn!("with_oauth2_audience has no effect in Glue/S3Tables catalog mode");
             }
         }
         self
@@ -617,6 +673,10 @@ impl IcebergConnectionConfig {
         match &self.catalog_mode {
             CatalogMode::Rest(rest) => &rest.catalog_uri,
             CatalogMode::Direct { table_location } => table_location,
+            CatalogMode::Glue { catalog_id, .. } => catalog_id.as_deref().unwrap_or("aws-glue"),
+            CatalogMode::S3Tables {
+                table_bucket_arn, ..
+            } => table_bucket_arn,
         }
     }
 
@@ -628,6 +688,16 @@ impl IcebergConnectionConfig {
     /// Returns `true` if this connection uses direct S3 catalog mode.
     pub fn is_direct(&self) -> bool {
         matches!(self.catalog_mode, CatalogMode::Direct { .. })
+    }
+
+    /// Returns `true` if this connection uses AWS Glue catalog mode.
+    pub fn is_glue(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::Glue { .. })
+    }
+
+    /// Returns `true` if this connection uses AWS S3 Tables catalog mode.
+    pub fn is_s3tables(&self) -> bool {
+        matches!(self.catalog_mode, CatalogMode::S3Tables { .. })
     }
 }
 
@@ -748,7 +818,10 @@ impl IcebergCreateConfig {
     /// Get the table identifier string (for REST mode), or derive from location (for direct mode).
     pub fn table_identifier_display(&self) -> String {
         match &self.connection.catalog_mode {
-            CatalogMode::Rest(_) => self.table_identifier.clone(),
+            // REST / Glue / S3Tables all carry an explicit `namespace.table`.
+            CatalogMode::Rest(_) | CatalogMode::Glue { .. } | CatalogMode::S3Tables { .. } => {
+                self.table_identifier.clone()
+            }
             CatalogMode::Direct { table_location } => {
                 let path = table_location
                     .trim_start_matches("s3://")
@@ -794,6 +867,37 @@ impl IcebergCreateConfig {
                     mapping: None,
                 }
             }
+            CatalogMode::Glue { region, catalog_id } => {
+                // AWS SDK reads S3 with the ambient credential chain — never vended.
+                let mut io = self.connection.io.clone();
+                io.vended_credentials = false;
+                IcebergGsConfig {
+                    catalog: CatalogConfig::Glue {
+                        region: region.clone(),
+                        catalog_id: catalog_id.clone(),
+                    },
+                    table: TableConfig::Identifier(self.table_identifier.clone()),
+                    io,
+                    mapping: None,
+                }
+            }
+            CatalogMode::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                // AWS SDK reads the managed table bucket with the ambient chain.
+                let mut io = self.connection.io.clone();
+                io.vended_credentials = false;
+                IcebergGsConfig {
+                    catalog: CatalogConfig::S3Tables {
+                        region: region.clone(),
+                        table_bucket_arn: table_bucket_arn.clone(),
+                    },
+                    table: TableConfig::Identifier(self.table_identifier.clone()),
+                    io,
+                    mapping: None,
+                }
+            }
         }
     }
 
@@ -834,6 +938,35 @@ impl IcebergCreateConfig {
                     )));
                 }
             }
+            CatalogMode::Glue { .. } => {
+                if self.table_identifier.trim().is_empty() {
+                    return Err(crate::ApiError::config(
+                        "Table identifier cannot be empty for Glue catalog mode (use namespace.table)",
+                    ));
+                }
+                use fluree_db_iceberg::catalog::parse_table_identifier;
+                parse_table_identifier(&self.table_identifier).map_err(|e| {
+                    crate::ApiError::config(format!("Invalid table identifier: {e}"))
+                })?;
+            }
+            CatalogMode::S3Tables {
+                table_bucket_arn, ..
+            } => {
+                if !table_bucket_arn.starts_with("arn:aws:s3tables:") {
+                    return Err(crate::ApiError::config(format!(
+                        "S3Tables table_bucket_arn must be an S3 Tables bucket ARN (arn:aws:s3tables:...), got: {table_bucket_arn}"
+                    )));
+                }
+                if self.table_identifier.trim().is_empty() {
+                    return Err(crate::ApiError::config(
+                        "Table identifier cannot be empty for S3Tables catalog mode (use namespace.table)",
+                    ));
+                }
+                use fluree_db_iceberg::catalog::parse_table_identifier;
+                parse_table_identifier(&self.table_identifier).map_err(|e| {
+                    crate::ApiError::config(format!("Invalid table identifier: {e}"))
+                })?;
+            }
         }
 
         Ok(())
@@ -847,6 +980,16 @@ impl IcebergCreateConfig {
     /// Returns `true` if this config uses direct S3 catalog mode.
     pub fn is_direct(&self) -> bool {
         self.connection.is_direct()
+    }
+
+    /// Returns `true` if this config uses AWS Glue catalog mode.
+    pub fn is_glue(&self) -> bool {
+        self.connection.is_glue()
+    }
+
+    /// Returns `true` if this config uses AWS S3 Tables catalog mode.
+    pub fn is_s3tables(&self) -> bool {
+        self.connection.is_s3tables()
     }
 }
 
@@ -1181,7 +1324,9 @@ mod tests {
     fn oauth2_auth(config: &IcebergCreateConfig) -> &fluree_db_iceberg::auth::AuthConfig {
         match &config.connection.catalog_mode {
             CatalogMode::Rest(rest) => &rest.auth,
-            CatalogMode::Direct { .. } => panic!("expected REST catalog mode"),
+            CatalogMode::Direct { .. }
+            | CatalogMode::Glue { .. }
+            | CatalogMode::S3Tables { .. } => panic!("expected REST catalog mode"),
         }
     }
 

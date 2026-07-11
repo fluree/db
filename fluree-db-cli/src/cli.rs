@@ -2269,6 +2269,8 @@ pub enum IcebergAction {
     ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --table openflights.airlines
     ///   fluree iceberg map my-gs --catalog-uri https://... --r2rml mappings/airlines.ttl
     ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table
+    ///   fluree iceberg map my-gs --mode glue --table enterprise_dw.dim_geography --region us-east-1 --r2rml mapping.ttl
+    ///   fluree iceberg map my-gs --mode s3tables --table enterprise_dw.dim_geography --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --region us-east-1
     Map(Box<IcebergMapArgs>),
 
     /// List Iceberg-family graph sources (Iceberg and R2RML mappings)
@@ -2313,7 +2315,7 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub remote: Option<String>,
 
-    /// Catalog mode: "rest" (default) or "direct"
+    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
     #[arg(long, default_value = "rest")]
     pub mode: String,
 
@@ -2330,6 +2332,21 @@ pub struct IcebergMapArgs {
     /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table")
     #[arg(long)]
     pub table_location: Option<String>,
+
+    /// AWS region for glue / s3tables mode (falls back to the AWS SDK default
+    /// credential-chain region if omitted)
+    #[arg(long)]
+    pub region: Option<String>,
+
+    /// AWS Glue catalog id for cross-account access (glue mode; defaults to the
+    /// caller's account)
+    #[arg(long)]
+    pub catalog_id: Option<String>,
+
+    /// AWS S3 Tables table-bucket ARN (required for s3tables mode),
+    /// e.g. "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+    #[arg(long)]
+    pub table_bucket_arn: Option<String>,
 
     /// R2RML mapping file (Turtle format). Defines how Iceberg table rows
     /// are mapped to RDF triples. When provided, table references come from
