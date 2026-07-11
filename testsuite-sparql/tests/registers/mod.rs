@@ -135,12 +135,13 @@ pub const SPARQL11_AGGREGATES: &[&str] = &[
     // empty named graphs; gated on decision D-6, expected to remain
     // registered after PR-G1 (1)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-empty-group-count-graph",
-    // expression/aggregate cluster (2) — PR-X2: agg-err-01 = aggregate must
-    // poison (unbind) on non-numeric group members; agg02 = COUNT(?var)
-    // re-typed as xsd:int — fix site UNCONFIRMED (it is NOT the
-    // group_aggregate finalize; probe before fixing)
+    // expression/aggregate cluster (1) — PR-X2: agg-err-01 = aggregate must
+    // poison (unbind) on non-numeric group members.
+    // (agg02 = `SELECT ?P (COUNT(?O) AS ?C) … GROUP BY ?P` now PASSES — fixed by
+    // the PR-1 L2 exact-directory-count path; stale skip entry removed. The old
+    // note guessed a datatype re-typing; the real fault was the stats-estimate
+    // count operator this PR replaced.)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-err-01",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg02",
     // expression/aggregate cluster: COUNT(DISTINCT *) needs a
     // rows-distinct IR aggregate (1) — PR-X2
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-count-rows-distinct",

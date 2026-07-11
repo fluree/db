@@ -55,7 +55,7 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::stats_query::StatsCountByPredicateOperator;
+use crate::stats_query::stats_count_by_predicate_operator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
@@ -1681,6 +1681,15 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     if !query.order_binds.is_empty() {
         return None;
     }
+    // OFFSET is applied twice when this operator declines at open() time and
+    // its fallback runs: the fallback tree already applies the full modifier
+    // stack, and the dispatch below wraps modifiers (including OFFSET) around
+    // this operator again. Sort/project/distinct/limit are idempotent under
+    // that re-wrapping; OFFSET is not. Decline and let the generic pipeline
+    // handle it.
+    if query.offset.is_some() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -2876,20 +2885,25 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: stats-based count-by-predicate query
-    // This avoids scanning all triples when we can answer directly from IndexStats.
-    // Skipped in `History` mode — IndexStats reflects current-state cardinality,
-    // not the asserts + retracts a history-range query needs.
+    // Fast-path: per-predicate count answered from POST leaf-directory metadata
+    // (exact — see stats_query.rs for why the old IndexStats numbers were wrong
+    // answers, differential harness FD-3). Skipped in `History` mode (directory
+    // rows are current-state only) and under the kill switch. The `stats.is_some()`
+    // trigger keeps the probe to plausibly-indexed ledgers; the operator's
+    // open()-time gate (`fast_path_store`) is the real guard, declining to the
+    // generic fallback under overlay novelty, time-travel, a non-root policy, or
+    // multi-ledger.
     if !planning.is_history() && !fast_paths_globally_disabled {
-        if let Some(ref stats_view) = stats {
+        if stats.is_some() {
             if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
-                // Build the policy-enforced fallback: the same query as a generic
-                // GROUP BY, producing the operator's internal `[pred, count]`
-                // schema (output forced to those two vars; ORDER BY / LIMIT /
-                // OFFSET stripped, since those wrap the stats operator below).
-                // Recurse with stats disabled so this fast path isn't re-entered.
-                // The operator streams from this fallback when a view policy is
-                // active (the whole-index stats counts can't be trusted then).
+                // Build the fallback: the same query as a generic GROUP BY,
+                // producing the operator's internal `[pred, count]` schema (output
+                // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
+                // since those wrap the operator below). Recurse with stats=None so
+                // this fast path isn't re-entered. The operator streams from this
+                // fallback whenever the directory-count gate declines (overlay,
+                // time-travel, policy, multi-ledger) — which also keeps a non-root
+                // policy's restricted predicates from leaking through stale counts.
                 let mut fallback_query = query.clone();
                 fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
                 fallback_query.ordering = Vec::new();
@@ -2903,8 +2917,7 @@ fn build_operator_tree_inner(
                     planning,
                 )?;
 
-                let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
-                    Arc::clone(stats_view),
+                let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
                     pred_var,
                     count_var,
                     Some(fallback),

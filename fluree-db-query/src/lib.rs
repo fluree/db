@@ -163,7 +163,7 @@ pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};
 pub use shortest_path::ShortestPathOperator;
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
-pub use stats_query::StatsCountByPredicateOperator;
+pub use stats_query::stats_count_by_predicate_operator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
 pub use unwind::UnwindOperator;

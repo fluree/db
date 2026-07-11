@@ -54,15 +54,16 @@
 //!   only holds after bulk import and is cleared by incremental writes;
 //!   this ledger was reindex-built. Suspect: `fast_min_max_string`
 //!   missing the lex-order gate.
-//! - **FD-3 `group_by_predicate_count`** (all three conditions,
-//!   differently): the stats-answered path
-//!   (`StatsCountByPredicateOperator`) (a) counts duplicate re-asserts
-//!   that set-semantics novelty apply dedups (base: `bsbm:name` 42 vs
-//!   22), (b) applies novelty deltas inconsistently per predicate
-//!   (overlay: `rdf:type` stale at the index-time 824 while other
-//!   predicates include novelty), and (c) omits the `rdf:type` row
-//!   entirely in pure novelty. Suspect: IndexStats accounting +
-//!   `detect_stats_count_by_predicate` novelty handling.
+//! - **FD-3 `group_by_predicate_count`** — FIXED (PR-1 L2), now enforced.
+//!   The stats-answered path returned `StatsView` estimates as answers,
+//!   which (a) counted duplicate re-asserts that set-semantics novelty
+//!   apply dedups (base: `bsbm:name` 42 vs 22), (b) applied novelty deltas
+//!   inconsistently per predicate (overlay: `rdf:type` stale at the
+//!   index-time count), and (c) omitted the `rdf:type` row entirely in
+//!   pure novelty. `stats_query::stats_count_by_predicate_operator` now
+//!   counts exactly from POST leaf-directory metadata, gated by
+//!   `fast_path_store` (exact at the persisted index/HEAD) with the generic
+//!   pipeline as the fallback for overlay/novelty/time-travel/policy.
 
 #![cfg(feature = "native")]
 
@@ -361,11 +362,13 @@ fn catalog() -> Vec<Case> {
             known_divergence: None,
             sparql: "SELECT ?o (COUNT(?s) AS ?c) WHERE { ?s bsbm:productType ?o } GROUP BY ?o ORDER BY DESC(?c) LIMIT 10",
         },
-        // detect_stats_count_by_predicate (StatsView-answered when indexed)
+        // detect_stats_count_by_predicate — FD-3 fixed (PR-1 L2): now counted
+        // exactly from POST leaf directories (base), or declined to the generic
+        // pipeline (overlay/novelty), never from StatsView estimates. Enforced.
         Case {
             name: "group_by_predicate_count",
             ordered: false,
-            known_divergence: Some("FD-3"),
+            known_divergence: None,
             sparql: "SELECT ?p (COUNT(?s) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?p",
         },
         // Property-join star fusion + ORDER BY (generic-path internal fast
