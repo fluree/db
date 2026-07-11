@@ -201,6 +201,10 @@ name = "it_query_cypher_fullscan"
 path = "tests/it_query_cypher_fullscan.rs"
 
 [[test]]
+name = "it_wga_gate_verify"
+path = "tests/it_wga_gate_verify.rs"
+
+[[test]]
 name = "it_policy_cypher"
 path = "tests/it_policy_cypher.rs"
 
