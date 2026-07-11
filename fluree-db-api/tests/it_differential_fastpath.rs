@@ -39,11 +39,13 @@
 //! for ALL cases — generic results agreed across base/overlay/novelty on
 //! every case at harness introduction.
 //!
-//! - **FD-1 `avg_numeric`** (base, overlay): values agree to f64
-//!   precision, but the AVG fast path emits an `xsd:double`-style JSON
-//!   number (`7072.886363636364`) while the generic pipeline emits an
-//!   arbitrary-precision `xsd:decimal` string. Observable datatype
-//!   contract difference. Suspect: `fast_predicate_scalar_agg`.
+//! - **FD-1 `avg_numeric`** — FIXED (PR-1 L1), now enforced. The AVG fast
+//!   path emitted an `xsd:double`-style JSON number (`7072.886363636364`)
+//!   while the generic pipeline emits an arbitrary-precision `xsd:decimal`
+//!   string. `fast_predicate_scalar_agg::AggState::Avg` now mirrors
+//!   `aggregate::finalize_avg` per number kind (exact `xsd:decimal` for
+//!   integers, plain `xsd:double` for doubles) so the two paths are
+//!   byte-identical.
 //! - **FD-2 `max_label` / `min_label`** (base): wrong answers. With
 //!   `bsbm:label` on vendors and products, generic MAX is
 //!   `"Vendor 000003"` (lexicographic), fast returns `"Product 000219"`
@@ -316,11 +318,13 @@ fn catalog() -> Vec<Case> {
             known_divergence: None,
             sparql: "SELECT (SUM(?o) AS ?total) WHERE { ?s bsbm:price ?o }",
         },
-        // detect_predicate_avg_numeric
+        // detect_predicate_avg_numeric — FD-1 fixed (PR-1 L1): the fast path
+        // now finalizes integer inputs as exact xsd:decimal, matching the
+        // generic pipeline. Enforced.
         Case {
             name: "avg_numeric",
             ordered: false,
-            known_divergence: Some("FD-1"),
+            known_divergence: None,
             sparql: "SELECT (AVG(?o) AS ?avg) WHERE { ?s bsbm:price ?o }",
         },
         // detect_predicate_minmax_string — churned labels sort after

@@ -8160,8 +8160,9 @@ async fn indexed_numeric_avg_min_max_fast_paths_work() {
             let avg_json = avg_result.to_jsonld(&view.snapshot).expect("to_jsonld");
             assert_eq!(
                 normalize_rows(&avg_json),
-                normalize_rows(&json!([[2.5]])),
-                "indexed AVG(?o) should average numeric values directly"
+                normalize_rows(&json!([["2.5"]])),
+                "indexed AVG(?o) over integers yields exact xsd:decimal \
+                 (serialized as a string), matching the generic pipeline"
             );
 
             let min_query = r"
@@ -8766,7 +8767,10 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .expect("view t=1");
             for (q, expected) in [
                 (sum_q, json!([[60]])),
-                (avg_q, json!([[20.0]])),
+                // AVG over integers now renders as an exact xsd:decimal string
+                // on the leaflet-metadata lane too (PR-1 L1), matching the
+                // overlay lane below and the generic pipeline.
+                (avg_q, json!([["20"]])),
                 (cd_q, json!([[2]])),
             ] {
                 let result = fluree
@@ -8796,9 +8800,9 @@ async fn indexed_overlay_scalar_agg_reflects_assert_and_retract() {
                 .db_at_t(ledger_id, ledger2.t())
                 .await
                 .expect("view t=2");
-            // AVG (a decimal) renders as a bare number on the indexed leaflet
-            // lane (phase 1) but as a precision-preserving decimal string on the
-            // overlay fast path that serves head-with-novelty views (the same
+            // AVG over integers renders as a precision-preserving xsd:decimal
+            // string on every lane after PR-1 L1 — the leaflet-metadata lane
+            // (phase 1) and this overlay POST-cursor lane now agree (the same
             // rendering `db()` returns in production; see it_join_batched_overlay).
             for (q, expected) in [
                 (sum_q, json!([[100]])),
