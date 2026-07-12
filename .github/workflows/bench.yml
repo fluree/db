@@ -49,7 +49,7 @@ jobs:
           sudo docker image prune --all --force
 
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
