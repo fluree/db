@@ -450,6 +450,26 @@ impl ComparableValue {
         }
     }
 
+    /// String content of a value usable as a SPARQL string-builtin argument: a
+    /// plain / `xsd:string` literal, or a language-tagged literal (§17.4.3
+    /// admits a simple literal, `xsd:string`, and a plain literal with a
+    /// language tag). Unlike [`as_str`](Self::as_str), this rejects an IRI and a
+    /// foreign-datatype `TypedLiteral`, so a builtin that requires a string
+    /// argument (CONTAINS/STRSTARTS/…) keeps raising a type error on those while
+    /// staying transparent to a language tag. Same accept-set as `CONCAT`.
+    pub fn string_arg(&self) -> Option<&str> {
+        match self {
+            ComparableValue::String(s) => Some(s.as_ref()),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s),
+                dtc,
+            } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => {
+                Some(s.as_str())
+            }
+            _ => None,
+        }
+    }
+
     /// Convert this value to a string-typed ComparableValue (for STR function).
     ///
     /// Consumes self and returns a `ComparableValue::String` containing the
@@ -1051,5 +1071,40 @@ mod tests {
         let cv = ComparableValue::Long(42);
         let sv = cv.into_string_value_with_namespaces(Some(&ns));
         assert_eq!(sv, Some(ComparableValue::String(Arc::from("42"))));
+    }
+
+    #[test]
+    fn test_string_arg_accept_set() {
+        // #1468: `string_arg` accepts a plain / xsd:string literal and a
+        // language-tagged literal (tag-transparent), but rejects an IRI and a
+        // foreign-datatype literal so string builtins keep raising a type error
+        // on those. Mirrors CONCAT's accept-set.
+        let plain = ComparableValue::String(Arc::from("x"));
+        assert_eq!(plain.string_arg(), Some("x"));
+
+        let lang = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::LangTag(Arc::from("en"))),
+        };
+        assert_eq!(lang.string_arg(), Some("x"));
+
+        let untyped = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: None,
+        };
+        assert_eq!(untyped.string_arg(), Some("x"));
+
+        let foreign = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                "http://example.org/dt",
+            ))),
+        };
+        assert_eq!(foreign.string_arg(), None);
+
+        let iri = ComparableValue::Iri(Arc::from("http://example.org/x"));
+        assert_eq!(iri.string_arg(), None);
+
+        assert_eq!(ComparableValue::Long(1).string_arg(), None);
     }
 }

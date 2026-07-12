@@ -1610,3 +1610,168 @@ async fn jsonld_ebv_of_cast_numeric_literals() {
     });
     assert_eq!(jsonld_rows(&fluree, &ledger, &q_falsy).await, json!([]));
 }
+
+// =============================================================================
+// D7 — a stored language-tagged literal carries its tag through the eval path
+// (#1468): `=`/`!=` are tag-aware, and the string builtins that accept a
+// language-tagged argument (§17.4.3) stay transparent to it.
+// =============================================================================
+
+/// A same-tag pair, a different-tag twin, and a plain-string twin — all on
+/// `ex:v`, so a self-join materializes both operands as `Binding::Lit` (the
+/// memory-backed Lit path, where `lit_to_comparable` runs).
+async fn seed_lang(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:en", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:en2", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:fr", "ex:v": { "@value": "x", "@language": "fr" } },
+            { "@id": "ex:plain", "ex:v": "x" }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert").ledger
+}
+
+// `?a = "x"@en` matches only the same-lexeme same-tag literals (ex:en, ex:en2);
+// `"x"@fr` (different tag) and the plain string `"x"` are known-unequal. Before
+// #1468 the tag was dropped, so all four collapsed to the string "x" and matched.
+#[tokio::test]
+async fn sparql_stored_lang_equality_is_tag_aware() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // `=`: only the @en subjects equal ex:en's "x"@en.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a = ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+    // `!=`: the different-tag literal and the plain string are `!=`-true; the
+    // @en pair is `!=`-false (excluded).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a != ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+}
+
+#[tokio::test]
+async fn jsonld_stored_lang_equality_is_tag_aware() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7:jsonld").await;
+    let q_eq = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            { "@id": "ex:en", "ex:v": "?b" },
+            ["filter", ["=", "?a", "?b"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_eq).await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+    let q_ne = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            { "@id": "ex:en", "ex:v": "?b" },
+            ["filter", ["!=", "?a", "?b"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_ne).await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+}
+
+// The string builtins that accept a language-tagged argument stay transparent
+// to the tag (no "requires string argument" type error), and LANG/LANGMATCHES
+// still read the tag off a stored lang literal.
+#[tokio::test]
+async fn sparql_string_builtins_accept_stored_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7b:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:en ex:v ?a . FILTER(CONTAINS(?a, \"x\")) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:en ex:v ?a . FILTER(LANG(?a) = \"en\") }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:en ex:v ?a . FILTER(LANGMATCHES(LANG(?a), \"en\")) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+}
+
+#[tokio::test]
+async fn jsonld_string_builtins_accept_stored_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/d7b:jsonld").await;
+    // CONTAINS accepts every stored value (all four contain "x") — no row errors
+    // out on the language-tagged literals.
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            ["filter", ["contains", "?a", "x"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["ex:en"], ["ex:en2"], ["ex:fr"], ["ex:plain"]])
+    );
+}
+
+// The sweep must not accept a foreign-datatype literal as a string argument: it
+// is not a string, so CONTAINS stays a type error (the row is excluded).
+#[tokio::test]
+async fn sparql_string_builtin_rejects_foreign_datatype_arg() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_foreign(&fluree, "x2/d7c:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // ex:fa ex:v is "zzz"^^ex:myType — CONTAINS on it is a type error → ASK false.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:fa ex:v ?a . FILTER(CONTAINS(?a, \"zz\")) }}"),
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+}
