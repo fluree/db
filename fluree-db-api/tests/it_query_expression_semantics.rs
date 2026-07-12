@@ -743,6 +743,88 @@ async fn jsonld_in_uses_value_equality() {
     assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["Alice"]]));
 }
 
+// O3 — IN / NOT IN propagate a three-valued error (§17.4.1.9): when no element
+// matches AND ≥1 element comparison errors, the whole expression is a type error
+// (unbound in BIND, row-dropped in FILTER, catchable by COALESCE), not `false`
+// (IN) / `true` (NOT IN). A definitive match still wins and discards the pending
+// error. On wave-3 the error half was swallowed, so `2 IN (1/0)` read as `false`.
+#[tokio::test]
+async fn sparql_in_error_propagation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/in-err:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+
+    // `BOUND(?r)` is true iff the IN/NOT IN expression did NOT error — an errored
+    // expression demotes to unbound in the BIND (was bound-to-false on wave-3).
+    for (expr, binds) in [
+        ("2 IN (1/0)", false),       // no match + demotable error → error → unbound
+        ("2 NOT IN (1/0)", false),   // no match + demotable error → error → unbound
+        ("2 IN (5, 3)", true),       // no match, no error → false (still bound)
+        ("2 IN (2, 3)", true),       // match → true (control)
+        ("2 IN (1/0, 2)", true),     // match discards the pending error → bound
+        ("2 NOT IN (1/0, 2)", true), // match discards the pending error → bound
+    ] {
+        let q = format!("{p} ASK {{ ?s ex:name ?n . BIND({expr} AS ?r) FILTER(BOUND(?r)) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(binds),
+            "BOUND {expr}"
+        );
+    }
+
+    // The non-errored cases keep their correct boolean value: `FILTER(?r)` passes
+    // iff `?r` is true, so the ASK result equals the expression's truth value.
+    for (expr, truth) in [
+        ("2 IN (2, 3)", true),
+        ("2 IN (5, 3)", false),
+        ("2 IN (1/0, 2)", true),      // match wins → true
+        ("2 NOT IN (1/0, 2)", false), // match wins → false
+    ] {
+        let q = format!("{p} ASK {{ ?s ex:name ?n . BIND({expr} AS ?r) FILTER(?r) }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            JsonValue::Bool(truth),
+            "VALUE {expr}"
+        );
+    }
+
+    // COALESCE catches the demotable IN error and falls through to the next arm
+    // (proving the error is `can_demote_in_expression`). On wave-3 `2 IN (1/0)`
+    // was `false`, so COALESCE returned that boolean and the filter type-errored.
+    let q = format!(
+        "{p} ASK {{ ?s ex:name ?n . BIND(COALESCE(2 IN (1/0), \"recovered\") AS ?c) FILTER(?c = \"recovered\") }}"
+    );
+    assert_eq!(
+        sparql_rows(&fluree, &ledger, &q).await,
+        JsonValue::Bool(true)
+    );
+}
+
+// O3 (JSON-LD sibling) — same three-valued IN/NOT IN error propagation through
+// the JSON-LD filter surface. Shared IR: the same `eval_in`/`eval_not_in` fix
+// serves both surfaces. An errored BIND leaves the target unbound (null).
+#[tokio::test]
+async fn jsonld_in_error_propagation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "x2/in-err:jsonld").await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?err", "?ok", "?win"],
+        "where": [
+            { "@id": "ex:alice", "ex:name": "?n" },
+            ["bind", "?err", "(in 2 [(/ 1 0)])"],
+            ["bind", "?ok", "(in 2 [2 3])"],
+            ["bind", "?win", "(in 2 [(/ 1 0) 2])"]
+        ]
+    });
+    // ?err errors → null (unbound); ?ok matches → true; ?win matches despite the
+    // errored element → true (the definitive match discards the pending error).
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([[null, true, true]])
+    );
+}
+
 /// Four one-property nodes spanning the EBV cases: numeric zero, empty string,
 /// a truthy number and a truthy string.
 async fn seed_ebv(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
