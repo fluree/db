@@ -101,7 +101,6 @@ on-demand):
    - **Smoke.** `cargo bench --workspace -- --test` runs each bench's
      scenarios once at `tiny` scale — catches benches that compile but panic
      at runtime (bad SPARQL, broken setup, missing API surface).
-
 2. **Per-PR compare (`ci.yml` `bench-compare`).** Runs the cheap subset
    (`query_overlay_matrix` + `query_hot_bsbm`) at `tiny`/`quick` and compares
    against the committed baseline via the `bench-baseline` bin. **Memory
@@ -113,6 +112,23 @@ on-demand):
    Captures the cheap subset on `ubuntu-latest` (`runner_class=ci-ubuntu-latest`)
    and uploads it as an artifact; committing it lands a CI-class baseline that
    makes the per-PR time half enforce.
+
+> **Visibility gap (documented; fix is a follow-up).** The per-PR gate only
+> *compiles* benches — `clippy --all --all-features --all-targets` in `ci.yml`
+> builds every bench, and `bench-compare` runs only the two cheap ones. Every
+> other bench is *executed* nightly-only (`bench.yml`), visible to the last
+> default-branch committer rather than to the PR that introduced a break. So a
+> bench that compiles cleanly but panics at runtime — bad SPARQL, or a setup
+> that matches zero data — sails through every PR and only reddens the nightly.
+> This is exactly how the `query_hot_whole_graph_agg` `@vocab` bug reached main
+> (its class scenarios matched zero nodes; the filtered-histogram sanity assert
+> panicked). Two consequences: historical numbers for that bench's
+> `SCALARS_CLASS`/`HISTOGRAM_CLASS` scenarios predate the fix, measured empty
+> scans, and are void — re-baseline them the first time a committed baseline
+> includes `whole_graph_agg` (the current committed baseline covers only the
+> cheap subset, which is unaffected); and whether to promote a tiny `-- --test`
+> runtime smoke into per-PR CI is an open follow-up, costed against the same
+> budget that keeps the compare subset cheap.
 
 To intentionally accept a regression (or tighten a budget), edit
 `regression-budget.json` in the same PR and explain in the PR body.
@@ -179,6 +195,15 @@ memory until a CI-class baseline exists. Two ways to make time enforce:
 
 The nightly reconcile + smoke still catches the regressions that don't depend on
 baseline comparison: API breakage, panics, missing budgets.
+
+> **Void pre-fix numbers — `query_hot_whole_graph_agg`.** Before the `@vocab`
+> fix in this PR, that bench's class-anchored scenarios (`scalars/class`,
+> `histogram/class`, `histogram/class_filtered`) matched zero nodes and silently
+> measured *empty* results — so any historical numbers for them are void and
+> must be re-baselined the first time a committed baseline includes that bench.
+> The committed `guardrails-pre.json` subset is `query_overlay_matrix` +
+> `query_hot_bsbm` **only** — it does not include `query_hot_whole_graph_agg` —
+> so there is no collision, and the recaptured baseline is unaffected.
 
 ## Architecture
 
