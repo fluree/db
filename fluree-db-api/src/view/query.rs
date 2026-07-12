@@ -675,16 +675,20 @@ impl Fluree {
         }
 
         let mut dataset = DataSetDb::new();
-        // §13.2: the dataset default graph is the RDF merge (a SET) of the
-        // FROM graphs — a repeated `FROM <g>` (or two spellings resolving to
-        // one graph) must contribute ONE member, not a bag-duplicating twin.
-        let mut seen_default: std::collections::HashSet<fluree_db_core::GraphId> =
-            std::collections::HashSet::new();
+        // A default graph named more than once (e.g. `FROM <g> FROM <g>`, or two
+        // aliases of the same graph) contributes a single member: the default
+        // union is a set (SPARQL §13.2). All within-ledger graphs share the one
+        // snapshot, so `graph_id` uniquely identifies a member — collapsing exact
+        // duplicates here keeps `FROM <g> FROM <g>` on the byte-identical
+        // single-graph path and avoids scanning the same graph twice. Genuinely
+        // distinct members that happen to share triples are still deduplicated at
+        // scan time by the `DatasetOperator`.
+        let mut seen_default_g_ids = std::collections::HashSet::new();
         for iri in &clause.default_graphs {
             let graph = self
                 .resolve_within_ledger_graph(db, iri)?
                 .ok_or_else(cross_ledger_dataset_error)?;
-            if seen_default.insert(graph.graph_id) {
+            if seen_default_g_ids.insert(graph.graph_id) {
                 dataset = dataset.with_default(graph);
             }
         }

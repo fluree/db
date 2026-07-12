@@ -617,11 +617,17 @@ impl Fluree {
 
         reject_reasoning_in_history_mode(history_mode, executable).map_err(ApiError::query)?;
 
-        let prepare_config = if history_mode {
+        let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
             PrepareConfig::current(primary.binary_store.as_ref())
         };
+        // A `>= 2`-member default union is an RDF merge (a set), not a bag
+        // (SPARQL §13.2); tell the planner so it forces full triple identity and
+        // the `DatasetOperator` deduplicates across members.
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(dataset.default.len() >= 2);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(query_error_to_api_error)?;
@@ -763,11 +769,16 @@ impl Fluree {
         reject_reasoning_in_history_mode(history_mode, executable)
             .map_err(fluree_db_query::QueryError::InvalidQuery)?;
 
-        let prepare_config = if history_mode {
+        let mut prepare_config = if history_mode {
             PrepareConfig::history(primary.binary_store.as_ref())
         } else {
             PrepareConfig::current(primary.binary_store.as_ref())
         };
+        // See `execute_dataset_into_with_r2rml`: a `>= 2`-member default union is
+        // a set (SPARQL §13.2), so the planner enforces triple-identity dedup.
+        prepare_config.planning = prepare_config
+            .planning
+            .with_multi_default_graph(dataset.default.len() >= 2);
         let prepared = prepare_execution_with_config(db, executable, &prepare_config).await?;
 
         let primary_ledger_id: &str = primary.ledger_id.as_ref();

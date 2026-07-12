@@ -2238,6 +2238,13 @@ fn build_operator_tree_inner(
     // single planner-time decision.
     let enable_fused_fast_paths = enable_fused_fast_paths && !planning.is_history();
 
+    // A `>= 2`-member default union is a set (SPARQL §13.2), not a bag. The
+    // fused count/aggregate fast paths short-circuit to per-member cardinalities
+    // (and some build count-only scans with a pruned emit mask), so they would
+    // over-count a triple shared across members. Decline them and let the
+    // general pipeline run over the deduplicating `DatasetOperator`.
+    let enable_fused_fast_paths = enable_fused_fast_paths && !planning.multi_default_graph;
+
     // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
     // generic pipeline's dedicated post-grouping bind stage. No fast path runs
     // that stage, so any fast path that returns early would sort on a synthetic

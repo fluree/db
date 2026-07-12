@@ -2687,3 +2687,292 @@ async fn sparql_within_ledger_repeated_from_is_deduped() {
         "FROM <g> FROM <g> must union the graph ONCE (set semantics), not double rows"
     );
 }
+
+// =============================================================================
+// #1469: the default-graph union is a SET (RDF merge), not a BAG (SPARQL §13.2)
+//
+// `FROM <g1> FROM <g2>` unions g1 and g2 into the default graph as an RDF
+// *merge*: a triple present in both members is emitted once, while two
+// *distinct* triples that happen to project to the same value keep their
+// multiplicity. These pin the `DatasetOperator` cross-member dedup, the forced
+// full triple identity (so a pruned column can't collapse distinct triples),
+// and the `COUNT(*)` set cardinality. All are new — no prior test seeded a
+// shared triple across default-union members, so the bag/set difference was
+// latent.
+// =============================================================================
+
+/// Seed ONE ledger with two named graphs that deliberately SHARE a triple.
+/// `<urn:s1>` and `<urn:s2>` each carry a private `schema:name`, the
+/// byte-identical shared triple `ex:x schema:name "Shared"`, and a *distinct*
+/// triple whose object is the same string `"Dup"` (different subjects `ex:d1`
+/// / `ex:d2`) to pin the EmitMask pruning trap. The ledger default graph holds
+/// only `ex:alice schema:name "Alice"`.
+async fn seed_union_dataset(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <urn:s1> {
+            ex:a  schema:name "A1" .
+            ex:x  schema:name "Shared" .
+            ex:d1 schema:name "Dup" .
+        }
+        GRAPH <urn:s2> {
+            ex:b  schema:name "B2" .
+            ex:x  schema:name "Shared" .
+            ex:d2 schema:name "Dup" .
+        }
+    "#;
+    fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert should succeed")
+        .ledger
+}
+
+/// (a) `FROM <g> FROM <g>` names the same graph twice. The default union is a
+/// set, so the graph contributes ONE copy of each of its triples — not two.
+#[tokio::test]
+async fn sparql_within_ledger_from_self_union_is_single_copy() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> FROM <urn:s1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("self-union FROM should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // s1's three triples, each once — NOT doubled.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (b)+(c) `FROM <s1> FROM <s2>` merges the two graphs as a set: the shared
+/// triple `ex:x schema:name "Shared"` is emitted ONCE, while the two *distinct*
+/// triples projecting to `"Dup"` (`ex:d1` / `ex:d2`) both survive. The `?s`
+/// column is unprojected and occurs once, so without the forced full triple
+/// identity it would be pruned and collapse the two `"Dup"` rows — the pruning
+/// trap this pins.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_is_a_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> FROM <urn:s2> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("union FROM should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // "Shared" once (set-merge of the shared triple); "Dup" twice (two distinct
+    // triples, multiplicity preserved); "A1" and "B2" once each.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["B2"], ["Dup"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (d) `COUNT(*)` over a default union is the set cardinality — the `drain_count`
+/// fast path must fall back to the deduplicating scan, not sum per-member (bag)
+/// counts. Self-union → 3; two-graph union with one shared triple → 5.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_count_is_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let self_union = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT (COUNT(*) AS ?c) FROM <urn:s1> FROM <urn:s1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, self_union)
+        .await
+        .expect("self-union COUNT should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[3]])));
+
+    let two_graph = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT (COUNT(*) AS ?c) FROM <urn:s1> FROM <urn:s2> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, two_graph)
+        .await
+        .expect("union COUNT should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[5]])));
+}
+
+/// (d2) Ground-pattern set-merge: a fully-constant pattern `{ <s> <p> <o> }`
+/// emits the empty solution mapping with a zero-column schema even under forced
+/// `EmitMask::ALL` (only variable positions form columns), so it can't be keyed
+/// by the row-tuple dedup. The empty mapping is still a single set solution, so
+/// `COUNT(*)` of a ground triple present in both members must be 1, not 2.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_ground_pattern_count_is_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX schema: <http://schema.org/>
+        SELECT (COUNT(*) AS ?c) FROM <urn:s1> FROM <urn:s2> { ex:x schema:name "Shared" }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("ground-pattern COUNT should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([[1]])));
+}
+
+/// (d3) A ground pattern that seeds a join must not multiply the join result by
+/// the number of members holding the ground triple. The guard
+/// `ex:x schema:name "Shared"` (present in both s1 and s2) contributes ONE empty
+/// solution, so the joined `?s schema:name ?name` names are the plain set-merged
+/// multiset, not doubled.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_ground_seed_join_not_multiplied() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r#"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> FROM <urn:s2>
+        { ex:x schema:name "Shared" . ?s schema:name ?name }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("ground-seeded join should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Same 5-row multiset as the guard-free union — NOT doubled to 10.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["B2"], ["Dup"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (e) `FROM NAMED` graphs are NOT merged: each named graph keeps its own
+/// triples, so `GRAPH ?g` over two named graphs that share a triple yields that
+/// triple once per graph. Set-merge dedup is scoped to the default union and
+/// must leave named-graph semantics untouched.
+#[tokio::test]
+async fn sparql_within_ledger_from_named_union_not_merged() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let sparql = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM NAMED <urn:s1> FROM NAMED <urn:s2>
+        { GRAPH ?g { ?s schema:name ?name } }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, sparql)
+        .await
+        .expect("FROM NAMED GRAPH ?g should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    // Every triple of both named graphs, unmerged: "Shared" and "Dup" appear
+    // twice (once per graph), "A1" and "B2" once.
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([
+            ["A1"],
+            ["B2"],
+            ["Dup"],
+            ["Dup"],
+            ["Shared"],
+            ["Shared"]
+        ]))
+    );
+}
+
+/// (f) The no-FROM and single-FROM paths are byte-identical to before (no
+/// dedup, no forced emit): a plain query sees the ledger default graph, and a
+/// single `FROM` scopes to one graph with each triple once.
+#[tokio::test]
+async fn sparql_within_ledger_no_from_and_single_from_unaffected() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    // No FROM: the ledger's real default graph (only Alice).
+    let no_from = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, no_from)
+        .await
+        .expect("no-FROM query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(normalize_rows(&jsonld), normalize_rows(&json!([["Alice"]])));
+
+    // Single FROM: one graph, each triple once.
+    let single_from = r"
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name FROM <urn:s1> { ?s schema:name ?name }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, single_from)
+        .await
+        .expect("single-FROM query should succeed");
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&jsonld),
+        normalize_rows(&json!([["A1"], ["Dup"], ["Shared"]]))
+    );
+}
+
+/// (g) JSON-LD parity: the JSON-LD `from` array builds the same within-ledger
+/// `DataSetDb` / `DatasetOperator` as SPARQL `FROM ... FROM ...`, so it enforces
+/// the same set-merge — shared triple once, distinct-but-equal-valued triples
+/// both kept. Mirrors `sparql_within_ledger_from_union_is_a_set`.
+#[tokio::test]
+async fn fql_within_ledger_from_union_is_a_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = seed_union_dataset(&fluree, "wl:main").await;
+
+    let query = json!({
+        "@context": {"schema": "http://schema.org/"},
+        "from": [
+            {"@id": "wl:main", "graph": "urn:s1"},
+            {"@id": "wl:main", "graph": "urn:s2"}
+        ],
+        "select": "?name",
+        "where": {"@id": "?s", "schema:name": "?name"}
+    });
+
+    let spec = DatasetSpec::from_json(&query).expect("parse dataset spec");
+    assert_eq!(spec.default_graphs.len(), 2, "two default-union members");
+    let dataset = fluree
+        .build_dataset_view(&spec)
+        .await
+        .expect("build within-ledger union dataset");
+    let result = fluree
+        .query_dataset(&dataset, &query)
+        .await
+        .expect("union dataset query should succeed");
+    let primary = dataset.primary().unwrap();
+    let jsonld = result
+        .to_jsonld(primary.snapshot.as_ref())
+        .expect("to_jsonld");
+    // Same multiset as the SPARQL twin: "Shared" once, "Dup" twice.
+    assert_eq!(
+        normalize_flat_results(&jsonld),
+        normalize_flat_results(&json!(["A1", "B2", "Dup", "Dup", "Shared"]))
+    );
+}
