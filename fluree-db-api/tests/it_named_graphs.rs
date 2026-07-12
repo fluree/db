@@ -2210,45 +2210,96 @@ async fn test_graph_mgmt_rejects_reserved_graph_targets() {
         .expect("CLEAR of a user graph must still succeed");
 }
 
-/// O5: COPY/MOVE/ADD of a named graph that contains edge annotations
-/// (`f:reifies*` flakes) must fail loud. Re-homing rewrites only each flake's
-/// `g`, desyncing the `f:reifiesGraph` anchor, so on `burndown/wave-3` the
-/// annotation is silently dropped at read time (both JSON-LD hydration and the
-/// attachment indexer skip a `GraphMismatch` bundle). Here the transfer must
-/// error instead of silently losing the annotation. (Remove the guard and this
-/// test fails: the COPY/MOVE/ADD succeeds and the annotation is lost.)
+/// O5 (#1467): COPY/MOVE/ADD of a graph containing edge annotations
+/// (`f:reifies*` flakes) now re-homes the `f:reifiesGraph` anchor instead of
+/// rejecting the transfer. This is the **default→named** case — the only one
+/// SPARQL UPDATE can seed (`{| |}` annotation tails inside a `GRAPH` block are
+/// rejected pre-expansion, so named-source annotations live in
+/// `it_edge_annotations.rs`). A default-graph annotation carries NO anchor
+/// flake, so the fix SYNTHESIZES one pointing at the dest graph; without it,
+/// `EdgeKey::from_reifies_facts` would decode `g == None != flake-level g` and
+/// both readers (JSON-LD hydration + attachment indexer) would silently drop
+/// the annotation. (On `burndown/wave-3` this errored with "edge annotations".)
 #[tokio::test]
-async fn test_graph_mgmt_rejects_annotation_bearing_transfer() {
+async fn test_graph_mgmt_transfers_default_annotation_to_named() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "it/graph-mgmt-annotation:main";
     let g2 = "http://example.org/g2";
-    let ledger = genesis_ledger(&fluree, ledger_id);
-
-    // Seed an annotated edge: the base triple AND its `f:reifies*` bundle land
-    // in the default graph. SPARQL UPDATE only accepts annotation tails in the
-    // default graph in v1 (the JSON-LD surface can place them in a named graph),
-    // but the guard fires on `f:reifies*` flakes in ANY source graph, so a
-    // default-graph source exercises the same path — and DEFAULT -> named is
-    // itself an orphaning case: the re-homed bundle would need an
-    // `f:reifiesGraph` anchor the source never had.
     let seed = r#"PREFIX ex: <http://example.org/>
 INSERT DATA {
   ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} .
 }"#;
-    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
 
-    for verb in ["COPY", "MOVE", "ADD"] {
+    // Each verb gets a fresh ledger (MOVE is destructive on the source).
+    for (verb, source_kept) in [("COPY", true), ("ADD", true), ("MOVE", false)] {
+        let ledger_id = format!("it/graph-mgmt-xfer-{}:main", verb.to_lowercase());
+        let ledger = genesis_ledger(&fluree, &ledger_id);
+        let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+
         let sparql = format!("{verb} DEFAULT TO <{g2}>");
-        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
-            .await
-            .expect_err(&format!("annotation-bearing {verb} must be rejected"));
-        assert!(
-            err.contains("edge annotations"),
-            "expected an annotation-transfer rejection for `{sparql}`, got: {err}"
+        let ledger = run_sparql_update(&fluree, ledger, &sparql).await.ledger;
+
+        // Rigorous correctness gate: the dest bundle must decode via the exact
+        // reader path (`from_reifies_facts`) with the synthesized anchor
+        // resolving `g == dest`. A GraphMismatch here is the silent-drop bug.
+        let g2_id = ledger
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(g2)
+            .expect("dest graph registered after transfer");
+        let dest_keys =
+            support::decode_annotations_for_subject(&ledger, g2_id, "http://example.org/alice")
+                .await;
+        assert_eq!(
+            dest_keys.len(),
+            1,
+            "{verb}: exactly one re-homed annotation in dest graph"
         );
+        let g2_sid = ledger
+            .snapshot
+            .encode_iri(g2)
+            .expect("encode dest graph IRI");
+        assert_eq!(
+            dest_keys[0].g,
+            Some(g2_sid),
+            "{verb}: decoded f:reifiesGraph anchor must name the dest graph"
+        );
+
+        // User-facing surface parity: SPARQL annotation-tail scoped to <g2>.
+        assert_eq!(
+            sparql_annotation_role(&fluree, &ledger, Some(g2))
+                .await
+                .as_deref(),
+            Some("Engineer"),
+            "{verb}: annotation must be queryable in dest graph <{g2}>"
+        );
+
+        // Source (default graph): kept for COPY/ADD, gone for MOVE.
+        let src_keys =
+            support::decode_annotations_for_subject(&ledger, 0, "http://example.org/alice").await;
+        if source_kept {
+            assert_eq!(src_keys.len(), 1, "{verb}: source annotation must remain");
+            assert_eq!(
+                src_keys[0].g, None,
+                "{verb}: source stays in the default graph"
+            );
+            assert_eq!(
+                sparql_annotation_role(&fluree, &ledger, None)
+                    .await
+                    .as_deref(),
+                Some("Engineer"),
+                "{verb}: source annotation stays queryable"
+            );
+        } else {
+            assert!(
+                src_keys.is_empty(),
+                "MOVE must remove the source annotation"
+            );
+        }
     }
 
     // Control: COPY of an annotation-free graph still succeeds.
+    let ledger_id = "it/graph-mgmt-xfer-control:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
     let plain_iri = "http://example.org/plain";
     let plain = format!(
         r#"INSERT DATA {{ GRAPH <{plain_iri}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
@@ -2261,6 +2312,36 @@ INSERT DATA {
     )
     .await
     .expect("COPY of an annotation-free graph must still succeed");
+}
+
+/// The `ex:role` of the annotation on `ex:alice ex:worksFor ex:acme`, queried
+/// through the SPARQL annotation-tail surface. `graph_iri = None` targets the
+/// default graph; `Some(iri)` wraps the pattern in a `GRAPH` block.
+async fn sparql_annotation_role(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    graph_iri: Option<&str>,
+) -> Option<String> {
+    let inner = "ex:alice ex:worksFor ex:acme {| ex:role ?role |}";
+    let sparql = match graph_iri {
+        Some(g) => format!(
+            "PREFIX ex: <http://example.org/> SELECT ?role WHERE {{ GRAPH <{g}> {{ {inner} }} }}"
+        ),
+        None => {
+            format!("PREFIX ex: <http://example.org/> SELECT ?role WHERE {{ {inner} }}")
+        }
+    };
+    let result = support::query_sparql(fluree, ledger, &sparql)
+        .await
+        .expect("annotation-tail query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .and_then(|b| b.first())
+        .and_then(|row| row["role"]["value"].as_str())
+        .map(String::from)
 }
 
 /// Graph management runs the SAME enforce_modify_policies as any other

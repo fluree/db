@@ -132,6 +132,85 @@ pub async fn query_jsonld_tracked(
     db.query(fluree).jsonld(query_json).execute_tracked().await
 }
 
+/// Decode every edge-annotation bundle whose reified SUBJECT is `subject_iri`
+/// within graph `g_id` of `ledger`, via `EdgeKey::from_reifies_facts` — the
+/// exact path both readers (JSON-LD hydration + attachment indexer) take.
+///
+/// Panics on a decode error (`GraphMismatch` / `Duplicate` — the silent-drop
+/// failure mode of a bad graph re-home), so a returned key is proof the bundle
+/// is self-consistent. Locating the reifier by `f:reifiesSubject` (not by
+/// `@id`) works for both anonymous and explicit reifiers. Returned keys are
+/// ordered by reifier Sid.
+///
+/// Uses point (`Eq`) POST + SPOT lookups rather than an unbounded scan so it
+/// works on both the novelty path and the V3 binary-index provider (which
+/// rejects `RangeTest::Ge` full scans).
+pub async fn decode_annotations_for_subject(
+    ledger: &LedgerState,
+    g_id: fluree_db_core::GraphId,
+    subject_iri: &str,
+) -> Vec<fluree_db_core::edge::EdgeKey> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::FlakeValue;
+
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri(subject_iri)
+        .expect("encode subject IRI");
+    let reifies_subject_pid = fluree_db_core::namespaces::reifies_subject_sid().clone();
+
+    // Reifier subjects: POST lookup of f:reifiesSubject → subject, in g_id.
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid)),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan f:reifiesSubject pointers");
+
+    let mut reifiers: Vec<fluree_db_core::Sid> = pointers
+        .iter()
+        .filter(|f| f.op)
+        .map(|f| f.s.clone())
+        .collect();
+    reifiers.sort();
+    reifiers.dedup();
+
+    let mut keys = Vec::with_capacity(reifiers.len());
+    for ann_sid in reifiers {
+        let subject_flakes = range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ann_sid.clone()),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan annotation subject flakes");
+        let bundle: Vec<_> = subject_flakes
+            .iter()
+            .filter(|f| f.op && fluree_db_core::is_reserved_reifies_predicate(&f.p))
+            .cloned()
+            .collect();
+        let key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
+            panic!(
+                "from_reifies_facts failed for reifier {ann_sid} in g_id {g_id}: \
+                 {e:?}; bundle: {bundle:#?}"
+            )
+        });
+        keys.push(key);
+    }
+    keys
+}
+
 /// Create a genesis ledger state for the given ledger ID.
 ///
 /// This is the Rust equivalent of `(fluree/create conn "ledger")` prior to the first commit:
