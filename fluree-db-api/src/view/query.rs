@@ -4,9 +4,9 @@
 //! a GraphDb, respecting policy and reasoning wrappers.
 
 use crate::query::helpers::{
-    build_query_result, charge_query_floor, parse_and_validate_sparql, parse_cypher_to_ir,
-    parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, status_for_query_error,
-    tracked_query_tracker, tracker_for_limits,
+    build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql,
+    parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution, sparql_ast_has_dataset,
+    status_for_query_error, tracked_query_tracker, tracker_for_limits,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -89,20 +89,34 @@ impl Fluree {
     ) -> Result<QueryResult> {
         let input = q.into();
 
+        // #1473: parse SPARQL once. The AST is reused for FROM-clause resolution
+        // and IR lowering below, instead of re-lexing the string 2–3×.
+        let parse_start = std::time::Instant::now();
+        let mut sparql_ast = match input {
+            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql)?),
+            QueryInput::JsonLd(_) => None,
+        };
+
         // A SPARQL FROM/FROM NAMED clause whose IRIs name graphs within this
         // ledger builds a within-ledger dataset and routes through the shared
         // dataset execution path (D-3, Option A). `Err` = a clause IRI is not
         // in this ledger (cross-ledger → connection path).
-        if let QueryInput::Sparql(sparql) = input {
-            if let Some(dataset) = self.build_within_ledger_dataset(db, sparql)? {
-                // query_dataset_with_options returns a concrete boxed future
-                // (its signature is `-> Pin<Box<dyn Future + Send>>`), which
-                // breaks the mutual-recursion `Send` auto-trait cycle between
-                // these two methods and keeps this crate's type-check fast.
-                return self
-                    .query_dataset_with_options(&dataset, input, options)
-                    .await;
-            }
+        let within_ledger_dataset = match &sparql_ast {
+            Some(ast) => self.build_within_ledger_dataset_from_ast(db, ast)?,
+            None => None,
+        };
+        if let Some(dataset) = within_ledger_dataset {
+            // query_dataset_with_prepared_ast returns a concrete boxed future
+            // (`-> Pin<Box<dyn Future + Send>>`), which breaks the
+            // mutual-recursion `Send` auto-trait cycle between these two methods
+            // and keeps this crate's type-check fast. The already-parsed AST is
+            // moved in so the dataset path does not re-parse.
+            let ast = sparql_ast
+                .take()
+                .expect("SPARQL input carries a parsed AST");
+            return self
+                .query_dataset_with_prepared_ast(&dataset, input, options, ast)
+                .await;
         }
 
         // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
@@ -114,14 +128,16 @@ impl Fluree {
         };
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
-        // 1. Parse to common IR
-        let parse_start = std::time::Instant::now();
+        // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
-                parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref())?
+                let ast = sparql_ast
+                    .take()
+                    .expect("SPARQL input carries a parsed AST");
+                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)?
             }
         };
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
@@ -267,14 +283,25 @@ impl Fluree {
     ) -> Result<QueryResult> {
         let input = q.into();
 
-        // R2RML + within-ledger SPARQL FROM/FROM NAMED is a deliberately
-        // unsupported combination: the R2RML dataset execution path is not
-        // `Send`, but this method runs from `Send`-required connection/spawn
-        // contexts. Reject a dataset clause here (rather than silently ignoring
-        // it); plain within-ledger datasets are handled by `query_with_options`.
-        if let QueryInput::Sparql(sparql) = input {
-            self.validate_sparql_for_view(sparql)?;
-        }
+        // #1473: parse SPARQL once. R2RML + within-ledger SPARQL FROM/FROM NAMED
+        // is a deliberately unsupported combination (the R2RML dataset execution
+        // path is not `Send`, but this method runs from `Send`-required
+        // connection/spawn contexts), so a dataset clause is rejected here rather
+        // than silently ignored; plain within-ledger datasets are handled by
+        // `query_with_options`. Otherwise the AST is reused for lowering.
+        let mut sparql_ast = match input {
+            QueryInput::Sparql(sparql) => {
+                let ast = parse_and_validate_sparql(sparql)?;
+                if sparql_ast_has_dataset(&ast) {
+                    return Err(ApiError::query(
+                        "SPARQL FROM/FROM NAMED clauses are not supported on a single-ledger \
+                         GraphDb. Use query_connection_sparql for multi-ledger queries.",
+                    ));
+                }
+                Some(ast)
+            }
+            QueryInput::JsonLd(_) => None,
+        };
 
         // 0. Tracker (fuel limits only). Charge the floor up front so a
         // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
@@ -284,13 +311,16 @@ impl Fluree {
         };
         charge_query_floor(&tracker).map_err(fluree_db_query::QueryError::from)?;
 
-        // 1. Parse to common IR
+        // 1. Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
-                parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref())?
+                let ast = sparql_ast
+                    .take()
+                    .expect("SPARQL input carries a parsed AST");
+                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql)?
             }
         };
 
@@ -364,23 +394,43 @@ impl Fluree {
     {
         let input = q.into();
 
-        // Within-ledger SPARQL dataset (see `query_with_options`) on the tracked
-        // path: delegate before charging the floor (the dataset method charges
-        // it) so fuel is accounted exactly once. `Err` = cross-ledger clause IRI.
+        // #1473: parse SPARQL once. Within-ledger SPARQL dataset (see
+        // `query_with_options`) on the tracked path: delegate (threading the
+        // already-parsed AST) before charging the floor (the dataset method
+        // charges it) so fuel is accounted exactly once. `Err` = cross-ledger
+        // clause IRI.
+        let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            match self.build_within_ledger_dataset(db, sparql) {
+            let ast = match parse_and_validate_sparql(sparql) {
+                Ok(ast) => ast,
+                Err(e) => {
+                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let _ = charge_query_floor(&tracker);
+                    return Err(crate::query::TrackedErrorResponse::new(
+                        400,
+                        e.to_string(),
+                        tracker.tally(),
+                    ));
+                }
+            };
+            match self.build_within_ledger_dataset_from_ast(db, &ast) {
                 Ok(Some(dataset)) => {
-                    // Boxed (`dyn`-erased) — see `query_with_options`.
-                    return futures::FutureExt::boxed(self.query_dataset_tracked_with_options(
-                        &dataset,
-                        input,
-                        format_config,
-                        tracking_override,
-                        options,
-                    ))
+                    // Boxed (`dyn`-erased) — see `query_with_options`. Threads
+                    // the already-parsed AST straight into the shared impl so
+                    // the dataset path does not re-parse (#1473).
+                    return futures::FutureExt::boxed(
+                        self.query_dataset_tracked_with_options_impl(
+                            &dataset,
+                            input,
+                            format_config,
+                            tracking_override,
+                            options,
+                            Some(ast),
+                        ),
+                    )
                     .await;
                 }
-                Ok(None) => {}
+                Ok(None) => sparql_ast = Some(ast),
                 Err(e) => {
                     let tracker = tracked_query_tracker(&input, &tracking_override);
                     let _ = charge_query_floor(&tracker);
@@ -408,7 +458,7 @@ impl Fluree {
         };
         let mut format_config = format_config.unwrap_or(default_format);
 
-        // Parse
+        // Lower to common IR (SPARQL reuses the AST parsed above).
         let (vars, mut parsed) = match &input {
             QueryInput::JsonLd(json) => {
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None).map_err(
@@ -418,7 +468,10 @@ impl Fluree {
                 )?
             }
             QueryInput::Sparql(sparql) => {
-                parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref()).map_err(
+                let ast = sparql_ast
+                    .take()
+                    .expect("SPARQL input carries a parsed AST");
+                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
                     },
@@ -512,16 +565,27 @@ impl Fluree {
     {
         let input = q.into();
 
-        // Within-ledger SPARQL dataset (see `query_with_options`), tracked +
-        // R2RML. Delegate before charging the floor (the dataset method charges
-        // it) so fuel is accounted exactly once.
+        // #1473: parse SPARQL once. Within-ledger SPARQL dataset (see
+        // `query_with_options`), tracked + R2RML: R2RML + within-ledger
+        // FROM/FROM NAMED is unsupported (the R2RML dataset path is non-`Send`;
+        // this runs from `Send` contexts), so a resolved clause is rejected
+        // rather than silently ignored. Otherwise the AST is reused for lowering.
+        let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            match self.build_within_ledger_dataset(db, sparql) {
+            let tracker = tracked_query_tracker(&input, &tracking_override);
+            let ast = match parse_and_validate_sparql(sparql) {
+                Ok(ast) => ast,
+                Err(e) => {
+                    let _ = charge_query_floor(&tracker);
+                    return Err(crate::query::TrackedErrorResponse::new(
+                        400,
+                        e.to_string(),
+                        tracker.tally(),
+                    ));
+                }
+            };
+            match self.build_within_ledger_dataset_from_ast(db, &ast) {
                 Ok(Some(_dataset)) => {
-                    // R2RML + within-ledger FROM/FROM NAMED is unsupported (the
-                    // R2RML dataset path is non-`Send`; this runs from `Send`
-                    // contexts). Reject rather than silently ignore the clause.
-                    let tracker = tracked_query_tracker(&input, &tracking_override);
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
                         400,
@@ -529,9 +593,8 @@ impl Fluree {
                         tracker.tally(),
                     ));
                 }
-                Ok(None) => {}
+                Ok(None) => sparql_ast = Some(ast),
                 Err(e) => {
-                    let tracker = tracked_query_tracker(&input, &tracking_override);
                     let _ = charge_query_floor(&tracker);
                     return Err(crate::query::TrackedErrorResponse::new(
                         400,
@@ -563,7 +626,10 @@ impl Fluree {
                 )?
             }
             QueryInput::Sparql(sparql) => {
-                parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref()).map_err(
+                let ast = sparql_ast
+                    .take()
+                    .expect("SPARQL input carries a parsed AST");
+                lower_sparql_ast(ast, &db.snapshot, db.default_context.as_ref(), sparql).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
                     },
@@ -647,20 +713,23 @@ impl Fluree {
     /// one ledger the dataset never `spans_multiple_ledgers`, so no cross-ledger
     /// provenance stamping engages and the scan hot path stays unchanged.
     ///
+    /// Takes an already parsed + validated AST: the SPARQL entry methods parse
+    /// once and reuse the AST for both dataset-clause resolution here and IR
+    /// lowering, rather than re-lexing the string 2–3× (#1473).
+    ///
     /// - `Ok(None)` — no dataset clause; run the plain single-graph path.
     /// - `Ok(Some(dataset))` — every clause IRI resolved within this ledger.
     /// - `Err(..)` — a clause IRI is not a graph in this ledger (e.g. it names
     ///   another ledger); cross-ledger datasets go through
     ///   `query_connection_sparql`.
-    pub(crate) fn build_within_ledger_dataset(
+    pub(crate) fn build_within_ledger_dataset_from_ast(
         &self,
         db: &GraphDb,
-        sparql: &str,
+        ast: &fluree_db_sparql::SparqlAst,
     ) -> Result<Option<DataSetDb>> {
-        let ast = parse_and_validate_sparql(sparql)?;
         // Prefix-expanded, BASE-resolved FROM / FROM NAMED IRIs (shared
         // resolution with constant IRIs; shipped by pr-base).
-        let Some(clause) = fluree_db_sparql::resolve_dataset_clause(&ast)
+        let Some(clause) = fluree_db_sparql::resolve_dataset_clause(ast)
             .map_err(|e| ApiError::query(e.to_string()))?
         else {
             return Ok(None);
@@ -757,8 +826,9 @@ impl Fluree {
     ///
     /// Used by the single-graph *streaming* endpoint (`plan_stream_query`),
     /// which does not support datasets. The buffered `query*` paths instead
-    /// build a within-ledger dataset via [`build_within_ledger_dataset`] and
-    /// only reject cross-ledger clause IRIs.
+    /// build a within-ledger dataset via
+    /// [`build_within_ledger_dataset_from_ast`](Self::build_within_ledger_dataset_from_ast)
+    /// and only reject cross-ledger clause IRIs.
     pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
         let ast = parse_and_validate_sparql(sparql)?;
 

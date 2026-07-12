@@ -70,12 +70,18 @@ pub(crate) fn parse_sparql_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
 ) -> Result<(VarRegistry, Query)> {
-    let mut ast = parse_and_validate_sparql(sparql)?;
+    let ast = parse_and_validate_sparql(sparql)?;
+    lower_sparql_ast(ast, snapshot, default_context, sparql)
+}
 
-    // Inject default prefixes from the ledger's stored @context, but only
-    // when the query declares no PREFIX of its own. Any explicit PREFIX
-    // declaration (even `PREFIX : <>`) signals the user is managing their
-    // own prefix environment, so we skip default injection entirely.
+/// Inject default prefixes from the ledger's stored `@context`, but only when
+/// the query declares no `PREFIX` of its own. Any explicit `PREFIX` declaration
+/// (even `PREFIX : <>`) signals the user is managing their own prefix
+/// environment, so default injection is skipped entirely.
+pub(crate) fn inject_default_prefixes(
+    ast: &mut fluree_db_sparql::SparqlAst,
+    default_context: Option<&JsonValue>,
+) {
     if ast.prologue.prefixes.is_empty() {
         if let Some(ctx_obj) = default_context.and_then(|v| v.as_object()) {
             for (short, iri_val) in ctx_obj {
@@ -91,11 +97,37 @@ pub(crate) fn parse_sparql_to_ir(
             }
         }
     }
+}
+
+/// Lower an already parsed + validated SPARQL AST to IR, injecting default
+/// prefixes first. Callers that parsed the AST for another reason (e.g. to
+/// resolve a `FROM` clause) reuse it here instead of re-parsing the string —
+/// see #1473. Behaviour matches [`parse_sparql_to_ir`], which is now a thin
+/// parse-then-lower wrapper over this.
+pub(crate) fn lower_sparql_ast(
+    mut ast: fluree_db_sparql::SparqlAst,
+    snapshot: &LedgerSnapshot,
+    default_context: Option<&JsonValue>,
+    sparql: &str,
+) -> Result<(VarRegistry, Query)> {
+    inject_default_prefixes(&mut ast, default_context);
 
     let mut vars = VarRegistry::new();
     let parsed =
         fluree_db_sparql::lower_sparql_with_source(&ast, snapshot, &mut vars, Some(sparql))?;
     Ok((vars, parsed))
+}
+
+/// Whether a parsed SPARQL AST carries a dataset clause (`FROM` / `FROM NAMED`).
+/// `UPDATE` requests have no dataset clause of this form.
+pub(crate) fn sparql_ast_has_dataset(ast: &fluree_db_sparql::SparqlAst) -> bool {
+    match &ast.body {
+        fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Describe(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.is_some(),
+        fluree_db_sparql::ast::QueryBody::Update(_) => false,
+    }
 }
 
 /// Parse a Cypher (openCypher 9) query and prepare it for execution.
@@ -445,7 +477,29 @@ macro_rules! r2rml_provider {
     }};
 }
 
+// Per-thread count of `parse_and_validate_sparql` calls, for the #1473
+// "parse SPARQL once" regression tests. Compiled only under `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    static SPARQL_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset the per-thread SPARQL parse counter (test-only).
+#[cfg(test)]
+pub(crate) fn reset_sparql_parse_count() {
+    SPARQL_PARSE_COUNT.with(|c| c.set(0));
+}
+
+/// Read the per-thread SPARQL parse counter (test-only).
+#[cfg(test)]
+pub(crate) fn sparql_parse_count() -> usize {
+    SPARQL_PARSE_COUNT.with(std::cell::Cell::get)
+}
+
 pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
+    #[cfg(test)]
+    SPARQL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
+
     let parse_output = fluree_db_sparql::parse_sparql(sparql);
 
     // Parse errors: return ApiError::sparql with structured diagnostics.
@@ -646,5 +700,40 @@ mod tests {
 
         // Missing param still errors through the cached path.
         assert!(substituted_cypher_ast(text, None).is_err());
+    }
+
+    use fluree_db_core::LedgerSnapshot;
+
+    /// #1473: lowering reuses an already-parsed AST rather than re-lexing the
+    /// string. A single `parse_and_validate_sparql` call covers both
+    /// dataset-clause resolution and IR lowering, so the parse counter must stay
+    /// at 1 across a parse-then-lower sequence — the parse-once guarantee the
+    /// entry methods rely on.
+    #[test]
+    fn lower_sparql_ast_reuses_parsed_ast() {
+        reset_sparql_parse_count();
+
+        let sparql = "SELECT * WHERE { ?s ?p ?o }";
+        let ast = parse_and_validate_sparql(sparql).expect("parse");
+        assert_eq!(sparql_parse_count(), 1, "exactly one parse so far");
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let _ = lower_sparql_ast(ast, &snapshot, None, sparql).expect("lower");
+
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "lower_sparql_ast must consume the AST, not re-parse the string"
+        );
+    }
+
+    /// The `parse_sparql_to_ir` convenience wrapper is exactly parse-then-lower,
+    /// so it performs one parse — matching the reused-AST path.
+    #[test]
+    fn parse_sparql_to_ir_parses_once() {
+        reset_sparql_parse_count();
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None).expect("lower");
+        assert_eq!(sparql_parse_count(), 1);
     }
 }
