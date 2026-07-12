@@ -1775,3 +1775,136 @@ async fn sparql_string_builtin_rejects_foreign_datatype_arg() {
         JsonValue::Bool(false)
     );
 }
+
+// =============================================================================
+// D5b (eval path) — encoded xsd:float keeps its datatype, and an encoded
+// language-tagged literal has no EBV (#1470). These exercise the
+// late-materialized `Binding::EncodedLit` path, which only fires on a
+// reindexed, novelty-free ledger (a trailing insert disables late
+// materialization and silently drops the test to the Lit path — §5.4).
+// =============================================================================
+
+// (`seed_indexed` is defined once, in the "Indexed twins" section above.)
+
+fn float_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [{ "@id": "ex:n", "ex:f": { "@value": "1.5", "@type": "xsd:float" } }]
+    })
+}
+
+// On decode the xsd:float is folded to a double (NUM_F64 fast path); #1470
+// re-tags it from `dt_id` so `datatype(?f + ?f)` is xsd:float — agreeing with
+// the Lit path (`sparql_numeric_promotion_result_datatype`). Without the fix
+// the encoded path yields xsd:double.
+#[tokio::test]
+async fn sparql_encoded_xsd_float_result_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/encfloat:sparql", &float_tx()).await;
+    let p = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> \
+             PREFIX ex: <http://example.org/ns/> ";
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:n ex:f ?f . FILTER(datatype(?f + ?f) = xsd:float) }}"),
+        )
+        .await,
+        JsonValue::Bool(true)
+    );
+    // Not xsd:double (the pre-#1470 encoded result).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} ASK {{ ex:n ex:f ?f . FILTER(datatype(?f + ?f) = xsd:double) }}"),
+        )
+        .await,
+        JsonValue::Bool(false)
+    );
+}
+
+#[tokio::test]
+async fn jsonld_encoded_xsd_float_result_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/encfloat:jsonld", &float_tx()).await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?ft"],
+        "where": [
+            { "@id": "ex:n", "ex:f": "?f" },
+            ["bind", "?ft", ["expr", ["datatype", ["+", "?f", "?f"]]]]
+        ]
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q).await,
+        json!([["xsd:float"]])
+    );
+}
+
+fn lang_ebv_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:l", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:p", "ex:v": "y" }
+        ]
+    })
+}
+
+// FILTER(?v) has no effective boolean value for a language-tagged literal
+// (§17.2.2). On the encoded path the decode collapses it to a bare string that
+// previously read truthy; #1470 consults `lang_id` and errors, so the lang row
+// is excluded and only the plain-string control survives — matching the Lit
+// path (`sparql_lit_lang_literal_ebv_is_type_error`).
+#[tokio::test]
+async fn sparql_encoded_lang_literal_ebv_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/enclangebv:sparql", &lang_ebv_tx()).await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?v . FILTER(?v) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:p"]])
+    );
+}
+
+#[tokio::test]
+async fn jsonld_encoded_lang_literal_ebv_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "x2/enclangebv:jsonld", &lang_ebv_tx()).await;
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?v" },
+            ["filter", "?v"]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(jsonld_rows(&fluree, &ledger, &q).await, json!([["ex:p"]]));
+}
+
+// The Lit (non-encoded) path already errors on a lang literal's EBV; pin it so
+// the encoded-path fix above reads as *agreement*, not a new divergence.
+#[tokio::test]
+async fn sparql_lit_lang_literal_ebv_is_type_error() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_lang(&fluree, "x2/litlangebv:sparql").await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // ex:en/ex:en2/ex:fr are language-tagged (no EBV → excluded); only the plain
+    // string "x" (ex:plain) survives.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?v . FILTER(?v) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:plain"]])
+    );
+}

@@ -53,6 +53,7 @@ use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FlakeValue};
 use crate::parse::UnresolvedDatatypeConstraint;
 use crate::var_registry::VarId;
+use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::DatatypeConstraint;
 use helpers::eval_cached_bool_predicate;
 use num_traits::Zero;
@@ -173,6 +174,17 @@ impl Expression {
                             e,
                         )
                     })?;
+                    // xsd:float is folded to `FlakeValue::Double` at decode (the
+                    // NUM_F64 fast path in `context.rs`), dropping the float tag
+                    // the Lit path keeps via `lit_to_comparable`. Re-tag it from
+                    // the in-scope `dt_id` so `datatype(?f + ?f)` stays xsd:float
+                    // on the late-materialized (`EncodedLit`) path — one integer
+                    // compare on the hot decode arm (#1470).
+                    if *dt_id == DatatypeDictId::FLOAT.as_u16() {
+                        if let FlakeValue::Double(d) = val {
+                            return Ok(Some(ComparableValue::Float(d as f32)));
+                        }
+                    }
                     Ok(ComparableValue::try_from(&val).ok())
                 }
                 Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),
@@ -527,6 +539,15 @@ fn binding_effective_bool(
             lang_id,
             ..
         }) => {
+            // A language-tagged literal has no effective boolean value (§17.2.2),
+            // matching the Lit path (`lit_effective_bool` errors on it). The
+            // late-materialized decode collapses it to a bare string, so consult
+            // `lang_id` before decoding rather than reading string-truthiness —
+            // a consistency fix aligning the encoded path with the Lit/constant
+            // path (#1470).
+            if *lang_id != 0 {
+                return Err(ebv_type_error());
+            }
             let decoded =
                 ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
             match decoded {
