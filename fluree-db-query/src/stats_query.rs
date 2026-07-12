@@ -135,14 +135,17 @@ fn exact_count_by_predicate_post(
             if let Some(p) = entry.p_const {
                 *counts.entry(p).or_insert(0) += i64::from(entry.row_count);
             } else {
-                let batch =
-                    match handle.load_columns(leaflet_idx, &pid_projection, RunSortOrder::Post) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "stats count-by-predicate: load columns failed; declining to generic scan");
-                            return Ok(None);
-                        }
-                    };
+                let batch = match handle.load_columns(
+                    leaflet_idx,
+                    &pid_projection,
+                    RunSortOrder::Post,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "stats count-by-predicate: load columns failed; declining to generic scan");
+                        return Ok(None);
+                    }
+                };
                 for row in 0..batch.row_count {
                     *counts.entry(batch.p_id.get(row)).or_insert(0) += 1;
                 }

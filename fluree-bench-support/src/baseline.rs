@@ -556,7 +556,10 @@ mod tests {
         let budget = RegressionBudget::empty(5.0);
 
         let report = compare(&base, &current, &budget, None, true);
-        assert!(report.passed(), "advisory time breach must not fail the gate");
+        assert!(
+            report.passed(),
+            "advisory time breach must not fail the gate"
+        );
         assert_eq!(report.advisories().count(), 1);
     }
 

@@ -224,7 +224,8 @@ fn run_compare(args: &[String]) -> ExitCode {
     // baseline and this runner share a runner class (or when neither opts out).
     // MEMORY is always enforced. `--time-advisory` forces advisory regardless.
     let current_rc = runner_class();
-    let time_advisory = flags.contains_key("--time-advisory") || baseline.runner_class != current_rc;
+    let time_advisory =
+        flags.contains_key("--time-advisory") || baseline.runner_class != current_rc;
     let budgets = match flags.get("--budget") {
         Some(p) => budget::load_from(PathBuf::from(p).as_path()),
         None => budget::load(),
