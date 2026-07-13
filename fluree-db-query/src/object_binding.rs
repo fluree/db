@@ -169,6 +169,13 @@ pub(crate) fn late_materialized_object_binding(
                 t,
             })
         }
+        // Inline decimals decode cheaply from `o_key` alone (no arena, unlike
+        // NUM_BIG), so we decline the encoded fast path and let the caller
+        // materialize a `FlakeValue::Decimal`. That keeps them on the ordinary
+        // value path for equality/aggregate surfaces, where they compare by
+        // canonical BigDecimal against decoded sources (VALUES, BIND, novelty,
+        // and arena-backed decimals on other roots).
+        DecodeKind::Decimal => None,
         _ => None,
     }
 }
@@ -437,6 +444,25 @@ mod tests {
             } if o_kind == ObjKind::DATE.as_u8()
                 && dt_id == DatatypeDictId::DATE.as_u16()
         ));
+    }
+
+    #[test]
+    fn late_materialized_object_binding_declines_inline_decimal() {
+        // Inline decimals decode cheaply, so the encoded fast path declines and
+        // the caller materializes a FlakeValue::Decimal — they never become an
+        // EncodedLit (which would need every equality surface to learn NUM_DEC).
+        use fluree_db_core::value_id::ObjKey;
+        let binding = late_materialized_object_binding(
+            OType::XSD_DECIMAL_INLINE.as_u16(),
+            ObjKey::encode_decimal(&"19.99".parse().unwrap())
+                .unwrap()
+                .as_u64(),
+            7,
+            0,
+            u32::MAX,
+            None,
+        );
+        assert!(binding.is_none());
     }
 
     #[test]

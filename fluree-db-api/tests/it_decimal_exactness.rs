@@ -977,6 +977,672 @@ async fn sparql_delete_data_decimal_retracts_exactly() {
     );
 }
 
+// =============================================================================
+// Inline xsd:decimal encoding (v3 root format)
+// =============================================================================
+
+/// Run a full rebuild, publish the new index, and return the decoded index root
+/// so tests can assert the on-disk decimal-encoding format.
+async fn full_rebuild_publish_decode_root(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_binary_index::format::index_root::IndexRoot {
+    use fluree_db_core::storage::ContentStore;
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record");
+    let result = fluree_db_indexer::rebuild_index_from_commits(
+        fluree.content_store(ledger_id),
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("full rebuild");
+    let root_bytes = fluree
+        .content_store(ledger_id)
+        .get(&result.root_id)
+        .await
+        .expect("fetch root bytes");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .await
+        .expect("publish index");
+    fluree_db_binary_index::format::index_root::IndexRoot::decode(&root_bytes).expect("decode root")
+}
+
+#[tokio::test]
+async fn full_reindex_writes_inline_decimal_v3_format_and_roundtrips() {
+    // A full rebuild adopts the inline-decimal format: the root is v3
+    // (InlineWhenFits), small exact decimals encode inline, and a value too
+    // large to fit inline falls back to the arena — all round-trip exactly.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-format:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r#"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:amount 19.99 .
+            ex:b ex:amount 0.0000001 .
+            ex:c ex:amount "1234567890123456789.5"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+        }
+        "#,
+    )
+    .await;
+    let _ = result;
+
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits,
+        "a full rebuild must write the inline-decimal (v3) format"
+    );
+
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?amount WHERE { ?s ex:amount ?amount . }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+
+    let mut amounts = binding_values(&sparql_json, "amount");
+    amounts.sort();
+    // Two inline-eligible decimals + one arena-overflow decimal, all exact and
+    // in plain (non-exponent) form.
+    assert_eq!(
+        amounts,
+        vec![
+            "0.0000001".to_string(),
+            "1234567890123456789.5".to_string(),
+            "19.99".to_string(),
+        ],
+        "inline + arena decimals must round-trip exactly after reindex"
+    );
+}
+
+#[tokio::test]
+async fn inline_decimal_equality_constant_matches_after_reindex() {
+    // A decimal equality constant must encode the same way as the stored inline
+    // row so the bound-object lookup hits it (issue #1328 narrowing).
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-eq:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:price 19.99 .
+            ex:b ex:price 20.00 .
+        }
+        ",
+    )
+    .await;
+
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+    let query = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE { ?s ex:price 19.99 . }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    assert_eq!(
+        binding_values(&sparql_json, "s"),
+        vec!["ex:a".to_string()],
+        "decimal equality constant must match the stored inline decimal"
+    );
+}
+
+/// Canonicalize a SPARQL bindings array for differential comparison: any literal
+/// whose value parses as a `BigDecimal` is rewritten to its normalized form.
+/// Indexing canonicalizes decimal scale (`10.50` -> `10.5`) for both the arena
+/// and inline encodings, so a novelty-vs-indexed comparison must compare by
+/// numeric value, not lexical form. Datatype and structure are preserved and
+/// still compared exactly.
+fn canon_decimal_bindings(bindings: &JsonValue) -> JsonValue {
+    let mut bindings = bindings.clone();
+    if let Some(rows) = bindings.as_array_mut() {
+        for row in rows {
+            if let Some(obj) = row.as_object_mut() {
+                for (_var, cell) in obj.iter_mut() {
+                    if let Some(v) = cell.get("value").and_then(|v| v.as_str()) {
+                        if let Ok(bd) = v.parse::<num_bigdecimal::BigDecimal>() {
+                            cell["value"] = JsonValue::String(bd.normalized().to_plain_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bindings
+}
+
+#[tokio::test]
+async fn inline_decimal_results_match_novelty_differential() {
+    // Differential: the same query must return identical results whether the
+    // decimals are unindexed (novelty, canonical FlakeValue::Decimal) or indexed
+    // under the inline (v3) format. Proves inline encoding is observably
+    // identical to the canonical representation across SELECT / ORDER BY / FILTER
+    // / aggregation.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-differential:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:amount 19.99 .
+            ex:b ex:amount 0.01 .
+            ex:c ex:amount 10.50 .
+            ex:d ex:amount 100.00 .
+        }
+        ",
+    )
+    .await;
+    let novelty_ledger = result.ledger;
+
+    let queries = [
+        // Plain projection + ORDER BY on the decimal value.
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?amount WHERE { ?s ex:amount ?amount . } ORDER BY ?amount",
+        // FILTER comparison against a decimal threshold.
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?amount WHERE { ?s ex:amount ?amount . FILTER(?amount > 10.0) } ORDER BY ?amount",
+        // Aggregation (SUM/AVG) + COUNT.
+        r"PREFIX ex: <http://example.org/>
+          SELECT (SUM(?amount) AS ?total) (COUNT(?amount) AS ?n) WHERE { ?s ex:amount ?amount . }",
+    ];
+
+    // Results from the unindexed (novelty) state.
+    let mut novelty_results = Vec::new();
+    for q in &queries {
+        let r = support::query_sparql(&fluree, &novelty_ledger, q)
+            .await
+            .expect("novelty query");
+        novelty_results.push(
+            r.to_sparql_json(&novelty_ledger.snapshot)
+                .expect("to_sparql_json")["results"]["bindings"]
+                .clone(),
+        );
+    }
+
+    // Reindex into the inline (v3) format.
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+    let indexed_ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    for (q, novelty_bindings) in queries.iter().zip(novelty_results) {
+        let r = support::query_sparql(&fluree, &indexed_ledger, q)
+            .await
+            .expect("indexed query");
+        let indexed_bindings = r
+            .to_sparql_json(&indexed_ledger.snapshot)
+            .expect("to_sparql_json")["results"]["bindings"]
+            .clone();
+        assert_eq!(
+            canon_decimal_bindings(&indexed_bindings),
+            canon_decimal_bindings(&novelty_bindings),
+            "inline-indexed results must match novelty results (by value + datatype) for query:\n{q}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn inline_decimal_order_by_and_range_are_numeric_after_reindex() {
+    // Order-preserving inline decimal keys: ORDER BY and range filters on a
+    // decimal predicate must use NUMERIC order, not scale-broken key order.
+    // 0.05 vs 0.5 (different scales) and negatives are the cases the old
+    // equality-keyed layout got wrong.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-order:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 0.5 .
+            ex:b ex:v 0.05 .
+            ex:c ex:v -1 .
+            ex:d ex:v 2 .
+            ex:e ex:v 19.99 .
+            ex:f ex:v -0.01 .
+            ex:g ex:v 1000.5 .
+        }
+        ",
+    )
+    .await;
+
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // 1. Plain ORDER BY ascending — full numeric order across signs and scales.
+    let asc = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v } ORDER BY ?v",
+    )
+    .await
+    .expect("order by asc");
+    let asc_json = asc.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&asc_json, "v"),
+        vec!["-1", "-0.01", "0.05", "0.5", "2", "19.99", "1000.5"],
+        "ORDER BY must be numeric (0.05 < 0.5, negatives first)"
+    );
+
+    // 2. ORDER BY DESC LIMIT — exercises the reverse-POST top-k fast path.
+    let desc = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v } ORDER BY DESC(?v) LIMIT 3",
+    )
+    .await
+    .expect("order by desc limit");
+    let desc_json = desc.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&desc_json, "v"),
+        vec!["1000.5", "19.99", "2"],
+        "ORDER BY DESC LIMIT must return the numerically largest values"
+    );
+
+    // 3. SELECT with a range FILTER — numeric subset.
+    let filtered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 0.1) } ORDER BY ?v",
+    )
+    .await
+    .expect("range filter");
+    let filtered_json = filtered.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&filtered_json, "v"),
+        vec!["0.5", "2", "19.99", "1000.5"],
+        "FILTER(?v > 0.1) must exclude 0.05 and the negatives"
+    );
+
+    // 4. COUNT with a range FILTER — exercises the numeric-compare COUNT fast path.
+    let counted = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:v ?v FILTER(?v > 0.1) }",
+    )
+    .await
+    .expect("count filter");
+    let counted_json = counted.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&counted_json, "n"),
+        vec!["4"],
+        "COUNT over a decimal range filter must match the four values > 0.1"
+    );
+
+    // 5. COUNT with an integer threshold against decimal rows (cross-form).
+    let counted_int = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:v ?v FILTER(?v >= 2) }",
+    )
+    .await
+    .expect("count int threshold");
+    let counted_int_json = counted_int.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&counted_int_json, "n"),
+        vec!["3"],
+        "FILTER(?v >= 2) over decimals must count 2, 19.99, 1000.5"
+    );
+
+    // 6. MIN / MAX — exercises the boundary-key numeric MIN/MAX fast path.
+    let minmax = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) WHERE { ?s ex:v ?v }",
+    )
+    .await
+    .expect("min/max");
+    let minmax_json = minmax.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&minmax_json, "lo"),
+        vec!["-1"],
+        "MIN over decimals must be the most negative value"
+    );
+    assert_eq!(
+        binding_values(&minmax_json, "hi"),
+        vec!["1000.5"],
+        "MAX over decimals must be the largest value"
+    );
+}
+
+#[tokio::test]
+async fn mixed_int_decimal_predicate_range_filter_is_correct() {
+    // Correctness guard for decimal range-scan narrowing: a predicate with BOTH
+    // integer and inline-decimal values spans two o_types, so the uniform-extent
+    // precondition fails and the scan must NOT narrow to the decimal key range —
+    // doing so would drop the integer rows. The general post-filter must return
+    // every numerically-matching value regardless of type.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/mixed-range:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 5 .
+            ex:b ex:v 10.5 .
+            ex:c ex:v 2 .
+            ex:d ex:v 7.5 .
+            ex:e ex:v 3 .
+        }
+        ",
+    )
+    .await;
+
+    full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // FILTER(?v > 4): must match the integer 5 AND the decimals 7.5, 10.5 —
+    // three values across two o_types. A decimal-only narrowed scan would miss 5.
+    let filtered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 4) } ORDER BY ?v",
+    )
+    .await
+    .expect("mixed range filter");
+    let json = filtered.to_sparql_json(&ledger.snapshot).expect("json");
+    let mut got = binding_values(&json, "v");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["10.5", "5", "7.5"],
+        "range filter over a mixed int+decimal predicate must keep matches of both types"
+    );
+
+    // Full ORDER BY must still interleave both types numerically.
+    let ordered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v } ORDER BY ?v",
+    )
+    .await
+    .expect("mixed order by");
+    let oj = ordered.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&oj, "v"),
+        vec!["2", "3", "5", "7.5", "10.5"],
+        "ORDER BY over mixed int+decimal must be numerically interleaved"
+    );
+}
+
+#[tokio::test]
+async fn inline_integer_range_pushdown_is_correct() {
+    // Integer keys are order-preserving (encode_i64), so a uniform-integer
+    // predicate gets the same range/ORDER BY/COUNT pushdown as decimals — and it
+    // needs no format change (works on any index). This checks correctness of
+    // the generalized path on a uniform xsd:integer predicate.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/inline-int-range:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:n 5 .
+            ex:b ex:n 100 .
+            ex:c ex:n -3 .
+            ex:d ex:n 42 .
+            ex:e ex:n 0 .
+        }
+        ",
+    )
+    .await;
+
+    full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // ORDER BY: numeric order across negatives.
+    let asc = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?n WHERE { ?s ex:n ?n } ORDER BY ?n",
+    )
+    .await
+    .expect("order by");
+    let asc_json = asc.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&asc_json, "n"),
+        vec!["-3", "0", "5", "42", "100"],
+        "integer ORDER BY must be numeric"
+    );
+
+    // Range FILTER (the new narrowing path) + COUNT.
+    let filtered = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?n WHERE { ?s ex:n ?n FILTER(?n > 4) } ORDER BY ?n",
+    )
+    .await
+    .expect("range filter");
+    let fj = filtered.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&fj, "n"),
+        vec!["5", "42", "100"],
+        "integer range filter must narrow to values > 4"
+    );
+
+    let counted = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT (COUNT(?s) AS ?c) WHERE { ?s ex:n ?n FILTER(?n >= 0) }",
+    )
+    .await
+    .expect("count");
+    let cj = counted.to_sparql_json(&ledger.snapshot).expect("json");
+    assert_eq!(
+        binding_values(&cj, "c"),
+        vec!["4"],
+        "COUNT(?n >= 0) over integers must be 4 (0, 5, 42, 100)"
+    );
+}
+
+#[tokio::test]
+async fn range_narrowing_keeps_cross_type_novelty() {
+    // Regression guard for the overlay/novelty hazard in numeric range
+    // narrowing. The base predicate is uniformly inline-decimal (so narrowing
+    // WOULD fire on a clean index), but novelty then adds a matching value of a
+    // DIFFERENT type (an integer) for the same predicate. The integer's overlay
+    // op sorts outside the decimal o_type/o_key window, so narrowing must be
+    // disabled while overlay is present — otherwise the integer is dropped
+    // before the post-filter sees it. With the overlay gate, the full scan +
+    // merge + post-filter keeps it.
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/xtype-novelty:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 0.5 .
+            ex:b ex:v 100.5 .
+            ex:c ex:v 10.5 .
+        }
+        ",
+    )
+    .await;
+
+    // Reindex: the base predicate is now uniformly inline-decimal (v3).
+    let root = full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    assert_eq!(
+        root.decimal_encoding(),
+        fluree_db_core::DecimalEncoding::InlineWhenFits
+    );
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // Add a NOVELTY integer (different o_type) that matches the filter, without
+    // reindexing — it lives in the overlay as XSD_INTEGER.
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX ex: <http://example.org/> INSERT DATA { ex:d ex:v 100 . }",
+    )
+    .await;
+    let ledger = result.ledger;
+
+    // FILTER(?v > 50): the indexed decimal 100.5 AND the novelty integer 100.
+    let r = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 50) } ORDER BY ?v",
+    )
+    .await
+    .expect("cross-type range filter");
+    let json = r.to_sparql_json(&ledger.snapshot).expect("json");
+    let mut got = binding_values(&json, "v");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["100", "100.5"],
+        "range filter must keep a cross-type novelty match (integer 100) on a \
+         uniform-decimal base predicate — narrowing must not drop it"
+    );
+}
+
+#[tokio::test]
+async fn integer_range_narrowing_keeps_cross_type_novelty() {
+    // The overlay gate is type-agnostic: a uniform-INTEGER base predicate with a
+    // matching DECIMAL novelty value must not drop the decimal. (Mirror of
+    // range_narrowing_keeps_cross_type_novelty with the base/overlay types
+    // swapped, covering the generalized integer/double pushdown path.)
+    let fluree = memory_fluree();
+    let ledger_id = "decimal/int-xtype-novelty:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    run_sparql_update(
+        &fluree,
+        ledger,
+        r"
+        PREFIX ex: <http://example.org/>
+        INSERT DATA {
+            ex:a ex:v 5 .
+            ex:b ex:v 100 .
+            ex:c ex:v 50 .
+        }
+        ",
+    )
+    .await;
+
+    full_rebuild_publish_decode_root(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load reindexed ledger");
+
+    // Novelty decimal (different o_type) that matches the filter.
+    let result = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX ex: <http://example.org/> INSERT DATA { ex:d ex:v 75.5 . }",
+    )
+    .await;
+    let ledger = result.ledger;
+
+    let r = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/>
+          SELECT ?v WHERE { ?s ex:v ?v FILTER(?v > 60) } ORDER BY ?v",
+    )
+    .await
+    .expect("cross-type range filter");
+    let json = r.to_sparql_json(&ledger.snapshot).expect("json");
+    let mut got = binding_values(&json, "v");
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["100", "75.5"],
+        "integer-base range filter must keep a cross-type novelty decimal (75.5)"
+    );
+}
+
 #[tokio::test]
 async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
     // Regression (fluree/db-r#142): an integer-valued double inserted into a
@@ -1086,7 +1752,7 @@ async fn integer_valued_double_over_indexed_predicate_is_not_corrupted() {
 /// Issue #1329: JSON-LD decimal rendering must be consistent regardless of
 /// whether the value is served from the binary index (arena-decoded) or from
 /// novelty (raw flake merge). The reported bug rendered index-served decimals
-/// as `{"@value": "19.99", "@type": ""}` (empty type) and novelty-served ones
+/// as `{"@value": "19.90", "@type": ""}` (empty type) and novelty-served ones
 /// as a bare string with no `@type`.
 #[tokio::test]
 async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
@@ -1108,13 +1774,15 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
         .run_until(async move {
             let ledger = genesis_ledger(&fluree, ledger_id);
 
-            // Indexed base: ex:a is arena-backed after the index build.
+            // Indexed base: ex:a is arena-backed after the index build. The
+            // trailing zero (19.90) exercises canonicalization on the indexed
+            // path — the inline decimal code strips it, so it renders as 19.9.
             let result = run_sparql_update(
                 &fluree,
                 ledger,
                 r"
                 PREFIX ex: <http://example.org/>
-                INSERT DATA { ex:a ex:price 19.99 . }
+                INSERT DATA { ex:a ex:price 19.90 . }
                 ",
             )
             .await;
@@ -1151,8 +1819,8 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
 
             // Both the arena-served (indexed) and novelty-served decimals must
             // render in the SAME shape. Before the fix the indexed copy lost its
-            // datatype and rendered as `{"@value":"19.99","@type":""}` while the
-            // novelty copy rendered as the bare string `"24.50"` (issue #1329).
+            // datatype and rendered as `{"@value":"19.90","@type":""}` while the
+            // novelty copy rendered as a bare string (issue #1329).
             let mut by_id = std::collections::HashMap::new();
             for node in rows {
                 let id = node["@id"].as_str().expect("@id").to_string();
@@ -1173,7 +1841,10 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
             }
 
             // Consistency: identical JSON shape across the two paths (xsd:decimal
-            // is an inferable datatype, so both render as the exact bare string).
+            // is an inferable datatype, so both render as a bare string). The
+            // inline decimal code is canonical (order-preserving, trailing zeros
+            // stripped), so both paths drop the trailing zero — 19.90 → 19.9 and
+            // 24.50 → 24.5 — matching the XSD canonical form of xsd:decimal.
             assert_eq!(
                 indexed.is_object(),
                 novel.is_object(),
@@ -1182,12 +1853,12 @@ async fn jsonld_decimal_renders_consistently_across_index_and_novelty() {
             );
             assert_eq!(
                 indexed,
-                &JsonValue::String("19.99".to_string()),
+                &JsonValue::String("19.9".to_string()),
                 "indexed decimal"
             );
             assert_eq!(
                 novel,
-                &JsonValue::String("24.50".to_string()),
+                &JsonValue::String("24.5".to_string()),
                 "novelty decimal"
             );
 
