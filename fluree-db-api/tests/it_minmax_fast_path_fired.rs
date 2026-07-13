@@ -2,12 +2,19 @@
 //! (not just agree with) aggregates over a multi-language predicate on a
 //! bulk-imported (lex-sorted) index.
 //!
-//! Kept as the only test in this binary: the assertion relies on a thread-local
-//! tracing subscriber (`set_default`), and concurrent tests in the same process
-//! push parts of query execution onto threads the subscriber can't see.
+//! Kept as the ONLY test in its own `[[test]]` binary (not bundled into
+//! `grp_misc`), same convention as `it_cyclic_bgp_probe`. Two reasons it can't
+//! share a binary with parallel siblings: (1) the PRESENCE assertions depend on
+//! the fast-path callsite being `enabled`, but tracing's callsite-interest cache
+//! is process-global — a sibling that hits the callsite first under the no-op
+//! default caches it "disabled" and this test then sees nothing; (2) the
+//! `!has_event("fast path declined")` ABSENCE assertion would capture a
+//! *sibling's* decline (the event is emitted from the shared aggregate fast-path,
+//! which many grp_misc siblings exercise). A thread-local `set_default` capture is
+//! only sound when this is the single test in the process.
 #![cfg(feature = "native")]
 
-use crate::support;
+mod support;
 use fluree_db_api::FlureeBuilder;
 use std::io::Write;
 use tempfile::TempDir;

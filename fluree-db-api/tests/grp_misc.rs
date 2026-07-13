@@ -31,8 +31,9 @@ mod it_host_plus_n_e2e;
 mod it_hydration_predicate_gating;
 #[path = "it_join_batched_overlay.rs"]
 mod it_join_batched_overlay;
-#[path = "it_minmax_fast_path_fired.rs"]
-mod it_minmax_fast_path_fired;
+// it_minmax_fast_path_fired is a STANDALONE `[[test]]` bin (see its header): its
+// process-scoped tracing capture + the process-global callsite-interest cache
+// make it flaky when run in parallel with siblings here.
 #[path = "it_minmax_string_fast_path.rs"]
 mod it_minmax_string_fast_path;
 #[path = "it_mixed_representation.rs"]

@@ -103,5 +103,11 @@ required-features = ["aws"]
 name = "read_local_iceberg"
 required-features = ["aws"]
 
+# smoke_minio uses the aws-gated S3IcebergStorage, so it must not be built under
+# default features (bare `cargo test -p fluree-db-iceberg` compiles examples).
+[[example]]
+name = "smoke_minio"
+required-features = ["aws"]
+
 [lints]
 workspace = true
