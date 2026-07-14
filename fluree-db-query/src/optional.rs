@@ -116,6 +116,16 @@ pub trait OptionalBuilder: Send + Sync {
         Ok(None)
     }
 
+    /// Whether this builder takes the batched single-seed hash-join path — i.e.
+    /// `build_batch` can collapse the correlated inner into ONE scan over the
+    /// distinct correlation tuples. When true, the OptionalOperator may COALESCE
+    /// the whole (bounded) driving side into one seed (PR-4d) so the inner is
+    /// scanned once rather than once per outer batch. Default: false — a per-row
+    /// builder gains nothing from coalescing and must keep streaming.
+    fn supports_seed_coalescing(&self) -> bool {
+        false
+    }
+
     /// Optional cache key for correlated OPTIONAL evaluation.
     ///
     /// If this returns `Some(key)`, the OptionalOperator may memoize the optional-side
@@ -1157,6 +1167,14 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         Ok(Some(op))
     }
 
+    /// PR-4d: this builder's `build_batch` takes the single-seed hash-join path
+    /// exactly when every inner pattern is hash-join-safe, so the OptionalOperator
+    /// may coalesce the whole driving side into one seed (one inner scan) rather
+    /// than one scan per outer batch. Mirrors `build_batch`'s own admission gate.
+    fn supports_seed_coalescing(&self) -> bool {
+        self.inner_patterns.iter().all(inner_pattern_is_hash_join_safe)
+    }
+
     /// Batched correlated OPTIONAL as a hash left-join.
     ///
     /// Instead of rebuilding and re-executing the inner subplan once per
@@ -1164,6 +1182,9 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     /// whole batch, execute it once, then hash-partition the results back to
     /// each row by correlation key. This collapses the per-driving-row subplan
     /// rebuild (the LDBC IC5 cliff) into a single inner scan.
+    ///
+    /// PR-4d makes the coalesced driving side one big batch, so "once per batch"
+    /// below becomes once for the whole (bounded) seed — see `supports_seed_coalescing`.
     ///
     /// Soundness: the inner solutions for a required row depend on the row only
     /// through its shared (correlation) variables — the sole overlap with the
@@ -1561,6 +1582,35 @@ fn optional_hash_join_disabled() -> bool {
     })
 }
 
+/// PR-4d sub-switch: `FLUREE_R2RML_OPTIONAL_SEED_COALESCE` (default ON, within the
+/// batched-OPTIONAL family). When on, the OptionalOperator coalesces the whole
+/// (bounded) driving side into ONE seed so a correlated hash-join inner is scanned
+/// once rather than once per outer batch. Off ⇒ per-outer-batch (pre-PR-4d),
+/// byte-identical output.
+fn optional_seed_coalesce_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_R2RML_OPTIONAL_SEED_COALESCE"))
+}
+
+/// PR-4d coalescing cap: the max driving rows buffered into one seed before the
+/// inner is scanned. Bounds peak memory for an UNBOUNDED OPTIONAL; a LIMIT-bounded
+/// driving side exhausts below this naturally (so `… LIMIT k` coalesces exactly the
+/// ≤k driving rows into one scan). Beyond the cap the operator degrades to
+/// cap-sized windows — still one inner scan per cap window, far fewer than the
+/// pre-PR-4d one-per-outer-batch. Override `FLUREE_R2RML_OPTIONAL_SEED_COALESCE_CAP`.
+fn optional_seed_coalesce_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FLUREE_R2RML_OPTIONAL_SEED_COALESCE_CAP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(512 * 1024)
+    })
+}
+
 /// Single-shot operator that emits a precomputed set of rows (the distinct
 /// correlation tuples) as the seed of a batched OPTIONAL hash-join, chunked to
 /// the execution batch size.
@@ -1692,6 +1742,48 @@ struct PendingOptionalMatch {
 }
 
 impl OptionalOperator {
+    /// PR-4d: pull and CONCATENATE required batches (up to the coalesce cap) into
+    /// one combined batch, so a batched-OPTIONAL inner is seeded — and scanned —
+    /// ONCE over the whole (bounded) driving side rather than once per outer batch
+    /// (the F14 per-window re-scan). All required batches share one schema, so this
+    /// is a column-wise append. A LIMIT-bounded driving side exhausts below the cap
+    /// (one seed, one scan); beyond the cap it degrades to cap-sized windows. Returns
+    /// `None` only when the driving side is exhausted with zero rows.
+    async fn pull_coalesced_required(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Batch>> {
+        let cap = optional_seed_coalesce_cap();
+        let mut schema: Option<Arc<[VarId]>> = None;
+        let mut columns: Vec<Vec<Binding>> = Vec::new();
+        let mut rows = 0usize;
+        while rows < cap {
+            match self.required.next_batch(ctx).await? {
+                Some(batch) => {
+                    if schema.is_none() {
+                        schema = Some(batch.schema_arc());
+                        columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
+                    }
+                    for (c, col) in columns.iter_mut().enumerate() {
+                        col.extend_from_slice(
+                            batch.column_by_idx(c).expect("column index within schema"),
+                        );
+                    }
+                    rows += batch.len();
+                }
+                None => break,
+            }
+        }
+        match schema {
+            // Empty-schema (0-column) driving side still carries a row count.
+            Some(schema) if rows > 0 && schema.is_empty() => {
+                Ok(Some(Batch::empty_schema_with_len(rows)))
+            }
+            Some(schema) if rows > 0 => Ok(Some(Batch::new(schema, columns)?)),
+            _ => Ok(None),
+        }
+    }
+
     /// Create a new left-join operator with an optional builder
     ///
     /// This is the general constructor that accepts any `OptionalBuilder`.
@@ -2009,9 +2101,22 @@ impl Operator for OptionalOperator {
             }
 
             // Need to process more required rows
-            // First, ensure we have a required batch
+            // First, ensure we have a required batch. PR-4d: when the inner takes
+            // the batched hash-join path, COALESCE the whole (bounded) driving side
+            // into one combined batch so the inner is seeded — and scanned — ONCE
+            // rather than once per outer batch. Any other shape (or the switch off)
+            // keeps the single-batch pull, byte-identical.
             if self.current_required_batch.is_none() {
-                match self.required.next_batch(ctx).await? {
+                let coalesce = optional_seed_coalesce_enabled()
+                    && !optional_hash_join_disabled()
+                    && !ctx.is_multi_ledger()
+                    && self.optional_builder.supports_seed_coalescing();
+                let next = if coalesce {
+                    self.pull_coalesced_required(ctx).await?
+                } else {
+                    self.required.next_batch(ctx).await?
+                };
+                match next {
                     Some(batch) => {
                         self.current_required_batch = Some(batch);
                         self.current_required_row = 0;
@@ -2984,5 +3089,177 @@ mod tests {
 
         // Should have same schema as new() constructor
         assert_eq!(op.schema().len(), 3);
+    }
+
+    // ---- PR-4d (F14): seed-coalescing hermetic differential ----
+
+    /// A required operator that yields a preset queue of batches, one per
+    /// `next_batch` — models the outer side emitting many small windowed batches
+    /// (the F14 per-window driver).
+    struct MultiBatchOp {
+        batches: std::collections::VecDeque<Batch>,
+    }
+    #[async_trait]
+    impl Operator for MultiBatchOp {
+        fn schema(&self) -> &[VarId] {
+            &[]
+        }
+        async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+        async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(self.batches.pop_front())
+        }
+        fn close(&mut self) {}
+    }
+
+    /// A coalescing-capable builder that COUNTS `build_batch` invocations (= inner
+    /// scans) and returns every driving row as an OPTIONAL miss. Lets a test assert
+    /// "N driving batches ⇒ ONE build_batch" without R2RML plumbing.
+    struct CountingCoalesceBuilder {
+        schema: Arc<[VarId]>,
+        opt_only: Vec<VarId>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl CountingCoalesceBuilder {
+        fn new(required_schema: &Arc<[VarId]>, calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            let opt = VarId(999);
+            let mut sch = required_schema.to_vec();
+            sch.push(opt);
+            Self {
+                schema: Arc::from(sch.into_boxed_slice()),
+                opt_only: vec![opt],
+                calls,
+            }
+        }
+    }
+    #[async_trait]
+    impl OptionalBuilder for CountingCoalesceBuilder {
+        fn build(
+            &self,
+            _r: &Batch,
+            _row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<BoxedOperator>> {
+            Ok(None) // per-row path unused: build_batch always returns Some
+        }
+        async fn build_batch(
+            &self,
+            required_batch: &Batch,
+            start_row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<Vec<OptionalBatchRow>>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Every driving row is an OPTIONAL miss (empty optional batches) → the
+            // row survives the left join with its optional-only var unbound.
+            Ok(Some(
+                (start_row..required_batch.len())
+                    .map(|r| (r, Vec::new()))
+                    .collect(),
+            ))
+        }
+        fn supports_seed_coalescing(&self) -> bool {
+            true
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        fn optional_only_vars(&self) -> &[VarId] {
+            &self.opt_only
+        }
+        fn unify_instructions(&self) -> &[UnifyInstruction] {
+            &[]
+        }
+    }
+
+    fn iri_batch(schema: &Arc<[VarId]>, vals: &[&str]) -> Batch {
+        Batch::new(
+            schema.clone(),
+            vec![vals.iter().map(|s| Binding::iri(*s)).collect()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pr4d_pull_coalesced_required_concatenates_all_batches_in_order() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [
+                iri_batch(&rs, &["a", "b"]),
+                iri_batch(&rs, &["c"]),
+                iri_batch(&rs, &["d", "e", "f"]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let builder = CountingCoalesceBuilder::new(&rs, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let mut op = OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let combined = futures::executor::block_on(op.pull_coalesced_required(&ctx))
+            .unwrap()
+            .expect("some coalesced batch");
+        assert_eq!(combined.len(), 6, "2+1+3 rows coalesce into one 6-row seed");
+        let col: Vec<String> = (0..6)
+            .map(|r| format!("{:?}", combined.get_by_col(r, 0)))
+            .collect();
+        assert!(
+            col[0].contains("a") && col[2].contains("c") && col[5].contains("f"),
+            "row order preserved across the concatenated batches: {col:?}"
+        );
+        // Driving side now exhausted → None.
+        assert!(
+            futures::executor::block_on(op.pull_coalesced_required(&ctx))
+                .unwrap()
+                .is_none(),
+            "second pull returns None once the driving side is drained"
+        );
+    }
+
+    #[test]
+    fn pr4d_multi_batch_driver_collapses_to_one_build_batch() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [
+                iri_batch(&rs, &["a", "b"]),
+                iri_batch(&rs, &["c"]),
+                iri_batch(&rs, &["d", "e", "f"]),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let builder = CountingCoalesceBuilder::new(&rs, Arc::clone(&calls));
+        let mut op = OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let out_rows = futures::executor::block_on(async {
+            op.open(&ctx).await?;
+            let mut rows = 0usize;
+            while let Some(b) = op.next_batch(&ctx).await? {
+                rows += b.len();
+            }
+            Result::<usize>::Ok(rows)
+        })
+        .unwrap();
+
+        // The whole 6-row driving side is seeded once → ONE build_batch (one inner
+        // scan), not one per outer batch (which would be 3). This is the F14 fix.
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "3 driving batches must collapse to ONE build_batch (one inner scan)"
+        );
+        // Left-join preserves every driving row (all OPTIONAL misses).
+        assert_eq!(out_rows, 6, "every driving row survives the left join");
     }
 }
