@@ -1,8 +1,8 @@
 # PR-8-TAIL (F18 cold-floor) — q031 loadTable-pin + fact-residency — DESIGN SCOPE
 
 **Branch:** `fix/f18-q031-memo-limit` (off `fix/f9-virtual-curie`, #1499 head e1ac1317f)
-**Status:** DESIGN SCOPE (doc only) — **STOP for lead review**. No engine code until approved.
-**North-star item 1**, RE-SCOPED per the lead's ruling (2026-07-14, Option 1): F18 is a **cold-floor** item framed as **the PR-8 tail** (persistent `loadTable`/creds pin beyond the 60s cross-query TTL + fact/dim residency), NOT a memo/limit PR. The memo non-engagement is split out as **F19** (own entry, standalone, low priority). This doc is the design scope; `17-pr-f18-q031-memo-limit.md` is the investigation record that forced the re-frame (its REVISED CONCLUSION → this).
+**Status:** DESIGN SCOPE (doc only) — **STOP for lead review**. No engine code until approved. **⚠️ L1 PREMISE REFUTED BY MEASUREMENT 2026-07-14 — see the MEASUREMENT ADDENDUM at the bottom before reading §a-§e.** The "loadTable/creds pin LEAK" hypothesis is wrong: q031 loads 7 DISTINCT tables once each (pin held perfectly across 72 s > the 60 s TTL). The 21.2 s is a **resolution FAN-OUT** (`?p edw:name ?pn` resolves against all 6 name-bearing dims), not a re-load storm. The real q031 lever is a **RefObjectMap-target resolution prune** (F8/PR-3 family), NOT a pin. §a-§e below are retained as the (now-superseded) reasoning trail.
+**North-star item 1**, RE-SCOPED per the lead's ruling (2026-07-14, Option 1): F18 is a **cold-floor** item framed as **the PR-8 tail**. The memo non-engagement is split out as **F19** (own entry, standalone, low priority). This doc is the design scope; `17-pr-f18-q031-memo-limit.md` is the investigation record that forced the re-frame (its REVISED CONCLUSION → this).
 
 Target (honest, pending open-item 2 below): q031 **72 s cache-thrashed → single-digit s** (≤~3 s if the one-time full fact read fits the bar; see the arithmetic).
 
@@ -107,3 +107,37 @@ From `pf_rebaseline_1499.jsonl` (hot reps), `r2rml.load_table` fires (`lt_n>0`) 
 4. Native untouched (r2rml / graph-source only; native never instantiates the R2RML scan path). Kill switch off = byte-identical + reverts to current re-load behavior.
 
 **STOP — design scope for review.** Open questions for the lead: (i) L1 + L2 scope as one PR, or L1 first (q031's dominant lever, cleanest counter proof) with L2 as a follow-up given its entanglement with F14/F17? (ii) the bar-semantics dependency on open-item 2 (fact-read floor) — does that go to AJ now with the fact-size measurement, or after? No engine code pending your call.
+
+---
+
+## MEASUREMENT ADDENDUM (2026-07-14) — open-items 1 & 2 resolved; L1 premise REFUTED
+
+Ran the two open-item measurements before writing the L1 code addendum. Both landed, and together they **overturn the L1 "loadTable pin leak" hypothesis** and correct the q031 fix.
+
+### Open-item 2 — table sizes (authoritative, from the content-addressed disk catalog `metadata.json` snapshot summaries; zero live-credential persist)
+
+| table | rows | data-files | bytes | rows/file | KB/file |
+|---|---:|---:|---:|---:|---:|
+| **FACT_INVENTORY_SNAPSHOT** | 300,000 | **7,670** | 51.1 MB | 39.1 | 6.5 |
+| DIM_PRODUCT | 37,500 | **1** | 1.0 MB | 37,500 | 997 |
+| (ref: FACT_ORDER) | 180,000 | 7,670 | 54.6 MB | 23.5 | 7.0 |
+| (ref: FACT_SHIPMENT) | 180,000 | 7,670 | 45.1 MB | 23.5 | 5.7 |
+
+**Verdict: q031's fact-read floor is FILE-COUNT-BOUND, not byte-bound.** 51 MB fits any cache trivially — L2-as-"raise the 512 MiB cap" is a non-issue (the whole fact table is 51 MB). The cost is the **7,670 tiny files** (6.5 KB, 39 rows each) — the canonical decode-wall layout the ROADMAP master-finding calls out (~39 files/s ⇒ ~197 s cold-S3). The un-prunable `FILTER(?oh<?rp)` means the `LIMIT 5000` cannot cut this scan → one full read touches all 7,670 files. So the residual floor after every other fix is **one 7,670-file FACT_INVENTORY_SNAPSHOT decode**, which is **PR-2a territory (per-file decode overhead), not cache-residency**.
+
+### Open-item 1 — why `load_table.n = 7` (the leak test) → NOT A LEAK
+
+Ran q031 against a FRESH catalog cache and enumerated the distinct tables loaded. Result: **7 DISTINCT tables, each loaded EXACTLY ONCE** — `FACT_INVENTORY_SNAPSHOT` + `DIM_ACCOUNT, DIM_CUSTOMER, DIM_EMPLOYEE, DIM_PRODUCT, DIM_STORE, DIM_SUPPLIER`. (wall 114.8 s cold, `load_table.n=7`.)
+
+- **The per-query pin is WORKING AS DESIGNED.** Each table loaded once; the pin held across the full 72–115 s query despite the 60 s cross-query TTL (`cache.rs:37`'s "in-flight query pins its own snapshot regardless" contract holds). **There is no re-load storm.** L1 as scoped (make the pin durable) fixes nothing — the pin is already durable.
+- **The 7 loads are a RESOLUTION FAN-OUT.** The 6 dims loaded are EXACTLY the 6 that map `edw:name` (`DIM_SUPPLIER`=SUPPLIER_NAME, `DIM_ACCOUNT`=ACCOUNT_NAME, `DIM_EMPLOYEE`=FULL_NAME, `DIM_STORE`=STORE_NAME, `DIM_CUSTOMER`=FULL_NAME, `DIM_PRODUCT`=PRODUCT_NAME). q031's second triple `?p edw:name ?pn` is a **variable-subject single-predicate pattern on a shared base predicate**, so TriplesMap resolution fans out to every `edw:name`-bearing map — even though `?p` is bound by `edw:product` (a RefObjectMap whose parent is provably `DIM_PRODUCT`). **The RefObjectMap's target class is not propagated to constrain the downstream `?p edw:name` resolution.**
+
+### Corrected q031 fix — a RESOLUTION-PRUNE (F8/PR-3 / ref-target family), NOT a loadTable-pin
+
+- **Primary lever (deterministic): propagate the RefObjectMap parent (`DIM_PRODUCT`, from `?p ← edw:product`) to prune the resolution of downstream patterns on `?p`.** `?p edw:name ?pn` then resolves to `DIM_PRODUCT` only → `load_table.n` **7 → 2** (fact + DIM_PRODUCT), killing 5 dead dim loads (~15 s incl. the 390 K-row DIM_CUSTOMER) AND — pending confirmation — most of the 1447 `scan_table` re-scans (if those are the 6-dim fan-out re-scanned per driving batch, not DIM_PRODUCT alone; this also subsumes much of the F18/F19 "1447 DIM_PRODUCT re-scans" framing, which assumed a single dim). This is the **F8/PR-3 shared-base-predicate over-scan**, on the JOINED dim attribute rather than the primary star, and it rhymes with `[[fk-templated-ref-fusion]]`'s `trust_fk_refs` (the FK target is known; don't scan all candidate parents).
+- **Residual floor (after the prune): one 7,670-file `FACT_INVENTORY_SNAPSHOT` decode** — the file-count decode-wall (PR-2a), un-cuttable by the LIMIT. **So q031's ≤3 s achievability depends on PR-2a (the ROADMAP's master lever), NOT on cache residency.**
+- **L1 (pin) and L2 (residency) are both largely MOOT for q031:** the pin isn't leaking, and 51 MB doesn't need residency tuning. What remains of "cold-floor" for q031 is (fix A) the resolution-prune + (floor) PR-2a's per-file decode. The disk catalog cache (PR-8 slice 2) already removes the metadata/manifest S3 reads; the vended-creds `loadTable` GET is one-per-table and correctly pinned.
+
+### Consequence for the slate
+
+q031's cold-floor PR should be **reframed from "loadTable-pin + residency" to "RefObjectMap-target resolution prune (F8/PR-3 family) + lean on PR-2a for the fact decode-wall."** This is a different, smaller, DETERMINISTIC fix (a resolution-set constraint, gated by a `scan_table`/`load_table`-count sentinel: 7→2), with the residual wall explicitly attributed to PR-2a. **The L1/L2 design in §a-§e is superseded.** Recommend: file the ref-target fan-out as its own finding (F20?), re-scope the q031 PR to it, and STOP for the lead's re-ruling — no L1 pin code. The open question for AJ's bar is now cleaner: after the prune, q031 = one 7,670-file fact decode; whether that clears ≤3 s cache-thrashed is a PR-2a question (per-file overhead × 7,670), reported honestly.
