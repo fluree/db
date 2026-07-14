@@ -1405,3 +1405,170 @@ fn remap_record(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::subject_id::SubjectId;
+
+    const OP_RETRACT: u8 = 0;
+    const OP_ASSERT: u8 = 1;
+
+    /// Integer-valued record in the default graph, no list index, no language.
+    fn rec(s_id: u64, p_id: u32, o_key: u64, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            s_id: SubjectId::from_u64(s_id),
+            o_key,
+            p_id,
+            t,
+            i: u32::MAX,
+            g_id: 0,
+            dt: 0,
+            lang_id: 0,
+            o_kind: 1,
+            op,
+        }
+    }
+
+    fn lang_rec(s_id: u64, p_id: u32, o_key: u64, lang_id: u16, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            lang_id,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    fn list_rec(s_id: u64, p_id: u32, o_key: u64, i: u32, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            i,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    /// Field projection for assertions (`RunRecord` has no `Debug`).
+    fn key(r: &RunRecord) -> (u64, u32, u64, u32, u16, u32, u8) {
+        (r.s_id.as_u64(), r.p_id, r.o_key, r.i, r.lang_id, r.t, r.op)
+    }
+
+    fn keys(records: &[RunRecord]) -> Vec<(u64, u32, u64, u32, u16, u32, u8)> {
+        records.iter().map(key).collect()
+    }
+
+    /// Issue #1412: the same fact asserted by two commits in one window must
+    /// dedup to the first assert (the later one is a no-op re-assert), so
+    /// the leaf merge sees each identity at most once.
+    #[test]
+    fn duplicate_asserts_dedup_to_first_assert() {
+        let records = vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 6, OP_ASSERT)];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+    }
+
+    /// Assert-then-retract of a new fact within one window resolves to the
+    /// retract; without the dedup the leaf merge emits the assert as a row
+    /// and only logs the retract, leaving a ghost row.
+    #[test]
+    fn assert_then_retract_dedups_to_retract() {
+        let records = vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 6, OP_RETRACT)];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+    }
+
+    #[test]
+    fn reassert_after_retract_survives_with_reassert_t() {
+        let records = vec![
+            rec(1, 1, 10, 3, OP_ASSERT),
+            rec(1, 1, 10, 4, OP_RETRACT),
+            rec(1, 1, 10, 5, OP_ASSERT),
+        ];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+    }
+
+    #[test]
+    fn repeat_retract_keeps_highest_t() {
+        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 6, OP_RETRACT)];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+    }
+
+    /// Same-`t` ties resolve retract-wins, matching `resolve_overlay_ops` and
+    /// `NoveltyFactState`. Sorted input puts the retract first (op 0 < 1).
+    #[test]
+    fn same_t_retract_beats_assert() {
+        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    }
+
+    /// `lang_id` is part of fact identity but not of the sort comparator:
+    /// records differing only in language must not dedup into each other.
+    #[test]
+    fn distinct_lang_ids_do_not_dedup() {
+        let records = vec![
+            lang_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            lang_rec(1, 1, 10, 2, 5, OP_ASSERT),
+            lang_rec(1, 1, 10, 1, 6, OP_ASSERT),
+        ];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                lang_rec(1, 1, 10, 1, 5, OP_ASSERT),
+                lang_rec(1, 1, 10, 2, 5, OP_ASSERT),
+            ])
+        );
+    }
+
+    /// The list index `i` is part of fact identity but not of the sort
+    /// comparator: the same value at different list positions must not dedup.
+    #[test]
+    fn distinct_list_indices_do_not_dedup() {
+        let records = vec![
+            list_rec(1, 1, 10, 0, 5, OP_ASSERT),
+            list_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            list_rec(1, 1, 10, 0, 6, OP_ASSERT),
+        ];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                list_rec(1, 1, 10, 0, 5, OP_ASSERT),
+                list_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            ])
+        );
+    }
+
+    /// Distinct facts pass through untouched, in input order.
+    #[test]
+    fn distinct_facts_are_preserved_in_order() {
+        let records = vec![
+            rec(1, 1, 10, 5, OP_ASSERT),
+            rec(1, 1, 20, 5, OP_ASSERT),
+            rec(2, 1, 10, 6, OP_RETRACT),
+            rec(3, 2, 30, 7, OP_ASSERT),
+        ];
+        let expected = keys(&records);
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(keys(&out), expected);
+    }
+
+    /// Winners within one sort-prefix group are emitted in `(t, op)` order so
+    /// the output stays sorted for the V1→V2 conversion and leaf slicing.
+    #[test]
+    fn group_winners_stay_sorted_by_t() {
+        let records = vec![
+            lang_rec(1, 1, 10, 1, 3, OP_ASSERT),  // lang 1: survives at t=3
+            lang_rec(1, 1, 10, 2, 4, OP_ASSERT),  // lang 2: superseded below
+            lang_rec(1, 1, 10, 1, 5, OP_ASSERT),  // lang 1: no-op re-assert
+            lang_rec(1, 1, 10, 2, 6, OP_RETRACT), // lang 2: winner at t=6
+        ];
+        let out = dedup_fact_lifecycles(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                lang_rec(1, 1, 10, 1, 3, OP_ASSERT),
+                lang_rec(1, 1, 10, 2, 6, OP_RETRACT),
+            ])
+        );
+    }
+}
