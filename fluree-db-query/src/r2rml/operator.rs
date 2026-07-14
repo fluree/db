@@ -556,6 +556,11 @@ impl R2rmlScanOperator {
     /// LIMIT, so a `None` here is only a missed optimization, never wrong.
     fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
         let (sort_var, k) = self.topk?;
+        // SOUNDNESS (heap feed): decline when a residual filter the operator
+        // enforces after the scan is present — the heap would see pre-filter rows.
+        if topk_residual_filter_present(&self.pattern) {
+            return None;
+        }
         let pred_iri = if Some(sort_var) == self.pattern.object_var {
             self.pattern.predicate_filter.as_deref()
         } else {
@@ -969,6 +974,15 @@ impl R2rmlScanOperator {
             // the directive — replaying that subset for a later FULL scan of the
             // same table+projection would silently drop rows (the exact silent-
             // wrong class the differential's second-scan case guards).
+            //
+            // The bypass keys on the STORED directive (`self.topk`), NOT the
+            // resolved one: when `resolve_topk_directive` DECLINES (a residual
+            // filter, below), `self.topk` is still `Some` so `cacheable` is false,
+            // but `main_scan_topk` is `None` so the scan runs FULL. That full scan
+            // then merely skips the cache — a missed optimization, never wrong. The
+            // load-bearing invariant is one-directional: NO path that could return
+            // a pruned subset (`self.topk.is_some()`) is ever cacheable, so a
+            // pruned result can never poison the `(table, projection)` cache.
             let main_scan_topk = self.resolve_topk_directive(triples_map);
             let cacheable = scan_cache_enabled()
                 && scan_filters.is_empty()
@@ -1659,6 +1673,21 @@ fn value_pushdown_column(om: &ObjectMap) -> Option<&str> {
         ObjectMap::Column { column, .. } => Some(column.as_str()),
         _ => None,
     }
+}
+
+/// Whether a pattern carries a RESIDUAL filter — one the operator enforces per
+/// row AFTER the scan emits (a folded `consumed_filter`, a constant object or
+/// subject, or a same-subject star existence constraint). The scan-side top-k
+/// heap is fed the scan's EMITTED rows; a residual filter means those include
+/// rows that don't survive to the result, so the k-th bound would ride too high
+/// and prune files whose qualifying rows belong in the true top-k. When true, the
+/// top-k pushdown MUST be declined (→ full sort). Pushed `scan_filters` are NOT
+/// residual — the reader applies them, so the emitted batch is already filtered.
+fn topk_residual_filter_present(pattern: &R2rmlPattern) -> bool {
+    pattern.consumed_filter.is_some()
+        || pattern.object_constant.is_some()
+        || pattern.subject_constant.is_some()
+        || !pattern.star_constraints.is_empty()
 }
 
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
@@ -2448,6 +2477,41 @@ mod tests {
     use crate::r2rml::{ObjectConstant, ScanValue};
     use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
     use fluree_db_r2rml::materialize::RdfTerm;
+
+    /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
+    /// carries a residual filter the operator enforces after emitting rows —
+    /// otherwise the heap is fed pre-filter values and could prune files whose
+    /// qualifying rows belong in the true top-k (silently dropping rows). A pure
+    /// value scan (q046 shape) is eligible; a folded FILTER, a constant
+    /// object/subject, or a same-subject star existence constraint declines.
+    #[test]
+    fn topk_declines_on_residual_filter() {
+        let base = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)))
+            .with_predicate("http://ex/orderTotal");
+        assert!(
+            !topk_residual_filter_present(&base),
+            "pure value scan is eligible"
+        );
+
+        let mut folded_filter = base.clone();
+        folded_filter.consumed_filter = Some(crate::ir::Expression::Var(VarId(7)));
+        assert!(topk_residual_filter_present(&folded_filter));
+
+        let mut const_object = base.clone();
+        const_object.object_constant = Some(ObjectConstant::Iri("http://ex/x".to_string()));
+        assert!(topk_residual_filter_present(&const_object));
+
+        let mut bound_subject = base.clone();
+        bound_subject.subject_constant = Some("http://ex/o/1".to_string());
+        assert!(topk_residual_filter_present(&bound_subject));
+
+        let mut star_constraint = base.clone();
+        star_constraint.star_constraints = vec![(
+            "http://ex/isCurrent".to_string(),
+            ObjectConstant::Scalar(ScanValue::Bool(true)),
+        )];
+        assert!(topk_residual_filter_present(&star_constraint));
+    }
 
     fn pom(pred: &str, col: &str) -> PredicateObjectMap {
         PredicateObjectMap {
@@ -3321,6 +3385,64 @@ mod tests {
                 provider.scans.lock().unwrap().get("customers").copied().unwrap_or(0),
                 2,
                 "two graph sources ⇒ two parent scans (graph_source_id in the key, no cross-source pollution)"
+            );
+        }
+
+        // PR-5 cache-poison guard: a top-k scan returns a PRUNED file subset, so it
+        // must never populate/replay the per-operator scan_cache — a later full scan
+        // of the same (table, projection) must see FULL results, not the subset.
+        // Proven by scan COUNT across repeated batches: WITHOUT topk the main table
+        // is cached (scanned once); WITH topk it is re-scanned each batch (the
+        // `cacheable = … && self.topk.is_none()` bypass held). This is the test that
+        // keeps the bypass true across future refactors.
+        #[test]
+        fn topk_scan_bypasses_scan_cache() {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{ORDER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("edw:orderTotal"),
+                    object_map: ObjectMap::column("ORDER_TOTAL"),
+                });
+            let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders]));
+
+            fn orders_scans(topk: bool, mapping: &Arc<CompiledR2rmlMapping>) -> usize {
+                let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+                let vars = VarRegistry::new();
+                let provider = CountingProvider::default();
+                {
+                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                    ctx.r2rml_table_provider = Some(&provider);
+                    let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+                    pattern.predicate_filter = Some("edw:orderTotal".to_string());
+                    let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+                    op.mapping = Some(Arc::clone(mapping));
+                    if topk {
+                        op.topk = Some((VarId(1), 10));
+                    }
+                    for _ in 0..3 {
+                        futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))
+                            .expect("build_progress");
+                    }
+                }
+                let count = provider
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .get("orders")
+                    .copied()
+                    .unwrap_or(0);
+                count
+            }
+
+            assert_eq!(
+                orders_scans(false, &mapping),
+                1,
+                "no topk: the main scan is cached and replayed across batches"
+            );
+            assert_eq!(
+                orders_scans(true, &mapping),
+                3,
+                "topk: the main scan bypasses the cache each batch — a pruned subset is never cached"
             );
         }
     }

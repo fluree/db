@@ -1643,9 +1643,11 @@ impl FlureeR2rmlProvider<'_> {
                 let mut bound = TopKBound::new(tk.k);
                 let mut collected: Vec<ColumnBatch> = Vec::new();
                 let mut tail: Vec<FileScanTask> = Vec::new();
+                let mut reads = 0usize;
                 for pos in 0..order.len() {
                     if pos >= TOPK_SEQUENTIAL_CAP {
-                        // Prune ineffective after the cap — finish in parallel.
+                        // Prune ineffective after the cap — finish in parallel so
+                        // the topk path is never slower than the full parallel scan.
                         tail = order[pos..]
                             .iter()
                             .map(|(orig, _)| tasks[*orig].clone())
@@ -1673,25 +1675,49 @@ impl FlureeR2rmlProvider<'_> {
                             tasks[orig].data_file.file_path
                         ))
                     })?;
+                    // SOUNDNESS INVARIANT: the heap is fed the sort values of the
+                    // rows this scan EMITS — which are the QUALIFYING result rows
+                    // (post any pushed row filter). The directive is declined
+                    // upstream (`resolve_topk_directive`) whenever a RESIDUAL filter
+                    // the operator enforces after this scan is present, because
+                    // feeding pre-filter values would ride the k-th bound too high
+                    // and prune files whose qualifying rows belong in the true
+                    // top-k. Never feed a superset of the qualifying rows here.
                     for b in &batches {
                         bound.observe_all(batch_sort_values(b, sort_field_id));
                     }
                     collected.extend(batches);
+                    reads += 1;
                     // Stop iff the heap is full and the NEXT (highest-remaining)
-                    // file's bound is strictly below the k-th (over-keep on ties;
-                    // a no-bound next → never stops). See `TopKBound::can_stop`.
+                    // file's upper_bound is strictly below the k-th (over-keep on
+                    // ties; a no-bound next → never stops). See `TopKBound::can_stop`.
                     if let Some((_, next_upper)) = order.get(pos + 1) {
                         if bound.can_stop(next_upper.as_ref()) {
                             break;
                         }
                     }
                 }
+
+                // Report the topk file selection through the SAME span the bench
+                // harness sums (`iceberg.scan_plan`) — the planner's span does not
+                // fire on this path, so without this the `files_selected` /
+                // `files_pruned` counters would read 0. `files_selected` is the
+                // files actually read (the sequential prefix plus any parallel
+                // tail); the rest were provably unable to beat the k-th bound.
+                let files_selected = reads + tail.len();
+                let files_pruned = order.len().saturating_sub(files_selected);
+                tracing::debug_span!(
+                    "iceberg.scan_plan",
+                    files_selected = files_selected as u64,
+                    files_pruned = files_pruned as u64,
+                )
+                .in_scope(|| {});
                 debug!(
-                    files_read = order.len() - tail.len(),
-                    tail_parallel = tail.len(),
+                    files_selected,
+                    files_pruned,
                     total_files = order.len(),
                     k = tk.k,
-                    "scan-side top-k read"
+                    "scan-side top-k prune"
                 );
                 let prefix = futures::stream::iter(collected.into_iter().map(Ok));
                 if tail.is_empty() {

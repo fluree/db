@@ -3447,6 +3447,70 @@ mod tests {
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
 
+    /// PR-5: the scan-side top-k directive offered to the child must carry
+    /// `k = LIMIT + OFFSET`, not `LIMIT` — the scan has to retain enough rows for
+    /// the OFFSET the sort above then skips, or `ORDER BY DESC … LIMIT k OFFSET m`
+    /// would silently drop the rows at positions `k+1..=k+m`. This locks the
+    /// single-owner `+offset` arithmetic against a future edit that moves or
+    /// duplicates it. (A pure `ORDER BY DESC LIMIT` with no residual filter still
+    /// pushes topk, so this arithmetic is live even though q046 has offset 0.)
+    #[test]
+    fn topk_directive_carries_limit_plus_offset() {
+        use crate::binding::Batch;
+        use crate::context::ExecutionContext;
+        use crate::error::Result as QResult;
+        use crate::operator::{BoxedOperator, Operator};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingTopkOp {
+            schema: Vec<VarId>,
+            recorded: Arc<Mutex<Option<(VarId, usize)>>>,
+        }
+        #[async_trait::async_trait]
+        impl Operator for RecordingTopkOp {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+            fn set_topk(&mut self, sort_var: VarId, k: usize) {
+                *self.recorded.lock().unwrap() = Some((sort_var, k));
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(None));
+        let op: BoxedOperator = Box::new(RecordingTopkOp {
+            schema: vec![VarId(0), VarId(1)],
+            recorded: Arc::clone(&recorded),
+        });
+        let planning = crate::temporal_mode::PlanningContext::current();
+        // ORDER BY DESC(?1) LIMIT 10 OFFSET 5.
+        let _tree = apply_solution_modifiers(
+            op,
+            None,
+            &[],
+            &[SortSpec::desc(VarId(1))],
+            None,
+            false,
+            Some(5),
+            Some(10),
+            false,
+            None,
+            &planning,
+        )
+        .expect("apply_solution_modifiers");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((VarId(1), 15)),
+            "k must be LIMIT(10) + OFFSET(5) = 15, so the scan retains the offset rows the sort then skips"
+        );
+    }
+
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(
             Ref::Var(s_var),

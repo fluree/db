@@ -832,6 +832,7 @@ mod e2e {
             table: &str,
             _projection: &[String],
             _filters: &[ScanFilter],
+            _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
             _as_of_t: Option<i64>,
         ) -> QueryResult<ColumnBatchStream> {
             self.scanned.lock().unwrap().push(table.to_string());

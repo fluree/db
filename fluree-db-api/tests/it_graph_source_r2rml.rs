@@ -15,7 +15,7 @@ use fluree_db_iceberg::io::batch::{BatchSchema, Column, ColumnBatch, FieldInfo, 
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
     convert_triple_to_r2rml, ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter,
-    ScanValue,
+    ScanTopK, ScanValue,
 };
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
@@ -94,6 +94,7 @@ impl R2rmlTableProvider for MockR2rmlProvider {
         _table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         Ok(vec_batch_stream(self.batches.clone()))
@@ -235,7 +236,14 @@ async fn test_mock_r2rml_provider() {
     // Test scan_table
     use futures::StreamExt;
     let batches: Vec<ColumnBatch> = provider
-        .scan_table("test-gs:main", "openflights.airlines", &[], &[], Some(0))
+        .scan_table(
+            "test-gs:main",
+            "openflights.airlines",
+            &[],
+            &[],
+            None,
+            Some(0),
+        )
         .await
         .unwrap()
         .map(|b| b.unwrap())
@@ -952,6 +960,7 @@ impl R2rmlTableProvider for IcebergDirectProvider {
         table_name: &str,
         projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         use fluree_db_iceberg::{
@@ -1514,6 +1523,7 @@ async fn engine_e2e_split_triples_map_class_and_predicate_not_fused() {
             table: &str,
             _p: &[String],
             _f: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
             _t: Option<i64>,
         ) -> QueryResult<ColumnBatchStream> {
             let batches = if table == "names" {
@@ -1700,6 +1710,7 @@ async fn engine_e2e_provider_method_calls() {
             table_name: &str,
             projection: &[String],
             _filters: &[ScanFilter],
+            _topk: Option<&ScanTopK>,
             _as_of_t: Option<i64>,
         ) -> QueryResult<ColumnBatchStream> {
             eprintln!(
@@ -2452,6 +2463,7 @@ impl R2rmlTableProvider for MultiTableMockProvider {
         table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         eprintln!("MultiTableMockProvider.scan_table: {table_name}");
@@ -2689,6 +2701,7 @@ impl R2rmlTableProvider for RecordingTableProvider {
         table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         self.scanned.lock().unwrap().push(table_name.to_string());
@@ -3389,6 +3402,7 @@ impl R2rmlTableProvider for CountingProvider {
         table_name: &str,
         projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         let mut proj = projection.to_vec();
@@ -3860,6 +3874,7 @@ impl R2rmlTableProvider for LimitProbeProvider {
         _table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         use futures::StreamExt;
@@ -3933,6 +3948,7 @@ impl R2rmlTableProvider for FilterCapturingProvider {
         _table_name: &str,
         _projection: &[String],
         filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         use futures::StreamExt;

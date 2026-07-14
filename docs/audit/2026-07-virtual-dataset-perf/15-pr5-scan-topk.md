@@ -69,4 +69,24 @@ Lead approved PROCEED. The distribution-free argument is the decider; the cold-o
 
 ---
 
-**F13 rider (in progress, parallel):** native-sf01 5-rep re-bless launched on the quiet machine (`pf_f13_rebless.sh` → `baselines/perf/native-sf01.json`), to retire the recurring q034/q050 false SLOWs before PR-5's gates. Will commit the refreshed baseline with an F13-citing note and report the delta.
+**F13 rider (DONE):** native-sf01 perf baselines re-blessed (`408b2052e`; q034 176→322, q050 96→283), retiring the recurring false SLOWs. The closing gate's native run confirmed 0 perf violations.
+
+## Implemented + gated (the series closer)
+
+**Root cause of the first-smoke no-prune.** The directive threaded to the `SortOperator`'s child, but a virtual query's scan lives in a `GraphOperator`'s per-parent INNER subplan, and `set_topk` offered to the GraphOperator hit its default no-op. Fix: `GraphOperator` threads the directive into both inner-subplan build sites (exactly as it already does `row_budget`, graph.rs), and `ProjectOperator` forwards it; `OffsetOperator`/`JoinOperator` decline (Offset sits above the sort, so it's never in the sort→scan path, and the k already owns `+offset`). Diagnosed with a per-step trace: `kth` climbs 3214→…→4999.6, `can_stop` fires at pos 9, `reads_sequential=10, stop_reason=early_stop`.
+
+**Perf (closing gate, DW_SF01, 7670 files):**
+| q046 | wall | files_pruned/selected | hash |
+|---|---|---|---|
+| ON (hot) | 136ms | 7660 / 10 | ==oracle |
+| OFF (hot) | 406ms | 0 / 7670 | ==oracle (byte-identical revert) |
+| **COLD** | **3129ms** | **7660** | ==oracle |
+Cold **~37s → 3.1s (~12×), 99.87% pruned** — beats the promise (>99%, cold<5s). ON is faster than OFF even hot. ORDER-BY sweep (q005/q012 declined via fallback) + native 54/54: 0 hash mismatch, 0 perf violations. Post-guard re-verify: q046 still prunes 7660 (the guard is not over-broad).
+
+**Soundness guard (heap feed).** The heap is fed the rows the scan EMITS — post any pushed scan filter (the reader applies those), but PRE any RESIDUAL filter the operator enforces per row. `resolve_topk_directive` DECLINES (→ full sort) when `consumed_filter` / `object_constant` / `subject_constant` / `star_constraints` is present (`topk_residual_filter_present`), so the heap never sees a superset that would ride the k-th bound too high and drop qualifying rows. Load-bearing doc-comment on the feed site.
+
+**Observability + the gate denominator.** The topk branch emits an `iceberg.scan_plan` span (`files_selected=reads`, `files_pruned=total-reads`) so the harness counters capture the prune. NOTE the cold *miss* arm ALSO runs the planner, which emits its own `iceberg.scan_plan` span (`selected=7670, pruned=0`, the PRE-topk plan); the RunRecord SUMS both, so on cold `files_selected` double-counts (7680) while **`files_pruned` is authoritative (7660 = planner 0 + topk 7660)**. The gate ratio is therefore **`files_pruned / total_files`** (7660/7670 = 99.87%), a fixed denominator — never `pruned/(pruned+selected)` (which reads 49.9% on the cold double-emission). Hot (cache arm, no planner span) reads a clean 10/7660.
+
+**Kill switch:** `FLUREE_R2RML_TOPK_PUSHDOWN` (default on); off ⇒ no directive ⇒ today's full-materialize top-k.
+
+**Tests.** iceberg core (10): TopKBound bound/tie/NaN + plan_topk_read/batch_sort_values + read-loop simulations (prune + k-exceeds-non-null + all-null-file). query: `topk_declines_on_residual_filter` (4 residual shapes + pure positive), `topk_scan_bypasses_scan_cache` (cache-poison: topk re-scans each batch vs cached once), `topk_directive_carries_limit_plus_offset` (k=LIMIT+OFFSET single-owner arithmetic). All green; clippy/fmt clean.
