@@ -663,6 +663,12 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     }
 }
 
+/// Bounded concurrency for warming per-table catalog contexts in
+/// [`FlureeR2rmlProvider::prefetch_tables`] (PR-8 slice 1). Matches the
+/// generate-path preview fan-out (`0ade90c59`); the catalog-request semaphore
+/// (PR-8 slice 3) is the global Horizon-QPS bound, this is the per-query width.
+const CATALOG_PREFETCH_CONCURRENCY: usize = 8;
+
 #[async_trait]
 impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// Scan an Iceberg table, streaming column batches as data files are read.
@@ -728,6 +734,66 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .instrument(span)
             .await
     }
+
+    /// Warm the per-query catalog session pin + cross-query caches for a set of
+    /// tables concurrently (PR-8 slice 1). Best-effort and side-effect-only: each
+    /// `load_table_context` populates `self.session` + the moka caches, so the
+    /// query's following *serial* scans resolve from the pin and skip the
+    /// `loadTable` GET. Resolution errors are intentionally swallowed — the real
+    /// scan re-resolves and surfaces them — so a warm failure degrades to today's
+    /// serial GET, never a changed result.
+    async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        // Dedup, preserving first-seen order, AND skip tables already resolved
+        // (with unexpired creds) in this query's session pin — re-warming a
+        // pinned table would issue a wasted `loadTable` GET. Collect OWNED names:
+        // a `Vec<&str>` here makes the `buffered` fan-out closure take a borrowed
+        // argument, which trips rustc's "FnOnce is not general enough" HRTB check.
+        let mut seen = std::collections::HashSet::new();
+        let mut to_warm: Vec<String> = Vec::new();
+        for t in table_names {
+            if seen.insert(t.as_str()) && !self.is_table_pinned(graph_source_id, t) {
+                to_warm.push(t.clone());
+            }
+        }
+
+        // Engagement + measurement span (allowlisted as `r2rml.prefetch`): its
+        // presence proves the prefetch path ran, and `warmed`/`requested` show the
+        // fan-out width vs how many were skipped as already-pinned. Emitted even
+        // for a no-op fan-out so "ran but skipped" is distinguishable from
+        // "never ran".
+        let span = tracing::debug_span!(
+            "r2rml.prefetch",
+            requested = table_names.len(),
+            warmed = to_warm.len(),
+        );
+        if to_warm.len() < 2 {
+            // Nothing to overlap. Enter/drop the span (no `.await` under it) so a
+            // no-op prefetch is still visible in the counters.
+            let _entered = span.entered();
+            return;
+        }
+        // `buffered` polls these futures COOPERATIVELY on one task (no spawn), and
+        // the REST-client build inside `load_table_context` is synchronous, so the
+        // first future polled builds + caches the process-wide client before any
+        // other future resumes past its (async) nameservice lookup — every later
+        // table then reuses that one client and its cached OAuth token. Verified
+        // live: a cold 3-table fan-out does exactly ONE `iceberg.oauth_token`
+        // exchange, not one per table. (If the client build ever becomes async,
+        // this dedup breaks and a serial first-table warm would be needed.)
+        //
+        // TODO(slice-3): once the process-wide catalog-request semaphore lands,
+        // bound this fan-out by it (e.g. `min(CATALOG_PREFETCH_CONCURRENCY, permits)`
+        // or acquire per future) so the prefetch cannot defeat the 429 protection
+        // it deliberately runs ahead of.
+        futures::stream::iter(to_warm)
+            .map(|table| async move {
+                let _ = self.load_table_context(graph_source_id, &table).await;
+            })
+            .buffered(CATALOG_PREFETCH_CONCURRENCY)
+            .for_each(|()| async {})
+            .instrument(span)
+            .await;
+    }
 }
 
 impl FlureeR2rmlProvider<'_> {
@@ -762,8 +828,17 @@ impl FlureeR2rmlProvider<'_> {
 
         // Manifest-only read (never a Parquet/data file): the live data files, and
         // whether the snapshot carries merge-on-read delete manifests.
+        // Measurement sub-span (PR-8 cold decomposition): the COUNT(*) path's
+        // manifest-list + manifest read (the scan path's equivalent is
+        // `iceberg.scan_plan`). For a bare `COUNT(*)` (q036) this plus
+        // `r2rml.load_table` + `r2rml.read_metadata` accounts for the entire cold
+        // wall — no data file is read. Allowlisted in `fluree-bench-virtual::spans`.
         let (data_files, _manifests_read, has_delete_manifests) =
             send_read_snapshot_data_files(storage.as_ref(), snapshot)
+                .instrument(tracing::debug_span!(
+                    "r2rml.count_manifest_read",
+                    table_name
+                ))
                 .await
                 .map_err(|e| {
                     QueryError::Internal(format!(
@@ -789,6 +864,23 @@ impl FlureeR2rmlProvider<'_> {
             ),
         }
         Ok(count)
+    }
+
+    /// Whether `table_name` is already resolved (with unexpired credentials) in
+    /// this query's session pin, so [`R2rmlTableProvider::prefetch_tables`] can
+    /// skip re-warming it. A name that fails to parse is reported as NOT pinned so
+    /// prefetch still attempts it and the real scan surfaces any error.
+    fn is_table_pinned(&self, graph_source_id: &str, table_name: &str) -> bool {
+        use fluree_db_iceberg::catalog::parse_table_identifier;
+        let Ok(id) = parse_table_identifier(table_name) else {
+            return false;
+        };
+        let key = super::catalog_session::IcebergCatalogSession::load_table_key(
+            graph_source_id,
+            &id.namespace,
+            &id.table,
+        );
+        self.session.is_pinned(&key)
     }
 
     /// Resolve a graph source down to its pinned Iceberg table context: the S3
@@ -979,43 +1071,60 @@ impl FlureeR2rmlProvider<'_> {
                 // GCS-backed tables (S3-interop endpoint) are read through this
                 // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
                 // GCS HTTP/2 range-read bug cannot occur.
-                let storage = if let Some(ref credentials) = load_response.credentials {
-                    info!(
-                        region = ?iceberg_config.io.s3_region,
-                        endpoint = ?iceberg_config.io.s3_endpoint,
-                        "Using vended credentials from catalog"
-                    );
-                    // Thread the io overrides so a catalog that omits the region (or where
-                    // we want an operator-configured endpoint/path-style) still resolves
-                    // correctly. Precedence inside the call: vended > these overrides > SDK.
-                    S3IcebergStorage::from_vended_credentials(
-                        credentials,
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
+                //
+                // Reuse the query session's cached S3 client for this table when
+                // one is present: constructing it (`aws_config` load + S3 client +
+                // HTTP client) is not free, and a correlated join — or the slice-1
+                // prefetch→scan — resolves the same table repeatedly. Any fresh
+                // loadTable above dropped the entry via `store_load_table`, so a hit
+                // here always corresponds to the current pinned credentials.
+                let storage = if let Some(cached) = self.session.cached_storage(&lt_key) {
+                    debug!(namespace = %table_id.namespace, table = %table_id.table,
+                        "S3 storage client reused (query-scoped)");
+                    cached
                 } else {
-                    info!(
-                        region = ?iceberg_config.io.s3_region,
-                        endpoint = ?iceberg_config.io.s3_endpoint,
-                        "Using ambient AWS credentials"
-                    );
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
+                    let built = if let Some(ref credentials) = load_response.credentials {
+                        info!(
+                            region = ?iceberg_config.io.s3_region,
+                            endpoint = ?iceberg_config.io.s3_endpoint,
+                            "Using vended credentials from catalog"
+                        );
+                        // Thread the io overrides so a catalog that omits the region (or where
+                        // we want an operator-configured endpoint/path-style) still resolves
+                        // correctly. Precedence inside the call: vended > these overrides > SDK.
+                        S3IcebergStorage::from_vended_credentials(
+                            credentials,
+                            iceberg_config.io.s3_region.as_deref(),
+                            iceberg_config.io.s3_endpoint.as_deref(),
+                            iceberg_config.io.s3_path_style,
+                        )
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                        })?
+                    } else {
+                        info!(
+                            region = ?iceberg_config.io.s3_region,
+                            endpoint = ?iceberg_config.io.s3_endpoint,
+                            "Using ambient AWS credentials"
+                        );
+                        S3IcebergStorage::from_default_chain(
+                            iceberg_config.io.s3_region.as_deref(),
+                            iceberg_config.io.s3_endpoint.as_deref(),
+                            iceberg_config.io.s3_path_style,
+                        )
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                        })?
+                    };
+                    let built = Arc::new(built);
+                    self.session
+                        .store_storage(lt_key.clone(), Arc::clone(&built));
+                    built
                 };
 
-                (load_response, Arc::new(storage))
+                (load_response, storage)
             }
             CatalogConfig::Direct { table_location } => {
                 info!(
@@ -1097,17 +1206,31 @@ impl FlureeR2rmlProvider<'_> {
         } else {
             debug!(metadata_location = %metadata_location, "Table metadata cache miss");
 
-            let metadata_bytes = storage
-                .as_ref()
-                .read(metadata_location)
-                .await
-                .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
-
-            let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
-                QueryError::Internal(format!("Failed to parse table metadata: {e}"))
-            })?;
-
-            let metadata = Arc::new(parsed);
+            // Measurement sub-span (PR-8 cold decomposition): isolate the
+            // metadata-JSON S3 GET + parse — the `load_table_context` component
+            // between the loadTable REST GET (`r2rml.load_table`) and the manifest
+            // read (`iceberg.scan_plan` / `r2rml.count_manifest_read`). Allowlisted
+            // in `fluree-bench-virtual::spans`; keyed by the content-addressed
+            // `metadata_location`, so it is exactly the layer §2.1 can persist.
+            let metadata = async {
+                let metadata_bytes =
+                    storage
+                        .as_ref()
+                        .read(metadata_location)
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to read table metadata: {e}"))
+                        })?;
+                let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                    QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+                })?;
+                Ok::<_, QueryError>(Arc::new(parsed))
+            }
+            .instrument(tracing::debug_span!(
+                "r2rml.read_metadata",
+                metadata_location = %metadata_location,
+            ))
+            .await?;
             cache
                 .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
                 .await;

@@ -20,10 +20,11 @@
 //! `FLUREE_ICEBERG_LOADTABLE_CACHE=0`, restoring per-scan loads.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fluree_db_iceberg::catalog::LoadTableResponse;
 use fluree_db_iceberg::credential::VendedCredentials;
+use fluree_db_iceberg::io::S3IcebergStorage;
 
 /// Master switch for all Iceberg catalog caching. Read once from
 /// `FLUREE_ICEBERG_LOADTABLE_CACHE` (only `0`/`false`/`off` disable it). When
@@ -86,6 +87,15 @@ impl CachedLoadTable {
 pub(crate) struct IcebergCatalogSession {
     /// Pinned `loadTable` responses keyed by `(graph_source_id, namespace.table)`.
     load_tables: Mutex<HashMap<String, CachedLoadTable>>,
+    /// S3 storage clients built from each table's vended credentials, keyed the
+    /// same as `load_tables`. The session pins the loadTable RESPONSE above; this
+    /// caches the AWS SDK client built FROM those credentials so repeated scans of
+    /// one table in a query — a correlated join re-scanning a dim, or the slice-1
+    /// prefetch-then-scan — reuse one client instead of rebuilding it
+    /// (`aws_config` load + S3 client + HTTP client) per scan. Invalidated by
+    /// `store_load_table`: any fresh loadTable (including a creds-expiry reload)
+    /// drops the entry, so a client built from stale credentials is never served.
+    storages: Mutex<HashMap<String, Arc<S3IcebergStorage>>>,
 }
 
 impl IcebergCatalogSession {
@@ -106,6 +116,21 @@ impl IcebergCatalogSession {
             return None;
         }
         Some(hit.to_response())
+    }
+
+    /// Whether `key` is pinned this query with unexpired credentials — the cheap
+    /// (no-clone) predicate `prefetch_tables` uses to skip re-warming a table that
+    /// is already resolved. A pinned-but-creds-expired table returns `false` (a
+    /// warm would usefully refresh it).
+    pub(crate) fn is_pinned(&self, key: &str) -> bool {
+        if !cache_enabled() {
+            return false;
+        }
+        self.load_tables
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|e| !e.creds_expired())
     }
 
     /// The `metadata_location` pinned for `key` on its first load this query,
@@ -132,6 +157,12 @@ impl IcebergCatalogSession {
         if !cache_enabled() {
             return;
         }
+        // Any fresh loadTable invalidates the cached S3 client for this table: a
+        // creds-expiry reload changes the vended credentials, so a client built
+        // from the previous (now-stale) credentials must be rebuilt (it would
+        // otherwise 403). The next `cached_storage` miss triggers the rebuild.
+        // On a first load there is nothing to drop; this is a no-op then.
+        self.storages.lock().unwrap().remove(&key);
         let mut lts = self.load_tables.lock().unwrap();
         match lts.get_mut(&key) {
             Some(existing) => existing.credentials = resp.credentials.clone(),
@@ -139,6 +170,28 @@ impl IcebergCatalogSession {
                 lts.insert(key, CachedLoadTable::from_response(resp));
             }
         }
+    }
+
+    /// The S3 storage client cached for `key`, if one was built and not since
+    /// invalidated by a creds refresh. A hit lets a later scan (or the slice-1
+    /// prefetch→scan) skip rebuilding the AWS SDK client. `None` when the cache is
+    /// disabled or after a fresh loadTable dropped the entry.
+    pub(crate) fn cached_storage(&self, key: &str) -> Option<Arc<S3IcebergStorage>> {
+        if !cache_enabled() {
+            return None;
+        }
+        self.storages.lock().unwrap().get(key).cloned()
+    }
+
+    /// Cache the S3 storage client built from `key`'s current pinned credentials.
+    /// Paired with `cached_storage`; `store_load_table` invalidates on a creds
+    /// refresh, so an entry here always corresponds to the currently pinned creds.
+    /// No-op when the cache is disabled.
+    pub(crate) fn store_storage(&self, key: String, storage: Arc<S3IcebergStorage>) {
+        if !cache_enabled() {
+            return;
+        }
+        self.storages.lock().unwrap().insert(key, storage);
     }
 }
 
@@ -237,6 +290,42 @@ mod tests {
         assert_eq!(
             hit.metadata_location, "s3://snap-A.json",
             "later scans read the pinned snapshot, not the reloaded one"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_load_table_invalidates_cached_storage_on_creds_refresh() {
+        // The session caches the S3 client built from a table's vended creds. A
+        // fresh loadTable (a creds-expiry reload) must DROP that client so a
+        // client built from stale credentials is never reused — otherwise a later
+        // scan would 403. `from_default_chain(Some(region), ..)` builds an SDK
+        // client offline (region set, ambient creds resolved lazily, no request),
+        // which is all this bookkeeping test needs.
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(3600)))),
+        );
+        let storage = Arc::new(
+            S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
+                .await
+                .expect("offline SDK client construction"),
+        );
+        s.store_storage(key.clone(), Arc::clone(&storage));
+        assert!(
+            s.cached_storage(&key).is_some(),
+            "storage client is cached after store"
+        );
+
+        // A fresh loadTable with rotated credentials must invalidate it.
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(3600)))),
+        );
+        assert!(
+            s.cached_storage(&key).is_none(),
+            "cached S3 client must be dropped on a credential refresh, forcing a rebuild"
         );
     }
 

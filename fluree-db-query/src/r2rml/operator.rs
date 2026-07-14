@@ -740,6 +740,22 @@ impl R2rmlScanOperator {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
 
+        // PR-8 slice 1: warm every TriplesMap table's catalog context CONCURRENTLY
+        // before the serial per-map scan loop below, so a multi-table pattern's
+        // per-table `loadTable` GETs overlap instead of summing. Best-effort (see
+        // `prefetch_tables`); a single-table pattern is a no-op inside it.
+        if super::parallel_catalog_resolution_enabled() {
+            let mut tm_tables: Vec<String> = Vec::with_capacity(triples_maps.len());
+            for tm in &triples_maps {
+                if let Some(t) = tm.table_name() {
+                    tm_tables.push(t.to_string());
+                }
+            }
+            table_provider
+                .prefetch_tables(&self.pattern.graph_source_id, &tm_tables)
+                .await;
+        }
+
         // Join vars (pattern-produced vars the child already binds) are the same
         // for every TriplesMap of this pattern.
         let join_vars: Vec<VarId> = self

@@ -202,6 +202,19 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
         Ok(None)
     }
+
+    /// Warm the per-query catalog session + caches for a known set of tables
+    /// CONCURRENTLY, so a following *serial* scan loop (which resolves one table
+    /// per `scan_table`) overlaps the per-table `loadTable` GETs instead of
+    /// summing them. Side-effect-only: returns nothing, and a resolution failure
+    /// here MUST be swallowed by the implementation — the real scan re-resolves
+    /// and surfaces any error — so this only ever removes latency, never changes
+    /// results or error behavior. Callers gate it on
+    /// [`super::parallel_catalog_resolution_enabled`]. The default is a no-op (a
+    /// provider without a remote catalog has nothing to warm).
+    async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        let _ = (graph_source_id, table_names);
+    }
 }
 
 // =============================================================================

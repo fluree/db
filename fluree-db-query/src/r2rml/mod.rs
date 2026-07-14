@@ -54,3 +54,13 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
         Err(_) => true,
     }
 }
+
+/// Whether a multi-table query may warm its per-table catalog contexts
+/// (`loadTable` GET + metadata) CONCURRENTLY before the serial scan loop, so the
+/// per-table GETs overlap instead of summing (PR-8 slice 1). Default on;
+/// `FLUREE_R2RML_PARALLEL_CATALOG=0|false|off|no` restores serial resolution.
+/// Cached in a `OnceLock` — set at process startup, not per query.
+pub(crate) fn parallel_catalog_resolution_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_PARALLEL_CATALOG"))
+}

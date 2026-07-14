@@ -11,6 +11,9 @@
 //! | `r2rml.scan_table`   | `fluree-db-api/src/graph_source/r2rml.rs` (scan setup: loadTable + planning) | `projection_len` |
 //! | `r2rml.count_manifest` | `fluree-db-api/src/graph_source/r2rml.rs` (COUNT(*) manifest-only read; `fired` = answered vs declined-to-scan) | — |
 //! | `r2rml.load_table`   | `fluree-db-api/src/graph_source/r2rml.rs` (cold REST/OAuth catalog load) | — |
+//! | `r2rml.read_metadata` | `fluree-db-api/src/graph_source/r2rml.rs` (PR-8 cold: metadata-JSON S3 GET + parse, keyed by content-addressed `metadata_location`) | — |
+//! | `r2rml.count_manifest_read` | `fluree-db-api/src/graph_source/r2rml.rs` (PR-8 cold: the COUNT(*) path's manifest-list + manifest read, nested in `r2rml.count_manifest`) | — |
+//! | `r2rml.prefetch` | `fluree-db-api/src/graph_source/r2rml.rs` (PR-8 slice-1: concurrent catalog-resolution warm; `requested`/`warmed` prove engagement + fan-out width) | — |
 //! | `iceberg.scan_plan`  | `fluree-db-iceberg/src/scan/send_planner.rs` (manifest read + file pruning) | `files_selected`, `files_pruned`, `estimated_row_count` |
 //! | `iceberg.parquet_read` | `fluree-db-api/src/graph_source/r2rml.rs` (per-file decode, in spawned tasks) | `file_size` |
 //! | `iceberg.oauth_token`  | `fluree-db-iceberg/src/auth/oauth2.rs` (OAuth token mint) | — |
@@ -32,6 +35,18 @@ pub const SPAN_ALLOWLIST: &[&str] = &[
     "r2rml.scan_table",
     "r2rml.count_manifest",
     "r2rml.load_table",
+    // PR-8 cold-floor decomposition (measurement-only): split the per-table
+    // catalog floor into its components so persistence lands on the right layer.
+    // `r2rml.load_table` (loadTable REST GET) + `r2rml.read_metadata`
+    // (metadata-JSON S3 GET + parse) + the manifest read (`iceberg.scan_plan` for
+    // the scan path, `r2rml.count_manifest_read` for the COUNT path) sum to the
+    // ~2 s/table cold wall.
+    "r2rml.read_metadata",
+    "r2rml.count_manifest_read",
+    // PR-8 slice-1 (measurement/engagement): the concurrent catalog-resolution
+    // warm. Its presence proves the prefetch path fired; `warmed`/`requested`
+    // fields (read from the raw record) show how many tables it overlapped.
+    "r2rml.prefetch",
     "iceberg.parquet_read",
     "iceberg.scan_plan",
     "iceberg.oauth_token",
@@ -223,6 +238,15 @@ mod tests {
                 "r2rml.load_table",
                 "fluree-db-api/src/graph_source/r2rml.rs",
             ),
+            (
+                "r2rml.read_metadata",
+                "fluree-db-api/src/graph_source/r2rml.rs",
+            ),
+            (
+                "r2rml.count_manifest_read",
+                "fluree-db-api/src/graph_source/r2rml.rs",
+            ),
+            ("r2rml.prefetch", "fluree-db-api/src/graph_source/r2rml.rs"),
             (
                 "iceberg.parquet_read",
                 "fluree-db-api/src/graph_source/r2rml.rs",
