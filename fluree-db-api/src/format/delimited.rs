@@ -682,6 +682,7 @@ mod tests {
             output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 

@@ -330,7 +330,15 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
     match binding {
         Binding::Sid { sid, .. } => write_node(out, &compactor.compact_id_sid(sid)?),
         Binding::IriMatch { iri, .. } => write_node(out, &compactor.compact_id_iri(iri)),
-        Binding::Iri(iri) => write_node(out, iri.as_ref()),
+        // Raw graph-source IRI: CURIE-compacted for sparql_json of a graph-source
+        // result so virtual output matches native (F9); otherwise emitted verbatim.
+        Binding::Iri(iri) => {
+            if compactor.compacts_graph_source_iris() {
+                write_node(out, &compactor.compact_id_iri(iri))
+            } else {
+                write_node(out, iri.as_ref())
+            }
+        }
         Binding::Lit { val, dtc, .. } => {
             let dt_iri = compactor.decode_sid(dtc.datatype())?;
             write_literal(out, val, dtc.lang_tag(), &dt_iri)?;
@@ -483,18 +491,26 @@ fn format_binding(
             }
         }
 
-        // Raw IRI string (from graph source, not in namespace table)
+        // Raw IRI string (from graph source, not in namespace table).
+        // CURIE-compacted for sparql_json of a graph-source result so virtual
+        // output matches native (F9); otherwise emitted verbatim. Parity with the
+        // streaming `write_term` arm above: both render the same string, then split
+        // on the `_:` blank-node prefix.
         Binding::Iri(iri) => {
-            // Check if it's a blank node (starts with _:)
-            if iri.starts_with("_:") {
+            let rendered = if compactor.compacts_graph_source_iris() {
+                compactor.compact_id_iri(iri)
+            } else {
+                iri.to_string()
+            };
+            if let Some(label) = rendered.strip_prefix("_:") {
                 Ok(Some(json!({
                     "type": "bnode",
-                    "value": iri.strip_prefix("_:").unwrap_or(iri.as_ref())
+                    "value": label
                 })))
             } else {
                 Ok(Some(json!({
                     "type": "uri",
-                    "value": iri.as_ref()
+                    "value": rendered
                 })))
             }
         }
@@ -777,6 +793,7 @@ mod tests {
             output: crate::QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -921,6 +938,7 @@ mod tests {
             output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -931,6 +949,76 @@ mod tests {
         let want = serde_json::to_string(&dom).unwrap();
         let got = format_string(result, compactor, &FormatterConfig::sparql_json()).unwrap();
         assert_eq!(got, want, "streaming SPARQL JSON diverged from DOM");
+    }
+
+    /// F9 load-bearing guard: the SAME graph-source `Binding::Iri` row renders
+    /// as a full IRI when the compactor's graph-source flag is OFF (native /
+    /// non-graph-source path) and as a CURIE when it is ON (graph-source
+    /// sparql_json). The namespace-code map is empty on purpose — compaction is
+    /// driven entirely by the query context's declared `edw:` prefix.
+    #[test]
+    fn graph_source_iri_compaction_is_flag_scoped() {
+        let ctx = crate::ParsedContext::parse(None, &json!({ "edw": "http://ns.fluree.dev/edw#" }))
+            .unwrap();
+        let ns = std::sync::Arc::new(HashMap::new());
+        let full = "http://ns.fluree.dev/edw#name";
+        let r = make_result(&["?p"], vec![vec![Binding::iri(full)]]);
+
+        // Flag OFF → raw full IRI (native behavior, unchanged).
+        let off = IriCompactor::new(std::sync::Arc::clone(&ns), &ctx);
+        let s_off =
+            serde_json::to_string(&format(&r, &off, &FormatterConfig::sparql_json()).unwrap())
+                .unwrap();
+        assert!(
+            s_off.contains(full),
+            "flag off must render the full IRI: {s_off}"
+        );
+        assert!(
+            !s_off.contains("edw:name"),
+            "flag off must not compact: {s_off}"
+        );
+
+        // Flag ON → CURIE (virtual matches native).
+        let on = IriCompactor::new(ns, &ctx).with_graph_source_iri_compaction(true);
+        let s_on =
+            serde_json::to_string(&format(&r, &on, &FormatterConfig::sparql_json()).unwrap())
+                .unwrap();
+        assert!(
+            s_on.contains("edw:name"),
+            "flag on must compact to the CURIE: {s_on}"
+        );
+        assert!(
+            !s_on.contains(full),
+            "flag on must not leave the full IRI: {s_on}"
+        );
+    }
+
+    /// The streaming (`write_term`) and DOM (`format_binding`) `Binding::Iri` arms
+    /// must flip together: with the graph-source flag ON, both compact — so DOM
+    /// and streaming stay byte-identical, and a future change to only one arm
+    /// breaks this parity test (the diagnosed PR-6 failure mode). Includes a
+    /// blank-node `Iri` so the `_:` split is exercised on both arms.
+    #[test]
+    fn parity_graph_source_iri_compaction() {
+        let ctx = crate::ParsedContext::parse(None, &json!({ "edw": "http://ns.fluree.dev/edw#" }))
+            .unwrap();
+        let on = IriCompactor::new(std::sync::Arc::new(HashMap::new()), &ctx)
+            .with_graph_source_iri_compaction(true);
+        let r = make_result(
+            &["?p", "?b"],
+            vec![vec![
+                Binding::iri("http://ns.fluree.dev/edw#name"),
+                Binding::iri("_:b0"),
+            ]],
+        );
+        assert_parity(&r, &on);
+        // Guard against a both-raw no-op passing parity: confirm it actually compacted.
+        let s = serde_json::to_string(&format(&r, &on, &FormatterConfig::sparql_json()).unwrap())
+            .unwrap();
+        assert!(
+            s.contains("edw:name"),
+            "expected compaction under the flag: {s}"
+        );
     }
 
     #[test]

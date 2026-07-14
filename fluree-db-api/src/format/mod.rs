@@ -143,6 +143,35 @@ pub async fn format_cypher_typed_table(
     cypher_typed::typed_table(result, &compactor, view).await
 }
 
+/// Kill switch (default ON) for the F9 graph-source CURIE alignment. Set
+/// `FLUREE_R2RML_CURIE_ALIGN=0` to force raw graph-source IRIs (the pre-F9
+/// behavior) — used for the revert differential in the perf harness and as a
+/// production safety. Read once per process (mirrors the other engine switches).
+fn curie_align_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FLUREE_R2RML_CURIE_ALIGN")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Whether the `sparql_json` formatter should CURIE-compact raw graph-source
+/// `Binding::Iri` node references for this render (F9).
+///
+/// True ONLY for a `SparqlJson` render of a result from the R2RML / graph-source
+/// execution path (`QueryResult::from_graph_source`). The format gate keeps the
+/// change scoped to `sparql_json`: every other output formatter (JSON-LD, SPARQL
+/// XML, typed, delimited) shares this compactor but receives `false` here and so
+/// keeps raw graph-source IRIs — that cross-format consistency work is register
+/// entry F16, deliberately out of scope for the corpus-gated F9 fix.
+fn graph_source_iri_compaction(result: &QueryResult, config: &FormatterConfig) -> bool {
+    result.from_graph_source
+        && curie_align_enabled()
+        && matches!(config.format, OutputFormat::SparqlJson)
+}
+
 /// Format query results to JSON using the specified configuration
 ///
 /// This is the main entry point for formatting. It dispatches to the appropriate
@@ -176,7 +205,8 @@ pub fn format_results(
         )));
     }
 
-    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
+        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
 
     // CONSTRUCT / DESCRIBE produce a graph, not a binding table, so the only
     // sensible JSON rendering is JSON-LD. Any JSON-producing format request
@@ -297,7 +327,8 @@ pub fn format_results_string(
     // Stream JSON straight to a String for the common SELECT case, skipping the
     // serde_json::Value DOM and its second serialization pass.
     if json_stream_eligible(result, config) {
-        let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+        let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
+            .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
         return stream_json(result, &compactor, config);
     }
 
@@ -371,7 +402,8 @@ pub async fn format_results_async(
         )));
     }
 
-    let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
+    let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context)
+        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config));
 
     // CONSTRUCT / DESCRIBE produce a graph (sync, no DB access needed); coerce
     // any JSON-producing format to JSON-LD rather than rejecting it. RDF/XML and
@@ -616,6 +648,7 @@ mod tests {
             output: QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 
@@ -781,6 +814,7 @@ mod tests {
             output: QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
+            from_graph_source: false,
         }
     }
 

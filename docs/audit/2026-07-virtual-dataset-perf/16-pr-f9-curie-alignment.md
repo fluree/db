@@ -119,6 +119,23 @@ Compacting `Binding::Iri` in `sparql.rs` would compact native GRAPH/SERVICE/BIND
 
 ---
 
+## IMPLEMENTED — option A (query-level graph-source flag), sparql_json-scoped
+
+Approved path: **A-query-flag**, `sparql_json`-only, native untouched by construction (C deferred to fluree/db#1496; B rejected — hot-path encode; D rejected — `IriMatch` carries a load-bearing `primary_sid`). Change surface:
+
+1. `QueryResult.from_graph_source: bool` (default false). Set true ONLY in `query_view_with_r2rml_options` from `db.graph_source_id.is_some()` — the resolved graph-source view carries `Some` (set by `load_view`), a native ledger carries `None`. Native `query_with_options` and mixed-dataset paths leave it false → raw, unchanged.
+2. `IriCompactor.compact_graph_source_iris` (default false) + `with_graph_source_iri_compaction()` builder + `compacts_graph_source_iris()` getter.
+3. Wired in the sparql_json entry points only (`format_results`, `format_results_string`, `format_results_async`) via `graph_source_iri_compaction(result, config) = result.from_graph_source && curie_align_enabled() && matches!(config.format, SparqlJson)`. Every other formatter shares the compactor but receives false here → raw graph-source IRIs (register **F16**).
+4. `format/sparql.rs` `Binding::Iri` arms — streaming `write_term` (~333) and DOM `format_binding` (~487) — compact via `compact_id_iri` when the flag is set, else verbatim; the two render the same string then split on `_:`, preserving DOM↔streaming parity.
+
+**Kill switch:** `FLUREE_R2RML_CURIE_ALIGN=0` forces raw graph-source IRIs (pre-F9 behavior) — powers the ON/OFF "0 other moves" differential and gives production a revert lever. Read once per process (OnceLock), like the other `FLUREE_R2RML_*` / `FLUREE_ICEBERG_*` switches.
+
+**Tests:** hermetic `compact_id_iri` context-driven proof (namespace map irrelevant); flag-off-raw / flag-on-CURIE on the SAME `Binding::Iri` row (scoping guard); a `Binding::Iri` row in the DOM↔streaming parity assertion (both arms must flip together — the diagnosed PR-6 failure mode). fluree-db-api lib 664/664; vbench builds clean with iceberg.
+
+**Re-bless: none.** The `expected/` oracles were blessed from native-sf01 and already carry the CURIE form (`edw:name`, …), so F9 was always "virtual diverges from the oracle"; the fix closes it and virtual now MATCHES the existing oracle hash with zero baseline churn. Gate confirms the q002/q042 flip + head row-diff (every previously-mismatching cell is now the oracle's CURIE form, nothing else moved) + full-corpus ON/OFF differential (only q002/q042 move) + native 54/54 + W3C.
+
+---
+
 ## Lead rulings (2026-07-14) — C out (→AJ follow-up), B out, D verify-first, else A
 
 - **(C) OUT without AJ — now FILED as a GitHub issue.** AJ constrained F9 to "keep native behavior; avoid SPARQL-correctness changes for now"; compacting native GRAPH/SERVICE/BIND(IRI)/search output is exactly that. The provenance-dependent rendering inconsistency (native STORED IRIs compact, constructed/federated ones don't) is surfaced for the team to decide later on separate branches: **fluree/db#1496** (https://github.com/fluree/db/issues/1496). Must NOT block F9.

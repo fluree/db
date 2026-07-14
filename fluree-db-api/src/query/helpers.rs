@@ -405,6 +405,10 @@ pub(crate) fn build_query_result(
         output: parsed.output,
         batches,
         binary_graph,
+        // Default: not a graph-source result. The R2RML execution path
+        // (`query_view_with_r2rml_options`) overrides this to true so the
+        // sparql_json formatter CURIE-compacts graph-source IRIs (F9).
+        from_graph_source: false,
     }
 }
 

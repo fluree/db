@@ -292,14 +292,21 @@ impl Fluree {
             .await?;
 
         // 5. Build result
-        Ok(build_query_result(
+        let mut result = build_query_result(
             vars,
             parsed,
             batches,
             Some(db.t),
             Some(db.overlay.clone()),
             db.binary_graph(),
-        ))
+        );
+        // This is the R2RML / graph-source execution path. Mark the result so the
+        // sparql_json formatter CURIE-compacts its raw graph-source `Binding::Iri`
+        // node references (F9). The resolved view of a genuine graph source carries
+        // `graph_source_id = Some` (set by `load_view`); a native ledger reached with
+        // `.with_r2rml()` attached but no mapping stays `None` → raw, unchanged.
+        result.from_graph_source = db.graph_source_id.is_some();
+        Ok(result)
     }
 
     /// Explain a JSON-LD query plan against a GraphDb.
