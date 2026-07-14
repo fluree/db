@@ -27,7 +27,7 @@ mod provider;
 mod rewrite;
 
 pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOperator};
-pub use operator::R2rmlScanOperator;
+pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
     ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
     ScanCmpOp, ScanFilter, ScanValue,

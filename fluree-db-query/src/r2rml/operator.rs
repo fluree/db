@@ -65,6 +65,75 @@ pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
 /// Composite key for caching a parent lookup: `(parent_tm_iri, sorted_parent_join_cols)`.
 type LookupCacheKey = (String, Vec<String>);
 
+/// Query-scoped key for the cross-operator-rebuild parent-lookup memo (PR-8b):
+/// `(graph_source_id, parent_tm_iri, sorted_parent_join_cols, as_of_t)`. Unlike
+/// the per-operator [`LookupCacheKey`], this memo is shared across ALL R2RML
+/// operators in a query, so the key MUST carry `graph_source_id` (two sources can
+/// hold a same-named table — no cross-source pollution) and `as_of_t` (cheap
+/// insurance: the per-query snapshot pin should keep it constant, but a
+/// query-wide share must not alias two snapshots).
+pub type R2rmlParentMemoKey = (String, String, Vec<String>, Option<i64>);
+
+/// The query-scoped parent-lookup memo (PR-8b). Extends PR-4's per-operator
+/// [`LookupCacheKey`] cache to a lifetime that survives the operator REBUILD an
+/// inner join with an interposed non-pushable FILTER + LIMIT performs per driving
+/// batch — which resets the per-operator cache (the q031 seam). Sharing is valid:
+/// a lookup's content is fixed by its key at a stable `as_of_t`.
+///
+/// `total_rows` bounds accumulation query-wide: a query-scoped cache can hold many
+/// parents where a single operator's cache held at most its own, so an insert that
+/// would exceed the total cap is refused — the caller falls through to a per-batch
+/// rebuild for that key — keeping memory bounded (per-entry is already ≤ one
+/// window via the q015 fact-as-parent guard).
+#[derive(Default)]
+pub struct R2rmlParentMemoInner {
+    map: HashMap<R2rmlParentMemoKey, Arc<ParentLookup>>,
+    total_rows: usize,
+}
+
+impl R2rmlParentMemoInner {
+    fn get(&self, key: &R2rmlParentMemoKey) -> Option<Arc<ParentLookup>> {
+        self.map.get(key).cloned()
+    }
+
+    /// Cache `lookup` under `key` unless it would push the memo past `total_cap`
+    /// rows. Returns whether the entry is now cached. A key already present is
+    /// treated as cached (idempotent).
+    fn try_insert(
+        &mut self,
+        key: R2rmlParentMemoKey,
+        lookup: &Arc<ParentLookup>,
+        total_cap: usize,
+    ) -> bool {
+        if self.map.contains_key(&key) {
+            return true;
+        }
+        let rows = lookup.len();
+        if self.total_rows.saturating_add(rows) > total_cap {
+            return false;
+        }
+        self.total_rows += rows;
+        self.map.insert(key, Arc::clone(lookup));
+        true
+    }
+}
+
+/// Shared, query-scoped parent-lookup memo — see [`R2rmlParentMemoInner`].
+pub type R2rmlParentMemo = std::sync::Arc<std::sync::Mutex<R2rmlParentMemoInner>>;
+
+/// Query-scoped parent-memo total-rows cap, as a multiple of the materialize
+/// window. Per-entry is already ≤ one window (the q015 fact-as-parent guard); this
+/// bounds the SUM across a query's parents. Default 2×; env
+/// `FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS`.
+fn parent_memo_total_cap_rows() -> usize {
+    let mult = std::env::var("FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+    mult.saturating_mul(materialize_window_rows())
+}
+
 /// A child-templated `RefObjectMap` shortcut: render the parent subject IRI
 /// directly from the child row's own FK columns via the parent's subject
 /// template, with NO scan of the parent table.
@@ -967,6 +1036,36 @@ impl R2rmlScanOperator {
                         }
                     }
 
+                    // PR-8b: reuse a parent lookup memoized by an EARLIER OPERATOR
+                    // INSTANCE this query. An inner join with an interposed
+                    // non-pushable FILTER + LIMIT rebuilds this R2RML operator per
+                    // driving batch, resetting `self.parent_lookup_cache` above (the
+                    // q031 seam); this query-scoped memo — keyed with
+                    // `graph_source_id` + `as_of_t`, so a cross-operator/cross-source
+                    // share can't alias — survives the rebuild. On a hit, seed the
+                    // per-operator cache too so later batches of THIS instance take
+                    // the fast local path.
+                    if parent_memo {
+                        let as_of_t = if ctx.dataset.is_some() {
+                            None
+                        } else {
+                            Some(ctx.to_t)
+                        };
+                        let ctx_key: R2rmlParentMemoKey = (
+                            self.pattern.graph_source_id.clone(),
+                            rom.parent_triples_map.clone(),
+                            parent_join_cols.clone(),
+                            as_of_t,
+                        );
+                        let hit = ctx.r2rml_parent_memo.lock().unwrap().get(&ctx_key);
+                        if let Some(cached) = hit {
+                            self.parent_lookup_cache
+                                .insert(lookup_key.clone(), Arc::clone(&cached));
+                            parent_lookups.insert(lookup_key, cached);
+                            continue;
+                        }
+                    }
+
                     let parent_tm = match mapping.get(&rom.parent_triples_map) {
                         Some(tm) => tm,
                         None => {
@@ -1048,6 +1147,27 @@ impl R2rmlScanOperator {
                     if parent_memo && lookup.len() <= materialize_window_rows() {
                         self.parent_lookup_cache
                             .insert(lookup_key.clone(), Arc::clone(&lookup));
+                        // PR-8b: also publish to the query-scoped memo so a later
+                        // operator rebuild reuses it. Refused (silently falling
+                        // through to a per-batch rebuild) if it would push the memo
+                        // past its total-rows cap — bounding cross-parent
+                        // accumulation the per-operator cache never had.
+                        let as_of_t = if ctx.dataset.is_some() {
+                            None
+                        } else {
+                            Some(ctx.to_t)
+                        };
+                        let ctx_key: R2rmlParentMemoKey = (
+                            self.pattern.graph_source_id.clone(),
+                            rom.parent_triples_map.clone(),
+                            parent_join_cols.clone(),
+                            as_of_t,
+                        );
+                        ctx.r2rml_parent_memo.lock().unwrap().try_insert(
+                            ctx_key,
+                            &lookup,
+                            parent_memo_total_cap_rows(),
+                        );
                     }
                     parent_lookups.insert(lookup_key, lookup);
                 }
@@ -2949,5 +3069,141 @@ mod tests {
             child_off, child_on,
             "memo OFF: identical child scan count — the memo affects parents only"
         );
+    }
+
+    // PR-8b shared test rig: a scan-counting provider + an orders→customers
+    // RefObjectMap mapping. `customers` (the DIM parent) carries its join column;
+    // `orders` (the child) is content-irrelevant (only stored, never lookup-built).
+    #[cfg(test)]
+    mod pr8b {
+        use super::*;
+        use crate::context::ExecutionContext;
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CountingProvider {
+            scans: Mutex<HashMap<String, usize>>,
+        }
+        fn one_row(col: &str, field_id: i32) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: col.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id,
+            }]));
+            ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap()
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for CountingProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                *self
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .entry(table_name.to_string())
+                    .or_default() += 1;
+                let batch = if table_name == "customers" {
+                    one_row("ID", 1)
+                } else {
+                    one_row("CUST_ID", 2)
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+        fn mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{ORDER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("edw:customer"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CUST_ID",
+                        "ID",
+                    )),
+                });
+            let customers = TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://ex/customer/{ID}");
+            Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]))
+        }
+        fn build_once(ctx: &ExecutionContext<'_>, mapping: &Arc<CompiledR2rmlMapping>, gs: &str) {
+            let mut pattern = R2rmlPattern::new(gs, VarId(0), Some(VarId(1)));
+            pattern.predicate_filter = Some("edw:customer".to_string());
+            let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+            op.mapping = Some(Arc::clone(mapping));
+            op.parent_memo = true;
+            futures::executor::block_on(op.build_progress(ctx, Batch::single_empty()))
+                .expect("build_progress");
+            // `op` dropped here → its per-operator `parent_lookup_cache` is gone; only
+            // the query-scoped ctx memo persists across the next `build_once`.
+        }
+
+        // The q031 seam: an inner join with an interposed FILTER + LIMIT rebuilds the
+        // R2RML operator per driving batch. PR-4's per-operator cache is reset by
+        // that rebuild; the query-scoped ctx memo (PR-8b) must survive — a FRESH
+        // operator each iteration against ONE ctx ⇒ the DIM parent is scanned once,
+        // not once per rebuild. (Distinct from `parent_lookup_memoized_across_child_batches`,
+        // which reuses ONE operator across batches.)
+        #[test]
+        fn parent_lookup_survives_operator_rebuild() {
+            let mapping = mapping();
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let vars = VarRegistry::new();
+            let provider = CountingProvider::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                for _ in 0..5 {
+                    build_once(&ctx, &mapping, "gs:main");
+                }
+            }
+            assert_eq!(
+                provider
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .get("customers")
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "ctx memo survives the operator rebuild: parent scanned once across 5 rebuilds"
+            );
+        }
+
+        // A query-scoped memo shared across R2RML operators must NOT cross-pollute
+        // two graph sources holding a same-named parent table: the key carries
+        // `graph_source_id`, so `gs:A` and `gs:B` each scan `customers` once.
+        #[test]
+        fn parent_memo_isolated_by_graph_source() {
+            let mapping = mapping();
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let vars = VarRegistry::new();
+            let provider = CountingProvider::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                build_once(&ctx, &mapping, "gs:A");
+                build_once(&ctx, &mapping, "gs:B");
+            }
+            assert_eq!(
+                provider.scans.lock().unwrap().get("customers").copied().unwrap_or(0),
+                2,
+                "two graph sources ⇒ two parent scans (graph_source_id in the key, no cross-source pollution)"
+            );
+        }
     }
 }

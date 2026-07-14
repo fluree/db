@@ -248,6 +248,14 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
+    /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
+    /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
+    /// reuses the parent lookup instead of re-scanning it — the q031 seam. Keyed
+    /// with `graph_source_id`, so a query-wide share across R2RML operators is
+    /// safe. `Arc<Mutex<…>>` so derived per-graph contexts share it and the context
+    /// stays `Send + Sync`.
+    pub r2rml_parent_memo: crate::r2rml::R2rmlParentMemo,
     /// Per-query memo: translated + resolved overlay ops per
     /// `(graph, order, predicate)` — see
     /// [`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache).
@@ -326,6 +334,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -380,6 +389,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -438,6 +448,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -485,6 +496,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -531,6 +543,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -579,6 +592,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -1086,6 +1100,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
@@ -1143,6 +1158,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
@@ -1203,6 +1219,7 @@ impl<'a> ExecutionContext<'a> {
             // graph/store into another. (`with_active_graph`/`with_default_graph`
             // keep the same store, so they correctly share the parent's memo.)
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
