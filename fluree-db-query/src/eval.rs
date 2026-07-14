@@ -185,6 +185,28 @@ impl Expression {
                             return Ok(Some(ComparableValue::Float(d as f32)));
                         }
                     }
+                    // A stored language-tagged literal decodes to a bare string
+                    // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
+                    // `IN` were tag-blind exactly on the production-typical
+                    // indexed path while the Lit path compares tag-aware
+                    // (#1468). Re-tag from the in-scope `lang_id` — symmetric
+                    // to the FLOAT re-tag above and to the `lang_id` check in
+                    // `binding_effective_bool`; one integer compare on the hot
+                    // arm, the meta decode only runs for lang-tagged rows.
+                    if *lang_id != 0 && matches!(&val, FlakeValue::String(_)) {
+                        if let Some(tag) = ctx
+                            .and_then(|c| c.binary_store.as_deref())
+                            .and_then(|s| s.decode_meta(*lang_id, i32::MIN))
+                            .and_then(|m| m.lang)
+                        {
+                            return Ok(Some(ComparableValue::TypedLiteral {
+                                val,
+                                dtc: Some(crate::parse::UnresolvedDatatypeConstraint::LangTag(
+                                    Arc::from(tag),
+                                )),
+                            }));
+                        }
+                    }
                     Ok(ComparableValue::try_from(&val).ok())
                 }
                 Some(Binding::Sid { sid, .. }) => Ok(Some(ComparableValue::Sid(sid.clone()))),

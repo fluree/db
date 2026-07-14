@@ -1990,3 +1990,95 @@ async fn sparql_lit_lang_literal_ebv_is_type_error() {
         json!([["ex:plain"]])
     );
 }
+
+// =============================================================================
+// D7 on the INDEXED path (#1483 review blocker): the EncodedLit decode arm
+// re-tags a stored language-tagged literal from `lang_id`, so `=`/`!=` (and
+// IN, which routes through the same equality) are tag-aware on the
+// late-materialized path too — previously only the memory/Lit path was, making
+// stored-lang equality materialization-dependent.
+// =============================================================================
+
+fn lang_tx() -> JsonValue {
+    json!({
+        "@context": ctx(),
+        "@graph": [
+            { "@id": "ex:en", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:en2", "ex:v": { "@value": "x", "@language": "en" } },
+            { "@id": "ex:fr", "ex:v": { "@value": "x", "@language": "fr" } },
+            { "@id": "ex:plain", "ex:v": "x" }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn sparql_stored_lang_equality_is_tag_aware_indexed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "d7/indexed:sparql", &lang_tx()).await;
+    let p = "PREFIX ex: <http://example.org/ns/> ";
+    // Stored-vs-stored `=`: only the @en pair equals ex:en's "x"@en.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a = ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]]),
+        "indexed stored-lang `=` must be tag-aware (was: all four matched)"
+    );
+    // Stored-vs-stored `!=`.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?a . ex:en ex:v ?b . FILTER(?a != ?b) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:fr"], ["ex:plain"]])
+    );
+    // Constant-vs-stored: the constant lowers to a lang TypedLiteral; the
+    // stored side must arrive tagged too, or a value-matching query returns
+    // zero rows (the pre-fix false negative).
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(?l = \"x\"@fr) }}"),
+        )
+        .await,
+        json!([["ex:fr"]]),
+        "indexed constant-vs-stored lang `=` must match (was: zero rows)"
+    );
+    // IN routes through the same rdf_term_equal.
+    assert_eq!(
+        sparql_rows(
+            &fluree,
+            &ledger,
+            &format!("{p} SELECT ?s WHERE {{ ?s ex:v ?l . FILTER(?l IN (\"x\"@en)) }} ORDER BY ?s"),
+        )
+        .await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+}
+
+// JSON-LD twin (shared IR/eval): stored-lang equality on the indexed path.
+#[tokio::test]
+async fn jsonld_stored_lang_equality_is_tag_aware_indexed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_indexed(&fluree, "d7/indexed:jsonld", &lang_tx()).await;
+    let q_eq = json!({
+        "@context": ctx(),
+        "select": ["?s"],
+        "where": [
+            { "@id": "?s", "ex:v": "?a" },
+            { "@id": "ex:en", "ex:v": "?b" },
+            ["filter", ["=", "?a", "?b"]]
+        ],
+        "orderBy": "?s"
+    });
+    assert_eq!(
+        jsonld_rows(&fluree, &ledger, &q_eq).await,
+        json!([["ex:en"], ["ex:en2"]])
+    );
+}
