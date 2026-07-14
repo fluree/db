@@ -116,3 +116,47 @@ Compacting `Binding::Iri` in `sparql.rs` would compact native GRAPH/SERVICE/BIND
 **Recommendation (now measured): (C).** It is the smallest code (two-line `sparql.rs` change), regresses ZERO test gate (W3C no-op + corpus byte-identical, both proven above), and its only real effect is a narrow, arguably-correct native consistency improvement that AJ signs off on. (A) — the provenance variant — is an enum-touching change to avoid an output change that doesn't even touch the test gates, so it is over-engineered unless AJ vetoes the native consistency change outright. Not my final call — routing to you + AJ for the sign-off.
 
 **STOP — the unconditional fix is blocked by the native-reachability finding. Lead (+AJ) scope decision required before any code.** (Mechanism + corrected-fix direction from the prior sections stand; only the *unconditional vs scoped* application is now in question.)
+
+---
+
+## Lead rulings (2026-07-14) — C out (→AJ follow-up), B out, D verify-first, else A
+
+- **(C) OUT without AJ.** AJ constrained F9 to "keep native behavior; avoid SPARQL-correctness changes for now"; compacting native GRAPH/SERVICE/BIND(IRI)/search output is exactly that. The provenance-dependent rendering inconsistency (native STORED IRIs compact, constructed/federated ones don't) is filed as a real finding for AJ LATER (new F-entry) and must NOT block F9.
+- **(B) OUT.** Encoding at the R2RML operator puts namespace-map work on the per-row emit path of the fact-scan the stack spent 14 PRs speeding up — a virtual-perf hazard, and architecturally novel (query-time encode). Not for a rendering fix.
+- **(D) VERIFY FIRST:** flip the r2rml/operator.rs CONSTRUCTION sites to emit the compactable `IriMatch` variant (which already routes through `compact_id_iri`) instead of `Binding::Iri`. Zero shared-formatter change, zero enum change, zero native reachability. Preconditions (i) identical consumer treatment IriMatch-vs-Iri between scan and formatter; (ii) no IriMatch payload invariant the virtual IRIs can't satisfy; (iii) nothing detects graph-source origin via `Binding::Iri`.
+- **Else (A):** query-level "has graph sources" formatter flag (lead's prior over an enum ripple); bring the marker design before implementing.
+
+## (D) VERIFICATION RESULT — **FAILS precondition (ii). D is unsound.**
+
+`IriMatch` is not a "compactable `Iri`"; it is a **cross-ledger reference carrying a real originating-ledger SID**:
+
+```
+IriMatch { iri: Arc<str>, primary_sid: Sid, ledger_alias: Arc<str> }   // binding.rs:82-89
+```
+
+The doc (binding.rs:37-43, 72-89) states it "caches the originating ledger's SID for efficient same-ledger lookups" and "tracks ledger provenance for re-encoding." Virtual R2RML IRIs have **no SID and no originating ledger** — that is the exact reason they are `Binding::Iri` (the `Iri` doc at 90-98: "not in the namespace table… not encoded"). To emit `IriMatch` we would have to **fabricate** `primary_sid` + `ledger_alias`, and that field is **load-bearing on the join path**:
+
+- **`eq_for_join` (binding.rs:761-787), called by the join operator (`join.rs:1045`)**, for two **same-ledger** `IriMatch` bindings compares **`primary_sid`, NOT the IRI** (line 778). The unit test `test_eq_for_join_same_ledger_different_sid` (binding.rs:2161) asserts same-ledger/different-SID bindings are **not equal**. So virtual rows with the same canonical IRI but different fabricated SIDs would **fail to join**, and different IRIs with colliding fabricated SIDs would **wrongly join**. A single constant fabricated `ledger_alias` (all virtual rows "same ledger") forces exactly this SID-comparison branch → **broken virtual joins**.
+- **`get_sid_for_ledger` (binding.rs:653-659)** hands `primary_sid` to callers for same-ledger lookups; a fabricated SID there is a latent lookup hazard.
+
+Getting a *real* SID means encoding the IRI at emit time = **option B**, already ruled out for the hot path. So D reduces to B or to fabrication-that-breaks-joins. **D is rejected on precondition (ii).** (Preconditions (i)/(iii) are moot given (ii); noting for completeness that equality's `Iri`-vs-`Iri` arm (binding.rs:866) correctly compares IRI strings, which is precisely why `Iri` — not `IriMatch` — is the right variant for un-encodable graph-source IRIs.)
+
+## (A) MARKER DESIGN — recommended (query-level graph-source flag; lead's prior)
+
+A clean query-level signal **already exists**: `GraphDb.graph_source_id: Option<Arc<str>>` (`view/types.rs:237`, default `None` at :303) — **`Some` for a virtual/graph-source view, `None` for a native ledger view, by construction.** No new provenance plumbing, no enum change.
+
+**Change surface (4 small edits, no enum touch, no shared native-behavior change):**
+1. `QueryResult` gains `from_graph_source: bool` (query/mod.rs struct).
+2. `build_query_result` takes it as a param; **both** call sites — native `query_with_options` (query.rs:~135) and virtual `query_view_with_r2rml_options` (query.rs:295) — pass `db.graph_source_id.is_some()`. Native → `false`; virtual → `true`.
+3. `IriCompactor` gains a `compact_graph_source_iris: bool` (default `false`), set at construction in the format entry points (`format_results` / `format_results_string` / `format_results_async`) from `result.from_graph_source`.
+4. The two `sparql.rs` `Binding::Iri` arms (333 streaming, 487 DOM): `if compactor.compacts_graph_source_iris() { write_node(out, &compactor.compact_id_iri(iri)) } else { write_node(out, iri.as_ref()) }`.
+
+**Native untouchability — STRUCTURAL, not just gate-green:** a native view has `graph_source_id = None` ⇒ `from_graph_source = false` ⇒ flag off ⇒ the `Iri` arm stays **raw**. Native `BIND(IRI)`/`SERVICE`/`GRAPH`/search output is byte-identical **by construction**, because the flag derives from a field that is definitionally `None` for native views. (W3C: native ledgers ⇒ `None` ⇒ raw, and the runner also uses an empty context — doubly safe.) This is the same structural native-untouchability D promised, achieved soundly via a flag instead of a variant.
+
+**Virtual compacts:** virtual view `graph_source_id = Some` ⇒ flag on ⇒ `Binding::Iri` → `compact_id_iri(query context)` ⇒ `edw:name`. q002/q042 flip.
+
+**Hybrid-query edge (disclosed):** the flag is **view-level**, not per-binding. A query over a graph-source view that ALSO uses `BIND(IRI)`/`SERVICE`/`GRAPH` producing `Binding::Iri` would compact those too. This is strictly narrower than (C) (which compacts even on pure-native queries), the corpus has no such mix (pure-virtual), and it is arguably the consistent behavior for a virtual query. Filed alongside the (C) follow-up.
+
+**Recommendation: (A) via the `graph_source_id`-derived flag.** Small, sound, structural native-untouchability, matches the lead's prior. Tests: the hermetic `compact_id_iri` unit still applies (mechanism unchanged); add a formatter test that the same `Binding::Iri` row renders raw with the flag off and CURIE with it on (guards the scoping), plus the streaming/DOM parity row.
+
+**STOP — bringing the (A) marker design for the lead's nod before implementing (per the ruling). D is verified-and-rejected; the verification was the gate and it did not pass, so this is the required round-trip.**
