@@ -78,4 +78,41 @@ Still self-contained and independent of PR-4d/F14; if anything the corrected fix
 
 `04-findings-register.md` F9 (line 148, "SHARPENED — a NAMESPACE-MAP gap") is refuted by `compact.rs` + the existing `iri.rs` tests + its own cited evidence. I'll correct it on your nod (or you may want to; flagging rather than unilaterally rewriting a canonical entry mid-reversal).
 
-**STOP — design RE-review before implementation.** The approach changed materially from the approved Option B.
+## PROOF OBLIGATION (rider, pre-code) — `Binding::Iri` construction-site enumeration — BLOCKS the unconditional fix
+
+The lead required, before code, that every `Binding::Iri` construction site be enumerated workspace-wide and each confirmed graph-source-only reachable — because if any native-reachable constructor exists, routing `Binding::Iri` through `compact_id_iri` in the SHARED formatter is a **native-visible** behavior change. **Result: native-reachable constructors DO exist.** The "native untouched by construction" scope claim is therefore false for the unconditional formatter fix.
+
+**Native-reachable `Binding::Iri` construction sites (would change native output under the shared-formatter fix):**
+
+| site | trigger | native-reachable via |
+|---|---|---|
+| `fluree-db-query/src/eval/value.rs:522` | `ComparableValue::Iri` not encodable to a SID — the code comment names `UUID`, `IRI()` | `BIND(IRI("…"))` / `UUID()` / constructed IRIs on any query |
+| `fluree-db-query/src/sparql_results.rs:84,88` (via `fluree-db-api/src/remote_service.rs:153`) | remote SPARQL-Results `uri`/`bnode` term | `SERVICE <…> { }` federation (the lead's named hazard) |
+| `fluree-db-query/src/graph.rs:343,440` (via `Binding::iri()`) | the `?g` graph-variable value | `GRAPH ?g { }` projection |
+| `fluree-db-query/src/bm25/operator.rs:615` | full-text hit IRI not encodable to a SID | native BM25 search (cross-ledger/unencodable hit) |
+| `fluree-db-query/src/vector/operator.rs:350` | vector hit IRI not encodable to a SID | native vector search (same) |
+
+**Virtual/graph-source-only (the intended target, safe to compact):** `fluree-db-query/src/r2rml/operator.rs` — 1628/1629 (predicate/blank), 2117/2163/2169/2193/2200/2225/2226 (class / rdf:type / predicate emission). These go through the `Binding::iri()` constructor from the R2RML materialization only.
+
+**Test-only (not production):** `graph.rs:958`, `optional.rs:2528+`, `eval/types.rs:150-151`, `eval/rdf.rs:451`, `format/sparql_xml.rs:782`, `format/delimited.rs:850-862`.
+
+### Consequence — the unconditional shared-formatter fix violates the DoD's "zero native-path touched"
+
+Compacting `Binding::Iri` in `sparql.rs` would compact native GRAPH/SERVICE/BIND(IRI)/search-hit IRIs whenever they match a declared query prefix. This is arguably a *consistency* improvement (a native STORED IRI (`Binding::Sid`) already compacts via `compact_id`; a constructed/federated/graph IRI with the identical value currently does not — same value, different rendering by provenance), but it IS a native-visible change and W3C-relevant (GRAPH/SERVICE/BIND-IRI are all in the W3C suite). Per the rider, back to the lead before code.
+
+### Options for the lead (+ likely AJ)
+
+- **(C) Own it as an intentional native consistency fix.** Route `Binding::Iri → compact_id_iri` unconditionally; accept that native constructed/federated/graph IRIs now compact identically to stored ones. Simplest code; widest validation — must re-run the full W3C suite (and confirm how `testsuite-sparql` compares results: if it canonicalizes to full IRIs, the CURIE display is invisible to it and native W3C stays green; if it compares raw sparql_json, some expected files re-bless) + native 54/54 + AJ sign-off on the native-output change.
+- **(A) Provenance-scoped fix.** Compact only graph-source-originated `Binding::Iri`. `Binding::Iri` is a bare `Arc<str>` with no provenance, so this needs a marker (a new binding variant or a flag) — an enum-touching change that ripples across every `Binding` match, but it keeps native byte-identical by construction.
+- **(B) Encode-at-operator.** Have the R2RML operator emit `Binding::Sid` (encode the IRI into a seeded snapshot namespace) so virtual rides native's existing `Binding::Sid → compact_id_sid` arm with no shared-formatter change. This resurrects namespace seeding (the refuted Option B's machinery, but now for *decode*, not compaction) and is more complex than (C); native paths untouched.
+
+### Test-gate exposure of (C) — measured, not assumed: ZERO regression
+
+- **W3C: unaffected.** The runner formats every actual result with an EMPTY context — `format::format_results(&query_result, &ParsedContext::new(), …)` at `testsuite-sparql/src/query_handler.rs:256/258`, `308/310`, `392/395`. `compact_id_iri` keys only on the context, so an empty context means it returns FULL IRIs for BOTH `Binding::Sid` and `Binding::Iri` — the (C) fix is a NO-OP in the W3C runner. Second independent safety net: the harness EXPANDS any compact IRI back to absolute form (`result_format.rs:1060-1246`, `expand_id`/`expand_vocab`) and compares as isomorphic RdfTerms (`result_comparison.rs:16`), so even a compacted result would match.
+- **Native 54/54: byte-identical.** No corpus query uses GRAPH ?g / SERVICE / BIND(IRI|UUID) (grep of `corpus/queries/` — the only two hits, q043/q044, match the substring "GRAPH" in *comments*; both are plain single-subject SELECTs returning 0 rows). So no corpus query reaches a native `Binding::Iri` construction path.
+- **Real native-user exposure (the only real change):** narrow — a real *API* query (non-W3C, non-corpus) that declares a prefix AND projects a GRAPH/SERVICE/BIND(IRI)/search IRI matching it would render a CURIE where it renders a full IRI today. This is the provenance-consistency change (stored IRIs already compact; constructed/federated/graph IRIs would now too) and is the only thing needing AJ sign-off. It regresses NO test gate.
+- **Implementation note:** format-module unit tests that construct `Binding::Iri` under a NON-empty matching context (e.g. any that assert full-IRI output) would need expectation updates — that's expected fix churn, caught by `cargo test`, not a native regression.
+
+**Recommendation (now measured): (C).** It is the smallest code (two-line `sparql.rs` change), regresses ZERO test gate (W3C no-op + corpus byte-identical, both proven above), and its only real effect is a narrow, arguably-correct native consistency improvement that AJ signs off on. (A) — the provenance variant — is an enum-touching change to avoid an output change that doesn't even touch the test gates, so it is over-engineered unless AJ vetoes the native consistency change outright. Not my final call — routing to you + AJ for the sign-off.
+
+**STOP — the unconditional fix is blocked by the native-reachability finding. Lead (+AJ) scope decision required before any code.** (Mechanism + corrected-fix direction from the prior sections stand; only the *unconditional vs scoped* application is now in question.)
