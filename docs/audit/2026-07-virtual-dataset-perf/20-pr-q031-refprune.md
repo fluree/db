@@ -3,7 +3,7 @@
 **Branch:** to stack as `perf/r2rml-q031-refprune` (off `perf/r2rml-pr4d`, itself off the docs branch off #1499). Stacking (lead-ruled): #1499 → docs branch → `perf/r2rml-pr4d` → `perf/r2rml-q031-refprune` (PR-4d implements first; this sketch queues the lead's review meanwhile).
 **Status:** SKETCH — **STOP for lead review**. No engine code until approved.
 **North-star slate item 1** (F20). Supersedes the F18 cold-floor framing (measurement refuted the pin-leak/residency premise — `18-pr8tail-...` MEASUREMENT ADDENDUM; register F20).
-**Target:** q031 72 s → low-single-digit s cache-thrashed, **without re-opening PR-2a** (see §arithmetic).
+**Target (corrected by measurement, §3):** q031 72 s → **~3–5 s cache-thrashed, loadTable-bound** (deterministic gate = `load_table.n` 7→2 + `scan_table` collapse). A hard ≤3 s first-ask is gated on a follow-up loadTable/creds cache, NOT this PR. PR-2a stays closed (the fact scan is ~1 s; the residual is the catalog round-trip, not the decode).
 
 ## The seam (measured, code-anchored)
 
@@ -29,13 +29,26 @@ The prune constrains `?p <pred>`'s resolution to `T` only when BOTH hold; if eit
 - *Allow* multiple ref sources IF all share the same parent `T`. Conservative first cut (recommended): allow ONLY the single-required-RefObjectMap case (exactly q031); DECLINE anything more complex, widen later behind the same switch + differential.
 - Scope care: bindings inside an OPTIONAL/subquery vs the required part must be handled — treat any binding producer of `?p` reachable at the point `?p <pred>` is evaluated as a source; when in doubt, DECLINE.
 
-**(B) Template-disjointness — `T` is the ONLY `<pred>`-bearing map whose subject template can match `?p`'s IRIs.** This is the PR-3 (b')/F10 lesson (reuse `wildcard_class_fusion_is_safe`): if a **vertically-partitioned** map shares `T`'s subject template AND maps `<pred>` (the value lives in the partition, not `T`), pruning to `T` drops rows. So require every OTHER `<pred>`-bearing map to be subject-template prefix-**disjoint** from `T`. In the SF01 corpus the dims are template-disjoint (`.../product/{k}` vs `.../supplier/{k}` …), so this holds — but the guard must be explicit so a hand-written vertically-partitioned mapping DECLINEs rather than silently drops. (Without (B), F20 would re-introduce exactly the unsoundness PR-3 corrected when it replaced raw (b) with (b').)
+**(B) Template-disjointness — `T` is the ONLY `<pred>`-bearing map whose subject template can match `?p`'s IRIs. MANDATORY, in-scope (lead-ruled 2026-07-14 — NOT a debug_assert).** This is the PR-3 (b')/F10 lesson (reuse `wildcard_class_fusion_is_safe`): if a **vertically-partitioned** map shares `T`'s subject template AND maps `<pred>` (the value lives in the partition, not `T`), pruning to `T` drops rows. So require every OTHER `<pred>`-bearing map to be subject-template prefix-**disjoint** from `T`. The SF01 corpus dims happen to be template-disjoint (`.../product/{k}` vs `.../supplier/{k}` …) — but the guard must NOT ride on that: a correctness guard resting on "this dataset's templates happen to be disjoint" is dataset coupling, the exact F10-class trap. So (B) is checked at runtime (reusing PR-3's predicate, cheap) and a hand-written vertically-partitioned mapping DECLINEs rather than silently drops. (Without (B), F20 would re-introduce exactly the unsoundness PR-3 corrected when it replaced raw (b) with (b').)
 
-## (3) Expected-wall arithmetic (does q031 land ≤3 s WITHOUT PR-2a?)
+## (3) Expected-wall arithmetic (MEASURED — the loadTable term is real; ≤3 s is NOT guaranteed by the prune alone)
 
-Post-prune, q031's plan = one `FACT_INVENTORY_SNAPSHOT` scan (7,670 files / 300 K rows / **51 MB** — file-count-bound) + one DIM_PRODUCT (1-file) hash-join + `FILTER(?oh<?rp)` (per-row, cheap) + `LIMIT 5000` materialize. The `FILTER` is un-prunable (two-column compare) so the LIMIT cannot cut the fact scan — one full 7,670-file read is the residual.
+Post-prune, q031's plan = **2 loadTables** (FACT_INVENTORY_SNAPSHOT + DIM_PRODUCT) + one FACT_INVENTORY_SNAPSHOT scan (7,670 files / 300 K rows / 51 MB — file-count-bound) + one DIM_PRODUCT (1-file) hash-join + `FILTER(?oh<?rp)` (un-prunable, so the LIMIT can't cut the fact scan) + `LIMIT 5000` materialize.
 
-**Empirical reference (SAME clean baseline, cache-thrashed full-corpus order):** a single full 7,670-file fact scan is **~1 s**: q018 = 1.06 s (`files_selected=7670`, 200 K rows, GROUP BY + FILTER), q044 = 0.96 s (`files_selected=7670`, 250 K rows). Both have `load_table.n=0` (cross-query-amortized in the full-corpus protocol). So q031 post-prune ≈ **~1 s fact scan + the DIM_PRODUCT join + 5000-row materialize** → **expected low-single-digit s, ≤3 s cache-thrashed, WITHOUT PR-2a.** The join/materialize is the only term above the q018 reference; it is bounded by the LIMIT (5000 rows). **PR-2a (the 7,670-file decode-wall / master lever) stays CLOSED** unless the gate misses — if the materialize term pushes >3 s, PR-2a (or a materialization lever) opens then, and it is the shared lever for the whole fact-scanning tail (q016-post-PR-4d bottoms out on the identical 7,670-file FACT_SHIPMENT scan).
+**The arithmetic hole (lead's rider, now closed by measurement).** The earlier "≤3 s" priced the scan from q018/q044 — but those have **`load_table.n=0`** (cross-query-amortized), so they hid the loadTable term. Post-prune q031 still pays **two REAL loadTables** under the thrashed / first-ask protocol. **Measured** via **q032** — the exact post-prune shape (1 fact FACT_INVENTORY_SNAPSHOT + 1 single-file dim DIM_STORE), fresh in-memory TTL (new process) + warm disk catalog (steady-state):
+
+| q032 (2-table proxy) | wall | `load_table` n / total | `oauth` | `parquet` n / total |
+|---|---:|---:|---:|---:|
+| rep 1 | 4.25 s | 2 / 6.61 s | 0.74 s | 7671 / 4.73 s |
+| rep 2 | 2.81 s | 2 / 4.59 s | 0.68 s | 7671 / 1.36 s |
+
+The `load_table` **total** (4.6–6.6 s) is the SUM of 2 loads that run **concurrently**, so the WALL contribution is ~2–3 s (the two overlap). q032's whole wall is **2.8–4.25 s** — and that IS the post-prune q031 shape (2 loadTables + a full 7,670-file fact scan + a 1-file dim join), except q032 folds to 500 rows (GROUP BY) where q031 materializes up to 5000 (LIMIT + var-var FILTER). So:
+
+**Honest total: post-prune q031 ≈ loadTable ~2–3 s (wall, 2 concurrent) + fact scan ~1 s + 5000-row join/materialize ~1 s ≈ 3–5 s cache-thrashed, loadTable-DOMINATED.** That is **AT or slightly OVER the ≤3 s bar** — the prune alone does NOT guarantee it.
+
+**Why the loadTable term does not amortize away here (verified).** PR-8 slice 2's disk catalog cache serves the metadata.json + the manifest-derived scan-file list from disk, but per its own contract (`disk_catalog_cache.rs`: *"a cold process still issues one loadTable GET for fresh vended credentials — this only removes the metadata + manifest S3 round-trips"*) it does **NOT** cover the loadTable **REST/OAuth credential GET**. That GET (~1–3 s/table) is paid per process per table, and it only amortizes via the **in-memory** 60 s moka cache when a PRIOR query touched the same table within 60 s. In the clean full-corpus baseline q031 showed `load_table.n=7` — i.e. it was NOT amortized (q031 is the near-sole InventorySnapshot consumer), so post-prune `load_table.n=2` will likewise be paid, not amortized. The loadTable term is real in AJ's actual protocol.
+
+**Verdict + the named closer (per the rider — do not implement on inferred arithmetic).** The resolution-prune STILL ships on its own merit — it takes q031 from **72 s → ~3–5 s** (removes 5 dead dim loads incl. 390 K-row DIM_CUSTOMER + the fan-out re-scans), deterministic and sound. But it does **not** by itself clear a hard ≤3 s first-ask; the residual is the **2 loadTable credential GETs**, which the prune cannot touch. **Closer = a persistent loadTable/creds cache (a PR-8 slice extension)** — the exact residual PR-8 slice 2 explicitly leaves on the table (creds not persisted). This is a **separate follow-up item**, NOT part of the prune PR. So the prune's honest end-state is **"~3–5 s cache-thrashed, loadTable-bound"** (~1–2 s once loadTable-amortized), and the ≤3 s first-ask target is gated on the follow-up creds-cache — **PR-2a stays closed** (the 51 MB / 7,670-file scan is ~1 s, not the bottleneck; the bottleneck is the catalog round-trip, not the decode).
 
 ## (4) Kill switch
 
@@ -49,9 +62,9 @@ Post-prune, q031's plan = one `FACT_INVENTORY_SNAPSHOT` scan (7,670 files / 300 
 
 ## (6) DoD / gate (lead-specified)
 
-1. **`load_table.n` 7 → 2** on q031 (deterministic, cache-independent — the crisp sentinel) + **`scan_table` collapse** (the fan-out re-scans gone).
-2. **Live q031 rows-parity vs oracle** (`rows_only` per manifest), cache-thrashed full-corpus order, wall low-single-digit (≤3 s target; reported, PR-2a-deferred if missed).
-3. **DECLINE cases as hermetic tests** — one per unsound binding-source shape (UNION-bound `?p`, second non-ref binder, `VALUES ?p`, different-parent second ref, and the (B) vertically-partitioned-template case): each must show the prune **NOT firing**, output byte-identical to switch-off.
+1. **`load_table.n` 7 → 2** on q031 (deterministic, cache-independent — the crisp sentinel = the win) + **`scan_table` collapse** (the fan-out re-scans gone). This is the gating metric.
+2. **Live q031 rows-parity vs oracle** (`rows_only` per manifest), cache-thrashed full-corpus order. **Wall: honest end-state ~3–5 s cache-thrashed, loadTable-bound (per §3 measurement) — NOT a hard ≤3 s.** The ≤3 s first-ask target is gated on the loadTable/creds-cache follow-up (§3 closer), NOT on this PR. Report the wall; do not fail the PR on the loadTable-bound residual.
+3. **DECLINE cases as hermetic tests (all in-scope, incl. (B))** — one per unsound binding-source shape: UNION-bound `?p`, second non-ref binder, `VALUES ?p`, different-parent second ref, **and the (B) vertically-partitioned template-sharing map** (a synthetic mapping with a second map sharing `T`'s subject template AND mapping `<pred>` — the prune MUST DECLINE). Each shows the prune **NOT firing**, output byte-identical to switch-off.
 4. **Full-corpus cache-thrashed baseline at head** — no other query's wall/hash regresses; the 42/50 ≤3 s set stays put.
 5. Native 54/54 + W3C + unit sweeps green; kill-switch off = byte-identical.
 
@@ -59,4 +72,11 @@ Post-prune, q031's plan = one `FACT_INVENTORY_SNAPSHOT` scan (7,670 files / 300 
 
 Confirm the exact injection point: (a) where the rewrite has both the RefObjectMap POM (`edw:product` → parent T) and the downstream `?p edw:name` pattern in one BGP scope, to compute `?p`'s binding-source set for invariant (A); (b) whether `class_prune_hint` + `tm_passes_star_prune` can carry a ref-target hint as-is or needs a sibling `ref_target_prune_hint`; (c) reuse `wildcard_class_fusion_is_safe` for invariant (B). Mirrors the trace-first discipline of docs 17/18.
 
-**STOP — design review before implementation.** Open questions for the lead: (i) conservative first cut = single-required-RefObjectMap only (exactly q031), widen later — agreed? (ii) is invariant (B) (template-disjointness reuse of PR-3's guard) in-scope for THIS PR or can the corpus's known-disjoint templates let it ship with (A) only + a `debug_assert` (I recommend in-scope — it's the F10 unsoundness guard, cheap via the existing predicate)? (iii) confirm the own-switch name.
+## Open questions — RESOLVED (lead, 2026-07-14)
+
+- **(i) Single-required-ref first cut — YES** (conservative-then-widen). This PR admits only the single-required-RefObjectMap binding of `?p`; anything more complex DECLINEs.
+- **(ii) Condition (B) template-disjointness — YES, MANDATORY, in-scope** (not a debug_assert; a correctness guard must not ride on this corpus's templates being disjoint). Reuses `wildcard_class_fusion_is_safe`; its own DECLINE hermetic test (DoD 3).
+- **(iii) Switch name — `FLUREE_R2RML_REF_TARGET_PRUNE`, approved.**
+- **ARITHMETIC HOLE — CLOSED (§3, measured).** Post-prune q031 is loadTable-bound at ~3–5 s cache-thrashed, NOT a guaranteed ≤3 s. The prune ships on the 72 s → ~3–5 s win + the deterministic 7→2 load-count gate; the ≤3 s first-ask is a **named follow-up** (persistent loadTable/creds cache, a PR-8 slice extension — the residual PR-8 slice 2 explicitly leaves). PR-2a stays closed.
+
+**STOP — awaiting the lead's go on the corrected, honest-arithmetic scope before implementation.**
