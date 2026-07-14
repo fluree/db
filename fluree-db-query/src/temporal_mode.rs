@@ -114,6 +114,11 @@ impl PlanningContext {
 
     /// Record that the default graph is a `>= 2`-member union (see
     /// [`Self::multi_default_graph`]). No-op in history mode, which keeps the
+    /// multi-`FROM` default union a BAG — the one place it is not a set:
+    /// history rows carry per-event assert/retract provenance the dedup key
+    /// deliberately ignores, so a triple present in two members yields one row
+    /// per member's event stream (user-facing corollary: `COUNT(*)` over a
+    /// multi-`FROM` history query counts per member, not per merged triple).
     /// full per-event stream rather than a deduplicated set.
     #[inline]
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {

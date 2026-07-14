@@ -1188,3 +1188,93 @@ async fn transfer_named_to_named_survives_reindex() {
         })
         .await;
 }
+
+/// default→named at the DURABLE-INDEX layer (#1483 review: the synthesized
+/// anchor was only checked in-memory). `COPY DEFAULT TO <g2>` SYNTHESIZES an
+/// `f:reifiesGraph` anchor the source never had; the attachment indexer
+/// decodes every bundle via `EdgeKey::from_reifies_facts` at seal time, so a
+/// malformed synthesized anchor would be silently dropped from the arena.
+#[tokio::test]
+async fn transfer_default_to_named_synthesized_anchor_survives_reindex() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:xfer-default-to-named";
+    let g2 = "http://example.org/g2";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            // Default-graph annotated edge — NO f:reifiesGraph anchor exists.
+            let seeded = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@id": "ex:alice",
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+                        }
+                    }),
+                )
+                .await
+                .expect("seed default-graph annotation");
+
+            let sparql = format!("COPY DEFAULT TO <{g2}>");
+            let parsed = fluree_db_sparql::parse_sparql(&sparql);
+            assert!(
+                !parsed.has_errors(),
+                "parse errors: {:?}",
+                parsed.diagnostics
+            );
+            let ast = parsed.ast.expect("AST");
+            let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&seeded.ledger.snapshot);
+            let txn = fluree_db_transact::lower_sparql_update_ast(
+                &ast,
+                &mut ns,
+                fluree_db_transact::TxnOpts::default(),
+            )
+            .expect("lower COPY DEFAULT");
+            let after_copy = fluree
+                .stage_owned(seeded.ledger)
+                .txn(txn)
+                .execute()
+                .await
+                .expect("stage COPY DEFAULT");
+
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_copy.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_copy.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            let ann_root = post
+                .snapshot
+                .annotation_index
+                .as_ref()
+                .expect("reindex with the attachment provider must seal an arena");
+
+            // The default-graph bundle carries NO anchor; the g2 copy carries
+            // exactly the ONE synthesized anchor — and it must decode at seal
+            // time (a bad synthesis would be dropped as GraphMismatch).
+            assert_eq!(
+                ann_root.stats.distinct_reified_graphs, 1,
+                "exactly the synthesized g2 anchor's graph must seal"
+            );
+            assert_eq!(
+                ann_root.stats.reifies_graph_rows, 1,
+                "exactly one synthesized f:reifiesGraph anchor row must survive the seal"
+            );
+        })
+        .await;
+}

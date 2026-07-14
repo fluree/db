@@ -1153,7 +1153,9 @@ async fn stage_graph_mgmt(
                 // is an unconditional whole-graph retraction — but a one-line
                 // `CLEAR ALL` strips the ontology, and because `is_schema_flake`
                 // exempts schema flakes from modify policy, that retraction is
-                // not policy-blockable.
+                // not policy-blockable. `COPY/MOVE <g> TO DEFAULT` reach the
+                // same wholesale default-graph retraction through their
+                // `clear_dest` pass, so the footgun applies to them equally.
                 let mut targets: Vec<(GraphId, Option<Sid>)> = Vec::new();
                 match target {
                     GraphTarget::Default => targets.push((0, None)),

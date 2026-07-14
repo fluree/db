@@ -2976,3 +2976,101 @@ async fn fql_within_ledger_from_union_is_a_set() {
         normalize_flat_results(&json!(["A1", "B2", "Dup", "Dup", "Shared"]))
     );
 }
+
+/// Multi-FROM + OFFSET/LIMIT (#1483 review): the §13.2 set-merge happens at
+/// scan time, BELOW the slice — so paging over a deduplicated union is stable
+/// and never re-serves (or skips past) the collapsed duplicate.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_offset_limit_pages_the_set() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_union_dataset(&fluree, "wl-union-page:main").await;
+
+    // Deduped, ordered union = A1, B2, Dup, Dup, Shared (ex:x collapses to
+    // one row; ex:d1/ex:d2 are DISTINCT subjects sharing a value).
+    let all = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:s1> FROM <urn:s2> WHERE { ?s schema:name ?name } ORDER BY ?name ?s",
+    )
+    .await
+    .expect("full union")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        all,
+        json!([["A1"], ["B2"], ["Dup"], ["Dup"], ["Shared"]]),
+        "set-merged union baseline"
+    );
+
+    // Page 2 of size 2 must be exactly rows 3-4 of the SET (both Dups) —
+    // a bag would shift the page by the duplicated Shared row.
+    let page = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name FROM <urn:s1> FROM <urn:s2> WHERE { ?s schema:name ?name } \
+         ORDER BY ?name ?s OFFSET 2 LIMIT 2",
+    )
+    .await
+    .expect("paged union")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        page,
+        json!([["Dup"], ["Dup"]]),
+        "OFFSET/LIMIT must slice the deduplicated sequence"
+    );
+}
+
+/// Var-var multi-pattern join over the union where BOTH patterns carry the
+/// cross-member duplicate and join on the shared subject (#1483 review): each
+/// scan set-merges independently, so the join multiplicity is 1×1 — not the
+/// 2×2 a bag union would produce.
+#[tokio::test]
+async fn sparql_within_ledger_from_union_var_var_join_is_set_merged() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "wl-union-join:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    // ex:x carries BOTH properties in BOTH graphs — the worst case for
+    // bag-union join inflation (2 copies × 2 copies = 4 rows).
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        GRAPH <urn:j1> {
+            ex:x schema:name "Shared" .
+            ex:x schema:jobTitle "Engineer" .
+        }
+        GRAPH <urn:j2> {
+            ex:x schema:name "Shared" .
+            ex:x schema:jobTitle "Engineer" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert")
+        .ledger;
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?name ?title FROM <urn:j1> FROM <urn:j2> \
+         WHERE { ?s schema:name ?name . ?s schema:jobTitle ?title }",
+    )
+    .await
+    .expect("join over union")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        rows,
+        json!([["Shared", "Engineer"]]),
+        "both scans must set-merge independently: 1×1 join row, not 2×2"
+    );
+}

@@ -5670,3 +5670,119 @@ async fn copy_onto_identical_annotation_tolerates_same_t_churn() {
         Some("Engineer")
     );
 }
+
+/// The collision guard's FALSE-POSITIVE boundary (#1483 review): the SAME
+/// explicit reifier reifying the SAME edge in source and dest must NOT trip
+/// the ADD rejection — equal edge signatures dedup cleanly against the dest
+/// bundle (no second f:reifiesSubject, no Duplicate).
+#[tokio::test]
+async fn add_same_edge_same_reifier_succeeds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:add-same-edge-ok";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    // Identical edge + reifier + payload in BOTH graphs.
+    let ledger = seed_named_annotation_for_edge(
+        &fluree, ledger0, g1, "ex:alice", "ex:acme", "ex:r1", "Engineer",
+    )
+    .await;
+    let ledger = seed_named_annotation_for_edge(
+        &fluree, ledger, g2, "ex:alice", "ex:acme", "ex:r1", "Engineer",
+    )
+    .await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("ADD <{g1}> TO <{g2}>")).await;
+
+    // Exactly ONE cleanly-decodable annotation in the dest — merged, not
+    // duplicated, not dropped.
+    let g2_ann = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g2),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(
+        g2_ann.len(),
+        1,
+        "same-edge same-reifier ADD must merge cleanly (guard false-positive)"
+    );
+    // Source untouched by ADD.
+    let g1_ann = support::decode_annotations_for_subject(
+        &ledger,
+        graph_id(&ledger, g1),
+        "http://example.org/alice",
+    )
+    .await;
+    assert_eq!(g1_ann.len(), 1, "ADD keeps the source annotation");
+}
+
+/// named→default MOVE and ADD (#1483 review: only COPY was covered for this
+/// direction): both must drop the f:reifiesGraph anchor on the re-homed copy;
+/// MOVE additionally retracts the source, ADD leaves it.
+#[tokio::test]
+async fn transfer_named_to_default_move_and_add() {
+    for verb in ["MOVE", "ADD"] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("it/edge-annotations:xfer-n2d-{}", verb.to_lowercase());
+        let g1 = "http://example.org/g1";
+        let ledger0 = genesis_ledger(&fluree, &ledger_id);
+        let ledger =
+            seed_named_annotation(&fluree, ledger0, g1, "ex:emp/alice-acme", "Engineer").await;
+
+        let ledger = run_graph_mgmt(&fluree, ledger, &format!("{verb} <{g1}> TO DEFAULT")).await;
+
+        let dest =
+            support::decode_annotations_for_subject(&ledger, 0, "http://example.org/alice").await;
+        assert_eq!(dest.len(), 1, "{verb}: one re-homed default annotation");
+        assert_eq!(
+            dest[0].g, None,
+            "{verb} named→default must drop the f:reifiesGraph anchor"
+        );
+
+        let src = support::decode_annotations_for_subject(
+            &ledger,
+            graph_id(&ledger, g1),
+            "http://example.org/alice",
+        )
+        .await;
+        match verb {
+            "MOVE" => assert_eq!(src.len(), 0, "MOVE retracts the source annotation"),
+            _ => assert_eq!(src.len(), 1, "ADD keeps the source annotation"),
+        }
+    }
+}
+
+/// Multi-hop re-homing composes (#1483 review): COPY <a> TO <b> then
+/// COPY <b> TO <c> rewrites the anchor at each hop, so all three graphs hold
+/// an independently-decodable annotation naming THEIR OWN graph.
+#[tokio::test]
+async fn multi_hop_copy_rehomes_anchor_each_hop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:multi-hop";
+    let ga = "http://example.org/ga";
+    let gb = "http://example.org/gb";
+    let gc = "http://example.org/gc";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let ledger = seed_named_annotation(&fluree, ledger0, ga, "ex:emp/alice-acme", "Engineer").await;
+
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{ga}> TO <{gb}>")).await;
+    let ledger = run_graph_mgmt(&fluree, ledger, &format!("COPY <{gb}> TO <{gc}>")).await;
+
+    for g in [ga, gb, gc] {
+        let g_id = graph_id(&ledger, g);
+        let anns =
+            support::decode_annotations_for_subject(&ledger, g_id, "http://example.org/alice")
+                .await;
+        assert_eq!(
+            anns.len(),
+            1,
+            "graph {g} must hold one decodable annotation"
+        );
+        assert_eq!(
+            anns[0].g,
+            Some(graph_sid(&ledger, g)),
+            "the hop-{g} anchor must name its own graph (re-homed per hop)"
+        );
+    }
+}
