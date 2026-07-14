@@ -1423,12 +1423,18 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
 /// over an R2RML source take the batched hash-left-join instead of the per-row
 /// operator rebuild (`optional.rs::build_correlated_optional_op`), which no
 /// operator-scoped cache can span (design: `07-pr4b-batched-optional.md`).
-/// Star / type-var / wildcard / bound-subject R2RML shapes stay EXCLUDED pending
-/// differential evidence (`r2rml_leaf_is_hash_join_safe`).
+/// PR-4b admits the subject-driven single-object leaf
+/// (`r2rml_leaf_is_hash_join_safe`); PR-4c widens to the same-subject STAR
+/// (`r2rml_star_is_hash_join_safe`, its own sub-switch). type-var / wildcard /
+/// bound-subject shapes stay EXCLUDED pending their own differential evidence.
 fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
     match p {
         Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_) => true,
-        Pattern::R2rml(rp) => batched_optional_r2rml_enabled() && r2rml_leaf_is_hash_join_safe(rp),
+        Pattern::R2rml(rp) => {
+            batched_optional_r2rml_enabled()
+                && (r2rml_leaf_is_hash_join_safe(rp)
+                    || (batched_optional_r2rml_star_enabled() && r2rml_star_is_hash_join_safe(rp)))
+        }
         _ => false,
     }
 }
@@ -1441,6 +1447,16 @@ fn batched_optional_r2rml_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_R2RML_BATCHED_OPTIONAL"))
+}
+
+/// PR-4c sub-switch: `FLUREE_R2RML_BATCHED_OPTIONAL_STAR` (default ON within the
+/// PR-4b family). Off ⇒ a same-subject STAR R2RML inner falls back to PR-4b's
+/// scalar-only admission (byte-identical PR-4b behavior — the q050 sentinel), so
+/// the star widening can be reverted independently.
+fn batched_optional_r2rml_star_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::r2rml::env_switch_enabled("FLUREE_R2RML_BATCHED_OPTIONAL_STAR"))
 }
 
 /// Whether an R2RML pattern is a subject-driven single-object LEAF scan — the
@@ -1474,6 +1490,28 @@ fn r2rml_leaf_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool 
         && rp.type_var.is_none()
         && rp.star_bindings.is_empty()
         && rp.star_constraints.is_empty()
+}
+
+/// Whether an R2RML pattern is a same-subject STAR the batched OPTIONAL can admit
+/// (PR-4c, q016). A star's solutions for a required row depend on the row ONLY
+/// through its correlation var(s), and `R2rmlPattern::referenced_vars` surfaces
+/// EVERY star-member object var (the P1 audit, landed + tested as PR-4b's
+/// precursor — `adapters.rs`), so the correlation set is complete and the
+/// partition is exact. Cartesian multiplicity (a correlation matching several
+/// member rows) is reproduced batched≡per-row for LEFT-JOIN — the same leaf
+/// materialization runs both paths; it is NOT the excluded row-multiplying
+/// subquery (an R2RML leaf carries no internal ops). The correlation may be a
+/// member OBJECT (q016 `?sh edw:order ?o`); such a var is seeded BOUND
+/// (`corr_var_only_triple_object` is Triple-only) — sound, only de-optimized, so
+/// it needs no gate here. `star_constraints` are constant-object existence
+/// filters (no var). EXCLUDES `type_var` (multi-class cartesian — a separate
+/// shape), a wildcard `predicate_var`, and a bound/constant subject.
+fn r2rml_star_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool {
+    rp.subject_var.is_some()
+        && !rp.star_bindings.is_empty()
+        && rp.type_var.is_none()
+        && rp.predicate_var.is_none()
+        && rp.subject_constant.is_none()
 }
 
 /// True iff `v` occurs in the inner patterns ONLY as the object of one or more
@@ -2314,6 +2352,57 @@ mod tests {
         );
     }
 
+    // PR-4c: the STAR admission (`r2rml_star_is_hash_join_safe`) admits a
+    // same-subject star (≥1 star member), incl. an object-correlated one (q016),
+    // and keeps type-var / wildcard / bound-subject EXCLUDED. A bare scalar leaf
+    // is NOT a star (empty star_bindings) — it stays on the PR-4b arm.
+    #[test]
+    fn r2rml_star_admission() {
+        use crate::ir::adapters::R2rmlPattern;
+
+        // A same-subject star: primary member (object_var) + one star member.
+        let mut star = R2rmlPattern::new("gs:main", VarId(3), Some(VarId(0)));
+        star.predicate_filter = Some("http://ex/order".to_string());
+        star.star_bindings = vec![("http://ex/shipStatus".to_string(), VarId(1))];
+        assert!(
+            r2rml_star_is_hash_join_safe(&star),
+            "same-subject star (incl. object-correlated) is admitted"
+        );
+        // A constant-object existence constraint carries no var — still safe.
+        let mut star_c = star.clone();
+        star_c.star_constraints = vec![(
+            "http://ex/kind".to_string(),
+            crate::r2rml::ObjectConstant::Iri("http://ex/c".to_string()),
+        )];
+        assert!(
+            r2rml_star_is_hash_join_safe(&star_c),
+            "star with a constant-object constraint (no var) stays safe"
+        );
+
+        // Kept exclusions.
+        let mut tv = star.clone();
+        tv.type_var = Some(VarId(9));
+        assert!(!r2rml_star_is_hash_join_safe(&tv), "type-var excluded");
+        let mut wild = star.clone();
+        wild.predicate_var = Some(VarId(9));
+        assert!(!r2rml_star_is_hash_join_safe(&wild), "wildcard excluded");
+        let mut bound = star.clone();
+        bound.subject_var = None;
+        bound.subject_constant = Some("http://ex/s/1".to_string());
+        assert!(
+            !r2rml_star_is_hash_join_safe(&bound),
+            "bound subject excluded"
+        );
+
+        // A non-star scalar leaf is NOT admitted by the star arm.
+        let mut leaf = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        leaf.predicate_filter = Some("http://ex/rating".to_string());
+        assert!(
+            !r2rml_star_is_hash_join_safe(&leaf),
+            "a scalar leaf has empty star_bindings — handled by the PR-4b arm, not the star arm"
+        );
+    }
+
     // PR-4b (B): the hermetic differential — the batched hash-left-join and the
     // per-row rebuild must produce IDENTICAL optional-side bindings on a GENUINE
     // R2RML dangling FK (empty bucket) and a matched FK, driving both OptionalBuilder
@@ -2530,6 +2619,233 @@ mod tests {
         for (row, pr) in per_row.iter().enumerate() {
             if !batched_rows.contains(&row) {
                 assert!(pr.is_empty(), "batched dropped row {row} that per-row kept");
+            }
+        }
+    }
+
+    // PR-4c (the correctness gate): the hermetic batched≡per-row differential for a
+    // same-subject STAR OPTIONAL inner with an OBJECT correlation (q016's shape:
+    // `?sh edw:order ?o ; edw:shipStatus ?st`, correlated on `?o`). ONE mock dataset
+    // carries all three multiplicity risks, asserted row-for-row both paths:
+    //   - `?o` = order/1 matched by TWO shipments  → the CARTESIAN (2 optional rows);
+    //   - `?o` = order/2 matched by ZERO shipments  → the LEFT-JOIN miss (0 rows);
+    //   - `?o` = order/3 matched by one shipment with a NULL star member (`?st`).
+    #[test]
+    fn batched_equals_per_row_on_object_correlated_star() {
+        use crate::context::ExecutionContext;
+        use crate::ir::adapters::R2rmlPattern;
+        use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
+        use std::sync::Arc;
+
+        // Shipment --edw:order(RefObjectMap)--> Order  ; edw:shipStatus (scalar col).
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Shipment", "shipments")
+                .with_subject_template("http://ex/shipment/{SH}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/order"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new("#Order", "OFK", "OID")),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/shipStatus"),
+                    object_map: ObjectMap::column("STATUS"),
+                }),
+            TriplesMap::new("#Order", "orders").with_subject_template("http://ex/order/{OID}"),
+        ]));
+
+        #[derive(Debug)]
+        struct MapProvider(Arc<CompiledR2rmlMapping>);
+        #[async_trait]
+        impl R2rmlProvider for MapProvider {
+            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+                true
+            }
+            async fn compiled_mapping(
+                &self,
+                _gs: &str,
+                _t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        fn batch(fields: Vec<(&str, i32)>, cols: Vec<Column>) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(
+                fields
+                    .into_iter()
+                    .map(|(n, id)| FieldInfo {
+                        name: n.to_string(),
+                        field_type: FieldType::Int64,
+                        nullable: true,
+                        field_id: id,
+                    })
+                    .collect(),
+            ));
+            ColumnBatch::new(schema, cols).unwrap()
+        }
+
+        #[derive(Debug)]
+        struct TableProvider;
+        #[async_trait]
+        impl R2rmlTableProvider for TableProvider {
+            async fn scan_table(
+                &self,
+                _gs: &str,
+                table: &str,
+                _proj: &[String],
+                _filters: &[ScanFilter],
+                _t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                // shipments: SH 100/101 → order 1 (TWO → cartesian); 102 → order 3
+                // with STATUS=NULL (null star member); no shipment for order 2 (miss).
+                let b = if table == "shipments" {
+                    batch(
+                        vec![("SH", 1), ("OFK", 2), ("STATUS", 3)],
+                        vec![
+                            Column::Int64(vec![Some(100), Some(101), Some(102), Some(103)]),
+                            Column::Int64(vec![Some(1), Some(1), Some(3), Some(4)]),
+                            // order 4's only shipment has a NULL shipStatus → the
+                            // same-subject star (a conjunction) drops that row.
+                            Column::Int64(vec![Some(10), Some(20), Some(30), None]),
+                        ],
+                    )
+                } else {
+                    // orders (ref parent): OID 1..4 all exist.
+                    batch(
+                        vec![("OID", 1)],
+                        vec![Column::Int64(vec![Some(1), Some(2), Some(3), Some(4)])],
+                    )
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+            }
+        }
+
+        // Inner star: subject ?sh (VarId 3); primary member edw:order → object ?o
+        // (VarId 0, the correlation); star member edw:shipStatus → ?st (VarId 1).
+        let mut inner = R2rmlPattern::new("gs:main", VarId(3), Some(VarId(0)));
+        inner.predicate_filter = Some("http://ex/order".to_string());
+        inner.star_bindings = vec![("http://ex/shipStatus".to_string(), VarId(1))];
+        assert!(
+            r2rml_star_is_hash_join_safe(&inner) && !r2rml_leaf_is_hash_join_safe(&inner),
+            "the object-correlated star must take the PR-4c star arm, not the PR-4b leaf arm"
+        );
+        let inner_patterns = vec![Pattern::R2rml(inner)];
+        let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let builder = PlanTreeOptionalBuilder::new(
+            required_schema.clone(),
+            inner_patterns,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+
+        // Required rows: the four orders, as the ref-rendered object IRIs (?o).
+        let required = Batch::new(
+            required_schema.clone(),
+            vec![vec![
+                Binding::iri("http://ex/order/1"),
+                Binding::iri("http://ex/order/2"),
+                Binding::iri("http://ex/order/3"),
+                Binding::iri("http://ex/order/4"),
+            ]],
+        )
+        .unwrap();
+
+        let map_provider = MapProvider(Arc::clone(&mapping));
+        let table_provider = TableProvider;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let mut ctx = ExecutionContext::new(&snapshot, &vars);
+        ctx = ctx.with_r2rml_providers(&map_provider, &table_provider);
+
+        let batched = futures::executor::block_on(builder.build_batch(&required, 0, &ctx))
+            .expect("build_batch")
+            .expect("star path admitted");
+
+        // Value key over the OPTIONAL-contributed vars (correlation ?o excluded — the
+        // partition row index pins its association; a mis-partition still fails).
+        let required_vars: std::collections::HashSet<VarId> =
+            required_schema.iter().copied().collect();
+        let row_repr = |b: &Batch, r: usize| -> Vec<String> {
+            let mut kv: Vec<String> = (0..b.schema().len())
+                .filter(|c| !required_vars.contains(&b.schema()[*c]))
+                .map(|c| format!("{:?}={:?}", b.schema()[c], b.get_by_col(r, c)))
+                .collect();
+            kv.sort();
+            kv
+        };
+
+        let per_row: Vec<Vec<Vec<String>>> = (0..required.len())
+            .map(|row| {
+                futures::executor::block_on(async {
+                    let mut op = builder.build(&required, row, &ctx)?.expect("per-row op");
+                    op.open(&ctx).await?;
+                    let mut rows = Vec::new();
+                    while let Some(b) = op.next_batch(&ctx).await? {
+                        for r in 0..b.len() {
+                            rows.push(row_repr(&b, r));
+                        }
+                    }
+                    op.close();
+                    Ok::<_, crate::error::QueryError>(rows)
+                })
+                .expect("per-row drain")
+            })
+            .collect();
+
+        // order/1 → 2 (cartesian); order/2 → 0 (miss); order/3 → 1 (valid single
+        // match); order/4 → 0 (its one shipment's null shipStatus drops the star).
+        assert_eq!(
+            per_row[0].len(),
+            2,
+            "cartesian: order/1 has 2 shipments: {:?}",
+            per_row[0]
+        );
+        assert_eq!(
+            per_row[1].len(),
+            0,
+            "miss: order/2 has no shipment: {:?}",
+            per_row[1]
+        );
+        assert_eq!(
+            per_row[2].len(),
+            1,
+            "order/3 has 1 valid shipment: {:?}",
+            per_row[2]
+        );
+        assert_eq!(
+            per_row[3].len(),
+            0,
+            "null star member drops the row: {:?}",
+            per_row[3]
+        );
+
+        for (row, batches) in &batched {
+            let mut batched_vals: Vec<Vec<String>> = batches
+                .iter()
+                .flat_map(|b| (0..b.len()).map(move |r| row_repr(b, r)))
+                .collect();
+            batched_vals.sort();
+            let mut per_row_vals = per_row[*row].clone();
+            per_row_vals.sort();
+            assert_eq!(
+                batched_vals, per_row_vals,
+                "batched != per-row optional VALUES for required row {row} (star cartesian/miss/null)"
+            );
+        }
+        let batched_rows: std::collections::HashSet<usize> =
+            batched.iter().map(|(r, _)| *r).collect();
+        for (row, rows) in per_row.iter().enumerate() {
+            if !rows.is_empty() {
+                assert!(
+                    batched_rows.contains(&row),
+                    "batched dropped non-miss required row {row}"
+                );
             }
         }
     }
