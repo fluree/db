@@ -258,6 +258,12 @@ fn dedup_adjacent_asserts(entries: &mut Vec<HistEntryV2>) {
 
 /// Merge sorted novelty operations into a decoded V3 leaflet.
 ///
+/// The novelty stream must contain at most one op per fact identity
+/// (lifecycle-deduped; see `dedup_fact_lifecycles` in
+/// `incremental_resolve`). A second op for an identity already consumed by
+/// the Equal arm would compare against later rows and be emitted as a
+/// duplicate row (assert) or dropped without effect (retract).
+///
 /// Walks the existing batch rows and novelty cursors together in sort order:
 ///
 /// - **Existing < Novelty**: Emit existing row unchanged.

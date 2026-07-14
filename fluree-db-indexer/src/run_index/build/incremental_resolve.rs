@@ -664,6 +664,25 @@ pub async fn resolve_incremental_commits_v6(
     v1_records.sort_unstable_by(|a, b| a.g_id.cmp(&b.g_id).then_with(|| spot_cmp(a, b)));
     let t_sort_ms = t0.elapsed().as_millis() as u64;
 
+    // 10a. Dedup fact lifecycles (RDF set semantics). Commit files are
+    //      event logs of user assertions, not state deltas: the same fact may
+    //      be asserted by several commits in this window, or asserted and
+    //      retracted within it. The leaf merge (`merge_novelty`) consumes at
+    //      most one op per fact identity, so each identity's event sequence
+    //      is resolved to its final state here.
+    let t0 = Instant::now();
+    let event_count = v1_records.len();
+    let v1_records = dedup_fact_lifecycles(v1_records);
+    let t_dedup_ms = t0.elapsed().as_millis() as u64;
+    let deduped_count = event_count - v1_records.len();
+    if deduped_count > 0 {
+        tracing::debug!(
+            event_count,
+            deduped_count,
+            "V6 incremental resolve: deduped fact lifecycles (set semantics)"
+        );
+    }
+
     // 11. Convert V1 → V2 + extract ops.
     let t0 = Instant::now();
     let mut records = Vec::with_capacity(v1_records.len());
@@ -686,6 +705,7 @@ pub async fn resolve_incremental_commits_v6(
         remap_fulltext_ms = t_remap_fulltext_ms,
         remap_records_ms = t_remap_records_ms,
         sort_ms = t_sort_ms,
+        dedup_ms = t_dedup_ms,
         convert_ms = t_convert_ms,
         total_ms = t_start.elapsed().as_millis() as u64,
         commit_count,
@@ -712,6 +732,74 @@ pub async fn resolve_incremental_commits_v6(
         base_numbig_counts,
         fulltext_string_bytes,
     })
+}
+
+// ============================================================================
+// Internal: Fact lifecycle dedup
+// ============================================================================
+
+/// True when two records agree on every field the `(g_id, SPOT)` comparator
+/// orders by, other than `t` and `op`. Records with the same prefix are
+/// adjacent in a sorted stream; full fact identity additionally distinguishes
+/// `i` and `lang_id`, which the comparator does not order by.
+fn same_sort_prefix(a: &RunRecord, b: &RunRecord) -> bool {
+    a.g_id == b.g_id
+        && a.s_id == b.s_id
+        && a.p_id == b.p_id
+        && a.o_kind == b.o_kind
+        && a.o_key == b.o_key
+        && a.dt == b.dt
+}
+
+/// Resolve each fact's event sequence within the commit window to a single
+/// final op, so the updated index materializes the same state the in-memory
+/// novelty view resolves:
+///
+/// - A re-assert of a currently-asserted fact is a no-op: the earlier assert
+///   (and its `t`) survives, matching `NoveltyFactState`'s skip rule.
+/// - Every other op becomes the identity's winner: a retract after an assert,
+///   an assert after a retract, and a repeat retract at higher `t`.
+/// - An assert at the same `t` as a winning retract loses (same-`t` ties
+///   resolve retract-wins), matching `resolve_overlay_ops`.
+///
+/// Input must be sorted by `(g_id, SPOT)`; output preserves that order.
+/// Within a sort-prefix group, records for one full identity arrive in
+/// `(t, op)` order even when several identities interleave, so a linear walk
+/// per identity sees its events chronologically.
+fn dedup_fact_lifecycles(records: Vec<RunRecord>) -> Vec<RunRecord> {
+    let mut out: Vec<RunRecord> = Vec::with_capacity(records.len());
+    // Winners for the current sort-prefix group, one per full identity
+    // (distinct `(i, lang_id)`). Groups are tiny, so a linear scan beats a
+    // map.
+    let mut group: Vec<RunRecord> = Vec::new();
+
+    for rec in records {
+        if group.last().is_some_and(|w| !same_sort_prefix(w, &rec)) {
+            flush_deduped_group(&mut group, &mut out);
+        }
+        match group
+            .iter_mut()
+            .find(|w| w.i == rec.i && w.lang_id == rec.lang_id)
+        {
+            None => group.push(rec),
+            Some(winner) => {
+                let noop_reassert = rec.op == 1 && winner.op == 1;
+                let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
+                if !noop_reassert && !same_t_retract_wins {
+                    *winner = rec;
+                }
+            }
+        }
+    }
+    flush_deduped_group(&mut group, &mut out);
+    out
+}
+
+/// Emit a sort-prefix group's winners in comparator order (`t`, then `op`)
+/// and clear the group.
+fn flush_deduped_group(group: &mut Vec<RunRecord>, out: &mut Vec<RunRecord>) {
+    group.sort_unstable_by(|a, b| a.t.cmp(&b.t).then(a.op.cmp(&b.op)));
+    out.append(group);
 }
 
 // ============================================================================
