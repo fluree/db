@@ -781,10 +781,12 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         // exchange, not one per table. (If the client build ever becomes async,
         // this dedup breaks and a serial first-table warm would be needed.)
         //
-        // TODO(slice-3): once the process-wide catalog-request semaphore lands,
-        // bound this fan-out by it (e.g. `min(CATALOG_PREFETCH_CONCURRENCY, permits)`
-        // or acquire per future) so the prefetch cannot defeat the 429 protection
-        // it deliberately runs ahead of.
+        // The `buffered` width here is the per-query fan-out ceiling; the true
+        // bound on concurrent catalog QPS is the process-wide catalog-request
+        // semaphore (PR-8 slice 3, `rest.rs`), which every `loadTable` GET this
+        // fan-out issues must acquire — so the prefetch cannot defeat the 429
+        // protection it runs ahead of, and a lower `FLUREE_ICEBERG_CATALOG_CONCURRENCY`
+        // transparently throttles it.
         futures::stream::iter(to_warm)
             .map(|table| async move {
                 let _ = self.load_table_context(graph_source_id, &table).await;

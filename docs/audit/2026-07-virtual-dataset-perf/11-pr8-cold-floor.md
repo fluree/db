@@ -197,7 +197,9 @@ and can never go stale. So slice 2 is just three content-addressed stores keyed 
   bypassed when a pushdown filter prunes, so this is immutable per snapshot) —
   removes the scan path's `iceberg.scan_plan` manifest read.
 - COUNT-path manifest stats (`data_files` + `has_delete_manifests`) — removes the
-  `r2rml.count_manifest_read` manifest read (q036's ~450 ms slice).
+  `r2rml.count_manifest_read` manifest read (q036's manifest slice, measured
+  ~450–990 ms across runs — it varies with Snowflake load, so a range, not a
+  point estimate).
 
 `DataFile` (+ `FileFormat`, `PartitionData`) gained `Serialize/Deserialize` in
 `fluree-db-iceberg` to persist the file lists (they derived only `Debug/Clone`);
@@ -241,3 +243,34 @@ The serde surface is narrow: `DataFile`/`FileFormat`/`PartitionData` hold only
 primitives, enums with unit variants, and `HashMap<i32, …>` / `Vec<…>` of the
 same — no borrowed or in-memory-only fields, so the derive is clean (no
 purpose-built record needed). Persistence is serde_json (no bincode in-tree).
+
+---
+
+## 9. Slice-3 (429 backoff + catalog-request semaphore) — implementation
+
+Greenfield hardening at the catalog transport (`fluree-db-iceberg/src/catalog/rest.rs`),
+so PR-2's raised scan concurrency, the slice-1 prefetch fan-out, and the wildcard
+crawl can't storm Snowflake Horizon. Behavioral, not a perf lever.
+
+- **429/503 backoff.** `request_with_retry` now loops: a `429 Too Many Requests`
+  or `503 Service Unavailable` is retried honoring a `Retry-After` header when
+  present, else exponential backoff with full jitter (base 250 ms, doubling, cap
+  8 s), bounded to `FLUREE_ICEBERG_CATALOG_MAX_RETRIES` (default 4) attempts, then
+  the error is surfaced cleanly (a `Catalog` error naming the status). The
+  existing 401-refresh-and-retry is preserved (it drops the semaphore permit
+  before recursing so a small cap can't self-deadlock).
+- **Process-wide catalog semaphore.** Every catalog request acquires a permit
+  from a shared `Semaphore` (sized by `FLUREE_ICEBERG_CATALOG_CONCURRENCY`,
+  default 8) before its round-trip, held across the backoff (a throttled request
+  keeps its slot — that IS the rate limiting). Because the semaphore lives in
+  `request_with_retry`, the slice-1 prefetch's `buffered(8)` fan-out and any crawl
+  fan-out are transparently bounded by it — the slice-1 TODO is retired.
+- **Gate (behavioral, wiremock).** `retries_on_429_then_succeeds` (2×429→200,
+  3 requests), `gives_up_after_max_retries_and_surfaces_the_error` (persistent 429
+  → `Catalog` error after 1+N requests), `retry_after_parses_delta_seconds…`
+  (header parse + backoff bounded by the cap), and
+  `semaphore_bounds_concurrent_catalog_requests` (6 delayed requests through a
+  2-permit vs a 6-permit client — the 2-permit serializes into ≥3 waves, the
+  6-permit is faster). Plus one live smoke: q008 warm-disk unchanged (the added
+  machinery adds no latency on the happy path). All switches default-on; off ⇒
+  today's single-shot, unbounded behavior.

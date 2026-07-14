@@ -2796,6 +2796,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-tabular",
  "futures",
+ "http 1.4.0",
  "hyper-rustls 0.24.2",
  "lru 0.12.5",
  "parquet",
