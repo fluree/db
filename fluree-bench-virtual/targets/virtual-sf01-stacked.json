@@ -1,0 +1,8 @@
+{
+  "id": "virtual-sf01-stacked",
+  "kind": "virtual",
+  "fluree_home": "/Users/ajohnson/vbench/.fluree",
+  "alias": "enterprise-sf01-v",
+  "description": "Data-identical clone of virtual-sf01 (same fluree_home + alias). Exists only to bless a POST-PR-stack perf baseline (baselines/perf/virtual-sf01-stacked.json) at HEAD 36564e8e6 (PR-2/3/4/4b) WITHOUT clobbering the pre-PR reference in baselines/perf/virtual-sf01.json (blessed 7d77218e2). Expected oracles are query-keyed and target-independent, so `compare` validates a stacked run against the same native oracles. Auth: VBENCH_PAT (ICEBERG_READER, expires 2026-10-08).",
+  "status": "ready"
+}
