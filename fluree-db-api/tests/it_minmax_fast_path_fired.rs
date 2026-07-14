@@ -12,6 +12,13 @@
 //! *sibling's* decline (the event is emitted from the shared aggregate fast-path,
 //! which many grp_misc siblings exercise). A thread-local `set_default` capture is
 //! only sound when this is the single test in the process.
+//!
+//! Both mechanisms are PROCESS-scoped: they bite under thread-parallel
+//! `cargo test` (all bundled siblings share one process) but not under
+//! nextest's process-per-test model — so observing that nextest-run bundled
+//! siblings don't interfere does NOT disprove the above. The standalone bin
+//! keeps the test sound under both runners, and `cargo test` is what
+//! contributors reach for first.
 #![cfg(feature = "native")]
 
 mod support;
