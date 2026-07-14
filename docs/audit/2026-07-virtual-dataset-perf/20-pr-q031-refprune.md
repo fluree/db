@@ -68,9 +68,22 @@ The `load_table` **total** (4.6–6.6 s) is the SUM of 2 loads that run **concur
 4. **Full-corpus cache-thrashed baseline at head** — no other query's wall/hash regresses; the 42/50 ≤3 s set stays put.
 5. Native 54/54 + W3C + unit sweeps green; kill-switch off = byte-identical.
 
-## (7) Implementation trace (first step, before code)
+## (7) Implementation trace — FINDINGS (injection point CONFIRMED, 2026-07-14; ready to implement)
 
-Confirm the exact injection point: (a) where the rewrite has both the RefObjectMap POM (`edw:product` → parent T) and the downstream `?p edw:name` pattern in one BGP scope, to compute `?p`'s binding-source set for invariant (A); (b) whether `class_prune_hint` + `tm_passes_star_prune` can carry a ref-target hint as-is or needs a sibling `ref_target_prune_hint`; (c) reuse `wildcard_class_fusion_is_safe` for invariant (B). Mirrors the trace-first discipline of docs 17/18.
+The trace resolves all three questions — the fix **reuses the existing `class_prune_hint` machinery wholesale**; no new hint field, no operator change.
+
+- **(a) Injection point + parent-class resolution.** `rewrite_patterns_for_r2rml` (`rewrite.rs:117`) collects same-subject `star_groups` and `class_groups` over one BGP scope, then per subject calls `fuse_class_if_safe` (`:293`). q031's `?p edw:name` is a star on `?p` with base predicate `edw:name`; today `fuse_class_if_safe` returns early (no `class_groups` entry for `?p` — no `?p a Class` in the query). **The parent class of a RefObjectMap IS resolvable:** a ref member's `rom.parent_triples_map` → `mapping.triples_maps.get(&rom.parent_triples_map).classes()` (prior art: `fused_aggregate.rs:1608`, `operator.rs:1144`). DIM_PRODUCT's TM declares `rr:class edw:Product` (verified in `enterprise-sf01-mapping.ttl`), so the ref target's class C = `edw:Product` is available.
+- **(b) Reuse `class_prune_hint` — NO new field.** The existing hint (`rewrite.rs:706`, set by `fuse_class_if_safe`'s PR-3 (b') branch; consumed by `tm_passes_star_prune` in `operator.rs`) already means "constrain this star's TriplesMap resolution to class-C-declaring maps, resolution-only, class stays its own concern." F20 sets **the same `base.class_prune_hint = Some(C)`** where C is derived from `?p`'s RefObjectMap parent instead of a query `?p a C`. So the operator side needs **zero** change — the hint plumbing already prunes.
+- **(c) Invariant (B) = `wildcard_class_fusion_is_safe(mapping, C)`** — the exact predicate `fuse_class_if_safe` already uses for the class case (`:705`). Reused verbatim.
+
+**Implementation plan (rewrite.rs only; behind `FLUREE_R2RML_REF_TARGET_PRUNE`):**
+1. **Pre-analysis over the scope's converted members** (after the collection loop, before the star-emit loop): build `ref_class: HashMap<VarId, Option<Iri>>` — for each star member with a constant predicate P and `object_var = Some(?o)` where P resolves (via the mapping) to a **RefObjectMap** with parent class C, record `?o → C`; if `?o` is the object of ≥2 refs with **different** parents, set `None` (DECLINE). (Resolve P→ref by scanning `mapping` POMs for a RefObjectMap whose predicate == P.)
+2. **Invariant (A) pollution scan (conservative first cut, single-required-ref):** `?o` qualifies ONLY if its sole roles in this scope are (i) object of that one ref member and (ii) subject of its own star. Any other appearance DECLINES: scan the scope's non-star `result_patterns` (`Values`/`Union`/`Optional`/`Minus`/`Exists`/`Service`/`Subquery`) via `Pattern::referenced_vars` for `?o`; also DECLINE if `?o` is an object of a second (non-ref) member, or a `class_groups` subject with a different class. (These cover the UNION/VALUES/other-triple/different-parent-ref decline set.)
+3. **Injection in the star-emit loop:** for the star on subject S, if `ref_class[S] == Some(C)`, S is not polluted, S has no fused/standalone class already, and `wildcard_class_fusion_is_safe(mapping, C)` — set `base.class_prune_hint = Some(C)`.
+4. **Tests (DoD 3, all in-scope):** the 5 DECLINE hermetics (UNION-bound `?o`, second non-ref binder, `VALUES ?o`, different-parent second ref, (B) template-sharing map) each assert `class_prune_hint == None`; the positive q031-shape asserts `class_prune_hint == Some(edw:Product)`. Mirror the existing `class_prune_hint_set_when_disjoint_but_not_fusable` / `class_prune_hint_refused_under_vertical_partition` tests (`rewrite.rs:1381/1408`).
+5. **Live gate:** q031 ON vs OFF — `load_table.n` 7→2, `scan_table` collapse, rows-parity; full-corpus baseline at head.
+
+**Estimated blast:** ~80–120 lines in `rewrite.rs` (pre-analysis + injection) + ~6 hermetic tests; zero operator change. Ready to implement on the lead's go (already given); branch `perf/r2rml-q031-refprune` off `perf/r2rml-pr4d`.
 
 ## Open questions — RESOLVED (lead, 2026-07-14)
 
