@@ -1,8 +1,8 @@
 # PR-F18 — q031 LIMIT-pushdown × correlated-driving re-scan — DESIGN SKETCH
 
 **Branch:** `fix/f18-q031-memo-limit` (off `fix/f9-virtual-curie`, #1499 head e1ac1317f)
-**Status:** SKETCH — **STOP for lead review** (no engine code until approved).
-**North-star item 1** (AJ-signed slate). Target: q031 72 s → ≤~3 s cache-thrashed.
+**Status:** INVESTIGATION RECORD — superseded by the lead's ruling. **RULING (2026-07-14): Option 1** — re-scope F18 to a cold-floor item (the PR-8 tail); memo non-engagement split to **F19**. The design scope is now [`18-pr8tail-coldfloor-loadtable-pin.md`](18-pr8tail-coldfloor-loadtable-pin.md); this doc is retained as the evidence trail (the REVISED CONCLUSION at the bottom is what forced the re-frame).
+**North-star item 1** (AJ-signed slate). Target: q031 72 s → single-digit s cache-thrashed.
 
 ## Headline correction (evidence-forced, from the sketch investigation)
 
