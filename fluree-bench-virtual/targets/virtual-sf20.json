@@ -1,7 +1,7 @@
 {
   "id": "virtual-sf20",
   "kind": "virtual",
-  "fluree_home": "/Users/ajohnson/horizon-demo/.fluree",
-  "alias": "enterprise",
-  "description": "Live virtual R2RML/Iceberg graph source over the Snowflake-managed ENTERPRISE_DEMO warehouse at SF20 scale (the registered 'enterprise' source in the horizon-demo home). EXPENSIVE + rate-limited (live Snowflake REST catalog + Parquet reads) — pace queries and avoid full-corpus sweeps against it. NOTE: SF20 data volume differs from native-sf01, so result hashes will NOT match native-sf01; hash comparison is only meaningful against a scale-matched virtual target (see virtual-sf01)."
+  "fluree_home": "/Users/ajohnson/vbench/.fluree",
+  "alias": "enterprise-sf20-v",
+  "description": "Live virtual R2RML/Iceberg graph source over the Snowflake-managed ENTERPRISE_DEMO warehouse at SF20 scale (harness-owned 'enterprise-sf20-v' source, registered 2026-07-14 to replace the retired horizon-demo 'enterprise' source whose stored client_secret had gone stale). EXPENSIVE + rate-limited (live Snowflake REST catalog + Parquet reads) — pace queries and avoid full-corpus sweeps against it. NOTE: SF20 data volume differs from native-sf01, so result hashes will NOT match native-sf01; hash comparison is only meaningful against a scale-matched virtual target (see virtual-sf01)."
 }
