@@ -65,4 +65,28 @@ Rides an existing switch, chosen by the fix lane: **(B)** is a change to the LIM
 3. **Full-corpus baseline at the PR head** (the new gate protocol: cache-thrashed sentinels, per-query manifest `timeout_s`, priming + 3-rep) — no other query regresses in wall or hash.
 4. Native 54/54 + W3C + unit sweeps green; **zero native-path change** (this is r2rml-operator-only; native never instantiates R2rmlScanOperator).
 
-**STOP — design review before implementation.** Key decisions for the lead: (i) fix lane A vs B (pending the sub-question trace — which I'll run first if you want the answer before you rule); (ii) which kill switch; (iii) confirm the blast-radius set (q031 only, q028 watched).
+---
+
+## REVISED CONCLUSION (trace done — the lane framing does NOT fit q031; re-frame needed)
+
+The trace (per-table split + span breakdown + budget/no-budget/warm A/B) settles the split BUT overturns the premise that a memo/limit fix reaches ≤3 s.
+
+**Split (locked):** `1 fact scan + 1447 single-file DIM_PRODUCT re-scans` (12-pr8b measured the identical shape: "1 fact + 1305 single-file DimProduct re-scans"; current counters match — scan_table 1448 = 1+1447, load_table cached at 7, parquet_read 9112 ≈ 7665 fact + 1447 dim). **The fact stream does NOT restart.** By the lead's arithmetic this is the Lane-A quadrant.
+
+**But the wall is NOT the dim re-scans, and NOT the memo:**
+- **q031 = 72 s WITH the budget vs 76 s WITHOUT** — the 1447 dim re-scans add ≈0 to the wall (within noise). They are near-free: `load_table` is cached (7 total, not 1447), so each re-scan just re-reads one already-warm 1-file dim. `PARENT_MEMO` on/off is identical in both budget modes.
+- **q031 was 188 ms fully warm** (the PR-8b reps=3 phase). So the 72 s is **cache-thrashed cold cost**, not a plan pathology.
+- **Span breakdown of the 72 s** (clean re-baseline): `r2rml.load_table` **21.2 s** (7× cold catalog OAuth + manifest — the single biggest cost), `iceberg.parquet_read` 9.8 s, `r2rml.scan_table` 7.5 s (setup overhead), `decode` 5.1 s, `fetch_bytes` 4.2 s, `prefetch` 3.3 s, `oauth_token` 3.2 s, + ~18 s materialization/eval. Every one of these is ~0 warm.
+
+**What a memo/dim fix (Lane A) actually buys:** eliminating the 1447 dim re-scans removes `scan_table` (~7.5 s) + ~1447 dim parquet reads. Net ~10–20 s. **72 s → ~52–62 s — nowhere near ≤3 s.** The dominant costs — cold `load_table` (21 s), cold fact reads/decode/fetch, and the fat-row materialization of a near-full `FACT_INVENTORY_SNAPSHOT` (the `FILTER(?oh<?rp)` is a two-column comparison: un-prunable and selective, so the LIMIT can't cut the fact scan) — are untouched by the memo or the budget.
+
+**So q031's ≤3 s bar is a CACHE-RESIDENCY / COLD-FLOOR problem, not a memo × limit-pushdown problem.** Warm it's already 188 ms; cache-thrashed (the full-corpus run evicts the fact table + re-loads the catalog) it's 72 s. The levers that move the 72 s are the **PR-8 cold-floor family** (persistent catalog to kill the 21 s of cold `load_table`; keeping the fact files resident), NOT the F18 memo/limit knobs. The dim-memo cleanup is a legitimate ~10–20 s tidy but cannot hit the bar alone, and the LIMIT cannot cut the selective un-prunable fact scan.
+
+**RECOMMENDATION — reclassify F18.** q031 is not a memo/limit-pushdown fix. Options for the lead:
+1. **Re-scope F18 → cold-floor for q031** (PR-8 persistent-catalog + fact-residency), targeting the 21 s `load_table` + cold reads. This is the only path to ≤3 s cache-thrashed. Shares the cure with any other cold-catalog-dominated tail query.
+2. **Reclassify q031 as a cache-residency exception** to the ≤3 s bar (it's 188 ms warm; the cache-thrashed number is the 09 caching-variance caveat writ large), and drop it from the plan-fix slate.
+3. **Ship the dim-memo cleanup anyway** as a small correctness/tidy win (fix the correlated sub-context that re-creates `r2rml_parent_memo` — see below), documented as ~10–20 s partial, NOT the ≤3 s fix.
+
+**Bonus — the memo-miss cause (found, for option 3):** `ExecutionContext` has SOME derivations that `clone()` the shared `r2rml_parent_memo` (context.rs:1103/1161) and OTHERS that create a fresh `::default()` (337/392/451/499/546/595/1222). The correlated per-driving-batch sub-execution almost certainly derives via a `::default()` path, so the "query-scoped" memo is re-created (populated-and-discarded) per batch → never hits (explains PARENT_MEMO on/off ≡). The one-line-ish fix is to thread the parent's memo (clone) into that derivation — but per the arithmetic above it's a ~10-20 s tidy, not the ≤3 s lever.
+
+**STOP — the lane decision is moot; the re-frame is the decision.** Which of options 1/2/3 (or a combination) for q031? And should this bump the slate priority (a cold-floor PR would also help other cache-thrashed tail entries, and it's the north-star's real long pole)? No engine code pending your call.
