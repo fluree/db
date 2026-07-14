@@ -18,8 +18,9 @@
 //! ```
 //! Connection defaults target `ENTERPRISE_DEMO.DW`; the sampled table is
 //! `DW.DIM_CUSTOMER` unless overridden via `ICEBERG_NAMESPACE` / `ICEBERG_TABLE`.
-//! Any connection field is overridable via env (`ICEBERG_CATALOG_URI`,
-//! `ICEBERG_WAREHOUSE`, `ICEBERG_OAUTH2_TOKEN_URL`, `ICEBERG_OAUTH2_SCOPE`,
+//! `ICEBERG_CATALOG_URI` is REQUIRED (no account default is committed; the test
+//! skips without it). Other connection fields are overridable via env
+//! (`ICEBERG_WAREHOUSE`, `ICEBERG_OAUTH2_TOKEN_URL`, `ICEBERG_OAUTH2_SCOPE`,
 //! `ICEBERG_OAUTH2_CLIENT_ID`, `ICEBERG_OAUTH2_CLIENT_SECRET`).
 
 use fluree_db_api::{
@@ -55,14 +56,19 @@ fn resolve_pat() -> Option<String> {
     None
 }
 
+/// Resolve the REST catalog URI from `ICEBERG_CATALOG_URI`. REQUIRED: no
+/// account default is committed to the repo — `None` is the skip signal.
+fn resolve_catalog_uri() -> Option<String> {
+    std::env::var("ICEBERG_CATALOG_URI")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Build the connection EXACTLY as solo's `build_iceberg_connection` does:
 /// REST + OAuth2 client-credentials with an EMPTY `client_id`, a `session:role:`
 /// scope, and the warehouse.
-fn build_connection(pat: &str) -> IcebergConnectionConfig {
-    let catalog_uri = env_or(
-        "ICEBERG_CATALOG_URI",
-        "https://abacyou-pp85756.snowflakecomputing.com/polaris/api/catalog",
-    );
+fn build_connection(pat: &str, catalog_uri: String) -> IcebergConnectionConfig {
     let token_url = env_or(
         "ICEBERG_OAUTH2_TOKEN_URL",
         &format!("{catalog_uri}/v1/oauth/tokens"),
@@ -88,8 +94,12 @@ async fn sample_rows_and_column_live_snowflake() {
         eprintln!("SKIP: no PAT resolvable (set ICEBERG_OAUTH2_CLIENT_SECRET or ICEBERG_PAT_FILE)");
         return;
     };
+    let Some(catalog_uri) = resolve_catalog_uri() else {
+        eprintln!("SKIP: set ICEBERG_CATALOG_URI (no account default is committed)");
+        return;
+    };
 
-    let conn = build_connection(&pat);
+    let conn = build_connection(&pat, catalog_uri);
     let namespace = env_or("ICEBERG_NAMESPACE", "DW");
     let table_name = env_or("ICEBERG_TABLE", "DIM_CUSTOMER");
     let table = TableIdentifier::new(&namespace, &table_name);

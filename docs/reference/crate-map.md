@@ -58,6 +58,7 @@ fluree-db/
 │
 └── Top-Level
     ├── fluree-db-api/             # Public API and high-level operations
+    ├── fluree-db-bolt/            # Bolt protocol codec + session machine
     └── fluree-db-server/          # HTTP server (binary)
 ```
 
@@ -569,6 +570,18 @@ fluree-db/
 - fluree-db-reasoner
 - fluree-db-shacl
 
+### fluree-db-bolt
+
+**Purpose:** Bolt protocol (Neo4j wire protocol) server-side codec
+
+**Responsibilities:**
+- PackStream encode/decode
+- Chunked message framing + handshake version negotiation
+- Autocommit session state machine (pure — no IO, no Fluree deps)
+
+**Dependencies:**
+- (none beyond `tracing`; the server crate owns TCP + execution glue)
+
 ### fluree-db-server
 
 **Purpose:** HTTP server (binary)
@@ -578,9 +591,11 @@ fluree-db/
 - Request routing
 - Response formatting
 - TLS/SSL, CORS handling
+- Bolt protocol listener (feature `bolt`, via fluree-db-bolt)
 
 **Dependencies:**
 - fluree-db-api
+- fluree-db-bolt (optional)
 - axum
 
 ## Dependency Layers

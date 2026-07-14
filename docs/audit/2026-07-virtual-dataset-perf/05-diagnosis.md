@@ -25,7 +25,7 @@ Every fact-touching DNF has the **same** root, measured identically across three
 
 ## Deep-dive 1 — q046 (ORDER BY + LIMIT): single-scan decode wall
 
-**Shape.** `?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot ORDER BY DESC(?tot) LIMIT 10`. Its A/B twin q045 (pure `LIMIT 10`) = **2.47 s**.
+**Shape.** `?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot ORDER BY DESC(?tot) LIMIT 10`. Its A/B twin q045 (pure `LIMIT 10`) = **2.47 s** (fresh-process, REST/catalog-floor-inclusive; the warm-process hot median is 266 ms — the number the brief cites).
 
 **Evidence.** **1** FACT_ORDER scan, `files_selected=7,670`, 2,322 whole-file decodes in 60 s (~39 files/s), DNF. No scan-count explosion, no operator churn — a single scan grinding through 7,670 files. **Toggle proof:** q045 with `FLUREE_R2RML_LIMIT_PUSHDOWN=0` went **2.47 s → DNF@75 s** — i.e. removing the LIMIT budget reproduces q046's full scan exactly. So the ORDER BY converts the fast pure-LIMIT into the slow full-decode.
 
@@ -87,7 +87,7 @@ Every fact-touching DNF has the **same** root, measured identically across three
 
 | Toggle | Baseline | Toggled | Verdict |
 |---|---|---|---|
-| **q045** `FLUREE_R2RML_LIMIT_PUSHDOWN=0` | 2.47 s (10 rows) | **DNF @ 75 s** | **H2 confirmed load-bearing.** The LIMIT budget pushdown (§5) is *exactly* why pure-LIMIT is fast; without it the full 7,670-file scan runs. This is the same budget the ORDER BY/DISTINCT/GROUP BY modifiers absorb. |
+| **q045** `FLUREE_R2RML_LIMIT_PUSHDOWN=0` | 2.47 s (10 rows, fresh-process) | **DNF @ 75 s** | **H2 confirmed load-bearing.** The LIMIT budget pushdown (§5) is *exactly* why pure-LIMIT is fast; without it the full 7,670-file scan runs. This is the same budget the ORDER BY/DISTINCT/GROUP BY modifiers absorb. |
 | **q022** `FLUREE_FUSED_R2RML_AGG=0` | 2.63 s | 3.90 s (**1.48×**) | **H6 fused-agg confirmed a real win.** Single-table GROUP BY takes the fused path and saves ~⅓ by folding from column batches instead of materializing bindings. (Consistent with the native 1.52× ratio in F6.) |
 
 (Reminder honored: `FLUREE_FUSED_R2RML_AGG` matches exactly `"0"`/`"false"` — inventory §0 note.)

@@ -28,6 +28,13 @@ pub fn lower_expr<E: IriEncoder>(
 ) -> Result<Expression> {
     match e {
         Expr::Var(v) => Ok(Expression::Var(ctx.intern_var(&v.name))),
+        // `null` is a first-class expression value: the unbound binding.
+        // (Comparisons with it are never true, `IS NULL` detects it, and a
+        // projected null renders as JSON null — matching Cypher's semantics
+        // through the engine's unbound handling.)
+        Expr::Lit(Literal::Null(_)) => Ok(Expression::Resolved(Box::new(
+            fluree_db_query::binding::Binding::Unbound,
+        ))),
         Expr::Lit(l) => Ok(Expression::Const(lower_literal(l)?)),
         Expr::Param(_) => Err(LowerError::unsupported(
             "parameter substitution is wired at the API layer, not the lowering layer; submit pre-substituted Cypher in v1",
@@ -56,6 +63,14 @@ pub fn lower_expr<E: IriEncoder>(
             if !matches!(target.as_ref(), Expr::Var(_)) {
                 if let Some(func) = temporal_field_function(key) {
                     let inner = lower_expr(ctx, target, aux)?;
+                    // A temporal-constant target (a folded constructor like
+                    // `date('2024-01-15').month`) folds the component too —
+                    // the runtime extractor needs a variable argument.
+                    if let Expression::Const(v) = &inner {
+                        if let Some(component) = fold_temporal_component(v, key) {
+                            return Ok(Expression::Const(FlakeValue::Long(component)));
+                        }
+                    }
                     return Ok(Expression::call(func, vec![inner]));
                 }
             }
@@ -114,14 +129,11 @@ pub fn lower_expr<E: IriEncoder>(
         }
         Expr::IsNull(inner, _) => {
             let inner = lower_expr(ctx, inner, aux)?;
-            Ok(Expression::call(Function::Not, vec![Expression::call(
-                Function::Bound,
-                vec![inner],
-            )]))
+            Ok(null_check_expr(inner, true))
         }
         Expr::IsNotNull(inner, _) => {
             let inner = lower_expr(ctx, inner, aux)?;
-            Ok(Expression::call(Function::Bound, vec![inner]))
+            Ok(null_check_expr(inner, false))
         }
         Expr::StartsWith(l, r, _) => {
             let l = lower_expr(ctx, l, aux)?;
@@ -325,6 +337,12 @@ pub fn lower_expr<E: IriEncoder>(
                     }
                     return Ok(Expression::call(Function::Str, args));
                 }
+                // Temporal constructors: a constant lexical argument folds to
+                // a typed value at lowering time; zero-arg date()/datetime()
+                // evaluate at runtime (current date / instant).
+                "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration" => {
+                    return lower_temporal_constructor(&name, args);
+                }
                 _ => {}
             }
 
@@ -386,6 +404,74 @@ pub fn lower_expr<E: IriEncoder>(
     }
 }
 
+/// Lower a temporal constructor. `date('2024-01-01')` / `datetime('…')` /
+/// `time('…')` / `duration('P1D')` with a constant string fold to a typed
+/// constant at lowering time; zero-arg `datetime()` / `date()` map to the
+/// runtime `NOW` / `TODAY` functions. Non-constant arguments are deferred.
+fn lower_temporal_constructor(name: &str, args: Vec<Expression>) -> Result<Expression> {
+    match args.as_slice() {
+        [] => match name {
+            // localdatetime() differs from datetime() only in timezone
+            // rendering; both answer the current instant.
+            "datetime" | "localdatetime" => Ok(Expression::call(Function::Now, args)),
+            "date" => Ok(Expression::call(Function::Today, args)),
+            _ => Err(LowerError::unsupported(format!(
+                "zero-argument {name}() is deferred — use datetime() or date(), \
+                 or pass a literal string"
+            ))),
+        },
+        [Expression::Const(FlakeValue::String(s))] => {
+            match fluree_db_core::temporal::cypher_temporal_constructor(name, s) {
+                Some(Ok(value)) => Ok(Expression::Const(value)),
+                Some(Err(e)) => Err(LowerError::unsupported(format!(
+                    "invalid {name}() literal `{s}`: {e}"
+                ))),
+                None => unreachable!("caller matched a temporal constructor name"),
+            }
+        }
+        // Component map: `date({year: 2024, month: 1, day: 15})` etc., with
+        // constant components.
+        [Expression::Map(entries)] => {
+            let fields = temporal_component_fields(name, entries)?;
+            match fluree_db_core::temporal::cypher_temporal_from_components(name, &fields) {
+                Some(Ok(value)) => Ok(Expression::Const(value)),
+                Some(Err(e)) => Err(LowerError::unsupported(format!(
+                    "invalid {name}({{…}}): {e}"
+                ))),
+                None => unreachable!("caller matched a temporal constructor name"),
+            }
+        }
+        _ => Err(LowerError::unsupported(format!(
+            "{name}() takes a literal string (e.g. {name}('2024-01-15')) or a constant \
+             component map (e.g. {name}({{year: 2024}})); for date()/datetime(), no argument"
+        ))),
+    }
+}
+
+/// Extract constant components from a lowered temporal component map.
+fn temporal_component_fields(
+    name: &str,
+    entries: &[(Arc<str>, Expression)],
+) -> Result<Vec<(String, fluree_db_core::temporal::TemporalComponent)>> {
+    use fluree_db_core::temporal::TemporalComponent;
+    entries
+        .iter()
+        .map(|(k, v)| {
+            let c = match v {
+                Expression::Const(FlakeValue::Long(n)) => TemporalComponent::Int(*n),
+                Expression::Const(FlakeValue::String(s)) => TemporalComponent::Str(s.clone()),
+                _ => {
+                    return Err(LowerError::unsupported(format!(
+                        "{name}({{…}}) components must be constant integers (or a timezone \
+                         string) in v1 — `{k}` is not"
+                    )))
+                }
+            };
+            Ok((k.to_string(), c))
+        })
+        .collect()
+}
+
 /// Lower Cypher `substring(s, start[, len])` (0-indexed) to the engine's
 /// `Substr` (1-based) by shifting the start position by `+1`.
 fn lower_substring(args: Vec<Expression>) -> Result<Expression> {
@@ -425,6 +511,37 @@ fn lower_list_predicate_kind(kind: ListPredicateKind) -> IrListPredicateKind {
         ListPredicateKind::Any => IrListPredicateKind::Any,
         ListPredicateKind::None => IrListPredicateKind::None,
         ListPredicateKind::Single => IrListPredicateKind::Single,
+    }
+}
+
+/// Extract a temporal component from a constant date/dateTime/time value
+/// (lowering-time fold of `date('…').month` etc.). Seconds truncate to the
+/// whole-second count, matching the accessor's integer surface.
+fn fold_temporal_component(v: &FlakeValue, key: &str) -> Option<i64> {
+    let key = key.to_ascii_lowercase();
+    match v {
+        FlakeValue::DateTime(dt) => Some(match key.as_str() {
+            "year" => i64::from(dt.year()),
+            "month" => i64::from(dt.month()),
+            "day" => i64::from(dt.day()),
+            "hour" => i64::from(dt.hours()),
+            "minute" => i64::from(dt.minutes()),
+            "second" => dt.seconds() as i64,
+            _ => return None,
+        }),
+        FlakeValue::Date(d) => Some(match key.as_str() {
+            "year" => i64::from(d.year()),
+            "month" => i64::from(d.month()),
+            "day" => i64::from(d.day()),
+            _ => return None,
+        }),
+        FlakeValue::Time(t) => Some(match key.as_str() {
+            "hour" => i64::from(t.hours()),
+            "minute" => i64::from(t.minutes()),
+            "second" => t.seconds() as i64,
+            _ => return None,
+        }),
+        _ => None,
     }
 }
 
@@ -501,13 +618,29 @@ pub(crate) fn resolve_property_accessor<E: IriEncoder>(
     let prop_var_name = format!("?#__prop_{}_{}", target_var.name, key);
     let prop_var = ctx.intern_var(&prop_var_name);
 
-    aux.push(Pattern::Optional(vec![Pattern::Triple(
-        TriplePattern::new(
-            Ref::Var(target_id),
-            Ref::Iri(pred_iri.into()),
-            Term::Var(prop_var),
-        ),
-    )]));
+    // Dedup within the current clause's aux list only (`min(n.age),
+    // max(n.age)` must share one accessor — a repeated Optional over the
+    // same var re-joins the property per occurrence). Cross-scope re-emits
+    // (the WITH-boundary case above) land in a fresh `aux`, so this
+    // clause-local scan never suppresses them.
+    let already_emitted = aux.iter().any(|p| match p {
+        Pattern::Optional(inner) => match inner.as_slice() {
+            [Pattern::Triple(tp)] => {
+                tp.s.as_var() == Some(target_id) && tp.o.as_var() == Some(prop_var)
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    if !already_emitted {
+        aux.push(Pattern::Optional(vec![Pattern::Triple(
+            TriplePattern::new(
+                Ref::Var(target_id),
+                ctx.iri_ref(pred_iri),
+                Term::Var(prop_var),
+            ),
+        )]));
+    }
     Ok(prop_var)
 }
 
@@ -557,6 +690,28 @@ fn lower_case<E: IriEncoder>(
         acc = Expression::call(Function::If, vec![test, val_expr, acc]);
     }
     Ok(acc)
+}
+
+/// Lower `IS NULL` / `IS NOT NULL` over an already-lowered inner expression.
+/// The engine's `Bound` requires a variable, so constant shapes fold here:
+/// a null literal (`null IS NULL` → true) and any other constant (never
+/// null). Variables and computed expressions test via `Bound` as before.
+fn null_check_expr(inner: Expression, is_null: bool) -> Expression {
+    use fluree_db_query::binding::Binding;
+    match &inner {
+        Expression::Resolved(b) if matches!(**b, Binding::Unbound) => {
+            Expression::Const(FlakeValue::Boolean(is_null))
+        }
+        Expression::Const(_) => Expression::Const(FlakeValue::Boolean(!is_null)),
+        _ => {
+            let bound = Expression::call(Function::Bound, vec![inner]);
+            if is_null {
+                Expression::call(Function::Not, vec![bound])
+            } else {
+                bound
+            }
+        }
+    }
 }
 
 pub fn lower_literal(lit: &Literal) -> Result<FlakeValue> {

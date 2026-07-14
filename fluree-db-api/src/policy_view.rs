@@ -321,6 +321,11 @@ pub(crate) async fn resolve_cross_ledger_policy_restrictions(
         ));
     };
 
+    // Wire artifacts can carry f:sparql policy queries; make sure the
+    // executor's SPARQL hooks exist before these restrictions are evaluated.
+    crate::sparql_lang::ensure_sparql_support_registered();
+    crate::cypher_lang::ensure_cypher_support_registered();
+
     fluree_db_policy::wire_to_restrictions(wire, |iri| snapshot.encode_iri(iri), Some(&filter))
         .map_err(crate::error::ApiError::from)
 }

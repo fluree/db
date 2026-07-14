@@ -175,6 +175,11 @@ enum CacheKey {
     /// xxh3_128(leaf CID bytes) — content-addressed → immutable,
     /// no epoch/time dimension needed.
     LeafDir(u128),
+    /// Shared leaf-file memory mapping. Key = xxh3_128(leaf CID bytes) —
+    /// content-addressed → immutable. Caching the mapping saves the
+    /// open+mmap+munmap syscall cycle every cursor otherwise pays per leaf
+    /// access (the dominant fixed cost of an indexed point lookup).
+    LeafMmap(u128),
     /// BM25 posting leaflet. Key = xxh3_128(CAS CID bytes).
     /// Content-addressed → immutable, no epoch/time dimension needed.
     Bm25Leaflet(u128),
@@ -335,6 +340,7 @@ enum CachedEntry {
     R2(CachedRegion2),
     DictLeaf(Arc<[u8]>),
     LeafDir(Arc<DecodedLeafDirV3>),
+    LeafMmap(Arc<memmap2::Mmap>),
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
@@ -353,6 +359,11 @@ impl CachedEntry {
             CachedEntry::R2(r2) => r2.byte_size(),
             CachedEntry::DictLeaf(bytes) => bytes.len(),
             CachedEntry::LeafDir(dir) => dir.byte_size(),
+            // A mapping is file-backed (reclaimable page cache), not heap:
+            // weigh it far below its length so it doesn't crowd out decoded
+            // batches, but keep it length-proportional so total mapped
+            // address space stays bounded by the cache budget (× 64).
+            CachedEntry::LeafMmap(mmap) => (mmap.len() / 64).max(16 * 1024),
             CachedEntry::Bm25Leaflet(bytes) => bytes.len(),
             CachedEntry::VectorShard(shard) => {
                 // Use capacity() for conservative accounting — correct even if
@@ -565,6 +576,36 @@ impl LeafletCache {
         match self.inner.get(&CacheKey::LeafDir(key)) {
             Some(CachedEntry::LeafDir(dir)) => Some(dir),
             _ => None,
+        }
+    }
+
+    /// Get or load the shared memory mapping of a leaf file with
+    /// single-flight and error propagation. Key should be
+    /// `xxh3_128(leaf_cid.to_bytes())` — content-addressed, so entries are
+    /// immutable and self-invalidating on leaf rewrite. NotFound from the
+    /// loader is NOT cached (moka only caches `Ok` values), so a
+    /// remote-promotion cache-miss probe stays a cheap error path.
+    pub fn try_get_or_load_leaf_mmap<F>(
+        &self,
+        key: u128,
+        load_fn: F,
+    ) -> io::Result<Arc<memmap2::Mmap>>
+    where
+        F: FnOnce() -> io::Result<Arc<memmap2::Mmap>>,
+    {
+        // Fast path: a plain hit must not pay the block_in_place cost.
+        if let Some(CachedEntry::LeafMmap(mmap)) = self.inner.get(&CacheKey::LeafMmap(key)) {
+            return Ok(mmap);
+        }
+        let result = in_blocking_region(|| {
+            self.inner.try_get_with(CacheKey::LeafMmap(key), || {
+                load_fn().map(CachedEntry::LeafMmap)
+            })
+        });
+        match result {
+            Ok(CachedEntry::LeafMmap(mmap)) => Ok(mmap),
+            Ok(_) => unreachable!("LeafMmap key always maps to LeafMmap entry"),
+            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
         }
     }
 

@@ -57,6 +57,7 @@ use fluree_db_query::QueryPolicyEnforcer;
 use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use futures::FutureExt;
 use serde_json::{json, Value as JsonValue};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -96,6 +97,11 @@ type CacheKey = (usize, Sid, u64, usize, Option<Arc<str>>);
 struct HydrationCaches {
     results: HashMap<CacheKey, JsonValue>,
     reencoded_levels: HashMap<(usize, usize), Arc<NestedSelectSpec>>,
+    /// Post-policy wildcard subject flakes, shared across rows, levels, and
+    /// nested ref expansion; bulk-populated by [`prefetch_wildcard_roots`].
+    /// Keyed by primary-view Sid — single-ledger only (dataset mode routes
+    /// per-ledger views whose Sids share an encoding space).
+    subject_flakes: HashMap<Sid, Arc<Vec<Flake>>>,
 }
 
 /// Depth bookkeeping for one hydration call.
@@ -755,6 +761,82 @@ impl<'a> FormatterSet<'a> {
     }
 }
 
+/// Concurrent wildcard-root fetches in flight during [`prefetch_wildcard_roots`].
+const PREFETCH_CONCURRENCY: usize = 16;
+
+/// Bulk-fetch the top-level subjects of wildcard hydration columns before
+/// the row walk. The engine has already produced the subject list, so these
+/// are independent point reads — issue them with bounded concurrency in
+/// subject order (leaflet locality) instead of one awaited SPOT scan per
+/// row. Runs through [`HydrationFormatter::fetch_subject_properties`], so
+/// policy filtering and fuel charging are identical to the on-demand path.
+///
+/// Single-ledger only: dataset hydration routes each root to its
+/// home-ledger view, and per-ledger Sids share an encoding space, so a
+/// Sid-keyed cache would be ambiguous there. Explicit (non-wildcard)
+/// projections keep their narrowed per-predicate reads. Nested ref
+/// expansion still fetches on demand but reads through the same cache.
+async fn prefetch_wildcard_roots(
+    set: &FormatterSet<'_>,
+    result: &QueryResult,
+    columns: &[Column],
+    cache: &mut HydrationCaches,
+) -> Result<()> {
+    let primary = set.primary();
+    if primary.dataset.is_some() || set.formatters.len() > 1 {
+        return Ok(());
+    }
+
+    let mut wanted: Vec<Sid> = Vec::new();
+    for column in columns {
+        let Column::Hydration(spec) = column else {
+            continue;
+        };
+        if predicate_filter_for_level(&spec.level).is_some() {
+            continue;
+        }
+        match &spec.root {
+            Root::Sid(sid) => wanted.push(sid.clone()),
+            Root::Var(var_id) => {
+                for batch in &result.batches {
+                    for row_idx in 0..batch.len() {
+                        let Some(root) =
+                            resolve_root_sid_from_binding(result, batch.get(row_idx, *var_id))?
+                        else {
+                            continue;
+                        };
+                        if root.ledger_alias.is_none() {
+                            wanted.push(root.sid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    wanted.sort_unstable_by(|a, b| {
+        (a.namespace_code, a.name.as_ref()).cmp(&(b.namespace_code, b.name.as_ref()))
+    });
+    wanted.dedup();
+    wanted.retain(|sid| !cache.subject_flakes.contains_key(sid));
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    let fetched: Vec<(Sid, Vec<Flake>)> = stream::iter(wanted.into_iter().map(|sid| async move {
+        let flakes = primary.fetch_subject_properties(&sid, None).await?;
+        Ok::<_, FormatError>((sid, flakes))
+    }))
+    .buffer_unordered(PREFETCH_CONCURRENCY)
+    .try_collect()
+    .await?;
+
+    for (sid, flakes) in fetched {
+        cache.subject_flakes.insert(sid, Arc::new(flakes));
+    }
+    Ok(())
+}
+
 /// Shared row loop for single-view and dataset hydration.
 ///
 /// Flat (`Column::Var`) columns are formatted with the primary view's
@@ -772,6 +854,7 @@ async fn run_hydration_rows(set: &FormatterSet<'_>, result: &QueryResult) -> Res
     // Shared per-response cache, reused across all rows and hydration columns.
     // See `HydrationCaches` for the key shape and what each map memoizes.
     let mut cache = HydrationCaches::default();
+    prefetch_wildcard_roots(set, result, columns, &mut cache).await?;
     let mut rows: Vec<JsonValue> = Vec::new();
 
     // If the underlying query produced no solutions, expansion produces no
@@ -1076,15 +1159,33 @@ impl<'a> HydrationFormatter<'a> {
             // even though the row loop drops every row. `@id` and reverse
             // properties are emitted by the dedicated paths further down.
             let predicate_filter = predicate_filter_for_level(level);
-            let flakes = match predicate_filter.as_deref() {
-                Some([]) => Vec::new(),
-                Some([only]) => self.fetch_subject_predicate_pair(sid, only).await?,
-                _ => self.fetch_subject_properties(sid, predicate_filter).await?,
+            let flakes: Arc<Vec<Flake>> = match predicate_filter.as_deref() {
+                Some([]) => Arc::new(Vec::new()),
+                Some([only]) => Arc::new(self.fetch_subject_predicate_pair(sid, only).await?),
+                // Wildcard: read through the shared flake cache (bulk-filled
+                // by the prefetch pass for top-level roots; nested refs and
+                // repeat subjects fill it on demand). Dataset mode bypasses
+                // the cache — per-ledger Sids share an encoding space.
+                // Wildcard ONLY: a narrowed K ≥ 2 projection must keep its
+                // predicate_filter (the filter drops rows before decode and
+                // dict-touch fuel; caching the unfiltered set would silently
+                // pay for every predicate).
+                None if self.dataset.is_none() => match cache.subject_flakes.get(sid) {
+                    Some(hit) => Arc::clone(hit),
+                    None => {
+                        let fetched = Arc::new(self.fetch_subject_properties(sid, None).await?);
+                        cache
+                            .subject_flakes
+                            .insert(sid.clone(), Arc::clone(&fetched));
+                        fetched
+                    }
+                },
+                _ => Arc::new(self.fetch_subject_properties(sid, predicate_filter).await?),
             };
 
             // Group flakes by predicate
             let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
-            for flake in &flakes {
+            for flake in flakes.iter() {
                 by_pred.entry(flake.p.clone()).or_default().push(flake);
             }
 

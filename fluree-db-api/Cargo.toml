@@ -44,6 +44,7 @@ full = ["native", "credential", "iceberg", "shacl", "ipfs"]
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
+lru = { workspace = true }
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
 fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-policy = { path = "../fluree-db-policy" }
@@ -89,9 +90,9 @@ xxhash-rust.workspace = true
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
-# Fast integer/float formatting for TSV output (zero-alloc)
+# Fast integer formatting for TSV output (zero-alloc); doubles use the
+# canonical xsd:double writer from fluree-graph-ir
 itoa.workspace = true
-ryu.workspace = true
 # CSV bulk import (neo4j-admin header convention → JSON-LD front-end)
 csv = "1.4"
 # Percent-encode CSV cell values into safe IRI segments
@@ -199,6 +200,30 @@ name = "it_minmax_fast_path_fired"
 path = "tests/it_minmax_fast_path_fired.rs"
 
 [[test]]
+name = "it_multi_graph_property_path"
+path = "tests/it_multi_graph_property_path.rs"
+
+[[test]]
+name = "it_query_cypher"
+path = "tests/it_query_cypher.rs"
+
+[[test]]
+name = "it_query_cypher_fullscan"
+path = "tests/it_query_cypher_fullscan.rs"
+
+[[test]]
+name = "it_policy_cypher"
+path = "tests/it_policy_cypher.rs"
+
+[[test]]
+name = "it_csv_import"
+path = "tests/it_csv_import.rs"
+
+[[test]]
+name = "it_cypher_import"
+path = "tests/it_cypher_import.rs"
+
+[[test]]
 name = "it_query_explain"
 path = "tests/it_query_explain.rs"
 
@@ -239,6 +264,11 @@ required-features = ["iceberg"]
 name = "it_iceberg_direct"
 path = "tests/it_iceberg_direct.rs"
 required-features = ["iceberg", "aws-testcontainers"]
+
+[[test]]
+name = "it_tpch_iceberg_bench"
+path = "tests/it_tpch_iceberg_bench.rs"
+required-features = ["iceberg"]
 
 [[test]]
 name = "it_storage_s3_testcontainers"
@@ -306,6 +336,14 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm_bi"
+harness = false
+
+[[bench]]
+name = "query_hot_property_path"
+harness = false
+
+[[bench]]
+name = "query_hot_whole_graph_agg"
 harness = false
 
 [lints]

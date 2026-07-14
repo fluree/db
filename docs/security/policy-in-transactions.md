@@ -83,6 +83,54 @@ Crucially, the policy is checked against the **flakes**, not the operation type.
 
 Enforcement is also independent of the **wire format**: the check runs on the staged flakes, so JSON-LD, SPARQL UPDATE, and Turtle / TriG / N-Triples writes are all governed by the same `f:modify` policy. Sending data as Turtle is not a way to bypass write policy.
 
+Class targeting on the write side is **exact**: an `f:onClass` modify policy governs *every* flake whose subject is an instance of the class — including properties the class has never carried before. (Read-side class targeting uses the committed class→property index; write-side targeting matches by the subject's classes directly, since a write may introduce class/property combinations no committed data predicts.)
+
+## Write verbs
+
+`f:action` accepts three write verbs — `f:create`, `f:update`, `f:delete` — that refine `f:modify` by the subject's **lifecycle** within the transaction:
+
+| subject exists pre-state | exists post-state | lifecycle |
+|--------------------------|-------------------|-----------|
+| no                       | yes               | `f:create` |
+| yes                      | yes               | `f:update` |
+| yes                      | no                | `f:delete` |
+
+Every staged flake inherits its subject's lifecycle verb. There is no in-place mutation in RDF — changing a value stages a retract of the old value plus an assert of the new one — so the verbs are deliberately *entity-lifecycle* verbs, not flake-op verbs:
+
+- **Changing** a value on an existing subject is entirely `f:update` (both the retract and the assert).
+- **Clearing** a value while the subject persists is `f:update`.
+- **Removing** the subject outright (all of its flakes retracted) is `f:delete`.
+- **Inserting** a subject that didn't exist is `f:create` — all of its flakes.
+
+This matches the SQL intuition (`UPDATE` can `SET x = NULL`; `DELETE` removes the row) and makes the common grants direct to express.
+
+### Verb semantics vs bare `f:modify`
+
+Verb policies get **exact** semantics on two axes where bare `f:modify` keeps its legacy behavior:
+
+1. **Class targeting is pre ∪ post.** A verb policy with `f:onClass ex:Lead` matches flakes whose subject is a Lead before *or after* the transaction. "May create new Leads" is therefore one policy — the created subject's post-state class is visible to targeting. A deny cannot be escaped by un-typing the subject in the same transaction. (Bare `f:modify` class targeting matches pre-state classes only, so it never applies to brand-new subjects — the [immutable-records pattern](#immutable-records) below relies on this.)
+2. **`rdf:type` flakes match by the class they mint or remove.** Asserting `rdf:type ex:Lead` is an operation *on `ex:Lead`* — it requires a grant whose class target covers Lead, and a grant scoped to Lead can never mint `ex:Contract`, even smuggled alongside a legitimate Lead typing. Under `default-allow: false`, class-scoped create grants are therefore also class-mint constraints, exactly like SQL's `GRANT INSERT ON lead`.
+
+### "May create new X"
+
+```json
+{
+  "@id": "ex:leadCreators",
+  "@type": ["f:AccessPolicy", "ex:ApiKeyPolicy"],
+  "f:onClass": [{"@id": "http://example.org/ns/Lead"}],
+  "f:action": {"@id": "f:create"},
+  "f:allow": true
+}
+```
+
+With `default-allow: false`, the holder can insert new `ex:Lead` subjects (any of their properties — typing the new subject as `ex:Lead` in the same transaction is what brings it under the grant) and nothing else: no other class can be minted, existing Leads can't be edited or removed. Pair with a SHACL shape (`sh:closed`, required properties) to constrain *what a valid Lead looks like* — the shape is identity-invariant; the policy is who may create.
+
+### Lifecycle edge cases
+
+- A subject can be hollowed out by an `f:update` holder — values removed one by one — but never fully removed: retracting its last flakes classifies as `f:delete`. Use SHACL `sh:minCount` on required properties to prevent degrading below the shape's minimum.
+- Retract-only writes against a nonexistent subject net to nothing and classify as `f:update` (no create/delete grant is consumed by a no-op).
+- Property-level append-only policies ("may add tags but never remove them") are below the verbs' resolution; express them as a condition on `?$op`: a required `f:onProperty` policy with `ASK { FILTER($op = "assert") }`.
+
 ## Config-driven write enforcement
 
 The ledger's `#config` graph governs writes the same way it governs reads:
@@ -167,21 +215,22 @@ End-user identities can read `ex:approved`, but only the workflow service can wr
 
 ### Immutable records
 
+The verb form states the intent directly — insertable, never editable or removable:
+
 ```json
 {
   "@id": "ex:audit-log-immutable",
   "@type": ["f:AccessPolicy", "ex:CorpPolicy"],
-  "f:required": true,
   "f:onClass": [{"@id": "http://example.org/AuditEvent"}],
-  "f:action": [{"@id": "f:modify"}],
+  "f:action": [{"@id": "f:update"}, {"@id": "f:delete"}],
   "f:exMessage": "Audit events are immutable.",
   "f:allow": false
 }
 ```
 
-Notice the absence of `f:query` — `f:allow: false` is a flat deny, applied to every modification of `ex:AuditEvent` instances. New events can still be inserted because the policy targets only existing-instance flakes; a fresh `@type: ex:AuditEvent` insertion creates a new subject and a new `rdf:type` flake, neither of which the targeting matches.
+Notice the absence of `f:query` — `f:allow: false` is a flat deny, applied to every update or delete of `ex:AuditEvent` instances. New events insert freely (pair with a create grant under `default-allow: false`). Because verb-policy `rdf:type` targeting matches the class being retracted, the deny also blocks *un-typing* an audit event — the type flake can't be stripped to escape the class.
 
-(For a hard "append-only" guarantee that forbids anything but new insertions, model the constraint with a SHACL shape that requires the property to be unset on prior commits — SHACL is a better fit for that pattern than policy.)
+The legacy spelling — `f:action: [{"@id": "f:modify"}]` — still works: bare `f:modify` class targeting matches pre-state classes only, so a fresh `@type: ex:AuditEvent` insertion creates a new subject the targeting doesn't match. Prefer the verb form for new policies; it says what it means and closes the un-typing edge.
 
 ## Failure shape
 

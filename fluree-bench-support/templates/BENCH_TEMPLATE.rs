@@ -95,11 +95,15 @@ fn bench_main(c: &mut Criterion) {
     // `iter_batched(setup, |x| measured_op(x), batch)` so setup is excluded
     // from measurement.
     //
-    // Example (uncomment and adapt):
+    // Example (uncomment and adapt; rename `_rt` above to `rt`). All
+    // `FlureeBuilder::build*` methods — including the synchronous
+    // `build_memory()` — spawn tasks and must run inside the runtime:
     //
     //     use fluree_bench_support::next_ledger_alias;
     //     use fluree_bench_support::gen::people;
-    //     let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+    //     let fluree = rt.block_on(async {
+    //         fluree_db_api::FlureeBuilder::memory().build_memory()
+    //     });
     //     let txns: Vec<_> = (0..10)
     //         .map(|i| people::generate_txn_data(i, 100))
     //         .map(|d| people::txn_data_to_jsonld(&d))

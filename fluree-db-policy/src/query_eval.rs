@@ -24,7 +24,7 @@ use crate::types::PolicyQuery;
 use crate::Result;
 use core::future::Future;
 use core::pin::Pin;
-use fluree_db_core::Sid;
+use fluree_db_core::FlakeValue;
 use std::collections::HashMap;
 
 /// Future type for policy query evaluation.
@@ -47,9 +47,11 @@ pub type PolicyQueryFut<'a> = Pin<Box<dyn Future<Output = Result<bool>> + 'a>>;
 /// # Variable Bindings
 ///
 /// The `bindings` parameter contains pre-bound special variables:
-/// - `?$this` - The subject being checked
-/// - `?$identity` - The requesting identity
-/// - Additional user-provided policy values
+/// - `?$this` - The subject being checked (`FlakeValue::Ref`)
+/// - `?$identity` - The requesting identity (`FlakeValue::Ref`)
+/// - `?$value` - The object of the flake being authorized
+/// - `?$op` - `"assert"` / `"retract"` (write path; reads bind `"assert"`)
+/// - Additional user-provided policy values (`FlakeValue::Ref`)
 ///
 /// # Execution Context
 ///
@@ -85,7 +87,7 @@ pub trait PolicyQueryExecutor: Send + Sync {
     fn evaluate_policy_query<'a>(
         &'a self,
         query: &'a PolicyQuery,
-        bindings: &'a HashMap<String, Sid>,
+        bindings: &'a HashMap<String, FlakeValue>,
     ) -> PolicyQueryFut<'a>;
 }
 
@@ -95,7 +97,7 @@ pub trait PolicyQueryExecutor {
     fn evaluate_policy_query<'a>(
         &'a self,
         query: &'a PolicyQuery,
-        bindings: &'a HashMap<String, Sid>,
+        bindings: &'a HashMap<String, FlakeValue>,
     ) -> PolicyQueryFut<'a>;
 }
 
@@ -110,7 +112,7 @@ impl PolicyQueryExecutor for NoOpQueryExecutor {
     fn evaluate_policy_query<'a>(
         &'a self,
         _query: &'a PolicyQuery,
-        _bindings: &'a HashMap<String, Sid>,
+        _bindings: &'a HashMap<String, FlakeValue>,
     ) -> PolicyQueryFut<'a> {
         Box::pin(async move {
             // Conservative default: query policies don't allow

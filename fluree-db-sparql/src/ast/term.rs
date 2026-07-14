@@ -92,6 +92,30 @@ impl Iri {
             span,
         }
     }
+
+    /// Create a reference to `rdf:first` (RDF collection desugaring).
+    pub fn rdf_first(span: SourceSpan) -> Self {
+        Self {
+            value: IriValue::Full(Arc::from(fluree_vocab::rdf::FIRST)),
+            span,
+        }
+    }
+
+    /// Create a reference to `rdf:rest` (RDF collection desugaring).
+    pub fn rdf_rest(span: SourceSpan) -> Self {
+        Self {
+            value: IriValue::Full(Arc::from(fluree_vocab::rdf::REST)),
+            span,
+        }
+    }
+
+    /// Create a reference to `rdf:nil` (the empty RDF collection `()`).
+    pub fn rdf_nil(span: SourceSpan) -> Self {
+        Self {
+            value: IriValue::Full(Arc::from(fluree_vocab::rdf::NIL)),
+            span,
+        }
+    }
 }
 
 /// The value of an IRI reference.
@@ -273,6 +297,15 @@ pub enum Term {
     Literal(Literal),
     /// Blank node
     BlankNode(BlankNode),
+    /// RDF 1.2 reified triple `<< s p o ~ r? >>` in object position.
+    ///
+    /// Per SPARQL 1.2, a reified triple used as a term denotes its
+    /// *reifier* node: `:a :b << s p o ~ r >>` is sugar for
+    /// `:a :b r . r rdf:reifies <<( s p o )>>` (with a fresh
+    /// non-distinguished reifier when `~ r` is absent). The lowering
+    /// layer performs that desugaring; contexts that cannot express it
+    /// (e.g. UPDATE templates) reject with a clean deferred error.
+    QuotedTriple(Box<QuotedTriple>),
 }
 
 impl Term {
@@ -283,6 +316,7 @@ impl Term {
             Term::Iri(i) => i.span,
             Term::Literal(l) => l.span,
             Term::BlankNode(b) => b.span,
+            Term::QuotedTriple(q) => q.span,
         }
     }
 
@@ -330,12 +364,29 @@ pub struct QuotedTriple {
     pub predicate: PredicateTerm,
     /// The object of the quoted triple
     pub object: Box<Term>,
+    /// RDF 1.2 in-triple reifier: `<< s p o ~ id? >>`.
+    ///
+    /// `None` means no `~` was present — the form remains eligible for
+    /// the legacy Fluree `f:t`/`f:op` history reading. `Some` with
+    /// `id: None` is a bare `~` (mint a fresh reifier at lowering).
+    pub reifier: Option<QtReifier>,
     /// Source span (including << and >>)
     pub span: SourceSpan,
 }
 
+/// The `~ id?` reifier tail inside an RDF 1.2 reified triple
+/// (`ReifiedTriple ::= '<<' rtSubject Verb rtObject Reifier? '>>'`,
+/// `Reifier ::= '~' VarOrReifierId?`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct QtReifier {
+    /// Explicit reifier id; `None` for a bare `~`.
+    pub id: Option<crate::ast::annotation::ReifierId>,
+    /// Span of the `~` (unioned with the id when present).
+    pub span: SourceSpan,
+}
+
 impl QuotedTriple {
-    /// Create a new quoted triple.
+    /// Create a new quoted triple with no in-triple reifier.
     pub fn new(
         subject: SubjectTerm,
         predicate: PredicateTerm,
@@ -346,8 +397,15 @@ impl QuotedTriple {
             subject: Box::new(subject),
             predicate,
             object: Box::new(object),
+            reifier: None,
             span,
         }
+    }
+
+    /// Attach an RDF 1.2 in-triple reifier (`<< s p o ~ id? >>`).
+    pub fn with_reifier(mut self, reifier: Option<QtReifier>) -> Self {
+        self.reifier = reifier;
+        self
     }
 }
 

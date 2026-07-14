@@ -200,6 +200,24 @@ struct GraphIndex {
 /// must change with it, or the translation cache will serve stale ids.
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whole-leaf bytes: a shared memory mapping when the leaf is local
+/// (saving the per-call open/read/copy), or an owned buffer for remote
+/// leaves.
+pub enum SharedLeafBytes {
+    Mmap(Arc<memmap2::Mmap>),
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for SharedLeafBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            SharedLeafBytes::Mmap(mmap) => mmap,
+            SharedLeafBytes::Owned(bytes) => bytes,
+        }
+    }
+}
+
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
 ///
 /// - Routing via `BranchManifest` (sidecar CIDs for history)
@@ -570,6 +588,44 @@ impl BinaryIndexStore {
     }
 
     /// Fetch leaf bytes by CID: local path first, then CAS with caching.
+    /// Leaf bytes served from the shared mmap cache when the leaf is on
+    /// local disk (or promoted to the disk cache), falling back to an owned
+    /// read for remote leaves. Point-lookup scan lanes read whole leaves
+    /// through this instead of [`Self::get_leaf_bytes_sync`], which copies
+    /// the full file into a fresh `Vec` on every call.
+    pub fn get_leaf_bytes_shared(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
+        if let Some(cs) = self.cas.as_ref() {
+            let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+            let mut local = cs.resolve_local_path(leaf_cid);
+            let promoted = self.cache_dir.join(leaf_cid.to_string());
+            if local.is_none() && promoted.exists() {
+                local = Some(promoted);
+            }
+            if let Some(path) = local {
+                let load = || -> io::Result<Arc<memmap2::Mmap>> {
+                    let file = std::fs::File::open(&path)?;
+                    // SAFETY: leaf files are immutable, content-addressed
+                    // CAS artifacts — never modified after write.
+                    Ok(Arc::new(unsafe { memmap2::Mmap::map(&file)? }))
+                };
+                let result = if let Some(cache) = &self.leaflet_cache {
+                    cache.try_get_or_load_leaf_mmap(leaf_id, load)
+                } else {
+                    load()
+                };
+                match result {
+                    Ok(mmap) => return Ok(SharedLeafBytes::Mmap(mmap)),
+                    // Path raced away (GC/promotion churn): fall back to the
+                    // owned read, which retries resolution from scratch.
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        self.get_leaf_bytes_sync(leaf_cid)
+            .map(SharedLeafBytes::Owned)
+    }
+
     pub fn get_leaf_bytes_sync(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
         let cs = self
             .cas
@@ -760,10 +816,21 @@ impl BinaryIndexStore {
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
-        let file = std::fs::File::open(path)?;
         // SAFETY: leaf files are immutable, content-addressed CAS artifacts —
         // never modified after write, so the mapping's bytes are stable.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // The mapping is created once per leaf and shared through the cache:
+        // the open+mmap (and later munmap) syscall cycle dominated the fixed
+        // cost of an indexed point lookup. `Mmap` does not hold the file
+        // descriptor, so cached mappings cost address space, not fds.
+        let load = || -> io::Result<Arc<memmap2::Mmap>> {
+            let file = std::fs::File::open(path)?;
+            Ok(Arc::new(unsafe { memmap2::Mmap::map(&file)? }))
+        };
+        let mmap = if let Some(cache) = &self.leaflet_cache {
+            cache.try_get_or_load_leaf_mmap(leaf_id, load)?
+        } else {
+            load()?
+        };
         // Content-addressed directory: parse once per leaf CID, reused across
         // opens. `leaf_id` == xxh3_128(leaf_cid) is the same key `open_leaf_dir`
         // and warm-on-write use.

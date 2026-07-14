@@ -100,18 +100,67 @@ pub(crate) fn parse_sparql_to_ir(
 
 /// Parse a Cypher (openCypher 9) query and prepare it for execution.
 ///
-/// Cypher has no prologue/prefix syntax of its own. The ledger's
-/// default JSON-LD context supplies `@vocab` (used to resolve bare
-/// labels/types/property keys) and named term mappings (used as
-/// overrides). Without a default context, the lowering falls back to
-/// `http://example.org/` for the vocab — useful for tests, not for
-/// production data.
+/// Cypher has no prologue/prefix syntax of its own. Bare identifiers
+/// (labels/types/property keys) are plain namespace-0 names by
+/// default; the ledger's default JSON-LD context can opt into RDF
+/// compat by supplying `@vocab` (a prefix for bare identifiers) and
+/// named term mappings (per-name overrides).
 pub(crate) fn parse_cypher_to_ir(
     cypher: &str,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
+    let ast = substituted_cypher_ast(cypher, params)?;
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay, policy)
+}
+
+/// Statements longer than this are parsed but never cached: unique bulk
+/// payloads (inline CREATE data) would evict the short, hot statements the
+/// cache exists for, and entry count — not bytes — bounds the LRU.
+const MAX_CACHED_STATEMENT_LEN: usize = 8 * 1024;
+
+/// Process-wide parsed-AST LRU, keyed on statement text.
+///
+/// The cached value is the **pre-substitution** AST: text-only key, ledger
+/// independent, immutable. Callers clone the `Arc`'d AST and run
+/// `substitute_params` on the clone, so per-request cost under a hit is
+/// clone + substitute instead of a full parse. Capacity comes from
+/// `FLUREE_CYPHER_AST_CACHE` (entries, default 512; `0` disables), read once.
+#[allow(clippy::type_complexity)]
+fn cypher_ast_cache(
+) -> Option<&'static parking_lot::Mutex<lru::LruCache<Box<str>, Arc<fluree_db_cypher::CypherAst>>>>
+{
+    use std::num::NonZeroUsize;
+    use std::sync::OnceLock;
+    #[allow(clippy::type_complexity)]
+    static CACHE: OnceLock<
+        Option<parking_lot::Mutex<lru::LruCache<Box<str>, Arc<fluree_db_cypher::CypherAst>>>>,
+    > = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let capacity = std::env::var("FLUREE_CYPHER_AST_CACHE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512);
+            NonZeroUsize::new(capacity).map(|c| parking_lot::Mutex::new(lru::LruCache::new(c)))
+        })
+        .as_ref()
+}
+
+/// Parse Cypher source through the process-wide AST cache.
+///
+/// Only successful parses are cached; parse failures re-parse on every call
+/// so diagnostics stay exact. Returns the shared pre-substitution AST — do
+/// not mutate through the `Arc`; clone first (see [`substituted_cypher_ast`]).
+pub(crate) fn parse_cypher_ast_cached(cypher: &str) -> Result<Arc<fluree_db_cypher::CypherAst>> {
+    if let Some(cache) = cypher_ast_cache() {
+        if let Some(hit) = cache.lock().get(cypher) {
+            return Ok(Arc::clone(hit));
+        }
+    }
     let out = fluree_db_cypher::parse_cypher(cypher);
     if out.has_errors() {
         let msg = out
@@ -122,19 +171,33 @@ pub(crate) fn parse_cypher_to_ir(
             .join("; ");
         return Err(ApiError::cypher(msg, out.diagnostics));
     }
-    let mut ast = out
-        .ast
-        .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
+    let ast = Arc::new(
+        out.ast
+            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?,
+    );
+    if cypher.len() <= MAX_CACHED_STATEMENT_LEN {
+        if let Some(cache) = cypher_ast_cache() {
+            cache.lock().put(cypher.into(), Arc::clone(&ast));
+        }
+    }
+    Ok(ast)
+}
 
-    // Substitute `$param` references before lowering, so the lowering path
-    // only ever sees concrete literals. Always run (empty map when no params
-    // were supplied) so a `$param` with no value reports a clear missing-
-    // parameter error rather than reaching the lowering as an unsupported node.
+/// Parse (via the AST cache) and return a param-substituted AST clone.
+///
+/// Substitution always runs (empty map when no params were supplied) so a
+/// `$param` with no value reports a clear missing-parameter error rather
+/// than reaching the lowering as an unsupported node.
+pub(crate) fn substituted_cypher_ast(
+    cypher: &str,
+    params: Option<&fluree_db_cypher::ParamMap>,
+) -> Result<fluree_db_cypher::CypherAst> {
+    let ast = parse_cypher_ast_cached(cypher)?;
+    let mut ast = (*ast).clone();
     let empty = fluree_db_cypher::ParamMap::new();
     fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
         .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-
-    lower_cypher_ast_to_ir(&ast, snapshot, default_context)
+    Ok(ast)
 }
 
 /// Lower an already-parsed, param-substituted Cypher read AST to the shared
@@ -144,6 +207,8 @@ pub(crate) fn lower_cypher_ast_to_ir(
     ast: &fluree_db_cypher::CypherAst,
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the
@@ -151,13 +216,129 @@ pub(crate) fn lower_cypher_ast_to_ir(
     // apply to bare Cypher identifiers.
     let (vocab, overrides) = extract_cypher_iri_mapping(default_context);
 
+    // Procedure shims (`CALL db.labels() YIELD …`) answer from ledger stats:
+    // rewrite the statement to a constant-rows query, then lower that.
+    let rewritten;
+    let ast = if let fluree_db_cypher::ast::Statement::CallProcedure(call) = &ast.statement {
+        let query = crate::cypher_procedures::procedure_call_query(
+            call,
+            snapshot,
+            overlay.map(|(o, _)| o),
+            vocab.as_deref(),
+            &overrides,
+            policy,
+        )?;
+        rewritten = fluree_db_cypher::CypherAst {
+            statement: fluree_db_cypher::ast::Statement::Query(query),
+            span: ast.span,
+        };
+        &rewritten
+    } else {
+        ast
+    };
+
     let mut vars = VarRegistry::new();
-    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars).with_vocab(vocab);
+    let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
+        .with_vocab_opt(vocab)
+        .with_allow_full_scan(cypher_full_scan_enabled())
+        .with_reified_edges_possible(reified_edges_possible(snapshot, overlay));
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
     let parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
     Ok((vars, parsed))
+}
+
+/// Whether any reified edge can exist in the queried view — the gate for
+/// value-only bound relationship variables' per-hop OPTIONAL annotation
+/// probe. Three tiers, each conservative (`true`) when it can't decide:
+///
+/// 1. Dictionary: `f:reifiesSubject` never entered the dictionary — no
+///    annotation was ever written; certain `false`.
+/// 2. Index stats: per-property counts show `f:reifiesSubject` facts.
+/// 3. Overlay: one PSOT walk answering "any `f:reifiesSubject` flake in
+///    novelty?", cached process-wide on `content_version` — callers that
+///    can't supply the overlay stay conservative.
+fn reified_edges_possible(
+    snapshot: &LedgerSnapshot,
+    overlay: Option<(&dyn OverlayProvider, u16)>,
+) -> bool {
+    let Some(reifies_sid) = snapshot.encode_iri(fluree_vocab::reifies_iris::SUBJECT) else {
+        return false;
+    };
+    if index_has_reified_edges(snapshot, &reifies_sid) {
+        return true;
+    }
+    match overlay {
+        None => true,
+        Some((overlay, g_id)) => overlay_has_reified_edges(overlay, g_id, &reifies_sid),
+    }
+}
+
+fn index_has_reified_edges(snapshot: &LedgerSnapshot, reifies_sid: &fluree_db_core::Sid) -> bool {
+    let Some(stats) = &snapshot.stats else {
+        return true;
+    };
+    let Some(props) = &stats.properties else {
+        return true;
+    };
+    props.iter().any(|p| {
+        p.count > 0
+            && p.sid.0 == reifies_sid.namespace_code
+            && p.sid.1.as_str() == reifies_sid.name.as_ref()
+    })
+}
+
+fn overlay_has_reified_edges(
+    overlay: &dyn OverlayProvider,
+    g_id: u16,
+    reifies_sid: &fluree_db_core::Sid,
+) -> bool {
+    use std::sync::OnceLock;
+    type ReifiesCache = parking_lot::Mutex<lru::LruCache<(u64, u16), bool>>;
+    static CACHE: OnceLock<ReifiesCache> = OnceLock::new();
+
+    if overlay.is_effectively_empty() {
+        return false;
+    }
+    let Some(version) = overlay.content_version() else {
+        return true;
+    };
+    let cache = CACHE.get_or_init(|| {
+        parking_lot::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(8).expect("nonzero"),
+        ))
+    });
+    if let Some(&hit) = cache.lock().get(&(version, g_id)) {
+        return hit;
+    }
+    let mut found = false;
+    overlay.for_each_overlay_flake(
+        g_id,
+        fluree_db_core::IndexType::Psot,
+        None,
+        None,
+        true,
+        i64::MAX,
+        &mut |flake| {
+            if flake.p == *reifies_sid {
+                found = true;
+            }
+        },
+    );
+    cache.lock().put((version, g_id), found);
+    found
+}
+
+/// Whether bare `MATCH (n)` whole-graph scans are opted in for Cypher
+/// (`FLUREE_CYPHER_ALLOW_FULL_SCAN=1|true`). Read once per process.
+fn cypher_full_scan_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FLUREE_CYPHER_ALLOW_FULL_SCAN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Extract `@vocab` and bare-identifier → IRI overrides from a
@@ -168,12 +349,12 @@ pub(crate) fn lower_cypher_ast_to_ir(
 /// ledger-context mappings.
 pub(crate) fn extract_cypher_iri_mapping(
     default_context: Option<&JsonValue>,
-) -> (String, std::collections::HashMap<String, String>) {
-    let mut vocab = "http://example.org/".to_string();
+) -> (Option<String>, std::collections::HashMap<String, String>) {
+    let mut vocab = None;
     let mut overrides = std::collections::HashMap::new();
     if let Some(obj) = default_context.and_then(|v| v.as_object()) {
         if let Some(v) = obj.get("@vocab").and_then(|v| v.as_str()) {
-            vocab = v.to_string();
+            vocab = Some(v.to_string());
         }
         for (k, v) in obj {
             if k.starts_with('@') {
@@ -267,10 +448,22 @@ macro_rules! r2rml_provider {
 pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
     let parse_output = fluree_db_sparql::parse_sparql(sparql);
 
-    // Parse errors: no AST, return ApiError::sparql with structured diagnostics.
+    // Parse errors: return ApiError::sparql with structured diagnostics.
+    //
+    // Error-severity diagnostics are authoritative EVEN WHEN the parser's
+    // error recovery produced an AST. A recovered AST silently drops or
+    // rewrites exactly the parts of the query the parser flagged, so
+    // executing it answers a different question than the user asked
+    // (docs/audit/burn-down/ROADMAP.md §1 addendum: the API previously
+    // swallowed these diagnostics whenever an AST survived recovery).
+    // Recovery itself is unchanged — `parse_sparql` still returns the AST
+    // plus diagnostics for tooling — and warning-severity diagnostics never
+    // reject. The SPARQL UPDATE path (tx_builder::parse_and_lower_sparql_update)
+    // already enforces the same rule.
+    let has_parse_errors = parse_output.has_errors();
     let ast = match parse_output.ast {
-        Some(ast) => ast,
-        None => {
+        Some(ast) if !has_parse_errors => ast,
+        _ => {
             let errors: Vec<_> = parse_output
                 .diagnostics
                 .into_iter()
@@ -401,5 +594,57 @@ pub(crate) fn extract_sparql_dataset_spec(
             DatasetSpec::from_sparql_clause(clause).map_err(|e| ApiError::query(e.to_string()))
         }
         None => Ok(DatasetSpec::default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cypher_ast_cache_returns_shared_ast() {
+        let text = "MATCH (n:CacheHitTest) RETURN n";
+        let first = parse_cypher_ast_cached(text).expect("parse");
+        let second = parse_cypher_ast_cached(text).expect("parse");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same statement text must hit the cache"
+        );
+    }
+
+    #[test]
+    fn cypher_ast_cache_skips_oversized_statements() {
+        let filler = "x".repeat(MAX_CACHED_STATEMENT_LEN);
+        let text = format!("MATCH (n:Big) WHERE n.name <> \"{filler}\" RETURN n");
+        let first = parse_cypher_ast_cached(&text).expect("parse");
+        let second = parse_cypher_ast_cached(&text).expect("parse");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "oversized statements must not be cached"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cypher_parse_errors_are_not_cached() {
+        let text = "MATCH (n:Broken RETURN";
+        assert!(parse_cypher_ast_cached(text).is_err());
+        assert!(parse_cypher_ast_cached(text).is_err());
+    }
+
+    #[test]
+    fn substitution_clones_and_leaves_cached_ast_pristine() {
+        let text = "MATCH (n:SubstTest {id: $id}) RETURN n";
+        let mut params_a = fluree_db_cypher::ParamMap::new();
+        params_a.insert("id".into(), serde_json::json!(1));
+        let mut params_b = fluree_db_cypher::ParamMap::new();
+        params_b.insert("id".into(), serde_json::json!(2));
+
+        let a = substituted_cypher_ast(text, Some(&params_a)).expect("subst a");
+        let b = substituted_cypher_ast(text, Some(&params_b)).expect("subst b");
+        assert_ne!(a, b, "different params must produce different ASTs");
+
+        // Missing param still errors through the cached path.
+        assert!(substituted_cypher_ast(text, None).is_err());
     }
 }

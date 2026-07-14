@@ -358,8 +358,8 @@ mod tests {
         fluree
     }
 
-    #[test]
-    fn test_builder_validate_missing_input() {
+    #[tokio::test]
+    async fn test_builder_validate_missing_input() {
         let fluree = FlureeBuilder::memory().build_memory();
         let builder = NameserviceQueryBuilder::new(&fluree);
         let result = builder.validate();
@@ -372,8 +372,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_builder_validate_with_jsonld() {
+    #[tokio::test]
+    async fn test_builder_validate_with_jsonld() {
         let fluree = FlureeBuilder::memory().build_memory();
         let query = json!({
             "select": ["?ledger"],
@@ -384,8 +384,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_builder_validate_with_sparql() {
+    #[tokio::test]
+    async fn test_builder_validate_with_sparql() {
         let fluree = FlureeBuilder::memory().build_memory();
         let builder = fluree
             .nameservice_query()

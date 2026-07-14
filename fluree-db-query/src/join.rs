@@ -51,7 +51,7 @@ const ADAPTIVE_FLUSH_GROWTH: usize = 8;
 /// sidecar bytes — the leaflet loop body destructures this and proceeds
 /// without repeating the fetch+decode dance at each site.
 struct LeafScan {
-    leaf_bytes: Vec<u8>,
+    leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
     header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
     dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
     leaf_id: u128,
@@ -85,6 +85,19 @@ impl RowAccess for CombinedRowView<'_> {
             Some(self.left_batch.get_by_col(self.left_row, pos))
         } else {
             self.right.get(pos - self.left_len)
+        }
+    }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        for (pos, var) in self.schema.iter().enumerate() {
+            let b = if pos < self.left_len {
+                Some(self.left_batch.get_by_col(self.left_row, pos))
+            } else {
+                self.right.get(pos - self.left_len)
+            };
+            if let Some(b) = b {
+                f(*var, b);
+            }
         }
     }
 }
@@ -127,7 +140,7 @@ fn prepare_leaf_for_scan(
     };
 
     let leaf_bytes = store
-        .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+        .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
         .map_err(|e| QueryError::Internal(format!("fetch leaf: {e}")))?;
     let sidecar_bytes: Option<Vec<u8>> = if need_replay {
         store
@@ -3192,7 +3205,9 @@ pub(crate) fn batched_subject_probe_binary(
     params: &SubjectProbeParams<'_>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+    };
     use fluree_db_binary_index::read::column_loader::load_leaflet_columns_cached;
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
@@ -3271,6 +3286,30 @@ pub(crate) fn batched_subject_probe_binary(
                 continue;
             }
 
+            // Directory-level subject skip: for a predicate-homogeneous leaflet
+            // the stored keys ascend by subject, so first_key/last_key bound its
+            // subject range. A scattered probe set spans the whole predicate
+            // partition but only touches a few leaflets — decline the rest here,
+            // before the (expensive) column decode + p-run scan, rather than
+            // after it (the `subj_start >= subj_end` check below). Only sound on
+            // homogeneous leaflets — a mixed-predicate leaflet resets s_id at each
+            // predicate boundary, so its key range isn't a clean subject interval
+            // — and only when not replaying history (a current-state key range can
+            // omit subjects that existed at an earlier `t`).
+            if entry.p_const == Some(p_id) && !needs_history_replay {
+                let lo = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key)
+                    .s_id
+                    .as_u64();
+                let hi = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key)
+                    .s_id
+                    .as_u64();
+                let a = unique_s_ids.partition_point(|&x| x < lo);
+                let b = unique_s_ids.partition_point(|&x| x <= hi);
+                if a >= b {
+                    continue;
+                }
+            }
+
             let batch = if entry.row_count == 0 {
                 fluree_db_binary_index::ColumnBatch::empty()
             } else if let Some(c) = &cache {
@@ -3322,13 +3361,21 @@ pub(crate) fn batched_subject_probe_binary(
             ctx.check_cancelled()?;
 
             let row_count = batch.row_count;
-            let p_start = (0..row_count)
-                .position(|i| batch.p_id.get_or(i, 0) >= p_id)
-                .unwrap_or(row_count);
-            let p_end = (p_start..row_count)
-                .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-                .map(|offset| p_start + offset)
-                .unwrap_or(row_count);
+            // A p-homogeneous leaflet is entirely this predicate — its p-run is
+            // the whole leaflet, so skip the two linear scans that would walk
+            // every row only to rediscover [0, row_count).
+            let (p_start, p_end) = if entry.p_const == Some(p_id) {
+                (0, row_count)
+            } else {
+                let p_start = (0..row_count)
+                    .position(|i| batch.p_id.get_or(i, 0) >= p_id)
+                    .unwrap_or(row_count);
+                let p_end = (p_start..row_count)
+                    .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
+                    .map(|offset| p_start + offset)
+                    .unwrap_or(row_count);
+                (p_start, p_end)
+            };
             if p_start == p_end {
                 continue;
             }

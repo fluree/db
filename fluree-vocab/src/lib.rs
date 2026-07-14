@@ -12,10 +12,12 @@
 //! - `owl` - OWL vocabulary (http://www.w3.org/2002/07/owl#)
 //! - `namespaces` - Namespace codes used for IRI encoding
 //! - `errors` - Error type compact IRIs for API responses
+//! - `iri` - IRI reference resolution against a base (RFC 3986 §5)
 
 use std::sync::Arc;
 
 pub mod errors;
+pub mod iri;
 
 /// Constraint on the datatype of an unresolved literal, using IRI strings.
 ///
@@ -1546,6 +1548,19 @@ pub mod fluree {
     /// db:rule IRI - datalog rule definition predicate
     pub const RULE: &str = "https://ns.flur.ee/db#rule";
 
+    /// db:sparql datatype IRI — marks a string literal as SPARQL source text.
+    ///
+    /// Used on `f:query` (policy condition, ASK/SELECT form) and `f:rule`
+    /// (datalog rule, CONSTRUCT...WHERE form) literals to select the SPARQL
+    /// parser instead of the default JSON-LD query interpretation
+    /// (`@json` / `rdf:JSON` literals).
+    pub const SPARQL: &str = "https://ns.flur.ee/db#sparql";
+
+    /// db:cypher datatype IRI — reserved for openCypher-language policy /
+    /// rule literals. Not yet accepted by the policy or rule extractors;
+    /// registered so the IRI is stable when support lands.
+    pub const CYPHER: &str = "https://ns.flur.ee/db#cypher";
+
     /// Fluree commit subject identifier scheme (not a predicate vocabulary)
     pub const COMMIT: &str = "fluree:commit:sha256:";
 
@@ -1568,6 +1583,12 @@ pub mod fluree {
 
     /// "This commit" placeholder IRI (scheme form, used without prefix definition)
     pub const COMMIT_THIS_SCHEME: &str = "fluree:commit:this";
+
+    /// db:Node — existence marker class for LPG nodes created with no labels
+    /// and no properties (Cypher `CREATE ()`). An RDF subject needs at least
+    /// one triple to exist; this class provides it. Hidden from Cypher
+    /// `labels()`.
+    pub const NODE: &str = "https://ns.flur.ee/db#Node";
 }
 
 /// Namespace codes for IRI encoding
@@ -1767,6 +1788,12 @@ pub mod db {
 
     /// db:rule - datalog rule definition
     pub const RULE: &str = "rule";
+
+    /// db:sparql - datatype local name for SPARQL source literals
+    pub const SPARQL: &str = "sparql";
+
+    /// db:cypher - datatype local name reserved for openCypher source literals
+    pub const CYPHER: &str = "cypher";
 
     /// db:op - operation type in RDF-Star annotations (assert/retract)
     pub const OP: &str = "op";
@@ -2011,6 +2038,18 @@ pub mod policy_iris {
     /// `https://ns.flur.ee/db#modify` - modify action IRI
     pub const MODIFY: &str = "https://ns.flur.ee/db#modify";
 
+    /// `https://ns.flur.ee/db#create` - create write verb (subject is new
+    /// in this transaction's post-state)
+    pub const CREATE: &str = "https://ns.flur.ee/db#create";
+
+    /// `https://ns.flur.ee/db#update` - update write verb (subject exists
+    /// before and after this transaction)
+    pub const UPDATE: &str = "https://ns.flur.ee/db#update";
+
+    /// `https://ns.flur.ee/db#delete` - delete write verb (subject is
+    /// removed by this transaction)
+    pub const DELETE: &str = "https://ns.flur.ee/db#delete";
+
     /// `https://ns.flur.ee/db#onProperty` - property-level targeting
     pub const ON_PROPERTY: &str = "https://ns.flur.ee/db#onProperty";
 
@@ -2022,6 +2061,17 @@ pub mod policy_iris {
 
     /// `https://ns.flur.ee/db#query` - policy query predicate
     pub const QUERY: &str = "https://ns.flur.ee/db#query";
+
+    /// `https://ns.flur.ee/db#queryState` - which transaction state the
+    /// policy's `f:query` condition evaluates against
+    pub const QUERY_STATE: &str = "https://ns.flur.ee/db#queryState";
+
+    /// `https://ns.flur.ee/db#preState` - pre-transaction state (default)
+    pub const PRE_STATE: &str = "https://ns.flur.ee/db#preState";
+
+    /// `https://ns.flur.ee/db#postState` - post-transaction state
+    /// (committed + staged flakes)
+    pub const POST_STATE: &str = "https://ns.flur.ee/db#postState";
 
     /// `https://ns.flur.ee/db#required` - required flag
     pub const REQUIRED: &str = "https://ns.flur.ee/db#required";

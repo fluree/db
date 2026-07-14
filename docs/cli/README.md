@@ -58,6 +58,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`insert`](insert.md) | Insert data into a ledger |
 | [`upsert`](upsert.md) | Upsert data (insert or update existing) |
 | [`update`](update.md) | Update with WHERE/DELETE/INSERT patterns |
+| [`load`](load.md) | Stream a CSV into a ledger as batched Cypher/JSON-LD upserts (`LOAD CSV`) |
 | [`query`](query.md) | Query a ledger |
 | [`validate`](validate.md) | Validate data against SHACL shapes (report) |
 | [`history`](history.md) | Show change history for an entity |

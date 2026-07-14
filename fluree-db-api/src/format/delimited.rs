@@ -7,7 +7,8 @@
 //! # Performance
 //!
 //! - Writes to `Vec<u8>` via `extend_from_slice` (no `fmt::Write` overhead)
-//! - Uses `itoa`/`ryu` for zero-alloc numeric formatting
+//! - Uses `itoa` / the canonical `xsd:double` stack-buffer writer for
+//!   zero-alloc numeric formatting
 //! - Column indices computed once per batch (not per cell)
 //! - No `serde_json::Value` allocation
 //!
@@ -169,8 +170,9 @@ fn format_delimited(
     #[cfg(not(debug_assertions))]
     {
         // SAFETY: We only write ASCII bytes, valid UTF-8 strings from IRIs/literals,
-        // and numeric formatting (itoa/ryu produce ASCII). Sanitization replaces
-        // control chars with ASCII space; CSV quoting uses ASCII `"`.
+        // and numeric formatting (itoa and the canonical xsd:double writer produce
+        // ASCII). Sanitization replaces control chars with ASCII space; CSV quoting
+        // uses ASCII `"`.
         Ok(unsafe { String::from_utf8_unchecked(bytes) })
     }
 }
@@ -536,8 +538,9 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
             cell.extend_from_slice(buf.format(*n).as_bytes());
         }
         FlakeValue::Double(d) => {
-            let mut buf = ryu::Buffer::new();
-            cell.extend_from_slice(buf.format(*d).as_bytes());
+            // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved),
+            // written straight into the cell buffer without allocating.
+            fluree_graph_ir::write_canonical_xsd_double(cell, *d);
         }
         FlakeValue::Boolean(b) => {
             cell.extend_from_slice(if *b { b"true" } else { b"false" });
@@ -807,7 +810,36 @@ mod tests {
         let tsv = format_tsv(&result, &snapshot).unwrap();
         let lines: Vec<&str> = tsv.lines().collect();
         assert_eq!(lines[0], "flag\tscore");
-        assert!(lines[1].starts_with("true\t"));
+        // Doubles render in W3C canonical xsd:double form (was `3.125` via ryu).
+        assert_eq!(lines[1], "true\t3.125E0");
+    }
+
+    /// Finite doubles serialize in the W3C canonical `xsd:double` lexical form
+    /// (issue #1445 / W3C csv03): `1.0E6`, not `1000000.0`.
+    #[test]
+    fn test_csv_tsv_double_canonical_form() {
+        let snapshot = make_test_snapshot();
+        for (d, expected) in [
+            (1_000_000.0, "1.0E6"),
+            (1e30, "1.0E30"),
+            (0.001, "1.0E-3"),
+            (-3.0, "-3.0E0"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
+        ] {
+            let result = make_result(
+                &["?v"],
+                vec![vec![Binding::lit(
+                    FlakeValue::Double(d),
+                    Sid::new(2, "double"),
+                )]],
+            );
+            let csv = format_csv(&result, &snapshot).unwrap();
+            assert_eq!(csv, format!("v\n{expected}\n"));
+            let tsv = format_tsv(&result, &snapshot).unwrap();
+            assert_eq!(tsv, format!("v\n{expected}\n"));
+        }
     }
 
     #[test]

@@ -165,8 +165,14 @@ impl Fluree {
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<QueryResult> {
         let parse_start = std::time::Instant::now();
-        let (vars, mut parsed) =
-            parse_cypher_to_ir(cypher, &db.snapshot, db.default_context.as_ref(), params)?;
+        let (vars, mut parsed) = parse_cypher_to_ir(
+            cypher,
+            &db.snapshot,
+            db.default_context.as_ref(),
+            params,
+            Some((&*db.overlay, db.graph_id)),
+            db.policy_enforcer().map(|e| &**e),
+        )?;
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
         maybe_wrap_for_graph_source(db, &mut parsed);
@@ -186,6 +192,8 @@ impl Fluree {
             ast,
             &db.snapshot,
             db.default_context.as_ref(),
+            Some((&*db.overlay, db.graph_id)),
+            db.policy_enforcer().map(|e| &**e),
         )?;
         maybe_wrap_for_graph_source(db, &mut parsed);
         self.execute_cypher_ir(db, vars, parsed, 0.0).await

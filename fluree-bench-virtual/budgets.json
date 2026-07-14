@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "_comment": "Perf regression budgets for `vbench compare --gate`. A query's observed hot wall may exceed its blessed baseline by at most `budget_pct` percent before it gates. Cold runs are advisory-only (never gate). `overrides` is keyed by query id and wins over the tag-level defaults.",
+  "_comment": "Perf regression budgets for `vbench compare --gate`. A query violates only when its observed hot wall exceeds its blessed baseline by more than `budget_pct` percent AND by at least `min_delta_ms` absolute (so a percent of a tiny baseline can't gate on noise). Cold runs are advisory-only (never gate). `overrides` is keyed by query id and wins over the tag-level defaults. Baselines are single-machine medians: re-bless locally (`vbench baseline --perf --run <fresh run>`) before gating on a different machine — see README `Baselines, budgets & gating`.",
   "default_budget_pct": {
     "native": 10.0,
     "virtual_hot": 20.0
   },
+  "min_delta_ms": 50,
   "cold": "advisory",
   "overrides": {}
 }

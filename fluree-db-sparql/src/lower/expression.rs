@@ -233,9 +233,11 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::IsLiteral => Function::IsLiteral,
             FunctionName::IsNumeric => Function::IsNumeric,
 
-            // RDF term functions
-            FunctionName::Lang => Function::Lang,
-            FunctionName::Datatype => Function::Datatype,
+            // RDF term functions — SPARQL semantics: a non-literal argument is
+            // a type error (strict), per §17.4.2.2/§17.4.2.3. The JSON-LD
+            // surface keeps the lenient extension (decision D-12).
+            FunctionName::Lang => Function::Lang { strict: true },
+            FunctionName::Datatype => Function::Datatype { strict: true },
 
             // String functions
             FunctionName::Strlen => Function::Strlen,
@@ -317,15 +319,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     xsd::DOUBLE => Function::XsdDouble,
                     xsd::DECIMAL => Function::XsdDecimal,
                     xsd::STRING => Function::XsdString,
+                    xsd::DATE_TIME => Function::XsdDateTime,
+                    xsd::DATE => Function::XsdDate,
+                    xsd::TIME => Function::XsdTime,
                     _ => Function::Custom(full_iri),
                 }
             }
         };
 
-        let lowered_args: Vec<Expression> = args
+        let mut lowered_args: Vec<Expression> = args
             .iter()
             .map(|a| self.lower_expression(a))
             .collect::<Result<Vec<_>>>()?;
+
+        // IRI()/URI() resolve relative arguments against the query BASE
+        // (SPARQL 1.1 §17.4.2.8). Constant-fold at lowering time so the eval
+        // path stays base-free (zero per-row cost): a constant string argument
+        // is rewritten to its resolved absolute form here. Variable/computed
+        // arguments are not resolved (no per-row resolution by design).
+        if matches!(func, Function::Iri) {
+            if let (Some(base), Some(Expression::Const(FlakeValue::String(s)))) =
+                (&self.base, lowered_args.first())
+            {
+                if !fluree_vocab::iri::is_absolute_iri(s) {
+                    let resolved = fluree_vocab::iri::resolve_iri(base, s);
+                    lowered_args[0] = Expression::Const(FlakeValue::String(resolved));
+                }
+            }
+        }
 
         Ok(Expression::call(func, lowered_args))
     }

@@ -476,6 +476,21 @@ async fn resolve_cross_ledger_schema_for_tx(
         })
 }
 
+/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
+/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
+/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
+/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
+/// compiled target index bakes in subclass expansion), and the same shape
+/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
+#[cfg(feature = "shacl")]
+struct CachedShaclCompile {
+    snapshot_t: i64,
+    shacl_epoch: u64,
+    schema_epoch: u64,
+    shapes_g_ids: Vec<GraphId>,
+    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
+}
+
 /// Resolve `f:shapesSource` from a loaded `LedgerConfig` into concrete graph
 /// IDs, against the current snapshot's graph registry.
 ///
@@ -489,20 +504,6 @@ async fn resolve_cross_ledger_schema_for_tx(
 /// same mechanism — schema, policy, and SHACL shapes can live in any graph
 /// the ledger knows about, including the config graph itself.
 #[cfg(feature = "shacl")]
-/// Cross-transaction compiled-SHACL cache entry, stored type-erased on
-/// `LedgerState::shacl_compile_cache`. Valid while nothing shape-affecting
-/// changed: same indexed snapshot, same SHACL epoch (no sh:* / shape-typing
-/// flakes committed — see `Novelty::shacl_epoch`), same schema epoch (the
-/// compiled target index bakes in subclass expansion), and the same shape
-/// source graphs. Inline / cross-ledger shapes bypass the cache (per-txn).
-struct CachedShaclCompile {
-    snapshot_t: i64,
-    shacl_epoch: u64,
-    schema_epoch: u64,
-    shapes_g_ids: Vec<GraphId>,
-    cache: std::sync::Arc<fluree_db_shacl::ShaclCache>,
-}
-
 pub(crate) fn resolve_shapes_source_g_ids(
     config: Option<&LedgerConfig>,
     snapshot: &fluree_db_core::LedgerSnapshot,
@@ -1953,8 +1954,38 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
-        let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let (view, ns_registry, txn_meta, graph_delta) = self
+            .stage_view_once(ledger, txn, ns_registry, index_config, policy, tracker)
+            .await?;
+        Ok(StageResult {
+            view,
+            ns_registry,
+            txn_meta,
+            graph_delta,
+        })
+    }
 
+    /// Stage one transaction against `ledger` using a caller-supplied namespace
+    /// registry, returning the staged view, the advanced registry, and the
+    /// transaction's extracted metadata. Threading the registry lets a caller
+    /// stage several transactions into one commit (see
+    /// [`Self::stage_pair_from_txns`]) with consistent first-time namespace
+    /// codes across the merged flake set.
+    async fn stage_view_once(
+        &self,
+        ledger: LedgerState,
+        txn: fluree_db_transact::Txn,
+        mut ns_registry: NamespaceRegistry,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+    ) -> Result<(
+        StagedLedger,
+        NamespaceRegistry,
+        Vec<TxnMetaEntry>,
+        FxHashMap<u16, String>,
+    )> {
         // Adopt any namespace allocations the lowering step already made
         // (e.g. `lower_sparql_update` allocates IRIs against a caller-owned
         // registry to build the templates' Sids). The staging registry must
@@ -2023,6 +2054,270 @@ impl crate::Fluree {
 
         validate_staged_reasoning_modes(&view)?;
 
+        Ok((view, ns_registry, txn_meta, graph_delta))
+    }
+
+    /// Stage an ordered pair of transactions against the same base ledger and
+    /// merge them into a single [`StageResult`], so a subsequent `build_commit`
+    /// publishes both as **one** commit at `t+1`. Both WHERE clauses evaluate
+    /// against the same base state; the namespace registry is threaded from the
+    /// first staging into the second so first-time namespace codes stay
+    /// consistent across the merged flake set.
+    ///
+    /// This backs per-row relationship `MERGE … ON MATCH SET`, which decomposes
+    /// into two disjoint operations — an `ON MATCH SET` over already-existing
+    /// edges, then a find-or-create over the absent rows — that cannot share
+    /// one `Txn`'s WHERE (their guards are `EXISTS` vs `NOT EXISTS`). The two
+    /// write disjoint subjects and the second never reads the first's writes,
+    /// so evaluating both against the same base and concatenating their flakes
+    /// is equivalent to the sequential semantics — with true all-or-nothing
+    /// atomicity: either the merged commit publishes, or an error returns with
+    /// nothing committed.
+    pub(crate) async fn stage_pair_from_txns(
+        &self,
+        ledger: LedgerState,
+        first: fluree_db_transact::Txn,
+        second: fluree_db_transact::Txn,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+    ) -> Result<StageResult> {
+        let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+        let (view1, ns_registry, mut txn_meta, mut graph_delta) = self
+            .stage_view_once(
+                ledger.clone(),
+                first,
+                ns_registry,
+                index_config,
+                policy,
+                tracker,
+            )
+            .await?;
+        let (view2, ns_registry, meta2, gdelta2) = self
+            .stage_view_once(ledger, second, ns_registry, index_config, policy, tracker)
+            .await?;
+
+        txn_meta.extend(meta2);
+        graph_delta.extend(gdelta2);
+
+        // Concatenate the two staged flake sets into one view over the shared
+        // base. The branches write disjoint subjects (the `ON MATCH SET` over
+        // existing annotation Sids; the create branch over fresh blank nodes +
+        // endpoints), so no assertion/retraction reconciliation is needed.
+        // Cypher writes are default-graph only, so the reverse-graph map is
+        // empty (default-graph flakes route to g_id 0 with no lookup).
+        let (base, mut flakes) = view1.into_parts();
+        let (_, flakes2) = view2.into_parts();
+        flakes.extend(flakes2);
+
+        let reverse_graph: HashMap<fluree_db_core::Sid, GraphId> = HashMap::new();
+        let view = StagedLedger::new(base, flakes, &reverse_graph).map_err(|e| {
+            ApiError::internal(format!("merging staged Cypher MERGE branches: {e}"))
+        })?;
+
+        Ok(StageResult {
+            view,
+            ns_registry,
+            txn_meta,
+            graph_delta,
+        })
+    }
+
+    /// Stage a SPARQL UPDATE request's transaction IRs **sequentially** and
+    /// return ONE staged view over the original base state.
+    ///
+    /// SPARQL 1.1 Update §3.1: each operation of a `;`-separated request
+    /// observes the graph-store state left by the previous one, while the
+    /// whole request is one atomic transaction (roadmap decision D-10:
+    /// sequential staging within ONE commit — not N commits).
+    ///
+    /// Dispatch:
+    /// - exactly one `Txn` → delegates to [`Self::stage_transaction_from_txn`]
+    ///   (the single-operation path is untouched);
+    /// - zero `Txn`s (empty / prologue-only request) → a zero-flake staged
+    ///   view; committing it reports `EmptyTransaction`, the same outcome as
+    ///   an update whose WHERE matched nothing (a valid no-op);
+    /// - N ≥ 2 → the sequential loop below.
+    ///
+    /// Loop shape, per operation:
+    /// 1. stage it against the current (virtual) state with the FULL per-op
+    ///    pipeline — namespace adoption, policy enforcement, SHACL,
+    ///    uniqueness — via `stage_transaction_from_txn`; the final state
+    ///    (base + all N ops) is exactly what op N's validators saw. Per-op
+    ///    validation is a documented semantics choice: a transiently-
+    ///    invalid-but-finally-valid request aborts at the offending
+    ///    operation (required for ordered uniqueness; deliberate for
+    ///    SHACL — no deferred constraints);
+    /// 2. fold its flakes into the merged set, re-stamped to the final
+    ///    commit `t` (`base.t() + 1`), last-wins per fact identity
+    ///    `(g, s, p, o, dt, m)` — so `INSERT x ; DELETE x` nets to the
+    ///    retract and `DELETE x ; INSERT x` nets to the assert, matching
+    ///    ordered application;
+    /// 3. overlay them onto the state as committed novelty (a commit-
+    ///    record-less "virtual commit",
+    ///    [`LedgerState::apply_staged_flakes_for_sequential_staging`]) so
+    ///    the next operation's WHERE evaluates over them.
+    ///
+    /// The final [`StagedLedger`] layers the merged fold over the ORIGINAL
+    /// base, so `build_commit` stamps `t+1` and applies the union envelope
+    /// deltas exactly as a single-operation commit would.
+    pub async fn stage_transaction_from_txns(
+        &self,
+        ledger: LedgerState,
+        txns: Vec<fluree_db_transact::Txn>,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+    ) -> Result<StageResult> {
+        use fluree_db_core::{Flake, FlakeMeta};
+
+        if txns.len() == 1 {
+            let txn = txns.into_iter().next().expect("length checked");
+            return self
+                .stage_transaction_from_txn(ledger, txn, index_config, policy, tracker)
+                .await;
+        }
+
+        if txns.is_empty() {
+            let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+            let view = StagedLedger::new(ledger, Vec::new(), &HashMap::new())?;
+            return Ok(StageResult {
+                view,
+                ns_registry,
+                txn_meta: Vec::new(),
+                graph_delta: FxHashMap::default(),
+            });
+        }
+
+        let original = ledger.clone();
+        let final_t = original.t() + 1;
+
+        // Merged flake fold: insertion-ordered, last-wins per fact identity.
+        type FactKey = (Option<Sid>, Sid, Sid, FlakeValue, Sid, Option<FlakeMeta>);
+        let fact_key = |f: &Flake| -> FactKey {
+            (
+                f.g.clone(),
+                f.s.clone(),
+                f.p.clone(),
+                f.o.clone(),
+                f.dt.clone(),
+                f.m.clone(),
+            )
+        };
+        let mut folded: Vec<Flake> = Vec::new();
+        let mut fold_index: HashMap<FactKey, usize> = HashMap::new();
+
+        // Simulate the graph registry's sequential per-op id assignment so
+        // the merged view's routing matches the ids each op's staging (and
+        // each intermediate envelope apply) used.
+        let mut sim_registry = original.snapshot.graph_registry.clone();
+        let mut merged_graph_iris: Vec<String> = Vec::new();
+        let mut seen_graph_iris: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        let mut txn_meta: Vec<TxnMetaEntry> = Vec::new();
+        let mut last_ns_registry: Option<NamespaceRegistry> = None;
+        // Union of every operation's namespace allocations, relative to the
+        // ORIGINAL base. The per-op staging registry allocates namespaces the
+        // lowering delta never saw (most importantly the namespace of a
+        // `GRAPH <iri>` name, split off at staging-time routing) — those must
+        // (i) reach the virtual state so the between-ops apply can route the
+        // op's own flakes (a graph flake's Sid is unresolvable otherwise),
+        // (ii) be baked into the next op's registry base so code assignment
+        // stays globally consistent, and (iii) reach the final commit
+        // envelope even when a later op's registry re-derives them from the
+        // virtual snapshot (which makes them look pre-existing and drop out
+        // of that op's delta).
+        let mut union_ns_delta: std::collections::HashMap<u16, String> =
+            std::collections::HashMap::new();
+
+        let op_count = txns.len();
+        let mut current = Some(ledger);
+        for (i, txn) in txns.into_iter().enumerate() {
+            // Captured before staging consumes the Txn; needed to advance
+            // the virtual state between operations.
+            let graph_iris: Vec<String> = txn.graph_delta.values().cloned().collect();
+
+            let state = current.take().expect("state threaded through the loop");
+            let result = self
+                .stage_transaction_from_txn(state, txn, index_config, policy, tracker)
+                .await?;
+
+            // The op's FULL namespace delta: lowering allocations (adopted
+            // into the staging registry) PLUS staging-time allocations —
+            // relative to the op's base, i.e. the virtual state, which the
+            // union below re-bases onto the original snapshot.
+            let ns_delta = result.ns_registry.delta().clone();
+            for (code, prefix) in &ns_delta {
+                union_ns_delta
+                    .entry(*code)
+                    .or_insert_with(|| prefix.clone());
+            }
+
+            for iri in &graph_iris {
+                if seen_graph_iris.insert(iri.clone()) {
+                    merged_graph_iris.push(iri.clone());
+                }
+            }
+            sim_registry.apply_delta(graph_iris.iter());
+
+            txn_meta.extend(result.txn_meta);
+            last_ns_registry = Some(result.ns_registry);
+
+            let (mut state_i, flakes_i) = result.view.into_parts();
+            for flake in &flakes_i {
+                let mut merged = flake.clone();
+                merged.t = final_t;
+                match fold_index.entry(fact_key(&merged)) {
+                    std::collections::hash_map::Entry::Occupied(entry) => {
+                        folded[*entry.get()] = merged;
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(folded.len());
+                        folded.push(merged);
+                    }
+                }
+            }
+
+            if i + 1 < op_count {
+                state_i.apply_staged_flakes_for_sequential_staging(
+                    flakes_i,
+                    &ns_delta,
+                    graph_iris.iter().map(String::as_str),
+                )?;
+                current = Some(state_i);
+            }
+        }
+
+        let mut ns_registry =
+            last_ns_registry.expect("multi-op loop staged at least one operation");
+        // Re-adopt the union so the commit envelope's `take_delta` carries
+        // EVERY operation's allocations relative to the original base — the
+        // last op's own delta omits whatever the virtual snapshot already
+        // baked in from earlier ops.
+        ns_registry
+            .adopt_delta_for_persistence(&union_ns_delta)
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "multi-op namespace delta union conflicts with final registry: {e}"
+                ))
+            })?;
+
+        // Graph routing for the merged view + the union graph delta the
+        // commit envelope persists (values drive the registry apply; ids
+        // are the simulated sequential assignment for view-consistency).
+        let mut reverse_graph: HashMap<Sid, GraphId> = HashMap::new();
+        for (g_id, iri) in sim_registry.iter_entries() {
+            reverse_graph.insert(ns_registry.sid_for_iri(iri), g_id);
+        }
+        let mut graph_delta: FxHashMap<u16, String> = FxHashMap::default();
+        for iri in &merged_graph_iris {
+            if let Some(g_id) = sim_registry.graph_id_for_iri(iri) {
+                graph_delta.insert(g_id, iri.clone());
+            }
+        }
+
+        let view = StagedLedger::new(original, folded, &reverse_graph)?;
         Ok(StageResult {
             view,
             ns_registry,

@@ -33,7 +33,7 @@ pub fn parse_cypher(src: &str) -> ParseOutput {
         }
     };
 
-    let mut stream = TokenStream::new(tokens);
+    let mut stream = TokenStream::new(tokens, src);
     let mut diagnostics = Vec::new();
 
     match stmt::parse_statement(&mut stream) {

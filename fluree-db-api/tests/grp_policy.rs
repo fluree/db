@@ -7,6 +7,8 @@ mod it_policy_allow;
 mod it_policy_class;
 #[path = "it_policy_cross_ledger.rs"]
 mod it_policy_cross_ledger;
+#[path = "it_policy_cypher_conditions.rs"]
+mod it_policy_cypher_conditions;
 #[path = "it_policy_federation.rs"]
 mod it_policy_federation;
 #[path = "it_policy_fquery.rs"]
@@ -21,11 +23,15 @@ mod it_policy_named_graphs;
 mod it_policy_optional_hashjoin;
 #[path = "it_policy_query_connection.rs"]
 mod it_policy_query_connection;
+#[path = "it_policy_sparql.rs"]
+mod it_policy_sparql;
 #[path = "it_policy_time_travel.rs"]
 mod it_policy_time_travel;
 #[path = "it_policy_tracking.rs"]
 mod it_policy_tracking;
 #[path = "it_policy_tx.rs"]
 mod it_policy_tx;
+#[path = "it_policy_verbs.rs"]
+mod it_policy_verbs;
 #[path = "it_policy_write_path.rs"]
 mod it_policy_write_path;

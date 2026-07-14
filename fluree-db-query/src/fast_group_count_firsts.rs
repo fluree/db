@@ -192,12 +192,7 @@ impl Operator for PredicateGroupCountFirstsOperator {
         // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
         //
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
-        {
+        if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match group_count_v6(
                     binary_index_store,
@@ -438,12 +433,7 @@ impl Operator for PredicateObjectCountFirstsOperator {
         // Try V6 fast-path first (only when no novelty overlay — overlay delta merge not yet implemented).
         //
         // `ExecutionContext` always carries an overlay provider; `NoOverlay` has epoch=0.
-        if ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
-        {
+        if !crate::fast_path_common::overlay_has_novelty(ctx) {
             if let Some(binary_index_store) = ctx.binary_store.as_ref() {
                 match count_bound_object_v6(
                     ctx.active_snapshot,
@@ -654,7 +644,7 @@ fn count_bound_object_v6(
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
         let header =
             decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;
@@ -823,7 +813,7 @@ fn offer_topk(heap: &mut BinaryHeap<GroupTopK>, limit: usize, cand: GroupTopK) {
     }
 }
 
-fn group_count_v6(
+pub(crate) fn group_count_v6(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &crate::ir::triple::Ref,
@@ -871,7 +861,7 @@ fn group_count_v6(
         check_cancelled(cancellation)?;
         let leaf_entry = &branch.leaves[leaf_idx];
         let bytes = store
-            .get_leaf_bytes_sync(&leaf_entry.leaf_cid)
+            .get_leaf_bytes_shared(&leaf_entry.leaf_cid)
             .map_err(|e| QueryError::Internal(format!("leaf fetch: {e}")))?;
         let header =
             decode_leaf_header_v3(&bytes).map_err(|e| QueryError::Internal(e.to_string()))?;

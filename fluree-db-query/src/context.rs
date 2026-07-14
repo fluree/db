@@ -265,6 +265,29 @@ pub struct ExecutionContext<'a> {
     pub translated_overlay_cache: TranslatedOverlayCache,
 }
 
+/// Re-encode a `Sid` from the primary/lowering snapshot into `target`'s
+/// namespace table.
+///
+/// Pattern and binding SIDs are encoded against the primary snapshot at plan
+/// time, but per-graph execution matches against a graph-specific snapshot that
+/// may assign the same IRI a different namespace code. Decode against
+/// `ctx.original_snapshot` (where the SID was encoded), re-encode against
+/// `target`. Returns `None` when the SID can't be decoded (unknown code) or its
+/// IRI can't be encoded in `target`; callers fall back to the raw SID (a range
+/// scan can still match it by bytes; single-graph round-trips to the same SID).
+///
+/// Shared by the scan (`binary_scan::build_match_val_for_snapshot`) and the
+/// property-path operator so the two can't drift.
+pub(crate) fn reencode_sid(
+    ctx: &ExecutionContext<'_>,
+    target: &LedgerSnapshot,
+    sid: &fluree_db_core::Sid,
+) -> Option<fluree_db_core::Sid> {
+    ctx.original_snapshot
+        .decode_sid(sid)
+        .and_then(|iri| target.encode_iri(&iri))
+}
+
 impl<'a> ExecutionContext<'a> {
     /// Create a new execution context
     pub fn new(snapshot: &'a LedgerSnapshot, vars: &'a VarRegistry) -> Self {
@@ -1189,7 +1212,7 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Cost: one `TypeId` comparison. Returns `None` when no range provider is
     /// attached (e.g. genesis / metadata-only snapshot).
-    fn extract_binary_store(snapshot: &LedgerSnapshot) -> Option<Arc<BinaryIndexStore>> {
+    pub(crate) fn extract_binary_store(snapshot: &LedgerSnapshot) -> Option<Arc<BinaryIndexStore>> {
         snapshot
             .range_provider
             .as_ref()

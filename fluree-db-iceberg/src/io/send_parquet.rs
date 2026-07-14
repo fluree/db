@@ -16,7 +16,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -44,7 +44,7 @@ use parquet::file::metadata::ParquetMetaData;
 use std::collections::HashMap;
 
 /// Parquet magic bytes (footer ends with "PAR1").
-const PARQUET_MAGIC: [u8; 4] = [b'P', b'A', b'R', b'1'];
+const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 
 /// Whether row-group / row-level predicate pushdown is enabled. Read once from
 /// `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` (only `0`/`false`/`off` disable it).
@@ -170,13 +170,19 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
 /// the policy fetches whole — parses its Parquet footer from those in-memory
 /// bytes instead of issuing a separate footer round-trip (measured ~190ms of two
 /// serial S3 range GETs per file, see `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`).
-/// Off (`"0"`/`"false"`, trimmed + case-insensitive per the R2RML switch
-/// convention) restores the byte-identical footer-first path.
+/// Off (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the R2RML switch
+/// family) restores the byte-identical footer-first path. Read once per process
+/// (`OnceLock`, the family idiom — e.g. `catalog_session::cache_enabled` in
+/// `fluree-db-api`): set it at startup, not per query.
 fn footer_from_cache_enabled() -> bool {
-    match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
-        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"),
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
         Err(_) => true,
-    }
+    })
 }
 
 /// Parse Parquet metadata from a whole-file byte buffer already resident in
@@ -431,16 +437,16 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     ///
     /// A larger file with a narrow projection returns `None` — that is the
     /// range-read tier, whose footer path is intentionally unchanged.
-    async fn try_whole_bytes_no_footer(
-        &self,
-        path: &str,
-        file_size: u64,
-    ) -> Result<Option<Bytes>> {
+    async fn try_whole_bytes_no_footer(&self, path: &str, file_size: u64) -> Result<Option<Bytes>> {
         if let Some(dc) = self.disk_cache.filter(|dc| dc.cache.budget_bytes() > 0) {
             let local = dc.local_path(path, file_size);
             // A2: whole file already local — serve footer + data from disk.
             if let Some(bytes) = read_whole_local(&local, file_size).await {
-                tracing::debug!(path, file_size, "Lever A: footer+data from disk cache (whole file)");
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from disk cache (whole file)"
+                );
                 return Ok(Some(bytes));
             }
             // A1 (cheap tier): admitted whole unconditionally, so fetch whole
@@ -457,7 +463,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     })
                     .await
                     .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
-                tracing::debug!(path, file_size, "Lever A: footer+data from whole-file fetch (cheap, cached)");
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from whole-file fetch (cheap, cached)"
+                );
                 return Ok(Some(Bytes::from(data)));
             }
             // Larger file, narrow projection: range-read tier (unchanged).
@@ -466,7 +476,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         // No disk cache: only the sub-`MIN_SPARSE_FILE_BYTES` correctness-floor
         // files are read whole (matches `read_file_for_task`).
         if file_size < MIN_SPARSE_FILE_BYTES {
-            tracing::debug!(path, file_size, "Lever A: footer+data from whole small file (no disk cache)");
+            tracing::debug!(
+                path,
+                file_size,
+                "Lever A: footer+data from whole small file (no disk cache)"
+            );
             return Ok(Some(self.storage.read(path).await?));
         }
         Ok(None)

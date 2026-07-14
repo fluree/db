@@ -56,7 +56,7 @@ impl Function {
 
             // String functions
             Function::Str => string::eval_str(args, row, ctx),
-            Function::Lang => string::eval_lang(args, row, ctx),
+            Function::Lang { strict } => string::eval_lang(args, row, ctx, *strict),
             Function::Lcase => string::eval_lcase(args, row, ctx),
             Function::Ucase => string::eval_ucase(args, row, ctx),
             Function::Strlen => string::eval_strlen(args, row, ctx),
@@ -92,6 +92,7 @@ impl Function {
 
             // DateTime functions
             Function::Now => datetime::eval_now(args),
+            Function::Today => datetime::eval_today(args),
             Function::Year => datetime::eval_year(args, row, ctx),
             Function::Month => datetime::eval_month(args, row, ctx),
             Function::Day => datetime::eval_day(args, row, ctx),
@@ -109,7 +110,7 @@ impl Function {
             Function::IsBlank => types::eval_is_blank(args, row, ctx),
 
             // RDF term functions
-            Function::Datatype => rdf::eval_datatype(args, row, ctx),
+            Function::Datatype { strict } => rdf::eval_datatype(args, row, ctx, *strict),
             Function::LangMatches => rdf::eval_lang_matches(args, row, ctx),
             Function::SameTerm => rdf::eval_same_term(args, row, ctx),
             Function::Iri => rdf::eval_iri(args, row, ctx),
@@ -188,6 +189,9 @@ impl Function {
             Function::XsdDouble => cast::eval_xsd_double(args, row, ctx),
             Function::XsdDecimal => cast::eval_xsd_decimal(args, row, ctx),
             Function::XsdString => cast::eval_xsd_string(args, row, ctx),
+            Function::XsdDateTime => cast::eval_xsd_datetime(args, row, ctx),
+            Function::XsdDate => cast::eval_xsd_date(args, row, ctx),
+            Function::XsdTime => cast::eval_xsd_time(args, row, ctx),
 
             // Path functions
             Function::PathLength => path::eval_path_length(args, row),
@@ -212,6 +216,7 @@ impl Function {
             | Function::Relationships
             | Function::MakeRel
             | Function::MakePath
+            | Function::MakePathHops
             | Function::Split
             | Function::Labels
             | Function::Keys

@@ -490,10 +490,7 @@ impl Committer for QueuedTransactor {
                 },
                 tally: record.tally.map(Into::into),
             }),
-            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
-                status: 500,
-                message: format!("cached failure: {:?}", record.reason),
-            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
         }
     }
 
@@ -536,10 +533,7 @@ impl Committer for QueuedTransactor {
                 new_head_t: record.t,
                 new_head_id: record.head,
             }),
-            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
-                status: 500,
-                message: format!("cached failure: {:?}", record.reason),
-            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
         }
     }
 
@@ -614,10 +608,7 @@ impl Committer for QueuedTransactor {
                 conflict_count: 0,
                 strategy,
             }),
-            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
-                status: 500,
-                message: format!("cached failure: {:?}", record.reason),
-            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
         }
     }
 
@@ -660,10 +651,7 @@ impl Committer for QueuedTransactor {
                 source_head_id: record.head,
                 strategy,
             }),
-            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
-                status: 500,
-                message: format!("cached failure: {:?}", record.reason),
-            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
         }
     }
 
@@ -744,10 +732,7 @@ impl Committer for QueuedTransactor {
                     indexing: idle_indexing_status(record.t),
                 })
             }
-            SubmissionOutcome::CachedFailure(record) => Err(SubmissionError::Execution {
-                status: 500,
-                message: format!("cached failure: {:?}", record.reason),
-            }),
+            SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
         }
     }
 }
@@ -803,14 +788,16 @@ fn committed_from_applied(key: IdempotencyKey, record: &ApplyRecord) -> Submissi
 }
 
 fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
-    // Failure shape — the replicated `PoisonRecord` only carries the
-    // poison reason (e.g. `BodyMalformed`, `StagingFailed`); surface
-    // it as an `Execution` error with the reason embedded. Clients
+    // Same status and phrasing the fresh path surfaces through
+    // `submission_error_from_abort`'s `Poisoned` arm — a poison
+    // replayed from the replicated map must read identically to one
+    // observed live. The replicated `PoisonRecord` only carries the
+    // poison reason (e.g. `BodyMalformed`, `StagingFailed`); clients
     // that need richer typing can use the body via the commit log;
     // the status route only promises pass/fail + identity.
     SubmissionError::Execution {
-        status: 500,
-        message: format!("submission failed: {:?}", record.reason),
+        status: 422,
+        message: format!("submission poisoned: {:?}", record.reason),
     }
 }
 
@@ -1135,5 +1122,32 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// A poison replayed from the replicated idempotency map must
+    /// surface with the same status and phrasing as one observed
+    /// live through the waiter — previously the replay said 500
+    /// "cached failure" where the fresh path said 422 "submission
+    /// poisoned", so a client's error handling depended on which
+    /// node answered.
+    #[test]
+    fn replayed_poison_surfaces_identically_to_fresh_poison() {
+        use crate::raft::state_machine::PoisonRecord;
+        use fluree_db_core::ContentKind;
+
+        let reason = PoisonReason::BodyMalformed {
+            error: "bad turtle".into(),
+        };
+        let fresh = submission_error_from_abort(AbortReason::Poisoned(reason.clone()));
+        let replayed = failure_from_poison(&PoisonRecord {
+            request_cid: ContentId::new(ContentKind::Commit, &[1]),
+            body_cid: ContentId::new(ContentKind::Commit, &[2]),
+            reason,
+            recorded_index: 1,
+            recorded_at_millis: 0,
+        });
+
+        assert_eq!(status(&fresh), status(&replayed));
+        assert_eq!(fresh.to_string(), replayed.to_string());
     }
 }

@@ -260,7 +260,7 @@ fn capture_selectivity_inputs(
     if let Some(s) = stats {
         // Prefer SID formatting when available (stable + compact).
         if let Some(pred_sid) = pattern.p.as_sid() {
-            inputs.property_sid = Some(format!("{}:{}", pred_sid.namespace_code, &pred_sid.name));
+            inputs.property_sid = Some(format!("{}:{}", pred_sid.namespace_code, pred_sid.name));
             if let Some(prop) = s.get_property(pred_sid) {
                 inputs.count = Some(prop.count);
                 inputs.ndv_values = Some(prop.ndv_values);
@@ -345,7 +345,7 @@ pub fn format_pattern(pattern: &TriplePattern) -> String {
 fn format_ref(r: &Ref) -> String {
     match r {
         Ref::Var(v) => format!("?v{}", v.0),
-        Ref::Sid(sid) => format!("<{}:{}>", sid.namespace_code, &sid.name),
+        Ref::Sid(sid) => format!("<{}:{}>", sid.namespace_code, sid.name),
         Ref::Iri(iri) => format!("<{iri}>"),
     }
 }
@@ -354,7 +354,7 @@ fn format_ref(r: &Ref) -> String {
 fn format_term(term: &Term) -> String {
     match term {
         Term::Var(v) => format!("?v{}", v.0),
-        Term::Sid(sid) => format!("<{}:{}>", sid.namespace_code, &sid.name),
+        Term::Sid(sid) => format!("<{}:{}>", sid.namespace_code, sid.name),
         Term::Iri(iri) => format!("<{iri}>"),
         Term::Value(val) => format!("{val:?}"),
     }
@@ -579,6 +579,7 @@ pub fn format_general_pattern(pattern: &Pattern) -> String {
             match sp.mode {
                 crate::ir::ShortestPathMode::Single => "shortestPath",
                 crate::ir::ShortestPathMode::All => "allShortestPaths",
+                crate::ir::ShortestPathMode::Enumerate => "enumeratePaths",
             },
             format_ref(&sp.start),
             format_ref(&sp.end),

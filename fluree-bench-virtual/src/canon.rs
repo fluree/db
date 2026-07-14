@@ -14,13 +14,24 @@
 //! - integer-family literals: reparsed and re-emitted (strips leading zeros /
 //!   whitespace).
 //! - decimal literals: shortest round-trip of the parsed value (so `100` and
-//!   `100.0` collapse).
+//!   `100.0` collapse). **Blind spot:** the round-trip goes through `f64`, so
+//!   two decimals that differ only past ~15 significant digits false-equate.
+//!   No corpus query projects such a value today; an exact-decimal
+//!   canonicalization would change every blessed decimal cell, so it is
+//!   deliberately deferred until a query needs it.
 //! - float/double literals: quantized to 12 significant digits.
+//! - language-tagged literals: the lexical plus its (case-folded) tag, so a
+//!   lang divergence between engines fails the hash gate.
 //! - everything else (string, date, dateTime, boolean, ...): the lexical form
 //!   verbatim.
+//!
+//! A document that is neither a JSON-LD graph, an ASK `boolean`, nor a
+//! well-formed `results.bindings` table is an **error**, not an empty result —
+//! otherwise a formatter shape change could bless 0-row oracles.
 
-use sha2::{Digest, Sha256};
+use anyhow::Result;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Unit separator between cells of a row (cannot appear in canonical cells).
 const CELL_SEP: char = '\u{1f}';
@@ -28,6 +39,9 @@ const CELL_SEP: char = '\u{1f}';
 const ROW_SEP: char = '\u{1e}';
 /// Sentinel for an unbound variable in a row.
 const UNBOUND: &str = "\u{0}UNBOUND";
+/// Separator between a literal's canonical lexical and its language tag
+/// (a control char, so no lexical form can collide with a tagged one).
+const LANG_SEP: char = '\u{1d}';
 
 /// Canonicalized result: row count, hex hash, and the sorted canonical rows.
 pub struct Canonical {
@@ -46,10 +60,12 @@ impl Canonical {
 
 /// Canonicalize a query result, dispatching on shape: a JSON-LD graph
 /// (`{"@graph":[...]}` or a bare node array — CONSTRUCT/DESCRIBE) is a node
-/// multiset; anything else is SPARQL-results JSON (SELECT/ASK).
-pub fn canonicalize(doc: &Value) -> Canonical {
+/// multiset; anything else is SPARQL-results JSON (SELECT/ASK). Errors on a
+/// document matching none of those shapes rather than treating it as an empty
+/// success.
+pub fn canonicalize(doc: &Value) -> Result<Canonical> {
     if doc.get("@graph").is_some() || doc.is_array() {
-        canonicalize_graph(doc)
+        Ok(canonicalize_graph(doc))
     } else {
         canonicalize_sparql_json(doc)
     }
@@ -76,12 +92,14 @@ fn canonicalize_graph(doc: &Value) -> Canonical {
     finish(rows)
 }
 
-/// Canonicalize a SPARQL-results-JSON document (SELECT or ASK).
-pub fn canonicalize_sparql_json(doc: &Value) -> Canonical {
+/// Canonicalize a SPARQL-results-JSON document (SELECT or ASK). A document
+/// with neither an ASK `boolean` nor a `results.bindings` array is malformed
+/// and errors — an empty SELECT still carries `results.bindings: []`.
+pub fn canonicalize_sparql_json(doc: &Value) -> Result<Canonical> {
     // ASK: a single boolean.
     if let Some(b) = doc.get("boolean").and_then(Value::as_bool) {
         let row = format!("BOOLEAN{CELL_SEP}{b}");
-        return finish(vec![row]);
+        return Ok(finish(vec![row]));
     }
 
     // SELECT: head.vars drives a stable column order; results.bindings are rows.
@@ -89,26 +107,34 @@ pub fn canonicalize_sparql_json(doc: &Value) -> Canonical {
         .get("head")
         .and_then(|h| h.get("vars"))
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     vars.sort();
 
-    let bindings = doc
+    let Some(bindings) = doc
         .get("results")
         .and_then(|r| r.get("bindings"))
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    else {
+        anyhow::bail!(
+            "unrecognized result document (no `boolean`, no `results.bindings` array): \
+             refusing to canonicalize as an empty result"
+        );
+    };
 
     let mut rows = Vec::with_capacity(bindings.len());
-    for binding in &bindings {
+    for binding in bindings {
         let mut cells = Vec::with_capacity(vars.len());
         for var in &vars {
             cells.push(canonical_cell(binding.get(var)));
         }
         rows.push(cells.join(&CELL_SEP.to_string()));
     }
-    finish(rows)
+    Ok(finish(rows))
 }
 
 /// Sort, join, and hash a set of canonical row strings.
@@ -139,7 +165,16 @@ fn canonical_cell(cell: Option<&Value>) -> String {
         "bnode" => "_:b".to_string(),
         _ => {
             let datatype = cell.get("datatype").and_then(Value::as_str);
-            canonical_literal(value, datatype)
+            let lit = canonical_literal(value, datatype);
+            // A language-tagged literal must not false-equate with its plain
+            // (or differently-tagged) twin. BCP-47 tags are case-insensitive,
+            // so the tag is case-folded before it joins the canonical form.
+            match cell.get("xml:lang").and_then(Value::as_str) {
+                Some(lang) if !lang.is_empty() => {
+                    format!("{lit}{LANG_SEP}@{}", lang.to_ascii_lowercase())
+                }
+                _ => lit,
+            }
         }
     }
 }
@@ -152,15 +187,16 @@ fn canonical_literal(value: &str, datatype: Option<&str>) -> String {
     let local = dt.rsplit(['#', '/']).next().unwrap_or(dt);
     match local {
         "integer" | "int" | "long" | "short" | "byte" | "nonNegativeInteger"
-        | "nonPositiveInteger" | "negativeInteger" | "positiveInteger"
-        | "unsignedLong" | "unsignedInt" | "unsignedShort" | "unsignedByte" => {
-            match value.trim().parse::<i128>() {
-                Ok(n) => n.to_string(),
-                Err(_) => value.to_string(),
-            }
-        }
+        | "nonPositiveInteger" | "negativeInteger" | "positiveInteger" | "unsignedLong"
+        | "unsignedInt" | "unsignedShort" | "unsignedByte" => match value.trim().parse::<i128>() {
+            Ok(n) => n.to_string(),
+            Err(_) => value.to_string(),
+        },
+        // Shortest round-trip collapses `100` / `100.0` / `100.00`. Blind
+        // spot: `f64` carries ~15-17 significant digits, so decimals that
+        // differ only beyond that false-equate (see the module doc for why
+        // exact-decimal canonicalization is deferred).
         "decimal" => match value.trim().parse::<f64>() {
-            // Shortest round-trip collapses `100` / `100.0` / `100.00`.
             Ok(f) => format!("{f}"),
             Err(_) => value.to_string(),
         },
@@ -212,8 +248,8 @@ mod tests {
                 json!({"s": {"type":"uri","value":"http://x/1"}, "n": {"type":"literal","value":"5","datatype":"http://www.w3.org/2001/XMLSchema#integer"}}),
             ],
         );
-        let ca = canonicalize_sparql_json(&a);
-        let cb = canonicalize_sparql_json(&b);
+        let ca = canonicalize_sparql_json(&a).unwrap();
+        let cb = canonicalize_sparql_json(&b).unwrap();
         assert_eq!(ca.rows, 2);
         assert_eq!(ca.hash, cb.hash, "row order must not affect the hash");
     }
@@ -223,28 +259,36 @@ mod tests {
         // `100` (integer) rendered by one engine, `100.0` (decimal) by another.
         let a = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"0100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"0100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}}),
+            ],
         );
         let b = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"100","datatype":"http://www.w3.org/2001/XMLSchema#integer"}}),
+            ],
         );
         assert_eq!(
-            canonicalize_sparql_json(&a).hash,
-            canonicalize_sparql_json(&b).hash
+            canonicalize_sparql_json(&a).unwrap().hash,
+            canonicalize_sparql_json(&b).unwrap().hash
         );
 
         let d1 = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"100.0","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"100.0","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}}),
+            ],
         );
         let d2 = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"100.00","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"100.00","datatype":"http://www.w3.org/2001/XMLSchema#decimal"}}),
+            ],
         );
         assert_eq!(
-            canonicalize_sparql_json(&d1).hash,
-            canonicalize_sparql_json(&d2).hash
+            canonicalize_sparql_json(&d1).unwrap().hash,
+            canonicalize_sparql_json(&d2).unwrap().hash
         );
     }
 
@@ -252,16 +296,20 @@ mod tests {
     fn floats_within_12_sig_digits_hash_equal() {
         let a = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"3.14159265358979","datatype":"http://www.w3.org/2001/XMLSchema#double"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"3.14159265358979","datatype":"http://www.w3.org/2001/XMLSchema#double"}}),
+            ],
         );
         // Differs only past the 12th significant digit.
         let b = sparql_doc(
             &["v"],
-            vec![json!({"v": {"type":"literal","value":"3.141592653589792","datatype":"http://www.w3.org/2001/XMLSchema#double"}})],
+            vec![
+                json!({"v": {"type":"literal","value":"3.141592653589792","datatype":"http://www.w3.org/2001/XMLSchema#double"}}),
+            ],
         );
         assert_eq!(
-            canonicalize_sparql_json(&a).hash,
-            canonicalize_sparql_json(&b).hash
+            canonicalize_sparql_json(&a).unwrap().hash,
+            canonicalize_sparql_json(&b).unwrap().hash
         );
     }
 
@@ -269,16 +317,42 @@ mod tests {
     fn unbound_variable_is_stable_and_distinct() {
         let bound = sparql_doc(
             &["a", "b"],
-            vec![json!({"a": {"type":"uri","value":"http://x/1"}, "b": {"type":"literal","value":"x"}})],
+            vec![
+                json!({"a": {"type":"uri","value":"http://x/1"}, "b": {"type":"literal","value":"x"}}),
+            ],
         );
         let unbound = sparql_doc(
             &["a", "b"],
             vec![json!({"a": {"type":"uri","value":"http://x/1"}})],
         );
         assert_ne!(
-            canonicalize_sparql_json(&bound).hash,
-            canonicalize_sparql_json(&unbound).hash
+            canonicalize_sparql_json(&bound).unwrap().hash,
+            canonicalize_sparql_json(&unbound).unwrap().hash
         );
+    }
+
+    #[test]
+    fn lang_tags_join_the_canonical_form_case_folded() {
+        let plain = sparql_doc(
+            &["v"],
+            vec![json!({"v": {"type":"literal","value":"chat"}})],
+        );
+        let fr = sparql_doc(
+            &["v"],
+            vec![json!({"v": {"type":"literal","value":"chat","xml:lang":"fr"}})],
+        );
+        let fr_upper = sparql_doc(
+            &["v"],
+            vec![json!({"v": {"type":"literal","value":"chat","xml:lang":"FR"}})],
+        );
+        let en = sparql_doc(
+            &["v"],
+            vec![json!({"v": {"type":"literal","value":"chat","xml:lang":"en"}})],
+        );
+        let h = |d: &Value| canonicalize_sparql_json(d).unwrap().hash;
+        assert_ne!(h(&plain), h(&fr), "a lang tag must change the hash");
+        assert_ne!(h(&fr), h(&en), "different lang tags must not collide");
+        assert_eq!(h(&fr), h(&fr_upper), "BCP-47 tags are case-insensitive");
     }
 
     #[test]
@@ -293,22 +367,42 @@ mod tests {
             {"@id":"http://x/2","http://p":"b"},
             {"@id":"http://x/1","http://p":"a"},
         ]});
-        let ca = canonicalize(&a);
+        let ca = canonicalize(&a).unwrap();
         assert_eq!(ca.rows, 2, "two graph nodes");
-        assert_eq!(ca.hash, canonicalize(&b).hash, "node order must not affect the hash");
+        assert_eq!(
+            ca.hash,
+            canonicalize(&b).unwrap().hash,
+            "node order must not affect the hash"
+        );
         // A SELECT doc still routes to the tabular canonicalizer.
-        let sel = sparql_doc(&["v"], vec![json!({"v":{"type":"uri","value":"http://x/1"}})]);
-        assert_eq!(canonicalize(&sel).rows, 1);
+        let sel = sparql_doc(
+            &["v"],
+            vec![json!({"v":{"type":"uri","value":"http://x/1"}})],
+        );
+        assert_eq!(canonicalize(&sel).unwrap().rows, 1);
     }
 
     #[test]
     fn ask_boolean_canonicalizes() {
         let t = json!({"head": {}, "boolean": true});
         let f = json!({"head": {}, "boolean": false});
-        assert_eq!(canonicalize_sparql_json(&t).rows, 1);
+        assert_eq!(canonicalize_sparql_json(&t).unwrap().rows, 1);
         assert_ne!(
-            canonicalize_sparql_json(&t).hash,
-            canonicalize_sparql_json(&f).hash
+            canonicalize_sparql_json(&t).unwrap().hash,
+            canonicalize_sparql_json(&f).unwrap().hash
         );
+    }
+
+    #[test]
+    fn malformed_results_error_instead_of_blessing_empty() {
+        // No boolean, no results.bindings — a formatter shape change must be
+        // a loud error, never a 0-row success that could be blessed.
+        assert!(canonicalize(&json!({"status": "ok"})).is_err());
+        assert!(canonicalize(&json!({"head": {"vars": ["v"]}, "results": {}})).is_err());
+        // A genuinely empty SELECT still carries results.bindings: [] — ok.
+        let empty = json!({"head": {"vars": ["v"]}, "results": {"bindings": []}});
+        assert_eq!(canonicalize(&empty).unwrap().rows, 0);
+        // An empty JSON-LD graph is a recognized shape — ok.
+        assert_eq!(canonicalize(&json!({"@graph": []})).unwrap().rows, 0);
     }
 }

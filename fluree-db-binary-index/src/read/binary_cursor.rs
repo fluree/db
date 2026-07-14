@@ -826,36 +826,88 @@ fn filter_batch(filter: &BinaryFilter, batch: &ColumnBatch, order: RunSortOrder)
     gather_batch(batch, &matching)
 }
 
-/// Binary-search the contiguous `[start, end)` row range whose leading sort
-/// column equals its bound filter value. Returns the full `[0, row_count)`
-/// range when the leading column is unbound or not a materialized (sorted)
-/// block — so callers fall back to a full scan, never miss rows.
+/// Binary-search the contiguous `[start, end)` row range matching every
+/// *prefix* of the order's sort-key columns that the filter binds,
+/// cascading: within the rows equal on key column k, rows are sorted by
+/// key column k+1, so each bound column narrows by two more
+/// `partition_point`s. The cascade stops at the first unbound (or
+/// unsearchable) column — rows outside the returned range differ from a
+/// bound prefix column, so they can't match the filter; the output is
+/// identical to a full scan. This is what keeps point probes (bound
+/// subject on SPOT, bound ref object on OPST, bound value on POST)
+/// leaflet-size-independent.
 fn leading_bound_range(
     filter: &BinaryFilter,
     batch: &ColumnBatch,
     order: RunSortOrder,
 ) -> (usize, usize) {
+    let full = (0usize, batch.row_count);
     match order {
-        RunSortOrder::Spot => sorted_block_range(&batch.s_id, filter.s_id, batch.row_count),
-        RunSortOrder::Post | RunSortOrder::Psot => {
-            sorted_block_range(&batch.p_id, filter.p_id, batch.row_count)
-        }
-        RunSortOrder::Opst => sorted_block_range(&batch.o_type, filter.o_type, batch.row_count),
+        // SPOT: (s_id, p_id, o_type, o_key)
+        RunSortOrder::Spot => cascade(full, &batch.s_id, filter.s_id)
+            .and_then(|r| cascade(r, &batch.p_id, filter.p_id))
+            .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
+            .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
+            .into_range(),
+        // PSOT: (p_id, s_id, o_type, o_key)
+        RunSortOrder::Psot => cascade(full, &batch.p_id, filter.p_id)
+            .and_then(|r| cascade(r, &batch.s_id, filter.s_id))
+            .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
+            .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
+            .into_range(),
+        // POST: (p_id, o_type, o_key, o_i, s_id)
+        RunSortOrder::Post => cascade(full, &batch.p_id, filter.p_id)
+            .and_then(|r| cascade(r, &batch.o_type, filter.o_type))
+            .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
+            .into_range(),
+        // OPST: (o_type, o_key, o_i, p_id, s_id)
+        RunSortOrder::Opst => cascade(full, &batch.o_type, filter.o_type)
+            .and_then(|r| cascade(r, &batch.o_key, filter.o_key))
+            .into_range(),
     }
 }
 
-fn sorted_block_range<T: Copy + Ord>(
-    col: &ColumnData<T>,
-    bound: Option<T>,
-    row_count: usize,
-) -> (usize, usize) {
-    match (bound, col) {
-        (Some(v), ColumnData::Block(arr)) => {
-            let start = arr.partition_point(|&x| x < v);
-            let end = arr.partition_point(|&x| x <= v);
-            (start, end)
+/// One step of the bound-prefix cascade. `Narrowed(range)` continues to the
+/// next key column; `Stop(range)` ends the cascade (unbound column, or a
+/// column representation we can't binary-search) with the range found so far.
+enum Cascade {
+    Narrowed((usize, usize)),
+    Stop((usize, usize)),
+}
+
+impl Cascade {
+    fn and_then(self, f: impl FnOnce((usize, usize)) -> Cascade) -> Cascade {
+        match self {
+            Cascade::Narrowed(r) => f(r),
+            Cascade::Stop(r) => Cascade::Stop(r),
         }
-        _ => (0, row_count),
+    }
+
+    fn into_range(self) -> (usize, usize) {
+        match self {
+            Cascade::Narrowed(r) | Cascade::Stop(r) => r,
+        }
+    }
+}
+
+fn cascade<T: Copy + Ord>(range: (usize, usize), col: &ColumnData<T>, bound: Option<T>) -> Cascade {
+    let Some(v) = bound else {
+        return Cascade::Stop(range);
+    };
+    match col {
+        ColumnData::Block(arr) => {
+            let (lo, hi) = range;
+            let window = &arr[lo..hi];
+            let start = lo + window.partition_point(|&x| x < v);
+            let end = lo + window.partition_point(|&x| x <= v);
+            Cascade::Narrowed((start, end))
+        }
+        // A constant column: every row carries the same value, so the range
+        // either stays as-is (still sorted by the next key column) or is
+        // provably empty.
+        ColumnData::Const(c) if *c == v => Cascade::Narrowed(range),
+        ColumnData::Const(_) => Cascade::Narrowed((range.0, range.0)),
+        ColumnData::AbsentDefault => Cascade::Stop(range),
     }
 }
 
@@ -1014,5 +1066,70 @@ mod tests {
 
         let (start, end) = compute_overlay_window(&ops, &leaf_key, None, RunSortOrder::Spot, true);
         assert_eq!((start, end), (0, 0));
+    }
+
+    /// An OPST batch in sort order (o_type, o_key, ...): a filter binding
+    /// both must narrow to exactly the matching run, not just the o_type
+    /// range (the pre-cascade behavior that linear-scanned every ref row
+    /// on a bound-object point probe).
+    #[test]
+    fn cascaded_range_narrows_opst_o_type_then_o_key() {
+        let batch = ColumnBatch {
+            row_count: 6,
+            s_id: ColumnData::Block(vec![1, 2, 3, 4, 5, 6].into()),
+            o_key: ColumnData::Block(vec![10, 10, 20, 20, 20, 5].into()),
+            p_id: ColumnData::Const(7),
+            o_type: ColumnData::Block(vec![1, 1, 1, 1, 1, 2].into()),
+            o_i: ColumnData::AbsentDefault,
+            t: ColumnData::AbsentDefault,
+        };
+        let filter = BinaryFilter {
+            o_type: Some(1),
+            o_key: Some(20),
+            ..Default::default()
+        };
+        let (start, end) = leading_bound_range(&filter, &batch, RunSortOrder::Opst);
+        assert_eq!((start, end), (2, 5), "exactly the (o_type=1, o_key=20) run");
+
+        // Unbound o_key: cascade stops after o_type.
+        let filter = BinaryFilter {
+            o_type: Some(1),
+            ..Default::default()
+        };
+        let (start, end) = leading_bound_range(&filter, &batch, RunSortOrder::Opst);
+        assert_eq!((start, end), (0, 5), "o_type range only");
+    }
+
+    /// A Const column on the cascade path must pass the range through when
+    /// it matches the bound value (rows are still sorted by the next key
+    /// column) and empty it when it can't match.
+    #[test]
+    fn cascaded_range_handles_const_columns() {
+        let batch = ColumnBatch {
+            row_count: 4,
+            s_id: ColumnData::Block(vec![11, 11, 12, 13].into()),
+            o_key: ColumnData::Block(vec![1, 2, 1, 1].into()),
+            p_id: ColumnData::Const(7),
+            o_type: ColumnData::Const(1),
+            o_i: ColumnData::AbsentDefault,
+            t: ColumnData::AbsentDefault,
+        };
+        // PSOT: (p_id, s_id, ...) — p_id is Const(7) and matches; s_id then
+        // narrows to the s_id=11 run.
+        let filter = BinaryFilter {
+            p_id: Some(7),
+            s_id: Some(11),
+            ..Default::default()
+        };
+        let (start, end) = leading_bound_range(&filter, &batch, RunSortOrder::Psot);
+        assert_eq!((start, end), (0, 2));
+
+        // Mismatched const: provably empty.
+        let filter = BinaryFilter {
+            p_id: Some(8),
+            ..Default::default()
+        };
+        let (start, end) = leading_bound_range(&filter, &batch, RunSortOrder::Psot);
+        assert_eq!(start, end, "const mismatch yields an empty range");
     }
 }

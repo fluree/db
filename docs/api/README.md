@@ -27,6 +27,12 @@ Complete reference for all HTTP endpoints:
 
 Bundle multiple JSON-LD and/or SPARQL queries into a single request that runs against one shared snapshot moment, with envelope-level `@context` / `opts` defaults and per-alias result assembly.
 
+### [Bolt protocol](bolt.md)
+
+The Neo4j wire protocol served against the openCypher surface: protocol
+versions and session model, typed value mappings (nodes, relationships,
+temporal values), and explicit-transaction semantics.
+
 ### [Headers, Content Types, and Request Sizing](headers.md)
 
 HTTP headers and request format details:

@@ -140,6 +140,97 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     result
 }
 
+/// Prefix → namespace map from the prologue (namespaces base-resolved).
+type PrefixMap = HashMap<Arc<str>, Arc<str>>;
+
+/// Build the prologue environment: the prefix → namespace map and the BASE.
+///
+/// A PREFIX namespace may itself be a relative IRI reference (`PREFIX : <>`,
+/// `PREFIX : <#>`); per SPARQL 1.1 §4.1.1 it resolves against the query BASE.
+/// Resolution happens once here (prepare-time) so every prefixed-name
+/// expansion sees an absolute namespace. Without a BASE, relative namespaces
+/// stay as written.
+///
+/// Deliberate simplifications in loosely-specified territory (PR-1454
+/// review): `prologue.base` is the single FINAL base (last declaration
+/// wins), so a relative PREFIX namespace declared textually BEFORE the
+/// BASE still resolves against it, and a second relative BASE is not
+/// chained against the first. Redeclared prefixes resolve last-wins via
+/// the map insert below.
+fn prologue_environment(prologue: &crate::ast::Prologue) -> (PrefixMap, Option<Arc<str>>) {
+    let base = prologue.base.as_ref().map(|b| b.iri.clone());
+
+    let mut prefixes = HashMap::new();
+    for decl in &prologue.prefixes {
+        let ns: Arc<str> = match &base {
+            Some(base) if !fluree_vocab::iri::is_absolute_iri(&decl.iri) => {
+                Arc::from(fluree_vocab::iri::resolve_iri(base, &decl.iri))
+            }
+            _ => decl.iri.clone(),
+        };
+        prefixes.insert(decl.prefix.clone(), ns);
+    }
+
+    (prefixes, base)
+}
+
+/// A query's `FROM` / `FROM NAMED` clause with every IRI prefix-expanded and
+/// base-resolved (same semantics as constant IRIs in the query body).
+///
+/// Produced by [`resolve_dataset_clause`]. Consumers (dataset construction —
+/// see the burn-down roadmap's PR-G2) receive absolute graph IRIs and never
+/// re-implement prologue handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDatasetClause {
+    /// `FROM <iri>` graphs (union forms the default graph).
+    pub default_graphs: Vec<Arc<str>>,
+    /// `FROM NAMED <iri>` graphs.
+    pub named_graphs: Vec<Arc<str>>,
+    /// Fluree `FROM <from> TO <to>` history-range extension endpoint.
+    pub to_graph: Option<Arc<str>>,
+}
+
+/// Resolve the query's dataset clause (`FROM` / `FROM NAMED`) IRIs against
+/// the prologue: prefixed names expand, relative references resolve against
+/// `BASE` (RFC 3986 §5). Returns `None` when the query has no dataset clause.
+///
+/// This is resolution plumbing only — it does not execute or authorize
+/// dataset clauses. Single-ledger `GraphDb` queries still reject FROM/FROM
+/// NAMED at the API layer (`validate_sparql_for_view`); when that guard is
+/// replaced by within-ledger dataset construction, the construction must
+/// consume these resolved IRIs rather than the raw AST strings.
+pub fn resolve_dataset_clause(ast: &SparqlAst) -> Result<Option<ResolvedDatasetClause>> {
+    let clause = match &ast.body {
+        QueryBody::Select(q) => q.dataset.as_ref(),
+        QueryBody::Ask(q) => q.dataset.as_ref(),
+        QueryBody::Describe(q) => q.dataset.as_ref(),
+        QueryBody::Construct(q) => q.dataset.as_ref(),
+        QueryBody::Update(_) => None,
+    };
+    let Some(clause) = clause else {
+        return Ok(None);
+    };
+
+    let (prefixes, base) = prologue_environment(&ast.prologue);
+    let expand = |iri: &crate::ast::term::Iri| -> Result<Arc<str>> {
+        term::expand_iri_with(&prefixes, base.as_deref(), iri).map(Arc::from)
+    };
+
+    Ok(Some(ResolvedDatasetClause {
+        default_graphs: clause
+            .default_graphs
+            .iter()
+            .map(expand)
+            .collect::<Result<Vec<_>>>()?,
+        named_graphs: clause
+            .named_graphs
+            .iter()
+            .map(expand)
+            .collect::<Result<Vec<_>>>()?,
+        to_graph: clause.to_graph.as_ref().map(expand).transpose()?,
+    }))
+}
+
 /// Walk every triple pattern reachable from `patterns` (recursing
 /// through container patterns) and reject any whose predicate slot is
 /// a system-controlled `f:reifies*` IRI/SID. Called by
@@ -227,9 +318,13 @@ fn reject_direct_reifies_in_patterns(patterns: &[Pattern]) -> Result<()> {
                 }
                 // ShortestPath also carries a predicate Sid; apply the same
                 // firewall (no SPARQL surface produces it today, but stay safe).
+                // The wildcard form (`predicate: None`) excludes `f:reifies*`
+                // in the operator's edge-set.
                 Pattern::ShortestPath(sp) => {
-                    if fluree_db_core::is_reserved_reifies_predicate(&sp.predicate) {
-                        return Err(reject_predicate_string(format!("{}", sp.predicate)));
+                    if let Some(pred) = &sp.predicate {
+                        if fluree_db_core::is_reserved_reifies_predicate(pred) {
+                            return Err(reject_predicate_string(format!("{pred}")));
+                        }
                     }
                 }
                 Pattern::Optional(inner)
@@ -316,14 +411,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         vars: &'a mut VarRegistry,
         source_text: Option<&'a str>,
     ) -> Self {
-        // Build prefix map from prologue
-        let mut prefixes = HashMap::new();
-        for decl in &ast.prologue.prefixes {
-            prefixes.insert(decl.prefix.clone(), decl.iri.clone());
-        }
-
-        // Get base IRI
-        let base = ast.prologue.base.as_ref().map(|b| b.iri.clone());
+        let (prefixes, base) = prologue_environment(&ast.prologue);
 
         Self {
             ast,
@@ -603,6 +691,32 @@ mod tests {
         encoder.add_namespace("http://schema.org/", 101);
         encoder.add_namespace("http://xmlns.com/foaf/0.1/", 102);
         encoder
+    }
+
+    #[test]
+    fn anonymous_bnode_vars_stay_disjoint_from_user_labels() {
+        // pr-1453 follow-up (same class as the transact-side fix):
+        // anonymous blank nodes minted `_:b{N}` variable names, which live
+        // inside the user label namespace — here the anon mints at
+        // vars.len() == 2, so a user-written _:b2 in the same scope
+        // silently unified with it, joining two independent existentials.
+        // The `_:[]{N}` namespace cannot be written as a BLANK_NODE_LABEL.
+        let (query, _vars) = lower_query_with_vars(
+            "SELECT * WHERE { _:b2 <http://example.org/p> ?o . [] <http://example.org/p> ?o }",
+        )
+        .expect("lowers");
+        let subject_var = |p: &Pattern| match p {
+            Pattern::Triple(t) => match &t.s {
+                Ref::Var(v) => *v,
+                other => panic!("expected var subject, got {other:?}"),
+            },
+            other => panic!("expected triple, got {other:?}"),
+        };
+        assert_ne!(
+            subject_var(&query.patterns[0]),
+            subject_var(&query.patterns[1]),
+            "a user label _:b2 must not unify with an anonymous [] blank node"
+        );
     }
 
     fn lower_query(sparql: &str) -> Result<Query> {
@@ -4198,5 +4312,160 @@ mod pragma_tests {
         )
         .unwrap_err();
         assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod base_resolution_tests {
+    use super::*;
+    use crate::parse::parse_sparql;
+    use fluree_db_core::FlakeValue;
+    use fluree_db_query::ir::triple::Ref;
+    use fluree_db_query::ir::{Expression, Function, GraphName, Pattern};
+    use fluree_db_query::parse::encode::MemoryEncoder;
+
+    fn lower_query(sparql: &str) -> Result<Query> {
+        let output = parse_sparql(sparql);
+        assert!(
+            output.ast.is_some(),
+            "Parse failed: {:?}",
+            output.diagnostics
+        );
+        let ast = output.ast.unwrap();
+        let mut encoder = MemoryEncoder::with_common_namespaces();
+        encoder.add_namespace("http://example.org/", 100);
+        let mut vars = VarRegistry::new();
+        lower_sparql(&ast, &encoder, &mut vars)
+    }
+
+    #[test]
+    fn base_resolves_constant_graph_iri_at_lowering() {
+        // The `graph-exist` mechanism: `GRAPH <data-g1.ttl>` under a document
+        // BASE lowers to the absolute registry-key IRI.
+        let query = lower_query(
+            "BASE <http://example.org/tests/query.rq>
+             SELECT * WHERE { GRAPH <data-g1.ttl> { ?s ?p ?o } }",
+        )
+        .unwrap();
+
+        let Pattern::Graph { name, .. } = &query.patterns[0] else {
+            panic!("expected graph pattern, got {:?}", query.patterns[0]);
+        };
+        let GraphName::Iri(iri) = name else {
+            panic!("expected constant graph name, got {name:?}");
+        };
+        assert_eq!(iri.as_ref(), "http://example.org/tests/data-g1.ttl");
+    }
+
+    #[test]
+    fn base_resolves_iri_function_constant_argument() {
+        // Expression-semantics D8 / W3C iri01: IRI()/URI() constant string
+        // arguments are base-resolved by a lowering-time constant fold.
+        let query = lower_query(
+            "BASE <http://example.org/>
+             SELECT (IRI(\"iri\") AS ?i) (URI(\"uri\") AS ?u) WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+
+        let folded: Vec<String> = collect_iri_call_constants(&query);
+        assert_eq!(
+            folded,
+            vec![
+                "http://example.org/iri".to_string(),
+                "http://example.org/uri".to_string()
+            ]
+        );
+    }
+
+    /// Collect the constant string arguments of every `Function::Iri` call in
+    /// SELECT-expression binds (order of appearance).
+    fn collect_iri_call_constants(query: &Query) -> Vec<String> {
+        let mut out = Vec::new();
+        for pattern in &query.patterns {
+            let Pattern::Bind { expr, .. } = pattern else {
+                continue;
+            };
+            if let Expression::Call { func, args } = expr {
+                if matches!(func, Function::Iri) {
+                    if let Some(Expression::Const(FlakeValue::String(s))) = args.first() {
+                        out.push(s.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base_resolves_relative_prefix_namespace() {
+        // W3C base-prefix-2 shape: `PREFIX : <#>` resolves against BASE
+        // before prefixed-name expansion.
+        let query = lower_query(
+            "BASE <http://example.org/x/>
+             PREFIX : <#>
+             SELECT * WHERE { ?s :p ?o }",
+        )
+        .unwrap();
+
+        let Pattern::Triple(t) = &query.patterns[0] else {
+            panic!("expected triple pattern, got {:?}", query.patterns[0]);
+        };
+        let Ref::Iri(p) = &t.p else {
+            panic!("expected un-encoded IRI predicate, got {:?}", t.p);
+        };
+        assert_eq!(p.as_ref(), "http://example.org/x/#p");
+    }
+
+    #[test]
+    fn no_base_keeps_relative_iris_verbatim() {
+        // Without BASE, relative references keep the historical passthrough
+        // (ledger-local names).
+        let query = lower_query("SELECT * WHERE { GRAPH <local-graph> { ?s ?p ?o } }").unwrap();
+
+        let Pattern::Graph { name, .. } = &query.patterns[0] else {
+            panic!("expected graph pattern, got {:?}", query.patterns[0]);
+        };
+        let GraphName::Iri(iri) = name else {
+            panic!("expected constant graph name, got {name:?}");
+        };
+        assert_eq!(iri.as_ref(), "local-graph");
+    }
+
+    #[test]
+    fn resolve_dataset_clause_expands_and_base_resolves() {
+        // PR-G2 plumbing: FROM / FROM NAMED IRIs come back prefix-expanded
+        // and base-resolved; the guard that rejects execution is elsewhere.
+        let output = parse_sparql(
+            "BASE <http://example.org/tests/query.rq>
+             PREFIX g: <http://example.org/graphs/>
+             SELECT * FROM <data-g1.ttl> FROM NAMED g:g2 WHERE { ?s ?p ?o }",
+        );
+        let ast = output.ast.expect("parse");
+
+        let resolved = resolve_dataset_clause(&ast).unwrap().expect("clause");
+        assert_eq!(
+            resolved
+                .default_graphs
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec!["http://example.org/tests/data-g1.ttl"]
+        );
+        assert_eq!(
+            resolved
+                .named_graphs
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>(),
+            vec!["http://example.org/graphs/g2"]
+        );
+        assert_eq!(resolved.to_graph, None);
+    }
+
+    #[test]
+    fn resolve_dataset_clause_none_without_clause() {
+        let output = parse_sparql("SELECT * WHERE { ?s ?p ?o }");
+        let ast = output.ast.expect("parse");
+        assert_eq!(resolve_dataset_clause(&ast).unwrap(), None);
     }
 }

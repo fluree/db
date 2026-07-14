@@ -109,7 +109,7 @@ tr.fail .sev{background:var(--bad)} tr.regress .sev{background:var(--warn)}
   background:var(--surface);border-radius:0 8px 8px 0;color:var(--muted);font-size:12.5px}
 "#;
 
-const SORT_JS: &str = r#"
+const SORT_JS: &str = r"
 <script>
 (function(){
   var t=document.querySelector('table'); if(!t)return;
@@ -130,7 +130,7 @@ const SORT_JS: &str = r#"
   });
 })();
 </script>
-"#;
+";
 
 /// A run file feeding the dashboard: its meta and records.
 pub struct RunData {
@@ -176,9 +176,15 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
     body.push_str("<span class=\"brand\"><span class=\"mark\">v</span>bench</span>");
     body.push_str(&format!("<span class=\"tagline\">{}</span>", esc(title)));
     body.push_str("<span class=\"prov\">");
-    body.push_str(&format!("<span><b>git</b> {}{}</span>", esc(&meta.git_commit),
-        if meta.git_dirty { "-dirty" } else { "" }));
-    body.push_str(&format!("<span><b>profile</b> {}</span>", esc(&meta.build_profile)));
+    body.push_str(&format!(
+        "<span><b>git</b> {}{}</span>",
+        esc(&meta.git_commit),
+        if meta.git_dirty { "-dirty" } else { "" }
+    ));
+    body.push_str(&format!(
+        "<span><b>profile</b> {}</span>",
+        esc(&meta.build_profile)
+    ));
     body.push_str(&format!("<span><b>host</b> {}</span>", esc(&meta.host)));
     body.push_str(&format!("<span>{}</span>", esc(&meta.timestamp)));
     body.push_str("</span></header>\n");
@@ -247,7 +253,7 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
         };
 
         let fail = matches!(hash_state, HashState::Miss);
-        let regress = ratio.map_or(false, |r| r >= 20.0);
+        let regress = ratio.is_some_and(|r| r >= 20.0);
         let sev_class = if fail {
             " class=\"fail\""
         } else if regress {
@@ -266,7 +272,12 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
         let tags: String = q
             .tags
             .iter()
-            .map(|t| format!("<span class=\"tag\">{}</span>", esc(&format!("{t:?}").to_lowercase())))
+            .map(|t| {
+                format!(
+                    "<span class=\"tag\">{}</span>",
+                    esc(&format!("{t:?}").to_lowercase())
+                )
+            })
             .collect();
         rows_html.push_str(&format!(
             "<td class=\"l bi\" data-sort=\"{}\">{}<div class=\"tags\"><span class=\"tag\">{}</span>{}</div></td>",
@@ -281,7 +292,9 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
         rows_html.push_str(&cell_status(nrec));
         rows_html.push_str(&cell_status(vrec));
         rows_html.push_str(&cell_hash(hash_state));
-        rows_html.push_str(&cell_counter(vrec, |c| spans::span_count(c, "r2rml.scan_table")));
+        rows_html.push_str(&cell_counter(vrec, |c| {
+            spans::span_count(c, "r2rml.scan_table")
+        }));
         rows_html.push_str(&cell_pruned(vrec));
         rows_html.push_str(&cell_missing(vrec));
         rows_html.push_str("</tr>\n");
@@ -292,13 +305,13 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
     body.push_str(&tile("queries", &shown.to_string(), None));
     body.push_str(&tile(
         "native median Σ",
-        &format!("{}<small> ms</small>", n_native_ms),
+        &format!("{n_native_ms}<small> ms</small>"),
         None,
     ));
     if virt.is_some() {
         body.push_str(&tile(
             "virtual median Σ",
-            &format!("{}<small> ms</small>", n_virt_ms),
+            &format!("{n_virt_ms}<small> ms</small>"),
             None,
         ));
         let hclass = if hash_total > 0 && hash_match == hash_total {
@@ -313,7 +326,11 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
             &format!("{hash_match}<small> / {hash_total}</small>"),
             hclass,
         ));
-        body.push_str(&tile("worst ratio", &format!("{worst_ratio:.0}<small>×</small>"), None));
+        body.push_str(&tile(
+            "worst ratio",
+            &format!("{worst_ratio:.0}<small>×</small>"),
+            None,
+        ));
     }
     let _ = (correctness_pass, correctness_total);
     body.push_str("</div>\n");
@@ -344,9 +361,13 @@ pub fn render(runs: &[RunData], corpus: &Corpus, title: &str) -> String {
 
     // Legend + caveats.
     body.push_str("<div class=\"legend\">");
-    body.push_str("<b>ratio</b> = virtual median wall ÷ native median wall (higher = virtual slower). ");
+    body.push_str(
+        "<b>ratio</b> = virtual median wall ÷ native median wall (higher = virtual slower). ",
+    );
     body.push_str("<b>scans</b> = <code>r2rml.scan_table</code> spans. ");
-    body.push_str("<b>pruned/sel</b> = Iceberg files pruned vs selected by <code>iceberg.scan_plan</code>. ");
+    body.push_str(
+        "<b>pruned/sel</b> = Iceberg files pruned vs selected by <code>iceberg.scan_plan</code>. ",
+    );
     body.push_str("<b>missing</b> = expected-for-virtual pathway spans that did not fire. ");
     body.push_str("A red stripe marks a native↔virtual result-hash mismatch; amber marks a ≥20× slowdown. Click a header to sort.");
     body.push_str("</div>");
@@ -370,7 +391,10 @@ enum HashState {
 
 fn tile(k: &str, v: &str, class: Option<&str>) -> String {
     let c = class.map_or(String::new(), |c| format!(" {c}"));
-    format!("<div class=\"tile{c}\"><div class=\"k\">{}</div><div class=\"v\">{v}</div></div>", esc(k))
+    format!(
+        "<div class=\"tile{c}\"><div class=\"k\">{}</div><div class=\"v\">{v}</div></div>",
+        esc(k)
+    )
 }
 
 fn cell_ms(rec: Option<&RunRecord>) -> String {
@@ -421,9 +445,7 @@ fn cell_status(rec: Option<&RunRecord>) -> String {
 fn cell_hash(state: HashState) -> String {
     match state {
         HashState::Match => "<td class=\"hash match\" data-sort=\"1\">✓</td>".to_string(),
-        HashState::RowsMatch => {
-            "<td class=\"hash match\" data-sort=\"1\">✓ rows</td>".to_string()
-        }
+        HashState::RowsMatch => "<td class=\"hash match\" data-sort=\"1\">✓ rows</td>".to_string(),
         HashState::Miss => "<td class=\"hash miss\" data-sort=\"0\">✗ mismatch</td>".to_string(),
         HashState::Na => "<td class=\"hash na\" data-sort=\"2\">—</td>".to_string(),
     }

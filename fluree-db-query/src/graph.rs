@@ -2,12 +2,20 @@
 //!
 //! Implements SPARQL GRAPH semantics:
 //! - `GRAPH <iri> { ... }`: Execute inner patterns against a specific named graph
-//! - `GRAPH ?g { ... }`: If ?g is bound, use that graph; if unbound, iterate all named graphs
+//! - `GRAPH ?g { ... }`: If ?g is bound, use that graph; if unbound, iterate
+//!   the **named graphs only** (per SPARQL 1.1 §13.3 the default graph is not
+//!   part of the range of `?g`)
 //!
 //! Key semantics:
 //! - GraphOperator is a **correlated operator** (like EXISTS/Subquery)
 //! - For each parent row, inner patterns are executed in the appropriate graph context
-//! - ?g is bound as `Binding::Lit { val: FlakeValue::String(...), dtc: Explicit(xsd:string) }`
+//! - ?g is bound as an IRI term (`Binding::Iri`). Per the SPARQL algebra the
+//!   `{?g → graph}` binding is JOINED with the inner solutions: an inner
+//!   occurrence of `?g` bound to a different term drops the row, and `?g` is
+//!   NOT in scope inside the group otherwise (`GRAPH ?g { FILTER(BOUND(?g)) }`
+//!   is empty — W3C graph-variable-scope). As a join-equivalent optimization
+//!   the value is seeded into the inner subplan when the inner *always* binds
+//!   `?g` (a required top-level triple/path/sub-SELECT), narrowing the scan.
 //! - Graph-not-found produces empty result (not an error)
 //!
 //! # Single-DB Mode
@@ -15,11 +23,14 @@
 //! In single-db mode (no dataset) every graph of the ledger lives in one
 //! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
 //! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
-//! explicit `FROM NAMED` (issue #1279); the ledger alias addresses the default
-//! graph, and reserved system graphs (txn-meta, config) stay private.
+//! explicit `FROM NAMED` (issue #1279); the ledger alias EXPLICITLY addresses
+//! the default graph, and reserved system graphs (txn-meta, config) stay private.
 //! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
 //!   the ledger alias, or an R2RML graph source; otherwise empty
-//! - unbound `GRAPH ?g`: binds ?g to each registered user graph and the alias
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph. The ledger
+//!   alias (default graph) is NOT enumerated — W3C-conformant since issue
+//!   #1442 (decision D-2); the #1279 implicit default-graph enumeration was
+//!   dropped, while explicit alias addressing above is retained
 //!
 //! # Architecture
 //!
@@ -31,17 +42,16 @@
 //! 5. Merges results with parent row (like SubqueryOperator)
 
 use crate::binding::{Batch, Binding};
-use crate::context::{ExecutionContext, WellKnownDatatypes};
+use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::r2rml::rewrite_patterns_for_r2rml;
+use crate::r2rml::{rewrite_patterns_for_r2rml, unsupported_subscope_error};
 use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
@@ -77,8 +87,6 @@ pub struct GraphOperator {
     graph_name: GraphName,
     /// Inner patterns to execute within the graph context
     inner_patterns: Vec<Pattern>,
-    /// Well-known datatypes for binding ?g as xsd:string
-    well_known: WellKnownDatatypes,
     /// Output schema (parent schema + any new vars from inner patterns)
     schema: Arc<[VarId]>,
     /// Operator state
@@ -94,6 +102,15 @@ pub struct GraphOperator {
     /// under a GRAPH wrapper (notably an R2RML graph source) can early-terminate
     /// instead of draining the whole table into `result_buffer`.
     row_budget: Option<usize>,
+    /// Plan-time decision: seed the enumerated graph variable into the inner
+    /// subplan. True only when the inner patterns bind the graph var in EVERY
+    /// solution (required top-level triple / property path / slice-free
+    /// sub-SELECT — `self_produced_vars`), where seeding merely filters and is
+    /// therefore equivalent to the SPARQL `{?g → graph}` join while strictly
+    /// narrowing the inner scan. When false, the join is enforced at merge
+    /// time instead, preserving `?g`-not-in-scope semantics for FILTER-only /
+    /// OPTIONAL / UNION references (W3C graph-variable-scope).
+    seed_graph_var: bool,
 }
 
 impl GraphOperator {
@@ -136,24 +153,33 @@ impl GraphOperator {
         schema_vec.extend(&new_vars);
         let schema = Arc::from(schema_vec.into_boxed_slice());
 
+        // Plan-time: seeding the graph var is join-equivalent only when the
+        // inner always binds it (see the field doc on `seed_graph_var`).
+        let seed_graph_var = match &graph_name {
+            GraphName::Var(v) => crate::subquery::self_produced_vars(&inner_patterns).contains(v),
+            GraphName::Iri(_) => false,
+        };
+
         Self {
             child,
             graph_name,
             inner_patterns,
-            well_known: WellKnownDatatypes::new(),
             schema,
             state: OperatorState::Created,
             result_buffer: Vec::new(),
             buffer_pos: 0,
             planning,
             row_budget: None,
+            seed_graph_var,
         }
     }
 
     /// Extract a graph IRI from a bound `?g`. Handles the IRI-typed forms a
     /// normal query produces — `<iri>` lowered to a `Sid` (decoded against the
-    /// active snapshot), a raw `Iri`, or a cross-ledger `IriMatch` — and also a
-    /// plain string literal for back-compat.
+    /// active snapshot), a raw `Iri`, or a cross-ledger `IriMatch` — plus the
+    /// late-materialized `EncodedSid`/`EncodedLit` forms a binary-index scan
+    /// binds (issue #1443: `?s :p ?g . FILTER EXISTS { GRAPH ?g { … } }`), and
+    /// also a plain string literal for back-compat.
     fn extract_graph_iri_from_binding(
         ctx: &ExecutionContext<'_>,
         binding: &Binding,
@@ -167,6 +193,28 @@ impl GraphOperator {
                 val: FlakeValue::String(s),
                 ..
             } => Some(Arc::from(s.as_str())),
+            // Late-materialized bindings from the binary index: decode against
+            // the active graph view, then extract from the decoded form.
+            // Defense-in-depth: as of PR-1454's audit, every upstream
+            // operator (hash join, filter/EXISTS seeding, merge) materializes
+            // batches before they reach either extraction call site, so no
+            // known plan shape delivers an encoded binding here — but that is
+            // a property of operator internals, not of this function's
+            // contract, and extraction must stay total across binding kinds.
+            // (Subject/string dictionaries are store-global, so decoding
+            // against the outer view is sound; when extraction DOES run in
+            // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
+            Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
+                let gv = ctx.graph_view()?;
+                match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
+                    Binding::Sid { sid, .. } => ctx.active_snapshot.decode_sid(&sid).map(Arc::from),
+                    Binding::Lit {
+                        val: FlakeValue::String(s),
+                        ..
+                    } => Some(Arc::from(s.as_str())),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -255,14 +303,10 @@ impl GraphOperator {
             // subqueries) whose bodies would evaluate against the R2RML source's
             // empty native index and silently return no rows — fail loudly.
             if !rewrite_result.unsupported.is_empty() {
-                return Err(crate::error::QueryError::InvalidQuery(format!(
-                    "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
-                     virtual dataset (an R2RML source has no native index, so these would \
-                     silently return no rows): {}. Rewrite them as basic triple patterns or move \
-                     them outside the GRAPH block.",
-                    graph_iri,
-                    rewrite_result.unsupported.join(", ")
-                )));
+                return Err(unsupported_subscope_error(
+                    &graph_iri,
+                    &rewrite_result.unsupported,
+                ));
             }
 
             std::borrow::Cow::Owned(rewrite_result.patterns)
@@ -270,8 +314,28 @@ impl GraphOperator {
             std::borrow::Cow::Borrowed(&self.inner_patterns)
         };
 
-        // Build seed operator from parent row (like EXISTS/Subquery)
-        let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
+        // Build seed operator from parent row (like EXISTS/Subquery). When this
+        // enumeration binds the graph variable AND the inner subplan is
+        // guaranteed to bind it in every solution (`seed_graph_var`, decided at
+        // plan time), seed it as an IRI term so inner occurrences of `?g` — a
+        // triple position, a sub-SELECT projecting `?g` — are constrained to
+        // the active graph's name instead of scanning free and being joined
+        // away at merge time. Join-equivalent by construction; strictly
+        // narrows the inner scan. All other shapes rely on the merge-time
+        // `{?g → graph}` join below.
+        let seed = match bind_graph_var {
+            Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
+                let mut schema_vec = parent_batch.schema().to_vec();
+                schema_vec.push(var);
+                let mut row: Vec<Binding> = parent_batch
+                    .row_view(row_idx)
+                    .expect("row_idx must be valid for batch")
+                    .to_vec();
+                row.push(Binding::iri(graph_iri.clone()));
+                SeedOperator::from_row(Arc::from(schema_vec.into_boxed_slice()), row)
+            }
+            _ => SeedOperator::from_batch_row(parent_batch, row_idx),
+        };
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &patterns_to_execute,
@@ -311,6 +375,35 @@ impl GraphOperator {
 
             // Merge each inner result with parent row
             for inner_row_idx in 0..batch.len() {
+                // SPARQL algebra: the `{?g → graph}` binding is JOINED with
+                // the inner solutions. A row whose inner `?g` is bound to a
+                // different term than the active graph's name is incompatible
+                // and is dropped — never overwritten (W3C graph-optional /
+                // graph-variable-join). Runs only when the enumeration binds a
+                // graph var the inner body actually carries; when the value
+                // was seeded (`seed_graph_var`) it short-circuits on the
+                // `Binding::Iri` fast path.
+                //
+                // Two deliberate edges (PR-1454 review): (1) an inner `?g`
+                // whose binding fails extraction (`extract → None`: a
+                // non-string literal, or an encoded form with no graph view)
+                // compares unequal and the row drops — lossy-but-safe over
+                // erroring mid-merge; (2) extraction honors the documented
+                // string-literal back-compat, so a plain-string graph name
+                // joins the IRI-valued enumeration by VALUE across term
+                // kinds where strict SPARQL term-equality would drop it
+                // (kept for pre-IRI-migration data).
+                if let Some(gvar) = bind_graph_var {
+                    if let Some(b) = batch.get(inner_row_idx, gvar) {
+                        if !matches!(b, Binding::Unbound | Binding::Poisoned)
+                            && Self::extract_graph_iri_from_binding(&graph_ctx, b).as_deref()
+                                != Some(graph_iri.as_ref())
+                        {
+                            continue;
+                        }
+                    }
+                }
+
                 let mut merged_row = Vec::with_capacity(self.schema.len());
 
                 // Copy parent bindings first
@@ -327,15 +420,12 @@ impl GraphOperator {
                 for (_i, var) in self.schema.iter().enumerate().skip(parent_len) {
                     // Check if this is the graph variable we need to bind
                     if bind_graph_var == Some(*var) {
-                        // Bind ?g to graph IRI using xsd:string
-                        let binding = Binding::Lit {
-                            val: FlakeValue::String(graph_iri.to_string()),
-                            dtc: DatatypeConstraint::Explicit(self.well_known.xsd_string.clone()),
-                            t: None,
-                            op: None,
-                            p_id: None,
-                        };
-                        merged_row.push(binding);
+                        // Bind ?g to the graph name as an IRI term (SPARQL
+                        // requires an IRI, not a string literal). The inner
+                        // subplan was seeded with the same value, so this is
+                        // consistent with — not an overwrite of — any inner
+                        // occurrence of the variable.
+                        merged_row.push(Binding::iri(graph_iri.clone()));
                     } else {
                         // Get from inner batch
                         let binding = batch
@@ -412,14 +502,10 @@ impl GraphOperator {
         // that would silently evaluate against the R2RML source's empty native
         // index — fail loudly rather than return a wrong empty result.
         if !rewrite_result.unsupported.is_empty() {
-            return Err(crate::error::QueryError::InvalidQuery(format!(
-                "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
-                 virtual dataset (an R2RML source has no native index, so these would silently \
-                 return no rows): {}. Rewrite them as basic triple patterns or move them outside \
-                 the GRAPH block.",
-                graph_iri,
-                rewrite_result.unsupported.join(", ")
-            )));
+            return Err(unsupported_subscope_error(
+                &graph_iri,
+                &rewrite_result.unsupported,
+            ));
         }
 
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
@@ -714,9 +800,14 @@ impl Operator for GraphOperator {
                                     .await?;
                                 }
                             } else {
-                                // Single-db: bind ?g to each registered user graph
-                                // (empty graphs emit no rows), then to the ledger
-                                // alias for the default graph.
+                                // Single-db: bind ?g to each registered user
+                                // graph (empty graphs emit no rows). The ledger
+                                // alias (default graph) is NOT enumerated: per
+                                // SPARQL 1.1, `GRAPH ?g` ranges over named
+                                // graphs only (D-2 / issue #1442 dropped the
+                                // #1279 implicit enumeration). The default
+                                // graph remains explicitly addressable via
+                                // `GRAPH <alias>` in the arms above.
                                 for iri in ctx.single_db_user_graph_iris() {
                                     self.execute_in_graph(
                                         ctx,
@@ -727,16 +818,6 @@ impl Operator for GraphOperator {
                                     )
                                     .await?;
                                 }
-                                let alias_iri: Arc<str> =
-                                    Arc::from(ctx.active_snapshot.ledger_id.as_str());
-                                self.execute_in_graph(
-                                    ctx,
-                                    &parent_batch,
-                                    row_idx,
-                                    alias_iri,
-                                    Some(*var),
-                                )
-                                .await?;
                             }
                         }
                     }
@@ -768,7 +849,7 @@ mod tests {
     use super::*;
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::var_registry::VarRegistry;
-    use fluree_db_core::{LedgerSnapshot, Sid};
+    use fluree_db_core::{DatatypeConstraint, LedgerSnapshot, Sid};
 
     // Helper test struct for creating operators with specific schemas
     struct TestChildOperator {

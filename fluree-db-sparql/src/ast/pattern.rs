@@ -202,7 +202,9 @@ pub enum GraphPattern {
         /// IRI, rejecting rebound-prefix false positives.
         predicate: super::term::PredicateTerm,
         /// The reified base edge (`<<( s p o )>>`).
-        triple_term: super::annotation::TripleTerm,
+        /// Boxed: `TripleTerm` embeds full subject/object terms (which
+        /// can hold reified triples inline), dominating the enum size.
+        triple_term: Box<super::annotation::TripleTerm>,
         /// Source span covering the entire pattern.
         span: SourceSpan,
     },
@@ -244,6 +246,135 @@ impl GraphPattern {
     /// Create a group pattern.
     pub fn group(patterns: Vec<GraphPattern>, span: SourceSpan) -> Self {
         GraphPattern::Group { patterns, span }
+    }
+
+    /// Collect the in-scope variables of this pattern per SPARQL 1.1
+    /// §18.2.1 ("Variable Scope"), appending references to `out`.
+    /// Duplicates are preserved; callers needing a set should dedupe.
+    ///
+    /// Rules implemented:
+    /// - BGP / property-path patterns: every variable in the pattern
+    ///   (including annotation-tail variables).
+    /// - `Group`: union of its children.
+    /// - `OPTIONAL { P }`, `GRAPH g { P }`, `SERVICE e { P }`: in-scope
+    ///   of `P` (plus the graph-name / endpoint variable, if any).
+    /// - `{ A } UNION { B }`: union of both branches.
+    /// - `A MINUS { B }`: in-scope of `A` only (the right side never
+    ///   projects variables out).
+    /// - `FILTER`: contributes nothing.
+    /// - `BIND (expr AS ?v)`: contributes `?v`.
+    /// - `VALUES`: contributes its variable list.
+    /// - Sub-`SELECT`: its projection (`SELECT *` projects the in-scope
+    ///   variables of its own pattern).
+    pub fn add_in_scope_variables<'a>(&'a self, out: &mut Vec<&'a Var>) {
+        match self {
+            GraphPattern::Bgp { patterns, .. } => {
+                for triple in patterns {
+                    add_triple_pattern_variables(triple, out);
+                }
+            }
+            GraphPattern::Group { patterns, .. } => {
+                for p in patterns {
+                    p.add_in_scope_variables(out);
+                }
+            }
+            GraphPattern::Optional { pattern, .. } => pattern.add_in_scope_variables(out),
+            GraphPattern::Union { left, right, .. } => {
+                left.add_in_scope_variables(out);
+                right.add_in_scope_variables(out);
+            }
+            GraphPattern::Minus { left, .. } => left.add_in_scope_variables(out),
+            GraphPattern::Filter { .. } => {}
+            GraphPattern::Bind { var, .. } => out.push(var),
+            GraphPattern::Values { vars, .. } => out.extend(vars.iter()),
+            GraphPattern::Graph { name, pattern, .. } => {
+                if let GraphName::Var(v) = name {
+                    out.push(v);
+                }
+                pattern.add_in_scope_variables(out);
+            }
+            GraphPattern::Service {
+                endpoint, pattern, ..
+            } => {
+                if let ServiceEndpoint::Var(v) = endpoint {
+                    out.push(v);
+                }
+                pattern.add_in_scope_variables(out);
+            }
+            GraphPattern::SubSelect { query, .. } => match &query.variables {
+                SelectVariables::Star => query.pattern.add_in_scope_variables(out),
+                SelectVariables::Explicit(items) => {
+                    for item in items {
+                        out.push(item.var());
+                    }
+                }
+            },
+            GraphPattern::Path {
+                subject, object, ..
+            } => {
+                if let SubjectTerm::Var(v) = subject {
+                    out.push(v);
+                }
+                if let Term::Var(v) = object {
+                    out.push(v);
+                }
+            }
+            GraphPattern::AnnotationTarget {
+                reifier,
+                triple_term,
+                ..
+            } => {
+                if let SubjectTerm::Var(v) = reifier {
+                    out.push(v);
+                }
+                if let SubjectTerm::Var(v) = &triple_term.subject {
+                    out.push(v);
+                }
+                if let PredicateTerm::Var(v) = &triple_term.predicate {
+                    out.push(v);
+                }
+                if let Term::Var(v) = &triple_term.object {
+                    out.push(v);
+                }
+            }
+        }
+    }
+}
+
+/// Collect every variable of a triple pattern including its RDF 1.2
+/// annotation tail (reifier variable and annotation-block entries).
+///
+/// `TriplePattern::variables` intentionally covers only subject /
+/// predicate / object (pre-annotation callers depend on that); scope
+/// computation must also see annotation-bound variables.
+fn add_triple_pattern_variables<'a>(triple: &'a TriplePattern, out: &mut Vec<&'a Var>) {
+    if let SubjectTerm::Var(v) = &triple.subject {
+        out.push(v);
+    }
+    if let PredicateTerm::Var(v) = &triple.predicate {
+        out.push(v);
+    }
+    if let Term::Var(v) = &triple.object {
+        out.push(v);
+    }
+    if let Some(annotation) = &triple.annotation {
+        for unit in &annotation.units {
+            if let Some(super::annotation::ReifierId::Var(v)) = &unit.reifier {
+                out.push(v);
+            }
+            if let Some(block) = &unit.block {
+                for entry in &block.entries {
+                    if let super::annotation::AnnotationVerb::Simple(PredicateTerm::Var(v)) =
+                        &entry.verb
+                    {
+                        out.push(v);
+                    }
+                    if let Term::Var(v) = &entry.object {
+                        out.push(v);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -306,6 +437,10 @@ pub struct SubSelect {
     /// subquery inherits HAVING, post-aggregation SELECT binds, and
     /// expression/aggregate ORDER BY identically.
     pub modifiers: SolutionModifiers,
+    /// Trailing VALUES clause (`SubSelect ::= SelectClause WhereClause
+    /// SolutionModifier ValuesClause`). Always a `GraphPattern::Values`
+    /// when present.
+    pub values: Option<Box<GraphPattern>>,
     /// Source span
     pub span: SourceSpan,
 }
@@ -410,6 +545,108 @@ mod tests {
             }
             _ => panic!("Expected Values pattern"),
         }
+    }
+
+    fn in_scope_names(pattern: &GraphPattern) -> Vec<String> {
+        let mut vars = Vec::new();
+        pattern.add_in_scope_variables(&mut vars);
+        let mut names: Vec<String> = vars.iter().map(|v| v.name.to_string()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn triple(s: &str, o: &str) -> TriplePattern {
+        TriplePattern::new(
+            SubjectTerm::Var(Var::new(s, test_span())),
+            PredicateTerm::Iri(Iri::prefixed("ex", "p", test_span())),
+            Term::Var(Var::new(o, test_span())),
+            test_span(),
+        )
+    }
+
+    #[test]
+    fn test_in_scope_variables_bgp_bind_values() {
+        let bgp = GraphPattern::bgp(vec![triple("s", "o")], test_span());
+        assert_eq!(in_scope_names(&bgp), vec!["o", "s"]);
+
+        let bind = GraphPattern::Bind {
+            expr: crate::ast::expr::Expression::literal(Literal::integer(1, test_span())),
+            var: Var::new("b", test_span()),
+            span: test_span(),
+        };
+        assert_eq!(in_scope_names(&bind), vec!["b"]);
+
+        let values = GraphPattern::Values {
+            vars: vec![Var::new("x", test_span()), Var::new("y", test_span())],
+            data: vec![],
+            span: test_span(),
+        };
+        assert_eq!(in_scope_names(&values), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn test_in_scope_variables_filter_contributes_nothing() {
+        let filter = GraphPattern::Filter {
+            expr: crate::ast::expr::Expression::var(Var::new("f", test_span())),
+            span: test_span(),
+        };
+        assert!(in_scope_names(&filter).is_empty());
+    }
+
+    #[test]
+    fn test_in_scope_variables_minus_right_excluded() {
+        let minus = GraphPattern::Minus {
+            left: Box::new(GraphPattern::bgp(vec![triple("a", "b")], test_span())),
+            right: Box::new(GraphPattern::bgp(vec![triple("c", "d")], test_span())),
+            span: test_span(),
+        };
+        assert_eq!(in_scope_names(&minus), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_in_scope_variables_union_both_branches() {
+        let union = GraphPattern::Union {
+            left: Box::new(GraphPattern::bgp(vec![triple("a", "b")], test_span())),
+            right: Box::new(GraphPattern::bgp(vec![triple("c", "d")], test_span())),
+            span: test_span(),
+        };
+        assert_eq!(in_scope_names(&union), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_in_scope_variables_subselect_projection() {
+        // Explicit projection: only the projected variable is in scope.
+        let sub = GraphPattern::SubSelect {
+            query: Box::new(SubSelect {
+                distinct: false,
+                reduced: false,
+                variables: SelectVariables::Explicit(vec![crate::ast::query::SelectVariable::Var(
+                    Var::new("x", test_span()),
+                )]),
+                pattern: Box::new(GraphPattern::bgp(vec![triple("x", "hidden")], test_span())),
+                modifiers: SolutionModifiers::default(),
+                values: None,
+                span: test_span(),
+            }),
+            span: test_span(),
+        };
+        assert_eq!(in_scope_names(&sub), vec!["x"]);
+
+        // SELECT * projects the pattern's own in-scope variables.
+        let sub_star = GraphPattern::SubSelect {
+            query: Box::new(SubSelect {
+                distinct: false,
+                reduced: false,
+                variables: SelectVariables::Star,
+                pattern: Box::new(GraphPattern::bgp(vec![triple("x", "y")], test_span())),
+                modifiers: SolutionModifiers::default(),
+                values: None,
+                span: test_span(),
+            }),
+            span: test_span(),
+        };
+        assert_eq!(in_scope_names(&sub_star), vec!["x", "y"]);
     }
 
     #[test]

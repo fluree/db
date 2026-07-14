@@ -491,8 +491,8 @@ async fn e2e_r2rml_query_iceberg_table() {
                         eprintln!(
                             "  Row {}: name={:?}, country={:?}",
                             batch_idx * 1000 + row_idx,
-                            &name_col[row_idx],
-                            &country_col[row_idx]
+                            name_col[row_idx],
+                            country_col[row_idx]
                         );
                     }
                 }
@@ -694,8 +694,8 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
                         eprintln!(
                             "  Row {}: name={:?}, country={:?}",
                             i * 1000 + row_idx,
-                            &name_col[row_idx],
-                            &country_col[row_idx]
+                            name_col[row_idx],
+                            country_col[row_idx]
                         );
                     }
                 }
@@ -738,6 +738,9 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
 ///   FLUREE_TEST_ICEBERG_CATALOG_URI   (required — the gate)
 ///   FLUREE_TEST_ICEBERG_WAREHOUSE     (required)
 ///   FLUREE_TEST_ICEBERG_OAUTH2_SECRET (required; `client_id:client_secret`)
+///   FLUREE_TEST_ICEBERG_OAUTH2_SCOPE  (default `session:role:ICEBERG_READER` —
+///                                      the Snowflake Horizon/Polaris role scope,
+///                                      matching the it_iceberg_*_live suites)
 ///   FLUREE_TEST_ICEBERG_TABLE         (default `DW.DIM_GEOGRAPHY`)
 ///   FLUREE_TEST_ICEBERG_KEY_COLUMN    (default `GEOGRAPHY_KEY`)
 ///
@@ -789,7 +792,11 @@ async fn live_iceberg_fql_type_returns_instances() {
         .with_s3_path_style(true);
     if let Some((client_id, client_secret)) = oauth2_secret.split_once(':') {
         let token_url = format!("{catalog_uri}/v1/oauth/tokens");
-        config = config.with_auth_oauth2(&token_url, client_id, client_secret);
+        let scope = std::env::var("FLUREE_TEST_ICEBERG_OAUTH2_SCOPE")
+            .unwrap_or_else(|_| "session:role:ICEBERG_READER".to_string());
+        config = config
+            .with_auth_oauth2(&token_url, client_id, client_secret)
+            .with_oauth2_scope(scope);
     }
 
     if let Err(e) = fluree.create_r2rml_graph_source(config).await {
@@ -1405,7 +1412,9 @@ async fn engine_e2e_type_scan_bound_and_variable_parity() {
 
 /// A variable-predicate wildcard (`?s ?p ?o`) must bind `?p` to each triple's
 /// predicate IRI — previously the operator left `?p` unbound, so a wildcard /
-/// crawl scan returned subjects and objects with a null predicate.
+/// crawl scan returned subjects and objects with a null predicate. It must ALSO
+/// emit each subject's `rr:class`-derived `rdf:type` triple (native parity: a
+/// native wildcard returns the type triple alongside the data predicates).
 #[tokio::test]
 async fn engine_e2e_wildcard_binds_predicate_var() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1422,12 +1431,15 @@ async fn engine_e2e_wildcard_binds_predicate_var() {
     let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
     let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, p, o]).await;
 
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
     let known_predicates = [
         "http://example.org/name",
         "http://example.org/country",
         "http://example.org/iata",
+        RDF_TYPE,
     ];
     let mut rows = 0;
+    let mut type_rows = 0;
     for b in &batches {
         for r in 0..b.len() {
             rows += 1;
@@ -1440,13 +1452,26 @@ async fn engine_e2e_wildcard_binds_predicate_var() {
                 known_predicates.contains(&p_iri.as_str()),
                 "?p bound to a mapping predicate; got {p_iri}"
             );
+            if p_iri == RDF_TYPE {
+                type_rows += 1;
+                let o_iri = b
+                    .get(r, o)
+                    .and_then(fluree_db_query::Binding::get_iri)
+                    .map(std::string::ToString::to_string)
+                    .expect("type row must bind ?o to an IRI");
+                assert_eq!(
+                    o_iri, "http://example.org/Airline",
+                    "type row object = the declared class"
+                );
+            }
         }
     }
-    // 3 airlines × 3 predicate-object maps = 9 triples.
+    // 3 airlines × (3 predicate-object maps + 1 rr:class rdf:type) = 12 triples.
     assert_eq!(
-        rows, 9,
-        "wildcard scan yields one row per (subject, predicate)"
+        rows, 12,
+        "wildcard scan yields one row per (subject, predicate) incl. rdf:type"
     );
+    assert_eq!(type_rows, 3, "exactly one rdf:type row per subject");
 }
 
 /// Regression (fluree/db#1406 review): a class and a predicate that live in
@@ -4188,8 +4213,12 @@ async fn guard_bound_subject_binds_object_only() {
 /// bound-subject wildcard scan that binds `?p` via `predicate_var` — this is the
 /// UI's "subject inspector". (Previously it was left unconverted for want of a
 /// predicate-var field.) A bound subject with a CONSTANT predicate still converts.
-#[test]
-fn bound_subject_variable_predicate_binds_predicate_var() {
+///
+/// `#[tokio::test]` (not a plain `#[test]`) because `edw_guard_ledger` builds a
+/// `Fluree`, and the builder spawns the cache event listener — which requires a
+/// live runtime even though this test body never awaits.
+#[tokio::test]
+async fn bound_subject_variable_predicate_binds_predicate_var() {
     let (_fluree, ledger) = edw_guard_ledger();
     let mut vars = VarRegistry::new();
     let p = vars.get_or_insert("?p");

@@ -14,8 +14,63 @@
 //! These restrictions are enforced at the validation layer, not during parsing.
 
 use super::pattern::{GraphName, GraphPattern, TriplePattern};
+use super::query::Prologue;
 use super::term::Iri;
 use crate::span::SourceSpan;
+
+/// A complete SPARQL Update request: `Prologue ( Update1 ( ';' Update )? )?`.
+///
+/// A request is a *sequence* of operations separated by `;`, sharing an
+/// accumulating prologue (a `PREFIX`/`BASE` declared after a `;` is visible
+/// to every subsequent operation). Per the grammar the operation list is
+/// optional, so an empty or prologue-only request is a **valid no-op** and
+/// parses to an `UpdateRequest` with zero operations.
+///
+/// Execution semantics (SPARQL 1.1 Update §3.1): operations apply in
+/// sequence, each observing the graph-store state left by the previous one;
+/// Fluree stages the whole request as ONE atomic commit (roadmap D-10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateRequest {
+    /// The `;`-separated operations, in request order. Empty = valid no-op.
+    pub operations: Vec<UpdateRequestOp>,
+    /// Source span of the whole request.
+    pub span: SourceSpan,
+}
+
+impl UpdateRequest {
+    /// Create a new update request.
+    pub fn new(operations: Vec<UpdateRequestOp>, span: SourceSpan) -> Self {
+        Self { operations, span }
+    }
+
+    /// Wrap a single operation as a one-element request (the effective
+    /// prologue is the request prologue). Convenience for tests and
+    /// programmatic AST construction.
+    pub fn single(prologue: Prologue, operation: UpdateOperation, span: SourceSpan) -> Self {
+        Self {
+            operations: vec![UpdateRequestOp {
+                prologue,
+                operation,
+            }],
+            span,
+        }
+    }
+}
+
+/// One operation of an [`UpdateRequest`], carrying the prologue in effect
+/// for that operation.
+///
+/// The prologue is the request-initial prologue plus every `PREFIX`/`BASE`
+/// declared before this operation. Snapshotting it per operation keeps
+/// prefix resolution correct when a later operation redeclares a prefix
+/// (the earlier operation must still resolve through the earlier binding).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateRequestOp {
+    /// The accumulated prologue in effect for this operation.
+    pub prologue: Prologue,
+    /// The operation itself.
+    pub operation: UpdateOperation,
+}
 
 /// A SPARQL Update operation.
 #[derive(Clone, Debug, PartialEq)]

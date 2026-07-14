@@ -13,8 +13,8 @@ dashboards / regression gates) read back.
 ## Build
 
 ```sh
-CARGO_TARGET_DIR=/Users/ajohnson/fluree/db/target cargo build -p fluree-bench-virtual
-# binary: <target>/debug/vbench   (add --release for realistic wall times)
+cargo build -p fluree-bench-virtual --release
+# binary: <target>/release/vbench   (use --release for realistic wall times)
 ```
 
 The crate depends on `fluree-db-api` with the `iceberg` feature, so a build pulls
@@ -24,11 +24,13 @@ in the R2RML/Iceberg read path and the AWS SDK the Snowflake REST catalog needs.
 
 ```sh
 vbench setup --verify [--targets native-sf01,virtual-sf01]
-vbench run   --targets native-sf01[,virtual-sf01] [--subset smoke] [--out FILE] [--keep-heads]
-             [--cache-state hot|cold] [--survey] [--max-queries N] [--max-wall-budget-s S]
-vbench exec-one --query q001 --target virtual-sf01 [--keep-heads] [--cold]
+vbench run   --targets native-sf01[,virtual-sf01] [--subset smoke] [--queries q001,q002]
+             [--out FILE] [--keep-heads] [--timeout-s S] [--cache-state hot|cold]
+             [--survey] [--max-queries N] [--max-wall-budget-s S]
+vbench exec-one --query q001 --target virtual-sf01 [--keep-heads] [--cold] [--timeout-s S]
 vbench report   --run FILE [--json]
-vbench baseline --expected [--run FILE | --targets native-sf01] --perf --run FILE [--baseline-dir DIR]
+vbench baseline --expected [--force] [--run FILE | --targets native-sf01] --perf --run FILE
+                [--baseline-dir DIR]
 vbench compare  --run FILE [--baseline-dir DIR] [--gate]
 vbench dashboard --run native.jsonl --run virtual.jsonl [--out FILE] [--title T]
 ```
@@ -46,11 +48,14 @@ artifact cache to a known directory.
   **median-wall** rep; the reported wall/rows/hash/counters all come from that
   one rep so they are internally consistent. Records stream to `run.jsonl` and
   are flushed after each line, so a crash keeps partial results.
+  - `--queries q010,q011` — run only these ids, in corpus order (overrides
+    `--subset`); the in-process resume hook after a crashed sweep.
   - `--cache-state cold` — the **cold protocol**: run each query in a fresh
     `exec-one --cold` subprocess (empty catalog TTL cache, OAuth token, footer
     LRU, leaflet cache) whose **child** clears the home-scoped disk artifact
     cache first, so it pays the full cold cost. No priming; 2 s pacing between
-    children.
+    children. The parent's `--timeout-s` / `--cache-dir` overrides are
+    forwarded to each child.
   - `--survey` — mark the run informational: it is **never a gate** (`baseline`
     refuses it, `compare` skips it). For the live SF20 stress subset.
   - `--max-queries N` / `--max-wall-budget-s S` — caps that bound live-Snowflake
@@ -62,9 +67,15 @@ artifact cache to a known directory.
 - **baseline** — bless the reference:
   - `--expected` writes the per-query **native** correctness oracle to
     `baselines/expected/<qid>.json` (`result_hash`, `rows`, first-20 `head_rows`,
-    provenance). Queries the manifest expects to error on virtual (q043/q044) get
+    provenance). Queries the manifest expects to error on virtual get
     **no** expected file — there is nothing to compare a correctly-erroring
     virtual result against. With no `--run`, a fresh native run is executed.
+    **Re-blessing is guarded:** an existing oracle whose hash/rows differ from
+    the new run **refuses** (printing the per-query delta, writing nothing)
+    unless `--force` is given — so a native regression that still exits ok
+    can't be silently blessed as the new truth. Oracles the run reproduces
+    exactly are left untouched (diff-free); `rows_only`-gated queries compare
+    row count, since their hash legitimately varies between runs.
   - `--perf` writes the per-target perf reference to `baselines/perf/<target>.json`
     (`hot_wall_ms_median`, optional `cold_wall_ms`, pathway counters, provenance),
     merging so a hot run and a later cold run both populate an entry.
@@ -94,14 +105,27 @@ carries its own stored auth.
 
 `baselines/` (checked in — the reference) holds `expected/<qid>.json` +
 `perf/<target>.json`; `budgets.json` (crate root) sets the perf gate:
-`{ default_budget_pct: { native, virtual_hot }, cold: advisory, overrides: {} }`
-— a query's observed hot wall may exceed its blessed baseline by at most that
-percent, with per-query `overrides` winning over the class default. A typical
-loop: `run` native → `baseline --expected --perf` → later `run` (native or
-virtual) → `compare --gate` to catch a correctness break or a perf regression.
-Cold runs, survey runs, and full-vs-smoke stay distinguishable in the record
-(`cache_state`, meta `survey`, meta `subset`) so a `compare` matches like with
-like (`compare` picks the hot or cold baseline wall by the record's `cache_state`).
+`{ default_budget_pct: { native, virtual_hot }, min_delta_ms, cold: advisory,
+overrides: {} }`. A query **violates** only when its observed hot wall exceeds
+its blessed baseline by more than the class percent (per-query `overrides`
+win) **and** by at least `min_delta_ms` absolute — the floor keeps a percent
+of a tiny baseline (10% of 8 ms = 0.8 ms) from gating on scheduler noise, at
+the documented cost of not flagging a regression that stays below the floor.
+A typical loop: `run` native → `baseline --expected --perf` → later `run`
+(native or virtual) → `compare --gate` to catch a correctness break or a perf
+regression. Cold runs, survey runs, and full-vs-smoke stay distinguishable in
+the record (`cache_state`, meta `survey`, meta `subset`) so a `compare`
+matches like with like (`compare` picks the hot or cold baseline wall by the
+record's `cache_state`).
+
+**Perf baselines are single-machine, single-day medians** (the committed ones
+came from the audit host). Correctness oracles (`expected/`) are
+hardware-independent and portable; the perf medians are not. Before gating on
+perf from a different machine — or after enough environmental drift that
+ratios move on an unchanged binary — re-bless locally the same day:
+`vbench run --targets … --out fresh.jsonl` on the **base** commit, then
+`vbench baseline --perf --run fresh.jsonl`, and only then `compare --gate`
+your change against those local medians.
 
 ### Cold-cache layout (verified)
 
@@ -127,27 +151,31 @@ when warm).
 `fluree_home` is a `.fluree` home directory; the on-disk store is
 `<fluree_home>/storage`. `kind` drives whether the query builder attaches
 `.with_r2rml()` (virtual only). A target may carry `"status": "pending"` to mark
-it non-runnable (e.g. `virtual-sf01`, whose Snowflake schema `DW_SF01` is not
-loaded yet); `run` / `exec-one` / `setup` refuse a pending target.
+it non-runnable; `run` / `exec-one` / `setup` refuse a pending target.
 
 Shipped targets:
 
 | id | kind | home | notes |
 |---|---|---|---|
-| `native-sf01` | native | `~/vbench/.fluree` | 35,238,778-triple baseline |
-| `virtual-sf20` | virtual | `~/horizon-demo/.fluree` | live Snowflake SF20 — **expensive / rate-limited** |
-| `virtual-sf01` | virtual | *(pending)* | scale-matched counterpart of native-sf01, not loaded |
+| `native-sf01` | native | `~/vbench/.fluree` | 35,238,778-triple baseline; source of the blessed oracles |
+| `virtual-sf01` | virtual | `~/vbench/.fluree` | scale-matched counterpart (Snowflake `ENTERPRISE_DEMO.DW_SF01`, loaded 2026-07-10, exact generator row counts); full hot + cold-subset perf baselines committed |
+| `virtual-sf20` | virtual | `~/horizon-demo/.fluree` | live Snowflake SF20, survey-only — **expensive / rate-limited** |
 
 ## Corpus (`corpus/`)
 
 `corpus/manifest.json` catalogs each query; `corpus/queries/*.rq` holds the SPARQL
-with a header comment (intent + BI-question placeholder). Each entry carries: an
-`id`, `file`, `bi_question`, `tags` (from a closed enum: `bgp_star`, `join`,
-`filter_range`, `order_by`, `group_by`, `aggregate`, `count`), source `tables`,
-a `class` (`dims-only` today, so every query runs on both native and virtual),
-`expected_rows` (exact or `[min,max]`), `order_sensitive`, `timeout_s`, and
-`subsets`. The seed corpus is five `smoke` queries whose predicates were verified
-against the ENTERPRISE_DEMO R2RML mapping.
+with a lineage header (BI question + design reference). The shipped corpus is
+the full design set: **26 BI questions → 54 queries (`q001`–`q054`)** spanning
+dimension and fact tables, with a 16-query `smoke` subset that covers every
+feature tag. Each entry carries: an `id`, `file`, `bi_question`, `tags` (from
+the closed 20-variant enum in `src/corpus.rs` — `bgp_star`, `join`, `fk_chain`,
+`filter_range`, `filter_string`, `filter_date`, `filter_iri`, `optional`,
+`union`, `aggregate`, `count`, `group_by`, `having`, `order_by`, `distinct`,
+`subquery`, `values`, `negation`, `property_path`, `construct`), source
+`tables`, a `class`, `expected_rows` (exact or `[min,max]`),
+`order_sensitive`, `timeout_s`, `subsets`, an optional per-target-kind
+`expected_status`, and `hash_gate` (`full` default; `rows_only` for the nine
+nondeterministic-selection LIMIT queries per the corpus determinism policy).
 
 `Corpus::load` validates the manifest before any run: unique ids, every `.rq`
 file present and non-empty, tags within the enum, and the `smoke` subset covering
@@ -158,9 +186,15 @@ every tag that appears anywhere in the corpus.
 Both engines render results as SPARQL-results JSON, and `src/canon.rs` reduces a
 result to an **order-independent multiset hash**: rows are canonicalized
 cell-by-cell (IRIs verbatim; integers reparsed; decimals shortest-round-trip;
-floats quantized to 12 significant digits), then the row-set is sorted and
+floats quantized to 12 significant digits; language tags case-folded and kept,
+so a lang divergence fails the gate), then the row-set is sorted and
 SHA-256'd. Two engines that emit the same bindings in a different order hash
-equal.
+equal. A document that is neither a JSON-LD graph, an ASK boolean, nor a
+well-formed `results.bindings` table is an **error**, not a 0-row success.
+Known blind spot: decimal canonicalization goes through `f64`, so decimals
+differing only past ~15 significant digits false-equate (no corpus query
+projects such a value; see `src/canon.rs` for why the exact-decimal fix is
+deferred).
 
 > **Scale matters for hash comparison.** `virtual-sf20` holds ~20× the data of
 > `native-sf01`, so their hashes will **not** match — that is expected. Hash
@@ -180,12 +214,15 @@ against a `debug_span!`/`.instrument()` callsite (cited in the module doc):
 | `iceberg.parquet_read` | per-file Parquet decode (records `file_size`; runs in spawned tasks) |
 | `iceberg.oauth_token` | OAuth token mint |
 
-`spans_missing` flags the two spans that must fire on any non-trivial virtual
-scan (`r2rml.scan_table`, `iceberg.scan_plan`) when they don't — the signal that
-a "virtual" query didn't actually hit the R2RML engine, or tracing was
-mis-installed. `parquet_read` / `load_table` / `oauth_token` are
-data-/cache-dependent (a metadata-only COUNT can skip Parquet; a warm cache skips
-the cold catalog and OAuth), so they are not in the expected-always set.
+`spans_missing` flags the must-fire span (`r2rml.scan_table`) when it doesn't
+fire — the signal that a "virtual" query didn't actually hit the R2RML engine,
+or tracing was mis-installed. The other four are conditional and deliberately
+not in the expected-always set: `scan_plan` fires only on the planner's
+pruning/pushdown branch (finding F7 — treating it as must-fire false-flagged
+most virtual queries); `parquet_read` is data-dependent (a metadata-only COUNT
+can skip Parquet); `load_table` / `oauth_token` fire only on a cold
+catalog/OAuth miss. A unit test greps each literal at its cited engine
+callsite so a silent engine-side rename can't zero a counter.
 
 The capture layer (`BenchSpanCapture`, from `fluree-bench-support`) is installed
 once as a global subscriber. Reps run strictly sequentially and drain the sink
@@ -222,8 +259,11 @@ incomparable "the ledger changed under me" run is detectable automatically._
 
 ## Validation status
 
-`cargo test -p fluree-bench-virtual` is green (corpus-validation + canon +
-span-aggregation unit tests). End-to-end verified against `native-sf01`
-(`setup --verify` triple-count assertion passes; the five-query smoke run returns
-`ok` with expected rows) and one live `exec-one` against `virtual-sf20` (all five
-pathway spans captured with nonzero counters).
+`cargo test -p fluree-bench-virtual -p fluree-bench-support` is green
+(corpus-validation, canon, span-aggregation/rename-guard, budget, bless-guard,
+and cold-arg-forwarding unit tests — all hermetic: no network, no PAT).
+End-to-end verified: `setup --verify` triple-count assertion on `native-sf01`;
+a full 54/54-ok native run (source of the blessed oracles); the full
+virtual-sf01 hot sweep + 6-query cold subset behind the committed perf
+baselines; and a live SF20 survey. Cold q001 on virtual-sf01 hash-matched the
+native blessed oracle end-to-end (the cross-pipeline parity proof).

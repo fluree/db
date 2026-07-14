@@ -3761,6 +3761,538 @@ async fn edgekey_roundtrip_language_tagged_literal_annotation() {
 }
 
 // =====================================================================
+// Turtle-star ↔ JSON-LD @annotation flake-equivalence gate tests
+// =====================================================================
+//
+// Contract (PR-W15): Turtle-star asserting forms (`<< s p o ~ r >>`,
+// `{| … |}`) must produce BIT-IDENTICAL `f:reifies*` flakes to the
+// JSON-LD `@annotation` lowering — same predicates, same object
+// values/datatypes/metadata, same "no f:reifiesDatatype" shape — so
+// cascade retracts, hydration, and the annotation arena treat both
+// surfaces as one. Both surfaces are inserted into the SAME ledger
+// (JSON-LD first, Turtle second) and their bundles compared per
+// transaction time, which keeps Sid identity comparable.
+
+/// All `f:reifies*` bundles for annotations reifying edges whose
+/// subject is `base_subject_iri`, grouped by `(ann_sid, t)`.
+async fn reifies_bundles_for_subject(
+    ledger: &MemoryLedger,
+    base_subject_iri: &str,
+) -> Vec<((fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>)> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+    use std::collections::BTreeMap;
+
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri(base_subject_iri)
+        .expect("encode base subject IRI");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("encode f:reifiesSubject");
+
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid)),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan f:reifiesSubject pointers");
+
+    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
+        BTreeMap::new();
+    for ptr in &pointers {
+        let ann_sid = ptr.s.clone();
+        let ann_flakes = range_with_overlay(
+            &ledger.snapshot,
+            0,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ann_sid.clone()),
+            RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .expect("scan annotation subject flakes");
+        for f in ann_flakes {
+            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
+                bundles.entry((ann_sid.clone(), f.t)).or_default().push(f);
+            }
+        }
+    }
+    bundles.into_iter().collect()
+}
+
+/// Normalize a bundle to its time/subject-agnostic body:
+/// sorted `(predicate, object, datatype, meta)` rows.
+fn bundle_body(
+    bundle: &[fluree_db_core::Flake],
+) -> Vec<(
+    fluree_db_core::Sid,
+    fluree_db_core::FlakeValue,
+    fluree_db_core::Sid,
+    Option<fluree_db_core::FlakeMeta>,
+)> {
+    let mut body: Vec<_> = bundle
+        .iter()
+        .map(|f| (f.p.clone(), f.o.clone(), f.dt.clone(), f.m.clone()))
+        .collect();
+    body.sort_by_key(|row| format!("{row:?}"));
+    body
+}
+
+/// Shared driver: insert the JSON-LD form, then the Turtle-star form,
+/// into one ledger; assert the two bundles' bodies are identical and
+/// both decode to the base edge's EdgeKey.
+async fn assert_turtle_star_matches_jsonld(
+    ledger_id: &str,
+    jsonld_txn: serde_json::Value,
+    turtle: &str,
+    base_subject_iri: &str,
+    base_predicate_iri: &str,
+) {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let jsonld_committed = fluree
+        .insert(ledger0, &jsonld_txn)
+        .await
+        .expect("JSON-LD @annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let turtle_committed = fluree
+        .insert_turtle(jsonld_committed.ledger, turtle)
+        .await
+        .expect("Turtle-star insert");
+    let ledger = &turtle_committed.ledger;
+    let t_turtle = ledger.t();
+    assert!(t_turtle > t_jsonld);
+
+    // Base edge (asserted by both surfaces; EdgeKey is t-agnostic).
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri(base_subject_iri)
+        .expect("encode subject");
+    let predicate_sid = ledger
+        .snapshot
+        .encode_iri(base_predicate_iri)
+        .expect("encode predicate");
+    let base_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject_predicate(subject_sid, predicate_sid),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan base edge");
+    assert!(!base_flakes.is_empty(), "base edge must exist");
+    let base_key = EdgeKey::from_flake(&base_flakes[0]);
+
+    let bundles = reifies_bundles_for_subject(ledger, base_subject_iri).await;
+    let jsonld_bundles: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .collect();
+    let turtle_bundles: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_turtle)
+        .collect();
+    assert_eq!(
+        jsonld_bundles.len(),
+        turtle_bundles.len(),
+        "each surface must produce the same number of reifier bundles: {bundles:#?}"
+    );
+    assert!(!jsonld_bundles.is_empty(), "expected at least one bundle");
+
+    // Pairwise body equality (bundles sorted by body for stable pairing).
+    let mut jl: Vec<_> = jsonld_bundles.iter().map(|(_, b)| bundle_body(b)).collect();
+    let mut tt: Vec<_> = turtle_bundles.iter().map(|(_, b)| bundle_body(b)).collect();
+    jl.sort();
+    tt.sort();
+    assert_eq!(
+        jl, tt,
+        "Turtle-star bundle bodies must be bit-identical to the JSON-LD \
+         @annotation bodies (same predicates/objects/datatypes/meta, no \
+         f:reifiesDatatype)"
+    );
+
+    // Every bundle decodes to the base edge's EdgeKey.
+    for ((ann, _), bundle) in &bundles {
+        let decoded = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        assert_eq!(
+            decoded, base_key,
+            "bundle for {ann:?} reifies the base edge"
+        );
+    }
+}
+
+#[tokio::test]
+async fn turtle_star_annotation_block_matches_jsonld_annotation() {
+    // `{| … |}` (anonymous reifier) ↔ `@annotation` (minted
+    // `_:fluree_ann_N`): identical bundle bodies, distinct blank anns.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:annotation-block",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:source": "hr-system" }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:worksFor ex:acme {| ex:source \"hr-system\" |} .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_named_reifier_matches_jsonld_named_annotation() {
+    // `~ ex:r_tt` ↔ `@annotation {"@id": "ex:r_jl"}`: a NAMED reifier
+    // becomes the annotation subject verbatim (no minting) on both
+    // surfaces. Uses two parallel edges (ex:alice / ex:bob) because
+    // re-asserting the identical (edge, reifier) bundle in a later txn
+    // is an idempotent no-op — the engine drops the duplicate flakes —
+    // so the same pair can't be exercised twice in one ledger. Bundle
+    // bodies are compared with the f:reifiesSubject row normalized.
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::FlakeValue;
+    use fluree_vocab::reifies_iris;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:named-reifier");
+
+    let jsonld_txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:r_jl" }
+        }
+    });
+    let jsonld_committed = fluree
+        .insert(ledger0, &jsonld_txn)
+        .await
+        .expect("JSON-LD named-annotation insert");
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         ex:bob ex:worksFor ex:acme ~ ex:r_tt .\n";
+    let turtle_committed = fluree
+        .insert_turtle(jsonld_committed.ledger, turtle)
+        .await
+        .expect("Turtle-star named-reifier insert");
+    let ledger = &turtle_committed.ledger;
+
+    let r_jl = ledger
+        .snapshot
+        .encode_iri("http://example.org/r_jl")
+        .expect("encode r_jl");
+    let r_tt = ledger
+        .snapshot
+        .encode_iri("http://example.org/r_tt")
+        .expect("encode r_tt");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("encode f:reifiesSubject");
+
+    let jl_bundles = reifies_bundles_for_subject(ledger, "http://example.org/alice").await;
+    let tt_bundles = reifies_bundles_for_subject(ledger, "http://example.org/bob").await;
+    assert_eq!(jl_bundles.len(), 1, "{jl_bundles:#?}");
+    assert_eq!(tt_bundles.len(), 1, "{tt_bundles:#?}");
+
+    // The named reifier IS the annotation subject — no minted blank node.
+    assert_eq!(jl_bundles[0].0 .0, r_jl);
+    assert_eq!(tt_bundles[0].0 .0, r_tt);
+
+    // Bodies are identical once the (deliberately different) base
+    // subjects are normalized away.
+    let normalize = |bundle: &[fluree_db_core::Flake]| {
+        let mut body = bundle_body(bundle);
+        for row in &mut body {
+            if row.0 == reifies_subject_pid {
+                row.1 = FlakeValue::String("<base-subject>".to_string());
+            }
+        }
+        body.sort_by_key(|row| format!("{row:?}"));
+        body
+    };
+    assert_eq!(
+        normalize(&jl_bundles[0].1),
+        normalize(&tt_bundles[0].1),
+        "named-reifier bundle bodies must match modulo the base subject"
+    );
+
+    // Each decodes to its own base edge.
+    for (bundle, subject_iri) in [
+        (&jl_bundles[0].1, "http://example.org/alice"),
+        (&tt_bundles[0].1, "http://example.org/bob"),
+    ] {
+        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        let expected_subject = ledger.snapshot.encode_iri(subject_iri).expect("encode");
+        assert_eq!(decoded.s, expected_subject);
+    }
+}
+
+#[tokio::test]
+async fn turtle_star_reified_triple_matches_jsonld_annotation() {
+    // Subject-position `<< … >>` with reifier properties ↔ `@annotation`
+    // with a body: the reifier carries the same ordinary property and the
+    // same bundle.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:reified-triple",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:q": { "@id": "ex:z" } }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         << ex:alice ex:worksFor ex:acme >> ex:q ex:z .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_lang_tagged_literal_matches_jsonld_annotation() {
+    // Language-tagged base object: both surfaces must emit f:reifiesLang
+    // and carry m.lang on the f:reifiesObject flake (BUGS-2 symmetry).
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:lang-literal",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "ex:source": "hr-system" }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:label \"chat\"@fr {| ex:source \"hr-system\" |} .\n",
+        "http://example.org/alice",
+        "http://example.org/label",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_typed_literal_matches_jsonld_annotation() {
+    // Typed-literal base object: bundle object flake preserves the
+    // declared datatype on both surfaces.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:typed-literal",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:joinedAt": {
+                "@value": "2024-01-01",
+                "@type": "xsd:date",
+                "@annotation": { "ex:source": "hr-system" }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:alice ex:joinedAt \"2024-01-01\"^^xsd:date {| ex:source \"hr-system\" |} .\n",
+        "http://example.org/alice",
+        "http://example.org/joinedAt",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn turtle_star_repeated_anonymous_occurrences_mint_fresh_reifiers() {
+    // THE required repeated-anonymous equivalence case (roadmap §1.1-10):
+    // annotating the same edge twice anonymously mints two DISTINCT
+    // reifiers on BOTH surfaces (JSON-LD mints `_:fluree_ann_0/_1`;
+    // Turtle must never dedup by EdgeKey), each with a complete bundle
+    // decoding to the same base EdgeKey. W3C `pattern-3-nomatch` depends
+    // on exactly this behavior.
+    use fluree_db_core::edge::EdgeKey;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:repeated-anon");
+
+    let jsonld_txn = json!({
+        "@context": ctx(),
+        "@id": "ex:s",
+        "ex:p": [
+            { "@id": "ex:o", "@annotation": { "ex:q": "one" } },
+            { "@id": "ex:o", "@annotation": { "ex:q": "two" } }
+        ]
+    });
+    let jsonld_committed = fluree
+        .insert(ledger0, &jsonld_txn)
+        .await
+        .expect("JSON-LD repeated-annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         ex:s ex:p ex:o {| ex:q \"one\" |} .\n\
+         ex:s ex:p ex:o {| ex:q \"two\" |} .\n";
+    let turtle_committed = fluree
+        .insert_turtle(jsonld_committed.ledger, turtle)
+        .await
+        .expect("Turtle-star repeated-annotation insert");
+    let ledger = &turtle_committed.ledger;
+    let t_turtle = ledger.t();
+
+    let bundles = reifies_bundles_for_subject(ledger, "http://example.org/s").await;
+    let jsonld_anns: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .map(|((ann, _), b)| (ann.clone(), b))
+        .collect();
+    let turtle_anns: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_turtle)
+        .map(|((ann, _), b)| (ann.clone(), b))
+        .collect();
+
+    // Two distinct reifiers per surface.
+    assert_eq!(jsonld_anns.len(), 2, "JSON-LD mints one ann per occurrence");
+    assert_eq!(turtle_anns.len(), 2, "Turtle mints one ann per occurrence");
+    assert_ne!(jsonld_anns[0].0, jsonld_anns[1].0);
+    assert_ne!(
+        turtle_anns[0].0, turtle_anns[1].0,
+        "anonymous Turtle reifiers must be fresh per occurrence — never \
+         deduped by EdgeKey"
+    );
+
+    // Every bundle decodes to the same base EdgeKey, and the bundle-body
+    // multisets match across surfaces.
+    let mut keys = Vec::new();
+    for (ann, bundle) in jsonld_anns.iter().chain(turtle_anns.iter()) {
+        let key = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        keys.push(key);
+    }
+    assert!(
+        keys.windows(2).all(|w| w[0] == w[1]),
+        "all four bundles reify the same base edge"
+    );
+    let mut jl: Vec<_> = jsonld_anns.iter().map(|(_, b)| bundle_body(b)).collect();
+    let mut tt: Vec<_> = turtle_anns.iter().map(|(_, b)| bundle_body(b)).collect();
+    jl.sort();
+    tt.sort();
+    assert_eq!(jl, tt, "bundle bodies must match across surfaces");
+}
+
+#[tokio::test]
+async fn turtle_star_anonymous_mints_never_collide_with_user_bnode_labels() {
+    // PR-1454 review regression: anonymous mints (bare `{| … |}` reifiers
+    // and `[]` nodes) used the generic `b{N}` label scheme, whose
+    // skolemized Sid is identical to a user-written `_:b{N}` in the same
+    // transaction — `_:b1` here silently absorbed the reifier bundle, the
+    // annotation body, and the `[]` node's properties. Anonymous mints now
+    // use the `-b{N}` namespace, which no user label can lex into.
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star:anon-user-label-collision");
+
+    let turtle = "@prefix ex: <http://example.org/> .\n\
+         _:b1 ex:name \"Bob\" .\n\
+         ex:a ex:b ex:c {| ex:source \"hr-system\" |} .\n\
+         ex:s2 ex:q [ ex:r \"y\" ] .\n";
+    let committed = fluree
+        .insert_turtle(ledger0, turtle)
+        .await
+        .expect("Turtle-star insert mixing user label with anonymous mints");
+    let ledger = &committed.ledger;
+
+    let name_pid = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .expect("encode ex:name");
+    let bob_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(name_pid.clone(), FlakeValue::String("Bob".to_string())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan for Bob's node");
+    assert_eq!(bob_pointers.len(), 1, "exactly one ex:name \"Bob\" fact");
+    let bob_sid = bob_pointers[0].s.clone();
+
+    // Bob's node carries ex:name and NOTHING else — no ex:source, no
+    // f:reifies* bundle, no `[]` properties.
+    let bob_flakes = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Spot,
+        RangeTest::Eq,
+        RangeMatch::subject(bob_sid.clone()),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan Bob's subject");
+    assert_eq!(
+        bob_flakes.len(),
+        1,
+        "user `_:b1` must not absorb system-minted facts; got {bob_flakes:?}"
+    );
+    assert_eq!(bob_flakes[0].p, name_pid, "Bob's only fact is ex:name");
+
+    // The annotation bundle exists, on its own fresh reifier node.
+    let bundles = reifies_bundles_for_subject(ledger, "http://example.org/a").await;
+    assert_eq!(bundles.len(), 1, "one anonymous reifier bundle for ex:a");
+    let ((ann_sid, _), _) = bundles.first().map(|(k, v)| (k.clone(), v)).unwrap();
+    assert_ne!(ann_sid, bob_sid, "reifier node distinct from user `_:b1`");
+
+    // The `[]` node is likewise its own node (the pre-existing collision
+    // this fix closes for free).
+    let r_pid = ledger
+        .snapshot
+        .encode_iri("http://example.org/r")
+        .expect("encode ex:r");
+    let anon_pointers = range_with_overlay(
+        &ledger.snapshot,
+        0,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(r_pid, FlakeValue::String("y".to_string())),
+        RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan for the `[]` node");
+    assert_eq!(anon_pointers.len(), 1, "exactly one ex:r \"y\" fact");
+    assert_ne!(
+        anon_pointers[0].s, bob_sid,
+        "`[]` node distinct from user `_:b1`"
+    );
+}
+
+// =====================================================================
 // Delete-path end-to-end coverage for literal-object annotations
 // =====================================================================
 

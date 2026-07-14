@@ -476,6 +476,187 @@ async fn create_branch_at_historical_t() {
 }
 
 #[tokio::test]
+async fn merge_preview_include_changes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "chg:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "chg:main")
+                .body(Body::from(
+                    serde_json::json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:alice",
+                        "ex:name": "Alice",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "chg", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert")
+                .header("content-type", "application/json")
+                .header("fluree-ledger", "chg:dev")
+                .body(Body::from(
+                    serde_json::json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:bob",
+                        "ex:name": "Bob",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Without include_changes the field is absent.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json.get("changes").is_none(), "unexpected changes: {json}");
+
+    // With include_changes the netted change set is present.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev&include_changes=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let changes = json.get("changes").expect("changes present");
+    assert_eq!(
+        changes
+            .get("assert_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1),
+        "unexpected changes: {changes}"
+    );
+    assert_eq!(
+        changes
+            .get("subject_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    let entries = changes.get("entries").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].get("subject").and_then(|v| v.as_str()),
+        Some("http://example.org/bob")
+    );
+
+    // Stats-only mode: exact counts, no payload.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev&include_changes=true&max_changes=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let changes = json.get("changes").expect("changes present");
+    assert_eq!(
+        changes
+            .get("assert_count")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        changes
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        changes
+            .get("truncated")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    // Cursor without include_changes is a 400.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/chg?source=dev&changes_after_subject=x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn ledger_with_slash_works_via_op_prefixed_routes() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state.clone());

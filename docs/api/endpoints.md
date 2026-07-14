@@ -2335,7 +2335,7 @@ Bearer token required when `data_auth.mode = required`; reads are gated on `bear
 
 **URL:**
 ```
-GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}
+GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}&include_changes={bool}&max_changes={n}&changes_after_subject={iri}
 ```
 
 **Path / Query Parameters:**
@@ -2350,6 +2350,9 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `include_conflicts` | bool | No | When false, skips the conflict computation (default true). Use this to make the preview cheap on diverged branches. |
 | `include_conflict_details` | bool | No | When true, includes source/target flake values for the returned conflict keys. Defaults to false. Details are computed after `max_conflict_keys` is applied. |
 | `strategy` | string | No | Strategy used to annotate conflict details. Defaults to `take-both`. Options: `take-both`, `abort`, `take-source`, `take-branch`. |
+| `include_changes` | bool | No | When true, includes the aggregate **netted** change set the merge would apply (source side, ancestor..source-head) as `changes`. Defaults to false. Costs one full commit load per commit in the source divergence; the walk is shared with the conflict computation when both are requested. |
+| `max_changes` | number | No | Cap on change entries returned, counted in **flakes** and cut at subject boundaries (default 500; server clamps to a hard maximum of 5,000). A single subject larger than the cap is returned whole. `0` is a valid "diff stats" mode: exact counts, no payload. Bounds response size, **not** the replay walk. |
+| `changes_after_subject` | string | No | Pagination cursor: return only subjects whose full IRI sorts strictly after this value. Pass the previous response's `changes.next_cursor`. Each page re-pays the full replay + netting cost. Requires `include_changes=true`. |
 
 **Response body (200 OK):**
 
@@ -2386,6 +2389,19 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
         }
       }
     ]
+  },
+  "changes": {
+    "assert_count": 2,
+    "retract_count": 1,
+    "subject_count": 1,
+    "entries": [
+      {
+        "subject": "http://example.org/ns/alice",
+        "asserts": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "retracts": [["ex:alice", "ex:status", "archived", "xsd:string", false]]
+      }
+    ],
+    "truncated": false
   }
 }
 ```
@@ -2400,15 +2416,23 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
 | `mergeable` | bool | False only when the selected preview strategy would abort, e.g. `strategy=abort` with conflicts. This is a strategy/conflict signal, not full transaction validation. `mergeable=true` does not guarantee a subsequent `POST /merge` will succeed; it only reflects the conflict/strategy interaction at preview time. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
+| `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
 
 Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first and include assert/retract counts plus an optional `message` extracted from `txn_meta` when an `f:message` string entry is present.
 
 When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
 
+**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), with internally-cancelling assert/retract pairs removed. Intermediate churn — a fact created then deleted within the range, or deleted then restored — never appears. This is the *net commit effect*: what replaying the source range applies, minus pairs that cancel, so a re-assert of a value that already existed before the range still nets as an assert. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
+
+- `assert_count` / `retract_count` / `subject_count` are exact across the full divergence, never truncated — a UI can render "showing X of Y".
+- `entries[]` groups net changes by subject, subjects ordered by full IRI. Each flake uses the same resolved tuple format as conflict details.
+- `truncated` is true when subjects were withheld by `max_changes` (or when `max_changes=0` suppressed the payload).
+- `next_cursor` (present only when truncated by the cap) is the last returned subject IRI; pass it as `changes_after_subject` to fetch the next page.
+
 **Status codes:**
 
 - `200 OK` — Preview computed successfully
-- `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, or `strategy=abort` with `include_conflicts=false`
+- `400 Bad Request` — Source has no branch point (e.g., main), `source == target`, unknown strategy, unsupported preview strategy, `include_conflict_details=true` with `include_conflicts=false`, `strategy=abort` with `include_conflicts=false`, or `changes_after_subject` without `include_changes=true`
 - `401 Unauthorized` — Bearer token required
 - `404 Not Found` — Ledger or branch does not exist (or bearer cannot read it)
 
@@ -2426,6 +2450,15 @@ curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&max_commits=
 
 # Include value details and labels for a source-winning merge
 curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&target=main&include_conflict_details=true&strategy=take-source"
+
+# Aggregate net change set for a merge-request "Changes" panel
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true"
+
+# Cheap diff stats: exact net counts, no payload
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true&max_changes=0"
+
+# Next page of a large diff
+curl "http://localhost:8090/v1/fluree/merge-preview/mydb?source=dev&include_changes=true&changes_after_subject=http%3A%2F%2Fexample.org%2Fns%2Falice"
 ```
 
 ### GET /info/{ledger-id}

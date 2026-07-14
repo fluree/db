@@ -36,6 +36,9 @@ use crate::fast_string_prefix_count_all::{
 };
 use crate::fast_sum_strlen_group_concat::sum_strlen_group_concat_operator;
 use crate::fast_union_star_count_all::{UnionCountMode, UnionStarCountAllOperator};
+use crate::fast_whole_graph_agg::{
+    detect_whole_graph_scalar_aggs, whole_graph_scalar_aggs_operator,
+};
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
@@ -1152,7 +1155,7 @@ fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String
 
     let is_lang_o = |e: &crate::ir::Expression| match e {
         crate::ir::Expression::Call { func, args } => {
-            *func == crate::ir::Function::Lang
+            matches!(func, crate::ir::Function::Lang { .. })
                 && args.len() == 1
                 && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
         }
@@ -1293,7 +1296,7 @@ fn detect_count_rows_with_encoded_filters(
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == o_var);
     let is_lang_call = |e: &crate::ir::Expression| match e {
         crate::ir::Expression::Call { func, args } => {
-            *func == crate::ir::Function::Lang
+            matches!(func, crate::ir::Function::Lang { .. })
                 && args.len() == 1
                 && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
         }
@@ -1578,10 +1581,9 @@ fn detect_predicate_sum_string_fn(query: &Query) -> Option<(Ref, StringFoldAgg, 
             Expression::Call { .. } => {
                 if let Some(needle) = var_const_args(Function::StrBefore, args) {
                     StringFoldAgg::SumStrlenBefore { needle }
-                } else if let Some(needle) = var_const_args(Function::StrAfter, args) {
-                    StringFoldAgg::SumStrlenAfter { needle }
                 } else {
-                    return None;
+                    let needle = var_const_args(Function::StrAfter, args)?;
+                    StringFoldAgg::SumStrlenAfter { needle }
                 }
             }
             _ => return None,
@@ -2182,6 +2184,26 @@ pub fn build_operator_tree(
     stats: Option<Arc<StatsView>>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
+    // same-group filter into required triples (well-formed left-join
+    // simplification), so equality/range pushdown and selectivity estimation
+    // see them. Canonical source: Cypher property accessors under a WHERE
+    // (`MATCH (n:User) WITH n WHERE n.id = $id` — a label scan without this).
+    // Runs first so the later folds and the planner operate on the
+    // simplified shape.
+    if crate::optional_filter_fold::has_optional_filter_candidate(query) {
+        let mut simplified = query.clone();
+        crate::optional_filter_fold::fold_optional_filters(&mut simplified);
+        return build_operator_tree_folds(&simplified, stats, planning);
+    }
+    build_operator_tree_folds(query, stats, planning)
+}
+
+fn build_operator_tree_folds(
+    query: &Query,
+    stats: Option<Arc<StatsView>>,
+    planning: &PlanningContext,
+) -> Result<BoxedOperator> {
     // Fold `FILTER(?x = ?y)` equijoins into variable unification before planning,
     // so the rewrite feeds the stats-driven reorder, count planner, and index
     // fast paths (rather than running as a cross-product + filter). Only clone
@@ -2309,6 +2331,20 @@ fn build_operator_tree_inner(
                 pred,
                 mode,
                 out_var,
+                Some(fallback),
+            )));
+        }
+    }
+
+    // Fast-path: whole-graph scalar aggregates over a distinct-subject
+    // subquery, the Cypher `MATCH (n) RETURN count(n), count(n.age), …`
+    // lowering. Multi-aggregate: each output column folds from index
+    // directories / a predicate-scoped scan. See `fast_whole_graph_agg`.
+    if enable_fused_fast_paths {
+        if let Some(plan) = detect_whole_graph_scalar_aggs(query) {
+            let fallback = build_operator_tree_inner(query, stats.clone(), false, planning)?;
+            return Ok(Box::new(whole_graph_scalar_aggs_operator(
+                plan,
                 Some(fallback),
             )));
         }

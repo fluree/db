@@ -130,8 +130,12 @@ pub fn aggregate_column_stats(data_files: &[DataFile], schema: &Schema) -> Table
     let mut had_column_bounds = false;
 
     for df in data_files {
-        row_count += df.record_count;
-        total_bytes += df.file_size_in_bytes;
+        // Saturate rather than wrap (or overflow-panic in debug builds) on a
+        // corrupt manifest; these table-level totals are advisory. Correctness
+        // consumers (the COUNT(*) manifest shortcut) re-derive the row count
+        // with per-file checked arithmetic and decline on any corruption.
+        row_count = row_count.saturating_add(df.record_count);
+        total_bytes = total_bytes.saturating_add(df.file_size_in_bytes);
 
         for field in &scalar_fields {
             let fid = field.id;

@@ -226,8 +226,12 @@ impl Worker {
     /// nameservice head so a conflict rooted in stale state (e.g.
     /// a namespace allocation this node missed because it took
     /// leadership mid-write) heals instead of producing the same
-    /// failure forever. Returns once the entry has reached a
-    /// terminal state in the queue (advanced or poisoned).
+    /// failure forever. A `Lagged` rejection (staged on a view
+    /// behind the replicated head) re-stages indefinitely with a
+    /// refresh between attempts — the entry is still at the queue
+    /// front and becomes stageable as soon as the local view
+    /// catches up. Returns once the entry has reached a terminal
+    /// state in the queue (advanced or poisoned).
     async fn process_entry(&self, entry: QueueEntry) -> Result<(), WorkerError> {
         let mut attempt: u32 = 0;
         loop {
@@ -283,6 +287,41 @@ impl Worker {
                             },
                         )
                         .await;
+                }
+                Err(WorkerError::Lagged(msg)) => {
+                    // The entry is still at the queue front: either
+                    // this worker staged on a local view lagging
+                    // the replicated head, or another ferry for the
+                    // same entry was in flight on the leader.
+                    // Refresh the local cache against the
+                    // replicated head and re-stage the same entry.
+                    // Unbounded — progress resumes as soon as the
+                    // newer head arrives or the competing ferry
+                    // resolves, and poisoning would fail a valid
+                    // entry over a node-local condition. The
+                    // staging-attempt budget resets: each lag retry
+                    // starts a fresh stage against a newer view.
+                    attempt = 0;
+                    warn!(
+                        queue_id = entry.queue_id,
+                        %msg,
+                        "staged on a lagging view; refreshing and re-staging"
+                    );
+                    tokio::time::sleep(RAFT_BACKOFF).await;
+                    let ledger_id = self.ref_key.ledger_id();
+                    if let Err(refresh_err) = self
+                        .staging
+                        .fluree
+                        .refresh(&ledger_id, RefreshOpts::default())
+                        .await
+                    {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            error = %refresh_err,
+                            "refresh after lagged apply failed; retrying anyway"
+                        );
+                    }
+                    continue;
                 }
                 Err(WorkerError::Stage(reason)) => {
                     return self.propose_poison(entry.queue_id, *reason).await;
@@ -361,16 +400,37 @@ impl Worker {
                     self.release_orphaned_commit_blob(&commit_id).await;
                     Ok(())
                 } else {
-                    // Apply didn't land. Release the staged commit
-                    // blob — the next retry rebuilds the commit with
-                    // a fresh timestamp, producing a different
-                    // `commit_id`, so this one is orphaned. Drop
-                    // `install` (write_guard releases without
-                    // calling `replace`, so this node's Fluree
-                    // handle stays at its pre-stage head — same as
-                    // every other node) and propagate the error for
-                    // the outer retry/poison logic.
-                    self.release_orphaned_commit_blob(&commit_id).await;
+                    // Apply didn't land locally. Whether the blob
+                    // can be released depends on what the failure
+                    // proves. An authoritative state-machine
+                    // rejection (`Stage`, `Lagged`) proves this
+                    // commit will never land — any retry rebuilds
+                    // with a fresh timestamp and a different
+                    // `commit_id` — so the blob is orphaned. An
+                    // ambiguous propose failure (`Raft`: ferry
+                    // timeout, leader step-down mid-propose, lost
+                    // response) may have committed the head advance
+                    // anyway, with only the local applied state
+                    // lagging behind it — releasing then would hard-
+                    // delete the blob every node's replicated head
+                    // points at in shared storage, so it is kept
+                    // (one orphan accumulates in CAS if the propose
+                    // truly failed). Either way drop `install`
+                    // (write_guard releases without calling
+                    // `replace`, so this node's Fluree handle stays
+                    // at its pre-stage head) and propagate the error
+                    // for the outer retry/poison logic.
+                    if err.is_rejection() {
+                        self.release_orphaned_commit_blob(&commit_id).await;
+                    } else {
+                        warn!(
+                            queue_id = entry.queue_id,
+                            commit_id = %commit_id,
+                            error = %err,
+                            "publish outcome unknown; keeping staged commit blob \
+                             (it may be the replicated head)"
+                        );
+                    }
                     Err(err)
                 }
             }
@@ -429,16 +489,15 @@ impl Worker {
             .is_some_and(|entry| &entry.head == commit_id)
     }
 
-    /// Release the staged commit blob from the local content store.
-    /// Called on the orphan paths in [`Self::try_advance_head`] —
-    /// the entry's `commit_t` won't land (either the queue front
-    /// moved past us, or the publish failed and the next retry
-    /// will rebuild the commit with a fresh timestamp, producing a
-    /// different `commit_id`). Without this release, every
-    /// transport blip or sibling-worker race leaks one blob per
-    /// failed attempt with no GC path: `release_envelopes` covers
-    /// the request body, not the staged commit; the state machine
-    /// doesn't track unreferenced commit blobs.
+    /// Release the staged commit blob from the content store.
+    /// Called on the orphan paths in [`Self::try_advance_head`],
+    /// and only when the publish outcome proves the commit can
+    /// never become the replicated head (see
+    /// [`WorkerError::is_rejection`]). Without this release,
+    /// every sibling-worker race leaks one blob per failed attempt
+    /// with no GC path: `release_envelopes` covers the request
+    /// body, not the staged commit; the state machine doesn't
+    /// track unreferenced commit blobs.
     ///
     /// Best effort — a failed release is logged but doesn't abort
     /// the worker's retry loop. `ContentStore::release` is
@@ -453,6 +512,32 @@ impl Worker {
                 "failed to release orphaned commit blob; CAS will accumulate one entry"
             );
         }
+    }
+
+    /// Persist a staged commit's blobs to `ledger_id`'s content
+    /// store: referenced payloads first, then the commit blob, so a
+    /// resolvable commit CID always implies its referenced payloads
+    /// are durable. (`referenced_bytes` is empty today; the
+    /// ordering matters the day it isn't.) `op` labels errors with
+    /// the operation being staged.
+    async fn persist_staged_blobs(
+        &self,
+        ledger_id: &str,
+        commit_cid: &ContentId,
+        staged: &fluree_db_transact::StagedCommit,
+        op: &str,
+    ) -> Result<(), WorkerError> {
+        let content_store = self.staging.fluree.content_store(ledger_id);
+        for (cid, bytes) in &staged.referenced_bytes {
+            content_store
+                .put_with_id(cid, bytes)
+                .await
+                .map_err(|e| stage_failure(&format!("{op} referenced blob write failed: {e}")))?;
+        }
+        content_store
+            .put_with_id(commit_cid, &staged.commit_bytes)
+            .await
+            .map_err(|e| stage_failure(&format!("{op} commit blob write failed: {e}")))
     }
 
     /// Install staged ledger state through the held write guard
@@ -536,6 +621,7 @@ impl Worker {
                     query,
                     params.as_ref(),
                     &governance,
+                    txn_opts.skolem_txn_id.clone(),
                 )
                 .await
                 .map_err(|e| stage_failure(&format!("cypher lowering failed: {e}")))?,
@@ -554,7 +640,12 @@ impl Worker {
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
             TransactionBody::Cypher { .. } => {
-                staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                let resolved = cypher_txn.expect("cypher_txn is Some for a Cypher body");
+                let staged = staged.txn(resolved.primary);
+                match resolved.followup {
+                    Some(followup) => staged.txn_followup(followup),
+                    None => staged,
+                }
             }
         };
 
@@ -587,17 +678,8 @@ impl Worker {
         // produced.
         let tally = staged_commit.tally.clone();
 
-        let content_store = self.staging.fluree.content_store(&ledger_id);
-        content_store
-            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
-            .await
-            .map_err(|e| stage_failure(&format!("commit blob write failed: {e}")))?;
-        for (cid, bytes) in &staged_commit.referenced_bytes {
-            content_store
-                .put_with_id(cid, bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("referenced blob write failed: {e}")))?;
-        }
+        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "transact")
+            .await?;
 
         // Derive post-commit state but do NOT call finalize_commit
         // here — local install runs after the publish confirms the
@@ -686,17 +768,8 @@ impl Worker {
         let commit_t = staged_commit.commit.t;
 
         let ledger_id = self.ref_key.ledger_id();
-        let content_store = self.staging.fluree.content_store(&ledger_id);
-        content_store
-            .put_with_id(&commit_cid, &staged_commit.commit_bytes)
-            .await
-            .map_err(|e| stage_failure(&format!("revert commit blob write failed: {e}")))?;
-        for (cid, bytes) in &staged_commit.referenced_bytes {
-            content_store
-                .put_with_id(cid, bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("revert referenced blob write failed: {e}")))?;
-        }
+        self.persist_staged_blobs(&ledger_id, &commit_cid, &staged_commit, "revert")
+            .await?;
 
         let (_receipt, new_state) = staged_commit
             .finalize_state()
@@ -853,16 +926,8 @@ impl Worker {
                     message: "build_merge_general produced staged commit without commit.id".into(),
                 })
             })?;
-            let content_store = self.staging.fluree.content_store(&target_id);
-            content_store
-                .put_with_id(&commit_cid, &staged.commit_bytes)
-                .await
-                .map_err(|e| stage_failure(&format!("merge commit blob write failed: {e}")))?;
-            for (cid, bytes) in &staged.referenced_bytes {
-                content_store.put_with_id(cid, bytes).await.map_err(|e| {
-                    stage_failure(&format!("merge referenced blob write failed: {e}"))
-                })?;
-            }
+            self.persist_staged_blobs(&target_id, &commit_cid, &staged, "merge")
+                .await?;
             let (_receipt, new_state) = staged
                 .finalize_state()
                 .map_err(|e| stage_failure(&format!("merge finalize_state failed: {e}")))?;
@@ -1005,6 +1070,18 @@ impl Worker {
             // up the new queue front once local raft applies the
             // pop.
             Err(NameServiceError::ApplyStale(msg)) => Err(WorkerError::Stale(msg)),
+            // The entry is still at the queue front, but this
+            // worker staged on a local view lagging the replicated
+            // head. The retry loop refreshes the local view and
+            // re-stages the same entry.
+            Err(NameServiceError::ApplyLagged(msg)) => Err(WorkerError::Lagged(msg)),
+            // Ambiguous outcome — the ApplyHead may have committed
+            // with only the response lost. `Raft` is not a
+            // rejection (see [`WorkerError::is_rejection`]), so the
+            // caller keeps the staged blob while it backs off.
+            Err(NameServiceError::ProposeUnresolved(msg)) => Err(WorkerError::Raft(format!(
+                "publish_commit unresolved: {msg}"
+            ))),
             Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
         }
     }
@@ -1078,6 +1155,9 @@ impl Worker {
                 }
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
+                }
+                Ok(Err(WorkerError::Lagged(_))) => {
+                    unreachable!("process_entry consumes Lagged internally and re-stages")
                 }
                 Ok(Err(WorkerError::Raft(propose_error))) => {
                     // Raft propose failed (leader stepped down, quorum
@@ -1491,6 +1571,36 @@ pub enum WorkerError {
     /// `snapshot_front` again.
     #[error("apply stale: {0}")]
     Stale(String),
+    /// The publish arrived behind the current state of affairs:
+    /// the staged `commit_t` doesn't advance the replicated head
+    /// (this worker staged against a lagging local view), or
+    /// another ferry for the same entry was already in flight on
+    /// the leader. Either way the entry is still at the queue
+    /// front: refresh the local view and re-stage the same entry,
+    /// rather than dropping the work ([`Self::Stale`]) or
+    /// re-proposing the same staged commit ([`Self::Raft`]).
+    #[error("publish lagged behind current state: {0}")]
+    Lagged(String),
+}
+
+impl WorkerError {
+    /// Whether this error is an authoritative rejection: an applied
+    /// state-machine response to this worker's own propose
+    /// (`Stale`, `Stage`, `Lagged`), as opposed to an ambiguous
+    /// outcome (`Raft`: ferry timeout, leader step-down
+    /// mid-propose, lost response) where the propose may have
+    /// committed anyway.
+    ///
+    /// A rejection proves the staged commit can never become the
+    /// replicated head — the state machine decided against it, and
+    /// no other proposer carries its `commit_id` — so its blob is
+    /// safe to release. On an ambiguous outcome the blob may be
+    /// the new head with only the local applied state lagging, and
+    /// `ContentStore::release` is a hard delete on storage shared
+    /// by every node, so the blob must be kept.
+    fn is_rejection(&self) -> bool {
+        matches!(self, Self::Stale(_) | Self::Stage(_) | Self::Lagged(_))
+    }
 }
 
 /// Output of a per-op staging path before consensus has confirmed
@@ -1581,6 +1691,26 @@ mod tests {
     fn check_envelope_kind_accepts_matching_pair() {
         assert!(check_envelope_kind(BodyKind::JsonLdInsert, &sample_transact_envelope()).is_ok());
         assert!(check_envelope_kind(BodyKind::Pushed, &sample_push_envelope()).is_ok());
+    }
+
+    /// Authoritative state-machine rejections orphan the staged
+    /// commit blob; ambiguous propose failures must keep it, since
+    /// the head advance may have committed with the local applied
+    /// state lagging and `release` hard-deletes from shared storage.
+    #[test]
+    fn only_authoritative_rejections_classify_as_rejection() {
+        assert!(WorkerError::Stale("queue front moved".into()).is_rejection());
+        assert!(WorkerError::Stage(Box::new(PoisonReason::LedgerNotFound {
+            ledger_id: "test/db:main".into(),
+        }))
+        .is_rejection());
+        assert!(WorkerError::Lagged("commit_t 3 <= head t 5".into()).is_rejection());
+
+        assert!(!WorkerError::Raft(
+            "apply_staged_commit POST to leader: operation timed out".into()
+        )
+        .is_rejection());
+        assert!(!WorkerError::Transient("backend blip".into()).is_rejection());
     }
 
     #[test]

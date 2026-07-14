@@ -82,24 +82,15 @@ impl LiteralValue {
     }
 
     /// Get the lexical representation of this value
+    ///
+    /// Doubles use the W3C canonical `xsd:double` form (`1.0E6`, `NaN`,
+    /// `INF`, `-INF`) — see [`crate::xsd_double`].
     pub fn lexical(&self) -> String {
         match self {
             LiteralValue::String(s) => s.to_string(),
             LiteralValue::Boolean(b) => b.to_string(),
             LiteralValue::Integer(i) => i.to_string(),
-            LiteralValue::Double(d) => {
-                if d.is_nan() {
-                    "NaN".to_string()
-                } else if d.is_infinite() {
-                    if d.is_sign_positive() {
-                        "INF".to_string()
-                    } else {
-                        "-INF".to_string()
-                    }
-                } else {
-                    d.to_string()
-                }
-            }
+            LiteralValue::Double(d) => crate::xsd_double::canonical_xsd_double(*d),
             LiteralValue::Json(s) => s.to_string(),
         }
     }
@@ -534,8 +525,12 @@ mod tests {
         let i = LiteralValue::Integer(42);
         assert_eq!(i.lexical(), "42");
 
+        // Doubles use the canonical xsd:double lexical form.
         let d = LiteralValue::Double(3.13);
-        assert!(d.lexical().starts_with("3.13"));
+        assert_eq!(d.lexical(), "3.13E0");
+
+        let big = LiteralValue::Double(1_000_000.0);
+        assert_eq!(big.lexical(), "1.0E6");
 
         let nan = LiteralValue::Double(f64::NAN);
         assert_eq!(nan.lexical(), "NaN");

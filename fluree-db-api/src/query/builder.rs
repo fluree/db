@@ -1686,8 +1686,8 @@ mod tests {
     // Builder construction tests
     // ========================================================================
 
-    #[test]
-    fn test_view_query_builder_validate_missing_input() {
+    #[tokio::test]
+    async fn test_view_query_builder_validate_missing_input() {
         let fluree = FlureeBuilder::memory().build_memory();
         // We can't create a view without a ledger, so test validate on FromQueryBuilder instead
         let builder = FromQueryBuilder::new(&fluree);
@@ -1701,8 +1701,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_from_query_builder_validate_with_input() {
+    #[tokio::test]
+    async fn test_from_query_builder_validate_with_input() {
         let fluree = FlureeBuilder::memory().build_memory();
         let query = json!({
             "from": "test:main",
@@ -1714,8 +1714,8 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_from_query_builder_validate_conflict() {
+    #[tokio::test]
+    async fn test_from_query_builder_validate_conflict() {
         let fluree = FlureeBuilder::memory().build_memory();
         let query = json!({"from": "test:main", "select": ["?s"]});
         let builder = fluree

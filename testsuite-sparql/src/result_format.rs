@@ -81,9 +81,299 @@ pub fn parse_expected_results(url: &str) -> Result<SparqlResults> {
     } else if url.ends_with(".rdf") {
         parse_rdf_dawg_result_set(&content)
             .with_context(|| format!("Parsing .rdf DAWG result set: {url}"))
+    } else if url.ends_with(".csv") {
+        parse_csv_results(&content).with_context(|| format!("Parsing .csv: {url}"))
+    } else if url.ends_with(".tsv") {
+        parse_tsv_results(&content).with_context(|| format!("Parsing .tsv: {url}"))
     } else {
         bail!("Unknown result file format: {url}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// SPARQL 1.1 CSV/TSV result formats
+// ---------------------------------------------------------------------------
+
+/// Parse SPARQL Results CSV (RFC 4180 dialect per the W3C spec).
+///
+/// CSV is lossy: every value is a plain string with no term-kind or datatype
+/// information. By W3C convention, values beginning with `_:` are read back
+/// as blank nodes (preserving isomorphism checks); everything else becomes a
+/// plain literal. Compare against actual results projected through
+/// [`project_to_csv_space`].
+pub fn parse_csv_results(content: &str) -> Result<SparqlResults> {
+    let mut rows = parse_csv_rows(content);
+    if rows.is_empty() {
+        bail!("CSV results missing header row");
+    }
+    let variables: Vec<String> = rows.remove(0);
+    let mut solutions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut solution = HashMap::new();
+        for (var, value) in variables.iter().zip(row) {
+            // An empty CSV field encodes an unbound variable (CSV cannot
+            // distinguish unbound from empty string; W3C convention reads
+            // empty as unbound, and project_to_csv_space drops empty-string
+            // bindings on the actual side to match).
+            if value.is_empty() {
+                continue;
+            }
+            solution.insert(var.clone(), csv_value_to_term(&value));
+        }
+        solutions.push(solution);
+    }
+    Ok(SparqlResults::Solutions {
+        variables,
+        solutions,
+    })
+}
+
+fn csv_value_to_term(value: &str) -> RdfTerm {
+    if let Some(label) = value.strip_prefix("_:") {
+        RdfTerm::BlankNode(label.to_string())
+    } else {
+        RdfTerm::Literal {
+            value: value.to_string(),
+            datatype: None,
+            language: None,
+        }
+    }
+}
+
+/// Minimal RFC 4180 CSV parser (quoted fields, `""` escapes, CRLF/LF rows).
+fn parse_csv_rows(content: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut chars = content.chars().peekable();
+    let mut in_quotes = false;
+    let mut saw_any = false;
+
+    while let Some(c) = chars.next() {
+        saw_any = true;
+        if in_quotes {
+            match c {
+                '"' => {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        field.push('"');
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                _ => field.push(c),
+            }
+        } else {
+            match c {
+                '"' => in_quotes = true,
+                ',' => row.push(std::mem::take(&mut field)),
+                '\r' => { /* swallow; LF terminates the row */ }
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
+                _ => field.push(c),
+            }
+        }
+    }
+    if saw_any && (!field.is_empty() || !row.is_empty()) {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+/// Project a solution set into CSV value space for comparison against
+/// [`parse_csv_results`] output: IRIs and literals collapse to their lexical
+/// form; blank nodes stay blank nodes (so isomorphism still applies).
+pub fn project_to_csv_space(results: SparqlResults) -> SparqlResults {
+    match results {
+        SparqlResults::Solutions {
+            variables,
+            solutions,
+        } => SparqlResults::Solutions {
+            variables,
+            solutions: solutions
+                .into_iter()
+                .map(|sol| {
+                    sol.into_iter()
+                        .filter_map(|(var, term)| {
+                            let projected = match term {
+                                RdfTerm::Iri(iri) => RdfTerm::Literal {
+                                    value: iri,
+                                    datatype: None,
+                                    language: None,
+                                },
+                                RdfTerm::BlankNode(b) => RdfTerm::BlankNode(b),
+                                RdfTerm::Literal { value, .. } => RdfTerm::Literal {
+                                    value,
+                                    datatype: None,
+                                    language: None,
+                                },
+                            };
+                            // Empty lexical forms serialize to an empty CSV
+                            // field, which parse_csv_results reads as unbound
+                            // — drop them so both sides agree.
+                            match &projected {
+                                RdfTerm::Literal { value, .. } if value.is_empty() => None,
+                                _ => Some((var, projected)),
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// Parse SPARQL Results TSV: header row of `?var` names, then one row per
+/// solution with terms in SPARQL/Turtle syntax (`<iri>`, `"lit"@lang`,
+/// `"lit"^^<dt>`, `_:b`, bare numeric literals). Empty field = unbound.
+pub fn parse_tsv_results(content: &str) -> Result<SparqlResults> {
+    let mut lines = content.lines();
+    let header = lines.next().context("TSV results missing header row")?;
+    let variables: Vec<String> = header
+        .split('\t')
+        .map(|v| v.trim().trim_start_matches('?').to_string())
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    let mut solutions = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let mut solution = HashMap::new();
+        for (var, raw) in variables.iter().zip(line.split('\t')) {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue; // unbound
+            }
+            solution.insert(
+                var.clone(),
+                parse_tsv_term(raw).with_context(|| format!("Parsing TSV term: {raw}"))?,
+            );
+        }
+        solutions.push(solution);
+    }
+    Ok(SparqlResults::Solutions {
+        variables,
+        solutions,
+    })
+}
+
+fn parse_tsv_term(raw: &str) -> Result<RdfTerm> {
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+    if let Some(iri) = raw.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
+        return Ok(RdfTerm::Iri(iri.to_string()));
+    }
+    if let Some(label) = raw.strip_prefix("_:") {
+        return Ok(RdfTerm::BlankNode(label.to_string()));
+    }
+    if raw.starts_with('"') {
+        // "lexical" | "lexical"@lang | "lexical"^^<datatype>
+        let closing = find_closing_quote(raw).context("Unterminated TSV literal")?;
+        let lexical = unescape_turtle_string(&raw[1..closing]);
+        let rest = &raw[closing + 1..];
+        if let Some(lang) = rest.strip_prefix('@') {
+            return Ok(RdfTerm::Literal {
+                value: lexical,
+                datatype: None,
+                language: Some(lang.to_string()),
+            });
+        }
+        if let Some(dt) = rest.strip_prefix("^^<").and_then(|r| r.strip_suffix('>')) {
+            return Ok(RdfTerm::Literal {
+                value: lexical,
+                datatype: Some(dt.to_string()),
+                language: None,
+            });
+        }
+        if rest.is_empty() {
+            return Ok(RdfTerm::Literal {
+                value: lexical,
+                datatype: None,
+                language: None,
+            });
+        }
+        bail!("Malformed TSV literal suffix: {rest}");
+    }
+    match raw {
+        "true" | "false" => {
+            return Ok(RdfTerm::Literal {
+                value: raw.to_string(),
+                datatype: Some(format!("{XSD}boolean")),
+                language: None,
+            })
+        }
+        _ => {}
+    }
+    // Bare numeric literals in canonical form (TSV shorthand):
+    // an optional single leading sign followed by digits only.
+    let unsigned = raw.strip_prefix(['-', '+']).unwrap_or(raw);
+    if !unsigned.is_empty() && unsigned.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(RdfTerm::Literal {
+            value: raw.to_string(),
+            datatype: Some(format!("{XSD}integer")),
+            language: None,
+        });
+    }
+    if raw.contains('e') || raw.contains('E') {
+        if raw.parse::<f64>().is_ok() {
+            return Ok(RdfTerm::Literal {
+                value: raw.to_string(),
+                datatype: Some(format!("{XSD}double")),
+                language: None,
+            });
+        }
+    } else if raw.contains('.') && raw.parse::<f64>().is_ok() {
+        return Ok(RdfTerm::Literal {
+            value: raw.to_string(),
+            datatype: Some(format!("{XSD}decimal")),
+            language: None,
+        });
+    }
+    bail!("Unrecognized TSV term syntax: {raw}")
+}
+
+/// Index of the closing `"` of a Turtle-quoted string starting at byte 0.
+fn find_closing_quote(raw: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Unescape the common Turtle string escapes used in TSV results.
+fn unescape_turtle_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -114,12 +404,81 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
             language: Option<String>,
         },
     }
+
+    /// Complete a finished element — on a real `Event::End`, or immediately
+    /// for a self-closing `Event::Empty` (which emits NO matching End event,
+    /// so its completion must never wait for one). Returns `Some` when the
+    /// element terminates parsing (`<boolean>`).
+    fn complete_element(
+        local_name: &[u8],
+        text_buf: &str,
+        solutions: &mut Vec<HashMap<String, RdfTerm>>,
+        current_binding_name: &mut Option<String>,
+        current_solution: &mut Option<HashMap<String, RdfTerm>>,
+        current_term: &mut Option<TermKind>,
+    ) -> Option<SparqlResults> {
+        match local_name {
+            b"result" => {
+                if let Some(solution) = current_solution.take() {
+                    solutions.push(solution);
+                }
+            }
+            b"binding" => {
+                *current_binding_name = None;
+            }
+            b"uri" => {
+                if let Some(TermKind::Uri) = current_term {
+                    if let Some(name) = current_binding_name.as_ref() {
+                        if let Some(solution) = current_solution.as_mut() {
+                            solution.insert(name.clone(), RdfTerm::Iri(text_buf.to_string()));
+                        }
+                    }
+                }
+                *current_term = None;
+            }
+            b"bnode" => {
+                if let Some(TermKind::Bnode) = current_term {
+                    if let Some(name) = current_binding_name.as_ref() {
+                        if let Some(solution) = current_solution.as_mut() {
+                            solution.insert(name.clone(), RdfTerm::BlankNode(text_buf.to_string()));
+                        }
+                    }
+                }
+                *current_term = None;
+            }
+            b"literal" => {
+                if let Some(TermKind::Literal { datatype, language }) = current_term.clone() {
+                    if let Some(name) = current_binding_name.as_ref() {
+                        if let Some(solution) = current_solution.as_mut() {
+                            solution.insert(
+                                name.clone(),
+                                RdfTerm::Literal {
+                                    value: text_buf.to_string(),
+                                    datatype,
+                                    language,
+                                },
+                            );
+                        }
+                    }
+                }
+                *current_term = None;
+            }
+            b"boolean" => {
+                let val = text_buf.trim();
+                return Some(SparqlResults::Boolean(val == "true" || val == "1"));
+            }
+            _ => {}
+        }
+        None
+    }
+
     let mut current_term: Option<TermKind> = None;
     let mut text_buf = String::new();
     let mut in_boolean = false;
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
@@ -178,62 +537,32 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                     }
                     _ => {}
                 }
+                // A self-closing element (`<result/>`, `<literal/>`, …)
+                // produces no End event; complete it right away so the
+                // element is committed and no stale state leaks forward.
+                if matches!(&event, Ok(Event::Empty(_))) {
+                    if let Some(result) = complete_element(
+                        local_name.as_ref(),
+                        &text_buf,
+                        &mut solutions,
+                        &mut current_binding_name,
+                        &mut current_solution,
+                        &mut current_term,
+                    ) {
+                        return Ok(result);
+                    }
+                }
             }
             Ok(Event::End(ref e)) => {
-                let local_name = e.local_name();
-                match local_name.as_ref() {
-                    b"result" => {
-                        if let Some(solution) = current_solution.take() {
-                            solutions.push(solution);
-                        }
-                    }
-                    b"binding" => {
-                        current_binding_name = None;
-                    }
-                    b"uri" => {
-                        if let Some(TermKind::Uri) = current_term {
-                            if let Some(ref name) = current_binding_name {
-                                if let Some(ref mut solution) = current_solution {
-                                    solution.insert(name.clone(), RdfTerm::Iri(text_buf.clone()));
-                                }
-                            }
-                        }
-                        current_term = None;
-                    }
-                    b"bnode" => {
-                        if let Some(TermKind::Bnode) = current_term {
-                            if let Some(ref name) = current_binding_name {
-                                if let Some(ref mut solution) = current_solution {
-                                    solution
-                                        .insert(name.clone(), RdfTerm::BlankNode(text_buf.clone()));
-                                }
-                            }
-                        }
-                        current_term = None;
-                    }
-                    b"literal" => {
-                        if let Some(TermKind::Literal { datatype, language }) = current_term.clone()
-                        {
-                            if let Some(ref name) = current_binding_name {
-                                if let Some(ref mut solution) = current_solution {
-                                    solution.insert(
-                                        name.clone(),
-                                        RdfTerm::Literal {
-                                            value: text_buf.clone(),
-                                            datatype,
-                                            language,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        current_term = None;
-                    }
-                    b"boolean" => {
-                        let val = text_buf.trim();
-                        return Ok(SparqlResults::Boolean(val == "true" || val == "1"));
-                    }
-                    _ => {}
+                if let Some(result) = complete_element(
+                    e.local_name().as_ref(),
+                    &text_buf,
+                    &mut solutions,
+                    &mut current_binding_name,
+                    &mut current_solution,
+                    &mut current_term,
+                ) {
+                    return Ok(result);
                 }
             }
             Ok(Event::Text(ref e)) if current_term.is_some() || in_boolean => {
@@ -348,6 +677,33 @@ fn parse_srj_term(value: &serde_json::Value) -> Option<RdfTerm> {
 pub fn fluree_json_to_sparql_results(json: &serde_json::Value) -> Result<SparqlResults> {
     let json_str = serde_json::to_string(json)?;
     parse_srj(&json_str)
+}
+
+// ---------------------------------------------------------------------------
+// Plain graph parsing (used by UpdateEvaluationTest expected state)
+// ---------------------------------------------------------------------------
+
+/// Parse an expected-state RDF file (referenced by URL) as a plain graph.
+///
+/// Unlike [`parse_expected_results`], this never applies DAWG Result Set
+/// auto-detection: update-test expected state is always a graph, even if it
+/// happens to contain result-set vocabulary terms.
+pub fn parse_expected_graph(url: &str) -> Result<Vec<Triple>> {
+    let content =
+        read_file_to_string(url).with_context(|| format!("Reading expected graph file: {url}"))?;
+    let with_base = format!("@base <{url}> .\n{content}");
+    let mut sink = GraphCollectorSink::new();
+    parse_turtle(&with_base, &mut sink)
+        .with_context(|| format!("Parsing expected graph: {url}"))?;
+    let graph = sink.finish();
+    Ok(graph
+        .iter()
+        .map(|t| Triple {
+            subject: ir_term_to_rdf_term(&t.s),
+            predicate: ir_term_to_rdf_term(&t.p),
+            object: ir_term_to_rdf_term(&t.o),
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -510,11 +866,71 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
         Boolean,
         Ignored,
     }
+
+    /// Complete a finished element state — popped off the stack on a real
+    /// `Event::End`, or applied directly for a self-closing `Event::Empty`
+    /// (which emits NO matching End event and therefore must never be pushed
+    /// onto the state stack: pushing it skews every subsequent pop, which is
+    /// how bound solutions after a `<rs:value rdf:resource=…/>` used to get
+    /// dropped while the unbound-variable solution before it survived).
+    /// Returns `Some` when the element terminates parsing (`<rs:boolean>`).
+    fn complete_state(
+        state: State,
+        text_buf: &str,
+        variables: &mut Vec<String>,
+        solutions: &mut Vec<HashMap<String, RdfTerm>>,
+        current_solution: &mut Option<HashMap<String, RdfTerm>>,
+        current_var_name: &mut Option<String>,
+        current_value: &mut Option<RdfTerm>,
+    ) -> Option<SparqlResults> {
+        match state {
+            State::ResultVariable => {
+                let var = text_buf.trim().to_string();
+                if !var.is_empty() {
+                    variables.push(var);
+                }
+            }
+            State::Boolean => {
+                let val = text_buf.trim();
+                return Some(SparqlResults::Boolean(val == "true" || val == "1"));
+            }
+            State::Solution => {
+                if let Some(sol) = current_solution.take() {
+                    solutions.push(sol);
+                }
+            }
+            State::Binding => {
+                if let (Some(name), Some(term)) = (current_var_name.take(), current_value.take()) {
+                    if let Some(sol) = current_solution.as_mut() {
+                        sol.insert(name, term);
+                    }
+                }
+            }
+            State::BindingVariable => {
+                *current_var_name = Some(text_buf.trim().to_string());
+            }
+            // Only set if not already set by an rdf:resource/rdf:nodeID attribute
+            State::BindingValue { datatype } if current_value.is_none() => {
+                let val = text_buf.trim().to_string();
+                if !val.is_empty() {
+                    *current_value = Some(RdfTerm::Literal {
+                        value: val,
+                        datatype,
+                        language: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     let mut state_stack: Vec<State> = vec![State::Root];
     let mut text_buf = String::new();
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local_name = e.local_name();
                 let local = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
@@ -536,12 +952,17 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
                     }
                     (State::Binding, "variable") => State::BindingVariable,
                     (State::Binding, "value") => {
-                        // Check for rdf:resource attribute (IRI value as attribute)
+                        // Term-as-attribute forms: rdf:resource carries an IRI
+                        // value, rdf:nodeID a blank-node label (both typically
+                        // appear on self-closing elements).
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.0).unwrap_or("");
                             if key == "rdf:resource" || key.ends_with(":resource") {
                                 let iri = String::from_utf8_lossy(&attr.value).to_string();
                                 current_value = Some(RdfTerm::Iri(iri));
+                            } else if key == "rdf:nodeID" || key.ends_with(":nodeID") {
+                                let label = String::from_utf8_lossy(&attr.value).to_string();
+                                current_value = Some(RdfTerm::BlankNode(label));
                             }
                         }
                         let datatype = e.attributes().flatten().find_map(|attr| {
@@ -557,50 +978,36 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
                     _ => State::Ignored,
                 };
 
-                state_stack.push(new_state);
+                if matches!(&event, Ok(Event::Empty(_))) {
+                    // Self-closing element: complete it immediately instead of
+                    // pushing expectation state that no End event will pop.
+                    if let Some(result) = complete_state(
+                        new_state,
+                        &text_buf,
+                        &mut variables,
+                        &mut solutions,
+                        &mut current_solution,
+                        &mut current_var_name,
+                        &mut current_value,
+                    ) {
+                        return Ok(result);
+                    }
+                } else {
+                    state_stack.push(new_state);
+                }
             }
             Ok(Event::End(_)) => {
                 let finished_state = state_stack.pop().unwrap_or(State::Root);
-                match finished_state {
-                    State::ResultVariable => {
-                        let var = text_buf.trim().to_string();
-                        if !var.is_empty() {
-                            variables.push(var);
-                        }
-                    }
-                    State::Boolean => {
-                        let val = text_buf.trim();
-                        return Ok(SparqlResults::Boolean(val == "true" || val == "1"));
-                    }
-                    State::Solution => {
-                        if let Some(sol) = current_solution.take() {
-                            solutions.push(sol);
-                        }
-                    }
-                    State::Binding => {
-                        if let (Some(name), Some(term)) =
-                            (current_var_name.take(), current_value.take())
-                        {
-                            if let Some(ref mut sol) = current_solution {
-                                sol.insert(name, term);
-                            }
-                        }
-                    }
-                    State::BindingVariable => {
-                        current_var_name = Some(text_buf.trim().to_string());
-                    }
-                    // Only set if not already set by rdf:resource attribute
-                    State::BindingValue { datatype } if current_value.is_none() => {
-                        let val = text_buf.trim().to_string();
-                        if !val.is_empty() {
-                            current_value = Some(RdfTerm::Literal {
-                                value: val,
-                                datatype,
-                                language: None,
-                            });
-                        }
-                    }
-                    _ => {}
+                if let Some(result) = complete_state(
+                    finished_state,
+                    &text_buf,
+                    &mut variables,
+                    &mut solutions,
+                    &mut current_solution,
+                    &mut current_var_name,
+                    &mut current_value,
+                ) {
+                    return Ok(result);
                 }
             }
             Ok(Event::Text(ref e)) => {
@@ -1233,6 +1640,219 @@ ex:bob ex:name "Bob" .
                 assert_eq!(
                     solutions[0]["addr"],
                     RdfTerm::Iri("http://example.org/alice".into())
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// Regression for the state-stack skew behind dawg-sort-3/6/8: a
+    /// self-closing `<rs:value rdf:resource=…/>` emits no End event, so
+    /// pushing it onto the state stack desynchronized every later pop —
+    /// the parser kept the solution with the unbound variable and dropped
+    /// every bound solution after the first self-closing value. Modeled on
+    /// `sort/result-sort-3.rdf` (4 solutions, first has unbound ?mbox).
+    #[test]
+    fn test_parse_rdf_dawg_self_closing_value_keeps_later_solutions() {
+        let xml = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rs="http://www.w3.org/2001/sw/DataAccess/tests/result-set#"
+         xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rs:ResultSet>
+    <rs:resultVariable>name</rs:resultVariable>
+    <rs:resultVariable>mbox</rs:resultVariable>
+    <rs:solution rdf:parseType="Resource">
+      <rs:index rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">1</rs:index>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>name</rs:variable>
+        <rs:value>Bob</rs:value>
+      </rs:binding>
+    </rs:solution>
+    <rs:solution rdf:parseType="Resource">
+      <rs:index rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">2</rs:index>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>name</rs:variable>
+        <rs:value>Alice</rs:value>
+      </rs:binding>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>mbox</rs:variable>
+        <rs:value rdf:resource="mailto:alice@work.example"/>
+      </rs:binding>
+    </rs:solution>
+    <rs:solution rdf:parseType="Resource">
+      <rs:index rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">3</rs:index>
+      <rs:binding rdf:parseType="Resource">
+        <rs:value rdf:resource="mailto:eve@work.example"/>
+        <rs:variable>mbox</rs:variable>
+      </rs:binding>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>name</rs:variable>
+        <rs:value>Eve</rs:value>
+      </rs:binding>
+    </rs:solution>
+  </rs:ResultSet>
+</rdf:RDF>"#;
+        let result = parse_rdf_dawg_result_set(xml).unwrap();
+        match result {
+            SparqlResults::Solutions {
+                variables,
+                solutions,
+            } => {
+                assert_eq!(variables, vec!["name", "mbox"]);
+                assert_eq!(solutions.len(), 3, "all solutions must survive");
+                // Solution 1: ?mbox unbound (OPTIONAL) — kept, without a
+                // phantom mbox binding.
+                assert_eq!(
+                    solutions[0]["name"],
+                    RdfTerm::Literal {
+                        value: "Bob".into(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+                assert!(!solutions[0].contains_key("mbox"));
+                // Solution 2: bound via self-closing rdf:resource value.
+                assert_eq!(
+                    solutions[1]["mbox"],
+                    RdfTerm::Iri("mailto:alice@work.example".into())
+                );
+                // Solution 3: self-closing value listed BEFORE the variable
+                // element inside its binding.
+                assert_eq!(
+                    solutions[2]["mbox"],
+                    RdfTerm::Iri("mailto:eve@work.example".into())
+                );
+                assert_eq!(
+                    solutions[2]["name"],
+                    RdfTerm::Literal {
+                        value: "Eve".into(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// `rdf:nodeID` on a self-closing `<rs:value/>` is a blank-node binding
+    /// (used by `sort/result-sort-8.rdf`).
+    #[test]
+    fn test_parse_rdf_dawg_node_id_blank_node_value() {
+        let xml = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rs="http://www.w3.org/2001/sw/DataAccess/tests/result-set#"
+         xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rs:ResultSet>
+    <rs:resultVariable>emp</rs:resultVariable>
+    <rs:solution rdf:parseType="Resource">
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>emp</rs:variable>
+        <rs:value rdf:nodeID="node0"/>
+      </rs:binding>
+    </rs:solution>
+    <rs:solution rdf:parseType="Resource">
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>emp</rs:variable>
+        <rs:value rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">9</rs:value>
+      </rs:binding>
+    </rs:solution>
+  </rs:ResultSet>
+</rdf:RDF>"#;
+        let result = parse_rdf_dawg_result_set(xml).unwrap();
+        match result {
+            SparqlResults::Solutions { solutions, .. } => {
+                assert_eq!(solutions.len(), 2);
+                assert_eq!(solutions[0]["emp"], RdfTerm::BlankNode("node0".into()));
+                assert_eq!(
+                    solutions[1]["emp"],
+                    RdfTerm::Literal {
+                        value: "9".into(),
+                        datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+                        language: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// The SRX parser had the same Start|Empty conflation: a self-closing
+    /// term element never saw its End event, so the binding was silently
+    /// dropped. `<literal/>` must bind the empty string.
+    #[test]
+    fn test_parse_srx_self_closing_literal() {
+        let xml = r#"<?xml version="1.0"?>
+<sparql xmlns="http://www.w3.org/2005/sparql-results#">
+  <head>
+    <variable name="x"/>
+    <variable name="y"/>
+  </head>
+  <results>
+    <result>
+      <binding name="x"><literal/></binding>
+      <binding name="y"><uri>http://example.org/a</uri></binding>
+    </result>
+    <result>
+      <binding name="x"><literal>later</literal></binding>
+    </result>
+  </results>
+</sparql>"#;
+        let result = parse_srx(xml).unwrap();
+        match result {
+            SparqlResults::Solutions { solutions, .. } => {
+                assert_eq!(solutions.len(), 2);
+                assert_eq!(
+                    solutions[0]["x"],
+                    RdfTerm::Literal {
+                        value: String::new(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+                assert_eq!(
+                    solutions[0]["y"],
+                    RdfTerm::Iri("http://example.org/a".into())
+                );
+                assert_eq!(
+                    solutions[1]["x"],
+                    RdfTerm::Literal {
+                        value: "later".into(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// A self-closing `<result/>` is a solution with every variable unbound;
+    /// it must be pushed, and must not swallow the following solutions.
+    #[test]
+    fn test_parse_srx_self_closing_empty_result() {
+        let xml = r#"<?xml version="1.0"?>
+<sparql xmlns="http://www.w3.org/2005/sparql-results#">
+  <head>
+    <variable name="x"/>
+  </head>
+  <results>
+    <result/>
+    <result>
+      <binding name="x"><literal>bound</literal></binding>
+    </result>
+  </results>
+</sparql>"#;
+        let result = parse_srx(xml).unwrap();
+        match result {
+            SparqlResults::Solutions { solutions, .. } => {
+                assert_eq!(solutions.len(), 2);
+                assert!(solutions[0].is_empty());
+                assert_eq!(
+                    solutions[1]["x"],
+                    RdfTerm::Literal {
+                        value: "bound".into(),
+                        datatype: None,
+                        language: None,
+                    }
                 );
             }
             _ => panic!("Expected Solutions, got {result:?}"),

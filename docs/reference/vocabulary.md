@@ -315,7 +315,10 @@ These predicates are used to define access control policies.
 | `f:allow` | `https://ns.flur.ee/db#allow` | Allow/deny flag on a policy rule |
 | `f:action` | `https://ns.flur.ee/db#action` | Action this rule governs (view or modify) |
 | `f:view` | `https://ns.flur.ee/db#view` | View action IRI |
-| `f:modify` | `https://ns.flur.ee/db#modify` | Modify action IRI |
+| `f:modify` | `https://ns.flur.ee/db#modify` | Modify action IRI (all writes, legacy class semantics) |
+| `f:create` | `https://ns.flur.ee/db#create` | Write verb: subject is new in this transaction |
+| `f:update` | `https://ns.flur.ee/db#update` | Write verb: subject exists before and after |
+| `f:delete` | `https://ns.flur.ee/db#delete` | Write verb: subject is removed by this transaction |
 | `f:onProperty` | `https://ns.flur.ee/db#onProperty` | Property-level policy targeting |
 | `f:onSubject` | `https://ns.flur.ee/db#onSubject` | Subject-level policy targeting |
 | `f:onClass` | `https://ns.flur.ee/db#onClass` | Class-level policy targeting |

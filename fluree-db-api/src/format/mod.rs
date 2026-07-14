@@ -43,6 +43,7 @@ mod agent_json;
 pub mod config;
 mod construct;
 mod cypher;
+pub mod cypher_typed;
 pub mod datatype;
 pub mod delimited;
 mod hydration;
@@ -115,6 +116,32 @@ pub enum FormatError {
 
 /// Result type for formatting operations
 pub type Result<T> = std::result::Result<T, FormatError>;
+
+/// The Cypher tabular result (columns + rows) with **RDF-faithful** cell
+/// values — `{"@value":…,"@type":…}` literals and `{"@id":…}` refs survive,
+/// unlike the flattened Cypher-JSON envelope. Transports with richer type
+/// systems (Bolt/PackStream) consume this so each maps datatypes once,
+/// sharing the per-binding conversion with the JSON formatter.
+pub fn format_cypher_table(
+    result: &QueryResult,
+    context: &ParsedContext,
+    snapshot: &LedgerSnapshot,
+) -> Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
+    let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
+    cypher::table(result, &compactor)
+}
+
+/// The typed counterpart of [`format_cypher_table`]: node refs hydrate into
+/// [`cypher_typed::CypherNode`], relationships/paths/temporals stay typed.
+/// Async (per-node property fetch); errors under a view policy.
+pub async fn format_cypher_typed_table(
+    result: &QueryResult,
+    context: &ParsedContext,
+    view: &crate::view::GraphDb,
+) -> Result<(Vec<String>, Vec<Vec<cypher_typed::CypherCell>>)> {
+    let compactor = IriCompactor::new(view.snapshot.shared_namespaces(), context);
+    cypher_typed::typed_table(result, &compactor, view).await
+}
 
 /// Format query results to JSON using the specified configuration
 ///

@@ -125,6 +125,26 @@ impl IriCompactor {
         Ok(format!("{}{}", prefix, sid.name))
     }
 
+    /// Decode a Sid to a full IRI as a shared string. Empty/overflow
+    /// namespace codes — and any namespace whose prefix is empty — return
+    /// the Sid's own name: a refcount bump, no allocation. That is the hot
+    /// path once Cypher identifiers default to namespace 0 (no prefix),
+    /// and the general path still pays only one allocation per distinct
+    /// Sid instead of one per use.
+    pub fn decode_sid_shared(&self, sid: &Sid) -> Result<std::sync::Arc<str>> {
+        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+            return Ok(std::sync::Arc::clone(&sid.name));
+        }
+        let prefix = self
+            .namespace_codes
+            .get(&sid.namespace_code)
+            .ok_or(FormatError::UnknownNamespace(sid.namespace_code))?;
+        if prefix.is_empty() {
+            return Ok(std::sync::Arc::clone(&sid.name));
+        }
+        Ok(std::sync::Arc::from(format!("{}{}", prefix, sid.name)))
+    }
+
     /// Look up the namespace prefix for a Sid without allocating.
     ///
     /// Returns `Ok(Some(prefix))` for a registered namespace — the full IRI is

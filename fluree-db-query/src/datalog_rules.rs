@@ -71,13 +71,15 @@ pub async fn extract_datalog_rules(db: GraphDbRef<'_>) -> Result<DatalogRuleSet>
         .filter(|f| f.op) // Only active assertions
         .collect();
 
-    // Parse each rule
+    // Parse each rule. The literal's datatype selects the rule language:
+    // `@json` (FlakeValue::Json) → JSON-LD `{"where":..., "insert":...}`;
+    // `f:sparql`-typed string → SPARQL `CONSTRUCT ... WHERE ...`.
+    let sparql_dt = Sid::new(FLUREE_DB, fluree_vocab::db::SPARQL);
     for flake in &rule_flakes {
         let rule_id = flake.s.clone();
 
-        // The rule value should be a JSON string
-        if let FlakeValue::Json(json_str) = &flake.o {
-            match serde_json::from_str::<JsonValue>(json_str) {
+        match &flake.o {
+            FlakeValue::Json(json_str) => match serde_json::from_str::<JsonValue>(json_str) {
                 Ok(rule_json) => match parse_rule_definition(&rule_id, &rule_json, db.snapshot) {
                     Ok(rule) => {
                         rule_set.add_rule(rule);
@@ -89,6 +91,23 @@ pub async fn extract_datalog_rules(db: GraphDbRef<'_>) -> Result<DatalogRuleSet>
                 Err(e) => {
                     tracing::warn!(?rule_id, %e, "Failed to parse datalog rule JSON");
                 }
+            },
+            FlakeValue::String(source) if flake.dt == sparql_dt => {
+                match parse_sparql_rule(&rule_id, source, db.snapshot) {
+                    Ok(rule) => {
+                        rule_set.add_rule(rule);
+                    }
+                    Err(e) => {
+                        tracing::warn!(?rule_id, %e, "Failed to parse SPARQL datalog rule");
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    ?rule_id,
+                    dt = ?flake.dt,
+                    "f:rule literal has unrecognized datatype; expected @json or f:sparql — rule skipped"
+                );
             }
         }
     }
@@ -96,11 +115,54 @@ pub async fn extract_datalog_rules(db: GraphDbRef<'_>) -> Result<DatalogRuleSet>
     Ok(rule_set)
 }
 
+/// Parse a SPARQL `CONSTRUCT ... WHERE ...` rule into a `DatalogRule`.
+///
+/// SPARQL lowering is provided by a higher layer via
+/// [`crate::lang_support::register_sparql_support`]; if it is absent the
+/// rule fails to parse (and is skipped with a warning by callers) rather
+/// than being silently misread.
+fn parse_sparql_rule(
+    rule_id: &Sid,
+    source: &str,
+    snapshot: &LedgerSnapshot,
+) -> Result<DatalogRule> {
+    let support = crate::lang_support::sparql_support().ok_or_else(|| {
+        QueryError::Internal(
+            "SPARQL rule support is not registered in this process; \
+             cannot parse f:sparql datalog rule"
+                .to_string(),
+        )
+    })?;
+
+    let parts = (support.lower_rule)(source, snapshot).map_err(QueryError::InvalidQuery)?;
+
+    let mut rule = DatalogRule::new(rule_id.clone(), parts.where_patterns, parts.insert_patterns);
+    if !parts.filters.is_empty() {
+        rule = rule.with_filters(parts.filters);
+    }
+    rule = rule.with_name(rule_id.name.to_string());
+    Ok(rule)
+}
+
+/// Recognize a SPARQL typed-value object:
+/// `{"@type": "f:sparql", "@value": "CONSTRUCT ..."}` (compact or full
+/// `https://ns.flur.ee/db#sparql` type IRI). Returns the SPARQL source.
+fn as_sparql_typed_value(json: &JsonValue) -> Option<&str> {
+    let obj = json.as_object()?;
+    let type_str = obj.get("@type")?.as_str()?;
+    if type_str != "f:sparql" && type_str != fluree_vocab::fluree::SPARQL {
+        return None;
+    }
+    obj.get("@value")?.as_str()
+}
+
 /// Parse a query-time rule from JSON-LD
 ///
-/// Query-time rules can have two formats:
+/// Query-time rules can have three formats:
 /// 1. Direct rule format: `{"where": ..., "insert": ...}`
 /// 2. Stored rule format: `{"@id": "...", "f:rule": {"@value": {"where": ..., "insert": ...}}}`
+/// 3. SPARQL typed value: `{"@type": "f:sparql", "@value": "CONSTRUCT ..."}`
+///    (directly, or as the `f:rule` value of format 2)
 fn parse_query_time_rule(
     json: &JsonValue,
     snapshot: &LedgerSnapshot,
@@ -111,13 +173,6 @@ fn parse_query_time_rule(
         .get("f:rule")
         .or_else(|| json.get(fluree_vocab::fluree::RULE))
     {
-        // Extract the actual rule from the @value wrapper
-        let rule_value = if let Some(value) = f_rule.get("@value") {
-            value
-        } else {
-            f_rule
-        };
-
         // Get rule ID from @id, or generate one
         let rule_id = if let Some(id_str) = json.get("@id").and_then(|v| v.as_str()) {
             Sid::new(0, id_str)
@@ -125,12 +180,30 @@ fn parse_query_time_rule(
             Sid::new(0, format!("_:query_rule_{index}"))
         };
 
+        // SPARQL typed value inside the wrapper
+        if let Some(source) = as_sparql_typed_value(f_rule) {
+            return parse_sparql_rule(&rule_id, source, snapshot);
+        }
+
+        // Extract the actual rule from the @value wrapper
+        let rule_value = if let Some(value) = f_rule.get("@value") {
+            value
+        } else {
+            f_rule
+        };
+
         return parse_rule_definition(&rule_id, rule_value, snapshot);
     }
 
-    // Direct rule format
     // Generate a synthetic rule ID
     let rule_id = Sid::new(0, format!("_:query_rule_{index}"));
+
+    // Direct SPARQL typed value
+    if let Some(source) = as_sparql_typed_value(json) {
+        return parse_sparql_rule(&rule_id, source, snapshot);
+    }
+
+    // Direct rule format
     parse_rule_definition(&rule_id, json, snapshot)
 }
 

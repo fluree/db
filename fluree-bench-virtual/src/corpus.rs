@@ -47,17 +47,12 @@ pub enum Tag {
 /// A per-target-kind expected terminal outcome. Defaults to [`Self::Ok`], so a
 /// query with no `expected_status` in the manifest is expected to succeed
 /// everywhere (the common case).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExpectedOutcome {
+    #[default]
     Ok,
     Error,
-}
-
-impl Default for ExpectedOutcome {
-    fn default() -> Self {
-        Self::Ok
-    }
 }
 
 /// Optional per-target-kind expected status. The error-boundary queries (a
@@ -221,8 +216,7 @@ impl Corpus {
     /// Read the SPARQL text for a query.
     pub fn read_query(&self, def: &QueryDef) -> Result<String> {
         let path = self.dir.join(&def.file);
-        std::fs::read_to_string(&path)
-            .with_context(|| format!("reading query {}", path.display()))
+        std::fs::read_to_string(&path).with_context(|| format!("reading query {}", path.display()))
     }
 
     /// Queries in a subset (or all queries when `subset` is `None`).
@@ -270,7 +264,11 @@ impl Corpus {
         for q in &self.queries {
             let path = self.dir.join(&q.file);
             let text = std::fs::read_to_string(&path).with_context(|| {
-                format!("query '{}' references missing file {}", q.id, path.display())
+                format!(
+                    "query '{}' references missing file {}",
+                    q.id,
+                    path.display()
+                )
             })?;
             if text.trim().is_empty() {
                 anyhow::bail!("query '{}' file {} is empty", q.id, path.display());
@@ -278,7 +276,11 @@ impl Corpus {
         }
 
         // Smoke covers every tag that appears anywhere in the corpus.
-        let all_tags: BTreeSet<Tag> = self.queries.iter().flat_map(|q| q.tags.iter().copied()).collect();
+        let all_tags: BTreeSet<Tag> = self
+            .queries
+            .iter()
+            .flat_map(|q| q.tags.iter().copied())
+            .collect();
         let smoke_tags: BTreeSet<Tag> = self
             .queries
             .iter()
@@ -288,8 +290,7 @@ impl Corpus {
         let uncovered: Vec<Tag> = all_tags.difference(&smoke_tags).copied().collect();
         if !uncovered.is_empty() {
             anyhow::bail!(
-                "smoke subset does not cover every tag present in the corpus; uncovered: {:?}",
-                uncovered
+                "smoke subset does not cover every tag present in the corpus; uncovered: {uncovered:?}"
             );
         }
 
@@ -327,7 +328,11 @@ mod tests {
             .filter(|q| q.in_subset("smoke"))
             .flat_map(|q| q.tags.iter().copied())
             .collect();
-        assert_eq!(smoke_tags.len(), 20, "smoke must exercise all 20 feature tags");
+        assert_eq!(
+            smoke_tags.len(),
+            20,
+            "smoke must exercise all 20 feature tags"
+        );
     }
 
     /// `select_by_ids` returns the requested queries in corpus order and rejects
@@ -343,27 +348,43 @@ mod tests {
         let ids: Vec<&str> = sel.iter().map(|q| q.id.as_str()).collect();
         assert_eq!(ids, vec!["q019", "q027", "q054"]);
         // A typo is a hard error, not a silent skip.
-        assert!(corpus.select_by_ids(&["q019".to_string(), "q999".to_string()]).is_err());
+        assert!(corpus
+            .select_by_ids(&["q019".to_string(), "q999".to_string()])
+            .is_err());
     }
 
     /// The error-boundary probes (q043 lang-tag, q044 custom-datatype) carry
     /// NO expected_status override: the audit predicted a whole-GRAPH error on
     /// virtual, but observed behavior (2026-07-11 baseline) is q043 ok/0-rows
     /// and q044 dnf — neither errors. Both must still admit 0 rows on native.
+    ///
+    /// PR-0 (findings F1/F2) then flipped the non-lowered sub-scope queries to
+    /// loud-refuse on virtual: exactly q034 (transitive property path) and
+    /// q051 (subquery) declare `virtual = error`, and both must stay `ok` on
+    /// native, where the same shapes evaluate fine against the ledger index.
     #[test]
     fn error_boundary_queries_match_observed_behavior() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
         let corpus = Corpus::load(&dir).expect("corpus loads");
-        let declared_error: Vec<&QueryDef> = corpus
+        let declared_error: Vec<&str> = corpus
             .queries
             .iter()
             .filter(|q| q.expected_status.for_target(true) == ExpectedOutcome::Error)
+            .map(|q| q.id.as_str())
             .collect();
-        assert!(
-            declared_error.is_empty(),
-            "no query declares virtual=error (empirically corrected); found {:?}",
-            declared_error.iter().map(|q| &q.id).collect::<Vec<_>>()
+        assert_eq!(
+            declared_error,
+            vec!["q034", "q051"],
+            "exactly the PR-0 loud-refuse queries declare virtual=error"
         );
+        for id in ["q034", "q051"] {
+            let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
+            assert_eq!(
+                q.expected_status.for_target(false),
+                ExpectedOutcome::Ok,
+                "{id} must stay ok on native"
+            );
+        }
         for id in ["q043", "q044"] {
             let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
             assert_eq!(q.expected_status.for_target(false), ExpectedOutcome::Ok);
@@ -385,10 +406,11 @@ mod tests {
             .filter(|q| q.hash_gate == HashGate::RowsOnly)
             .map(|q| q.id.as_str())
             .collect();
-        let expected: BTreeSet<&str> =
-            ["q015", "q016", "q028", "q029", "q031", "q045", "q048", "q049", "q053"]
-                .into_iter()
-                .collect();
+        let expected: BTreeSet<&str> = [
+            "q015", "q016", "q028", "q029", "q031", "q045", "q048", "q049", "q053",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(rows_only, expected, "rows_only set must match the §5 audit");
     }
 

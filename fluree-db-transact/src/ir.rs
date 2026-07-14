@@ -478,6 +478,17 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
+    /// Skolemization id override for blank-node minting in this transaction.
+    ///
+    /// When set, staging uses this id instead of a generated timestamp in the
+    /// `fdb-{txn_id}-{solution}-{label}` skolem key, making created-entity
+    /// Sids reconstructible by the caller (Cypher `CREATE … RETURN n`
+    /// resolves the created node from the id it supplied). Must be unique per
+    /// committed transaction — reuse would collide freshly minted subjects
+    /// with an earlier commit's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skolem_txn_id: Option<String>,
+
     /// Inline SHACL shape definitions for *this transaction only*.
     ///
     /// JSON-LD document carrying SHACL shapes (sh:NodeShape /

@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_datalog_rules.rs"]
 mod it_datalog_rules;
+#[path = "it_datalog_rules_sparql.rs"]
+mod it_datalog_rules_sparql;
 #[path = "it_reasoning_budget.rs"]
 mod it_reasoning_budget;
 #[path = "it_reasoning_imports.rs"]

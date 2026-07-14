@@ -690,8 +690,9 @@ const SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS: usize = 8;
 /// sub-SELECT whose own body always-binds them. NOT vars bound only inside a
 /// `UNION` branch or `OPTIONAL` (conditional), nor a sub-SELECT's pass-throughs.
 /// These are the only correlation variables safe to use as evaluate-once
-/// hash-join keys.
-fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
+/// hash-join keys. Also used by `GraphOperator` to decide whether seeding the
+/// graph variable into its inner subplan is join-equivalent (issue #1442).
+pub(crate) fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
     let mut produced: HashSet<VarId> = HashSet::new();
     for p in patterns {
         match p {

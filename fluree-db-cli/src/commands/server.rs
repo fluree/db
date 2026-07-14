@@ -27,6 +27,8 @@ struct ServerMeta {
     storage_path: String,
     #[serde(default)]
     connection_config: Option<String>,
+    #[serde(default)]
+    bolt_listen_addr: Option<String>,
     config_path: Option<String>,
     started_at: String,
     /// The raw args passed to the `_child` process (for `restart`).
@@ -60,6 +62,8 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             storage_path,
             connection_config,
             log_level,
+            bolt_listen_addr,
+            bolt_default_db,
             profile,
             extra_args,
         } => {
@@ -69,6 +73,8 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 storage_path,
                 connection_config,
                 log_level,
+                bolt_listen_addr,
+                bolt_default_db,
                 profile,
                 &extra_args,
             )
@@ -80,6 +86,8 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             storage_path,
             connection_config,
             log_level,
+            bolt_listen_addr,
+            bolt_default_db,
             profile,
             dry_run,
             extra_args,
@@ -90,6 +98,8 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 storage_path,
                 connection_config,
                 log_level,
+                bolt_listen_addr,
+                bolt_default_db,
                 profile,
                 dry_run,
                 &extra_args,
@@ -105,6 +115,8 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             storage_path,
             connection_config,
             log_level,
+            bolt_listen_addr,
+            bolt_default_db,
             profile,
             extra_args,
         } => {
@@ -114,6 +126,8 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 storage_path,
                 connection_config,
                 log_level,
+                bolt_listen_addr,
+                bolt_default_db,
                 profile,
                 &extra_args,
             )
@@ -130,12 +144,15 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
 // `fluree server run` — foreground
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_foreground(
     config_override: Option<&Path>,
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
@@ -148,6 +165,8 @@ async fn run_foreground(
         storage_path.clone(),
         connection_config,
         log_level,
+        bolt_listen_addr,
+        bolt_default_db,
         profile,
         extra_args,
     )?;
@@ -176,6 +195,7 @@ async fn run_foreground(
             .connection_config
             .as_ref()
             .map(|p| p.display().to_string()),
+        bolt_listen_addr: server_config.bolt_listen_addr.map(|a| a.to_string()),
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: Vec::new(),
@@ -214,6 +234,8 @@ async fn run_start(
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     dry_run: bool,
     extra_args: &[String],
@@ -225,6 +247,8 @@ async fn run_start(
         storage_path.clone(),
         connection_config,
         log_level.clone(),
+        bolt_listen_addr,
+        bolt_default_db,
         profile.clone(),
         extra_args,
     )?;
@@ -311,6 +335,7 @@ async fn run_start(
             .connection_config
             .as_ref()
             .map(|p| p.display().to_string()),
+        bolt_listen_addr: server_config.bolt_listen_addr.map(|a| a.to_string()),
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args,
@@ -419,6 +444,10 @@ async fn run_start_with_child_args(
         connection_config: child_args
             .windows(2)
             .find(|w| w[0] == "--connection-config")
+            .map(|w| w[1].clone()),
+        bolt_listen_addr: child_args
+            .windows(2)
+            .find(|w| w[0] == "--bolt-listen-addr")
             .map(|w| w[1].clone()),
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
@@ -553,6 +582,9 @@ async fn run_status(config_override: Option<&Path>) -> CliResult<()> {
         } else {
             eprintln!("  storage_path: {}", m.storage_path);
         }
+        if let Some(ref bolt) = m.bolt_listen_addr {
+            eprintln!("  bolt:         {bolt}");
+        }
         eprintln!("  started_at:   {}", m.started_at);
         if let Some(uptime) = format_uptime(&m.started_at) {
             eprintln!("  uptime:       {uptime}");
@@ -597,12 +629,15 @@ async fn run_status(config_override: Option<&Path>) -> CliResult<()> {
 // `fluree server restart`
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn run_restart(
     config_override: Option<&Path>,
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
@@ -630,6 +665,8 @@ async fn run_restart(
             storage_path.as_deref(),
             connection_config.as_deref(),
             log_level.as_deref(),
+            bolt_listen_addr.as_ref(),
+            bolt_default_db.as_deref(),
             profile.as_deref(),
             extra_args,
         );
@@ -643,6 +680,8 @@ async fn run_restart(
         storage_path,
         connection_config,
         log_level,
+        bolt_listen_addr,
+        bolt_default_db,
         profile,
         false,
         extra_args,
@@ -739,12 +778,15 @@ async fn run_child(args: &[String]) -> CliResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Build a `ServerConfig` by merging the config file with CLI flag overrides.
+#[allow(clippy::too_many_arguments)]
 fn build_server_config(
     config_override: Option<&Path>,
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
     log_level: Option<String>,
+    bolt_listen_addr: Option<SocketAddr>,
+    bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<ServerConfig> {
@@ -777,6 +819,16 @@ fn build_server_config(
     if let Some(ref level) = log_level {
         args.push("--log-level".into());
         args.push(level.clone());
+    }
+
+    if let Some(addr) = bolt_listen_addr {
+        args.push("--bolt-listen-addr".into());
+        args.push(addr.to_string());
+    }
+
+    if let Some(ref db) = bolt_default_db {
+        args.push("--bolt-default-db".into());
+        args.push(db.clone());
     }
 
     if let Some(ref p) = profile {
@@ -853,6 +905,27 @@ fn build_child_args(
         args.push(path.display().to_string());
     }
 
+    // Bolt flags from the resolved config — skipped when the user supplied
+    // them via `--` passthrough (forwarded verbatim below), which would
+    // otherwise duplicate the flag and fail the child's arg parse.
+    let in_extra = |flag: &str| {
+        extra_args
+            .iter()
+            .any(|a| a == flag || a.starts_with(&format!("{flag}=")))
+    };
+    if let Some(addr) = config.bolt_listen_addr {
+        if !in_extra("--bolt-listen-addr") {
+            args.push("--bolt-listen-addr".into());
+            args.push(addr.to_string());
+        }
+    }
+    if let Some(ref db) = config.bolt_default_db {
+        if !in_extra("--bolt-default-db") {
+            args.push("--bolt-default-db".into());
+            args.push(db.clone());
+        }
+    }
+
     // Pass through explicit overrides
     if log_level.is_some() {
         args.push("--log-level".into());
@@ -894,6 +967,8 @@ fn merge_restart_args(
     new_storage_path: Option<&Path>,
     new_connection_config: Option<&Path>,
     new_log_level: Option<&str>,
+    new_bolt_listen_addr: Option<&SocketAddr>,
+    new_bolt_default_db: Option<&str>,
     new_profile: Option<&str>,
     new_extra_args: &[String],
 ) -> Vec<String> {
@@ -942,12 +1017,24 @@ fn merge_restart_args(
                 result.push(new_profile.unwrap().to_string());
                 i += 2;
             }
+            "--bolt-listen-addr" if new_bolt_listen_addr.is_some() => {
+                result.push("--bolt-listen-addr".into());
+                result.push(new_bolt_listen_addr.unwrap().to_string());
+                i += 2;
+            }
+            "--bolt-default-db" if new_bolt_default_db.is_some() => {
+                result.push("--bolt-default-db".into());
+                result.push(new_bolt_default_db.unwrap().to_string());
+                i += 2;
+            }
             // Known flag with a value argument — copy both
             "--listen-addr"
             | "--storage-path"
             | "--connection-config"
             | "--log-level"
             | "--profile"
+            | "--bolt-listen-addr"
+            | "--bolt-default-db"
             | "--config-file" => {
                 result.push(old_args[i].clone());
                 if i + 1 < old_args.len() {
@@ -981,6 +1068,18 @@ fn merge_restart_args(
         if !has("--connection-config") {
             result.push("--connection-config".into());
             result.push(path.display().to_string());
+        }
+    }
+    if let Some(addr) = new_bolt_listen_addr {
+        if !has("--bolt-listen-addr") {
+            result.push("--bolt-listen-addr".into());
+            result.push(addr.to_string());
+        }
+    }
+    if let Some(db) = new_bolt_default_db {
+        if !has("--bolt-default-db") {
+            result.push("--bolt-default-db".into());
+            result.push(db.to_string());
         }
     }
     if let Some(level) = new_log_level {
@@ -1025,6 +1124,16 @@ fn print_resolved_config(config: &ServerConfig, dirs: &FlureeDir) {
         );
     }
     eprintln!("  log_level:    {}", config.log_level);
+    eprintln!(
+        "  bolt:         {}",
+        config
+            .bolt_listen_addr
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "(disabled)".into())
+    );
+    if let Some(ref db) = config.bolt_default_db {
+        eprintln!("    default_db: {db}");
+    }
     eprintln!("  cors_enabled: {}", config.cors_enabled);
     eprintln!("  indexing:     {}", config.indexing_enabled);
     if config.indexing_enabled {

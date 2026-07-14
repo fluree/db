@@ -2662,7 +2662,7 @@ pub fn build_overlay_cursor_for_predicate(
     // the returned batch — the output shape the count operators see is
     // unchanged. (Production masks this via the cache's `all()` load; a
     // cache-less store would miscount. See `BinaryCursor::set_overlay_ops`.)
-    let overlay_active = ctx.overlay.is_some() && ctx.overlay().epoch() != 0;
+    let overlay_active = overlay_has_novelty(ctx);
     let projection = if overlay_active {
         let identity = ColumnSet::CORE.union(ColumnSet::single(ColumnId::OI));
         ColumnProjection {
@@ -2690,7 +2690,7 @@ pub fn build_overlay_cursor_for_predicate(
     // novelty (epoch 0): the persisted index alone is then exact. Ops come
     // from the per-execution cache, so N cursors over the same predicate
     // (flushes, partitions, cyclic edges) share one walk + translation.
-    if ctx.overlay.is_some() && ctx.overlay().epoch() != 0 {
+    if overlay_has_novelty(ctx) {
         match cached_overlay_ops(ctx, store, g_id, order, &pred_sid)? {
             Some(ops) => {
                 if !ops.is_empty() {
@@ -3456,13 +3456,25 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
 /// unfiltered).
 #[inline]
 fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
-        && ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            == 0
+    !ctx.is_multi_ledger() && ctx.from_t.is_none() && !overlay_has_novelty(ctx)
+}
+
+/// True when the overlay can still contribute flakes.
+///
+/// `epoch()` is a monotonic mutation counter that never resets, so
+/// `epoch() == 0` means "never had novelty since this overlay was created" —
+/// it stays non-zero forever on a long-lived cached ledger even after an
+/// index swap drains every segment. Gating on it alone permanently disables
+/// the metadata fast paths on any server that has processed a write
+/// (measured: whole-graph aggregates stuck at ~190ms after the background
+/// indexer caught up, until restart). `is_effectively_empty()` exists for
+/// exactly this distinction; keep `epoch()` itself for cache keys only.
+#[inline]
+pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
+    match &ctx.overlay {
+        Some(o) => o.epoch() != 0 && !o.is_effectively_empty(),
+        None => false,
+    }
 }
 
 /// Combined fast-path eligibility: [`allow_fast_path`] + binary store present + `to_t == max_t`.

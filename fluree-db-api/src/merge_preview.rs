@@ -20,8 +20,9 @@ use fluree_db_core::{
     ContentId, ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_novelty::compute_delta_keys;
+use fluree_db_novelty::{compute_delta_keys, compute_delta_keys_and_changes};
 use futures::{stream, StreamExt, TryStreamExt};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::Instrument;
@@ -31,6 +32,10 @@ pub const DEFAULT_MAX_COMMITS: usize = 500;
 
 /// Default cap on conflict keys returned in [`ConflictSummary::keys`].
 pub const DEFAULT_MAX_CONFLICT_KEYS: usize = 200;
+
+/// Default cap on change entries returned in [`ChangeSummary::entries`],
+/// counted in flakes.
+pub const DEFAULT_MAX_CHANGES: usize = 500;
 
 /// Knobs for [`crate::Fluree::merge_preview`].
 ///
@@ -76,6 +81,26 @@ pub struct MergePreviewOpts {
     pub include_conflict_details: bool,
     /// Strategy used for human-readable conflict resolution labels.
     pub conflict_strategy: ConflictStrategy,
+    /// When `true`, include the aggregate netted change set the merge would
+    /// apply (source side, `ancestor..source_head`) as
+    /// [`MergePreview::changes`]. Costs one full commit load per commit in
+    /// the source divergence; the walk is shared with the conflict
+    /// computation when both are requested.
+    pub include_changes: bool,
+    /// Cap on change entries returned in [`ChangeSummary::entries`], counted
+    /// in **flakes** (not subjects) and cut at subject boundaries — a
+    /// subject's diff is never split across the cap, so a single subject
+    /// larger than the cap is returned whole (bounded overshoot). `Some(0)`
+    /// is a valid "diff stats" mode: exact counts, no payload, and no
+    /// source-state load for IRI resolution. `None` is unbounded. Caps the
+    /// response size only — counts stay exact and the replay walk is
+    /// unaffected.
+    pub max_changes: Option<usize>,
+    /// Resume cursor for paging [`ChangeSummary::entries`]: return only
+    /// subjects whose full IRI sorts strictly after this value. Pass the
+    /// previous response's [`ChangeSummary::next_cursor`]. Each page re-pays
+    /// the full replay + netting cost. Requires `include_changes`.
+    pub changes_after_subject: Option<String>,
 }
 
 impl Default for MergePreviewOpts {
@@ -86,6 +111,9 @@ impl Default for MergePreviewOpts {
             include_conflicts: true,
             include_conflict_details: false,
             conflict_strategy: ConflictStrategy::default(),
+            include_changes: false,
+            max_changes: Some(DEFAULT_MAX_CHANGES),
+            changes_after_subject: None,
         }
     }
 }
@@ -155,6 +183,70 @@ impl ConflictSummary {
     }
 }
 
+/// Aggregate netted change set a merge would apply — the source side's
+/// `ancestor..source_head` flakes folded per fact, with
+/// internally-cancelling assert/retract pairs removed.
+///
+/// ### Netting contract
+///
+/// Per fact (full identity: subject, predicate, object, datatype, graph,
+/// language tag, list index), the net op is the newest in-range op; a fact
+/// survives only when its oldest and newest in-range ops agree. Intermediate
+/// churn (create-then-delete, delete-then-restore) never appears. This is
+/// the **net commit effect** — what replaying the range applies, minus
+/// pairs that cancel — so a re-assert of a value that already existed
+/// before the range still nets as an assert (the merge does apply it).
+///
+/// The change set is strategy-independent: it is the raw source-vs-ancestor
+/// delta, *before* conflict resolution. Under a non-default strategy,
+/// conflicting keys resolve per the separately-returned
+/// [`ConflictSummary::details`].
+#[derive(Clone, Debug, Serialize)]
+pub struct ChangeSummary {
+    /// Exact net assert count across the full divergence. Never truncated.
+    pub assert_count: usize,
+    /// Exact net retract count across the full divergence. Never truncated.
+    pub retract_count: usize,
+    /// Exact number of distinct subjects touched by net changes.
+    pub subject_count: usize,
+    /// Net changes grouped by subject, subjects ordered by full IRI.
+    /// Bounded by [`MergePreviewOpts::max_changes`] (counting flakes, cut at
+    /// subject boundaries) and offset by
+    /// [`MergePreviewOpts::changes_after_subject`].
+    pub entries: Vec<SubjectChange>,
+    /// `true` when subjects after this page were withheld — either by the
+    /// flake cap or because `max_changes = 0` suppressed the payload.
+    pub truncated: bool,
+    /// Cursor for the next page when `truncated` by the flake cap: the last
+    /// returned subject IRI, to be passed as `changes_after_subject`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+impl ChangeSummary {
+    fn empty() -> Self {
+        Self {
+            assert_count: 0,
+            retract_count: 0,
+            subject_count: 0,
+            entries: Vec::new(),
+            truncated: false,
+            next_cursor: None,
+        }
+    }
+}
+
+/// Net changes for one subject.
+#[derive(Clone, Debug, Serialize)]
+pub struct SubjectChange {
+    /// Full (expanded) subject IRI — also the pagination sort key.
+    pub subject: String,
+    /// Net additions on this subject.
+    pub asserts: Vec<crate::ResolvedFlake>,
+    /// Net removals on this subject.
+    pub retracts: Vec<crate::ResolvedFlake>,
+}
+
 /// Read-only diff between two branches.
 #[derive(Clone, Debug, Serialize)]
 pub struct MergePreview {
@@ -179,6 +271,11 @@ pub struct MergePreview {
 
     /// Whether the selected strategy can be applied without aborting.
     pub mergeable: bool,
+
+    /// Aggregate netted change set. Present iff
+    /// [`MergePreviewOpts::include_changes`] was set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ChangeSummary>,
 }
 
 impl crate::Fluree {
@@ -243,6 +340,11 @@ impl crate::Fluree {
         if opts.conflict_strategy == ConflictStrategy::Skip {
             return Err(ApiError::InvalidBranch(
                 "Skip strategy is not supported for merge preview".to_string(),
+            ));
+        }
+        if opts.changes_after_subject.is_some() && !opts.include_changes {
+            return Err(ApiError::InvalidBranch(
+                "changes_after_subject requires include_changes=true".to_string(),
             ));
         }
 
@@ -366,23 +468,59 @@ impl crate::Fluree {
             commits: behind_summaries,
         };
 
-        // ---- Conflicts (only if relevant). --------------------------------
-        let conflicts = if !opts.include_conflicts || fast_forward {
-            ConflictSummary::empty()
-        } else {
-            match (&source_head, &target_head, &ancestor) {
-                (Some(s_head), Some(t_head), Some(anc)) => {
-                    let s_delta_fut =
-                        compute_delta_keys(source_store.clone(), s_head.clone(), anc.t);
-                    let t_delta_fut =
-                        compute_delta_keys(target_branched.clone(), t_head.clone(), anc.t);
-                    let (s_delta, t_delta) = tokio::try_join!(s_delta_fut, t_delta_fut)?;
+        // ---- Source-side replay (conflicts and/or changes). ---------------
+        // Conflicts and the netted change set both fold the source commit
+        // chain since the ancestor; when both are requested one walk serves
+        // both. Conflicts are only possible on non-fast-forward merges;
+        // changes are meaningful regardless (fast-forward is the common
+        // merge-request review case).
+        let need_conflicts = opts.include_conflicts
+            && !fast_forward
+            && source_head.is_some()
+            && target_head.is_some()
+            && ancestor.is_some();
+        let need_changes = opts.include_changes;
 
+        let source_fut = async {
+            match &source_head {
+                Some(s_head) if need_changes => {
+                    let (keys, net) = compute_delta_keys_and_changes(
+                        source_store.clone(),
+                        s_head.clone(),
+                        stop_at_t,
+                    )
+                    .await?;
+                    Ok::<_, ApiError>((Some(keys), Some(net)))
+                }
+                Some(s_head) if need_conflicts => {
+                    let keys =
+                        compute_delta_keys(source_store.clone(), s_head.clone(), stop_at_t).await?;
+                    Ok((Some(keys), None))
+                }
+                _ => Ok((None, None)),
+            }
+        };
+        let target_fut = async {
+            match (&target_head, &ancestor) {
+                (Some(t_head), Some(anc)) if need_conflicts => {
+                    let keys =
+                        compute_delta_keys(target_branched.clone(), t_head.clone(), anc.t).await?;
+                    Ok::<_, ApiError>(Some(keys))
+                }
+                _ => Ok(None),
+            }
+        };
+        let ((source_delta, net_flakes), target_delta) = tokio::try_join!(source_fut, target_fut)?;
+
+        // ---- Conflicts (only if relevant). --------------------------------
+        let (conflict_keys, conflict_count, conflicts_truncated) =
+            match (need_conflicts, &source_delta, &target_delta) {
+                (true, Some(s_delta), Some(t_delta)) => {
                     // Sort lexicographically by (s, p, g) so capped responses
                     // are stable across builds and across requests — `HashSet`
                     // intersection order is otherwise unspecified.
                     let mut keys: Vec<ConflictKey> =
-                        s_delta.intersection(&t_delta).cloned().collect();
+                        s_delta.intersection(t_delta).cloned().collect();
                     keys.sort();
                     let count = keys.len();
                     let truncated = match opts.max_conflict_keys {
@@ -392,44 +530,88 @@ impl crate::Fluree {
                         }
                         _ => false,
                     };
-
-                    let details = if opts.include_conflict_details && !keys.is_empty() {
-                        let source_state_fut = self.load_queryable_state_with_store(
-                            source_store.clone(),
-                            source_record.clone(),
-                        );
-                        let target_state_fut = self.load_queryable_state_with_store(
-                            target_branched.clone(),
-                            target_record.clone(),
-                        );
-                        let (source_state, target_state) =
-                            tokio::try_join!(source_state_fut, target_state_fut)?;
-
-                        build_conflict_details(
-                            &keys,
-                            &source_state,
-                            &target_state,
-                            &opts.conflict_strategy,
-                        )
-                        .await?
-                    } else {
-                        Vec::new()
-                    };
-
-                    ConflictSummary {
-                        count,
-                        keys,
-                        truncated,
-                        strategy: if count > 0 {
-                            Some(opts.conflict_strategy.as_str().to_string())
-                        } else {
-                            None
-                        },
-                        details,
-                    }
+                    (keys, count, truncated)
                 }
-                _ => ConflictSummary::empty(),
+                _ => (Vec::new(), 0, false),
+            };
+
+        // ---- Load states needed for IRI resolution. -----------------------
+        // Conflict details need both sides; the change payload needs only the
+        // source side (its head state carries every namespace code the
+        // divergence introduced). Stats-only mode (`max_changes = 0`) skips
+        // the load entirely.
+        let want_details = opts.include_conflict_details && !conflict_keys.is_empty();
+        let want_change_payload = need_changes
+            && net_flakes.as_ref().is_some_and(|n| !n.is_empty())
+            && opts.max_changes != Some(0);
+
+        let (source_state, target_state) = if want_details {
+            let source_state_fut =
+                self.load_queryable_state_with_store(source_store.clone(), source_record.clone());
+            let target_state_fut = self
+                .load_queryable_state_with_store(target_branched.clone(), target_record.clone());
+            let (s, t) = tokio::try_join!(source_state_fut, target_state_fut)?;
+            (Some(s), Some(t))
+        } else if want_change_payload {
+            let s = self
+                .load_queryable_state_with_store(source_store.clone(), source_record.clone())
+                .await?;
+            (Some(s), None)
+        } else {
+            (None, None)
+        };
+
+        let conflicts = if !need_conflicts {
+            ConflictSummary::empty()
+        } else {
+            let details = if want_details {
+                build_conflict_details(
+                    &conflict_keys,
+                    source_state.as_ref().expect("loaded for details"),
+                    target_state.as_ref().expect("loaded for details"),
+                    &opts.conflict_strategy,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+
+            ConflictSummary {
+                count: conflict_count,
+                keys: conflict_keys,
+                truncated: conflicts_truncated,
+                strategy: if conflict_count > 0 {
+                    Some(opts.conflict_strategy.as_str().to_string())
+                } else {
+                    None
+                },
+                details,
             }
+        };
+
+        // ---- Changes (only if requested). ----------------------------------
+        let changes = if need_changes {
+            // No compactor in stats-only mode even when conflict details
+            // loaded the source state — `max_changes = 0` means no payload.
+            let compactor = if want_change_payload {
+                source_state
+                    .as_ref()
+                    .map(|s| IriCompactor::from_namespaces(s.snapshot.shared_namespaces()))
+            } else {
+                None
+            };
+            let summary = match net_flakes {
+                Some(net) if !net.is_empty() => build_change_summary(
+                    net,
+                    compactor,
+                    opts.max_changes,
+                    opts.changes_after_subject.as_deref(),
+                )?,
+                _ => ChangeSummary::empty(),
+            };
+            Some(summary)
+        } else {
+            None
         };
 
         let mergeable = opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
@@ -457,8 +639,112 @@ impl crate::Fluree {
             fast_forward,
             conflicts,
             mergeable,
+            changes,
         })
     }
+}
+
+/// Group netted flakes by subject, order deterministically, and apply the
+/// cursor + flake cap. Counts are computed over the full net set before any
+/// truncation. `compactor: None` is stats-only mode — exact counts, no
+/// entries.
+fn build_change_summary(
+    net_flakes: Vec<Flake>,
+    compactor: Option<IriCompactor>,
+    max_changes: Option<usize>,
+    after_subject: Option<&str>,
+) -> Result<ChangeSummary> {
+    let assert_count = net_flakes.iter().filter(|f| f.op).count();
+    let retract_count = net_flakes.len() - assert_count;
+
+    let Some(compactor) = compactor else {
+        // Stats-only: distinct subjects countable without IRI resolution
+        // (Sid ↔ IRI is bijective under one namespace table).
+        let subjects: FxHashSet<&fluree_db_core::Sid> = net_flakes.iter().map(|f| &f.s).collect();
+        return Ok(ChangeSummary {
+            assert_count,
+            retract_count,
+            subject_count: subjects.len(),
+            entries: Vec::new(),
+            truncated: !net_flakes.is_empty(),
+            next_cursor: None,
+        });
+    };
+
+    // Group by Sid first — a cheap Arc-clone key with no IRI resolution — so
+    // each distinct subject is decoded exactly once rather than once per flake.
+    // Sorting by the decoded IRI then gives the deterministic subject order
+    // that pagination cursors rely on.
+    let mut by_sid: FxHashMap<fluree_db_core::Sid, Vec<Flake>> = FxHashMap::default();
+    for f in net_flakes {
+        by_sid.entry(f.s.clone()).or_default().push(f);
+    }
+    let subject_count = by_sid.len();
+
+    let mut by_subject: Vec<(String, Vec<Flake>)> = by_sid
+        .into_iter()
+        .map(|(sid, flakes)| Ok((compactor.decode_sid(&sid)?, flakes)))
+        .collect::<Result<_>>()?;
+    by_subject.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut entries = Vec::new();
+    let mut emitted_flakes = 0usize;
+    let mut truncated = false;
+
+    for (subject, mut flakes) in by_subject
+        .into_iter()
+        .skip_while(|(s, _)| after_subject.is_some_and(|a| s.as_str() <= a))
+    {
+        // Cut at subject boundaries: stop before a subject that would cross
+        // the cap — unless it's the first subject of the page, which is
+        // returned whole (bounded overshoot) so progress is always possible.
+        if let Some(cap) = max_changes {
+            if !entries.is_empty() && emitted_flakes + flakes.len() > cap {
+                truncated = true;
+                break;
+            }
+        }
+        emitted_flakes += flakes.len();
+
+        // Deterministic order within a subject.
+        flakes.sort_by(|a, b| {
+            a.p.cmp(&b.p)
+                .then_with(|| a.o.cmp(&b.o))
+                .then_with(|| a.dt.cmp(&b.dt))
+                .then_with(|| a.m.cmp(&b.m))
+        });
+
+        let mut asserts = Vec::new();
+        let mut retracts = Vec::new();
+        for f in &flakes {
+            let resolved = resolve_flake(&compactor, f)?;
+            if f.op {
+                asserts.push(resolved);
+            } else {
+                retracts.push(resolved);
+            }
+        }
+        entries.push(SubjectChange {
+            subject,
+            asserts,
+            retracts,
+        });
+    }
+
+    let next_cursor = if truncated {
+        entries.last().map(|e| e.subject.clone())
+    } else {
+        None
+    };
+
+    Ok(ChangeSummary {
+        assert_count,
+        retract_count,
+        subject_count,
+        entries,
+        truncated,
+        next_cursor,
+    })
 }
 
 async fn build_conflict_details(

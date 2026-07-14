@@ -23,7 +23,7 @@
 //! |---|---|
 //! | unset / not `1`+ | Tracing **off**. No subscriber installed. Zero overhead. |
 //! | `FLUREE_BENCH_TRACING=1` | Install a stderr subscriber filtered by `RUST_LOG` (defaults to `info` if `RUST_LOG` is unset). |
-//! | `FLUREE_BENCH_TRACING=file:./out.json` | (Reserved for `BenchSpanLayer`; see TODO note below.) |
+//! | `FLUREE_BENCH_TRACING=file:./out.jsonl` | Install a file-only [`BenchSpanLayer`] streaming one JSON span record per line, optionally filtered by `FLUREE_BENCH_SPAN_ALLOWLIST` (comma-separated span names). No in-memory sink — safe for long-running processes with no `take()` caller. |
 //!
 //! The crate-level `Targets` filter from `fluree-db-server::telemetry` is not
 //! invoked here because benches typically run only one or two crates at DEBUG
@@ -126,9 +126,8 @@ impl BenchSpanCapture {
     /// cost nothing.
     pub fn layer(&self, allowlist: Option<&[&str]>) -> BenchSpanLayer {
         BenchSpanLayer {
-            allowlist: allowlist
-                .map(|names| names.iter().map(|s| s.to_string()).collect()),
-            sink: Arc::clone(&self.records),
+            allowlist: allowlist.map(|names| names.iter().map(|s| s.to_string()).collect()),
+            sink: Some(Arc::clone(&self.records)),
             file: None,
         }
     }
@@ -137,9 +136,14 @@ impl BenchSpanCapture {
 /// `tracing_subscriber::Layer` that captures span open/close with monotonic
 /// timestamps and recorded fields into a [`BenchSpanCapture`] sink and/or a
 /// JSONL file (`FLUREE_BENCH_TRACING=file:./out.jsonl`).
+///
+/// The in-memory sink is optional: the file-only installation
+/// ([`install_file_span_capture`]) leaves it `None`, because a sink nobody
+/// drains via [`BenchSpanCapture::take`] grows without bound over a
+/// long-running process.
 pub struct BenchSpanLayer {
     allowlist: Option<HashSet<String>>,
-    sink: Arc<Mutex<Vec<SpanRecord>>>,
+    sink: Option<Arc<Mutex<Vec<SpanRecord>>>>,
     file: Option<Arc<Mutex<std::io::BufWriter<std::fs::File>>>>,
 }
 
@@ -235,37 +239,35 @@ where
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(&id) else { return };
-        let Some(mut in_flight) = span.extensions_mut().remove::<InFlight>()
-        else {
+        let Some(mut in_flight) = span.extensions_mut().remove::<InFlight>() else {
             return;
         };
         in_flight.record.elapsed_us =
-            u64::try_from(in_flight.start.elapsed().as_micros())
-                .unwrap_or(u64::MAX);
+            u64::try_from(in_flight.start.elapsed().as_micros()).unwrap_or(u64::MAX);
         if let Some(file) = &self.file {
-            if let (Ok(mut w), Ok(line)) =
-                (file.lock(), serde_json::to_string(&in_flight.record))
-            {
+            if let (Ok(mut w), Ok(line)) = (file.lock(), serde_json::to_string(&in_flight.record)) {
                 let _ = writeln!(w, "{line}");
                 let _ = w.flush();
             }
         }
-        self.sink
-            .lock()
-            .expect("span sink poisoned")
-            .push(in_flight.record);
+        if let Some(sink) = &self.sink {
+            sink.lock()
+                .expect("span sink poisoned")
+                .push(in_flight.record);
+        }
     }
 }
 
-/// Install a registry + `BenchSpanLayer` writing JSONL to `path` (the
-/// `FLUREE_BENCH_TRACING=file:...` mode). Optional allowlist from
+/// Install a registry + a **file-only** `BenchSpanLayer` writing JSONL to
+/// `path` (the `FLUREE_BENCH_TRACING=file:...` mode). Optional allowlist from
 /// `FLUREE_BENCH_SPAN_ALLOWLIST` (comma-separated span names; unset = all
-/// spans). Returns the capture handle so callers can also drain in-process.
-pub fn install_file_span_capture(
-    path: &str,
-) -> std::io::Result<BenchSpanCapture> {
+/// spans). Deliberately installs **no in-memory sink**: this mode serves
+/// externally-traced, possibly long-running processes where nothing ever
+/// drains a sink, which would otherwise grow without bound. An in-process
+/// consumer should build its own [`BenchSpanCapture`] + [`BenchSpanCapture::layer`]
+/// instead.
+pub fn install_file_span_capture(path: &str) -> std::io::Result<()> {
     use tracing_subscriber::prelude::*;
-    let capture = BenchSpanCapture::new();
     let allowlist_env = std::env::var("FLUREE_BENCH_SPAN_ALLOWLIST").ok();
     let allowlist: Option<Vec<String>> = allowlist_env.map(|v| {
         v.split(',')
@@ -273,23 +275,51 @@ pub fn install_file_span_capture(
             .filter(|s| !s.is_empty())
             .collect()
     });
-    let names: Option<Vec<&str>> = allowlist
-        .as_ref()
-        .map(|v| v.iter().map(String::as_str).collect());
-    let mut layer = capture.layer(names.as_deref());
-    layer.file = Some(Arc::new(Mutex::new(std::io::BufWriter::new(
-        std::fs::File::create(path)?,
-    ))));
+    let layer = BenchSpanLayer {
+        allowlist: allowlist.as_ref().map(|v| v.iter().cloned().collect()),
+        sink: None,
+        file: Some(Arc::new(Mutex::new(std::io::BufWriter::new(
+            std::fs::File::create(path)?,
+        )))),
+    };
     let _ = tracing_subscriber::registry()
         .with(layer.with_filter(span_name_filter(allowlist)))
         .try_init();
-    Ok(capture)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tracing_subscriber::prelude::*;
+
+    /// A file-only layer (the `FLUREE_BENCH_TRACING=file:` shape) streams
+    /// JSONL and holds no in-memory sink, so a long-running externally-traced
+    /// process cannot accumulate records nobody drains.
+    #[test]
+    fn file_only_layer_writes_jsonl_without_a_sink() {
+        let path =
+            std::env::temp_dir().join(format!("bench-span-file-only-{}.jsonl", std::process::id()));
+        let layer = BenchSpanLayer {
+            allowlist: None,
+            sink: None,
+            file: Some(Arc::new(Mutex::new(std::io::BufWriter::new(
+                std::fs::File::create(&path).unwrap(),
+            )))),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            let span = tracing::debug_span!("bench.file_only", files = 7i64);
+            let _g = span.enter();
+        });
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let line = written.lines().next().expect("one span record written");
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(record["name"], "bench.file_only");
+        assert_eq!(record["fields"]["files"], 7);
+    }
 
     #[test]
     fn init_tracing_is_idempotent() {
@@ -316,10 +346,7 @@ mod tests {
             let outer = tracing::debug_span!("bench.outer", files = 3i64);
             let _og = outer.enter();
             {
-                let inner = tracing::debug_span!(
-                    "bench.inner",
-                    rows = tracing::field::Empty
-                );
+                let inner = tracing::debug_span!("bench.inner", rows = tracing::field::Empty);
                 let _ig = inner.enter();
                 inner.record("rows", 42i64);
                 std::thread::sleep(std::time::Duration::from_millis(2));

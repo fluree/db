@@ -47,6 +47,12 @@ impl RowAccess for RowWithLocals<'_> {
             .map(|(_, b)| b)
             .or_else(|| self.base.get(var))
     }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        // Loop locals are comprehension-scoped, not part of the solution
+        // mapping — the per-solution identity comes from the base row only.
+        self.base.for_each_binding(f);
+    }
 }
 
 /// The elements of `list`, or `None` when it isn't a list (a null or non-list
@@ -117,6 +123,39 @@ pub fn eval_reduce<R: RowAccess>(
         acc = body.try_eval_to_binding(&scoped, ctx)?;
     }
     Ok(acc)
+}
+
+/// A [`RowAccess`] that binds nothing — the base for evaluating a predicate
+/// that references only its own overlaid locals.
+struct EmptyRow;
+
+impl RowAccess for EmptyRow {
+    fn get(&self, _var: VarId) -> Option<&Binding> {
+        None
+    }
+
+    fn for_each_binding(&self, _f: &mut dyn FnMut(VarId, &Binding)) {
+        // Binds nothing — no (var, binding) pairs to visit.
+    }
+}
+
+/// Evaluate a boolean predicate with a single variable bound to `node` — the
+/// per-element body of `all(var IN nodes(p) WHERE predicate)`, extracted so a
+/// `shortestPath` search can qualify one candidate node during expansion.
+///
+/// Uses the same member-resolution path ([`eval_member`] → `eval_node_property`)
+/// as the post-filter, so a node qualifies here iff `predicate` holds for it in
+/// the `all(…)` filter: pushing the check into the search yields exactly the
+/// paths whose every node passes.
+pub fn eval_single_node_predicate(
+    var: VarId,
+    predicate: &Expression,
+    node: Binding,
+    ctx: &ExecutionContext<'_>,
+) -> Result<bool> {
+    let locals = [(var, node)];
+    let scoped = RowWithLocals::new(&EmptyRow, &locals);
+    predicate.eval_to_bool(&scoped, Some(ctx))
 }
 
 /// `all/any/none/single(var IN list WHERE predicate)`. Returns `None` for a

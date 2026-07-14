@@ -1912,6 +1912,52 @@ pub async fn incremental_index(
             std::collections::HashMap::new()
         };
 
+        // Base carry-forward must not depend on the sketch blob alone. When
+        // it is absent or unreadable, the hook would start from zero and the
+        // new root would persist DELTA-ONLY per-graph property stats — base
+        // predicates vanish and net-zero churn shows count 0, compounding on
+        // every subsequent incremental (observed: 4 of 8 predicates left
+        // after one incremental over a sketchless bulk import). Seed
+        // counts/datatypes/last_modified_t from the base root's persisted
+        // per-graph property stats instead. HLL registers cannot be
+        // reconstructed from the persisted ndv ESTIMATES, so remember those
+        // estimates and clamp the finalized ndv below — HLL ndv is monotone
+        // (registers only grow), so the base estimate is a valid floor. The
+        // clamp applies on every incremental (not just the fallback) so ndv
+        // survives register loss in a previously fallback-seeded sketch.
+        let mut prior_properties = prior_properties;
+        let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
+            std::collections::HashMap::new();
+        if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
+            let seed_from_base_stats = prior_properties.is_empty();
+            for g in graphs {
+                for prop in &g.properties {
+                    let key = stats::GraphPropertyKey {
+                        g_id: g.g_id,
+                        p_id: prop.p_id,
+                    };
+                    base_ndv_floor.insert(key.clone(), (prop.ndv_values, prop.ndv_subjects));
+                    if seed_from_base_stats {
+                        let datatypes = prop
+                            .datatypes
+                            .iter()
+                            .map(|&(tag, c)| (tag, c as i64))
+                            .collect();
+                        prior_properties.insert(
+                            key,
+                            stats::IdPropertyHll::from_sketches(
+                                prop.count as i64,
+                                crate::hll::HllSketch256::new(),
+                                crate::hll::HllSketch256::new(),
+                                prop.last_modified_t,
+                                datatypes,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
         // Seed hook with prior properties.
         let rdf_type_p_id = novelty
             .shared
@@ -2001,6 +2047,21 @@ pub async fn incremental_index(
             // 5. Build ClassStatEntry with datatypes, langs, ref-class edges
             // 6. Apply count deltas to base entries, add new entries
             let mut final_graphs = id_stats_result.graphs;
+
+            // ndv floor from the base root (see the seeding block above).
+            if !base_ndv_floor.is_empty() {
+                for g in &mut final_graphs {
+                    for prop in &mut g.properties {
+                        if let Some(&(nv, ns)) = base_ndv_floor.get(&stats::GraphPropertyKey {
+                            g_id: g.g_id,
+                            p_id: prop.p_id,
+                        }) {
+                            prop.ndv_values = prop.ndv_values.max(nv);
+                            prop.ndv_subjects = prop.ndv_subjects.max(ns);
+                        }
+                    }
+                }
+            }
 
             let has_class_changes =
                 !class_count_deltas.is_empty() || !novelty_subject_class_deltas.is_empty();

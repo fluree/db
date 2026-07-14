@@ -203,13 +203,31 @@ impl Hash for SubjectKey {
 }
 
 impl PropertyJoinOperator {
+    /// Rank a predicate as the leading (subject-set-seeding) scan.
+    ///
+    /// All fully-bound objects share the best score; ties resolve to the
+    /// lowest index, and predicate order follows the planner's
+    /// selectivity-reordered pattern order. This is what lets a specific
+    /// bound value (`{id: 4112}`, ~1 row) drive ahead of its `rdf:type`
+    /// class pattern (|class| rows) — while a genuinely rare class, which
+    /// the planner orders first, still wins the tie.
+    ///
+    /// Under time-travel replay (`replay`) a bound `rdf:type` object is
+    /// hard-preferred instead: a predicate whose rows were all retracted
+    /// after `to_t` has no PSOT/POST partition in the current index, so a
+    /// direct scan of it silently returns nothing — its historical rows are
+    /// only reachable through the subject-keyed SPOT sidecars the batched
+    /// probes replay. Driving from the class scan keeps every non-driver
+    /// predicate on that replay-correct probe lane.
     fn driver_score(
         predicate: &PropertyJoinPredicate,
         object_bounds: &HashMap<VarId, ObjectBounds>,
+        replay: bool,
     ) -> u8 {
         match &predicate.object {
-            PropertyJoinObject::Bound(_) if predicate.pred_ref.is_rdf_type() => 0,
-            PropertyJoinObject::Bound(_) => 1,
+            PropertyJoinObject::Bound(_) if replay && predicate.pred_ref.is_rdf_type() => 0,
+            PropertyJoinObject::Bound(_) if replay => 1,
+            PropertyJoinObject::Bound(_) => 0,
             PropertyJoinObject::Var(obj_var) if object_bounds.contains_key(obj_var) => 2,
             PropertyJoinObject::Var(_) => 3,
         }
@@ -218,12 +236,15 @@ impl PropertyJoinOperator {
     fn select_driver_predicate(
         predicates: &[PropertyJoinPredicate],
         object_bounds: &HashMap<VarId, ObjectBounds>,
+        replay: bool,
     ) -> Option<usize> {
         predicates
             .iter()
             .enumerate()
             .filter(|(_, predicate)| predicate.required)
-            .min_by_key(|(idx, predicate)| (Self::driver_score(predicate, object_bounds), *idx))
+            .min_by_key(|(idx, predicate)| {
+                (Self::driver_score(predicate, object_bounds, replay), *idx)
+            })
             .map(|(idx, _)| idx)
     }
 
@@ -781,9 +802,17 @@ impl Operator for PropertyJoinOperator {
                     .fold(0u64, |mask, (idx, _)| mask | (1u64 << idx))
             };
 
+            let replay = ctx
+                .binary_store
+                .as_ref()
+                .is_some_and(|store| ctx.to_t < store.max_t());
             let driver_pred_idx =
-                Self::select_driver_predicate(&self.predicates, &self.object_bounds);
-            tracing::debug!(?driver_pred_idx, "property_join: selected driver predicate");
+                Self::select_driver_predicate(&self.predicates, &self.object_bounds, replay);
+            tracing::debug!(
+                ?driver_pred_idx,
+                replay,
+                "property_join: selected driver predicate"
+            );
 
             let mut scan_order: Vec<usize> = self
                 .predicates
@@ -1304,8 +1333,61 @@ mod tests {
         let mut bounds = HashMap::new();
         bounds.insert(VarId(2), ObjectBounds::new());
 
-        let driver = PropertyJoinOperator::select_driver_predicate(&op.predicates, &bounds);
+        let driver = PropertyJoinOperator::select_driver_predicate(&op.predicates, &bounds, false);
         assert_eq!(driver, Some(0));
+    }
+
+    #[test]
+    fn test_property_join_driver_follows_planner_order_for_bound_objects() {
+        // Post-reorder pattern order is [value-bound, rdf:type]: the specific
+        // bound value must drive, not the class pattern (PERF-1: a
+        // `(:User {id: $id})` star label-scanned because rdf:type outranked
+        // the ~1-row id seek).
+        let rdf_type = || Ref::Iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into());
+        let patterns = vec![
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "id")),
+                Term::Value(fluree_db_core::value::FlakeValue::Long(4112)),
+            ),
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                rdf_type(),
+                Term::Sid(Sid::new(100, "User")),
+            ),
+        ];
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let driver =
+            PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new(), false);
+        assert_eq!(driver, Some(0), "specific bound value should drive");
+
+        // Under time-travel replay the class pattern must reclaim the driver:
+        // a fully-retracted value predicate has no PSOT/POST partition in the
+        // current index, so it can only be probed via SPOT sidecar replay.
+        let driver =
+            PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new(), true);
+        assert_eq!(driver, Some(1), "rdf:type should drive under replay");
+
+        // When the planner orders the class first (rare class more selective
+        // than the bound value), the tie-break preserves that choice.
+        let patterns = vec![
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                rdf_type(),
+                Term::Sid(Sid::new(100, "RareClass")),
+            ),
+            TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "status")),
+                Term::Value(fluree_db_core::value::FlakeValue::String("active".into())),
+            ),
+        ];
+        let op =
+            PropertyJoinOperator::new(&patterns, HashMap::new(), TemporalMode::Current).unwrap();
+        let driver =
+            PropertyJoinOperator::select_driver_predicate(&op.predicates, &HashMap::new(), false);
+        assert_eq!(driver, Some(0), "planner-first class should keep driving");
     }
 
     #[test]

@@ -64,6 +64,8 @@ The master bottleneck. Split into three tracks; ship 2a first because it is meas
 
 **DoD:** the per-file composition is **measured and documented** · fact scans land under the corpus timeout · parity hashes green on all fact queries · native/BSBM budgets unregressed · kill-switch off = old timing.
 
+**PR-2 residual — broad-projection mid-size files still pay footer-first.** Lever A's whole-fetch tier stops at `WHOLE_FILE_MAX_BYTES` (32MB): a 32–64MB file with no local cache copy and a broad (≥50%-share) projection is still fetched whole by `admit_whole_file`'s `broad` branch, but only *after* the 2-RT footer read — broadness is computed from footer metadata (projected column-chunk bytes), so covering this tier means speculatively fetching whole before the footer. Deliberately left conservative in PR-2; the leftover win is bounded to that tier.
+
 ---
 
 ## PR-3 — Typed-dim-star over-scan (F8) *(class: surgical → structural)*
@@ -138,6 +140,7 @@ The master bottleneck. Split into three tracks; ship 2a first because it is meas
 **Scope.** Attack the fixed cold cost (F8/H7: cold q001 ~20.8 s dominated by `loadTable` OAuth/catalog). Items:
 - **Persistent catalog state** across process restarts — persist the `rest_load_tables` / `rest_clients` cache (or a metadata-location snapshot) so a cold process doesn't re-OAuth + re-`loadTable` every table. Cold ~17 s → target (a warm-disk-class number).
 - **Catalog 429 backoff + concurrency cap** (memory: the wildcard-crawl fan-out trips the Snowflake Horizon 429) — exponential backoff on 429 and a catalog-request concurrency cap, so PR-2's raised scan concurrency and PR-3's crawl don't storm the catalog. `crawl.rs`, catalog client.
+- **PR-1 residual — COUNT(*)-shortcut decline pays the manifest read twice.** When `table_row_count` declines (delete manifests present), the fallback scan's planner re-reads the manifest list the shortcut just read; `cache.get_scan_files` absorbs it warm, but a first cold COUNT on a delete-bearing table pays two manifest reads. Fold into the catalog/manifest round-trip caching here.
 - **Anchors:** `cache.rs` (three-tier caches, §3/§4), `catalog_session.rs`, inventory §3/§10.
 - **Impact.** Every query's cold column; the `loadTable` term that PR-3 reduces 6×, PR-8 reduces further and makes durable. Risk: LOW–MED (cache persistence correctness — honor creds expiry; the rotated-secret hazard §4 must still self-heal). Kill-switches: the existing TTL/cache env vars.
 - **DoD:** cold-protocol subset (05 §cold) hits the cold target · 429 backoff verified under a forced-429 stub · rotated-secret still self-heals within TTL.
@@ -146,9 +149,9 @@ The master bottleneck. Split into three tracks; ship 2a first because it is meas
 
 ## Harness follow-ups (not perf PRs, but gating)
 
-- **`scan_plan` span coverage (F7).** The span fires only on the pushdown branch (2/16 smoke queries); tune the `EXPECTED_FOR_VIRTUAL` set so it isn't false-flagged as missing, or emit it unconditionally with `files_pruned=0`. Feeds PR-2/PR-5/PR-7 measurement.
+- **`scan_plan` span coverage (F7).** The span fires only on the pushdown branch (2/16 smoke queries); tune the `EXPECTED_FOR_VIRTUAL` set so it isn't false-flagged as missing, or emit it unconditionally with `files_pruned=0`. Feeds PR-2/PR-5/PR-7 measurement. **Harness side DONE on this branch:** `EXPECTED_FOR_VIRTUAL` is now `scan_table` only, so `spans_missing` no longer false-flags; unconditional engine-side emission remains open.
 - **`files_pruned` / `rows_decoded` counters** (PR-7 pre-task, PR-2a) — the two counters flagged in `02-hypothesis-map` as H1/H4 confirm-gaps.
-- **`hash_gate` compare-side wiring** — `baseline::check` must skip the hash assertion on `RowsOnly` (described in `03 §5.1`; field is ready, gate not yet wired — WP6/baseline owner).
+- **`hash_gate` compare-side wiring** — ~~`baseline::check` must skip the hash assertion on `RowsOnly` (described in `03 §5.1`; field is ready, gate not yet wired — WP6/baseline owner).~~ **DONE on this branch:** `compare_one` gates `RowsOnly` on row count (dashboard applies the same rule), and `baseline --expected` re-bless tolerates hash drift on `RowsOnly` oracles.
 - **`ns@v2` store-state fingerprint TODO** — the run `TargetFingerprint` (`schema.rs:57-64`) keys on `fluree_home` only; add a native store-state / namespace-v2 fingerprint so a re-indexed or drifted native ledger is detected as incomparable across runs (prevents a stale-baseline false pass).
 
 ---

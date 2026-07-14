@@ -93,7 +93,11 @@ fn binding_subject_s_id(
 }
 
 /// Extract the Cypher-local name from a full IRI (inverse of `@vocab` concat).
-fn cypher_name_from_iri(iri: &str) -> String {
+/// The Cypher-visible name for an IRI: the fragment after the last `#` or
+/// `/`, falling back to the whole IRI. Shared naming rule for labels,
+/// property keys, and relationship types across `labels()`/`keys()`/
+/// `properties()`/`type()` and the result formatters.
+pub fn cypher_name_from_iri(iri: &str) -> String {
     if let Some((_, local)) = iri.rsplit_once('#') {
         if !local.is_empty() {
             return local.to_string();
@@ -376,11 +380,17 @@ fn rdf_type_sid(ctx: &ExecutionContext<'_>) -> Sid {
         .unwrap_or_else(|| Sid::new(3, "type"))
 }
 
-/// Build the `labels(node)` list binding from resolved class SIDs.
+/// Build the `labels(node)` list binding from resolved class SIDs. The
+/// `db:Node` existence marker (asserted for Cypher `CREATE ()` nodes) is a
+/// system class, not a user label, and is hidden.
 fn labels_binding(class_sids: Vec<Sid>, ctx: &ExecutionContext<'_>) -> Result<Binding> {
     let dt = xsd_string_sid(ctx);
+    let node_marker = ctx.active_snapshot.encode_iri(fluree_vocab::fluree::NODE);
     let mut labels = Vec::with_capacity(class_sids.len());
     for class_sid in class_sids {
+        if node_marker.as_ref() == Some(&class_sid) {
+            continue;
+        }
         if let Some(name) = cypher_name_from_sid(&class_sid, ctx)? {
             labels.push(string_binding(name, &dt));
         }

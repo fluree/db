@@ -11,13 +11,20 @@ use fluree_db_api::FlureeBuilder;
 use serde_json::json;
 use support::{genesis_ledger, graphdb_from_ledger};
 
-/// Base namespace = the Cypher default `@vocab`, so bare Cypher labels /
-/// predicates (`Person`, `KNOWS`, `name`) resolve to the minted IRIs.
+/// The import mints IRIs under a base namespace — RDF-flavored data.
+/// Bare Cypher identifiers reach it through the view's `@vocab`
+/// (see [`vocab_db`]): the RDF-compat mode.
 fn opts() -> CsvImportOptions {
     CsvImportOptions {
         base_iri: "http://example.org/".to_string(),
         ..Default::default()
     }
+}
+
+/// View with `@vocab` matching the import base, so bare Cypher labels /
+/// predicates (`Person`, `KNOWS`, `name`) resolve to the minted IRIs.
+fn vocab_db(ledger: &fluree_db_api::LedgerState) -> fluree_db_api::GraphDb {
+    graphdb_from_ledger(ledger).with_default_context(Some(json!({"@vocab": "http://example.org/"})))
 }
 
 // person nodes; knows edges carry a creationDate property → annotation.
@@ -39,7 +46,7 @@ async fn csv_import_round_trips_to_cypher_and_sparql() {
         .await
         .expect("import csv-derived jsonld")
         .ledger;
-    let db = graphdb_from_ledger(&l);
+    let db = vocab_db(&l);
 
     // Cypher, plain (set semantics) — sees the base edges.
     let plain = fluree
@@ -116,7 +123,7 @@ async fn csv_import_plain_policy_yields_pure_rdf_edges() {
     )
     .expect("csv → jsonld");
     let l = fluree.insert(ledger0, &doc).await.expect("import").ledger;
-    let db = graphdb_from_ledger(&l);
+    let db = vocab_db(&l);
 
     // Base edges present.
     let plain = fluree
@@ -163,7 +170,7 @@ async fn cypher_json_emits_native_scalars_not_rdf_value_objects() {
     let persons = "id:ID(Person),name:string,birthday:date,:LABEL\n10,Alice,1990-11-23,Person\n";
     let doc = csv_files_to_jsonld(&[persons], &opts()).expect("csv");
     let l = fluree.insert(ledger0, &doc).await.expect("insert").ledger;
-    let db = graphdb_from_ledger(&l);
+    let db = vocab_db(&l);
 
     let res = fluree
         .query_cypher(
@@ -206,7 +213,7 @@ async fn cypher_json_emits_native_scalars_not_rdf_value_objects() {
         let doc = csv_files_to_jsonld(&[PERSONS, KNOWS], &opts()).expect("csv");
         fluree.insert(ledger0, &doc).await.expect("insert").ledger
     };
-    let db2 = graphdb_from_ledger(&l2);
+    let db2 = vocab_db(&l2);
     let cj2 = fluree
         .query_cypher(
             &db2,
@@ -237,7 +244,7 @@ async fn cypher_json_unaliased_projection_keeps_columns_and_values() {
     let persons = "id:ID(Person),name:string,birthday:date,:LABEL\n10,Alice,1990-11-23,Person\n";
     let doc = csv_files_to_jsonld(&[persons], &opts()).expect("csv");
     let l = fluree.insert(ledger0, &doc).await.expect("insert").ledger;
-    let db = graphdb_from_ledger(&l);
+    let db = vocab_db(&l);
 
     let cj = fluree
         .query_cypher(

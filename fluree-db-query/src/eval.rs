@@ -26,6 +26,7 @@ mod geo;
 mod hash;
 mod helpers;
 mod iter;
+pub(crate) use iter::eval_single_node_predicate;
 mod list;
 mod logical;
 mod metadata;
@@ -39,6 +40,8 @@ mod uuid;
 mod value;
 mod vector;
 pub mod vector_math;
+
+pub use metadata::cypher_name_from_iri;
 
 pub(crate) use helpers::build_regex_with_flags;
 pub use helpers::PreparedBoolExpression;

@@ -200,7 +200,7 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         // Stage
         // TODO: Add trig_meta support to tracked+policy path
         let stage_result = if let Some(sparql) = self.core.pending_sparql {
-            let txn =
+            let txns =
                 parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, self.core.txn_opts)?;
             let tracker = self
                 .core
@@ -209,9 +209,9 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
                 .unwrap_or_else(Tracker::disabled);
             self.graph
                 .fluree
-                .stage_transaction_from_txn(
+                .stage_transaction_from_txns(
                     ledger_state,
-                    txn,
+                    txns,
                     Some(&index_config),
                     self.core.policy.as_ref(),
                     Some(&tracker),

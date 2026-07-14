@@ -1633,7 +1633,18 @@ async fn cypher_classifications(
 #[tokio::test]
 async fn cypher_read_enforces_policy() {
     let (_tmp, state) = policy_test_state().await;
+    let fluree = state.fluree.clone();
     let app = setup_policy_ledger(build_router(state), "cypherpol:main").await;
+    // The seed data is RDF-flavored (`ex:` IRIs); bare Cypher identifiers
+    // reach it through the ledger's `@vocab` — the RDF-compat mode (the
+    // default Cypher resolution is bare namespace-0 names).
+    fluree
+        .set_default_context(
+            "cypherpol:main",
+            &serde_json::json!({"@vocab": "http://example.org/"}),
+        )
+        .await
+        .expect("set @vocab");
 
     let signing_key = SigningKey::from_bytes(&[1u8; 32]);
 
@@ -1669,8 +1680,17 @@ async fn cypher_read_enforces_policy() {
 #[tokio::test]
 async fn cypher_write_under_employee_bearer_denied() {
     let (_tmp, state) = policy_test_state().await;
+    let fluree = state.fluree.clone();
     let app = setup_policy_ledger(build_router(state), "cypherwpol:main").await;
     add_modify_policies(&app, "cypherwpol:main").await;
+    // RDF-compat: bare Cypher names resolve through the ledger `@vocab`.
+    fluree
+        .set_default_context(
+            "cypherwpol:main",
+            &serde_json::json!({"@vocab": "http://example.org/"}),
+        )
+        .await
+        .expect("set @vocab");
 
     let signing_key = SigningKey::from_bytes(&[34u8; 32]);
     let token = identity_token_rw(

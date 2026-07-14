@@ -9,6 +9,108 @@ use crate::ast::{GraphPattern, Iri};
 use crate::lex::TokenKind;
 use crate::span::SourceSpan;
 
+/// Collect the labeled blank nodes appearing in an update operation's
+/// blank-node-MINTING template positions: INSERT DATA quad data and Modify
+/// INSERT templates.
+///
+/// Used by the request-level parser to enforce SPARQL 1.1 Update §19.6's
+/// blank-node label scoping: a label may not be reused across operations of
+/// one request. WHERE-clause and DELETE-side blank nodes are excluded — in
+/// WHERE clauses (including DELETE WHERE, per Fluree's documented
+/// extension) they act as non-distinguished matching variables governed by
+/// the query-side BGP scoping rules, and strict-mode DELETE templates/data
+/// reject blank nodes outright downstream (validator + lowering) — in
+/// neither case is there a minted node the label-scope rule could protect,
+/// and walking them over-rejected `DELETE WHERE { _:b1 … } ; DELETE WHERE
+/// { _:b1 … }`, whose two labels are independently-scoped matches.
+///
+/// Parser-synthesized labels (`#bnpl<N>` from blank-node property lists) are
+/// minted from a counter that is monotonic across the whole request, so they
+/// can never collide across operations; they flow through here harmlessly.
+pub(super) fn collect_template_bnode_labels(
+    op: &UpdateOperation,
+    out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
+) {
+    fn from_triple(
+        tp: &crate::ast::TriplePattern,
+        out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
+    ) {
+        use crate::ast::{BlankNodeValue, SubjectTerm, Term};
+
+        fn from_subject(s: &SubjectTerm, out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>) {
+            match s {
+                SubjectTerm::BlankNode(bn) => {
+                    if let BlankNodeValue::Labeled(label) = &bn.value {
+                        out.push((label.clone(), bn.span));
+                    }
+                }
+                SubjectTerm::QuotedTriple(qt) => {
+                    from_subject(&qt.subject, out);
+                    if let Term::BlankNode(bn) = qt.object.as_ref() {
+                        if let BlankNodeValue::Labeled(label) = &bn.value {
+                            out.push((label.clone(), bn.span));
+                        }
+                    }
+                }
+                SubjectTerm::Var(_) | SubjectTerm::Iri(_) => {}
+            }
+        }
+
+        from_subject(&tp.subject, out);
+        if let Term::BlankNode(bn) = &tp.object {
+            if let BlankNodeValue::Labeled(label) = &bn.value {
+                out.push((label.clone(), bn.span));
+            }
+        }
+        if let Some(annotation) = &tp.annotation {
+            for unit in &annotation.units {
+                if let Some(crate::ast::annotation::ReifierId::BlankNode(bn)) = &unit.reifier {
+                    if let BlankNodeValue::Labeled(label) = &bn.value {
+                        out.push((label.clone(), bn.span));
+                    }
+                }
+                if let Some(block) = &unit.block {
+                    for entry in &block.entries {
+                        if let Term::BlankNode(bn) = &entry.object {
+                            if let BlankNodeValue::Labeled(label) = &bn.value {
+                                out.push((label.clone(), bn.span));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn from_elements(
+        elements: &[QuadPatternElement],
+        out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
+    ) {
+        for el in elements {
+            match el {
+                QuadPatternElement::Triple(tp) => from_triple(tp, out),
+                QuadPatternElement::Graph { triples, .. } => {
+                    for tp in triples {
+                        from_triple(tp, out);
+                    }
+                }
+            }
+        }
+    }
+
+    match op {
+        UpdateOperation::InsertData(insert) => from_elements(&insert.data.quads, out),
+        UpdateOperation::Modify(modify) => {
+            if let Some(insert_clause) = &modify.insert_clause {
+                from_elements(&insert_clause.patterns, out);
+            }
+        }
+        // DELETE-side blank nodes never mint nodes (see the doc comment),
+        // so they carry no cross-operation label identity to protect.
+        UpdateOperation::DeleteData(_) | UpdateOperation::DeleteWhere(_) => {}
+    }
+}
+
 impl super::Parser<'_> {
     /// Parse a SPARQL Update operation.
     ///

@@ -86,6 +86,12 @@ pub struct ServerFileConfig {
     #[serde(default)]
     pub mcp: Option<McpFileConfig>,
 
+    /// `[server.bolt]` — Bolt protocol listener (Neo4j drivers). Only
+    /// consumed when the `bolt` feature is built; deserializes silently
+    /// when the feature is off so configs are portable.
+    #[serde(default)]
+    pub bolt: Option<BoltFileConfig>,
+
     /// `[server.storage_proxy]`
     #[serde(default)]
     pub storage_proxy: Option<StorageProxyFileConfig>,
@@ -106,6 +112,13 @@ pub struct RaftFileConfig {
     pub node_id: Option<u64>,
     pub storage_path: Option<String>,
     pub listen_addr: Option<String>,
+}
+
+/// Bolt protocol listener settings. Mirrors the `--bolt-*` CLI flags.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+pub struct BoltFileConfig {
+    pub listen_addr: Option<String>,
+    pub default_db: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -436,6 +449,8 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "peer_reconnect_initial_ms",
     "peer_reconnect_max_ms",
     "peer_reconnect_multiplier",
+    "bolt_listen_addr",
+    "bolt_default_db",
     "mcp_enabled",
     "mcp_auth_trusted_issuers",
     "mcp_agent_json_max_bytes",
@@ -781,6 +796,27 @@ pub fn apply_to_server_config(
         if is_default("mcp_query_timeout_ms") {
             if let Some(v) = mcp.query_timeout_ms {
                 config.mcp_query_timeout_ms = v;
+            }
+        }
+    }
+
+    // --- Bolt ---
+    if let Some(ref bolt) = file.bolt {
+        if is_default("bolt_listen_addr") {
+            if let Some(ref addr_str) = bolt.listen_addr {
+                if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+                    config.bolt_listen_addr = Some(addr);
+                } else {
+                    warn!(
+                        value = addr_str,
+                        "Invalid bolt listen_addr in config file, ignoring"
+                    );
+                }
+            }
+        }
+        if is_default("bolt_default_db") {
+            if let Some(ref v) = bolt.default_db {
+                config.bolt_default_db = Some(v.clone());
             }
         }
     }

@@ -520,9 +520,12 @@ pub(crate) fn table_schema_from_metadata(
     table: &TableIdentifier,
     metadata: &TableMetadata,
 ) -> Result<TableSchema> {
-    let schema = metadata
-        .current_schema()
-        .ok_or_else(|| crate::ApiError::config("Table metadata has no current schema"))?;
+    let schema = metadata.current_schema().ok_or_else(|| {
+        crate::ApiError::config(format!(
+            "Table {} metadata has no current schema",
+            table.qualified()
+        ))
+    })?;
 
     let current_snapshot = metadata.current_snapshot();
     let snapshot = match current_snapshot {
@@ -631,7 +634,10 @@ pub async fn preview_iceberg_table(
             {
                 Some(snapshot) => {
                     let iceberg_schema = metadata.current_schema().ok_or_else(|| {
-                        crate::ApiError::config("Table metadata has no current schema")
+                        crate::ApiError::config(format!(
+                            "Table {} metadata has no current schema",
+                            table.qualified()
+                        ))
                     })?;
 
                     // Build S3 storage from vended credentials (if the catalog

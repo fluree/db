@@ -167,6 +167,39 @@ When stored rules, cross-ledger rules, and query-time rules are
 present, they are all **merged** and execute together in the
 same fixpoint loop.
 
+## SPARQL rules
+
+Rules can alternatively be written as SPARQL `CONSTRUCT ... WHERE ...`
+queries: the CONSTRUCT template is the rule head (`insert`) and the WHERE
+clause is the rule body. The language of a stored `f:rule` literal is
+selected by its RDF datatype — `@json` means the JSON-LD rule format above;
+the `f:sparql` datatype (`https://ns.flur.ee/db#sparql`) means SPARQL.
+
+**Store a SPARQL rule:**
+```json
+{
+  "@context": {"f": "https://ns.flur.ee/db#"},
+  "insert": {
+    "@id": "http://example.org/grandparentRule",
+    "f:rule": {
+      "@type": "f:sparql",
+      "@value": "PREFIX ex: <http://example.org/> CONSTRUCT { ?person ex:grandparent ?gp } WHERE { ?person ex:parent ?p . ?p ex:parent ?gp }"
+    }
+  }
+}
+```
+
+The same typed-value form works inside a query-time `rules` array entry
+(directly, or as the `f:rule` value of a stored-rule-shaped entry).
+
+SPARQL rules compile into the same restricted rule language as JSON-LD
+rules, so the body supports **basic graph patterns and comparison FILTERs**
+(`=`, `!=`, `<`, `<=`, `>`, `>=`, combined with `&&`, `||`, `!`). Anything
+else — OPTIONAL, UNION, property paths, BIND, subqueries, aggregates — is
+rejected: the rule is skipped with a warning and derives nothing (it never
+partially applies). Include `PREFIX` declarations in the rule text; the
+request `@context` is not applied to rule sources.
+
 ## Examples
 
 ### Sibling inference

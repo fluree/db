@@ -22,10 +22,11 @@ use crate::IdempotencyCacheKey;
 use fluree_db_api::{ContentId, PolicyStats, TrackingTally};
 use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
 use fluree_db_nameservice::{
-    ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue, StatusValue,
+    ConfigPayload, ConfigValue, GraphSourceRecord, GraphSourceType, RefKind, RefValue,
+    StatusPayload, StatusValue,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use thiserror::Error;
 
 /// Postcard-friendly mirror of [`TrackingTally`].
@@ -188,7 +189,7 @@ pub struct LedgerRecord {
     /// Branches registered on this ledger. Populated by
     /// [`Command::CreateLedger`] (on init) and the self-healing branch
     /// add inside [`Command::AdvanceRef`]. Drained by
-    /// [`Command::PurgeLedger`]; an empty `branches` list triggers
+    /// [`Command::PurgeBranch`]; an empty `branches` list triggers
     /// removal of the `LedgerRecord` so the ledger name can be reused.
     pub branches: Vec<String>,
 }
@@ -404,9 +405,11 @@ pub struct ClearMarker {
 }
 
 /// Bounds the replicated cost of the per-branch queues. Held on
-/// [`NameServiceState`] so the apply path consults the same
-/// values on every node (configured at bootstrap time via
-/// `RaftBootstrapConfig`).
+/// [`NameServiceState`] so the apply path consults the same values
+/// on every node. No wiring sets it today — every node uses
+/// [`QueueConfig::default`], which keeps it deterministic across the
+/// cluster; a configuration surface would have to replicate the
+/// values (e.g. via a command) so all nodes agree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueConfig {
     /// Maximum queue depth per `RefKey`. Isolates branches from
@@ -441,7 +444,7 @@ pub struct NameServiceState {
     /// Branches marked retracted (soft-dropped) but not yet purged.
     /// The branch's [`LedgerRecord`] entry and [`RefEntry`] (if born)
     /// stay in place so the name can't be reused until
-    /// [`Command::PurgeLedger`] runs.
+    /// [`Command::PurgeBranch`] runs.
     pub retracted: HashSet<RefKey>,
     /// One cache spanning successful and failed applies — see
     /// [`ApplyOutcome`]. A retry of `K` with matching `request_cid`
@@ -475,13 +478,13 @@ pub struct NameServiceState {
     /// read path falls back to [`StatusValue::initial`] when the
     /// branch is registered but no record lives here.
     #[serde(default)]
-    pub status: HashMap<String, StatusValue>,
+    pub status: HashMap<String, StoredStatus>,
     /// Per-`alias:branch` configuration pushed via
     /// [`fluree_db_nameservice::ConfigPublisher::push_config`]. The
     /// read path falls back to [`ConfigValue::unborn`] when the
     /// branch is registered but no record lives here.
     #[serde(default)]
-    pub config: HashMap<String, ConfigValue>,
+    pub config: HashMap<String, StoredConfig>,
     /// Non-ledger graph source records (BM25, Vector, Geo, R2RML,
     /// Iceberg) keyed by `name:branch`. Mutated through the three
     /// [`fluree_db_nameservice::GraphSourcePublisher`] commands:
@@ -544,7 +547,7 @@ pub enum Command {
     /// implicit branch creation through [`Command::ApplyHead`]),
     /// decrementing the parent's child counter when applicable.
     /// Refuses to remove a branch whose own `branches` count is
-    /// non-zero. Unlike [`Command::PurgeLedger`], not idempotent on
+    /// non-zero. Unlike [`Command::PurgeBranch`], not idempotent on
     /// missing branches — returns `LedgerNotFound`.
     DropBranch {
         ledger_id: String,
@@ -580,8 +583,11 @@ pub enum Command {
     /// Hard-drop a branch: remove its [`RefEntry`], retraction mark,
     /// and entry from the parent [`LedgerRecord::branches`]. Removes
     /// the `LedgerRecord` itself when its branches list empties.
-    /// Idempotent.
-    PurgeLedger {
+    /// Idempotent. Refuses with [`Response::BranchHasChildren`] if
+    /// the branch still has children, like [`Self::DropBranch`] — a
+    /// whole-ledger drop composes these leaf-first, so the guard
+    /// never blocks it (the parent's child count is already 0).
+    PurgeBranch {
         ledger_id: String,
         branch: String,
         /// See [`Command::DropBranch::applied_at_millis`].
@@ -598,36 +604,29 @@ pub enum Command {
     /// and enforces per-kind monotonicity on the update
     /// (`new.t > current.t` for [`RefKind::CommitHead`],
     /// `new.t >= current.t` for [`RefKind::IndexHead`]).
-    CompareAndSetRef {
-        ledger_id: String,
-        branch: String,
-        kind: RefKind,
-        expected: Option<RefValue>,
-        new: RefValue,
-        /// See [`Command::DropBranch::applied_at_millis`].
-        applied_at_millis: u64,
-    },
+    CompareAndSetRef(RefCas),
     /// CAS push for one branch's operational status. Mirrors the
     /// [`fluree_db_nameservice::StatusPublisher::push_status`]
     /// contract: returns [`Response::StatusConflict`] when `expected`
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
-    /// [`StatusValue::initial`] when no record is present for a
-    /// registered branch.
+    /// [`StoredStatus::initial`] when no record is present for a
+    /// registered branch. Values travel in the postcard-safe
+    /// [`StoredStatus`] form; proposers convert (see
+    /// `RaftNameService::push_status`).
     PushStatus {
         ledger_id: String,
-        expected: Option<StatusValue>,
-        new: StatusValue,
+        expected: Option<StoredStatus>,
+        new: StoredStatus,
     },
     /// CAS push for one branch's configuration. Mirrors the
     /// [`fluree_db_nameservice::ConfigPublisher::push_config`]
     /// contract: returns [`Response::ConfigConflict`] when `expected`
     /// doesn't match the current value, and enforces
     /// `new.v > current.v`. The current value is
-    /// [`ConfigValue::unborn`] when no record is present for a
-    /// registered branch. The args are boxed because
-    /// [`ConfigValue`]'s `ConfigPayload` carries an `extra` map
-    /// whose size dominates the enum otherwise.
+    /// [`StoredConfig::unborn`] when no record is present for a
+    /// registered branch. The args are boxed because the payload
+    /// text can dominate the enum's size otherwise.
     PushConfig(Box<ConfigUpdate>),
     /// Upsert a graph source's config-side fields (source type,
     /// config blob, dependencies). On an existing record the index
@@ -695,12 +694,215 @@ pub enum Command {
     SetWorkerEligibility(WorkerEligibility),
 }
 
+/// Postcard-safe JSON value tree with deterministic encoding:
+/// objects are `BTreeMap`s, so equal values have equal structure —
+/// and equal postcard bytes — at every depth, with no text
+/// canonicalization anywhere. Mirrors the JSON data model because
+/// `serde_json::Value` itself can't ride the raft log:
+/// `Value`'s `Deserialize` requires a self-describing format, which
+/// postcard is not.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CanonicalValue {
+    Null,
+    Bool(bool),
+    /// JSON integers keep their `i64`/`u64` split so the full
+    /// `u64` range round-trips exactly.
+    Int(i64),
+    UInt(u64),
+    /// Finite by construction: JSON cannot represent NaN or ∞
+    /// (`serde_json` maps them to null), so trees built by
+    /// [`Self::from_json`] never contain them and structural
+    /// equality has no NaN hole.
+    Float(f64),
+    String(String),
+    Array(Vec<CanonicalValue>),
+    Object(BTreeMap<String, CanonicalValue>),
+}
+
+impl From<&serde_json::Value> for CanonicalValue {
+    fn from(value: &serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::Null => Self::Null,
+            serde_json::Value::Bool(b) => Self::Bool(*b),
+            serde_json::Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    Self::Int(i)
+                } else if let Some(u) = n.as_u64() {
+                    Self::UInt(u)
+                } else {
+                    // `as_f64` is Some for every remaining Number.
+                    Self::Float(n.as_f64().unwrap_or_default())
+                }
+            }
+            serde_json::Value::String(s) => Self::String(s.clone()),
+            serde_json::Value::Array(items) => Self::Array(items.iter().map(Self::from).collect()),
+            serde_json::Value::Object(map) => Self::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from(v)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<&CanonicalValue> for serde_json::Value {
+    fn from(value: &CanonicalValue) -> Self {
+        match value {
+            CanonicalValue::Null => Self::Null,
+            CanonicalValue::Bool(b) => Self::Bool(*b),
+            CanonicalValue::Int(i) => Self::from(*i),
+            CanonicalValue::UInt(u) => Self::from(*u),
+            CanonicalValue::Float(f) => Self::from(*f),
+            CanonicalValue::String(s) => Self::String(s.clone()),
+            CanonicalValue::Array(items) => Self::Array(items.iter().map(Self::from).collect()),
+            CanonicalValue::Object(map) => Self::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::from(v)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// Convert an HTTP-shaped extras map into the stored tree form.
+fn extra_from_json(extra: &HashMap<String, serde_json::Value>) -> BTreeMap<String, CanonicalValue> {
+    extra
+        .iter()
+        .map(|(k, v)| (k.clone(), CanonicalValue::from(v)))
+        .collect()
+}
+
+/// Convert a stored extras tree back to the HTTP-shaped map.
+fn extra_to_json(extra: &BTreeMap<String, CanonicalValue>) -> HashMap<String, serde_json::Value> {
+    extra
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::from(v)))
+        .collect()
+}
+
+/// Postcard-safe form of [`StatusValue`] carried in
+/// [`Command::PushStatus`] and held in [`NameServiceState::status`].
+///
+/// `StatusPayload` is HTTP-shaped — `#[serde(flatten)]` over an
+/// arbitrary metadata map — which postcard's known-length format
+/// cannot encode, so neither the raft log nor state snapshots can
+/// carry it directly. The typed fields are mirrored here (the
+/// exhaustive destructuring in [`Self::from_value`] turns any
+/// HTTP-schema field change into a compile error at the conversion)
+/// and the open metadata map becomes a [`CanonicalValue`] tree, so
+/// the CAS comparison in `apply_versioned_push` is structural — no
+/// serialization in the equality path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredStatus {
+    pub v: i64,
+    pub state: String,
+    pub extra: BTreeMap<String, CanonicalValue>,
+}
+
+impl From<&StatusValue> for StoredStatus {
+    fn from(value: &StatusValue) -> Self {
+        // Exhaustive destructuring: a field added to the HTTP types
+        // fails compilation here until it's mapped into the stored
+        // form (or explicitly dropped).
+        let StatusValue { v, payload } = value;
+        let StatusPayload { state, extra } = payload;
+        Self {
+            v: *v,
+            state: state.clone(),
+            extra: extra_from_json(extra),
+        }
+    }
+}
+
+impl From<&StoredStatus> for StatusValue {
+    fn from(stored: &StoredStatus) -> Self {
+        Self::new(
+            stored.v,
+            StatusPayload {
+                state: stored.state.clone(),
+                extra: extra_to_json(&stored.extra),
+            },
+        )
+    }
+}
+
+impl StoredStatus {
+    /// Stored form of [`StatusValue::initial`] — the fallback the
+    /// apply path compares an initial CAS push against.
+    pub fn initial() -> Self {
+        Self::from(&StatusValue::initial())
+    }
+}
+
+/// Postcard-safe form of [`ConfigValue`] — same rationale and
+/// structure as [`StoredStatus`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredConfig {
+    pub v: i64,
+    pub payload: Option<StoredConfigPayload>,
+}
+
+/// Mirror of [`ConfigPayload`]'s typed fields plus the stored form
+/// of its open metadata map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredConfigPayload {
+    pub default_context: Option<ContentId>,
+    pub config_id: Option<ContentId>,
+    pub extra: BTreeMap<String, CanonicalValue>,
+}
+
+impl From<&ConfigValue> for StoredConfig {
+    fn from(value: &ConfigValue) -> Self {
+        // Exhaustive destructuring — see `From<&StatusValue>`.
+        let ConfigValue { v, payload } = value;
+        Self {
+            v: *v,
+            payload: payload.as_ref().map(|p| {
+                let ConfigPayload {
+                    default_context,
+                    config_id,
+                    extra,
+                } = p;
+                StoredConfigPayload {
+                    default_context: default_context.clone(),
+                    config_id: config_id.clone(),
+                    extra: extra_from_json(extra),
+                }
+            }),
+        }
+    }
+}
+
+impl From<&StoredConfig> for ConfigValue {
+    fn from(stored: &StoredConfig) -> Self {
+        Self::new(
+            stored.v,
+            stored.payload.as_ref().map(|p| ConfigPayload {
+                default_context: p.default_context.clone(),
+                config_id: p.config_id.clone(),
+                extra: extra_to_json(&p.extra),
+            }),
+        )
+    }
+}
+
+impl StoredConfig {
+    /// Stored form of [`ConfigValue::unborn`] — the fallback the
+    /// apply path compares an initial CAS push against.
+    pub fn unborn() -> Self {
+        Self {
+            v: 0,
+            payload: None,
+        }
+    }
+}
+
 /// Payload for [`Command::PushConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdate {
     pub ledger_id: String,
-    pub expected: Option<ConfigValue>,
-    pub new: ConfigValue,
+    pub expected: Option<StoredConfig>,
+    pub new: StoredConfig,
 }
 
 /// Payload for [`Command::EnqueueCommand`].
@@ -794,6 +996,18 @@ pub struct NewIndexHead {
     pub applied_at_millis: u64,
 }
 
+/// Payload for [`Command::CompareAndSetRef`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefCas {
+    pub ledger_id: String,
+    pub branch: String,
+    pub kind: RefKind,
+    pub expected: Option<RefValue>,
+    pub new: RefValue,
+    /// Leader's wall-clock at proposal, milliseconds since epoch.
+    pub applied_at_millis: u64,
+}
+
 /// Payload for [`Command::CreateLedger`].
 ///
 /// `ledger_id` is the bare ledger name (no branch suffix); `branch`
@@ -881,12 +1095,12 @@ pub enum Response {
     /// `new.v` failed the monotonic guard. `actual` carries the
     /// current value when the branch is known; `None` when the
     /// ledger or branch isn't registered.
-    StatusConflict { actual: Option<StatusValue> },
+    StatusConflict { actual: Option<StoredStatus> },
     /// [`Command::PushConfig`] succeeded.
     ConfigUpdated,
     /// [`Command::PushConfig`] refused — see [`Self::StatusConflict`]
     /// for the analogous semantics.
-    ConfigConflict { actual: Option<ConfigValue> },
+    ConfigConflict { actual: Option<StoredConfig> },
     /// [`Command::PublishGraphSource`] upserted the record.
     GraphSourcePublished,
     /// [`Command::PublishGraphSourceIndex`] advanced the index
@@ -956,17 +1170,17 @@ pub enum Response {
     /// targeted a branch flagged retracted by `RetractLedger`. Writes
     /// are rejected so the visible `retracted: true` status on
     /// `lookup` can't be silently undone — a branch only becomes
-    /// writable again via `PurgeLedger` + a fresh `CreateLedger` /
+    /// writable again via `PurgeBranch` + a fresh `CreateLedger` /
     /// `CreateBranch`.
     LedgerRetracted { ledger_id: String },
-    /// [`Command::PurgeLedger`] removed a registered branch (any
+    /// [`Command::PurgeBranch`] removed a registered branch (any
     /// retraction state). See [`Self::BranchDropped`] for
     /// `released_envelopes` semantics.
     Purged {
         ledger_id: String,
         released_envelopes: Vec<(String, ContentId)>,
     },
-    /// [`Command::PurgeLedger`] was a no-op — the branch wasn't
+    /// [`Command::PurgeBranch`] was a no-op — the branch wasn't
     /// registered. Idempotent at the trait layer; carried as a
     /// distinct variant so event emission can skip it.
     AlreadyPurged { ledger_id: String },
@@ -1002,10 +1216,17 @@ pub enum Response {
     },
     /// [`Command::ApplyHead`] popped the queue front and advanced
     /// the branch head.
+    ///
+    /// `released_envelope` carries the popped entry's `request_cid`
+    /// when the entry had no idempotency key — nothing else records
+    /// it, so the wrapper releases the envelope blob now. A keyed
+    /// entry's envelope is instead held by its idempotency
+    /// [`ApplyRecord`] and released at eviction, so this is `None`.
     HeadApplied {
         ledger_id: String,
         commit_id: ContentId,
         commit_t: i64,
+        released_envelope: Option<ContentId>,
     },
     /// [`Command::ApplyHead`] or [`Command::PoisonQueueEntry`]
     /// found the queue front didn't match `queue_id`. State
@@ -1017,10 +1238,16 @@ pub enum Response {
     },
     /// [`Command::PoisonQueueEntry`] popped the front and
     /// recorded the failure.
+    ///
+    /// `released_envelope` follows the same rule as
+    /// [`Self::HeadApplied`]: `Some(request_cid)` for a keyless
+    /// entry (released now), `None` for a keyed entry (held by its
+    /// [`PoisonRecord`] until eviction).
     Poisoned {
         ledger_id: String,
         queue_id: u64,
         reason: PoisonReason,
+        released_envelope: Option<ContentId>,
     },
     /// [`Command::EvictIdempotency`] removed `removed` entries.
     /// `released_envelopes` carries `(ledger_id, request_cid)` pairs
@@ -1079,8 +1306,9 @@ pub enum EligibilityRefusal {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesyncReason {
     /// Some other proposal popped the entry the worker was
-    /// trying to apply. `actual_queue_id` is whatever's at the
-    /// front now (which may be the next entry, or 0 if empty).
+    /// trying to apply. `actual_queue_id` is the entry now at the
+    /// front — always a real queued id, since an empty queue
+    /// surfaces as [`Self::InvariantViolated`], not this variant.
     WrongFront { actual_queue_id: u64 },
     /// Per-branch queue was drained by a head-mutating admin
     /// command between the worker's stage and apply.
@@ -1152,35 +1380,26 @@ pub fn apply(state: &mut NameServiceState, command: Command, log_index: u64) -> 
             branch,
             applied_at_millis,
         } => retract_ledger(state, ledger_id, branch, applied_at_millis),
-        Command::PurgeLedger {
+        Command::PurgeBranch {
             ledger_id,
             branch,
             applied_at_millis,
-        } => purge_ledger(state, ledger_id, branch, applied_at_millis),
+        } => purge_branch(state, ledger_id, branch, applied_at_millis),
         Command::ReleaseContent { id: _ } => Response::NoOp,
-        Command::CompareAndSetRef {
-            ledger_id,
-            branch,
-            kind,
-            expected,
-            new,
-            applied_at_millis,
-        } => apply_compare_and_set_ref(
-            state,
-            log_index,
-            ledger_id,
-            branch,
-            kind,
-            expected,
-            new,
-            applied_at_millis,
-        ),
+        Command::CompareAndSetRef(args) => apply_compare_and_set_ref(state, log_index, args),
         Command::PushStatus {
             ledger_id,
             expected,
             new,
-        } => apply_push_status(state, ledger_id, expected, new),
-        Command::PushConfig(args) => apply_push_config(state, *args),
+        } => apply_versioned_push(&state.ledgers, &mut state.status, ledger_id, expected, new),
+        Command::PushConfig(args) => {
+            let ConfigUpdate {
+                ledger_id,
+                expected,
+                new,
+            } = *args;
+            apply_versioned_push(&state.ledgers, &mut state.config, ledger_id, expected, new)
+        }
         Command::PublishGraphSource {
             name,
             branch,
@@ -1312,7 +1531,7 @@ fn retract_ledger(
     }
 }
 
-fn purge_ledger(
+fn purge_branch(
     state: &mut NameServiceState,
     ledger_id: String,
     branch: String,
@@ -1320,6 +1539,25 @@ fn purge_ledger(
 ) -> Response {
     let key = RefKey::new(&ledger_id, &branch);
     let full = format_ledger_id(&ledger_id, &branch);
+
+    // Refuse a branch that still has children — the same lineage
+    // guard `drop_branch` enforces. `purge_branch` already
+    // maintains the parent side of the child-count invariant
+    // (`decrement_child_count` below); this closes the other side so
+    // a purge can't strand a child with a dangling `source_branch`.
+    // A whole-ledger drop composes purges leaf-first, so by the time
+    // a parent is purged its children are gone and its count is 0 —
+    // the guard never blocks that path; it only catches an
+    // out-of-order direct purge.
+    if let Some(entry) = state.refs.get(&key) {
+        if entry.branches > 0 {
+            return Response::BranchHasChildren {
+                ledger_id: full,
+                children: entry.branches,
+            };
+        }
+    }
+
     let removed_entry = state.refs.remove(&key);
     let removed_ref = removed_entry.is_some();
     let removed_source = removed_entry.and_then(|r| r.source_branch);
@@ -1609,6 +1847,17 @@ fn set_index_head(
     }
 
     let ref_key = RefKey::new(&ledger_id, &branch);
+
+    // Index publishes are writes — same tombstone semantics as the
+    // commit-head paths (`EnqueueCommand`, `ApplyHead`, `ResetHead`,
+    // `CompareAndSetRef`): a retracted branch's refs are frozen
+    // until purge + re-create.
+    if state.retracted.contains(&ref_key) {
+        return Response::LedgerRetracted {
+            ledger_id: format_ledger_id(&ledger_id, &branch),
+        };
+    }
+
     let Some(entry) = state.refs.get_mut(&ref_key) else {
         // No ref means no commits on this branch yet — nothing to
         // index. Reuse `LedgerNotFound` since `advance_ref`
@@ -1678,17 +1927,19 @@ fn current_ref_value(state: &NameServiceState, key: &RefKey, kind: RefKind) -> O
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_compare_and_set_ref(
     state: &mut NameServiceState,
     log_index: u64,
-    ledger_id: String,
-    branch: String,
-    kind: RefKind,
-    expected: Option<RefValue>,
-    new: RefValue,
-    applied_at_millis: u64,
+    args: RefCas,
 ) -> Response {
+    let RefCas {
+        ledger_id,
+        branch,
+        kind,
+        expected,
+        new,
+        applied_at_millis,
+    } = args;
     let key = RefKey::new(&ledger_id, &branch);
     let full_ledger_id = format_ledger_id(&ledger_id, &branch);
 
@@ -1697,6 +1948,18 @@ fn apply_compare_and_set_ref(
             ledger_id: full_ledger_id,
         };
     };
+
+    // A CAS is a write — same semantics as `EnqueueCommand`,
+    // `ApplyHead`, and `ResetHead`. The retracted flag is a
+    // tombstone (the branch stays registered, so the lookup above
+    // succeeds); refuse the write until the branch is purged +
+    // re-created, or a matching `expected` would advance a
+    // tombstoned head and silently un-retract it in effect.
+    if state.retracted.contains(&key) {
+        return Response::LedgerRetracted {
+            ledger_id: full_ledger_id,
+        };
+    }
 
     // `expected = None` matches when the current ref has no `id`
     // (no `RefEntry`, or an `IndexHead` with no `index` field).
@@ -1777,84 +2040,92 @@ fn apply_compare_and_set_ref(
     Response::RefCasUpdated
 }
 
-fn apply_push_status(
-    state: &mut NameServiceState,
-    ledger_id: String,
-    expected: Option<StatusValue>,
-    new: StatusValue,
-) -> Response {
-    let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
-        return Response::StatusConflict { actual: None };
-    };
-    let branch_registered = state
-        .ledgers
-        .get(&name)
-        .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
-    if !branch_registered {
-        return Response::StatusConflict { actual: None };
-    }
-
-    // Absent record reads as `StatusValue::initial`; the apply uses
-    // the same fallback so an initial CAS push from
-    // `expected = initial` lands on a fresh branch.
-    let current = state
-        .status
-        .get(&ledger_id)
-        .cloned()
-        .unwrap_or_else(StatusValue::initial);
-
-    if expected.as_ref() != Some(&current) {
-        return Response::StatusConflict {
-            actual: Some(current),
-        };
-    }
-    if new.v <= current.v {
-        return Response::StatusConflict {
-            actual: Some(current),
-        };
-    }
-    state.status.insert(ledger_id, new);
-    Response::StatusUpdated
+/// A branch-scoped, CAS-updated value with a strictly-advancing
+/// version — the stored form of the nameservice's status and
+/// config values. Implementations supply the per-value pieces;
+/// [`apply_versioned_push`] owns the shared contract.
+trait VersionedValue: Clone + PartialEq {
+    /// The value an absent record reads as, so an initial CAS push
+    /// against a fresh branch lands.
+    fn absent() -> Self;
+    /// Monotonic version watermark; every push must strictly
+    /// advance it.
+    fn v(&self) -> i64;
+    fn conflict(actual: Option<Self>) -> Response;
+    fn updated() -> Response;
 }
 
-fn apply_push_config(state: &mut NameServiceState, args: ConfigUpdate) -> Response {
-    let ConfigUpdate {
-        ledger_id,
-        expected,
-        new,
-    } = args;
+impl VersionedValue for StoredStatus {
+    fn absent() -> Self {
+        Self::initial()
+    }
+    fn v(&self) -> i64 {
+        self.v
+    }
+    fn conflict(actual: Option<Self>) -> Response {
+        Response::StatusConflict { actual }
+    }
+    fn updated() -> Response {
+        Response::StatusUpdated
+    }
+}
+
+impl VersionedValue for StoredConfig {
+    fn absent() -> Self {
+        Self::unborn()
+    }
+    fn v(&self) -> i64 {
+        self.v
+    }
+    fn conflict(actual: Option<Self>) -> Response {
+        Response::ConfigConflict { actual }
+    }
+    fn updated() -> Response {
+        Response::ConfigUpdated
+    }
+}
+
+/// Shared apply body for [`Command::PushStatus`] and
+/// [`Command::PushConfig`]: validate the id and its branch
+/// registration, CAS against the current record (an absent record
+/// reads as [`VersionedValue::absent`], so an initial push lands
+/// on a fresh branch), and require the pushed version to strictly
+/// advance.
+///
+/// `values` is keyed by the command's `ledger_id` verbatim —
+/// proposers canonicalize it to `name:branch` (see
+/// `RaftNameService::push_status`); canonicalizing here instead
+/// would make mixed-version nodes replay the same log entry to
+/// different keys. The CAS equality is structural
+/// ([`CanonicalValue`] trees with sorted maps), so logically equal
+/// payloads compare equal regardless of construction order.
+fn apply_versioned_push<T: VersionedValue>(
+    ledgers: &HashMap<String, LedgerRecord>,
+    values: &mut HashMap<String, T>,
+    ledger_id: String,
+    expected: Option<T>,
+    new: T,
+) -> Response {
     let Ok((name, branch)) = split_ledger_id(&ledger_id) else {
-        return Response::ConfigConflict { actual: None };
+        return T::conflict(None);
     };
-    let branch_registered = state
-        .ledgers
+    let branch_registered = ledgers
         .get(&name)
         .is_some_and(|l| l.branches.iter().any(|b| b == &branch));
     if !branch_registered {
-        return Response::ConfigConflict { actual: None };
+        return T::conflict(None);
     }
 
-    // Absent record reads as `ConfigValue::unborn`; the apply uses
-    // the same fallback so an initial CAS push from
-    // `expected = unborn` lands on a fresh branch.
-    let current = state
-        .config
-        .get(&ledger_id)
-        .cloned()
-        .unwrap_or_else(ConfigValue::unborn);
+    let current = values.get(&ledger_id).cloned().unwrap_or_else(T::absent);
 
     if expected.as_ref() != Some(&current) {
-        return Response::ConfigConflict {
-            actual: Some(current),
-        };
+        return T::conflict(Some(current));
     }
-    if new.v <= current.v {
-        return Response::ConfigConflict {
-            actual: Some(current),
-        };
+    if new.v() <= current.v() {
+        return T::conflict(Some(current));
     }
-    state.config.insert(ledger_id, new);
-    Response::ConfigUpdated
+    values.insert(ledger_id, new);
+    T::updated()
 }
 
 fn apply_publish_graph_source(
@@ -2028,7 +2299,15 @@ fn apply_enqueue_command(
         };
     }
 
-    // 4. Append.
+    // 4. Append. Clear any admin-clear marker first: it exists only
+    //    to give a stale in-flight propose a meaningful
+    //    `QueueCleared` reason while the queue is empty. Once a fresh
+    //    entry is queued, a stale propose disambiguates as
+    //    `WrongFront` against this entry's `queue_id` instead — and
+    //    leaving the one-shot marker in place would make
+    //    `pop_validated_front` spuriously abort the first apply of
+    //    this very entry with `QueueCleared`.
+    state.recently_cleared.remove(&ref_key);
     let queue_id = state.next_queue_id;
     state.next_queue_id = state.next_queue_id.wrapping_add(1);
     let entry = QueueEntry {
@@ -2099,6 +2378,23 @@ fn pop_validated_front(
     Ok(queue.pop_front().expect("non-empty checked above"))
 }
 
+/// Remove a branch's queue from `state.queues` if it has drained
+/// empty. The normal pop path (unlike `clear_queue_for_admin`)
+/// leaves the `VecDeque` behind otherwise, so without this every
+/// branch that ever transacted retains an empty queue forever. A
+/// missing queue and an empty one are already equivalent to
+/// `pop_validated_front` (both surface `InvariantViolated`), so this
+/// is behaviour-preserving.
+fn drop_queue_if_empty(state: &mut NameServiceState, ref_key: &RefKey) {
+    if state
+        .queues
+        .get(ref_key)
+        .is_some_and(std::collections::VecDeque::is_empty)
+    {
+        state.queues.remove(ref_key);
+    }
+}
+
 fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) -> Response {
     let StagedHead {
         ledger_id,
@@ -2139,9 +2435,10 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
     // `t` and replace the head's content lineage with a non-
     // descendant. Push the popped entry back at the front so the
     // worker retries once its local view catches up.
-    if let Some(existing) = state.refs.get(&ref_key) {
-        if commit_t <= existing.t {
-            let current_t = existing.t;
+    // The read borrows only `.t` (a `Copy`), so it ends before the
+    // `state.queues` push-back below.
+    if let Some(current_t) = state.refs.get(&ref_key).map(|r| r.t) {
+        if commit_t <= current_t {
             state
                 .queues
                 .get_mut(&ref_key)
@@ -2158,26 +2455,41 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
         }
     }
 
-    // Advance the branch's `RefEntry`, carrying forward index +
-    // lineage state from any existing entry (matches the
-    // self-healing pattern in `advance_ref`).
-    let (prior_index, prior_source, prior_branches) = state
-        .refs
-        .get(&ref_key)
-        .map(|r| (r.index.clone(), r.source_branch.clone(), r.branches))
-        .unwrap_or_default();
-    state.refs.insert(
-        ref_key.clone(),
-        RefEntry {
-            head: commit_id.clone(),
-            t: commit_t,
-            last_advanced_at_millis: applied_at_millis,
-            last_advanced_index: log_index,
-            index: prior_index,
-            source_branch: prior_source,
-            branches: prior_branches,
-        },
-    );
+    // The entry is consumed for good now (the monotonic guard above
+    // is the only path that pushes it back). Drop the queue if it
+    // drained empty so `state.queues` holds one entry per *live*
+    // branch, not one per branch that ever transacted — which also
+    // keeps the global-depth `sum()` in `apply_enqueue_command`
+    // proportional to live branches. `apply_enqueue_command`
+    // re-creates the queue on the next submission.
+    drop_queue_if_empty(state, &ref_key);
+
+    // Advance the branch's `RefEntry`. Mutate the existing entry in
+    // place so its index pointer + lineage (source/child count) stay
+    // put without cloning them out and rebuilding; only a fresh
+    // branch (no entry yet) takes the insert path.
+    match state.refs.get_mut(&ref_key) {
+        Some(existing) => {
+            existing.head = commit_id.clone();
+            existing.t = commit_t;
+            existing.last_advanced_at_millis = applied_at_millis;
+            existing.last_advanced_index = log_index;
+        }
+        None => {
+            state.refs.insert(
+                ref_key.clone(),
+                RefEntry {
+                    head: commit_id.clone(),
+                    t: commit_t,
+                    last_advanced_at_millis: applied_at_millis,
+                    last_advanced_index: log_index,
+                    index: None,
+                    source_branch: None,
+                    branches: 0,
+                },
+            );
+        }
+    }
 
     // Self-healing branch registration on the `LedgerRecord`,
     // matching `advance_ref`'s behaviour so the queue path doesn't
@@ -2188,27 +2500,36 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
         }
     }
 
-    if let Some(key) = entry.idempotency {
-        state.idempotency.insert(
-            key,
-            ApplyOutcome::Applied(ApplyRecord {
-                request_cid: entry.request_cid,
-                body_cid: entry.body_cid,
-                body_kind: entry.body_kind,
-                recorded_at_millis: applied_at_millis,
-                head: commit_id.clone(),
-                t: commit_t,
-                recorded_index: log_index,
-                tally,
-                flake_count,
-            }),
-        );
-    }
+    // Keyed entry: the idempotency record retains `request_cid` and
+    // its eviction releases the envelope later. Keyless entry:
+    // nothing will ever record it, so hand it to the wrapper for
+    // release now — otherwise the envelope blob leaks in CAS.
+    let released_envelope = match entry.idempotency {
+        Some(key) => {
+            state.idempotency.insert(
+                key,
+                ApplyOutcome::Applied(ApplyRecord {
+                    request_cid: entry.request_cid,
+                    body_cid: entry.body_cid,
+                    body_kind: entry.body_kind,
+                    recorded_at_millis: applied_at_millis,
+                    head: commit_id.clone(),
+                    t: commit_t,
+                    recorded_index: log_index,
+                    tally,
+                    flake_count,
+                }),
+            );
+            None
+        }
+        None => Some(entry.request_cid),
+    };
 
     Response::HeadApplied {
         ledger_id: full_ledger_id,
         commit_id,
         commit_t,
+        released_envelope,
     }
 }
 
@@ -2231,24 +2552,35 @@ fn apply_poison_queue_entry(
         Ok(entry) => entry,
         Err(resp) => return *resp,
     };
+    // Poison always consumes the front — drop the queue if it
+    // drained empty (see `drop_queue_if_empty`).
+    drop_queue_if_empty(state, &ref_key);
 
-    if let Some(key) = entry.idempotency {
-        state.idempotency.insert(
-            key,
-            ApplyOutcome::Failed(PoisonRecord {
-                request_cid: entry.request_cid,
-                body_cid: entry.body_cid,
-                reason: reason.clone(),
-                recorded_index: log_index,
-                recorded_at_millis: applied_at_millis,
-            }),
-        );
-    }
+    // Keyless entries release their envelope now; keyed entries
+    // hold it in the `PoisonRecord` until eviction. See
+    // `apply_head`.
+    let released_envelope = match entry.idempotency {
+        Some(key) => {
+            state.idempotency.insert(
+                key,
+                ApplyOutcome::Failed(PoisonRecord {
+                    request_cid: entry.request_cid,
+                    body_cid: entry.body_cid,
+                    reason: reason.clone(),
+                    recorded_index: log_index,
+                    recorded_at_millis: applied_at_millis,
+                }),
+            );
+            None
+        }
+        None => Some(entry.request_cid),
+    };
 
     Response::Poisoned {
         ledger_id: full_ledger_id,
         queue_id,
         reason,
+        released_envelope,
     }
 }
 
@@ -2542,6 +2874,128 @@ mod tests {
     }
 
     #[test]
+    fn compare_and_set_ref_rejects_retracted_branch_with_ledger_retracted() {
+        // The retracted flag is a tombstone and CAS is a write:
+        // even a CAS whose `expected` matches the frozen head must
+        // be refused, or a publisher holding the pre-retraction
+        // head could advance a tombstoned branch and silently
+        // un-retract it in effect.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 5);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::CompareAndSetRef(RefCas {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                kind: RefKind::CommitHead,
+                expected: Some(RefValue {
+                    id: Some(cid(1)),
+                    t: 5,
+                }),
+                new: RefValue {
+                    id: Some(cid(2)),
+                    t: 6,
+                },
+                applied_at_millis: 0,
+            }),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+
+        // The frozen head is untouched.
+        let entry = state
+            .refs
+            .get(&RefKey::new("test/db", "main"))
+            .expect("retract keeps the ref entry");
+        assert_eq!(entry.head, cid(1));
+        assert_eq!(entry.t, 5);
+    }
+
+    #[test]
+    fn advance_index_head_rejects_retracted_branch_with_ledger_retracted() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 5);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::AdvanceIndexHead(NewIndexHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(9),
+                t: 5,
+                applied_at_millis: 0,
+            }),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
+    fn rewrite_index_head_rejects_retracted_branch_with_ledger_retracted() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        seed_head(&mut state, "test/db", "main", cid(1), 5);
+        apply(
+            &mut state,
+            Command::RetractLedger {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                applied_at_millis: 0,
+            },
+            2,
+        );
+
+        let resp = apply(
+            &mut state,
+            Command::RewriteIndexHead(NewIndexHead {
+                ledger_id: "test/db".into(),
+                branch: "main".into(),
+                new_index_head: cid(9),
+                t: 5,
+                applied_at_millis: 0,
+            }),
+            3,
+        );
+        assert_eq!(
+            resp,
+            Response::LedgerRetracted {
+                ledger_id: "test/db:main".into()
+            }
+        );
+    }
+
+    #[test]
     fn reset_head_rejects_retracted_branch_with_ledger_retracted() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
@@ -2647,7 +3101,7 @@ mod tests {
 
         let resp = apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -2675,7 +3129,7 @@ mod tests {
         apply(&mut state, create_branch_cmd("test/db", "feature"), 2);
         apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
                 applied_at_millis: 0,
@@ -2691,7 +3145,7 @@ mod tests {
         let mut state = NameServiceState::new();
         let resp = apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "missing".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -2712,7 +3166,7 @@ mod tests {
         apply(&mut state, create_ledger("test/db"), 1);
         apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "main".into(),
                 applied_at_millis: 0,
@@ -2973,7 +3427,7 @@ mod tests {
         );
         apply(
             &mut state,
-            Command::PurgeLedger {
+            Command::PurgeBranch {
                 ledger_id: "test/db".into(),
                 branch: "feature".into(),
                 applied_at_millis: 0,
@@ -3584,10 +4038,14 @@ mod tests {
                 ledger_id,
                 commit_id,
                 commit_t,
+                released_envelope,
             } => {
                 assert_eq!(ledger_id, "test/db:main");
                 assert_eq!(commit_id, cid(42));
                 assert_eq!(commit_t, 10);
+                // Keyed entry: the envelope is retained by the
+                // idempotency record, released at eviction — not now.
+                assert_eq!(released_envelope, None);
             }
             other => panic!("expected HeadApplied, got {other:?}"),
         }
@@ -3617,6 +4075,38 @@ mod tests {
         };
         assert_eq!(record.request_cid, cid(7));
         assert_eq!(record.head, cid(42));
+    }
+
+    #[test]
+    fn apply_head_drops_queue_when_drained_empty() {
+        // Draining the last entry removes the queue from the map
+        // (not just leaves an empty VecDeque), so `state.queues`
+        // tracks live branches only.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state.queues.contains_key(&ref_key));
+
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", queue_id, cid(42), 10),
+            3,
+        );
+        // Queue fully drained → entry gone from the map, not an
+        // empty VecDeque left behind.
+        assert!(
+            !state.queues.contains_key(&ref_key),
+            "drained queue should be removed from state.queues"
+        );
+
+        // A fresh submission re-creates it.
+        apply(&mut state, enqueue("test/db", "main", 8, None), 4);
+        assert!(state.queues.contains_key(&ref_key));
     }
 
     #[test]
@@ -3880,6 +4370,7 @@ mod tests {
                 ledger_id,
                 queue_id: qid,
                 reason: PoisonReason::BodyMalformed { error },
+                ..
             } => {
                 assert_eq!(ledger_id, "test/db:main");
                 assert_eq!(qid, queue_id);
@@ -3916,11 +4407,20 @@ mod tests {
             other => panic!("not Enqueued: {other:?}"),
         };
 
-        apply(
+        let resp = apply(
             &mut state,
             poison_cmd("test/db", "main", queue_id, body_malformed("nope")),
             3,
         );
+
+        // No idempotency record will ever hold this envelope, so the
+        // poison releases it now — otherwise the blob leaks in CAS.
+        match resp {
+            Response::Poisoned {
+                released_envelope, ..
+            } => assert_eq!(released_envelope, Some(cid(7))),
+            other => panic!("expected Poisoned, got {other:?}"),
+        }
 
         let ref_key = RefKey::new("test/db", "main");
         assert!(state
@@ -3929,6 +4429,35 @@ mod tests {
             .map(VecDeque::is_empty)
             .unwrap_or(true));
         // No idempotency key means nothing recorded — the cache stays empty.
+        assert!(state.idempotency.is_empty());
+    }
+
+    #[test]
+    fn apply_head_without_idempotency_releases_envelope() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let enq = apply(&mut state, enqueue("test/db", "main", 7, None), 2);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", queue_id, cid(42), 10),
+            3,
+        );
+
+        // Keyless success path: the envelope has no idempotency
+        // record to retire it, so it's released as the entry
+        // applies. Its `request_cid` == the enqueue body seed.
+        match resp {
+            Response::HeadApplied {
+                released_envelope, ..
+            } => assert_eq!(released_envelope, Some(cid(7))),
+            other => panic!("expected HeadApplied, got {other:?}"),
+        }
+        // And nothing was cached, so nothing else references it.
         assert!(state.idempotency.is_empty());
     }
 
@@ -4185,14 +4714,14 @@ mod tests {
         expected: Option<RefValue>,
         new: RefValue,
     ) -> Command {
-        Command::CompareAndSetRef {
+        Command::CompareAndSetRef(RefCas {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             kind,
             expected,
             new,
             applied_at_millis: 0,
-        }
+        })
     }
 
     #[test]
@@ -4372,20 +4901,147 @@ mod tests {
     // PushStatus
     // ====================================================================
 
-    fn status(v: i64, state_str: &str) -> StatusValue {
-        StatusValue::new(v, fluree_db_nameservice::StatusPayload::new(state_str))
+    fn status(v: i64, state_str: &str) -> StoredStatus {
+        StoredStatus::from(&StatusValue::new(
+            v,
+            fluree_db_nameservice::StatusPayload::new(state_str),
+        ))
     }
 
     fn push_status_cmd(
         ledger_id: &str,
-        expected: Option<StatusValue>,
-        new: StatusValue,
+        expected: Option<StoredStatus>,
+        new: StoredStatus,
     ) -> Command {
         Command::PushStatus {
             ledger_id: ledger_id.into(),
             expected,
             new,
         }
+    }
+
+    /// The CAS in `apply_versioned_push` is structural equality on
+    /// `CanonicalValue` trees, and the replicated bytes are postcard
+    /// over `BTreeMap`s — both must be independent of the insertion
+    /// order of the HTTP-shaped `HashMap` the payload arrived in.
+    #[test]
+    fn stored_forms_are_insertion_order_independent() {
+        use fluree_db_nameservice::StatusPayload;
+
+        let mut ab = StatusPayload::new("ready");
+        ab.extra
+            .insert("alpha".into(), serde_json::json!({"y": 2, "x": 1}));
+        ab.extra.insert("beta".into(), serde_json::json!(true));
+
+        let mut ba = StatusPayload::new("ready");
+        ba.extra.insert("beta".into(), serde_json::json!(true));
+        ba.extra
+            .insert("alpha".into(), serde_json::json!({"x": 1, "y": 2}));
+
+        let stored_ab = StoredStatus::from(&StatusValue::new(1, ab));
+        let stored_ba = StoredStatus::from(&StatusValue::new(1, ba));
+        assert_eq!(
+            stored_ab, stored_ba,
+            "same logical payload must convert to structurally equal trees"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&stored_ab).unwrap(),
+            postcard::to_allocvec(&stored_ba).unwrap(),
+            "and to identical replicated bytes"
+        );
+    }
+
+    /// Stored forms round-trip losslessly to the HTTP-shaped types —
+    /// flattened extra metadata, nested structure, and the full JSON
+    /// number range included — and survive the postcard encoding the
+    /// raft log and snapshots apply (the original bug: the
+    /// HTTP-shaped types could not be postcard-encoded at all, and
+    /// the log-write failure surfaced as a raft fatal).
+    #[test]
+    fn stored_status_and_config_round_trip() {
+        use fluree_db_nameservice::StatusPayload;
+
+        let mut payload = StatusPayload::new("indexing");
+        payload
+            .extra
+            .insert("progress".into(), serde_json::json!(0.5));
+        payload
+            .extra
+            .insert("count".into(), serde_json::json!(-7_i64));
+        payload
+            .extra
+            .insert("big".into(), serde_json::json!(u64::MAX));
+        payload.extra.insert(
+            "nested".into(),
+            serde_json::json!({"errors": [null, "disk full"], "retries": 3}),
+        );
+        let value = StatusValue::new(3, payload);
+        let stored = StoredStatus::from(&value);
+        assert_eq!(StatusValue::from(&stored), value);
+        let bytes = postcard::to_allocvec(&stored).expect("stored status postcard-encodes");
+        let decoded: StoredStatus = postcard::from_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded, stored);
+        assert_eq!(
+            StatusValue::from(&StoredStatus::initial()),
+            StatusValue::initial()
+        );
+
+        let config_value = ConfigValue::new(
+            2,
+            Some(fluree_db_nameservice::ConfigPayload {
+                default_context: Some(cid(4)),
+                config_id: None,
+                extra: Default::default(),
+            }),
+        );
+        let stored = StoredConfig::from(&config_value);
+        assert_eq!(ConfigValue::from(&stored), config_value);
+        let bytes = postcard::to_allocvec(&stored).expect("stored config postcard-encodes");
+        let decoded: StoredConfig = postcard::from_bytes(&bytes).expect("decodes");
+        assert_eq!(decoded, stored);
+        assert_eq!(
+            ConfigValue::from(&StoredConfig::unborn()),
+            ConfigValue::unborn()
+        );
+        assert_eq!(
+            StoredConfig::from(&ConfigValue::unborn()),
+            StoredConfig::unborn(),
+            "the apply fallback must equal a proposer-converted unborn"
+        );
+    }
+
+    /// Populated status/config state must survive the postcard
+    /// snapshot cycle — the second half of the original bug (the
+    /// HTTP-shaped types inside `NameServiceState` broke every
+    /// snapshot build once an entry existed).
+    #[test]
+    fn populated_status_config_state_snapshots_round_trip() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+        let resp = apply(
+            &mut state,
+            push_status_cmd(
+                "test/db:main",
+                Some(StoredStatus::initial()),
+                status(2, "indexing"),
+            ),
+            1,
+        );
+        assert_eq!(resp, Response::StatusUpdated);
+        let resp = apply(
+            &mut state,
+            push_config_cmd(
+                "test/db:main",
+                Some(StoredConfig::unborn()),
+                config(1, Some(cid(9))),
+            ),
+            2,
+        );
+        assert_eq!(resp, Response::ConfigUpdated);
+
+        let bytes = state.to_snapshot().expect("populated state snapshots");
+        let restored = NameServiceState::from_snapshot(&bytes).expect("snapshot restores");
+        assert_eq!(restored, state);
     }
 
     #[test]
@@ -4469,19 +5125,19 @@ mod tests {
     // PushConfig
     // ====================================================================
 
-    fn config(v: i64, default_context: Option<ContentId>) -> ConfigValue {
+    fn config(v: i64, default_context: Option<ContentId>) -> StoredConfig {
         let payload = default_context.map(|cid| fluree_db_nameservice::ConfigPayload {
             default_context: Some(cid),
             config_id: None,
             extra: Default::default(),
         });
-        ConfigValue::new(v, payload)
+        StoredConfig::from(&ConfigValue::new(v, payload))
     }
 
     fn push_config_cmd(
         ledger_id: &str,
-        expected: Option<ConfigValue>,
-        new: ConfigValue,
+        expected: Option<StoredConfig>,
+        new: StoredConfig,
     ) -> Command {
         Command::PushConfig(Box::new(ConfigUpdate {
             ledger_id: ledger_id.into(),
@@ -4499,7 +5155,7 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
+                Some(StoredConfig::unborn()),
                 config(1, Some(cid(42))),
             ),
             1,
@@ -4519,7 +5175,7 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
+                Some(StoredConfig::unborn()),
                 config(1, Some(cid(42))),
             ),
             1,
@@ -4530,7 +5186,7 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
+                Some(StoredConfig::unborn()),
                 config(2, Some(cid(43))),
             ),
             2,
@@ -4553,8 +5209,8 @@ mod tests {
             &mut state,
             push_config_cmd(
                 "test/db:main",
-                Some(ConfigValue::unborn()),
-                ConfigValue::unborn(),
+                Some(StoredConfig::unborn()),
+                StoredConfig::unborn(),
             ),
             1,
         );
@@ -4794,8 +5450,8 @@ mod tests {
         }
     }
 
-    fn purge_ledger_cmd(ledger_id: &str, branch: &str) -> Command {
-        Command::PurgeLedger {
+    fn purge_branch_cmd(ledger_id: &str, branch: &str) -> Command {
+        Command::PurgeBranch {
             ledger_id: ledger_id.into(),
             branch: branch.into(),
             applied_at_millis: 0,
@@ -4834,6 +5490,56 @@ mod tests {
         assert_eq!(
             state.recently_cleared.get(&ref_key).map(|m| m.reason),
             Some(ClearReason::BranchDropped)
+        );
+    }
+
+    /// After an admin clear stamps a one-shot marker, a fresh
+    /// enqueue must clear it — otherwise `pop_validated_front`
+    /// spuriously aborts the first apply of that legitimate entry
+    /// with `QueueCleared`. (Regression: the marker used to survive
+    /// the enqueue and poison the very entry that superseded it.)
+    #[test]
+    fn enqueue_after_clear_consumes_marker_and_applies_cleanly() {
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        // Enqueue then drop: the drop clears the queue and stamps
+        // the marker.
+        apply(&mut state, enqueue("test/db", "feature", 7, None), 3);
+        apply(&mut state, drop_branch_cmd("test/db", "feature"), 4);
+        let ref_key = RefKey::new("test/db", "feature");
+        assert!(state.recently_cleared.contains_key(&ref_key));
+
+        // Re-create the branch and enqueue a fresh entry. The
+        // enqueue must consume the stale marker.
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            5,
+        );
+        let enq = apply(&mut state, enqueue("test/db", "feature", 8, None), 6);
+        let queue_id = match enq {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        assert!(
+            !state.recently_cleared.contains_key(&ref_key),
+            "fresh enqueue must consume the admin-clear marker"
+        );
+
+        // Applying the fresh entry succeeds — no spurious QueueCleared.
+        let resp = apply(
+            &mut state,
+            apply_head_cmd("test/db", "feature", queue_id, cid(42), 1),
+            7,
+        );
+        assert!(
+            matches!(resp, Response::HeadApplied { .. }),
+            "fresh entry must apply cleanly, got {resp:?}"
         );
     }
 
@@ -4894,12 +5600,12 @@ mod tests {
     }
 
     #[test]
-    fn purge_ledger_clears_queue_and_stamps_marker() {
+    fn purge_branch_clears_queue_and_stamps_marker() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");
         apply(&mut state, enqueue("test/db", "main", 7, None), 2);
 
-        apply(&mut state, purge_ledger_cmd("test/db", "main"), 3);
+        apply(&mut state, purge_branch_cmd("test/db", "main"), 3);
 
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
@@ -4910,7 +5616,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_ledger_clears_queue_for_unborn_branch() {
+    fn purge_branch_clears_queue_for_unborn_branch() {
         // Branches with queue entries but no RefEntry can exist (enqueue
         // does not require the branch to be live). A purge of such a
         // branch is otherwise AlreadyPurged but still has to drain the
@@ -4919,7 +5625,7 @@ mod tests {
         apply(&mut state, create_ledger("test/db"), 1);
         apply(&mut state, enqueue("test/db", "main", 7, None), 2);
 
-        let resp = apply(&mut state, purge_ledger_cmd("test/db", "main"), 3);
+        let resp = apply(&mut state, purge_branch_cmd("test/db", "main"), 3);
 
         let ref_key = RefKey::new("test/db", "main");
         assert!(!state.queues.contains_key(&ref_key));
@@ -4935,6 +5641,65 @@ mod tests {
                 ledger_id: "test/db:main".into(),
                 released_envelopes: vec![("test/db:main".into(), cid(7))],
             }
+        );
+    }
+
+    #[test]
+    fn purge_branch_refuses_when_branch_has_children() {
+        // Same lineage guard `drop_branch` enforces: a direct,
+        // out-of-order purge of a parent must refuse rather than
+        // strand the child with a dangling `source_branch`.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+        let resp = apply(&mut state, purge_branch_cmd("test/db", "main"), 3);
+        assert_eq!(
+            resp,
+            Response::BranchHasChildren {
+                ledger_id: "test/db:main".into(),
+                children: 1,
+            }
+        );
+        // State untouched — the parent survives.
+        assert!(state.refs.contains_key(&RefKey::new("test/db", "main")));
+    }
+
+    #[test]
+    fn purge_branch_child_first_lets_parent_purge_succeed() {
+        // The whole-ledger drop path: purging leaf-first decrements
+        // the parent's child count to 0, so the parent purge then
+        // passes the guard. Confirms the guard doesn't block the
+        // supported composition.
+        let mut state = NameServiceState::new();
+        create_ledger_with_genesis(&mut state, "test/db");
+        apply(
+            &mut state,
+            create_branch_cmd_helper("test/db", "feature", "main", None),
+            2,
+        );
+
+        // Purge the child first.
+        let child = apply(&mut state, purge_branch_cmd("test/db", "feature"), 3);
+        assert!(matches!(child, Response::Purged { .. }));
+        // Parent's child count is now 0.
+        assert_eq!(
+            state
+                .refs
+                .get(&RefKey::new("test/db", "main"))
+                .unwrap()
+                .branches,
+            0
+        );
+
+        // Parent purge now succeeds.
+        let parent = apply(&mut state, purge_branch_cmd("test/db", "main"), 4);
+        assert!(
+            matches!(parent, Response::Purged { .. }),
+            "parent purge should succeed once its child is gone, got {parent:?}"
         );
     }
 
@@ -5114,9 +5879,10 @@ mod tests {
     }
 
     #[test]
-    fn set_eligibility_demotes_above_quorum_floor() {
-        // 5 configured voters → quorum floor is 3. Demoting one
-        // when 5 are eligible drops to 4 — still above floor.
+    fn set_eligibility_demote_removes_voter_from_eligible_set() {
+        // Demotion of a configured voter always succeeds — the apply
+        // imposes no eligible-count floor (worker eligibility and
+        // raft voting quorum are independent).
         let mut state = NameServiceState::new();
         seed_voters(&mut state, [1, 2, 3, 4, 5]);
 
@@ -5140,8 +5906,8 @@ mod tests {
 
     #[test]
     fn set_eligibility_demoting_already_ineligible_voter_is_unchanged_noop() {
-        // Idempotent demotion bypasses the quorum check because no
-        // mutation would occur.
+        // Demoting a voter that's already ineligible is a no-op
+        // (`changed: false`) — no mutation occurs.
         let mut state = NameServiceState::new();
         seed_voters(&mut state, [1, 2, 3]);
         state.worker_eligible_voters.remove(&3);

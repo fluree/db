@@ -10,9 +10,8 @@ The same database is queryable through JSON-LD, SPARQL, and Cypher at once — o
 underlying store, no separate copy or sync step, so data written through any
 surface is immediately visible to the others. Because each surface is its own
 query language over that shared data, there are some subtle differences to be
-aware of. For a feature-by-feature
-status view — supported, divergent-by-design, or deferred — see the
-[openCypher support matrix](../reference/cypher-support-matrix.md).
+aware of — see [Differences from Neo4j](#differences-from-neo4j) at the end for
+the model divergences and the handful of deferred forms.
 
 [opencypher]: https://opencypher.org/resources/
 
@@ -71,6 +70,12 @@ The body may be raw Cypher, or a JSON envelope `{"cypher": "...", "params": {...
 (the Neo4j-HTTP shape). Responses are cypher-json; request RDF JSON-LD with
 `Accept: application/ld+json`.
 
+**Bulk loading** — a `.cypher` dump of `CREATE` / `MATCH … CREATE` statements
+(the Neo4j/Memgraph export idiom) should not be replayed statement-by-statement.
+`fluree create <ledger> --from dump.cypher` converts it on the fly and loads it
+through the chunked bulk-import pipeline; see
+[the create command](../cli/create.md#property-graph-imports-csv--cypher).
+
 ## Cardinality
 
 Cypher's default is **bag semantics**; SPARQL's default is set
@@ -106,12 +111,31 @@ ORDER BY / SKIP / LIMIT
   listed type per hop (LDBC IC12's
   `[:HAS_TYPE|IS_SUBCLASS_OF*0..]`). Bounded alternation
   (`-[:A|B*1..3]->`) is still deferred — use the unbounded form.
-- **Variable-length relationship / path binding** — a **bounded** typed
-  var-length relationship may bind a variable: `-[r:T*1..n]->` binds `r` to the
-  list of relationship values on each match, and `MATCH p = (a)-[:T*1..n]->(b)`
-  binds `p` to a path. Each fixed-length chain branch constructs the value from
-  its nodes. Deferred: binding on an **unbounded** (`-[r:T*]->`), **undirected**,
-  **untyped**, or IRI-anchored var-length path (all reject with a clear error).
+- **Variable-length relationship / path binding.** A var-length relationship
+  may bind a variable: `-[r:T*…]->` binds `r` to the list of relationship
+  values per match, and `MATCH p = (a)-[:T*…]->(b)` binds `p` to a path value.
+  Two execution strategies, chosen automatically:
+  - **Bounded typed directed** ranges expand to fixed-length chain branches,
+    each constructing the value from its nodes.
+  - Everything else — **unbounded** (`-[r:T*]->`, `p = (a)-[:T*]->(b)`),
+    **untyped/wildcard**, **undirected**, zero lower bounds (`*0..`), and
+    lower bounds above 1 — runs the **path-enumeration** search: a DFS from
+    the (anchored) start emitting one row per path whose hop count is in range.
+    The end node binds per path when free, or filters the enumeration when
+    already bound. The search enforces Cypher **relationship-uniqueness** (trail
+    semantics — no edge is traversed twice, but a node may be revisited via a
+    different edge; e.g. the triangle closure `a→b→c→a` is a valid 3-hop path),
+    matching Neo4j. It is guarded by visited/path caps that **error** rather than
+    silently truncate — narrow dense patterns with hop bounds, a bound end, or a
+    type.
+
+  A **fixed** single hop also takes a path variable
+  (`MATCH p = (a)-[:T]->(b)` is a `*1..1` path), as does a **multi-hop chain**
+  of fixed single-typed directed hops (`p = (a)-[:R1]->(b)<-[:R2]-(c)`) — the
+  path value is built from the bound nodes and per-hop relationship values.
+  Deferred: a variable-length or undirected segment inside a multi-hop path
+  value, binding over a type alternation, and property filters on a
+  var-length relationship.
 - **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the
@@ -151,9 +175,10 @@ ORDER BY / SKIP / LIMIT
   - **Math:** `abs`, `round`, `floor`, `ceil`/`ceiling`, `rand`, `sqrt`,
     `sign`, `log` (natural logarithm), and the `^` exponent operator
     (right-associative).
-  - **Identity:** `id(n)` / `elementId(n)` return the node/relationship's **IRI
-    string** — Fluree has no integer element id, so this is its stable string
-    identity (differs from Neo4j's integer `id`).
+  - **Identity:** `id(n)` / `elementId(n)` return the node/relationship's
+    stable **identity string** (the stored name — a full IRI in `@vocab`
+    mode; see [names](#names-and-opting-into-iris)). Fluree has no integer
+    element id (differs from Neo4j's integer `id`).
 - `WHERE` expressions: comparison, AND/OR/XOR/NOT, arithmetic `+ - * / %`, `^`,
   STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
@@ -177,6 +202,13 @@ ORDER BY / SKIP / LIMIT
   `d.minute`, `d.second` extract a component of a date/dateTime-valued property
   as an integer (e.g. `WHERE p.birthDate.year < 1990`). This is the one
   property-accessor chain that is *not* rejected.
+- Temporal constructors — `date('2024-01-15')`, `datetime('2024-01-15T10:00:00Z')`,
+  `time('10:00:00')`, `duration('P1D')` fold a constant lexical argument to a
+  typed value, usable in comparisons (`WHERE e.at > datetime('…')`) and as
+  write property values (`SET n.created = datetime()`). Zero-arg `datetime()` /
+  `date()` are the current instant / date; in a write statement every zero-arg
+  constructor sees the same instant. Component maps (`date({year: 2024})`),
+  non-constant arguments, and duration arithmetic are deferred.
 - ORDER BY (variable, property-accessor, or general expression keys —
   e.g. `ORDER BY toInteger(n.id)`), SKIP, LIMIT.
 - `UNWIND [literals] AS x` — inline list literal unwinding, and
@@ -282,6 +314,46 @@ ORDER BY / SKIP / LIMIT
   spec). `RETURN *` is also rejected in UNION branches because its
   projected-vars list is opaque at lower time.
 
+### Procedures (introspection shims)
+
+Graph tooling — Neo4j Browser, LangChain, driver smoke tests — introspects the
+database through built-in procedures before it issues real queries. Fluree
+answers the common ones directly from ledger statistics (novelty-merged, no
+scan), so they are instant even on large ledgers:
+
+| Procedure | Answers |
+|---|---|
+| `CALL db.labels()` | Distinct node labels (classes), sorted. |
+| `CALL db.relationshipTypes()` | Distinct relationship types (predicates whose objects are nodes; `rdf:type` excluded). |
+| `CALL db.propertyKeys()` | Distinct property keys (predicates with literal values). |
+| `CALL db.schema.visualization()` | One row: `nodes` / `relationships` summary lists (best effort). |
+| `CALL dbms.components()` | Compatibility identity (mirrors the Bolt handshake's `Neo4j/<version> (compatible; Fluree/…)`). |
+| `CALL apoc.meta.data()` | Per-(label, property) schema rows — node properties with meta types (`STRING`/`INTEGER`/…) and outgoing relationships (`type: "RELATIONSHIP"`, `other` = end labels). Covers the LangChain `Neo4jGraph` schema queries verbatim. |
+
+The full call form composes like any read — after the `YIELD` the statement
+continues with ordinary read clauses
+(`CALL proc() [YIELD * | col [AS alias], … [WHERE …]] [WITH/UNWIND/MATCH …] [RETURN …]`):
+
+```cypher
+CALL db.labels() YIELD label WHERE label STARTS WITH "P" RETURN label ORDER BY label
+```
+
+```cypher
+CALL apoc.meta.data()
+YIELD label, other, elementType, type, property
+WHERE type = "RELATIONSHIP" AND elementType = "node"
+UNWIND other AS other_node
+RETURN {start: label, type: property, end: toString(other_node)} AS output
+```
+
+Names render through the ledger's default context (`@vocab` stripped, term
+overrides reversed), so `db.labels()` returns the identifiers you would write
+in a `MATCH`. Like Neo4j's own catalog procedures, answers are lenient about
+tombstones: a label or key whose facts were all retracted may keep appearing
+until a reindex. A procedure call stands alone as its own statement (it can't
+follow a `MATCH`), and unsupported procedures (e.g. `apoc.*`) fail with an
+error listing the supported set.
+
 ### Writes
 
 - **`CREATE`** — nodes and relationships. Directed typed relationships emit a
@@ -299,6 +371,15 @@ ORDER BY / SKIP / LIMIT
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
   removes a node together with its relationships.
+- **`FOREACH`** — unroll a write over a **constant** list (inline literal,
+  constant `range()`, or a `$param` array), running a `CREATE` / `SET` /
+  `REMOVE` body per element:
+  ```cypher
+  FOREACH (n IN range(1, 3) | CREATE (:Ping {n: n}))
+  ```
+  Bodies unroll at parse time (≤ 10000 iterations; same-property `SET` is
+  last-wins). Deferred: runtime lists (e.g. a collected list) and
+  `MERGE` / `DELETE` / nested `FOREACH` bodies.
 - **`MERGE`** — find-or-create for a single node
   (`MERGE (n:Person {name: "Alice"})`) or a single relationship path, in two
   forms:
@@ -321,10 +402,32 @@ ORDER BY / SKIP / LIMIT
   > considers every ordered pair — O(n²) candidate edges. Add a selective
   > `WHERE` (as above) unless a full cross-product is intended.
 
-  `ON CREATE SET` is supported on both forms (and may target either endpoint
-  node variable). `ON MATCH SET` is supported on **single-node** `MERGE` only
-  (deferred on a relationship `MERGE`). Resolved by probing the current writer
-  state, then staging either a create or an update.
+  A property-bearing relationship pattern (`MERGE (a)-[:IN {since: 2020}]->(b)`)
+  matches only an edge whose properties carry those values — a different value
+  creates a parallel edge, per Cypher.
+
+  `ON CREATE SET` is supported on both forms and may target endpoint node
+  variables or the relationship variable (`ON CREATE SET r.checks = 1`).
+  `ON MATCH SET` is supported on single-node `MERGE`, on **standalone**
+  relationship `MERGE` (resolved by probing the current writer state, then
+  staging either branch), and on the **per-row** relationship form (leading
+  `MATCH`). The per-row form decomposes into two branches over the same
+  leading `MATCH` — an `ON MATCH SET` over the rows whose edge already exists,
+  then a create (`ON CREATE SET`) over the rows whose edge is absent — staged
+  into a **single atomic commit** (either both branches publish, or an error
+  returns with nothing committed). `ON MATCH SET` on a per-row *node* MERGE
+  (leading `MATCH` before a node `MERGE`) stays deferred — there is no
+  relationship to partition the rows on.
+
+  A single-node or standalone relationship `MERGE` also takes trailing `SET`
+  clauses, which apply on *both* branches — the standard upsert idiom:
+
+  ```cypher
+  MERGE (n:User {id: $id}) SET n += $props
+  ```
+
+  The map side of `SET n = …` / `SET n += …` may be a whole-map parameter
+  (`$props` above) or an inline `{k: v}` literal.
 
   Style note: write bound endpoints **bare** in the `MERGE` pattern
   (`MATCH (a:Person) MERGE (a)-[:T]->(b)`). Repeating a label on a bound
@@ -332,9 +435,10 @@ ORDER BY / SKIP / LIMIT
   the edge is inserted — idempotent in RDF, but redundant.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
-  property filters, directed single-typed relationships, and scalar `WHERE`
-  filters over the same comparison/boolean/string/property-accessor expression
-  surface used by reads. `CASE` / `EXISTS` inside write-side `WHERE` are still
+  property filters (on nodes and relationships — `-[r:T {w: 3}]->` filters on
+  the relationship's properties), directed single-typed relationships, and
+  scalar `WHERE` filters over the same comparison/boolean/string/property-
+  accessor expression surface used by reads. `CASE` / `EXISTS` inside write-side `WHERE` are still
   deferred.
 - **`MATCH … WITH … <write>`** — a `WITH` between the match and the write,
   limited to the *horizon subset*: pass-through variables (`WITH a, b`), renames
@@ -347,10 +451,53 @@ ORDER BY / SKIP / LIMIT
   resolution keys off the raw MATCH variables and can't honor a rename/horizon —
   `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
   `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
+- **`… RETURN <created>`** — a trailing `RETURN` of *created* entities:
+  `CREATE (n:Person {name: "Alice"}) RETURN n`,
+  `MATCH (a), (b) CREATE (a)-[e:KNOWS]->(b) RETURN e` (one row per matched
+  pair). Answered as the read path's Cypher-JSON tabular envelope; each entity
+  serializes as its identifier string. v1 surface: bare variables (optionally
+  aliased) naming a fresh `CREATE` node or relationship variable. Deferred:
+  expressions, `RETURN` modifiers, `MATCH`-bound variables, and `RETURN` with
+  `MERGE` (the matched branch's node isn't a created entity).
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;
+// or, when the statement ends in RETURN:
+let (committed, rows) = fluree.transact_cypher_returning(ledger, cypher, None).await?;
 ```
+
+The transact API also accepts a semicolon-separated **script** of write
+statements, executed sequentially with one commit per statement — later
+statements see earlier ones' effects, and only the final statement may carry
+a `RETURN` (cypher-shell autocommit semantics; a failure aborts the remainder
+but keeps prior commits — use an explicit Bolt transaction for atomicity):
+
+```rust
+let committed = fluree
+    .transact_cypher(
+        ledger,
+        r#"CREATE (:Person {name: "Alice"});
+           CREATE (:Person {name: "Bob"});
+           MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"})
+           CREATE (a)-[:KNOWS]->(b);"#,
+    )
+    .await?;
+```
+
+To **bulk-load a CSV**, use the CLI's [`fluree load`](../cli/load.md) — Fluree's
+`LOAD CSV` analog. It reads the file client-side and streams it as batched
+per-row upserts, one commit per batch. Each row binds as `row` inside
+`UNWIND $batch AS row …` (`--cypher`), or the batch is injected as an update's
+`values` clause (`--jsonld`):
+
+```bash
+fluree load people --from people.csv \
+  --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
+```
+
+The same per-row upsert shape works directly on the transact API:
+`UNWIND $batch AS row MERGE (n:Person {id: row.id}) SET n.name = row.name`, with
+`$batch` a parameter array of row maps.
 
 Writes default to LPG mode, where every relationship reifies (carries an
 annotation identity). See [Edge annotations](../concepts/edge-annotations.md) for the RDF
@@ -381,39 +528,128 @@ on its properties — which in turn decides the cardinality and whether plain
 | Pattern | Lowers to | Cardinality | Sees plain RDF? |
 |---|---|---|---|
 | `(a)-[:T]->(b)` | Plain triple `(a, <T>, b)` | Set | Yes |
-| `(a)-[r:T]->(b)` | `EdgeAnnotation { edge, annotation: ?r, body: [] }` | Bag | No — only reifier-bundled edges |
+| `(a)-[r:T]->(b)`, `r` **value-only** | Plain triple + `OPTIONAL { EdgeAnnotation }` + `r = coalesce(annotation, MakeRel(a, T, b))` | Bag over annotations; one row for an unreified edge | Yes |
+| `(a)-[r:T]->(b)`, `r` **property-read** | `EdgeAnnotation { edge, annotation: ?r, body: [] }` | Bag | No — only reifier-bundled edges |
 | `(a)-[:T {p:v}]->(b)` | `EdgeAnnotation { edge, annotation: ?#__anon, body: [(?#__anon, p, v)] }` | Bag | No |
 
-**Consequence.** If your data was loaded via JSON-LD without
-`@annotation` (or any other path that doesn't produce reifier
-bundles), `MATCH (a)-[r:T]->(b)` returns zero rows even though the
-base triples exist. Drop the `r` to get plain-RDF-visible set
-semantics:
+A bound relationship variable is **value-only** when the statement never reads
+its properties — no `r.prop`, `properties(r)`, `keys(r)`, or map projection
+`r{…}` anywhere (a statement-wide scan decides this at lowering). Value-only
+uses (`RETURN r`, `type(r)`, `startNode(r)` / `endNode(r)`, comparisons,
+`collect(r)`) are satisfied by a relationship value synthesized from the base
+triple, so plain (un-annotated) RDF edges match too; edges that *do* carry
+reifier bundles still bind one row per annotation (parallel relationships stay
+distinct).
+
+**Consequence.** Only a *property-reading* relationship variable requires
+reifier bundles. If your data was loaded via JSON-LD without `@annotation`
+(or any other path that doesn't produce reifier bundles),
+`MATCH (a)-[r:T]->(b) RETURN r.since` returns zero rows even though the base
+triples exist — there is no annotation node to read `since` from:
 
 ```cypher
--- bag semantics, requires reifier bundles
-MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r, o
+-- value-only r: sees all base edges, plus per-annotation rows where reified
+MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, type(r), o
+
+-- property read on r: requires reifier bundles
+MATCH (a:Person)-[r:WORKS_FOR]->(o:Organization) RETURN a, r.since, o
 
 -- set semantics, sees all base edges
 MATCH (a:Person)-[:WORKS_FOR]->(o:Organization) RETURN a, o
 ```
 
-### IRI mapping for bare identifiers
+### Names, and opting into IRIs
 
-Cypher uses bare names like `Person`, `WORKS_FOR`, `name`. Fluree
-resolves them via:
+Cypher uses bare names like `Person`, `WORKS_FOR`, `name`. **By
+default they are just names** — no IRI prefix is invented for them.
+Internally they live under namespace code 0 (the empty prefix), so a
+label written as `Person` reads back as `Person` on every surface:
+`labels(n)`, Bolt, and even JSON-LD/SPARQL queries against the same
+ledger see the same bare (relative) name. A pure-Cypher user never
+sees or configures a namespace.
 
-1. **The ledger's default `@context`** (the same context that applies
-   to JSON-LD queries against the same ledger).
-   - `@vocab` supplies the fallback namespace.
-   - Full-term mappings (e.g. `"Person": "http://example.org/Person"`)
-     act as overrides.
-2. **Fallback default:** `http://example.org/` when no context is
-   configured. Useful in tests; not appropriate for production data.
+To interoperate with RDF-style data (full IRIs), configure the
+ledger's default `@context` — the same context that applies to JSON-LD
+queries against that ledger:
+
+- `@vocab` supplies the namespace prefix: `Person` then resolves to
+  `<vocab>Person`, matching data whose IRIs live under that vocab.
+- Full-term mappings (e.g. `"Person": "http://schema.org/Person"`) act
+  as per-name overrides (they work with or without `@vocab`).
 
 The mapping is **case-preserving**: `WORKS_FOR` becomes
 `<vocab>WORKS_FOR`, not `<vocab>worksFor`. Put any case-normalizing
 aliases in the context.
+
+The placement rule for a name (without `@vocab`) is: **no colon →
+the whole name, verbatim**. Backticked names containing `/`, `#`,
+spaces, or `@` (`` `a/b` ``, `` `my prop` ``, `` `user@host` ``) are
+never split into namespaces — they round-trip intact. A backticked
+name that *does* contain a colon is treated as an RDF identifier
+(prefixed name or full IRI): `` `ex:code` `` or
+`` `http://schema.org/name` `` registers its namespace and
+interoperates with SPARQL/JSON-LD views of the same data.
+
+Note the two modes address different data: bare names and
+vocab-resolved IRIs are different identifiers. Adding `@vocab` to a
+ledger whose data was written bare (or vice versa) changes what Cypher
+statements match.
+
+### Identifiers and keywords
+
+Keyword tokens (`count`, `end`, `order`, `limit`, `all`, …) are accepted
+as binding names — both as aliases (`RETURN n.name AS end`,
+`WITH count(*) AS count`, `UNWIND xs AS end`, `YIELD col AS type`) and
+when referenced downstream as plain variables
+(`WITH count(*) AS count WHERE count > 5 RETURN count`). This is a
+deliberate leniency over strict openCypher, which reserves these words
+and requires backticking (`` AS `count` ``) — backticked identifiers are
+also accepted. The dedicated meanings win where a keyword is followed by
+its delimiter: `count(*)`, `exists { … }`, and `all(x IN … )` still
+parse as their constructs.
+
+## Differences from Neo4j
+
+Fluree implements the openCypher 9 surface faithfully — the common clause,
+pattern, and expression set works as specified, and anything unsupported
+returns a **clear error, never a silently wrong result**. A few differences are
+worth knowing, and they fall into two kinds.
+
+**Divergent by design** — inherent to running Cypher over an RDF store, and
+here to stay:
+
+- **Nodes are durable subjects, not opaque LPG nodes.** `labels(n)` are
+  `rdf:type` assertions; node identity is the subject's stored name (a plain
+  name by default, a full IRI in `@vocab` mode — see
+  [Names, and opting into IRIs](#names-and-opting-into-iris)).
+- **Relationships are edge annotations.** `-[r:T]->` reifies the base triple
+  `(s, p, o)` into a reifier node (the edge identity) — the same RDF 1.2 model
+  SPARQL exposes via the `{| … |}` annotation tail and `rdf:reifies <<( s p o )>>`
+  triple terms. So an edge is a *reifier over* a triple, not a triple term
+  stored as a value (triple terms are supported as the object of `rdf:reifies`,
+  not free-standing). See [How Cypher maps to RDF](#how-cypher-maps-to-rdf) and
+  [Edge annotations](../concepts/edge-annotations.md).
+- **`id(n)` / `elementId(n)` return the identity string**, not an integer — RDF
+  subjects have no integer element id. Over Bolt, `xsd:decimal` renders as
+  Float (Neo4j parity, precision loss); integer division yields decimals, so
+  this shows on ordinary `a / b`.
+- **No implicit per-statement transaction id.** Immutability and time-travel
+  (`f:t`, history queries) replace those semantics.
+
+**Deferred (fringe / on request)** — rejected with a clear error until a use
+case pulls them in; each has a workaround:
+
+- Bounded type-alternation var-length `-[:A|B*1..3]->` — use the unbounded form
+  `-[:A|B*]->`.
+- Spatial `point()` / `distance()`, and `duration` arithmetic (`date + duration`).
+- Chained property access `n.a.b` (except temporal field chains like
+  `x.date.month`) and mixing `.*` with named selectors in a map projection.
+- `ORDER BY` over a list/map value, and `neo4j://` cluster routing (use
+  `bolt://` direct).
+
+Everything else — the full clause/pattern/expression surface, the write path,
+procedures, and Bolt driver support — works; when in doubt, try it and read the
+error, which names the unsupported form and its workaround.
 
 ## See also
 

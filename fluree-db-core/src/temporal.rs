@@ -1986,6 +1986,283 @@ fn parse_seconds_to_micros(s: &str) -> Result<i64, String> {
     }
 }
 
+impl DateTime {
+    /// The current UTC instant at millisecond precision — what Cypher's
+    /// zero-arg `datetime()` and SPARQL's `NOW()` return.
+    pub fn now_utc() -> Self {
+        let formatted = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        Self::parse(&formatted).expect("RFC3339 UTC timestamp parses")
+    }
+}
+
+impl Date {
+    /// The current UTC calendar date — what Cypher's zero-arg `date()` returns.
+    pub fn today_utc() -> Self {
+        let formatted = Utc::now().format("%Y-%m-%d").to_string();
+        Self::parse(&formatted).expect("UTC date parses")
+    }
+}
+
+/// Fold a Cypher temporal constructor with a constant lexical argument into a
+/// typed value: `date('2024-01-01')`, `datetime('…')`, `localdatetime('…')`,
+/// `time('…')`, `duration('P1D')`. Returns `None` when `func` (expected
+/// lowercased) is not a temporal constructor, `Some(Err)` on a bad lexical
+/// form. A duration folds to the narrowest totally-orderable XSD type
+/// (dayTimeDuration / yearMonthDuration), falling back to the mixed
+/// xsd:duration.
+pub fn cypher_temporal_constructor(
+    func: &str,
+    lexical: &str,
+) -> Option<Result<crate::value::FlakeValue, String>> {
+    use crate::value::FlakeValue;
+    let v = match func {
+        "date" => Date::parse(lexical).map(|d| FlakeValue::Date(Box::new(d))),
+        "datetime" | "localdatetime" => {
+            DateTime::parse(lexical).map(|d| FlakeValue::DateTime(Box::new(d)))
+        }
+        "time" | "localtime" => Time::parse(lexical).map(|t| FlakeValue::Time(Box::new(t))),
+        "duration" => DayTimeDuration::parse(lexical)
+            .map(|d| FlakeValue::DayTimeDuration(Box::new(d)))
+            .or_else(|_| {
+                YearMonthDuration::parse(lexical)
+                    .map(|d| FlakeValue::YearMonthDuration(Box::new(d)))
+            })
+            .or_else(|_| Duration::parse(lexical).map(|d| FlakeValue::Duration(Box::new(d)))),
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// One constant component of a Cypher temporal component-map constructor
+/// (`date({year: 2024, month: 1})`): an integer field or a string field
+/// (`timezone`).
+#[derive(Debug, Clone)]
+pub enum TemporalComponent {
+    Int(i64),
+    Str(String),
+}
+
+/// Fold a Cypher temporal component-map constructor
+/// (`date({year: 2024, month: 1, day: 15})`, `datetime({…})`, `time({…})`,
+/// `duration({days: 3, hours: 12})`) into a typed value by composing the
+/// lexical form and delegating to [`cypher_temporal_constructor`] (so a
+/// duration still picks the narrowest orderable type). Returns `None` when
+/// `func` (expected lowercased) is not a temporal constructor; `Some(Err)`
+/// on an unknown key, a wrong component type, or out-of-range values.
+pub fn cypher_temporal_from_components(
+    func: &str,
+    fields: &[(String, TemporalComponent)],
+) -> Option<Result<crate::value::FlakeValue, String>> {
+    if !matches!(
+        func,
+        "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration"
+    ) {
+        return None;
+    }
+    Some(compose_components(func, fields).and_then(|lexical| {
+        cypher_temporal_constructor(func, &lexical)
+            .expect("func checked above")
+            .map_err(|e| format!("{e} (composed `{lexical}`)"))
+    }))
+}
+
+fn compose_components(
+    func: &str,
+    fields: &[(String, TemporalComponent)],
+) -> Result<String, String> {
+    let int = |allowed: &str, default: i64| -> Result<i64, String> {
+        for (k, v) in fields {
+            if k.eq_ignore_ascii_case(allowed) {
+                return match v {
+                    TemporalComponent::Int(n) => Ok(*n),
+                    TemporalComponent::Str(_) => {
+                        Err(format!("component `{allowed}` must be an integer"))
+                    }
+                };
+            }
+        }
+        Ok(default)
+    };
+
+    let known = |keys: &[&str]| -> Result<(), String> {
+        for (k, _) in fields {
+            if !keys.iter().any(|a| k.eq_ignore_ascii_case(a)) {
+                return Err(format!(
+                    "unknown component `{k}` — supported: {}",
+                    keys.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    let timezone = fields
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("timezone"))
+        .map(|(_, v)| match v {
+            TemporalComponent::Str(s) => Ok(s.clone()),
+            TemporalComponent::Int(_) => Err("component `timezone` must be a string".to_string()),
+        })
+        .transpose()?;
+    // Neo4j's default timezone is UTC; the `local*` forms carry none.
+    let tz_suffix = |default_utc: bool| match &timezone {
+        Some(tz) if tz == "Z" || tz.eq_ignore_ascii_case("utc") => "Z".to_string(),
+        Some(tz) => tz.clone(),
+        None if default_utc => "Z".to_string(),
+        None => String::new(),
+    };
+
+    // Fractional seconds from millisecond/microsecond/nanosecond components.
+    // The three combine into a sub-second nanosecond count that must stay
+    // below 1s — there's no cascade into the whole-seconds field (and from
+    // there into minutes/hours/day), so a total ≥ 1s is rejected rather than
+    // silently truncated to the wrong fraction (e.g. `millisecond: 1500`
+    // silently becoming `.15` instead of carrying a second).
+    let frac = |ms: i64, us: i64, ns: i64| -> Result<String, String> {
+        let overflow = || "millisecond/microsecond/nanosecond components overflow".to_string();
+        let ms_ns = ms.checked_mul(1_000_000).ok_or_else(overflow)?;
+        let us_ns = us.checked_mul(1_000).ok_or_else(overflow)?;
+        let total = ms_ns
+            .checked_add(us_ns)
+            .and_then(|v| v.checked_add(ns))
+            .ok_or_else(overflow)?;
+        if !(0..1_000_000_000).contains(&total) {
+            return Err(
+                "millisecond/microsecond/nanosecond components must combine to a value in \
+                 [0, 1s) — they don't carry into the whole-seconds field"
+                    .to_string(),
+            );
+        }
+        if total == 0 {
+            Ok(String::new())
+        } else {
+            Ok(format!(".{total:09}").trim_end_matches('0').to_string())
+        }
+    };
+
+    match func {
+        "date" => {
+            known(&["year", "month", "day"])?;
+            let (y, m, d) = (int("year", 0)?, int("month", 1)?, int("day", 1)?);
+            if !fields.iter().any(|(k, _)| k.eq_ignore_ascii_case("year")) {
+                return Err("date({…}) requires a `year` component".to_string());
+            }
+            Ok(format!("{y:04}-{m:02}-{d:02}"))
+        }
+        "datetime" | "localdatetime" => {
+            known(&[
+                "year",
+                "month",
+                "day",
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "microsecond",
+                "nanosecond",
+                "timezone",
+            ])?;
+            if !fields.iter().any(|(k, _)| k.eq_ignore_ascii_case("year")) {
+                return Err(format!("{func}({{…}}) requires a `year` component"));
+            }
+            let (y, mo, d) = (int("year", 0)?, int("month", 1)?, int("day", 1)?);
+            let (h, mi, s) = (int("hour", 0)?, int("minute", 0)?, int("second", 0)?);
+            let f = frac(
+                int("millisecond", 0)?,
+                int("microsecond", 0)?,
+                int("nanosecond", 0)?,
+            )?;
+            let tz = tz_suffix(func == "datetime");
+            Ok(format!(
+                "{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}{f}{tz}"
+            ))
+        }
+        "time" | "localtime" => {
+            known(&[
+                "hour",
+                "minute",
+                "second",
+                "millisecond",
+                "microsecond",
+                "nanosecond",
+                "timezone",
+            ])?;
+            let (h, mi, s) = (int("hour", 0)?, int("minute", 0)?, int("second", 0)?);
+            let f = frac(
+                int("millisecond", 0)?,
+                int("microsecond", 0)?,
+                int("nanosecond", 0)?,
+            )?;
+            let tz = tz_suffix(func == "time");
+            Ok(format!("{h:02}:{mi:02}:{s:02}{f}{tz}"))
+        }
+        "duration" => {
+            known(&[
+                "years",
+                "months",
+                "weeks",
+                "days",
+                "hours",
+                "minutes",
+                "seconds",
+                "milliseconds",
+            ])?;
+            let years = int("years", 0)?;
+            let months_raw = int("months", 0)?;
+            let months = years
+                .checked_mul(12)
+                .and_then(|v| v.checked_add(months_raw))
+                .ok_or_else(|| "years/months components overflow".to_string())?;
+            let weeks = int("weeks", 0)?;
+            let days_raw = int("days", 0)?;
+            let days = weeks
+                .checked_mul(7)
+                .and_then(|v| v.checked_add(days_raw))
+                .ok_or_else(|| "weeks/days components overflow".to_string())?;
+            let (h, mi) = (int("hours", 0)?, int("minutes", 0)?);
+            let ms = int("milliseconds", 0)?;
+            let s = int("seconds", 0)?;
+            let mut out = String::from("P");
+            if months != 0 {
+                out.push_str(&format!("{months}M"));
+            }
+            if days != 0 {
+                out.push_str(&format!("{days}D"));
+            }
+            let total_ms = s
+                .checked_mul(1000)
+                .and_then(|v| v.checked_add(ms))
+                .ok_or_else(|| "seconds/milliseconds components overflow".to_string())?;
+            let has_time = h != 0 || mi != 0 || total_ms != 0;
+            if has_time {
+                out.push('T');
+                if h != 0 {
+                    out.push_str(&format!("{h}H"));
+                }
+                if mi != 0 {
+                    out.push_str(&format!("{mi}M"));
+                }
+                if total_ms != 0 {
+                    if total_ms % 1000 == 0 {
+                        out.push_str(&format!("{}S", total_ms / 1000));
+                    } else {
+                        out.push_str(&format!(
+                            "{}.{:03}S",
+                            total_ms / 1000,
+                            (total_ms % 1000).unsigned_abs()
+                        ));
+                    }
+                }
+            }
+            if out == "P" {
+                out.push_str("T0S");
+            }
+            Ok(out)
+        }
+        _ => unreachable!("caller checked the constructor name"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3046,5 +3323,74 @@ mod tests {
     fn test_duration_canonical_mixed_with_fractional() {
         let d = Duration::parse("P1Y2M3DT4H5M6.789S").unwrap();
         assert_eq!(d.to_canonical_string(), "P1Y2M3DT4H5M6.789S");
+    }
+
+    #[test]
+    fn test_datetime_from_components_millisecond_over_one_second_errors() {
+        // `millisecond: 1500` is 1.5s, not a valid sub-second fraction — it
+        // must error rather than silently compose `.15` (truncated + missing
+        // the carried second).
+        let fields = vec![
+            ("year".to_string(), TemporalComponent::Int(2024)),
+            ("millisecond".to_string(), TemporalComponent::Int(1500)),
+        ];
+        let err = cypher_temporal_from_components("datetime", &fields)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.contains("whole-seconds field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_datetime_from_components_millisecond_exact_second_boundary_errors() {
+        let fields = vec![
+            ("year".to_string(), TemporalComponent::Int(2024)),
+            ("millisecond".to_string(), TemporalComponent::Int(1000)),
+        ];
+        let err = cypher_temporal_from_components("datetime", &fields)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            err.contains("whole-seconds field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_datetime_from_components_valid_millisecond_composes() {
+        let fields = vec![
+            ("year".to_string(), TemporalComponent::Int(2024)),
+            ("millisecond".to_string(), TemporalComponent::Int(500)),
+        ];
+        let v = cypher_temporal_from_components("datetime", &fields)
+            .unwrap()
+            .unwrap();
+        let crate::value::FlakeValue::DateTime(dt) = v else {
+            panic!("expected DateTime, got {v:?}");
+        };
+        assert_eq!(dt.to_string(), "2024-01-01T00:00:00.5Z");
+    }
+
+    #[test]
+    fn test_duration_from_components_years_overflow_errors() {
+        let fields = vec![("years".to_string(), TemporalComponent::Int(i64::MAX))];
+        let err = cypher_temporal_from_components("duration", &fields)
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("overflow"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_duration_from_components_seconds_milliseconds_overflow_errors() {
+        let fields = vec![
+            ("seconds".to_string(), TemporalComponent::Int(i64::MAX)),
+            ("milliseconds".to_string(), TemporalComponent::Int(1)),
+        ];
+        let err = cypher_temporal_from_components("duration", &fields)
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("overflow"), "unexpected error: {err}");
     }
 }

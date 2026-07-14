@@ -108,12 +108,36 @@ MATCH (a:Person), (b:Person) WHERE a.name <> b.name
 MERGE (a)-[:KNOWS]->(b)
 ```
 
+## Bulk-load a CSV (`LOAD CSV`)
+
+Fluree's `LOAD CSV` analog is the CLI's [`fluree load`](../cli/load.md). It reads
+the file client-side and streams it as batched per-row upserts (one commit per
+batch). Each CSV row binds as `row`, keyed by column:
+
+```bash
+fluree load people --from people.csv \
+  --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name, n.age = toInteger(row.age)'
+```
+
+Re-running is idempotent — `MERGE` upserts, so the same file loaded twice
+updates in place rather than duplicating. The batch rides in as
+`UNWIND $batch AS row …`, so the same shape works on the transact API with a
+`$batch` parameter. A JSON-LD update template (`--jsonld`) is also supported,
+with the batch injected as the update's `values` clause.
+
 ## Update and delete
 
 ```cypher
 MATCH (p:Person {name: "Alice"}) SET p.age = 35, p:Verified
 MATCH (p:Person {name: "Alice"}) REMOVE p.age
 MATCH (p:Person {name: "Bob"}) DETACH DELETE p
+```
+
+To repeat a write across a constant list, `FOREACH` unrolls a `CREATE` / `SET` /
+`REMOVE` body per element:
+
+```cypher
+FOREACH (tag IN ["a", "b", "c"] | CREATE (:Tag {name: tag}))
 ```
 
 `SET p += {a: 1, b: 2}` merges a map of properties; `SET p:Label` adds a label;
@@ -280,9 +304,8 @@ surface as the same edge with the same `role` metadata — see
 
 ## See also
 
-- [Cypher (concept)](../query/cypher.md) — supported surface and RDF mapping.
-- [openCypher support matrix](../reference/cypher-support-matrix.md) — per-feature
-  status, including what's not yet supported.
+- [Cypher (concept)](../query/cypher.md) — supported surface, RDF mapping, and
+  [differences from Neo4j](../query/cypher.md#differences-from-neo4j).
 - [Edge annotations](../concepts/edge-annotations.md) — the storage model behind
   Cypher relationships.
 - [Query patterns](cookbook-query-patterns.md) — the generic operators

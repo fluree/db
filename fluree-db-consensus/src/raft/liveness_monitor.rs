@@ -33,11 +33,24 @@ use tracing::{debug, warn};
 /// Default interval between metric samples.
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Default time a peer's match log can stay stuck (while the
-/// leader's last log advances past it) before being proposed as
-/// ineligible. Sized to absorb transient slowness — short GC
-/// pauses, a brief network jitter — without demoting healthy peers.
+/// Default time a peer's match log can stay more than
+/// [`DEFAULT_MAX_HEALTHY_LAG`] entries behind the leader before being
+/// proposed as ineligible. Sized to absorb transient slowness —
+/// short GC pauses, a brief network jitter, a replication burst the
+/// peer is catching up on — without demoting healthy peers.
 pub const DEFAULT_UNREACHABLE_AFTER: Duration = Duration::from_secs(15);
+
+/// Default maximum number of log entries a peer's match log may trail
+/// the leader's last log and still count as healthy. Measures lag as
+/// *distance*, not "did the match index move at all": a peer matching
+/// one entry per sample while the leader gains thousands is advancing
+/// yet falling further behind, and only a distance measure demotes
+/// it. Set comfortably above the deepest legitimate in-flight
+/// replication window (openraft ships entries in batches, so a
+/// keeping-up follower trails by at most a batch or two) so normal
+/// pipelining never trips it; a peer that stays beyond it for
+/// [`DEFAULT_UNREACHABLE_AFTER`] genuinely can't keep pace.
+pub const DEFAULT_MAX_HEALTHY_LAG: u64 = 1000;
 
 /// Default minimum time a previously-demoted peer must show
 /// advancement before being proposed as eligible again. Strictly
@@ -47,8 +60,9 @@ pub const DEFAULT_UNREACHABLE_AFTER: Duration = Duration::from_secs(15);
 pub const DEFAULT_LIVE_AFTER: Duration = Duration::from_secs(5);
 
 /// Default minimum time between consecutive eligibility proposes
-/// for the same peer after a refusal. A refused propose (e.g.
-/// quorum-floor refusal) still commits a raft log entry that
+/// for the same peer after a refusal. A refused propose (the apply
+/// refuses a voter no longer in the configured set —
+/// `VoterNotConfigured`) still commits a raft log entry that
 /// applies as a no-op; without backoff, the monitor would commit
 /// one such entry every [`DEFAULT_SAMPLE_INTERVAL`] until the
 /// refusal condition clears. Set well above the sample interval
@@ -61,10 +75,16 @@ pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(30);
 pub struct LivenessConfig {
     /// Interval between metric samples.
     pub sample_interval: Duration,
-    /// How long a peer's match log can stay stuck (while the
-    /// leader's log advances past it) before being proposed
-    /// ineligible.
+    /// How long a peer's match log can stay more than
+    /// [`Self::max_healthy_lag`] entries behind the leader before
+    /// being proposed ineligible.
     pub unreachable_after: Duration,
+    /// Maximum entries a peer may trail the leader's last log and
+    /// still count as keeping up. Lag beyond this — sustained past
+    /// [`Self::unreachable_after`] — demotes the peer even if its
+    /// match index is still inching forward. See
+    /// [`DEFAULT_MAX_HEALTHY_LAG`].
+    pub max_healthy_lag: u64,
     /// How long a previously-demoted peer must show advancement
     /// before being proposed eligible again. Should be strictly
     /// less than `unreachable_after` to keep the hysteresis window
@@ -72,8 +92,8 @@ pub struct LivenessConfig {
     pub live_after: Duration,
     /// Minimum time between consecutive eligibility proposes for
     /// the same peer after the prior one was refused. Caps the
-    /// raft-log commit rate when the refusal condition (e.g.
-    /// quorum-floor) is persistent.
+    /// raft-log commit rate when the refusal condition
+    /// (`VoterNotConfigured`) is persistent.
     pub refusal_backoff: Duration,
 }
 
@@ -84,6 +104,7 @@ impl Default for LivenessConfig {
             unreachable_after: DEFAULT_UNREACHABLE_AFTER,
             live_after: DEFAULT_LIVE_AFTER,
             refusal_backoff: DEFAULT_REFUSAL_BACKOFF,
+            max_healthy_lag: DEFAULT_MAX_HEALTHY_LAG,
         }
     }
 }
@@ -132,7 +153,7 @@ struct PeerTracker {
     /// timestamp, preventing the monitor from committing a raft
     /// log entry every sample tick when the refusal condition
     /// hasn't cleared. Cleared whenever a propose lands
-    /// successfully — the underlying refusal (e.g. quorum-floor)
+    /// successfully — the underlying refusal (`VoterNotConfigured`)
     /// is by definition no longer in effect.
     last_refused: Option<Instant>,
 }
@@ -271,7 +292,13 @@ impl LivenessMonitor {
                     PeerTracker::for_ineligible_peer()
                 }
             });
-            record_replication_progress(tracker, peer_log, leader_last_log, now);
+            record_replication_progress(
+                tracker,
+                peer_log,
+                leader_last_log,
+                self.config.max_healthy_lag,
+                now,
+            );
             let Some(proposal) = next_eligibility_proposal(tracker, now, &self.config) else {
                 continue;
             };
@@ -333,9 +360,9 @@ impl LivenessMonitor {
     }
 
     /// `true` only when the apply landed (or was idempotent against
-    /// state that already matched). `WorkerEligibilityRefused` —
-    /// notably the quorum-floor refusal — returns `false` so the
-    /// next tick re-attempts once the refusal condition clears.
+    /// state that already matched). `WorkerEligibilityRefused`
+    /// (`VoterNotConfigured`) returns `false` so the next tick
+    /// re-attempts once the refusal condition clears.
     async fn propose_eligibility(&self, args: WorkerEligibility) -> bool {
         let voter = args.voter;
         let eligible = args.eligible;
@@ -384,30 +411,32 @@ fn record_replication_progress(
     tracker: &mut PeerTracker,
     current_log: Option<LogId<NodeId>>,
     leader_last_log: Option<u64>,
+    max_healthy_lag: u64,
     now: Instant,
 ) {
+    // Track the peer's furthest observed match position (monotonic).
     if log_advanced(&tracker.last_observed_log, &current_log) {
         tracker.last_observed_log = current_log;
+    }
+
+    if peer_is_keeping_up(leader_last_log, &tracker.last_observed_log, max_healthy_lag) {
+        // Within the healthy lag window — clear any pending
+        // unreachable timer. The first healthy sample after a
+        // demotion opens the recovery window; later healthy samples
+        // don't push its start forward, so the promote check
+        // measures sustained health from a fixed point.
         tracker.unreachable_since = None;
-        // First advance after a demotion starts the recovery
-        // window; subsequent advances don't push the start forward
-        // — the promote check needs a non-moving timestamp to
-        // measure against.
         if tracker.last_proposed == Some(EligibilityProposal::Demote)
             && tracker.recovering_since.is_none()
         {
             tracker.recovering_since = Some(now);
         }
-    } else if leader_is_ahead_of_peer(leader_last_log, &tracker.last_observed_log) {
-        // No advance from the peer while the leader has new entries
-        // it hasn't matched — the peer is lagging. Start the
-        // unreachable timer on the first sample that observes the
-        // lag; subsequent samples don't reset it until the peer
-        // advances. A peer that has yet to match anything (e.g. a
-        // freshly-added voter mid-snapshot-install) falls through
-        // here without setting the timer: [`leader_is_ahead_of_peer`]
-        // returns `false` for a `None` `last_observed_log`, so the
-        // bootstrap window doesn't count as lag.
+    } else {
+        // Trailing the leader by more than `max_healthy_lag` — the
+        // peer isn't keeping pace, even if its match index is still
+        // inching forward. Start the unreachable timer on the first
+        // lagging sample; subsequent samples don't reset it until the
+        // peer catches back inside the window.
         tracker.unreachable_since.get_or_insert(now);
         tracker.recovering_since = None;
     }
@@ -422,7 +451,7 @@ fn record_replication_progress(
 ///
 /// Returns `None` while the [`LivenessConfig::refusal_backoff`]
 /// window after a refused propose is still in effect — without
-/// this short-circuit, a persistent refusal (e.g. quorum-floor)
+/// this short-circuit, a persistent refusal (`VoterNotConfigured`)
 /// would commit a raft log entry every sample tick until the
 /// underlying condition cleared.
 fn next_eligibility_proposal(
@@ -467,10 +496,22 @@ fn log_advanced(prev: &Option<LogId<NodeId>>, curr: &Option<LogId<NodeId>>) -> b
 /// lag, and treating the absence of a baseline as lag would demote
 /// a freshly-added voter before it had any chance to start
 /// replicating.
-fn leader_is_ahead_of_peer(leader_last_log: Option<u64>, peer_log: &Option<LogId<NodeId>>) -> bool {
+/// True when the peer's match log is within `max_healthy_lag` entries
+/// of the leader's last log — i.e. keeping pace. A peer that has yet
+/// to match anything (`None`) counts as keeping up: it's in its
+/// bootstrap / snapshot-install window, and treating an absent
+/// baseline as lag would demote every freshly-added voter. A leader
+/// with no log yet (`None`) trivially can't be ahead.
+fn peer_is_keeping_up(
+    leader_last_log: Option<u64>,
+    peer_log: &Option<LogId<NodeId>>,
+    max_healthy_lag: u64,
+) -> bool {
     match (leader_last_log, peer_log) {
-        (Some(leader_idx), Some(peer_log)) => leader_idx > peer_log.index,
-        _ => false,
+        (Some(leader_idx), Some(peer_log)) => {
+            leader_idx.saturating_sub(peer_log.index) <= max_healthy_lag
+        }
+        _ => true,
     }
 }
 
@@ -495,6 +536,9 @@ mod tests {
             unreachable_after: Duration::from_millis(100),
             live_after: Duration::from_millis(30),
             refusal_backoff: Duration::from_millis(200),
+            // Small window so tests can express "keeping up" vs
+            // "falling behind" with modest index gaps.
+            max_healthy_lag: 10,
         }
     }
 
@@ -526,7 +570,13 @@ mod tests {
         config: &LivenessConfig,
         apply_landed: bool,
     ) -> Option<EligibilityProposal> {
-        record_replication_progress(tracker, current_log, leader_last_log, now);
+        record_replication_progress(
+            tracker,
+            current_log,
+            leader_last_log,
+            config.max_healthy_lag,
+            now,
+        );
         let proposal = next_eligibility_proposal(tracker, now, config);
         match (proposal, apply_landed) {
             (Some(EligibilityProposal::Promote), true) => {
@@ -566,26 +616,85 @@ mod tests {
     }
 
     #[test]
-    fn peer_stuck_with_leader_ahead_proposes_demote_after_unreachable_after() {
+    fn peer_far_behind_leader_proposes_demote_after_unreachable_after() {
         // First sample: leader at 5, peer at 5, healthy.
-        // Subsequent samples: leader advances to 10, peer stuck at
-        // 5. After `unreachable_after` elapses, demote.
+        // Subsequent samples: leader runs to 50 (> max_healthy_lag
+        // ahead), peer stuck at 5. After `unreachable_after`
+        // elapses, demote.
         let cfg = fast_config();
         let t0 = Instant::now();
         let mut tracker = PeerTracker::for_eligible_peer();
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg);
-        // Leader runs ahead, peer doesn't follow.
+        // Leader runs far ahead, peer doesn't follow.
         let t1 = t0 + cfg.sample_interval;
-        let d1 = tick(&mut tracker, Some(log_id(1, 5)), Some(10), t1, &cfg);
+        let d1 = tick(&mut tracker, Some(log_id(1, 5)), Some(50), t1, &cfg);
         assert_eq!(d1, None, "unreachable_after hasn't elapsed yet");
         assert!(tracker.unreachable_since.is_some());
         // Past the threshold.
         let t2 = t1 + cfg.unreachable_after;
-        let d2 = tick(&mut tracker, Some(log_id(1, 5)), Some(10), t2, &cfg);
+        let d2 = tick(&mut tracker, Some(log_id(1, 5)), Some(50), t2, &cfg);
         assert_eq!(
             d2,
             Some(EligibilityProposal::Demote),
             "monitor demotes after unreachable_after"
+        );
+    }
+
+    #[test]
+    fn peer_inching_forward_while_falling_behind_is_still_demoted() {
+        // The bug this fixes: a peer whose match index advances every
+        // sample — but by far less than the leader gains — was seen
+        // as healthy because "it advanced", so its `unreachable_since`
+        // reset every tick and it was never demoted while its
+        // branches backed up. With lag measured as distance, a peer
+        // that keeps falling further behind is demoted.
+        let cfg = fast_config(); // max_healthy_lag = 10
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_eligible_peer();
+
+        // Sample 0: caught up.
+        let _ = tick(&mut tracker, Some(log_id(1, 100)), Some(100), t0, &cfg);
+        assert!(tracker.unreachable_since.is_none());
+
+        // Each sample the peer gains 1 entry; the leader gains 100,
+        // so the gap grows without bound. Across these samples the
+        // unreachable timer must stay set — the crux of the fix,
+        // since the old "did it advance?" check reset it every tick.
+        let mut peer_idx = 100u64;
+        let mut leader_idx = 100u64;
+        let mut t = t0;
+        for _ in 0..3 {
+            t += cfg.sample_interval;
+            peer_idx += 1;
+            leader_idx += 100;
+            let d = tick(
+                &mut tracker,
+                Some(log_id(1, peer_idx)),
+                Some(leader_idx),
+                t,
+                &cfg,
+            );
+            assert_eq!(d, None, "not demoted before unreachable_after elapses");
+            assert!(
+                tracker.unreachable_since.is_some(),
+                "an inching-but-falling-behind peer must stay flagged"
+            );
+        }
+
+        // Still inching, still falling behind, now past
+        // `unreachable_after` — demote.
+        let t_final = t + cfg.unreachable_after;
+        let d = tick(
+            &mut tracker,
+            Some(log_id(1, peer_idx + 1)),
+            Some(leader_idx + 100),
+            t_final,
+            &cfg,
+        );
+        assert_eq!(
+            d,
+            Some(EligibilityProposal::Demote),
+            "a peer that advances but keeps falling behind must be demoted"
         );
     }
 
@@ -686,21 +795,22 @@ mod tests {
     }
 
     #[test]
-    fn peer_advancing_clears_an_in_progress_unreachable_window() {
-        // Peer goes stuck, accumulates `unreachable_since`, then
-        // advances before the demotion threshold. The window
-        // resets — no demote.
+    fn peer_catching_up_clears_an_in_progress_unreachable_window() {
+        // Peer falls far behind, accumulates `unreachable_since`,
+        // then catches back inside the healthy lag window before the
+        // demotion threshold. The window resets — no demote.
         let cfg = fast_config();
         let t0 = Instant::now();
         let mut tracker = PeerTracker::for_eligible_peer();
         let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg);
         let t1 = t0 + cfg.sample_interval;
-        let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(10), t1, &cfg);
+        // Leader jumps 45 ahead (> max_healthy_lag) — peer is behind.
+        let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(50), t1, &cfg);
         assert!(tracker.unreachable_since.is_some());
-        // Peer recovers before unreachable_after elapses.
+        // Peer catches back to within the window before the threshold.
         let t2 = t1 + cfg.unreachable_after / 2;
-        let d = tick(&mut tracker, Some(log_id(1, 10)), Some(10), t2, &cfg);
-        assert_eq!(d, None, "advance before threshold = no demote");
+        let d = tick(&mut tracker, Some(log_id(1, 45)), Some(50), t2, &cfg);
+        assert_eq!(d, None, "back inside the lag window = no demote");
         assert!(tracker.unreachable_since.is_none());
     }
 
@@ -737,9 +847,9 @@ mod tests {
         // stuck sample, then enough time for `unreachable_after`.
         let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(5), t0, &cfg, true);
         let t1 = t0 + cfg.sample_interval;
-        let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(10), t1, &cfg, true);
+        let _ = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(50), t1, &cfg, true);
         let t2 = t1 + cfg.unreachable_after;
-        let first = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(10), t2, &cfg, false);
+        let first = tick_with_outcome(&mut tracker, Some(log_id(1, 5)), Some(50), t2, &cfg, false);
         assert_eq!(
             first,
             Some(EligibilityProposal::Demote),
@@ -752,11 +862,11 @@ mod tests {
 
         // Within the backoff window, the refusal must not re-fire
         // — otherwise the monitor would commit a raft log entry
-        // every sample tick on a persistent refusal (e.g. quorum
-        // floor).
+        // every sample tick on a persistent refusal (e.g.
+        // `VoterNotConfigured`).
         let t3 = t2 + cfg.sample_interval;
         assert!(t3 < t2 + cfg.refusal_backoff);
-        let throttled = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t3, &cfg);
+        let throttled = tick(&mut tracker, Some(log_id(1, 5)), Some(50), t3, &cfg);
         assert_eq!(
             throttled, None,
             "within refusal_backoff window, monitor must not re-attempt"

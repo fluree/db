@@ -282,6 +282,111 @@ independent of `t` — the value of `--at --explain` is in honoring the
 contract and consistency with the query path, not in producing
 materially different plans.
 
+**Remote Cypher queries (`fluree query --cypher --remote`)** POST to the same
+**ledger-scoped** query endpoint with a Cypher content type:
+
+```
+POST {api_base_url}/query/{ledger}
+Content-Type: application/cypher
+
+MATCH (n:Person) RETURN n.name LIMIT 10
+```
+
+- The server detects Cypher by content type (`application/cypher` or
+  `application/opencypher`, `FlureeHeaders::is_cypher_query`) and, for reads,
+  executes via `execute_cypher_ledger`. The body is sent **verbatim** — either
+  raw Cypher text or a `{cypher, params}` envelope — and the server splits it
+  with `fluree_db_api::extract_cypher_envelope`, exactly like the write path.
+- The response is a cypher-json document
+  (`application/vnd.fluree.cypher+json`) — the Neo4j-compatible tabular shape.
+- **Read auth and policy** ride exactly as for the SPARQL/JSON-LD read paths:
+  the URL path drives the bearer's `can_read(ledger)` check, and the
+  [Policy Enforcement Contract](#policy-enforcement-contract) headers apply.
+  `Fluree-Min-T` read-your-writes freshness is honored against the path ledger.
+- **Limitations over remote** (the CLI errors with a pointer to `--direct` for
+  local execution): the server renders cypher-json only — the other `--format`
+  shapes (`json`/`typed-json`/`csv`/`tsv`) are built client-side on the local
+  path and are not negotiated remotely — and the endpoint has no `--at`
+  time-travel handling for Cypher. `--explain`, `--bench`, and `--track*` are
+  not supported for Cypher on any transport.
+
+### `fluree load` (CSV → batched upserts), `fluree update --format cypher`
+
+`fluree load` streams a local CSV into a ledger as a sequence of batched
+upserts. **No new endpoint is required** — every batch is an ordinary write to
+the existing ledger-scoped update endpoint:
+
+- `POST {api_base_url}/update/{ledger}`
+
+The CLI holds the file: it reads and parses the CSV client-side, groups rows
+into batches (`--batch-size`, default 1000), and sends **one request per
+batch**, each committing independently. The server never receives the CSV, a
+file path, or a URL — only ordinary parameterized writes. There is no
+transactionality across batches; a mid-load failure leaves earlier batches
+committed.
+
+The per-row template is either Cypher or JSON-LD, which selects the request
+content type:
+
+**Cypher template (`--cypher`, and `fluree update --format cypher`):**
+
+```
+POST {api_base_url}/update/{ledger}
+Content-Type: application/cypher
+
+{ "cypher": "UNWIND $batch AS row\nMERGE (n:Person {id: row.id}) SET n.name = row.name",
+  "params": { "batch": [ {"id":"1","name":"Alice"}, {"id":"2","name":"Bob"} ] } }
+```
+
+- The server must detect Cypher by content type — the reference server matches
+  `application/cypher` **or** `application/opencypher`
+  (`FlureeHeaders::is_cypher_query`).
+- The body is the `{cypher, params}` envelope (the Neo4j-HTTP shape). A body
+  that isn't a JSON object with a `cypher` key is treated as **raw Cypher text**
+  with no params, so plain-text Cypher also works. The reference server splits
+  it with `fluree_db_api::extract_cypher_envelope` and executes via
+  `execute_cypher_transact`.
+- **Cypher writes must be ledger-scoped.** The connection-scoped
+  `POST /update` (no `{ledger}` in the path) rejects Cypher with `400` because
+  it can't resolve a target ledger — the CLI always targets the ledger-scoped
+  route.
+- The `$batch` parameter and the `UNWIND $batch AS row …` wrapper are
+  constructed entirely client-side; the server just substitutes `$param`
+  references and runs the statement. Empty CSV cells arrive as JSON `null`.
+- A standalone `fluree update --format cypher --remote <name>` (a single
+  statement, not a CSV load) POSTs to the same `POST /update/{ledger}` route.
+  The CLI sends the body **verbatim** — raw Cypher or a `{cypher, params}`
+  envelope — and the server splits it the same way. The response is the usual
+  commit receipt, or a cypher-json document when the statement carries a
+  `RETURN`. **Policy flags are rejected** for Cypher writes on both transports
+  (`--policy*` has no enforcement path for Cypher writes yet); other write
+  auth rides normally.
+
+**JSON-LD template (`--jsonld`):**
+
+```
+POST {api_base_url}/update/{ledger}
+Content-Type: application/json
+
+{ "@context": {"ex": "http://example.org/"},
+  "where":  {"@id": "?s", "ex:id": "?id"},
+  "insert": {"@id": "?s", "ex:email": "?email"},
+  "values": [ ["?id", "?email"], [ ["1","alice@ex.org"], ["2","bob@ex.org"] ] ] }
+```
+
+- This is an ordinary JSON-LD update — identical to `fluree update` with a
+  JSON-LD body. The CLI injects the batch as the update's `values` clause, one
+  `?<column>` variable per CSV column; the template author references those
+  variables in `where` / `insert` / `delete`. Empty CSV cells arrive as `""`
+  (the JSON-LD `values` parser rejects nulls).
+- No special handling beyond the existing JSON-LD update path.
+
+**Auth, policy, and tracking** ride exactly as for `fluree update` above: normal
+write auth (`can_write(ledger)`), and the [Policy Enforcement
+Contract](#policy-enforcement-contract) headers (plus JSON-LD body `opts` for
+the JSON-LD template). A server that already implements `POST /update/{ledger}`
+for `fluree update` supports `fluree load` with no additional work.
+
 ### `fluree multi-query`
 
 - `POST {api_base_url}/multi-query`
@@ -378,13 +483,41 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 
 ### `fluree branch diff` (read-only merge preview)
 
-- `GET {api_base_url}/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=`
+- `GET {api_base_url}/merge-preview/*ledger?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_changes=&max_changes=&changes_after_subject=`
 
 Returns the rich diff between two branches — ahead/behind commit summaries,
-common ancestor, conflict keys, fast-forward eligibility — without mutating
-any nameservice or content-store state. See
+common ancestor, conflict keys, fast-forward eligibility, and (opt-in) the
+aggregate netted change set — without mutating any nameservice or
+content-store state. See
 [Merge Preview Contract](#merge-preview-contract) for the full semantic and
 response-shape spec.
+
+**Using the CLI from external apps.** Applications that shell out to the
+CLI (instead of calling the HTTP endpoint directly) get the same diff
+through `fluree branch diff`:
+
+```bash
+# Machine-readable: --json emits the raw preview (identical shape to the
+# HTTP response body, including the `changes` object when requested)
+fluree branch diff dev --changes --json --remote origin -l mydb
+
+# Cheap stats-only probe (exact net counts, no payload)
+fluree branch diff dev --stat --json --remote origin -l mydb
+
+# Page a large diff: read changes.next_cursor from the previous output
+fluree branch diff dev --changes --json --changes-after '<subject-iri>' \
+  --remote origin -l mydb
+```
+
+The CLI resolves the same three modes everywhere: `--remote <name>` targets
+a configured remote server, tracked ledgers route through their tracking
+remote automatically, and plain local ledgers compute the preview in-process
+(no server required). In all modes `--json` output is the `MergePreview`
+JSON documented below, so an app can parse one shape regardless of where
+the ledger lives. Errors surface as a nonzero exit code with a message on
+stderr. Note the CLI cap convention: `--max-changes 0` means *unbounded*
+(local mode only; over HTTP the server's cap still applies) — stats-only
+mode is spelled `--stat`, which maps to `max_changes=0` on the wire.
 
 ## Policy Enforcement Contract
 
@@ -647,6 +780,7 @@ terminal `end` record arrive in order.
 GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
    &max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
    &include_conflict_details={bool}&strategy={strategy}
+   &include_changes={bool}&max_changes={n}&changes_after_subject={iri}
 ```
 
 | Parameter | Type | Required | Server default | Description |
@@ -659,6 +793,9 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
 | `include_conflicts` | bool | No | `true` | When `false`, the conflict computation is skipped |
 | `include_conflict_details` | bool | No | `false` | When `true`, include source/target flake values for the returned conflict keys |
 | `strategy` | string | No | `take-both` | Strategy used for resolution labels in `conflicts.details[].resolution`; one of `take-both`, `abort`, `take-source`, `take-branch` |
+| `include_changes` | bool | No | `false` | When `true`, include the aggregate netted change set as `changes` |
+| `max_changes` | integer | No | `500` | Cap on `changes.entries`, counted in flakes, cut at subject boundaries. `0` = stats-only mode |
+| `changes_after_subject` | string | No | — | Pagination cursor (full subject IRI); requires `include_changes=true` |
 
 Auth follows the same pattern as `GET /branch/*ledger` (read-only): require
 a Bearer when `data_auth.mode == required`; gate on `can_read(ledger)`;
@@ -733,6 +870,28 @@ These rules are not negotiable; the CLI and other clients depend on them:
    example, reject when `target.t - ancestor.t` exceeds some threshold)
    or document that clients should pass `include_conflicts=false` for a
    cheaper preview.
+11. **Aggregate change set.** When `include_changes == true`, populate
+   `changes` with the source side's `ancestor..source_head` flakes **netted
+   per fact** — full fact identity is `(subject, predicate, object,
+   datatype, graph, language tag, list index)`; a fact survives only when
+   its oldest and newest in-range ops agree (net op = newest op), so
+   create-then-delete and delete-then-restore churn never appears. The set
+   is strategy-independent (raw source-vs-ancestor delta, before conflict
+   resolution). `assert_count` / `retract_count` / `subject_count` are
+   exact and unaffected by the cap. `entries` groups changes by subject,
+   subjects ordered by **full IRI** (this ordering is the pagination
+   contract); flakes use the same resolved tuple shape as conflict
+   details. The `max_changes` cap counts flakes but cuts at subject
+   boundaries — never split a subject across pages; a single subject
+   larger than the cap is returned whole. `max_changes=0` is stats-only
+   (exact counts, empty `entries`, `truncated=true` when changes exist).
+   When truncated by the cap, `next_cursor` is the last returned subject
+   IRI; `changes_after_subject` resumes strictly after it. The reference
+   server clamps `max_changes` with hard max `5_000`
+   (`PREVIEW_HARD_MAX_CHANGES`). `changes_after_subject` without
+   `include_changes=true` is a `400`. The source-side commit replay is
+   shared with the conflict walk when both are requested; each pagination
+   page re-pays the replay cost.
 
 ### Response (`200 OK`)
 
@@ -777,6 +936,21 @@ These rules are not negotiable; the CLI and other clients depend on them:
         }
       }
     ]
+  },
+  // present iff include_changes=true
+  "changes": {
+    "assert_count": 2,
+    "retract_count": 1,
+    "subject_count": 1,
+    "entries": [
+      {
+        "subject": "http://example.org/ns/alice",
+        "asserts": [["ex:alice", "ex:status", "active", "xsd:string", true]],
+        "retracts": [["ex:alice", "ex:status", "archived", "xsd:string", false]]
+      }
+    ],
+    "truncated": false
+    // "next_cursor": "<subject IRI>" — only when truncated by the cap
   }
 }
 ```

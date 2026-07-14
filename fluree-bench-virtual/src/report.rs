@@ -140,7 +140,9 @@ pub fn print_table(meta: &RunMeta, records: &[RunRecord]) {
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
     for r in &rows {
-        let native_ms = r.native_ms.map_or_else(|| "-".to_string(), |m| m.to_string());
+        let native_ms = r
+            .native_ms
+            .map_or_else(|| "-".to_string(), |m| m.to_string());
         let ratio = r
             .ratio
             .map_or_else(|| "-".to_string(), |x| format!("{x:.2}x"));
@@ -161,7 +163,10 @@ pub fn print_table(meta: &RunMeta, records: &[RunRecord]) {
             r.query_id, native_ms, virt_ms, ratio, r.scans, r.load_table, pruned_select, hash
         );
         if !r.spans_missing.is_empty() {
-            println!("         !! expected virtual spans missing: {:?}", r.spans_missing);
+            println!(
+                "         !! expected virtual spans missing: {:?}",
+                r.spans_missing
+            );
         }
     }
 }

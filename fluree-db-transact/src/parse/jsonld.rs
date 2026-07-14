@@ -392,6 +392,19 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
             &from_named_aliases,
         );
         let templates = parse_update_templates_with_ctx(delete_val, &mut ctx)?;
+        // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
+        // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
+        // fresh node, so the retraction would skolemize a brand-new SID and
+        // silently match nothing. Stable `_:fdb-` ids already resolved to
+        // constant SIDs above, so they pass. Nested objects without `@id`
+        // also mint blank nodes and are rejected the same way.
+        if let Some(label) = first_blank_node_in_templates(&templates) {
+            return Err(TransactError::Parse(format!(
+                "blank node {label} is not allowed in delete: it denotes a fresh node and can \
+                 never match existing data. Use a variable bound by \"where\", a concrete @id, \
+                 or a Fluree stable _:fdb- id."
+            )));
+        }
         if templates.is_empty() {
             // An explicit empty delete (e.g. `"delete": []`) is a no-op.
             // Still reject structurally-empty deletes like `{ "@id": "ex:foo" }`.
@@ -804,6 +817,22 @@ impl<'a> TemplateParseCtx<'a> {
             self.strict_compact_iri,
         )?)
     }
+}
+
+/// First blank-node label appearing in any template term, if one exists.
+///
+/// Used to reject blank nodes in delete templates (they can never match
+/// stored data). Stable `_:fdb-` ids never appear here — the term parsers
+/// resolve them to constant `TemplateTerm::Sid`s.
+fn first_blank_node_in_templates(templates: &[TripleTemplate]) -> Option<&str> {
+    templates.iter().find_map(|t| {
+        [&t.subject, &t.predicate, &t.object]
+            .into_iter()
+            .find_map(|term| match term {
+                TemplateTerm::BlankNode(label) => Some(label.as_str()),
+                _ => None,
+            })
+    })
 }
 
 fn parse_update_templates_with_ctx(

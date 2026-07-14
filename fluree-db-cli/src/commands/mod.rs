@@ -18,6 +18,7 @@ pub mod info;
 pub mod init;
 pub mod insert;
 pub mod list;
+pub mod load;
 pub mod log;
 pub mod mcp;
 pub mod memory;

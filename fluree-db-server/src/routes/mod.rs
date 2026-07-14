@@ -23,7 +23,7 @@ mod storage_proxy;
 mod stream_query;
 mod stubs;
 mod submissions;
-mod transact;
+pub(crate) mod transact;
 #[cfg(feature = "shacl")]
 mod validate;
 
@@ -102,9 +102,17 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let v1_admin_protected_writes =
         v1_admin_protected_writes.route("/iceberg/map", post(iceberg::iceberg_map));
 
-    // Forward to the Raft leader (when running in Raft mode) before
-    // admin-token auth: an out-of-date follower with stale credentials
-    // shouldn't reject a request the leader would accept.
+    // Admin auth runs BEFORE leader-forward. Axum runs the
+    // last-applied layer outermost, so `require_admin_token`
+    // (applied after `apply_leader_forward`) is the outer layer and
+    // gates the request first: an unauthenticated write is rejected
+    // locally with 401 rather than relayed across the cluster —
+    // forwarding an unauthenticated request would be a DoS
+    // amplifier. The trade-off is that a follower whose JWKS cache
+    // is stale during a key rotation 401s a request the leader
+    // would accept, instead of forwarding it; that's the safe
+    // direction to fail. The gate is pinned by
+    // `tests/admin_auth_layering.rs`.
     let v1_admin_protected_writes = apply_leader_forward(v1_admin_protected_writes, &state);
 
     let v1_admin_protected_writes = v1_admin_protected_writes
@@ -304,7 +312,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         // Health check
         .route("/health", get(admin::health))
-        // Diagnostic: binary-scan leaflet-loop counters (GET, ?reset=true to zero)
         // Auth discovery (CLI auto-configuration)
         .route("/.well-known/fluree.json", get(admin::discovery))
         // Versioned API
@@ -320,6 +327,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Add state
     let mut router = router.with_state(state.clone());
+
+    // Enforce the configured request-body cap on every public
+    // route. Without this layer, body-consuming extractors fall
+    // back to axum's 2 MiB default and `--body-limit` is a no-op.
+    router = router.layer(axum::extract::DefaultBodyLimit::max(
+        state.config.body_limit,
+    ));
 
     // Add CORS if enabled
     if state.config.cors_enabled {

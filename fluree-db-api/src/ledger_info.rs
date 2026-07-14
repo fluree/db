@@ -1028,19 +1028,24 @@ fn redact_json_secrets(value: &mut JsonValue) -> bool {
 
 /// Redact auth/credential leaves from a stored graph-source config JSON string.
 ///
-/// Returns the original string unchanged when it is not JSON or contains no
+/// Returns the original string unchanged when it parses as JSON and contains no
 /// secrets, so non-secret configs (e.g. BM25/Vector) stay byte-for-byte
 /// identical; otherwise returns a re-serialized, redacted JSON string.
+///
+/// FAILS CLOSED: input that does not parse as JSON (unreachable today — every
+/// stored config is serde-serialized) is replaced wholesale rather than echoed,
+/// because a redactor that cannot inspect its input must not forward it.
 pub fn redact_graph_source_config(config: &str) -> String {
     match serde_json::from_str::<JsonValue>(config) {
         Ok(mut value) => {
             if redact_json_secrets(&mut value) {
-                serde_json::to_string(&value).unwrap_or_else(|_| config.to_string())
+                serde_json::to_string(&value)
+                    .unwrap_or_else(|_| "\"[redacted:unserializable]\"".to_string())
             } else {
                 config.to_string()
             }
         }
-        Err(_) => config.to_string(),
+        Err(_) => "\"[redacted:unparseable]\"".to_string(),
     }
 }
 
@@ -2119,7 +2124,9 @@ impl<'a> LedgerInfoBuilder<'a> {
 
     /// Execute the ledger info request.
     pub async fn execute(self) -> crate::Result<JsonValue> {
-        // A committed ledger takes the native path (byte-identical output). When
+        // A committed ledger takes the native path (shape/value-identical output;
+        // the typed refactor re-emits nested stats-map keys in sorted order —
+        // same keys/values, no consumer parses positionally). When
         // the id is not a committed ledger, fall back to a graph-source lookup so
         // a virtual (query-in-place) R2RML/Iceberg dataset returns real
         // classes/properties/counts derived from metadata rather than a stub.
@@ -2132,6 +2139,12 @@ impl<'a> LedgerInfoBuilder<'a> {
                     .lookup_graph_source(&self.ledger_id)
                     .await
                 {
+                    // NOTE(perf, PR-8 catalog floor): this virtual branch
+                    // bypasses the leaflet-cache response memoization below, so
+                    // every call (e.g. MCP `get_data_model`) redoes the budgeted
+                    // loadTable count fan-out. Bounded + low-traffic today;
+                    // fold into the response cache keyed on the graph-source
+                    // fingerprint + snapshot when the catalog floor lands.
                     return build_graph_source_info(self.fluree, &gs).await;
                 }
                 return Err(e);
@@ -2755,5 +2768,107 @@ mod tests {
         );
         assert!(redacted.contains("https://polaris.example.com"));
         assert!(redacted.contains("svc-client"));
+    }
+
+    /// The redactor FAILS CLOSED: input it cannot parse as JSON (unreachable
+    /// today — every stored config is serde-serialized) is replaced wholesale,
+    /// never echoed. A redactor that cannot inspect its input must not forward it.
+    #[test]
+    fn test_redact_graph_source_config_fails_closed_on_non_json() {
+        let out = redact_graph_source_config("client_secret=oops-not-json");
+        assert!(
+            !out.contains("oops-not-json"),
+            "non-JSON input must not be echoed: {out}"
+        );
+        assert!(out.contains("redacted"), "placeholder expected: {out}");
+    }
+
+    /// VALUE-PATTERN BACKSTOP over EVERY `AuthConfig` variant: serialize each
+    /// through the real storage path (`IcebergGsConfig::to_json`) with sentinel
+    /// secrets in every secret-capable field (literal AND env-var-default
+    /// `ConfigValue` forms) and assert redaction strips every sentinel. The
+    /// wildcard-free `match` below is deliberate: adding a new `AuthConfig`
+    /// variant stops this test compiling, forcing an explicit redaction
+    /// decision (allowlist entry + a case here) before the variant can ship —
+    /// the compile-time guard `is_secret_config_key`'s exact-match allowlist
+    /// otherwise lacks.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn test_every_auth_config_variant_redacts_on_emit() {
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+        use fluree_db_iceberg::{ConfigValue, IcebergGsConfig};
+
+        const SENTINEL_A: &str = "sentinel-secret-value-AAAA";
+        const SENTINEL_B: &str = "sentinel-secret-value-BBBB";
+
+        let auths: Vec<AuthConfig> = vec![
+            AuthConfig::None,
+            AuthConfig::Bearer {
+                token: ConfigValue::literal(SENTINEL_A),
+            },
+            AuthConfig::Bearer {
+                token: ConfigValue::Dynamic {
+                    env_var: Some("MY_TOKEN".to_string()),
+                    java_property: None,
+                    default_val: Some(SENTINEL_B.to_string()),
+                },
+            },
+            AuthConfig::OAuth2ClientCredentials {
+                token_url: "https://c.example.com/tokens".to_string(),
+                client_id: ConfigValue::literal("svc-client"),
+                client_secret: ConfigValue::Dynamic {
+                    env_var: Some("MY_SECRET".to_string()),
+                    java_property: None,
+                    default_val: Some(SENTINEL_A.to_string()),
+                },
+                scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+                audience: None,
+            },
+        ];
+
+        // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
+        // fails compilation here until it is covered above and its secret
+        // fields earn allowlist entries.
+        for auth in &auths {
+            match auth {
+                AuthConfig::None
+                | AuthConfig::Bearer { .. }
+                | AuthConfig::OAuth2ClientCredentials { .. } => {}
+            }
+        }
+
+        for auth in auths {
+            let cfg = IcebergGsConfig {
+                catalog: CatalogConfig::Rest {
+                    catalog_type: "rest".to_string(),
+                    uri: "https://polaris.example.com".to_string(),
+                    auth,
+                    warehouse: None,
+                },
+                table: TableConfig::Identifier("ns.t".to_string()),
+                io: IoConfig::default(),
+                mapping: None,
+            };
+            let stored = cfg.to_json().unwrap();
+            let redacted = redact_graph_source_config(&stored);
+            assert!(
+                !redacted.contains(SENTINEL_A) && !redacted.contains(SENTINEL_B),
+                "sentinel secret survived redaction: {redacted}"
+            );
+            // Env-var NAMES survive (they identify, not authenticate).
+            if stored.contains("MY_TOKEN") {
+                assert!(
+                    redacted.contains("MY_TOKEN"),
+                    "env var name lost: {redacted}"
+                );
+            }
+            if stored.contains("MY_SECRET") {
+                assert!(
+                    redacted.contains("MY_SECRET"),
+                    "env var name lost: {redacted}"
+                );
+            }
+        }
     }
 }

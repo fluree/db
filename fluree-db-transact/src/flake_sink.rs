@@ -7,6 +7,8 @@ use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
+#[cfg(test)]
+use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
@@ -211,9 +213,17 @@ impl GraphSink for FlakeSink<'_> {
                 id
             }
             None => {
-                // Anonymous blank node — unique counter-based label
+                // Anonymous blank node (`[]`, bare `~` reifiers, `{| … |}`
+                // blocks) — unique counter-based label. The leading '-'
+                // keeps the minted namespace disjoint from every
+                // user-written label: BLANK_NODE_LABEL must start with
+                // PN_CHARS_U | [0-9], so `_:-b1` can never lex (`_:b1` +
+                // an anonymous mint used to skolemize identically and
+                // silently merge). '-' stays legal medially, so the full
+                // skolemized `fdb-{txn}--b{N}` label still serializes and
+                // re-imports as the same stored node.
                 self.blank_counter += 1;
-                let label = format!("b{}", self.blank_counter);
+                let label = format!("-b{}", self.blank_counter);
                 let sid = self.skolemize(&label);
                 self.add_term(ResolvedTerm::Sid(sid))
             }
@@ -259,6 +269,46 @@ impl GraphSink for FlakeSink<'_> {
     fn emit_list_item(&mut self, subject: TermId, predicate: TermId, object: TermId, index: i32) {
         if let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) {
             self.flakes.push(flake);
+        }
+    }
+
+    fn supports_reified_triples(&self) -> bool {
+        true
+    }
+
+    /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
+    /// built by the shared [`crate::generate::flakes::reified_triple_bundle`]
+    /// (bit-identical with the JSON-LD `@annotation` lowering and with
+    /// `ImportSink`'s bulk path). The base triple has already been emitted
+    /// by the parser via `emit_triple`.
+    fn emit_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+    ) {
+        let Some(s) = self.resolve_sid(subject) else {
+            return;
+        };
+        let Some(p) = self.resolve_sid(predicate) else {
+            return;
+        };
+        let Some((o, dtc)) = self.resolve_object(object) else {
+            return;
+        };
+        let Some(ann) = self.resolve_sid(reifier) else {
+            return;
+        };
+
+        match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
+            Ok(bundle) => self.flakes.extend(bundle),
+            Err(e) => {
+                tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
+                if self.invariant_error.is_none() {
+                    self.invariant_error = Some(e);
+                }
+            }
         }
     }
 }
@@ -382,6 +432,25 @@ mod tests {
     }
 
     #[test]
+    fn test_anonymous_mints_disjoint_from_user_label_namespace() {
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        // A user-written `_:b1` and the first anonymous mint used to
+        // skolemize to the SAME Sid (`{txn}-b1`), silently merging user
+        // data into system-minted `[]`/reifier nodes. TermId inequality
+        // (above) never caught it — the collision was at the Sid level.
+        let user = sink.term_blank(Some("b1"));
+        let anon = sink.term_blank(None);
+        let user_sid = sink.resolve_sid(user).expect("user blank is a Sid");
+        let anon_sid = sink.resolve_sid(anon).expect("anon blank is a Sid");
+        assert_ne!(
+            user_sid, anon_sid,
+            "anonymous mint must never share a Sid with a user `_:b1`"
+        );
+    }
+
+    #[test]
     fn test_iri_object_as_ref() {
         let (mut ns, t, txn_id) = make_sink();
         let mut sink = FlakeSink::new(&mut ns, t, txn_id);
@@ -469,6 +538,90 @@ mod tests {
         // dt must be xsd:long (declared), not xsd:integer (inferred)
         let expected_dt = ns.sid_for_iri(xsd::LONG);
         assert_eq!(flakes[0].dt, expected_dt);
+    }
+
+    #[test]
+    fn test_reified_triple_emits_jsonld_compatible_bundle() {
+        // Ref-object, default-graph: exactly Subject + Predicate + Object —
+        // NO f:reifiesDatatype (the JSON-LD-compatible shape), and the
+        // bundle decodes back to the base edge's EdgeKey.
+        use fluree_db_core::namespaces::{
+            is_reifies_datatype, is_reifies_object, is_reifies_predicate, is_reifies_subject,
+        };
+
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let s = sink.term_iri("http://example.org/alice");
+        let p = sink.term_iri("http://example.org/worksFor");
+        let o = sink.term_iri("http://example.org/acme");
+        let r = sink.term_iri("http://example.org/reifier");
+        sink.emit_triple(s, p, o);
+        sink.emit_reified_triple(s, p, o, r);
+
+        let flakes = sink.finish().expect("no invariant violation");
+        // 1 base + 3 bundle flakes.
+        assert_eq!(flakes.len(), 4);
+        let base = &flakes[0];
+        let bundle = &flakes[1..];
+        assert!(bundle.iter().any(|f| is_reifies_subject(&f.p)));
+        assert!(bundle.iter().any(|f| is_reifies_predicate(&f.p)));
+        assert!(bundle.iter().any(|f| is_reifies_object(&f.p)));
+        assert!(
+            !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
+            "JSON-LD-compatible bundle must omit f:reifiesDatatype: {bundle:?}"
+        );
+        for f in bundle {
+            assert!(f.op, "assertion bundle");
+            assert_eq!(f.t, t);
+            assert!(f.g.is_none(), "plain Turtle is default-graph");
+        }
+        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        assert_eq!(
+            decoded,
+            EdgeKey::from_flake(base),
+            "decoded EdgeKey must equal the base edge's EdgeKey"
+        );
+    }
+
+    #[test]
+    fn test_reified_triple_lang_literal_bundle_carries_lang() {
+        // Language-tagged object: bundle adds f:reifiesLang and the
+        // f:reifiesObject flake carries m.lang (cascade symmetry with the
+        // JSON-LD writer — see EdgeKey docs / BUGS-2).
+        use fluree_db_core::namespaces::{is_reifies_lang, is_reifies_object};
+
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let s = sink.term_iri("http://example.org/alice");
+        let p = sink.term_iri("http://example.org/label");
+        let o = sink.term_literal("chat", Datatype::rdf_lang_string(), Some("fr"));
+        let r = sink.term_iri("http://example.org/reifier");
+        sink.emit_triple(s, p, o);
+        sink.emit_reified_triple(s, p, o, r);
+
+        let flakes = sink.finish().expect("no invariant violation");
+        // 1 base + 4 bundle flakes (S, P, O, Lang).
+        assert_eq!(flakes.len(), 5);
+        let base = &flakes[0];
+        let bundle = &flakes[1..];
+        let obj = bundle
+            .iter()
+            .find(|f| is_reifies_object(&f.p))
+            .expect("f:reifiesObject");
+        assert_eq!(
+            obj.m.as_ref().and_then(|m| m.lang.as_deref()),
+            Some("fr"),
+            "f:reifiesObject must carry m.lang"
+        );
+        let lang = bundle
+            .iter()
+            .find(|f| is_reifies_lang(&f.p))
+            .expect("f:reifiesLang");
+        assert!(matches!(&lang.o, FlakeValue::String(l) if l == "fr"));
+        let decoded = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+        assert_eq!(decoded, EdgeKey::from_flake(base));
     }
 
     #[test]

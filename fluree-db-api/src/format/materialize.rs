@@ -19,11 +19,20 @@ use fluree_db_query::binding::Binding;
 /// - If an encoded binding is encountered but `result.binary_graph` is `None`
 /// - If the binary store cannot resolve the encoded IDs
 pub(crate) fn materialize_binding(result: &QueryResult, binding: &Binding) -> Result<Binding> {
+    materialize_with_graph(result.binary_graph.as_ref(), binding)
+}
+
+/// [`materialize_binding`] for callers holding the binary graph directly
+/// rather than a whole `QueryResult`.
+pub(crate) fn materialize_with_graph(
+    gv: Option<&BinaryGraphView>,
+    binding: &Binding,
+) -> Result<Binding> {
     if !binding.is_encoded() {
         return Ok(binding.clone());
     }
 
-    let gv = result.binary_graph.as_ref().ok_or_else(|| {
+    let gv = gv.ok_or_else(|| {
         FormatError::InvalidBinding(
             "Encountered encoded binding during formatting but QueryResult has no binary_graph"
                 .to_string(),

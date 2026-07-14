@@ -405,6 +405,7 @@ pub async fn run(
             &tracking,
             at,
             policy,
+            dirs,
         )
         .await;
     }
@@ -1356,12 +1357,14 @@ fn print_stream_footer(outcome: &query_stream::StreamOutcome, elapsed: std::time
     eprintln!("({})", parts.join(", "));
 }
 
-/// Execute a Cypher read query against a local ledger view.
+/// Execute a Cypher read query against a local ledger view or a remote server.
 ///
 /// Cypher rides a separate API method (`query_cypher`) and renders its
-/// SELECT-shaped results as JSON-LD (the documented default). Remote/HTTP
-/// execution is not yet available, so a server-routed ledger errors with a
-/// pointer to `--direct`.
+/// SELECT-shaped results as cypher-json (the documented default). A local
+/// ledger executes in-process; a server-routed (`Tracked`) ledger POSTs the
+/// `application/cypher` envelope to the ledger-scoped `/query` endpoint. The
+/// remote path emits cypher-json only — the server does not negotiate the
+/// other `--format` shapes for Cypher, so those (and `--at`) require `--direct`.
 #[allow(clippy::too_many_arguments)]
 async fn run_cypher_query(
     mode: LedgerMode,
@@ -1372,6 +1375,7 @@ async fn run_cypher_query(
     tracking: &TrackingFlags,
     at: Option<&str>,
     policy: &PolicyArgs,
+    dirs: &FlureeDir,
 ) -> CliResult<()> {
     if explain {
         return Err(CliError::Usage(
@@ -1402,13 +1406,23 @@ async fn run_cypher_query(
 
     let (fluree, alias) = match mode {
         LedgerMode::Local { fluree, alias } => (fluree, alias),
-        LedgerMode::Tracked { .. } => {
-            return Err(CliError::Usage(
-                "Cypher queries are only supported on local ledgers; the HTTP Cypher \
-                 endpoint is not yet available.\n  \
-                 Retry with --direct to bypass the server route."
-                    .to_string(),
-            ));
+        LedgerMode::Tracked {
+            client,
+            remote_alias,
+            remote_name,
+            ..
+        } => {
+            return run_remote_cypher_query(
+                *client,
+                &remote_alias,
+                &remote_name,
+                content,
+                output_format,
+                at,
+                policy,
+                dirs,
+            )
+            .await;
         }
     };
 
@@ -1477,6 +1491,69 @@ async fn run_cypher_query(
     let output = output::format_result(
         &formatted_json,
         display_format,
+        detect::QueryFormat::JsonLd,
+        None,
+    )?;
+    println!("{}", output.text);
+    print_footer(output.total_rows, None, elapsed);
+    Ok(())
+}
+
+/// Execute a Cypher read query against a remote server via the ledger-scoped
+/// `/query` endpoint (`Content-Type: application/cypher`).
+///
+/// The server renders Cypher as cypher-json only — it does not negotiate the
+/// RDF JSON-LD / typed-json / delimited shapes the local path builds
+/// client-side, nor does it honor `--at` for Cypher. Those cases are rejected
+/// here with a pointer to `--direct` (local execution). Policy flags ride
+/// through as request headers + body opts via `with_policy`.
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_cypher_query(
+    client: crate::remote_client::RemoteLedgerClient,
+    remote_alias: &str,
+    remote_name: &str,
+    content: &str,
+    output_format: OutputFormatKind,
+    at: Option<&str>,
+    policy: &PolicyArgs,
+    dirs: &FlureeDir,
+) -> CliResult<()> {
+    // Only cypher-json-producing formats have a remote equivalent: the default
+    // global `--format table` and explicit `--format cypher-json`. RDF JSON-LD,
+    // typed-json, and delimited (csv/tsv) are rendered client-side on the local
+    // path and have no server negotiation yet.
+    if !matches!(
+        output_format,
+        OutputFormatKind::Table | OutputFormatKind::CypherJson
+    ) {
+        return Err(CliError::Usage(format!(
+            "--format {output_format} is not supported for Cypher over a remote server; \
+             the server renders Cypher as cypher-json.\n  \
+             Use --format cypher-json, or retry with --direct for local rendering."
+        )));
+    }
+    // The remote Cypher endpoint has no time-travel handling; local execution does.
+    if at.is_some() {
+        return Err(CliError::Usage(
+            "--at is not supported for Cypher over a remote server; retry with --direct."
+                .to_string(),
+        ));
+    }
+
+    // Attach policy flags so headers + body opts ride through on the request.
+    let client = client.with_policy(policy.clone());
+
+    // The body is sent verbatim (raw Cypher or a `{cypher, params}` envelope);
+    // the server extracts the envelope itself.
+    let timer = Instant::now();
+    let result = client.query_cypher(remote_alias, content).await?;
+    let elapsed = timer.elapsed();
+
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let output = output::format_result(
+        &result,
+        OutputFormatKind::CypherJson,
         detect::QueryFormat::JsonLd,
         None,
     )?;

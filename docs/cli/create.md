@@ -18,9 +18,11 @@ fluree create <LEDGER> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--from <PATH>` | Import data from a file (Turtle, N-Triples, N-Quads, TriG, or JSON-LD), optionally `.gz`- or `.zst`-compressed. N-Triples (`.nt`) parses as Turtle; N-Quads (`.nq`) converts to TriG (named graphs supported). A `.flpack` archive (see [export](export.md)) is restored wholesale instead — full ledger including its prebuilt index. |
+| `--from <PATH>` | Import data from a file (Turtle, N-Triples, N-Quads, TriG, or JSON-LD), optionally `.gz`- or `.zst`-compressed. N-Triples (`.nt`) parses as Turtle; N-Quads (`.nq`) converts to TriG (named graphs supported). Also accepts property-graph inputs: `.csv` (neo4j-admin header convention) and `.cypher`/`.cyp`/`.cql` scripts of `CREATE` / `MATCH … CREATE` statements — see below. A `.flpack` archive (see [export](export.md)) is restored wholesale instead — full ledger including its prebuilt index. |
 | `--remote <NAME>` | Create on a remote server instead of locally. With no `--from`, creates an empty ledger. With `--from <archive>.flpack`, streams the archive to the server's import endpoint to restore the ledger remotely. Other `--from` formats are not supported remotely — export to `.flpack` first, or create locally then [publish](publish.md). |
 | `--memory [PATH]` | Import memory history from a git-tracked `.fluree-memory/` directory. Defaults to the current repo if no path is given. Mutually exclusive with `--from`. |
+| `--edge-properties <MODE>` | CSV/Cypher import: how properties on a relationship (edge) are stored. `annotated` (default) keeps them as RDF 1.2 / LPG `@annotation` — readable from Cypher rel-vars (`r.prop`) and SPARQL (`{\| … \|}`); `plain` drops them (every edge a plain triple); `nary` is not implemented yet. |
+| `--base-iri <IRI>` | CSV/Cypher import: base IRI namespace for minted ids, predicates, and classes. CSV defaults to `http://example.org/`; Cypher defaults to **bare names** (namespace 0), which zero-config Cypher queries read directly. |
 | `--no-user` | Exclude user-scoped memories (`.local/user.ttl`) from `--memory` import |
 | `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` or `.nt` file. |
 | `--leaflet-rows <N>` | Rows per leaflet in the binary index (default: 25000). Larger values produce fewer, bigger leaflets — less I/O per scan, more memory per read. |
@@ -38,6 +40,40 @@ Creates a new empty ledger with the given name and sets it as the active ledger.
 Use `--from` to create a ledger pre-populated with data from a Turtle, N-Triples, N-Quads, TriG, or JSON-LD file (or a directory of same-format files). Any input may be gzip- or zstd-compressed and is decoded transparently (`data.ttl.gz`, `dump.nq.zst`, mixed directories — the underlying RDF extension classifies the file). N-Triples (`.nt`) is a strict subset of Turtle and is parsed by the same parser. N-Quads (`.nq`) and TriG (`.trig`) support named graphs — queryable after import via the `#<graph-iri>` fragment. For large Turtle/N-Triples files (including `.ttl.gz`/`.nt.gz`), the CLI splits work into chunks and runs parallel parse threads — though compressed inputs decode single-threaded; TriG/N-Quads/JSON-LD use a serial path. Tune with `--memory-budget-mb` and `--parallelism` if needed.
 
 **Directory imports (`.ttl`/`.nt`)** are *rechunked by bytes* rather than one-chunk-per-file: large files are sub-split at statement boundaries and many small files are coalesced into `~chunk_size` work items. This keeps the import fully parallel and bounds the number of commits and sorted index runs regardless of how the data is packaged — so a directory of one big file, or of hundreds of tiny shards, both import at full speed. Coalescing engages automatically once a directory holds more than 64 sub-`chunk_size` files; a file containing a labeled blank node (`_:`) or an `@base` directive is never coalesced (it would change RDF document scope) and is imported as its own chunk. Set `FLUREE_IMPORT_COALESCE_THRESHOLD=<n>` to change the gate (`0` disables coalescing — every file becomes its own commit, the legacy behavior). Directories containing any `.trig`/`.nq`/`.jsonld` continue to use the per-file serial path.
+
+### Property-graph imports (CSV & Cypher)
+
+Two property-graph front-ends convert to JSON-LD on the fly and load through
+the same chunked bulk-import pipeline (not the per-transaction write path):
+
+- **CSV** (`.csv`, single file or a directory of them) — node/relationship
+  files in the **neo4j-admin import** header convention (`:ID`, `:LABEL`,
+  `:START_ID`/`:END_ID`, `:TYPE`, `name:type` columns).
+- **Cypher scripts** (`.cypher`/`.cyp`/`.cql`, single file or a directory) —
+  `;`-separated statements in the Neo4j/Memgraph dump idiom: `CREATE` for
+  nodes (and inline paths), and `MATCH (n:L {key: v}), (m:L {key: v})
+  CREATE (n)-[:T]->(m)` for edges between property-matched nodes. Anything
+  else (`MERGE`, `SET`, reads, …) fails the import with its line number.
+
+Cypher node identity is derived from the property sets `MATCH` uses per label
+(learned in a first pass): `CREATE (:User {id: 42, …})` and
+`MATCH (n:User {id: 42})` both resolve to the stable id `User/42`, so edges
+land on the right nodes without replaying statements transactionally. Two
+`CREATE`s with the same key values therefore merge into one node, and an edge
+whose endpoint was never created is skipped (with a warning count) — `MATCH`
+finds nothing, so the statement is a no-op.
+
+By default a Cypher import emits **bare names** (namespace 0), the same
+resolution Cypher's own read/write paths use — the imported data is queryable
+with zero configuration (`MATCH (n:User {id: 42}) RETURN n`). Pass
+`--base-iri` to mint prefixed IRIs instead (RDF-compat; pair it with a ledger
+default context carrying the matching `@vocab`). CSV always mints prefixed
+IRIs (`--base-iri`, default `http://example.org/`).
+
+Edge properties follow `--edge-properties` in both formats. Note the Cypher
+read contract: a plain (property-less) edge is visible to `(a)-[:T]->(b)` and
+`-->` patterns, but a relationship *variable* (`(a)-[r:T]->(b)`) only binds
+reified (annotated) edges.
 
 Use `--memory` to import your project's developer memory history into a time-travel-capable Fluree ledger. Each git commit that touched `.fluree-memory/repo.ttl` (and `.local/user.ttl` unless `--no-user` is set) becomes a Fluree transaction. The git commit message, SHA, and author date are stored as transaction metadata, so you can correlate Fluree `t` values with git history.
 
@@ -63,6 +99,12 @@ fluree create mydb --from initial.jsonld
 
 # Create with explicit memory and parallelism for a large Turtle file
 fluree create mydb --from large.ttl --memory-budget-mb 4096 --parallelism 8
+
+# Bulk-load a Cypher dump (e.g. a Memgraph/Neo4j benchmark dataset)
+fluree create pokec --from pokec_import.cypher
+
+# Bulk-load neo4j-admin convention CSVs, dropping edge properties
+fluree create snb --from ./csv-dir --edge-properties plain
 
 # Restore a .flpack archive into a new local ledger (any name)
 fluree create restored-db --from mydb.flpack

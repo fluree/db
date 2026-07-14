@@ -2298,3 +2298,116 @@ GRAPH <http://example.org/graphs/g1> {
         "named-graph bound-predicate must match; got {named_rows}"
     );
 }
+
+// ============================================================================
+// Incremental index over an imported (sketch-less) base preserves stats
+// ============================================================================
+
+/// Bulk import writes `sketch_ref: None`, so the first incremental index
+/// cannot merge base property stats from HLL registers. It must fall back to
+/// seeding from the base root's persisted per-graph property stats —
+/// previously it started from zero and persisted DELTA-ONLY stats (base
+/// predicates vanished; net-zero churn kept count 0), which silently broke
+/// stats-driven folds and planner selectivities on every imported ledger
+/// after its first post-import write.
+#[tokio::test]
+async fn incremental_index_over_import_preserves_property_stats() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r#"
+@prefix ex: <http://example.org/ns/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice a ex:User ;
+    schema:name "Alice" ;
+    schema:age 42 .
+
+ex:bob a ex:User ;
+    schema:name "Bob" ;
+    schema:age 22 .
+"#;
+    let ttl_path = write_ttl(data_dir.path(), "people.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let ledger_id = "test/import-incr-stats:main";
+    fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import should succeed");
+
+    // Post-import writes: net-zero churn on schema:age (retract+assert) and
+    // a brand-new predicate.
+    let ledger = fluree.ledger(ledger_id).await.expect("load after import");
+    let ctx = json!({"ex": "http://example.org/ns/", "schema": "http://schema.org/"});
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "delete": [{"@id": "ex:alice", "schema:age": 42}],
+                "insert": [{"@id": "ex:alice", "schema:age": 43}]
+            }),
+        )
+        .await
+        .expect("churn age")
+        .ledger;
+    let _ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "@id": "ex:cam", "@type": "ex:User", "ex:brandnew": 7
+            }),
+        )
+        .await
+        .expect("new predicate")
+        .ledger;
+
+    // Incremental index (base exists, small gap).
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let db = fluree.db(ledger_id).await.expect("incremental view");
+
+    let stats = db.snapshot.stats.as_ref().expect("index stats");
+    let g0 = stats
+        .graphs
+        .as_ref()
+        .expect("per-graph stats")
+        .iter()
+        .find(|g| g.g_id == 0)
+        .expect("default graph stats");
+    let prop_sum: u64 = g0.properties.iter().map(|p| p.count).sum();
+    assert_eq!(
+        prop_sum,
+        g0.flakes,
+        "per-graph property counts must cover all flakes; entries: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.count))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        g0.properties.iter().all(|p| p.count > 0),
+        "net-zero churn must keep the base count: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.count))
+            .collect::<Vec<_>>()
+    );
+    // ndv floors survive even though the base had no HLL registers.
+    assert!(
+        g0.properties.iter().any(|p| p.ndv_values >= 2),
+        "base ndv estimates must not reset: {:?}",
+        g0.properties
+            .iter()
+            .map(|p| (p.p_id, p.ndv_values))
+            .collect::<Vec<_>>()
+    );
+}

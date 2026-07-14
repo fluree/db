@@ -1192,3 +1192,420 @@ async fn preview_conflict_keys_are_sorted() {
         assert!(pair[0] <= pair[1], "conflict keys must be sorted");
     }
 }
+
+// =============================================================================
+// 9. Aggregate change set (include_changes)
+// =============================================================================
+
+/// Standard fixture: `main` holds ex:alice, branch `dev` is created from it.
+async fn setup_branch(fluree: &fluree_db_api::Fluree) -> fluree_db_api::LedgerState {
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let base = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+    });
+    let main_ledger = fluree.insert(ledger, &base).await.unwrap().ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    main_ledger
+}
+
+fn changes_opts() -> MergePreviewOpts {
+    MergePreviewOpts {
+        include_changes: true,
+        ..MergePreviewOpts::default()
+    }
+}
+
+#[tokio::test]
+async fn changes_absent_by_default() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    let preview = fluree.merge_preview("mydb", "dev", None).await.unwrap();
+    assert!(preview.changes.is_none());
+}
+
+#[tokio::test]
+async fn changes_fast_forward_basic() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, changes_opts())
+        .await
+        .unwrap();
+
+    assert!(preview.fast_forward);
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 1);
+    assert_eq!(changes.retract_count, 0);
+    assert_eq!(changes.subject_count, 1);
+    assert!(!changes.truncated);
+    assert!(changes.next_cursor.is_none());
+    assert_eq!(changes.entries.len(), 1);
+    let entry = &changes.entries[0];
+    assert_eq!(entry.subject, "http://example.org/ns/bob");
+    assert_eq!(entry.asserts.len(), 1);
+    assert!(entry.retracts.is_empty());
+    assert!(entry.asserts[0].op);
+}
+
+#[tokio::test]
+async fn changes_netting_cancels_churn() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    // Create bob, then delete him again — the net diff must be empty.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .update(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "delete": {"@id": "ex:bob", "ex:name": "Bob"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, changes_opts())
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 0, "churn must cancel");
+    assert_eq!(changes.retract_count, 0);
+    assert_eq!(changes.subject_count, 0);
+    assert!(changes.entries.is_empty());
+    assert!(!changes.truncated);
+    // The commits themselves are still visible — only the net diff is empty.
+    assert!(preview.ahead.count >= 2);
+}
+
+#[tokio::test]
+async fn changes_update_shows_both_sides() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    // Rename alice on the branch: net = one retract (old) + one assert (new).
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "delete": {"@id": "ex:alice", "ex:name": "Alice"},
+                "insert": {"@id": "ex:alice", "ex:name": "Alicia"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, changes_opts())
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 1);
+    assert_eq!(changes.retract_count, 1);
+    assert_eq!(changes.subject_count, 1);
+    assert_eq!(changes.entries.len(), 1);
+    let entry = &changes.entries[0];
+    assert_eq!(entry.subject, "http://example.org/ns/alice");
+    assert_eq!(entry.asserts.len(), 1);
+    assert_eq!(entry.retracts.len(), 1);
+}
+
+#[tokio::test]
+async fn changes_pure_retract_of_ancestor_fact() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "delete": {"@id": "ex:alice", "ex:name": "Alice"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, changes_opts())
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 0);
+    assert_eq!(changes.retract_count, 1);
+    assert_eq!(changes.subject_count, 1);
+    assert!(!changes.entries[0].retracts[0].op);
+}
+
+#[tokio::test]
+async fn changes_truncation_cuts_at_subject_boundary_and_pages() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    // Three subjects, two facts each: 6 net flakes total.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:s1", "ex:name": "One",   "ex:rank": 1},
+                    {"@id": "ex:s2", "ex:name": "Two",   "ex:rank": 2},
+                    {"@id": "ex:s3", "ex:name": "Three", "ex:rank": 3},
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let page = |after: Option<String>| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .merge_preview_with(
+                    "mydb",
+                    "dev",
+                    None,
+                    MergePreviewOpts {
+                        include_changes: true,
+                        max_changes: Some(2),
+                        changes_after_subject: after,
+                        ..MergePreviewOpts::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .changes
+                .expect("include_changes was set")
+        }
+    };
+
+    // Page 1: cap of 2 flakes fits exactly one subject.
+    let p1 = page(None).await;
+    assert_eq!(p1.assert_count, 6, "counts stay exact under the cap");
+    assert_eq!(p1.subject_count, 3);
+    assert_eq!(p1.entries.len(), 1);
+    assert!(p1.truncated);
+    let cursor1 = p1.next_cursor.clone().expect("truncated page has cursor");
+    assert_eq!(cursor1, p1.entries[0].subject);
+
+    // Page 2 resumes strictly after the cursor.
+    let p2 = page(Some(cursor1.clone())).await;
+    assert_eq!(p2.entries.len(), 1);
+    assert!(p2.entries[0].subject > cursor1, "no overlap between pages");
+    assert!(p2.truncated);
+
+    // Page 3 is the last.
+    let p3 = page(p2.next_cursor.clone()).await;
+    assert_eq!(p3.entries.len(), 1);
+    assert!(!p3.truncated);
+    assert!(p3.next_cursor.is_none());
+
+    let mut subjects: Vec<String> = [&p1, &p2, &p3]
+        .iter()
+        .flat_map(|p| p.entries.iter().map(|e| e.subject.clone()))
+        .collect();
+    let ordered = subjects.clone();
+    subjects.sort();
+    subjects.dedup();
+    assert_eq!(subjects.len(), 3, "pages cover all subjects exactly once");
+    assert_eq!(ordered, subjects, "subjects arrive in IRI order");
+}
+
+#[tokio::test]
+async fn changes_stats_only_mode() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:bob", "ex:name": "Bob"},
+                    {"@id": "ex:carol", "ex:name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                max_changes: Some(0),
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 2);
+    assert_eq!(changes.retract_count, 0);
+    assert_eq!(changes.subject_count, 2);
+    assert!(changes.entries.is_empty());
+    assert!(changes.truncated, "payload was withheld");
+    assert!(changes.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn changes_alongside_conflicts_and_details() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main_ledger = setup_branch(&fluree).await;
+
+    // Diverge: both sides rename alice.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "A-dev"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .insert(
+            main_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "A-main"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                include_conflict_details: true,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(!preview.fast_forward);
+    assert!(preview.conflicts.count >= 1);
+    assert!(!preview.conflicts.details.is_empty());
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 1, "source-side net assert");
+    assert_eq!(changes.entries[0].subject, "http://example.org/ns/alice");
+}
+
+#[tokio::test]
+async fn changes_cursor_requires_include_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    setup_branch(&fluree).await;
+
+    let err = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                changes_after_subject: Some("http://example.org/ns/a".to_string()),
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("changes_after_subject requires include_changes"));
+}
+
+#[tokio::test]
+async fn changes_multi_value_predicate_nets_independently() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    // Alice starts with two nicknames.
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:nick": ["Al", "Ali"]}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // Remove one of the two values on the branch.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(
+            dev,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "delete": {"@id": "ex:alice", "ex:nick": "Al"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, changes_opts())
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("include_changes was set");
+    assert_eq!(changes.assert_count, 0);
+    assert_eq!(
+        changes.retract_count, 1,
+        "only the deleted value appears; the sibling value is untouched"
+    );
+}

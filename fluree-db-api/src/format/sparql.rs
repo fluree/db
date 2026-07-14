@@ -26,6 +26,7 @@ use crate::QueryResult;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::VarRegistry;
+use fluree_graph_ir::canonical_xsd_double;
 use serde_json::{json, Map, Value as JsonValue};
 
 /// Format query results in SPARQL 1.1 JSON format
@@ -410,19 +411,8 @@ fn write_literal(
 fn scalar_lexical(val: &FlakeValue) -> String {
     match val {
         FlakeValue::Long(n) => n.to_string(),
-        FlakeValue::Double(d) => {
-            if d.is_nan() {
-                "NaN".to_string()
-            } else if d.is_infinite() {
-                if d.is_sign_positive() {
-                    "INF".to_string()
-                } else {
-                    "-INF".to_string()
-                }
-            } else {
-                d.to_string()
-            }
-        }
+        // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved).
+        FlakeValue::Double(d) => canonical_xsd_double(*d),
         FlakeValue::Boolean(b) => b.to_string(),
         FlakeValue::Vector(v) => serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()),
         FlakeValue::Json(json_str) => json_str.clone(),
@@ -545,22 +535,11 @@ fn format_binding(
                     "datatype": dt_iri
                 }))),
                 FlakeValue::Double(d) => {
-                    // Handle special float values
-                    let value_str = if d.is_nan() {
-                        "NaN".to_string()
-                    } else if d.is_infinite() {
-                        if d.is_sign_positive() {
-                            "INF".to_string()
-                        } else {
-                            "-INF".to_string()
-                        }
-                    } else {
-                        d.to_string()
-                    };
+                    // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved).
                     // Include datatype for numeric literals.
                     Ok(Some(json!({
                         "type": "literal",
-                        "value": value_str,
+                        "value": canonical_xsd_double(*d),
                         "datatype": dt_iri
                     })))
                 }
@@ -1151,5 +1130,42 @@ mod tests {
             formatted,
             json!({"type": "literal", "value": "-INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"})
         );
+    }
+
+    /// Finite doubles serialize in the W3C canonical `xsd:double` lexical form
+    /// (issue #1445 / W3C csv03): `1.0E6`, not Rust-Display `1000000`.
+    #[test]
+    fn test_format_binding_double_canonical_form() {
+        let compactor = make_test_compactor();
+        let result = make_test_result();
+
+        for (d, expected) in [
+            (1_000_000.0, "1.0E6"),
+            (1e30, "1.0E30"),
+            (0.001, "1.0E-3"),
+            (-3.0, "-3.0E0"),
+            (0.0, "0.0E0"),
+        ] {
+            let binding = Binding::lit(FlakeValue::Double(d), Sid::new(2, "double"));
+            let formatted = format_binding(&result, &binding, &compactor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                formatted,
+                json!({"type": "literal", "value": expected, "datatype": "http://www.w3.org/2001/XMLSchema#double"})
+            );
+        }
+
+        // Both the DOM and the streaming writer emit the canonical form.
+        let r = make_result(
+            &["?d"],
+            vec![vec![Binding::lit(
+                FlakeValue::Double(1_000_000.0),
+                Sid::new(2, "double"),
+            )]],
+        );
+        assert_parity(&r, &compactor);
+        let out = format_string(&r, &compactor, &FormatterConfig::sparql_json()).unwrap();
+        assert!(out.contains(r#""value":"1.0E6""#), "{out}");
     }
 }

@@ -375,6 +375,187 @@ async fn test_sparql_delete_data_named_graph() {
 }
 
 #[tokio::test]
+async fn test_sparql_delete_where_named_graph_block() {
+    // W3C dawg-delete-where-02/04/06 shape: DELETE WHERE { GRAPH <g> { ... } }
+    // matches inside the named graph and retracts only there. Routed through
+    // the same Modify-with-GRAPH lowering as DELETE/INSERT ... WHERE.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/sparql-delete-where-graph:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // Same subject/predicate in the default graph, g1 (two values),
+            // and g2 — only g1's matches may be deleted.
+            let insert = r#"
+                INSERT DATA {
+                    <https://example.org/a> <https://example.org/knows> "default" .
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/a> <https://example.org/knows> "b" .
+                        <https://example.org/a> <https://example.org/knows> "c" .
+                        <https://example.org/a> <https://example.org/name> "Alice" .
+                    }
+                    GRAPH <https://example.org/g/2> {
+                        <https://example.org/a> <https://example.org/knows> "d" .
+                    }
+                }
+            "#;
+            let r1 = run_sparql_update(&fluree, ledger, insert).await;
+            trigger_index_and_wait(&handle, ledger_id, r1.receipt.t).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+            let delete = r"
+                DELETE WHERE {
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/a> <https://example.org/knows> ?b
+                    }
+                }
+            ";
+            let r2 = run_sparql_update(&fluree, ledger, delete).await;
+            assert!(r2.receipt.t > r1.receipt.t, "delete should bump t");
+            trigger_index_and_wait(&handle, ledger_id, r2.receipt.t).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+
+            let values = |from: &str, pred: &str| {
+                let q = json!({
+                    "from": from,
+                    "select": "?o",
+                    "where": {"@id": "https://example.org/a", pred: "?o"}
+                });
+                let fluree = &fluree;
+                let ledger = &ledger;
+                async move {
+                    let results = fluree.query_connection(&q).await.expect("query");
+                    let arr = results.to_jsonld(&ledger.snapshot).expect("jsonld");
+                    arr.as_array().expect("array").clone()
+                }
+            };
+
+            // g1: both `knows` triples retracted, unrelated predicate kept.
+            let g1 = format!("{ledger_id}#https://example.org/g/1");
+            let knows_g1 = values(&g1, "https://example.org/knows").await;
+            assert!(
+                knows_g1.is_empty(),
+                "g1 `knows` triples should be deleted, got {knows_g1:?}"
+            );
+            let name_g1 = values(&g1, "https://example.org/name").await;
+            assert_eq!(name_g1, vec!["Alice"], "non-matching g1 triple survives");
+
+            // g2 and the default graph are untouched.
+            let g2 = format!("{ledger_id}#https://example.org/g/2");
+            let knows_g2 = values(&g2, "https://example.org/knows").await;
+            assert_eq!(knows_g2, vec!["d"], "g2 must not be affected");
+            let knows_default = values(ledger_id, "https://example.org/knows").await;
+            assert_eq!(
+                knows_default,
+                vec!["default"],
+                "default graph must not be affected"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_jsonld_delete_where_named_graph_scoped() {
+    // JSON-LD parity for DELETE WHERE { GRAPH <g> { ... } } (three-surface
+    // rule: the graph-scoped delete-where capability must be expressible and
+    // guarded on the JSON-LD surface too). Top-level "graph" scopes both the
+    // WHERE match and the delete template to the named graph.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/jsonld-delete-where-graph:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            let insert = r#"
+                INSERT DATA {
+                    <https://example.org/a> <https://example.org/knows> "default" .
+                    GRAPH <https://example.org/g/1> {
+                        <https://example.org/a> <https://example.org/knows> "b" .
+                        <https://example.org/a> <https://example.org/knows> "c" .
+                    }
+                    GRAPH <https://example.org/g/2> {
+                        <https://example.org/a> <https://example.org/knows> "d" .
+                    }
+                }
+            "#;
+            let r1 = run_sparql_update(&fluree, ledger, insert).await;
+            trigger_index_and_wait(&handle, ledger_id, r1.receipt.t).await;
+
+            // JSON-LD analogue of DELETE WHERE { GRAPH <g1> { :a :knows ?b } }.
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+            let update = json!({
+                "graph": "https://example.org/g/1",
+                "where": { "@id": "https://example.org/a", "https://example.org/knows": "?b" },
+                "delete": { "@id": "https://example.org/a", "https://example.org/knows": "?b" }
+            });
+            let r2 = fluree
+                .update(ledger, &update)
+                .await
+                .expect("graph-scoped JSON-LD delete");
+            assert!(r2.receipt.t > r1.receipt.t, "delete should bump t");
+            trigger_index_and_wait(&handle, ledger_id, r2.receipt.t).await;
+
+            let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+
+            let values = |from: &str| {
+                let q = json!({
+                    "from": from,
+                    "select": "?o",
+                    "where": {"@id": "https://example.org/a", "https://example.org/knows": "?o"}
+                });
+                let fluree = &fluree;
+                let ledger = &ledger;
+                async move {
+                    let results = fluree.query_connection(&q).await.expect("query");
+                    let arr = results.to_jsonld(&ledger.snapshot).expect("jsonld");
+                    arr.as_array().expect("array").clone()
+                }
+            };
+
+            let g1 = format!("{ledger_id}#https://example.org/g/1");
+            let knows_g1 = values(&g1).await;
+            assert!(
+                knows_g1.is_empty(),
+                "g1 `knows` triples should be deleted, got {knows_g1:?}"
+            );
+            let g2 = format!("{ledger_id}#https://example.org/g/2");
+            assert_eq!(values(&g2).await, vec!["d"], "g2 must not be affected");
+            assert_eq!(
+                values(ledger_id).await,
+                vec!["default"],
+                "default graph must not be affected"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
 async fn test_insert_data_same_triple_default_and_named_one_txn() {
     // Graph-scoping regression: the SAME (s,p,o) asserted in both the default
     // graph and a named graph within ONE transaction must produce TWO distinct

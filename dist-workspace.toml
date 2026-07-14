@@ -27,5 +27,8 @@ publish-jobs = ["homebrew"]
 allow-dirty = ["ci"]
 
 [dist.github-custom-runners]
-aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+# Native ARM64 build on the org's larger hosted runner (8-core/32GB). The
+# default 4-core/16GB ubuntu-24.04-arm OOM'd at link time under fat LTO
+# (runner lost communication ~59min); 32GB gives ~2x headroom.
+aarch64-unknown-linux-gnu = "asset-publisher-8-core"
 x86_64-unknown-linux-gnu = "ubuntu-24.04"

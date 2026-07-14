@@ -1146,6 +1146,7 @@ async fn main() -> Result<()> {
                 max_commits: Some(0),       // counts only — no commit summaries
                 max_conflict_keys: Some(0),
                 include_conflicts: false,
+                ..MergePreviewOpts::default()
             },
         )
         .await?;
@@ -1162,6 +1163,7 @@ async fn main() -> Result<()> {
                 max_commits: None,
                 max_conflict_keys: None,
                 include_conflicts: true,
+                ..MergePreviewOpts::default()
             },
         )
         .await?;
@@ -1169,6 +1171,74 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+#### The aggregate change set (`include_changes`)
+
+For a merge-request "Changes" panel, `include_changes` returns the **net**
+set of facts the merge would apply — the source side's commits since the
+common ancestor folded per fact, with internally-cancelling assert/retract
+pairs removed. A branch with 40 commits that ultimately changes 12 facts
+reviews as 12 facts:
+
+```rust
+use fluree_db_api::{FlureeBuilder, MergePreviewOpts, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // ... create ledger, branch, transact on dev, etc.
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                // Cap the payload at 100 flakes, cut at subject boundaries.
+                // Some(0) = stats-only; None = unbounded (Rust-only escape hatch).
+                max_changes: Some(100),
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await?;
+
+    let changes = preview.changes.expect("include_changes was set");
+    println!(
+        "+{} -{} across {} subject(s)",
+        changes.assert_count, changes.retract_count, changes.subject_count,
+    );
+    for entry in &changes.entries {
+        println!("{}: +{} -{}", entry.subject, entry.asserts.len(), entry.retracts.len());
+    }
+    // Page through a large diff: subjects are ordered by full IRI and a
+    // truncated page carries a resume cursor.
+    if let Some(cursor) = changes.next_cursor {
+        let _next_page = fluree
+            .merge_preview_with(
+                "mydb",
+                "dev",
+                None,
+                MergePreviewOpts {
+                    include_changes: true,
+                    max_changes: Some(100),
+                    changes_after_subject: Some(cursor),
+                    ..MergePreviewOpts::default()
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+```
+
+Exact counts (`assert_count` / `retract_count` / `subject_count`) are never
+truncated, so a UI can render "showing X of Y". The change set is
+strategy-independent — the raw source-vs-ancestor delta before conflict
+resolution; conflicting keys resolve per `conflicts.details`. Each page
+re-pays the source-side replay cost (there is no cache), matching what the
+merge itself would pay.
 
 #### What the caps do (and don't) control
 

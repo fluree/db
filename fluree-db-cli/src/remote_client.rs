@@ -1241,6 +1241,74 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Execute a Cypher write (with optional parameters) via the update
+    /// endpoint. The body is the `{cypher, params}` envelope the server's
+    /// `application/cypher` handler accepts — the transport behind `fluree
+    /// load`'s batched `UNWIND $batch` upserts.
+    pub async fn update_cypher(
+        &self,
+        ledger: &str,
+        cypher: &str,
+        params: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        let envelope = match params {
+            Some(p) => serde_json::json!({ "cypher": cypher, "params": p }),
+            None => serde_json::json!({ "cypher": cypher }),
+        };
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Json(&envelope)),
+        )
+        .await
+    }
+
+    /// Execute a Cypher write via the ledger-scoped `update` endpoint, sending
+    /// `body` verbatim as the `application/cypher` payload — either raw Cypher
+    /// text or a `{cypher, params}` envelope; the server reads it as a string
+    /// and extracts the envelope itself. Unlike [`update_cypher`], the caller
+    /// need not pre-split the envelope. Returns the server's response JSON — a
+    /// commit receipt for a plain write, or a cypher-json document when the
+    /// statement carries a `RETURN`.
+    pub async fn update_cypher_body(
+        &self,
+        ledger: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    /// Execute a Cypher read query via the ledger-scoped `query` endpoint.
+    ///
+    /// `body` is sent verbatim as the `application/cypher` payload — either raw
+    /// Cypher text or a `{cypher, params}` envelope; the server's handler reads
+    /// it as a string and extracts the envelope itself. The response is a
+    /// cypher-json document (`application/vnd.fluree.cypher+json`), which
+    /// `send_json` parses as JSON.
+    pub async fn query_cypher(
+        &self,
+        ledger: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("query", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
     // =========================================================================
     // Ledger Info / Exists
     // =========================================================================
@@ -2132,7 +2200,7 @@ impl RemoteLedgerClient {
 
     /// Read-only merge preview between two branches on the remote server.
     ///
-    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=`.
+    /// Calls `GET {base_url}/merge-preview/{ledger}?source=&target=&max_commits=&max_conflict_keys=&include_conflicts=&include_conflict_details=&strategy=&include_changes=&max_changes=&changes_after_subject=`.
     /// The ledger path segment is URL-encoded (via [`op_url`](Self::op_url))
     /// so names containing spaces, `?`, `#`, `%`, etc. produce well-formed URLs.
     #[allow(clippy::too_many_arguments)]
@@ -2146,6 +2214,9 @@ impl RemoteLedgerClient {
         include_conflicts: Option<bool>,
         include_conflict_details: Option<bool>,
         strategy: Option<&str>,
+        include_changes: Option<bool>,
+        max_changes: Option<usize>,
+        changes_after_subject: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("merge-preview", ledger);
         let mut sep = '?';
@@ -2193,6 +2264,20 @@ impl RemoteLedgerClient {
                 &mut sep,
                 "strategy",
                 urlencoding::encode(s).into_owned(),
+            );
+        }
+        if let Some(b) = include_changes {
+            push(&mut url, &mut sep, "include_changes", b.to_string());
+        }
+        if let Some(n) = max_changes {
+            push(&mut url, &mut sep, "max_changes", n.to_string());
+        }
+        if let Some(c) = changes_after_subject {
+            push(
+                &mut url,
+                &mut sep,
+                "changes_after_subject",
+                urlencoding::encode(c).into_owned(),
             );
         }
 

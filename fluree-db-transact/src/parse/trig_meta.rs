@@ -613,14 +613,23 @@ impl<'a> TrigMetaParser<'a> {
         }
     }
 
+    /// Resolve a potentially relative IRI reference against `@base` per
+    /// RFC 3986 §5, via the shared `fluree_vocab::iri` resolver — the same
+    /// semantics as the Turtle parser and SPARQL prologue handling. The old
+    /// `!iri.contains(':')` + concat heuristic mis-resolved sibling
+    /// references (`<sibling.ttl>` was appended, not merged), `<//host/x>`,
+    /// `</rooted>`, and dot-segments, and mis-classified colon-in-path
+    /// relatives (`<a/b:c>`) as absolute. Without a `@base`, relative
+    /// references stay as written (ledger-local names) — this import path's
+    /// historical behavior, which also keeps the relative `<#txn-meta>`
+    /// sentinel matching `TXN_META_GRAPH_IRI` exactly.
     fn resolve_iri(&self, iri: &str) -> String {
-        // Simple resolution - if relative and base is set, resolve against base
-        if let Some(base) = &self.base {
-            if !iri.contains(':') {
-                return format!("{base}{iri}");
+        match &self.base {
+            Some(base) if !fluree_vocab::iri::is_absolute_iri(iri) => {
+                fluree_vocab::iri::resolve_iri(base, iri)
             }
+            _ => iri.to_string(),
         }
-        iri.to_string()
     }
 
     fn expand_prefixed_name(&self, prefix: &str, local: &str) -> Result<String> {
@@ -696,6 +705,33 @@ impl<'a> TrigMetaParser<'a> {
         Ok(())
     }
 
+    /// Clean, specific rejection for RDF 1.2 star constructs inside TriG
+    /// `GRAPH` blocks (TriG-star). Turtle-star asserting forms are supported
+    /// on the default-graph Turtle ingest paths; star-inside-a-named-graph
+    /// is deferred (it needs `f:reifiesGraph`-carrying bundles through this
+    /// structured-triple path). Kept as its own helper so a future TriG-star
+    /// implementation (or the D-8 builder-path routing) replaces one site.
+    fn trig_star_deferred_error(&self) -> TransactError {
+        TransactError::UnsupportedFeature(
+            "RDF 1.2 Turtle-star constructs ('<< … >>', '{| … |}', '~ reifier', \
+             '<<( … )>>') inside TriG GRAPH blocks (TriG-star) are deferred; \
+             Turtle-star asserting forms are supported in default-graph Turtle only"
+                .to_string(),
+        )
+    }
+
+    /// True when the current token opens/continues an RDF 1.2 star construct.
+    fn at_star_token(&self) -> bool {
+        !self.is_at_end()
+            && matches!(
+                self.current().kind,
+                TokenKind::ReifiedTripleStart
+                    | TokenKind::TripleTermStart
+                    | TokenKind::AnnotationOpen
+                    | TokenKind::Tilde
+            )
+    }
+
     fn parse_triple(&mut self) -> Result<Vec<ParsedTriple>> {
         // Parse subject
         let subject = self.parse_subject()?;
@@ -765,6 +801,7 @@ impl<'a> TrigMetaParser<'a> {
                 self.advance();
                 Ok(TermValue::BlankNode(label.to_string()))
             }
+            _ if self.at_star_token() => Err(self.trig_star_deferred_error()),
             _ => Err(TransactError::Parse(format!(
                 "expected subject, found {:?}",
                 self.current().kind
@@ -809,10 +846,17 @@ impl<'a> TrigMetaParser<'a> {
 
     fn parse_object_list(&mut self) -> Result<Vec<ObjectValue>> {
         let mut objects = vec![self.parse_object()?];
+        if self.at_star_token() {
+            // `~ reifier` / `{| … |}` annotation tail on a named-graph triple.
+            return Err(self.trig_star_deferred_error());
+        }
 
         while self.check(&TokenKind::Comma) {
             self.advance();
             objects.push(self.parse_object()?);
+            if self.at_star_token() {
+                return Err(self.trig_star_deferred_error());
+            }
         }
 
         Ok(objects)
@@ -904,6 +948,7 @@ impl<'a> TrigMetaParser<'a> {
                 self.advance();
                 Ok(ObjectValue::Boolean(false))
             }
+            _ if self.at_star_token() => Err(self.trig_star_deferred_error()),
             _ => Err(TransactError::Parse(format!(
                 "expected object, found {:?}",
                 self.current().kind
@@ -1459,6 +1504,66 @@ GRAPH <http://example.org/my-graph> {
     }
 
     #[test]
+    fn test_base_resolves_relative_references_rfc3986() {
+        // bplatz's PR-1454 case: this is the production TriG import path,
+        // and a document-IRI @base with a sibling relative reference must
+        // MERGE paths per RFC 3986 §5 — the old concat heuristic produced
+        // "http://ex.org/data/doc.trigsibling.ttl".
+        let mut ns = test_registry();
+        let input = r#"
+@base <http://ex.org/data/doc.trig> .
+@prefix ex: <http://example.org/> .
+
+GRAPH <sibling.ttl> {
+    ex:alice ex:name "Alice" .
+}
+
+GRAPH <#annotations> {
+    ex:alice ex:note "fragment-named graph" .
+}
+
+GRAPH </rooted> {
+    ex:alice ex:note "root-relative graph" .
+}
+
+GRAPH <urn:absolute:g> {
+    ex:alice ex:note "absolute passthrough" .
+}
+"#;
+
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        let iris: Vec<&str> = result.named_graphs.iter().map(|g| g.iri.as_str()).collect();
+        assert_eq!(
+            iris,
+            vec![
+                "http://ex.org/data/sibling.ttl",
+                "http://ex.org/data/doc.trig#annotations",
+                "http://ex.org/rooted",
+                "urn:absolute:g",
+            ],
+            "RFC 3986 §5 resolution on the TriG import path"
+        );
+    }
+
+    #[test]
+    fn test_relative_references_without_base_stay_as_written() {
+        // Ledger-local names: without @base, relative references pass
+        // through verbatim (also keeps the `<#txn-meta>` sentinel intact —
+        // covered by the txn-meta tests above).
+        let mut ns = test_registry();
+        let input = r#"
+@prefix ex: <http://example.org/> .
+
+GRAPH <local-graph> {
+    ex:alice ex:name "Alice" .
+}
+"#;
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert_eq!(result.named_graphs.len(), 1);
+        assert_eq!(result.named_graphs[0].iri, "local-graph");
+    }
+
+    #[test]
     fn test_multiple_named_graphs() {
         let mut ns = test_registry();
         let input = r#"
@@ -1928,5 +2033,67 @@ ex:alice ex:note "value with a { brace" .
         assert!(result.txn_meta.is_empty());
         assert!(result.named_graphs.is_empty());
         assert!(result.turtle.contains("value with a { brace"));
+    }
+
+    // =====================================================================
+    // TriG-star — deferred, rejected with a specific error
+    // =====================================================================
+
+    /// Star constructs INSIDE a `GRAPH` block are TriG-star — deferred.
+    /// The error must name the construct family so the W3C harness (and
+    /// users) see a real classification, not a generic parse failure.
+    /// Kept deliberately narrow so the D-8 builder-path routing for plain
+    /// TriG remains viable: only star tokens inside blocks trip this.
+    #[test]
+    fn test_trig_star_inside_graph_block_rejected_with_deferred_error() {
+        let mut ns = test_registry();
+        for (label, input) in [
+            (
+                "reified subject",
+                "@prefix ex: <http://example.org/> .\n\
+                 GRAPH ex:g { <<ex:s ex:p ex:o>> ex:q ex:z . }\n",
+            ),
+            (
+                "annotation block",
+                "@prefix ex: <http://example.org/> .\n\
+                 GRAPH ex:g { ex:s ex:p ex:o {| ex:q ex:z |} . }\n",
+            ),
+            (
+                "tilde reifier",
+                "@prefix ex: <http://example.org/> .\n\
+                 GRAPH ex:g { ex:s ex:p ex:o ~ ex:r . }\n",
+            ),
+            (
+                "reified object",
+                "@prefix ex: <http://example.org/> .\n\
+                 GRAPH ex:g { ex:z ex:q <<ex:s ex:p ex:o>> . }\n",
+            ),
+        ] {
+            let err = extract_trig_txn_meta(input, &mut ns)
+                .expect_err("TriG-star must be rejected")
+                .to_string();
+            assert!(
+                err.contains("TriG-star") && err.contains("deferred"),
+                "[{label}] expected a specific TriG-star deferred error, got: {err}"
+            );
+        }
+    }
+
+    /// Star constructs in the DEFAULT-graph portion of a TriG document are
+    /// plain Turtle-star: the gate must pass them through untouched (byte
+    /// range → reconstructed Turtle) for the streaming parser to handle.
+    #[test]
+    fn test_turtle_star_outside_graph_blocks_passes_through() {
+        let mut ns = test_registry();
+        let input = "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:b ex:c {| ex:q ex:z |} .\n\
+             GRAPH ex:g { ex:s ex:p ex:o . }\n";
+        let result = extract_trig_txn_meta(input, &mut ns).unwrap();
+        assert_eq!(result.named_graphs.len(), 1);
+        assert!(
+            result.turtle.contains("{| ex:q ex:z |}"),
+            "default-graph star text must round-trip: {}",
+            result.turtle
+        );
     }
 }

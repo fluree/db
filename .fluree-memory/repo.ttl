@@ -1108,6 +1108,178 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
+mem:decision-01kwwmmezehttr76cjq1kdtfqf a mem:Decision ;
+    mem:content "Bolt/Cypher node-emit strings are Arc<str> end-to-end: CypherNode/Relationship/Path fields, the hydrator memos, AND the bolt codec's Value::String + MapValue keys — names alloc once per distinct name per result, never per use (87→73ms on the 20k-node probe). IriCompactor::decode_sid_shared returns the Sid's own name (refcount bump, no alloc) for EMPTY/OVERFLOW/empty-prefix namespaces — the ready-made hot path for the planned move of default Cypher identifiers to namespace 0 (no IRI prefix instead of http://example.org/). Note: the dict already stores split (ns_code, suffix), so NS-0's win is decode-side only." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "namespace-0" ;
+    mem:tag "node-emit" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/iri.rs" ;
+    mem:artifactRef "fluree-db-bolt/src/value.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T21:16:34.158183+00:00"^^xsd:dateTime ;
+    mem:rationale "User decided Cypher's default namespace will move to code 0; the Arc<str> plumbing captures the allocation win for any namespace today and makes NS-0 decode zero-cost when it lands. Don't reintroduce String copies at the PackStream boundary — that re-buys every allocation." .
+
+mem:decision-01kwwmsb3939gkgcss4nnpetwa a mem:Decision ;
+    mem:content "Cypher identifiers (labels, property keys, rel types) default to namespace code 0 — bare names, no IRI prefix — on BOTH read and write paths; RDF compat is opt-in via ledger default context @vocab (set_default_context) or GraphDb::with_default_context. Implemented 2026-07-06 on feature/bolt (see ns-0 lowering fact for mechanics). elementId/node identity = the stored name (full IRI only in @vocab mode)." ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "namespace-0" ;
+    mem:scope mem:repo ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T21:19:14.025388+00:00"^^xsd:dateTime ;
+    mem:rationale "User decision 2026-07-06: NS 0 makes more sense as the Cypher default than http://example.org/. Supersedes the old default-vocab behavior." .
+
+mem:fact-01kwvpa1cdekas5700mv919nte a mem:Fact ;
+    mem:content "Bolt v1 landed on feature/bolt: pure codec crate fluree-db-bolt (PackStream/chunking/handshake 4.4+5.0-5.4/session machine, zero Fluree deps) + server feature `bolt` (default on, binds only when --bolt-listen-addr set; --bolt-default-db). Session is action-based: on_request returns Turn::Execute(RunRequest), server glue executes then calls run_succeeded/run_failed — keeps the state machine sync/pure. Reads use QueryResult::to_cypher_table (pre-cypherify RDF-faithful cells factored out of format/cypher.rs) then cell_to_bolt: xsd:decimal→Float, temporal→ISO strings, nodes→IRI strings (v1). Writes reuse pub(crate) submit_via_consensus/wait_for_committed_state. Auth landed later on feature/bolt-auth (see bolt auth memory) — the old refuse-to-start-under-required-auth guard is GONE, replaced by per-session enforcement." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "packstream" ;
+    mem:tag "protocol" ;
+    mem:tag "server" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/bolt-adapter.md" ;
+    mem:artifactRef "fluree-db-api/src/format/cypher.rs" ;
+    mem:artifactRef "fluree-db-bolt/src/session.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T12:26:35.277629+00:00"^^xsd:dateTime ;
+    mem:rationale "Follow-up work (explicit transactions, temporal/graph PackStream structures, auth) must preserve the pure-codec/server-glue split and the shared table converter rather than forking value mappings." .
+
+mem:fact-01kwvpa4y42ve0930eqqf0kz47 a mem:Fact ;
+    mem:content "Cypher parsed-AST cache: process-wide LRU (FLUREE_CYPHER_AST_CACHE entries, default 512, 0 disables; read once) keyed on statement text, caching the PRE-substitution Arc<CypherAst>. Single choke point query/helpers.rs parse_cypher_ast_cached + substituted_cypher_ast; all five parse sites route through it, plus cypher_statement_is_write (Bolt dispatch). Statements over 8KiB never cached; parse failures not cached. MEASURED (cypher_phase_profile, release): parse 1-4us, clone 0.2-1us, lower 1-4us — a lowered-IR cache is NOT warranted (plan+exec dominates by 3+ orders of magnitude). Profiler caveat: unindexed in-memory novelty path; filter/aggregate e2e is ms-to-minutes there (filter_topk 703ms @ 500 users), so keep PROF_USERS modest." ;
+    mem:tag "cache" ;
+    mem:tag "cypher" ;
+    mem:tag "parser" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/examples/cypher_phase_profile.rs" ;
+    mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T12:26:38.916498+00:00"^^xsd:dateTime .
+
+mem:fact-01kwvtdzzsfecc56zgjs23ckwq a mem:Fact ;
+    mem:content "Bolt explicit transactions (feature/bolt): optimistic one-commit-per-statement model in api cypher_txn.rs. BEGIN pins the cached head; each write stages against the txn's private LedgerState then pure build_commit + finalize_state (nothing published; read-your-writes via GraphDb::from_ledger_state). COMMIT: lock_for_write, verify head t+commit_id == base, put_with_id all pending blobs, ONE compare_and_set_ref to the final commit (atomic visibility; chain keeps provenance), then finalize_commit. Base moved → TransactError::CommitConflict → Neo.TransientError.* so drivers auto-retry managed tx fns. Single-node only — glue rejects BEGIN under raft/peer. Session: TxReady/TxStreaming, qid streams, Turn::Begin/Commit/Rollback/Reset." ;
+    mem:tag "bolt" ;
+    mem:tag "commit" ;
+    mem:tag "cypher" ;
+    mem:tag "optimistic-concurrency" ;
+    mem:tag "transactions" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_txn.rs" ;
+    mem:artifactRef "fluree-db-bolt/src/session.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T13:38:39.225260+00:00"^^xsd:dateTime ;
+    mem:rationale "Future Bolt tx work (Raft support, policy) must preserve the atomic single-ref-advance publish and the base-precondition; N sequential ref advances would expose intermediate states." .
+
+mem:fact-01kww286deybnkjrnyxn4w55fe a mem:Fact ;
+    mem:content "Bolt node hydration final: typed_table prefetch = two lanes. Batched lane (sorted SPOT sweep via batched_lookup_subject_properties, nodes built from raw rows, refs skipped by o_type pre-decode) gated PER-SUBJECT: overlay dirty-subject set from one SPOT walk cached on (content_version,g_id); clean subjects without raw s_id get a reverse dict lookup (find_subject_id_by_parts, ~2us) — CRITICAL because under live novelty the executor emits materialized Sid not EncodedSid, and is_effectively_empty is ledger-global, so v1 gating made the lane a bench no-op (flat at every size). Dirty/novelty-only subjects → merge-correct per-subject fallback. Probe: 0.65ms/200 rich nodes on BOTH clean HEAD and live novelty; tracing::debug reports lane split." ;
+    mem:tag "benchmark" ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "hydration" ;
+    mem:tag "performance" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/examples/bolt_node_emit_probe.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/materialize.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T15:55:17.806942+00:00"^^xsd:dateTime ;
+    mem:rationale "Converge on hydration.rs fetch_subject_properties (policy-aware) when Bolt auth lands; the engine-level batched gather (property_join-style) is the long-term fix if hydration still shows hot." .
+
+mem:fact-01kww2pyrz2rdf3tzgc72dhe4p a mem:Fact ;
+    mem:content "JSON-LD select-map hydration now bulk-prefetches wildcard roots: run_hydration_rows collects top-level subjects of wildcard hydration columns, fetches sorted + buffer_unordered(16) via fetch_subject_properties (policy/fuel semantics unchanged) into HydrationCaches.subject_flakes; the expansion body reads through that cache (also dedups repeat subjects across levels and nested refs). GUARDS: single-ledger only — dataset mode bypasses cache entirely because per-ledger Sids share an encoding space (Sid-keyed cache would be ambiguous); explicit projections keep narrowed per-predicate reads; cached flakes are POST-policy (one policy context per request, so per-request cache is sound)." ;
+    mem:tag "cache" ;
+    mem:tag "hydration" ;
+    mem:tag "jsonld" ;
+    mem:tag "performance" ;
+    mem:tag "select-map" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/hydration.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T16:03:21.503160+00:00"^^xsd:dateTime ;
+    mem:rationale "Anyone extending hydration caching to dataset mode must key by (ledger_alias, Sid); anyone changing policy contexts mid-request would invalidate the post-policy cache assumption." .
+
+mem:fact-01kww61t7fnmpf936xj5aecp7v a mem:Fact ;
+    mem:content "Bolt auth (feature/bolt-auth): HELLO(≤5.0)/LOGON(5.1+) auth maps → Turn::Authenticate; glue verifies via the hoisted verify_data_principal (the ONE transport-agnostic token→DataPrincipal pipeline, also used by HTTP MaybeDataBearer). Session keeps an `authenticated` flag so RESET after failed LOGON returns to Authentication, not Ready; HELLO-auth failure closes (no pre-5.1 re-auth). Per-STATEMENT re-checks: token exp (no skew → TokenExpired; login validate allows 60s skew, so exp-within-skew tokens logon but can't run) and ledger read/write scopes (denial = DatabaseNotFound, existence-hiding like HTTP 404). basic scheme = token-in-password carrier; principal field ignored." ;
+    mem:tag "auth" ;
+    mem:tag "bolt" ;
+    mem:tag "security" ;
+    mem:tag "session" ;
+    mem:tag "tokens" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-bolt/src/session.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:artifactRef "fluree-db-server/src/extract/data_bearer.rs" ;
+    mem:artifactRef "fluree-db-server/tests/bolt_auth_integration.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T17:01:43.023441+00:00"^^xsd:dateTime ;
+    mem:rationale "Any transport adding token auth must reuse verify_data_principal, and the RESET/authenticated-flag interaction is a subtle state-machine trap." .
+
+mem:fact-01kww61y9crayg5pqd2ghnawt5 a mem:Fact ;
+    mem:content "Bolt policy enforcement (landed on feature/bolt 32112e2fb): identity-only GovernanceOptions drives wrap_policy on both read paths (autocommit + in-txn view); CypherTransaction carries governance pinned at BEGIN — each staged statement builds build_transact_policy_context against the txn's PRIVATE state and policy-wraps the MERGE probe. to_cypher_typed_table filters instead of failing closed: NodeHydrator runs raw-SPOT fetches through the view's QueryPolicyEnforcer. INVARIANT: the perf batched sorted-crawl hydration lane builds nodes from raw (p_id,o_type,o_key) rows and CANNOT policy-filter — NodeHydrator::new forces gv=None under a non-root enforcer so all subjects take the flake-level fallback lane; future hydration perf work must preserve this gate." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "hydration" ;
+    mem:tag "policy" ;
+    mem:tag "transactions" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_txn.rs" ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T17:01:47.180471+00:00"^^xsd:dateTime ;
+    mem:rationale "The hydrator is the pattern for any format-time raw-SPOT read under policy; the txn governance pinning and probe wrap must be preserved by future Bolt/txn work." .
+
+mem:fact-01kwwddyea3x6nyqmysg11vqvf a mem:Fact ;
+    mem:content "Bound-edge annotation probe gate (multi-hop typed patterns were 2.2-2.8x slower without it): value-only rel vars' per-hop OPTIONAL EdgeAnnotation probe is gated by LoweringContext.reified_edges_possible, computed in api helpers with three conservative tiers: (1) f:reifiesSubject absent from dict — useless alone since built-in vocab passes on ~every ledger (the old sole gate); (2) snapshot.stats.properties count for f:reifiesSubject; (3) overlay PSOT walk cached on content_version. Probe: 2-hop pattern 3.04→0.54ms. ALSO: a bound rel var on a reified edge binds the ANNOTATION SUBJECT Sid (coalesce(ann, MakeRel)) — cypher_typed subject cells detect f:reifies* rows and render Relationship not Node, in both hydration lanes." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "lowering" ;
+    mem:tag "performance" ;
+    mem:tag "reification" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/cypher_typed.rs" ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T19:10:40.586531+00:00"^^xsd:dateTime ;
+    mem:rationale "Future annotation writes must keep the gate honest (stats/overlay reflect new f:reifies facts before queries run) or bound edge vars silently drop annotation bindings; bolt_reified_edge_gate_reopens_for_novelty_annotations pins this." .
+
+mem:fact-01kwwpw1xptfx0aspa02chhrvx a mem:Fact ;
+    mem:content "NS-0 Cypher default LANDED: LoweringContext.vocab + CypherLowerOpts.vocab are Option<String>, None default; extract_cypher_iri_mapping only returns Some when ledger context has @vocab. iri_ref/iri_term: strict-encode fail + vocab None + name has no ':' → Sid(EMPTY, name); scheme-ful strings keep Ref::Iri fallback (NoEncoder/rdf:type must not collapse into NS-0). Write side needs no special-casing: sid_for_iri canonical_splits bare names to the pre-registered \"\" prefix (code 0). GOTCHAS: policy identity resolution uses STRICT encode → bare token identities never match (use DIDs/full IRIs); encode_iri_strict rejects EMPTY by design; bare JSON-LD @id/@type/keys with no vocab also land in NS-0, so both surfaces converge on bare names." ;
+    mem:tag "cypher" ;
+    mem:tag "lowering" ;
+    mem:tag "namespace-0" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/context.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_cypher_update.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-06T21:55:40.086415+00:00"^^xsd:dateTime .
+
+mem:fact-01kwx8z7tx43vecccdww6w19j9 a mem:Fact ;
+    mem:content "shortestPath runs a raw-id lane (813e535c6) when the view allows: bidirectional BFS keyed by persisted s_id (PathNode::Id|Novel), each frontier level expanded by ONE galloping batched-lookup sweep per side, neighbors taken from IRI_REF o_keys; dict touched only at endpoints + final path. Overlay correctness is per-node: overlay_dirty_ids collects touched subjects AND ref-objects (retracts stamp both) per content_version; dirty/novelty-only nodes expand via the Sid fallback. Lane declines (falls back to the Sid search) on: no binary store, active policy, or unsummarizable overlay. chunk_subjects gap threshold is the measured break-even (4096 ids) — 64 hurt dense sets, none made scattered frontiers sweep every leaflet in span." ;
+    mem:tag "batched-lookup" ;
+    mem:tag "cypher" ;
+    mem:tag "overlay" ;
+    mem:tag "performance" ;
+    mem:tag "shortest-path" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/batched_lookup.rs" ;
+    mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
+    mem:branch "feature/bolt" ;
+    mem:createdAt "2026-07-07T03:11:58.813517+00:00"^^xsd:dateTime ;
+    mem:rationale "Supersedes the earlier reverted-batched-frontier memory: the revert's conclusion (per-node reads fit early-exit searches) held only on the old substrate; with shared mmaps + cascaded seeks + galloping lookups, batched level expansion wins at every scale. Novelty semantics pinned by cypher_shortest_path_batched_lane_respects_novelty." .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
@@ -1144,6 +1316,66 @@ mem:decision-01kje2pt9maxrxjw49ydgejmpe a mem:Decision ;
     mem:createdAt "2026-02-26T22:56:56.628412+00:00"^^xsd:dateTime ;
     mem:rationale "RDF strict equality treats \"hello\"^^xsd:string and \"hello\"^^ex:custom as different values because their datatype IRIs differ. For a uniqueness constraint this is surprising and easily subverted — users expect \"same text = same value.\" Storage-layer identity (FlakeValue enum variant + payload) is the right granularity: it's what the index actually stores and compares, it's deterministic, and it prevents accidental or intentional duplicate sneaking via datatype annotation." ;
     mem:alternatives "RDF strict equality (datatype-aware key including dt Sid), datatype-family matching via dt_compatible()" .
+
+mem:fact-01kwwxb012x61f0mkj5zzrrnns a mem:Fact ;
+    mem:content "Cypher bulk import (.cypher/.cyp/.cql): cypher_import.rs mirrors csv_import.rs — converts CREATE / MATCH…CREATE dump scripts (benchgraph pokec idiom) to bare-name JSON-LD NDJSON shards riding the JsonLdStream chunked bulk pipeline. Node identity: pass 1 learns per-label match-key property sets from MATCH…CREATE; node id = Label/keyval (percent-encoded, sorted-key order); key-less nodes = Label/_anon-N. Duplicate keys merge; dangling edges skipped+counted. 3 passes/file (keys → nodes → edges), one parse per statement; the importer owns a quote/comment-aware splitter (parser rejects multi-statement). Edge props reuse csv EdgePolicy. CLI: create --from x.cypher; --base-iri now Option (None = cypher bare-name mode)." ;
+    mem:tag "bulk" ;
+    mem:tag "cli" ;
+    mem:tag "csv" ;
+    mem:tag "cypher" ;
+    mem:tag "import" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/cli/create.md" ;
+    mem:artifactRef "fluree-db-api/src/cypher_import.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_cypher_import.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-06T23:48:41.122129+00:00"^^xsd:dateTime .
+
+mem:fact-01kwwxbbtehrj3nrk2r9wykj8h a mem:Fact ;
+    mem:content "Bare relative @id values (\"User/4112\") and bare terms in JSON-LD inserts unify with zero-config Cypher reads (spike-proven in it_cypher_import.rs::bare_id_jsonld_insert_reads_from_cypher). Since the ns-0 landing (e13332382), bare JSON-LD terms land in namespace 0 like Cypher lowering; a bare @id goes through canonical_split (splits at last '/', e.g. allocating a \"User/\" namespace) — identical on every occurrence, so node objects and edge references encode to the same Sid. This is the contract the Cypher bulk importer's JSON-LD output depends on; no @context or @vocab needed." ;
+    mem:tag "bare-names" ;
+    mem:tag "cypher" ;
+    mem:tag "import" ;
+    mem:tag "json-ld" ;
+    mem:tag "ns-0" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_cypher_import.rs" ;
+    mem:artifactRef "fluree-db-transact/src/namespace.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-06T23:48:53.198165+00:00"^^xsd:dateTime .
+
+mem:fact-01kwx4dgvp4p8pnsc5wq52fp5s a mem:Fact ;
+    mem:content "Cypher gap round 1 LANDED (feature/cypher-import): MERGE upsert — trailing SET folds into both conditional branches (MergeSet variant); SET n += $props whole-map param = reserved empty-key MapLit entry expanded at substitution. Temporal constructors — const-fold via core::temporal::cypher_temporal_constructor; zero-arg datetime()/date() = Function::Now/Today (reads) + per-statement fold (writes). Schema DDL no-ops — Statement::Schema; CREATE/DROP INDEX|CONSTRAINT → empty Update-typed Txn (zero-effect return; Insert-typed empties throw EmptyTransaction); SHOW → zero-row InlineRows. DEFERRED: LOAD CSV / CALL IN TRANSACTIONS. NEXT: CALL proc() YIELD shims (db.labels etc.) via synthesized queries; watch the full-scan gate." ;
+    mem:tag "cypher" ;
+    mem:tag "ddl" ;
+    mem:tag "gaps" ;
+    mem:tag "merge" ;
+    mem:tag "procedures" ;
+    mem:tag "temporal" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/reference/cypher-support-matrix.md" ;
+    mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
+    mem:artifactRef "fluree-db-core/src/temporal.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/mod.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-07T01:52:23.926306+00:00"^^xsd:dateTime .
+
+mem:fact-01kwx6n2brwbcgryf5txj1hchn a mem:Fact ;
+    mem:content "Cypher procedure shims (8412aba24): CALL db.labels/relationshipTypes/propertyKeys/schema.visualization/dbms.components answer from novelty-merged stats (assemble_fast_stats, to_t=i64::MAX) in fluree-db-api cypher_procedures.rs — Statement::CallProcedure is rewritten to an InlineRows query in lower_cypher_ast_to_ir BEFORE fluree-db-cypher lowering (which errors on the variant; it lacks ledger stats). Parser disambiguates CALL <ident> (procedure) vs CALL {/( (subquery); first-clause standalone only. dbms.components version \"5.4.0\" must stay in SYNC with server_agent() in bolt.rs. literal_to_binding now recurses into constant list/map Exprs for InlineRows cells." ;
+    mem:tag "bolt" ;
+    mem:tag "cypher" ;
+    mem:tag "introspection" ;
+    mem:tag "procedures" ;
+    mem:tag "stats" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_procedures.rs" ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/parse/stmt.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:branch "feature/cypher-import" ;
+    mem:createdAt "2026-07-07T02:31:28.376492+00:00"^^xsd:dateTime .
 
 mem:fact-01km06dhjzpgyvbs1yc5h0h28e a mem:Fact ;
     mem:content "Default context: per-ledger JSON prefix map auto-applied to queries/transactions that omit @context. Stored in CAS keyed by ContentId; pointer in ConfigPayload.default_context via nameservice.\n\nPopulation: bulk import captures @prefix + builtins; API set_default_context(); HTTP PUT /v1/fluree/context/*ledger; CLI fluree context set.\n\nPrecedence: Query @context/PREFIX > ledger default > built-in (rdf, rdfs, xsd, owl, sh, geo).\n\nUpdates use CAS via ConfigPublisher::push_config() with retry; disconnect_ledger() evicts cache after update. ProxyNameService does NOT implement ConfigPublisher — context writes only on tx server." ;
@@ -1461,6 +1693,79 @@ mem:fact-01kj8k5nzpe59p5vp7zrehbrr9 a mem:Fact ;
     mem:branch "feature/memory" ;
     mem:createdAt "2026-02-24T19:49:14.358637+00:00"^^xsd:dateTime .
 
+mem:decision-01kwsmdnf7mhnbvn29qgf2j2cx a mem:Decision ;
+    mem:content "Merge-preview include_changes nets per FULL fact key (g,s,p,o,dt,lang,i) — NOT Flake Eq/Hash (ignores g) and NOT (s,p,o,dt,g) alone (collides lang tags + list positions). Netting contract = \"net commit effect\": fact survives iff oldest and newest in-range ops agree (net op = newest); re-assert of a pre-range value nets as assert because the merge replays it. Changes are strategy-independent (raw source-vs-ancestor delta, pre-conflict-resolution) — under TakeSource/TakeBranch the merge commit differs on conflict keys; conflicts.details covers those." ;
+    mem:tag "branches" ;
+    mem:tag "diff" ;
+    mem:tag "flake-identity" ;
+    mem:tag "merge-preview" ;
+    mem:tag "netting" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/merge_preview.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/delta.rs" ;
+    mem:branch "feature/merge-preview-changes" ;
+    mem:createdAt "2026-07-05T17:15:08.135861+00:00"^^xsd:dateTime ;
+    mem:rationale "Pairing-only netting cannot distinguish ancestor-state diff from commit-effect diff without loading ancestor state; net-commit-effect is cheap and equals what merge_branch applies minus cancelling pairs." .
+
+mem:fact-01kwsmdy5pms38yy81d0bdxprb a mem:Fact ;
+    mem:content "Merge-preview changes pagination: subjects sorted by full IRI (decode_sid) — that ordering IS the cursor contract (changes_after_subject resumes strictly after). max_changes counts flakes, cuts at subject boundaries, first subject of a page returned whole even over cap; Some(0)=stats-only (exact counts, truncated=true, no source-state load); CLI --stat maps to Some(0) while CLI --max-changes 0 keeps the CLI's 0=unbounded convention (None locally, param omitted remotely). Source-side walk is shared: compute_delta_keys_and_changes yields conflict keys + netted flakes in one trace_commits_by_id pass (iterate commit.flakes.rev() so within-commit order stays reverse-chronological)." ;
+    mem:tag "branches" ;
+    mem:tag "cli" ;
+    mem:tag "merge-preview" ;
+    mem:tag "pagination" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/merge_preview.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/branch.rs" ;
+    mem:artifactRef "fluree-db-novelty/src/delta.rs" ;
+    mem:branch "feature/merge-preview-changes" ;
+    mem:createdAt "2026-07-05T17:15:17.046896+00:00"^^xsd:dateTime .
+
+mem:decision-01kx0v325fhgme9a3yfn7cjqtq a mem:Decision ;
+    mem:content "Policy condition unification (user-decided 2026-07): state graph IRIs are f:preState/f:postState (NOT f:pre/f:post); every f:query condition is an ASK contract regardless of language — JSON-LD gains the existing `{\"ask\": ...}` query form as preferred spelling (parse/mod.rs already parses ask; policy parser must accept it), SPARQL ASK/SELECT as-is, Cypher reserved via f:cypher datatype (read-only MATCH, ≥1 row = allow, $this/$identity/$value as native Cypher parameters). Per-policy f:queryState selector = whole-condition state switch for graph-less languages; SPARQL GRAPH f:postState for in-query mixing. Design doc: docs/design/policy-condition-languages.md." ;
+    mem:tag "ask" ;
+    mem:tag "conditions" ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "policy" ;
+    mem:tag "prestate-poststate" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/policy-condition-languages.md" ;
+    mem:artifactRef "fluree-db-query/src/parse/mod.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:26:21.743914+00:00"^^xsd:dateTime ;
+    mem:rationale "Naming settled before deployment (annoying to change after policies ship). Cypher $param syntax coinciding with SHACL-SPARQL $this convention is the unification hinge." .
+
+mem:fact-01kx0tafnf825th2w2q4z46a66 a mem:Fact ;
+    mem:content "Write verbs LANDED on feature/policy-write-intents (1792293ed): f:action accepts f:create/f:update/f:delete; PolicyRestriction.verbs: Option<WriteVerbs> (None = legacy bare f:modify, pre-state class matching); WriteFlakeInfo carries lifecycle + pre/union classes + type_object_class; stage.rs classify_subject_lifecycle probes pre-state only when has_write_verb_policies(). rdf:type flakes match class policies by OBJECT class under verbs. Branch also has: by_class modify index (d0b6d8868), inline-policy merge fix (135fca8ef), SPARQL f:query (0a6c5e5e4). Remaining roadmap: schema-flake write bypass, $value/$op bindings, f:pre/f:post state graphs, f:onShape." ;
+    mem:tag "create-intent" ;
+    mem:tag "lifecycle" ;
+    mem:tag "policy" ;
+    mem:tag "write-verbs" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_policy_verbs.rs" ;
+    mem:artifactRef "fluree-db-policy/src/evaluate.rs" ;
+    mem:artifactRef "fluree-db-policy/src/types.rs" ;
+    mem:artifactRef "fluree-db-transact/src/stage.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:12:56.367344+00:00"^^xsd:dateTime .
+
+mem:fact-01kx0wpcatfkav62h6ng3nw4dp a mem:Fact ;
+    mem:content "Cypher policy conditions LANDED (0ddc990e9): f:cypher datatype on f:query; read-only MATCH...RETURN, ≥1 row = allow; write/schema/procedure statements rejected at build → Deny. $this/$identity are Cypher PARAMETERS carrying IRI strings (substitute_params pre-lowering — no variable seeding, unlike SPARQL's Pattern::Values); unbound identity → null param. Lowering has NO ledger @vocab (executor lacks a context handle) — conditions must use backtick-quoted full IRIs on @vocab ledgers. Hook: lang_support::CypherSupport registered from api cypher_lang.rs. JSON-LD ask form also landed (ed8d0e623): {\"ask\": X} normalizes to {\"where\": X}; both keys fails closed." ;
+    mem:tag "ask" ;
+    mem:tag "conditions" ;
+    mem:tag "cypher" ;
+    mem:tag "f-cypher-datatype" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_lang.rs" ;
+    mem:artifactRef "fluree-db-api/tests/it_policy_cypher_conditions.rs" ;
+    mem:artifactRef "fluree-db-query/src/lang_support.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "feature/policy-write-intents" ;
+    mem:createdAt "2026-07-08T12:54:23.322509+00:00"^^xsd:dateTime ;
+    mem:rationale "The vocab caveat is the sharpest future gotcha; the params-vs-values seeding difference matters for the upcoming $value/state-graphs work." .
+
 mem:constraint-01kwjtjew74a727brs0q3jaf7e a mem:Constraint ;
     mem:content "SHACL tx-path engine identity: fluree-db-api builds a ShaclEngine but hands only the ShaclCache across the crate boundary into fluree-db-transact's validate_view_with_shacl, which used to rebuild a HIERARCHY-LESS engine — engine-level state (hierarchy for subproperty/predicate-target entailment) silently vanished at transaction time while cache-baked state (subclass target index) survived. Fixed: validate_view_with_shacl takes Arc<ShaclCache> + Option<SchemaHierarchy> via ShaclEngine::from_shared_cache. When adding engine-level fields, thread them through this boundary or they only apply to validate_all paths." ;
     mem:tag "crate-boundary" ;
@@ -1506,19 +1811,6 @@ mem:fact-01kwjtjbnvb36dtaf2zrq806cj a mem:Fact ;
     mem:artifactRef "fluree-db-policy/src/index.rs" ;
     mem:branch "feature/rdfs-enforcement-entailment" ;
     mem:createdAt "2026-07-03T01:47:52.379794+00:00"^^xsd:dateTime .
-mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
-    mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
-    mem:tag "dataset" ;
-    mem:tag "derived-facts" ;
-    mem:tag "history-mode" ;
-    mem:tag "reasoning" ;
-    mem:tag "time-travel" ;
-    mem:scope mem:repo ;
-    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
-    mem:artifactRef "fluree-db-api/src/view/dataset_builder.rs" ;
-    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
-    mem:branch "feature/shacl-property-paths" ;
-    mem:createdAt "2026-07-05T13:38:04.147463+00:00"^^xsd:dateTime .
 
 mem:fact-01kwktkb2r0ktxt5xaxvbwev3e a mem:Fact ;
     mem:content "The \"query peer over HTTP\" model exists as server peer proxy mode: ProxyStorage + ProxyNameService wired via FlureeBuilder::memory().build_with(storage, NameServiceMode::ReadOnly); serving side is the StorageProxyBearer route group; GET /nameservice/snapshot filters to the token's fluree.storage.ledgers scope. ProxyStorage is mode-aware (feature/remote-mounts): ProxyReadMode::Raw fetches canonical CID-verified bytes via GET /storage/objects/{cid} (peer default; what makes indexed ledgers readable), ProxyReadMode::Filtered uses POST /storage/block FLKB negotiation. CRITICAL: no production code decodes FLKB — the filtered tier is transport-only until a leaf decoder exists on the read path. Remaining gaps: one upstream per server (no composite nameservice), no HTTP Range on ProxyStorage, no vended-credential/origin handoff." ;
@@ -1608,6 +1900,20 @@ mem:fact-01kws95166gqpjjfda0nvmkraq a mem:Fact ;
     mem:branch "feature/remote-mounts" ;
     mem:createdAt "2026-07-05T13:58:10.886197+00:00"^^xsd:dateTime ;
     mem:rationale "Non-obvious: indexed snapshot t and effective (novelty-inclusive) t diverge between a commit and the next reindex; config changes live in novelty, so t-keyed caches of config-derived state silently go stale if keyed on the base t." .
+
+mem:fact-01kws806qkz7h5w609y1b0r25n a mem:Fact ;
+    mem:content "Reasoning is rejected (400) on history/changes dataset queries (from–to time range). Root cause of the silent bug: the derived-facts overlay is computed at primary.t (latest) and spliced onto GraphRefs keyed (ledger,g_id,to_t) where as_runtime_dataset sets to_t=view.t (latest) but execution runs at hist_to, so in history mode the key never matched and derived facts were silently dropped (status 200, derived_facts 0). Guard reject_reasoning_in_history_mode() runs at BOTH dataset execute paths, mirroring prepare's executable.reasoning.modes.has_any_enabled() gate (so \"reasoning\":\"none\" is allowed). Config reasoning defaults were already skipped in history mode (dataset_builder history branch omits apply_config_defaults)." ;
+    mem:tag "dataset" ;
+    mem:tag "derived-facts" ;
+    mem:tag "history-mode" ;
+    mem:tag "reasoning" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/view/dataset.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_builder.rs" ;
+    mem:artifactRef "fluree-db-api/src/view/dataset_query.rs" ;
+    mem:branch "feature/shacl-property-paths" ;
+    mem:createdAt "2026-07-05T13:38:04.147463+00:00"^^xsd:dateTime .
 
 mem:fact-01kvzn4mmmcvc7zz6bcswtw47c a mem:Fact ;
     mem:content "SPARQL property paths, branch feature/sparql-property-paths: closed ALL reported gaps PLUS inverse-in-composite (wired in BOTH sparql lower/path.rs AND query parse/lower.rs for JSON-LD parity). (1) ZeroOrOne p?: PathModifier::ZeroOrOne; BFS self+1hop. (2) Negated sets !: fresh ?__np{n} pred-var triple + FILTER(?p != IRI(...)); fwd/inv/mixed=UNION. (3) Nested modifiers (p*)*: collapse_modifiers (zero=any */?, unbounded=any +/*). (4) Composite-transitive (a/b)+ incl inverse steps (^a/b)+: PropertyPathPattern has predicates+first_inverse+sequence_steps:Vec<PathStep{predicates,inverse}>; operator's read_step reads SPOT/POST by direction (opposite index when retreating); single_predicate() bails on composite. ONLY UNSUPPORTED (niche): nested transitive step in a composite unit (a+/b)+ — not exercised by any W3C test." ;
@@ -1784,6 +2090,50 @@ mem:fact-01kta3264pg54aabvt97spk5qt a mem:Fact ;
     mem:branch "fix/langstring-novelty-dedup-1273" ;
     mem:createdAt "2026-06-04T19:51:46.070663+00:00"^^xsd:dateTime ;
     mem:rationale "A reviewer flagged \"use resolver fallback instead of sid_to_iri for novelty subjects\" as a major data-loss bug; it is a false positive due to the Sid-vs-integer-ID distinction." .
+
+mem:fact-01kwzz0ynexdgwfrw9vvsd7xfe a mem:Fact ;
+    mem:content "f:query / f:rule are language-discriminated by RDF datatype: @json or bare string → JSON-LD (legacy); `f:sparql` (https://ns.flur.ee/db#sparql; f:cypher reserved) → SPARQL. PolicyQuery = { source, language: PolicyQueryLanguage (non_exhaustive) }; WirePolicyValue::Query { source, language }. SPARQL policies must be ASK/SELECT (no grouping), evaluated as existence checks; SPARQL rules must be CONSTRUCT...WHERE with BGP + comparison FILTERs only (OPTIONAL/UNION/paths → rule skipped with warning). Build-time parse validation preserves fail-closed deny. Tests: it_policy_sparql.rs (grp_policy), it_datalog_rules_sparql.rs (grp_reasoning)." ;
+    mem:tag "datalog" ;
+    mem:tag "f-sparql-datatype" ;
+    mem:tag "policy" ;
+    mem:tag "policy-query-language" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/query/datalog-rules.md" ;
+    mem:artifactRef "docs/security/policy-model.md" ;
+    mem:artifactRef "fluree-db-api/src/policy_builder.rs" ;
+    mem:artifactRef "fluree-db-policy/src/types.rs" ;
+    mem:artifactRef "fluree-db-query/src/datalog_rules.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T04:15:52.494354+00:00"^^xsd:dateTime .
+
+mem:fact-01kwzz1e0t51fjfgr6bmbqpmnb a mem:Fact ;
+    mem:content "SPARQL support for policies/rules uses a OnceLock hook registry because fluree-db-sparql depends on fluree-db-query (the query crate cannot call the parser). lang_support.rs defines SparqlSupport { lower_policy_query, lower_rule }; api's sparql_lang.rs implements+registers via ensure_sparql_support_registered(), called from FlureeBuilder::finalize_with_backend (all build terminals), make_policy_query_value, and policy_view wire translation. QueryPolicyExecutor::evaluate_sparql fails CLOSED if unregistered. Binding keys \"?$this\"/\"?$identity\" map to SPARQL names \"?this\"/\"?identity\" (strip \"?$\"→\"?\"); seeded via directly-built Pattern::Values, unbound identity → Binding::Unbound (mirrors JSON null VALUES cell)." ;
+    mem:tag "crate-layering" ;
+    mem:tag "executor" ;
+    mem:tag "lang-support-registry" ;
+    mem:tag "policy" ;
+    mem:tag "sparql" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/sparql_lang.rs" ;
+    mem:artifactRef "fluree-db-query/src/lang_support.rs" ;
+    mem:artifactRef "fluree-db-query/src/policy/executor.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T04:16:08.218859+00:00"^^xsd:dateTime .
+
+mem:fact-01kx0h97eybzh5g0bkaw3dr0f3 a mem:Fact ;
+    mem:content "Test-harness trap: `normalize_rows` (fluree-db-api/tests/support/mod.rs) only sorts rows — it does NOT flatten. With `\"select\": [\"?x\"]` (array select) each row is a one-element ARRAY, so `normalize_rows(..).contains(&json!(\"ex:thing\"))` is always false; use scalar select `\"select\": \"?x\"` (flat string rows) for contains-style assertions. This trap produced a false \"bound literal objects don't match the reasoning-derived overlay\" diagnosis — DISPROVEN: bound bool/long/string objects match derived-overlay facts correctly in all combinations (base-present or derived-only predicate, JSON-LD or SPARQL rules)." ;
+    mem:tag "derived-overlay" ;
+    mem:tag "gotcha" ;
+    mem:tag "normalize-rows" ;
+    mem:tag "reasoning" ;
+    mem:tag "select-shape" ;
+    mem:tag "tests" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/tests/it_datalog_rules_sparql.rs" ;
+    mem:artifactRef "fluree-db-api/tests/support/mod.rs" ;
+    mem:branch "fix/policy-class-with-identity" ;
+    mem:createdAt "2026-07-08T09:34:58.014473+00:00"^^xsd:dateTime .
 
 mem:fact-01kqfy6r0w86fcsd9km0707xzg a mem:Fact ;
     mem:content "v3 commit envelope reader at `legacy_v3.rs:305-309` deliberately stubs `graph_delta = HashMap::new()` since v3 never encoded the field. Envelope-only walkers (`first_t_where_graph_registered`) therefore return `None` on any chain that includes v3 commits, regardless of whether the named graph was actually registered. Callers that rely on the result for short-circuiting must either fall through to a full load on `None`, detect v3 envelopes and signal \"inconclusive\", or accept silent correctness regressions on legacy chains." ;
@@ -1969,6 +2319,63 @@ mem:fact-01ktys13s07fm2mphwxqnr339h a mem:Fact ;
     mem:branch "main" ;
     mem:createdAt "2026-06-12T20:40:28.192512+00:00"^^xsd:dateTime ;
     mem:rationale "46 panel-confirmed findings from a 260-agent audit; fixing engine lanes is pointless until ingestion stops corrupting values — any future decimal work should start from DECIMAL_AUDIT.md's priority list." .
+
+mem:fact-01kwstgh1vshsahk63r0dzdkdt a mem:Fact ;
+    mem:content "Cypher bound rel var `-[e]->` is now dual-mode: a statement-wide scan (fluree-db-cypher lower/annotation_use.rs) classifies vars; value-only vars (no e.prop/properties/keys/map-projection anywhere) lower to plain base triple + OPTIONAL EdgeAnnotation + Bind e=coalesce(ann, MakeRel(s,p,o)) so unreified edges match while reified parallel edges keep per-annotation rows; property-reading vars keep annotation-only lowering. The OPTIONAL probe is skipped entirely when encode_iri(f:reifiesSubject) fails (no reified edge exists in the ledger). Engine prereq: Coalesce got a binding-path arm in eval/list.rs eval_list_fn_to_binding — the scalar ComparableValue path collapses Rel/List/Map to Unbound." ;
+    mem:tag "coalesce" ;
+    mem:tag "cypher" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "lowering" ;
+    mem:tag "rel-var" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/lower/annotation_use.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/list.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:01:33.371634+00:00"^^xsd:dateTime .
+
+mem:fact-01kwstgvy9sfntgk0w8vydzkyf a mem:Fact ;
+    mem:content "Untyped shortestPath/allShortestPaths: ShortestPathPattern.predicate is now Option<Sid> — None = wildcard edge-set (Ref objects only, excludes rdf:type + f:reifies* via property_path::is_reserved_edge_predicate, now pub(crate)). Wildcard backward hops probe OPST (POST needs a predicate prefix). Per-hop predicates for relationships(p) are NOT threaded through BFS — build_edges resolves each found hop post-hoc via a SPOT probe (hop_predicate), trying both orientations under Either. JSON-LD lowering wraps Some(pred); the sparql firewall (lower/mod.rs) guards Some only." ;
+    mem:tag "cypher" ;
+    mem:tag "property-path" ;
+    mem:tag "query" ;
+    mem:tag "shortest-path" ;
+    mem:tag "wildcard" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-query/src/ir/path.rs" ;
+    mem:artifactRef "fluree-db-query/src/shortest_path.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:01:44.521231+00:00"^^xsd:dateTime .
+
+mem:fact-01kwsthd6k6xagy4tdtre2ncew a mem:Fact ;
+    mem:content "Cypher surface-gap fixes (2026-07-05): unary-minus folded at parse (parse_unary); untyped single-hop --> gets edge-set filter (pred != rdf:type AND isIri||isBlank(o)) in push_rel_triple; bare MATCH (n) opt-in via FLUREE_CYPHER_ALLOW_FULL_SCAN env → uncorrelated SELECT DISTINCT subject subquery; bare CREATE () asserts hidden rdf:type db:Node marker (fluree_vocab::fluree::NODE, filtered from labels()); inline UNWIND range()/[list] before writes folds to a synthetic $param (inline_constant_unwind, 10k cap)." ;
+    mem:tag "cypher" ;
+    mem:tag "full-scan" ;
+    mem:tag "parser" ;
+    mem:tag "unwind" ;
+    mem:tag "write-path" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/query/helpers.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/lower/pattern.rs" ;
+    mem:artifactRef "fluree-db-cypher/src/params.rs" ;
+    mem:artifactRef "fluree-db-transact/src/lower_cypher_update.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:02:02.195415+00:00"^^xsd:dateTime .
+
+mem:fact-01kwsthhc6fkb931xyd6anfjye a mem:Fact ;
+    mem:content "Cypher RETURN-on-write LANDED (fce28d8e9, on feature/bolt lineage): caller pre-supplies txn_id via TxnOpts.skolem_txn_id — plan_write_return_source validates the RETURN shape pre-submission, fresh_skolem_txn_id ships with the TransactionRequest, and write_return_rows reconstructs created-node Sids statelessly post-commit (Sid::new(BLANK_NODE, \"fdb-{txn_id}-{solution}-{label}\")) then answers the cypher-json envelope. Both the HTTP route (routes/transact.rs execute_cypher_transact) and the Bolt glue (server src/bolt.rs execute_write) use this path." ;
+    mem:tag "consensus" ;
+    mem:tag "cypher" ;
+    mem:tag "design" ;
+    mem:tag "return-on-write" ;
+    mem:tag "skolemization" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/cypher_write.rs" ;
+    mem:artifactRef "fluree-db-server/src/bolt.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-05T19:02:06.470017+00:00"^^xsd:dateTime .
 
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
@@ -2298,6 +2705,34 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:branch "misc/fixes" ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
+
+mem:fact-01kx4zr6ed32yj966mpngvqhcg a mem:Fact ;
+    mem:content "HTTP Cypher READ endpoint already existed server-side: POST /v1/fluree/query/*ledger + Content-Type: application/cypher → execute_cypher_ledger (can_read/policy/Min-T, returns application/vnd.fluree.cypher+json). Gap was CLI-only; wired `fluree query --cypher --remote` via remote_client::query_cypher (body sent verbatim as RequestBody::Text; server calls extract_cypher_envelope itself) + run_remote_cypher_query. Remote emits cypher-json ONLY — --format json/typed-json/csv/tsv and --at rejected before network call, pointing to --direct." ;
+    mem:tag "cli" ;
+    mem:tag "cypher" ;
+    mem:tag "http-endpoint" ;
+    mem:tag "query" ;
+    mem:tag "remote" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cli/src/commands/query.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:branch "perf/property-path-batched-frontier" ;
+    mem:createdAt "2026-07-10T03:04:46.285148+00:00"^^xsd:dateTime .
+
+mem:fact-01kx4zresym4eghmrzn2wcchx5 a mem:Fact ;
+    mem:content "`fluree update --format cypher --remote` write path is now WIRED (previously errored \"HTTP Cypher endpoint not yet available\"). Added remote_client::update_cypher_body (sends body verbatim as RequestBody::Text to ledger-scoped POST /update; server calls extract_cypher_envelope; response = commit receipt, or cypher-json when statement has RETURN). update.rs Tracked arm routes Cypher through it. --policy* is REJECTED for Cypher writes on both transports (no enforcement path yet), matching the local arm. `fluree load --cypher --remote` still uses the older update_cypher (structured {cypher,params} envelope)." ;
+    mem:tag "cli" ;
+    mem:tag "cypher" ;
+    mem:tag "remote" ;
+    mem:tag "update" ;
+    mem:tag "write" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cli/src/commands/load.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/update.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:branch "perf/property-path-batched-frontier" ;
+    mem:createdAt "2026-07-10T03:04:54.846310+00:00"^^xsd:dateTime .
 
 mem:fact-01kvg5mrhz4zvhg425038pfj7m a mem:Fact ;
     mem:content "SPARQL UPDATE annotation tails are rejected inside GRAPH{}/WITH<g> (\"default-graph only\") only because the lowering never emits f:reifiesGraph — NOT a storage limit (JSON-LD path + EdgeKey fully support named-graph annotations). Closing it is SMALL/localized: add a graph_iri param to expand_annotated_triples + expand_annotated_triples_in_quad_pattern, emit one f:reifiesGraph TriplePattern when graph is non-default (graph IRI already available: with_graph_iri in lower_modify ~L894; GraphName::Iri at the GRAPH rejection ~L410), delete reject_with_scoped_annotations + the two rejection blocks (~L414, ~L517). Downstream .with_graph_id stamping + EdgeKey decoder validation already correct; no schema/invariant changes." ;

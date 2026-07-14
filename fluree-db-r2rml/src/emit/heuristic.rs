@@ -251,10 +251,11 @@ fn build_table_draft(
 ///
 /// - [`SubjectStrategy::Auto`] (default): a name-fallback column that is not
 ///   *provably* non-null is USED anyway — downgraded from `NoSafeSubjectKey` to
-///   a non-blocking `SubjectKeyUnverified`, kept join-compatible (indexed as an
-///   FK parent) — and a table with no key-like column at all gets a
-///   deterministic COMPOSITE subject (`SubjectKeySynthesized`) so it stays
-///   saveable.
+///   a non-blocking `SubjectKeyUnverified`, but NOT indexed as an FK parent
+///   (same policy as a nullable declared identifier: a nullable / uniqueness-
+///   unverifiable parent key would silently change join cardinality) — and a
+///   table with no key-like column at all gets a deterministic COMPOSITE
+///   subject (`SubjectKeySynthesized`) so it stays saveable.
 /// - [`SubjectStrategy::Identifier`] (strict, the pre-change behavior): a
 ///   nullable name key or a keyless table yields `NoSafeSubjectKey`, no subject.
 ///
@@ -297,9 +298,13 @@ fn select_subject_key(
         // Not provably non-null: the strategy decides.
         return match strategy {
             SubjectStrategy::Auto => {
-                // Use it anyway — DOWNGRADE NoSafeSubjectKey → SubjectKeyUnverified,
-                // and keep it join-compatible (indexed as an FK parent) so FK joins
-                // TO this table still resolve.
+                // Use it anyway — DOWNGRADE NoSafeSubjectKey → SubjectKeyUnverified —
+                // but do NOT index it as an FK parent, mirroring the nullable-
+                // identifier policy: saveability only needs a subject, while an
+                // FK parent needs a provably-non-null key (a nullable / dup-able
+                // parent key silently changes join cardinality with no diagnostic).
+                // A caller that KNOWS the column is a real PK asserts it via the
+                // per-table `primary_key` override, which does index.
                 diagnostics.push(Diagnostic::new(
                     Severity::Warning,
                     DiagCode::SubjectKeyUnverified,
@@ -308,11 +313,16 @@ fn select_subject_key(
                     format!(
                         "subject key '{}' chosen by name fallback; NOT provably non-null \
                          (no `required`, no null_fraction==0) and uniqueness is unverifiable \
-                         metadata-only — emitted so the table is saveable",
+                         metadata-only — emitted so the table is saveable, but NOT indexed \
+                         as an FK parent (assert it with a per-table primary_key override \
+                         to enable joins)",
                         col.name
                     ),
                 ));
-                SubjectKey::single(col.name.clone())
+                SubjectKey {
+                    columns: vec![col.name.clone()],
+                    index_as_pk: false,
+                }
             }
             SubjectStrategy::Identifier => {
                 diagnostics.push(Diagnostic::new(
@@ -510,21 +520,25 @@ fn select_identifier_subject_key(
 }
 
 /// Synthesize a deterministic COMPOSITE subject over the row's columns when no
-/// key-like column exists (Auto strategy only). The column set is every
-/// non-nested column in `field_id` order — the closest stable approximation of
-/// row identity without a hash (R2RML templates cannot hash). It is NEVER
-/// indexed as an FK parent (it is not a unique key). Emits `SubjectKeySynthesized`.
+/// key-like column exists (Auto strategy only). The column set is the
+/// PROVABLY-NON-NULL non-nested columns in `field_id` order when at least one
+/// exists, else every non-nested column — the closest stable approximation of
+/// row identity without a hash (R2RML templates cannot hash).
+///
+/// The non-null subset is preferred because template expansion produces NO
+/// subject for a row with a NULL in ANY referenced column — templating over a
+/// nullable column silently drops every row where it is NULL, which is exactly
+/// the population keyless tables tend to have. Restricting to non-null columns
+/// trades that invisible row loss for a visible one: rows identical across the
+/// (narrower) subset collapse into one subject with merged values. Both hazards
+/// are disclosed in the `SubjectKeySynthesized` diagnostic. The subject is
+/// NEVER indexed as an FK parent (it is not a unique key).
 fn synthesize_composite_subject_key(
     table: &EmitTableSchema,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SubjectKey {
-    let columns: Vec<String> = table
-        .columns
-        .iter()
-        .filter(|c| !c.nested)
-        .map(|c| c.name.clone())
-        .collect();
-    if columns.is_empty() {
+    let flat: Vec<&EmitColumn> = table.columns.iter().filter(|c| !c.nested).collect();
+    if flat.is_empty() {
         // Degenerate: nothing flat to key on (all columns nested).
         diagnostics.push(Diagnostic::new(
             Severity::Error,
@@ -537,17 +551,43 @@ fn synthesize_composite_subject_key(
         ));
         return SubjectKey::none();
     }
+    let non_null: Vec<String> = flat
+        .iter()
+        .filter(|c| c.is_non_null())
+        .map(|c| c.name.clone())
+        .collect();
+    let (columns, message) = if non_null.is_empty() {
+        // No provably-non-null column: template over everything and DISCLOSE
+        // the null-drop — this is the only synthesized shape that loses rows.
+        let all: Vec<String> = flat.iter().map(|c| c.name.clone()).collect();
+        let msg = format!(
+            "no key-like column and no provably-non-null column; synthesized a deterministic \
+             composite subject over all {} flat columns so the table is saveable — the subject \
+             is neither unique nor an FK parent, rows identical across all columns collapse, \
+             and ROWS WITH A NULL IN ANY COLUMN WILL NOT APPEAR in the virtual dataset \
+             (R2RML template expansion emits no subject for them); set a per-table \
+             primary_key/subject_key override to control this",
+            all.len()
+        );
+        (all, msg)
+    } else {
+        let msg = format!(
+            "no key-like column; synthesized a deterministic composite subject over the {} \
+             provably-non-null flat column(s) (of {} flat) so the table is saveable and no \
+             row is dropped for a NULL — the subject is neither unique nor an FK parent, and \
+             rows identical across those column(s) collapse into one subject with merged \
+             values; set a per-table primary_key/subject_key override to control this",
+            non_null.len(),
+            flat.len()
+        );
+        (non_null, msg)
+    };
     diagnostics.push(Diagnostic::new(
         Severity::Warning,
         DiagCode::SubjectKeySynthesized,
         table.qualified_name(),
         None,
-        format!(
-            "no key-like column; synthesized a deterministic composite subject over all {} \
-             flat columns so the table is saveable — the subject is neither unique nor an FK \
-             parent, and rows identical across all columns collapse (verify before relying on it)",
-            columns.len()
-        ),
+        message,
     ));
     SubjectKey {
         columns,
@@ -643,12 +683,22 @@ fn infer_foreign_keys(
         }
 
         // Parents matching on NAME ∧ TYPE. A single match joins on name∧type
-        // ALONE (Snowflake often supplies no integer bounds); multiple matches
-        // are DISAMBIGUATED by range-containment (never a hard gate).
+        // ALONE when bounds are absent (Snowflake often supplies no integer
+        // bounds) but is VETOED when both sides carry complete bounds and
+        // containment provably fails; multiple matches are DISAMBIGUATED by
+        // range-containment (never a hard gate).
         let name_type = candidate_parents(table, col, pk_index);
+        let mut range_vetoed: Option<&PkEntry> = None;
         let chosen: Option<&PkEntry> = match name_type.as_slice() {
             [] => None,
-            [only] => Some(only),
+            [only] => {
+                if range_refuted(col.stats.min, col.stats.max, only.min, only.max) {
+                    range_vetoed = Some(only);
+                    None
+                } else {
+                    Some(only)
+                }
+            }
             many => {
                 let contained: Vec<&PkEntry> = many
                     .iter()
@@ -688,6 +738,26 @@ fn infer_foreign_keys(
                     ),
                 ));
             }
+        } else if let Some(parent) = range_vetoed {
+            // A single name∧type parent whose bounds CONTRADICT the child's:
+            // both sides supplied complete [min,max] bounds and the child range
+            // is not contained — joining would fabricate a provably-dangling
+            // relationship, so keep the column literal and say why.
+            diagnostics.push(Diagnostic::new(
+                Severity::Warning,
+                DiagCode::UnresolvedFkCandidate,
+                table.qualified_name(),
+                Some(col.name.clone()),
+                format!(
+                    "'{}' matches {}.{} by name∧type but its value range {} is not contained \
+                     in the parent's {}; kept literal, no join fabricated",
+                    col.name,
+                    parent.table_name,
+                    parent.pk_column,
+                    fmt_range(col.stats.min, col.stats.max),
+                    fmt_range(parent.min, parent.max),
+                ),
+            ));
         } else if name_type.len() >= 2 {
             // Multiple name∧type parents that range-containment could not narrow
             // to one — ambiguous, never fabricated.
@@ -733,7 +803,9 @@ fn infer_foreign_keys(
 /// Range-containment is deliberately NOT applied here: it is a DISAMBIGUATOR the
 /// caller uses only when more than one parent survives. Requiring it as a hard
 /// gate blocks correct joins whenever Snowflake supplies no integer min/max
-/// bounds, so an exact name+type match on a single parent joins on its own.
+/// bounds, so an exact name+type match on a single parent joins on its own —
+/// unless both sides carry complete bounds that REFUTE containment
+/// ([`range_refuted`]), in which case the caller vetoes the join.
 fn candidate_parents<'a>(
     table: &EmitTableSchema,
     col: &EmitColumn,
@@ -772,6 +844,32 @@ fn key_types_match(child: FieldType, parent: FieldType) -> bool {
         }
         (c, p) => c == p,
     }
+}
+
+/// True iff BOTH sides carry complete `[min,max]` bounds AND the child range is
+/// NOT contained in the parent's — i.e. the join is provably contradicted by
+/// the stats. Any missing bound ⇒ cannot refute ⇒ `false` (absence of bounds
+/// never blocks a single name∧type match; that is the Snowflake no-bounds case
+/// the disambiguator-not-gate design exists for).
+fn range_refuted(
+    child_min: Option<TypedBound>,
+    child_max: Option<TypedBound>,
+    parent_min: Option<TypedBound>,
+    parent_max: Option<TypedBound>,
+) -> bool {
+    match (child_min, child_max, parent_min, parent_max) {
+        (Some(cmin), Some(cmax), Some(pmin), Some(pmax)) => !(pmin <= cmin && cmax <= pmax),
+        _ => false,
+    }
+}
+
+/// Render an optional `[min,max]` bound pair for a diagnostic message.
+fn fmt_range(min: Option<TypedBound>, max: Option<TypedBound>) -> String {
+    let f = |b: Option<TypedBound>| match b {
+        Some(TypedBound::Int(v)) => v.to_string(),
+        None => "?".to_string(),
+    };
+    format!("[{},{}]", f(min), f(max))
 }
 
 /// True iff `child [min,max] ⊆ parent [min,max]`. Any missing bound ⇒ cannot

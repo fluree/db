@@ -27,6 +27,8 @@ mod it_transact_object_var;
 mod it_transact_pure_delete_dedup;
 #[path = "it_transact_update.rs"]
 mod it_transact_update;
+#[path = "it_transact_update_indexed.rs"]
+mod it_transact_update_indexed;
 #[path = "it_transact_upsert.rs"]
 mod it_transact_upsert;
 #[path = "it_txn_meta.rs"]

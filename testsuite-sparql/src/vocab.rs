@@ -28,6 +28,11 @@ pub mod mf {
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#PositiveUpdateSyntaxTest11";
     pub const NEGATIVE_UPDATE_SYNTAX_TEST_11: &str =
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#NegativeUpdateSyntaxTest11";
+    // SPARQL 1.2 manifests use the un-versioned update syntax test types.
+    pub const POSITIVE_UPDATE_SYNTAX_TEST: &str =
+        "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#PositiveUpdateSyntaxTest";
+    pub const NEGATIVE_UPDATE_SYNTAX_TEST: &str =
+        "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#NegativeUpdateSyntaxTest";
     pub const UPDATE_EVALUATION_TEST: &str =
         "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#UpdateEvaluationTest";
     pub const CSV_RESULT_FORMAT_TEST: &str =

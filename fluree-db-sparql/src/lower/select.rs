@@ -603,6 +603,20 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         // input BINDs are appended below, just as in the top-level pipeline).
         let mut patterns = self.lower_graph_pattern(&subselect.pattern)?;
 
+        // Trailing VALUES clause (`SubSelect ::= … SolutionModifier
+        // ValuesClause`): joined with the subquery's WHERE result by
+        // appending the VALUES table to the subquery's own pattern list —
+        // i.e. before this subquery's projection/modifiers. For a
+        // modifier-free subquery this is exactly the spec's
+        // `M := Join(M, ToMultiSet(data))` insertion point (§18.2.4.3, which
+        // applies VALUES before Project); with GROUP BY it approximates the
+        // spec by joining before grouping rather than after HAVING. Appended
+        // before the `SELECT *` var computation below so VALUES-introduced
+        // variables are in scope of `*`.
+        if let Some(values) = &subselect.values {
+            patterns.extend(self.lower_graph_pattern(values)?);
+        }
+
         // Build a SelectClause so the shared SELECT/modifier lowering applies.
         // REDUCED is treated as DISTINCT (handled when assembling the pattern).
         let select_clause = SelectClause {

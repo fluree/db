@@ -171,11 +171,7 @@ pub fn predicate_scalar_agg_operator(
             // constant-folding / directory shortcuts). An uncommitted overlay or
             // `to_t < max_t` would make that scan stale, so fold the same
             // aggregate over a POST overlay cursor instead.
-            let has_overlay = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let has_overlay = crate::fast_path_common::overlay_has_novelty(ctx);
             let result = if !has_overlay && ctx.to_t == store.max_t() {
                 scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind)?
             } else {
@@ -192,7 +188,7 @@ pub fn predicate_scalar_agg_operator(
 }
 
 /// The folded result of a scalar aggregate, before batch construction.
-enum AggOutput {
+pub(crate) enum AggOutput {
     /// `xsd:integer` value (SUM, COUNT-DISTINCT, and the empty-group identity 0
     /// for AVG).
     Integer(i64),
@@ -201,6 +197,14 @@ enum AggOutput {
 }
 
 impl AggOutput {
+    /// The result as a bare binding (for folds that assemble multi-column rows).
+    pub(crate) fn into_binding(self) -> Binding {
+        match self {
+            AggOutput::Integer(v) => Binding::lit(FlakeValue::Long(v), Sid::xsd_integer()),
+            AggOutput::Binding(b) => b,
+        }
+    }
+
     fn into_batch(self, out_var: VarId) -> Result<Batch> {
         match self {
             AggOutput::Integer(v) => build_i64_singleton_batch(out_var, v, "scalar-agg"),
@@ -352,7 +356,7 @@ fn empty_result(kind: ScalarAggKind) -> AggOutput {
 /// Shared POST-leaflet scan driver. Returns `Ok(None)` when a variant hits a
 /// runtime-unsupported leaflet (mixed/non-matching datatypes) and the caller
 /// must fall back to the planned pipeline.
-fn scan_predicate_scalar_agg(
+pub(crate) fn scan_predicate_scalar_agg(
     store: &BinaryIndexStore,
     g_id: GraphId,
     predicate: &Ref,
@@ -472,7 +476,7 @@ fn leaflet_scan_plan(
 /// [`AggState`] over a POST overlay cursor that merges uncommitted novelty and
 /// honors `to_t`. Used when an overlay carries novelty or `to_t < max_t`, where
 /// the leaflet-metadata scan would be stale.
-fn scan_predicate_scalar_agg_overlay(
+pub(crate) fn scan_predicate_scalar_agg_overlay(
     ctx: &crate::context::ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -484,11 +488,7 @@ fn scan_predicate_scalar_agg_overlay(
         // Predicate absent from the persisted dictionary. With novelty present it
         // may exist only in the overlay (no `p_id` to range-bound a cursor), so
         // fall back to the planned pipeline; otherwise the input is genuinely empty.
-        let overlay_has_rows = ctx
-            .overlay
-            .map(fluree_db_core::OverlayProvider::epoch)
-            .unwrap_or(0)
-            != 0;
+        let overlay_has_rows = crate::fast_path_common::overlay_has_novelty(ctx);
         return if overlay_has_rows {
             Ok(None)
         } else {

@@ -47,7 +47,8 @@ use fluree_db_r2rml::mapping::{
 };
 use fluree_db_r2rml::materialize::{
     expand_template, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_subject_from_batch, reverse_subject_template, RdfTerm,
+    materialize_predicate_from_batch, materialize_subject_from_batch, reverse_subject_template,
+    RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use fluree_vocab::xsd;
@@ -1771,11 +1772,23 @@ fn materialize_batch(
                     base.push((sv, subject_binding.clone()));
                 }
                 // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
-                // `?p` to this POM's predicate IRI. A templated (non-constant)
-                // predicate leaves `?p` unbound for that triple.
+                // `?p` to this POM's predicate IRI. A templated/column (non-
+                // constant) predicate — rare but representable — is materialized
+                // from the row; when it expands to nothing (NULL column) the
+                // triple does not exist for this row, so the POM is SKIPPED
+                // rather than emitting a solution with a bound object and an
+                // unbound predicate.
                 if let Some(pv) = pattern.predicate_var {
-                    if let Some(pred_iri) = pom.predicate_map.as_constant() {
-                        base.push((pv, Binding::iri(pred_iri)));
+                    match pom.predicate_map.as_constant() {
+                        Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
+                        None => match materialize_predicate_from_batch(
+                            &pom.predicate_map,
+                            iceberg_batch,
+                            table_row_idx,
+                        )? {
+                            Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
+                            None => continue,
+                        },
                     }
                 }
                 base.push((obj_var, object_binding));
@@ -1814,26 +1827,24 @@ fn materialize_batch(
             }
         }
 
-        // 0b (fluree/db F3): a bound-subject true wildcard (`<iri> ?p ?o`) must
-        // also emit the `rr:class`-derived `rdf:type` triple(s). The POM loop
-        // above materializes only the data predicates, so without this the
-        // bound-subject inspector shows no `@type` for a virtual-dataset subject
-        // (native returns it). Reached only for the matched subject row (the
-        // `subject_term_matches_iri` gate above `continue`s the rest). Scoped to
-        // a bound subject (`subject_var` is None) with a variable predicate and
-        // no explicit predicate filter or projected type-var: a predicate-
-        // filtered `<iri> edw:name ?o` wants only its predicate, and a fused
-        // `?s a ?type` crawl already projects the class via `type_var`.
-        if pattern.subject_var.is_none()
-            && pattern.predicate_filter.is_none()
-            && pattern.type_var.is_none()
-        {
+        // A TRUE-wildcard scan (`?s ?p ?o` / `<iri> ?p ?o`: variable predicate,
+        // no predicate filter) must ALSO emit each subject's `rr:class`-derived
+        // `rdf:type` triple — the POM loop above materializes only the data
+        // predicates, while a native wildcard returns the type triple too
+        // (without this, the subject inspector shows no `@type` on a virtual
+        // dataset). Excluded when a type-var is projected (a fused browse crawl
+        // already carries the class on every row — no double emission) and when
+        // a predicate filter pins `?p` to one data predicate.
+        if pattern.predicate_filter.is_none() && pattern.type_var.is_none() {
             if let Some(pv) = pattern.predicate_var {
                 for class_iri in triples_map.classes() {
-                    produced.push(vec![
-                        (pv, Binding::iri(fluree_vocab::rdf::TYPE)),
-                        (obj_var, Binding::iri(class_iri.as_str())),
-                    ]);
+                    let mut row = Vec::with_capacity(3);
+                    if let Some(sv) = pattern.subject_var {
+                        row.push((sv, subject_binding.clone()));
+                    }
+                    row.push((pv, Binding::iri(fluree_vocab::rdf::TYPE)));
+                    row.push((obj_var, Binding::iri(class_iri.as_str())));
+                    produced.push(row);
                 }
             }
         }
@@ -2403,32 +2414,47 @@ mod tests {
         ));
     }
 
-    /// PR-0/0b (fluree/db F3): a bound-subject true wildcard (`<iri> ?p ?o`)
-    /// emits the `rr:class`-derived `rdf:type` triple that the POM loop alone
-    /// omits — otherwise the subject inspector shows no `@type` on virtual.
-    #[test]
-    fn bound_subject_wildcard_emits_rdf_type() {
-        use fluree_db_r2rml::mapping::TriplesMap;
-        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
-        use std::sync::Arc;
+    // ---- true-wildcard rdf:type emission + non-constant predicate binding ----
 
-        // DIM_STORE keyed on STORE_KEY, class edw:Store, no data POMs — so the
-        // ONLY output is the class-derived rdf:type row.
-        let tm = TriplesMap::new("#Store", "DIM_STORE")
-            .with_subject_template("http://ex/store/{STORE_KEY}")
-            .with_class("http://ex/Store");
+    use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
+    fn iri_of(b: &Binding) -> String {
+        match b {
+            Binding::Iri(s) => s.to_string(),
+            other => panic!("expected an IRI binding, got {other:?}"),
+        }
+    }
+
+    fn find(row: &[(VarId, Binding)], v: VarId) -> Option<&Binding> {
+        row.iter().find(|(rv, _)| *rv == v).map(|(_, b)| b)
+    }
+
+    fn single_col_batch(name: &str, values: Vec<Option<i64>>) -> ColumnBatch {
         let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
-            name: "STORE_KEY".to_string(),
+            name: name.to_string(),
             field_type: FieldType::Int64,
             nullable: false,
             field_id: 1,
         }]));
-        let batch = ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap();
+        ColumnBatch::new(schema, vec![Column::Int64(values)]).unwrap()
+    }
+
+    /// A bound-subject true wildcard (`<iri> ?p ?o`) emits the `rr:class`-derived
+    /// `rdf:type` triple that the POM loop alone omits — without it the subject
+    /// inspector shows no `@type` on a virtual dataset (native returns it).
+    #[test]
+    fn bound_subject_wildcard_emits_rdf_type() {
+        // DIM_STORE keyed on STORE_KEY, class ex:Store, no data POMs — so the
+        // ONLY output is the class-derived rdf:type row.
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store");
+        let batch = single_col_batch("STORE_KEY", vec![Some(1)]);
 
         // `<http://ex/store/1> ?p ?o` (?p = VarId 1, ?o = VarId 2).
-        let pattern = R2rmlPattern::new_bound_subject("gs:main", "http://ex/store/1", Some(VarId(2)))
-            .with_predicate_var(VarId(1));
+        let pattern =
+            R2rmlPattern::new_bound_subject("gs:main", "http://ex/store/1", Some(VarId(2)))
+                .with_predicate_var(VarId(1));
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
@@ -2438,17 +2464,151 @@ mod tests {
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
             .expect("materialize");
 
-        let iri_of = |b: &Binding| -> String {
-            match b {
-                Binding::Iri(s) => s.to_string(),
-                other => panic!("expected an IRI binding, got {other:?}"),
-            }
-        };
         assert_eq!(rows.len(), 1, "exactly the one rdf:type row: {rows:?}");
         let row = &rows[0];
-        let pred = row.iter().find(|(v, _)| *v == VarId(1)).map(|(_, b)| iri_of(b));
-        let obj = row.iter().find(|(v, _)| *v == VarId(2)).map(|(_, b)| iri_of(b));
-        assert_eq!(pred.as_deref(), Some(fluree_vocab::rdf::TYPE), "?p = rdf:type");
-        assert_eq!(obj.as_deref(), Some("http://ex/Store"), "?o = the class IRI");
+        assert_eq!(
+            find(row, VarId(1)).map(iri_of).as_deref(),
+            Some(fluree_vocab::rdf::TYPE),
+            "?p = rdf:type"
+        );
+        assert_eq!(
+            find(row, VarId(2)).map(iri_of).as_deref(),
+            Some("http://ex/Store"),
+            "?o = the class IRI"
+        );
+    }
+
+    /// A var-subject true wildcard (`?s ?p ?o`) emits each row's data POM rows
+    /// PLUS one class-derived rdf:type row binding the subject — matching the
+    /// native wildcard, which returns the type triple alongside the data.
+    #[test]
+    fn var_subject_wildcard_emits_rdf_type_rows() {
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: fluree_db_r2rml::mapping::PredicateMap::constant(
+                    "http://ex/storeKey",
+                ),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let batch = single_col_batch("STORE_KEY", vec![Some(7)]);
+
+        // `?s ?p ?o` (?s = VarId 0, ?p = VarId 1, ?o = VarId 2).
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let encoder = LiteralEncoder::build(&tm, &snapshot);
+        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
+            .expect("materialize");
+
+        assert_eq!(rows.len(), 2, "one data row + one type row: {rows:?}");
+        let type_row = rows
+            .iter()
+            .find(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == fluree_vocab::rdf::TYPE))
+                    .unwrap_or(false)
+            })
+            .expect("a type row must be emitted");
+        assert!(
+            find(type_row, VarId(0)).is_some(),
+            "type row must bind the subject var"
+        );
+        assert_eq!(
+            find(type_row, VarId(2)).map(iri_of).as_deref(),
+            Some("http://ex/Store"),
+            "type row object = class IRI"
+        );
+        // The data row still carries its constant predicate.
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == "http://ex/storeKey"))
+                    .unwrap_or(false)
+            }),
+            "the data POM row must survive alongside the type row: {rows:?}"
+        );
+    }
+
+    /// A templated (non-constant) predicate binds `?p` from the row when the
+    /// template expands, and SKIPS the POM when a referenced column is NULL —
+    /// never emitting a solution with a bound object and an unbound predicate.
+    #[test]
+    fn templated_predicate_binds_or_skips_never_half_bound() {
+        use fluree_db_r2rml::mapping::PredicateMap;
+
+        // Classless map (isolates POM behavior): predicate templated over
+        // ATTR_NAME, object from ATTR_VAL.
+        let tm = TriplesMap::new("#Attr", "ATTRS")
+            .with_subject_template("http://ex/attr-row/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::template(
+                    "http://ex/attr/{ATTR_NAME}",
+                    vec!["ATTR_NAME".to_string()],
+                ),
+                object_map: ObjectMap::column("ATTR_VAL"),
+            });
+
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "ID".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "ATTR_NAME".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "ATTR_VAL".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Int64(vec![Some(1), Some(2)]),
+                Column::String(vec![Some("color".to_string()), None]), // row 2: NULL name
+                Column::String(vec![Some("red".to_string()), Some("blue".to_string())]),
+            ],
+        )
+        .unwrap();
+
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let encoder = LiteralEncoder::build(&tm, &snapshot);
+        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
+            .expect("materialize");
+
+        // Row 1 materializes with ?p expanded from the template; row 2's POM is
+        // skipped (NULL template column ⇒ the triple does not exist), so no row
+        // may carry a bound object with an unbound predicate.
+        assert_eq!(rows.len(), 1, "only the expandable row survives: {rows:?}");
+        assert_eq!(
+            find(&rows[0], VarId(1)).map(iri_of).as_deref(),
+            Some("http://ex/attr/color"),
+            "?p = the row-expanded templated predicate"
+        );
+        for row in &rows {
+            assert!(
+                !(find(row, VarId(2)).is_some() && find(row, VarId(1)).is_none()),
+                "no solution may bind ?o while leaving ?p unbound: {row:?}"
+            );
+        }
     }
 }

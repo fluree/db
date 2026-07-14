@@ -14,6 +14,12 @@ Recipes for the list-value and path operators: dense / gap-filled series with `u
 
 Querying and writing with openCypher: modeling a property graph, querying relationships, `MERGE` find-or-create, updates and deletes, paths and shortest path, aggregation, and cross-surface round-trips with JSON-LD/SPARQL.
 
+### [Connecting with Neo4j drivers (Bolt)](bolt.md)
+
+Enable and configure the Bolt listener, connect with official Neo4j
+drivers (Python/JavaScript examples), transaction retry semantics, and
+troubleshooting.
+
 ### [SPARQL](cookbook-sparql.md)
 
 The Fluree-specific SPARQL surface (the 1.1 basics assumed): time travel with `FROM @t:`, fact history via `<< s p o >> f:t/f:op`, RDF 1.2 edge annotations (`{| |}`, `~`, `rdf:reifies`), cross-ledger `FROM`/`GRAPH` queries, and cross-surface round-trips.

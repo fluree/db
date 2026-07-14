@@ -267,6 +267,28 @@ impl QueryResult {
         format::format_results(self, &self.context, snapshot, &config)
     }
 
+    /// The Cypher tabular result (columns + rows) with RDF-faithful cell
+    /// values — the pre-flattening form of [`Self::to_cypher_json`]. Value-
+    /// typed transports (Bolt) map datatypes from these cells directly.
+    pub fn to_cypher_table(
+        &self,
+        snapshot: &LedgerSnapshot,
+    ) -> format::Result<(Vec<String>, Vec<Vec<JsonValue>>)> {
+        format::format_cypher_table(self, &self.context, snapshot)
+    }
+
+    /// The typed Cypher tabular result: node refs hydrate into
+    /// [`format::cypher_typed::CypherNode`] (labels + properties fetched
+    /// from `view` at format time), relationship/path/temporal values stay
+    /// typed. Under a view policy, hydration filters each subject's raw
+    /// SPOT fetch through the view's enforcer before rendering.
+    pub async fn to_cypher_typed_table(
+        &self,
+        view: &crate::view::GraphDb,
+    ) -> format::Result<(Vec<String>, Vec<Vec<format::cypher_typed::CypherCell>>)> {
+        format::format_cypher_typed_table(self, &self.context, view).await
+    }
+
     /// Format as AgentJson (LLM/agent-optimized envelope)
     ///
     /// Returns an envelope with schema header, compact object rows, and pagination metadata.

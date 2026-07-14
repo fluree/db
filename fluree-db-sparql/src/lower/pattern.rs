@@ -157,8 +157,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         *span,
                     ));
                 }
-                let pat = self.lower_annotation_target_pattern(reifier, triple_term)?;
-                Ok(vec![pat])
+                self.lower_annotation_target_pattern(reifier, triple_term)
             }
         }
     }

@@ -154,12 +154,6 @@ pub struct CommitOpts {
     /// Used during rebase replay where the branch is disconnected and we
     /// control the full commit sequence.
     pub skip_backpressure: bool,
-    /// Skip sequencing verification (commit head matching).
-    ///
-    /// Used during rebase replay where the base state is the source branch
-    /// but we commit to the target branch namespace. The sequencing check
-    /// would fail because the nameservice head doesn't match the base state.
-    pub skip_sequencing: bool,
     /// Additional parent commit IDs for merge commits.
     ///
     /// When non-empty, these are appended as extra `parents` on the
@@ -208,7 +202,6 @@ impl std::fmt::Debug for CommitOpts {
                     .map(std::collections::HashMap::len),
             )
             .field("skip_backpressure", &self.skip_backpressure)
-            .field("skip_sequencing", &self.skip_sequencing)
             .field("merge_parents", &self.merge_parents.len())
             .field("timestamp", &self.timestamp)
             .field("received_at", &self.received_at)
@@ -232,7 +225,6 @@ impl Clone for CommitOpts {
             graph_delta: self.graph_delta.clone(),
             namespace_delta: self.namespace_delta.clone(),
             skip_backpressure: self.skip_backpressure,
-            skip_sequencing: self.skip_sequencing,
             merge_parents: self.merge_parents.clone(),
             timestamp: self.timestamp.clone(),
             received_at: self.received_at.clone(),
@@ -316,12 +308,6 @@ impl CommitOpts {
         self
     }
 
-    /// Skip sequencing verification (for rebase replay).
-    pub fn with_skip_sequencing(mut self) -> Self {
-        self.skip_sequencing = true;
-        self
-    }
-
     /// Set additional parent commit IDs for merge commits.
     pub fn with_merge_parents(mut self, parents: Vec<ContentId>) -> Self {
         self.merge_parents = parents;
@@ -362,9 +348,9 @@ impl CommitOpts {
 ///   upload before enqueueing and carries the resolved CID via
 ///   `raw_txn_id`, so the worker doesn't re-do the upload.
 /// - `graph_delta` / `namespace_delta` / `skip_backpressure` /
-///   `skip_sequencing` / `merge_parents` — populated during staging or
-///   reserved for the rebase/merge paths, which carry their own
-///   request envelopes when they join the queue.
+///   `merge_parents` — populated during staging or reserved for the
+///   rebase/merge paths, which carry their own request envelopes
+///   when they join the queue.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CommitOptsRequest {
     pub identity: Option<String>,
@@ -402,7 +388,6 @@ impl CommitOptsRequest {
             graph_delta: HashMap::new(),
             namespace_delta: None,
             skip_backpressure: false,
-            skip_sequencing: false,
             merge_parents: Vec::new(),
             timestamp: self.timestamp,
             received_at: self.received_at,
@@ -766,6 +751,14 @@ impl StagedCommit {
     /// `put_with_id` (idempotent), publishes the new head ref to the
     /// nameservice, and finalizes the resulting [`LedgerState`].
     ///
+    /// The publish is a compare-and-set against the exact head this
+    /// commit was built on (`expected_head_ref`, baked in by
+    /// [`build_commit`]); a head that moved between build and apply
+    /// surfaces as [`TransactError::PublishLostRace`]. Callers that
+    /// make the commit durable through another mechanism (the Raft
+    /// `ApplyHead` path, rebase's batched replay publish) use
+    /// [`Self::finalize_state`] instead.
+    ///
     /// On publish failure, the raw-txn blob uploaded during
     /// [`build_commit`] is released — that CID is no longer referenced
     /// by any durable commit record.
@@ -773,13 +766,12 @@ impl StagedCommit {
         self,
         content_store: &C,
         nameservice: &N,
-        skip_sequencing: bool,
     ) -> Result<(CommitReceipt, LedgerState)>
     where
         C: ContentStore + ?Sized,
         N: RefPublisher + ?Sized,
     {
-        apply_commit_inner(self, content_store, nameservice, skip_sequencing).await
+        apply_commit_inner(self, content_store, nameservice).await
     }
 
     /// Pure post-publish/post-apply state finalization. Builds the
@@ -810,7 +802,6 @@ async fn apply_commit_inner<C, N>(
     staged: StagedCommit,
     content_store: &C,
     nameservice: &N,
-    skip_sequencing: bool,
 ) -> Result<(CommitReceipt, LedgerState)>
 where
     C: ContentStore + ?Sized,
@@ -860,39 +851,17 @@ where
             id: Some(commit_cid.clone()),
             t: new_t,
         };
-        let publish_result = if skip_sequencing {
-            nameservice
-                .fast_forward_commit(ledger_id_for_publish.as_str(), &new_head_ref, 3)
-                .instrument(tracing::debug_span!("commit_publish_nameservice"))
-                .await?
-        } else {
-            nameservice
-                .compare_and_set_ref(
-                    ledger_id_for_publish.as_str(),
-                    RefKind::CommitHead,
-                    expected_head_ref.as_ref(),
-                    &new_head_ref,
-                )
-                .instrument(tracing::debug_span!("commit_publish_nameservice"))
-                .await?
-        };
+        let publish_result = nameservice
+            .compare_and_set_ref(
+                ledger_id_for_publish.as_str(),
+                RefKind::CommitHead,
+                expected_head_ref.as_ref(),
+                &new_head_ref,
+            )
+            .instrument(tracing::debug_span!("commit_publish_nameservice"))
+            .await?;
         match publish_result {
             CasResult::Updated => {}
-            CasResult::Conflict { actual } if skip_sequencing => {
-                let head_ahead = actual.as_ref().map(|r| r.t >= new_t).unwrap_or(false);
-                if !head_ahead {
-                    return Err(TransactError::PublishLostRace {
-                        ledger_id: ledger_id_for_publish.clone(),
-                        attempted_t: new_t,
-                        attempted_commit_id: commit_cid.to_string(),
-                        published_t: actual.as_ref().map(|r| r.t).unwrap_or(0),
-                        published_commit_id: actual
-                            .and_then(|r| r.id)
-                            .map(|cid| cid.to_string())
-                            .unwrap_or_else(|| "None".to_string()),
-                    });
-                }
-            }
             CasResult::Conflict { actual } => {
                 return Err(TransactError::PublishLostRace {
                     ledger_id: ledger_id_for_publish.clone(),
@@ -1099,8 +1068,6 @@ where
     C: ContentStore + ?Sized,
     N: NameServiceLookup + RefPublisher + ?Sized,
 {
-    let skip_sequencing = opts.skip_sequencing;
-
     let commit_span = tracing::debug_span!(
         "txn_commit",
         alias = view.base().ledger_id(),
@@ -1119,15 +1086,11 @@ where
         // blob the upload already landed in CAS. Awaiting `finish()`
         // first would have promoted the blob to a referenced CID with
         // no caller obligated to release it.
-        let current = if skip_sequencing {
-            None
-        } else {
-            nameservice
-                .lookup(view.base().ledger_id())
-                .instrument(tracing::debug_span!("commit_nameservice_lookup"))
-                .await?
-        };
-        if !skip_sequencing {
+        let current = nameservice
+            .lookup(view.base().ledger_id())
+            .instrument(tracing::debug_span!("commit_nameservice_lookup"))
+            .await?;
+        {
             let span = tracing::debug_span!("commit_verify_sequencing");
             let _g = span.enter();
             verify_sequencing(view.base(), current.as_ref())?;
@@ -1168,9 +1131,7 @@ where
                 return Err(e);
             }
         };
-        staged
-            .apply(content_store, nameservice, skip_sequencing)
-            .await
+        staged.apply(content_store, nameservice).await
     }
     .instrument(commit_span)
     .await

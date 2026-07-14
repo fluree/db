@@ -381,12 +381,14 @@ fn composite_subject_key_uses_multi_placeholder_template() {
 // =============================================================================
 
 #[test]
-fn auto_name_fallback_emits_unverified_subject() {
+fn auto_name_fallback_emits_unverified_subject_not_indexed() {
     // The live Snowflake case: no identifier_field_ids, and a WIDGET_KEY that is
     // required=false with unknown null_fraction (NOT provably non-null). Under the
     // default Auto strategy the emitter USES it — SubjectKeyUnverified, downgraded
-    // from NoSafeSubjectKey — so the table is saveable, and keeps it
-    // join-compatible (indexed as an FK parent).
+    // from NoSafeSubjectKey — so the table is saveable, but does NOT index it as
+    // an FK parent: same policy as a nullable declared identifier (a nullable /
+    // uniqueness-unverifiable parent key silently changes join cardinality). A
+    // caller that knows better asserts the PK via the per-table override.
     let parent = tbl(
         "DIM_WIDGET",
         vec![], // no identifier_field_ids
@@ -414,19 +416,27 @@ fn auto_name_fallback_emits_unverified_subject() {
     assert!(diag_cols(&out, DiagCode::SubjectKeyUnverified)
         .contains(&("DW.DIM_WIDGET".to_string(), "WIDGET_KEY".to_string())));
     assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
-    // Join-compatible: the child's WIDGET_KEY resolves to the unverified parent PK.
-    assert!(resolved_fks(&out).contains(&(
-        "DW.FACT_USE".to_string(),
-        "WIDGET_KEY".to_string(),
-        "DW.DIM_WIDGET".to_string(),
-        "WIDGET_KEY".to_string(),
-    )));
+    // NOT join-compatible: the nullable fallback key must not become a live FK
+    // parent, so the child's WIDGET_KEY stays literal and is surfaced.
+    assert!(
+        !resolved_fks(&out)
+            .iter()
+            .any(|(ct, cc, pt, _)| ct == "DW.FACT_USE"
+                && cc == "WIDGET_KEY"
+                && pt == "DW.DIM_WIDGET"),
+        "a nullable name-fallback key must not be an FK parent"
+    );
+    assert!(diag_cols(&out, DiagCode::UnresolvedFkCandidate)
+        .contains(&("DW.FACT_USE".to_string(), "WIDGET_KEY".to_string())));
 }
 
 #[test]
 fn auto_keyless_table_synthesizes_composite_subject() {
-    // Auto default + a table with NO key-like column → a deterministic composite
-    // subject over all columns (SubjectKeySynthesized), never a fabricated rownum.
+    // Auto default + a table with NO key-like column and NO provably-non-null
+    // column → a deterministic composite subject over ALL flat columns
+    // (SubjectKeySynthesized), never a fabricated rownum — and the diagnostic
+    // must DISCLOSE that rows with a NULL in any templated column are dropped
+    // (template expansion emits no subject for them).
     let weird = tbl(
         "WEIRD",
         vec![],
@@ -439,9 +449,61 @@ fn auto_keyless_table_synthesizes_composite_subject() {
         "keyless table must get a composite subject, got {}",
         tm.subject_template
     );
-    assert!(out.diagnostics.iter().any(
-        |d| d.code == DiagCode::SubjectKeySynthesized && d.table.as_deref() == Some("DW.WEIRD")
-    ));
+    let synth = out
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == DiagCode::SubjectKeySynthesized && d.table.as_deref() == Some("DW.WEIRD")
+        })
+        .expect("keyless table must earn SubjectKeySynthesized");
+    assert!(
+        synth.message.contains("WILL NOT APPEAR"),
+        "an all-nullable synthesized subject must disclose the NULL row drop, got: {}",
+        synth.message
+    );
+    assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
+}
+
+#[test]
+fn auto_keyless_synthesis_prefers_provably_non_null_columns() {
+    // Keyless DIM_LOOKUP(CODE NOT NULL, LABEL nullable, NOTE nullable): the
+    // synthesized composite must template over the provably-non-null subset
+    // ONLY — templating over LABEL/NOTE would silently drop every row where
+    // either is NULL (exactly the rows keyless tables tend to have). The
+    // trade (rows identical on CODE collapse) is disclosed instead.
+    let lookup = tbl(
+        "LOOKUP",
+        vec![],
+        vec![
+            ik(1, "CODE", 1, 999, true), // required → provably non-null
+            sc(2, "LABEL", FieldType::String),
+            sc(3, "NOTE", FieldType::String),
+        ],
+    );
+    let out = emit_r2rml(&[lookup], &EmitOptions::default());
+    let tm = &out.structured.table_mappings[0];
+    assert!(
+        tm.subject_template.ends_with("/{CODE}"),
+        "synthesis must use the non-null subset, got {}",
+        tm.subject_template
+    );
+    assert!(
+        !tm.subject_template.contains("{LABEL}") && !tm.subject_template.contains("{NOTE}"),
+        "nullable columns must not enter the synthesized template, got {}",
+        tm.subject_template
+    );
+    let synth = out
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == DiagCode::SubjectKeySynthesized && d.table.as_deref() == Some("DW.LOOKUP")
+        })
+        .expect("keyless table must earn SubjectKeySynthesized");
+    assert!(
+        synth.message.contains("provably-non-null") && synth.message.contains("no row is dropped"),
+        "diagnostic must state the non-null-subset choice, got: {}",
+        synth.message
+    );
     assert!(diag_cols(&out, DiagCode::NoSafeSubjectKey).is_empty());
 }
 
@@ -748,11 +810,12 @@ fn fk_join_locals_disambiguate_across_joins_not_just_literals() {
 }
 
 #[test]
-fn fk_single_parent_resolves_even_when_range_incompatible() {
-    // INTENTIONAL behavior change: range-containment is a DISAMBIGUATOR, not a
-    // hard gate. A single name+type parent joins on name∧type ALONE, even when
-    // the child range ⊄ parent range (Snowflake often supplies no usable bounds,
-    // and requiring them blocked correct joins).
+fn fk_single_parent_vetoed_when_bounds_refute_containment() {
+    // Range-containment is a disambiguator, not a hard gate — but when BOTH
+    // sides supply complete [min,max] bounds and the child range is NOT
+    // contained, the join is provably contradicted: veto it (kept literal,
+    // surfaced as UnresolvedFkCandidate) rather than fabricating a dangling
+    // relationship. Child [1,500] vs parent [1000,2000] is disjoint.
     let parent = tbl(
         "DIM_PARENT",
         vec![1],
@@ -768,13 +831,52 @@ fn fk_single_parent_resolves_even_when_range_incompatible() {
     );
     let out = emit_r2rml(&[parent, child], &EmitOptions::default());
     assert!(
+        resolved_fks(&out).is_empty(),
+        "a single name+type parent with refuting bounds must NOT resolve"
+    );
+    let veto = out
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == DiagCode::UnresolvedFkCandidate
+                && d.table.as_deref() == Some("DW.FACT_CHILD")
+                && d.column.as_deref() == Some("PARENT_KEY")
+        })
+        .expect("range veto must surface an UnresolvedFkCandidate diagnostic");
+    assert!(
+        veto.message.contains("not contained"),
+        "veto diagnostic must explain the range refutation, got: {}",
+        veto.message
+    );
+}
+
+#[test]
+fn fk_single_parent_resolves_when_bounds_cannot_refute() {
+    // One side missing bounds ⇒ containment can be neither confirmed NOR
+    // refuted ⇒ the single name+type match still joins (the Snowflake
+    // no-bounds case the disambiguator-not-gate design exists for).
+    let parent = tbl(
+        "DIM_PARENT",
+        vec![1],
+        vec![dk_nobounds(1, "PARENT_KEY", true)], // parent supplies no bounds
+    );
+    let child = tbl(
+        "FACT_CHILD",
+        vec![1],
+        vec![
+            dk(1, "CHILD_KEY", 1, 100, true),
+            dk(2, "PARENT_KEY", 1, 500, false), // child has bounds
+        ],
+    );
+    let out = emit_r2rml(&[parent, child], &EmitOptions::default());
+    assert!(
         resolved_fks(&out).contains(&(
             "DW.FACT_CHILD".to_string(),
             "PARENT_KEY".to_string(),
             "DW.DIM_PARENT".to_string(),
             "PARENT_KEY".to_string(),
         )),
-        "a single name+type parent must resolve without range-containment"
+        "absent bounds must never block a single name+type match"
     );
 }
 

@@ -635,12 +635,11 @@ impl crate::Fluree {
     /// Dry-run terminal for rebase: stage `flakes` on top of `state`
     /// and produce a [`StagedCommit`] representing the replay of
     /// `original_commit`, without writing the commit blob or
-    /// publishing the ref. The caller composes this with either
-    /// [`StagedCommit::apply`] (local single-step apply) or the
-    /// blob-write + `AdvanceRef` consensus apply path.
+    /// publishing the ref. The caller finalizes each step via
+    /// `staged.finalize_state()` and publishes the batch's final
+    /// head once through `publish_commit`.
     ///
-    /// Uses `skip_sequencing=true` (no `expected_head_ref` baked in)
-    /// and `skip_backpressure=true` (a single rebase can accumulate
+    /// Uses `skip_backpressure=true` (a single rebase can accumulate
     /// novelty well past the per-commit gate). Atomic rebase is
     /// instead bounded by a cumulative novelty check the caller
     /// applies after `staged.finalize_state()` of each step.
@@ -661,14 +660,13 @@ impl crate::Fluree {
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let commit_opts = CommitOpts::default()
             .with_skip_backpressure()
-            .with_skip_sequencing()
             .with_namespace_delta(original_commit.namespace_delta.clone())
             .with_graph_delta(original_commit.graph_delta.clone());
 
-        // With skip_sequencing=true the apply path uses
-        // `fast_forward_commit` (no CAS), so `expected_head_ref` is
-        // intentionally `None` here. raw_txn has no place in a replay
-        // commit, so `txn_id` is `None` as well.
+        // Replay commits never go through `StagedCommit::apply` — the
+        // caller publishes the batch's final head once — so
+        // `expected_head_ref` is `None` here. raw_txn has no place in
+        // a replay commit, so `txn_id` is `None` as well.
         let staged = fluree_db_transact::build_commit(
             view,
             ns_registry,

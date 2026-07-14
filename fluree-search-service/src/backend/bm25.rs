@@ -336,7 +336,7 @@ mod tests {
             // Find newest snapshot <= target_t
             let indexes = self.indexes.read().unwrap();
             let mut best: Option<i64> = None;
-            for (key, _) in indexes.iter() {
+            for key in indexes.keys() {
                 if key.0 == graph_source_id && key.1 <= target_t {
                     match best {
                         None => best = Some(key.1),

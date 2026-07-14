@@ -768,6 +768,20 @@ mod tests {
         assert_eq!(result, json!(3.13));
     }
 
+    /// Guard for the canonical `xsd:double` change (issue #1445): JSON-LD
+    /// output is a JSON-native surface, so a double MUST stay a JSON number.
+    /// It must never become the RDF canonical lexical string ("1.0E6") used by
+    /// the SPARQL-JSON/XML, CSV/TSV, and N-Triples serializations.
+    #[test]
+    fn test_format_binding_double_stays_json_number() {
+        let compactor = make_test_compactor();
+        let binding = Binding::lit(FlakeValue::Double(1_000_000.0), Sid::new(2, "double"));
+        let result = format_binding(&binding, &compactor).unwrap();
+        assert!(result.is_number(), "double must be a JSON number: {result}");
+        assert_eq!(result, json!(1_000_000.0));
+        assert_ne!(result, json!("1.0E6"));
+    }
+
     #[test]
     fn test_format_binding_boolean() {
         let compactor = make_test_compactor();

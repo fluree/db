@@ -791,6 +791,21 @@ impl BranchLifecycle for DynamoDbNameService {
         let meta = Self::find_item_by_sk(&meta_items, SK_META)
             .ok_or_else(|| NameServiceError::not_found(ledger_id))?;
 
+        // Refuse a branch that still has children — the same lineage
+        // guard the other backends and the raft state machine
+        // enforce. Only reachable on a direct out-of-order call; the
+        // api layer defers a branch with children instead.
+        let child_count = meta
+            .get(ATTR_BRANCHES)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0);
+        if child_count > 0 {
+            return Err(NameServiceError::storage(format!(
+                "drop_branch refused: {ledger_id} still has {child_count} child branch(es)"
+            )));
+        }
+
         let parent_source = meta
             .get(ATTR_BP_SOURCE)
             .and_then(|v| v.as_s().ok())

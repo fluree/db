@@ -22,7 +22,7 @@ name = "fluree_db_server"
 path = "src/lib.rs"
 
 [features]
-default = ["native", "credential", "iceberg", "shacl"]
+default = ["native", "credential", "iceberg", "shacl", "bolt"]
 native = ["fluree-db-api/native"]
 # AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
 aws = ["fluree-db-api/aws"]
@@ -52,12 +52,18 @@ otel = [
 # middleware on leader-only routes and exposes the inter-node RPC +
 # cluster-admin routers on a separate private listener.
 raft = ["fluree-db-consensus/raft", "dep:fluree-db-indexer"]
+# Bolt protocol listener (Neo4j drivers speak to the openCypher surface).
+# Default on — the listener only binds when bolt_listen_addr is configured,
+# so runtime config is the real gate; exclude the feature only for minimal
+# builds. See docs/api/bolt.md.
+bolt = ["dep:fluree-db-bolt"]
 
 [dependencies]
 # Optional global allocator (see the `mimalloc` feature).
 mimalloc = { workspace = true, optional = true }
 # Fluree DB crates
 fluree-db-api = { path = "../fluree-db-api" }
+fluree-db-bolt = { path = "../fluree-db-bolt", optional = true }
 fluree-db-connection = { path = "../fluree-db-connection" }
 fluree-db-core = { path = "../fluree-db-core" }
 fluree-db-consensus = { path = "../fluree-db-consensus" }
@@ -160,6 +166,9 @@ schemars = { workspace = true }
 
 # Async cancellation token for graceful shutdown
 tokio-util = { version = "0.7", features = ["rt", "io"] }
+
+# Body-length-limit error classification for the request-body cap.
+http-body-util = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

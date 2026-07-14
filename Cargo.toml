@@ -30,6 +30,7 @@ members = [
     "fluree-db-tabular",
     "fluree-db-r2rml",
     "fluree-db-server",
+    "fluree-db-bolt",
     "fluree-db-peer",
     "fluree-sse",
     "fluree-db-nameservice-sync",
@@ -47,7 +48,7 @@ members = [
 exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
 
 [workspace.package]
-version = "4.1.1"
+version = "4.1.2"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"

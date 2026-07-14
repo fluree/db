@@ -103,6 +103,10 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             no_conflicts,
             conflict_details,
             strategy,
+            changes,
+            max_changes,
+            stat,
+            changes_after,
             json,
             ledger,
             remote,
@@ -116,6 +120,13 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                     include_conflicts: !no_conflicts,
                     include_conflict_details: conflict_details,
                     strategy,
+                    include_changes: changes
+                        || stat
+                        || max_changes.is_some()
+                        || changes_after.is_some(),
+                    max_changes,
+                    stat,
+                    changes_after,
                     json,
                 },
                 ledger.as_deref(),
@@ -1031,6 +1042,13 @@ struct DiffOpts {
     include_conflicts: bool,
     include_conflict_details: bool,
     strategy: Option<String>,
+    include_changes: bool,
+    /// `None` = default (500). `Some(0)` = unbounded (local mode only),
+    /// matching the other CLI cap conventions. `--stat` supplies the
+    /// stats-only mode instead.
+    max_changes: Option<usize>,
+    stat: bool,
+    changes_after: Option<String>,
     json: bool,
 }
 
@@ -1076,6 +1094,20 @@ async fn run_diff(
         .as_deref()
         .or_else(|| include_conflict_details.then_some(conflict_strategy.as_str()));
 
+    // `--stat` = stats-only (API `max_changes = 0`); the CLI's `0 = unbounded`
+    // convention maps to `None` locally and to "omit the param" remotely
+    // (the server always enforces its own cap).
+    let include_changes = opts.include_changes;
+    let max_changes = if opts.stat {
+        Some(0)
+    } else {
+        match opts.max_changes {
+            None => Some(fluree_db_api::DEFAULT_MAX_CHANGES),
+            Some(0) => None,
+            Some(n) => Some(n),
+        }
+    };
+
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
         let (ledger_name, _) = split_ledger_id(&alias)?;
@@ -1090,6 +1122,9 @@ async fn run_diff(
                 Some(include_conflicts),
                 Some(include_conflict_details),
                 remote_strategy,
+                include_changes.then_some(true),
+                max_changes.filter(|_| include_changes),
+                opts.changes_after.as_deref(),
             )
             .await?;
 
@@ -1130,6 +1165,9 @@ async fn run_diff(
                     Some(include_conflicts),
                     Some(include_conflict_details),
                     remote_strategy,
+                    include_changes.then_some(true),
+                    max_changes.filter(|_| include_changes),
+                    opts.changes_after.as_deref(),
                 )
                 .await?;
 
@@ -1149,6 +1187,9 @@ async fn run_diff(
                 include_conflicts,
                 include_conflict_details,
                 conflict_strategy,
+                include_changes,
+                max_changes,
+                changes_after_subject: opts.changes_after.clone(),
             };
 
             let preview = fluree
@@ -1235,6 +1276,41 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
                 "    target: {}",
                 serde_json::to_string(&detail.target_values).unwrap_or_default()
             );
+        }
+    }
+
+    if let Some(ch) = &p.changes {
+        let shown: usize = ch
+            .entries
+            .iter()
+            .map(|e| e.asserts.len() + e.retracts.len())
+            .sum();
+        println!(
+            "changes: +{} -{} across {} subject(s){}",
+            ch.assert_count,
+            ch.retract_count,
+            ch.subject_count,
+            if ch.truncated {
+                format!(
+                    " (showing {} of {} facts)",
+                    shown,
+                    ch.assert_count + ch.retract_count
+                )
+            } else {
+                String::new()
+            }
+        );
+        for e in &ch.entries {
+            println!("  {}", e.subject);
+            for a in &e.asserts {
+                println!("    + {}", serde_json::to_string(a).unwrap_or_default());
+            }
+            for r in &e.retracts {
+                println!("    - {}", serde_json::to_string(r).unwrap_or_default());
+            }
+        }
+        if let Some(cursor) = &ch.next_cursor {
+            println!("  next page: --changes-after '{cursor}'");
         }
     }
 }
@@ -1350,6 +1426,61 @@ fn print_preview_json(v: &serde_json::Value) -> CliResult<()> {
                     }
                 }
             }
+        }
+    }
+
+    if let Some(ch) = v.get("changes").filter(|x| !x.is_null()) {
+        let asserts = ch.get("assert_count").and_then(Value::as_u64).unwrap_or(0);
+        let retracts = ch.get("retract_count").and_then(Value::as_u64).unwrap_or(0);
+        let subjects = ch.get("subject_count").and_then(Value::as_u64).unwrap_or(0);
+        let truncated = ch
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let entries = ch.get("entries").and_then(Value::as_array);
+        let shown: u64 = entries
+            .map(|es| {
+                es.iter()
+                    .map(|e| {
+                        let a = e
+                            .get("asserts")
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len);
+                        let r = e
+                            .get("retracts")
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len);
+                        (a + r) as u64
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        println!(
+            "changes: +{asserts} -{retracts} across {subjects} subject(s){}",
+            if truncated {
+                format!(" (showing {} of {} facts)", shown, asserts + retracts)
+            } else {
+                String::new()
+            }
+        );
+        if let Some(entries) = entries {
+            for e in entries {
+                let subject = e.get("subject").and_then(Value::as_str).unwrap_or("?");
+                println!("  {subject}");
+                if let Some(list) = e.get("asserts").and_then(Value::as_array) {
+                    for a in list {
+                        println!("    + {}", serde_json::to_string(a).unwrap_or_default());
+                    }
+                }
+                if let Some(list) = e.get("retracts").and_then(Value::as_array) {
+                    for r in list {
+                        println!("    - {}", serde_json::to_string(r).unwrap_or_default());
+                    }
+                }
+            }
+        }
+        if let Some(cursor) = ch.get("next_cursor").and_then(Value::as_str) {
+            println!("  next page: --changes-after '{cursor}'");
         }
     }
     Ok(())

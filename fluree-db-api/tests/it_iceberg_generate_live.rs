@@ -17,8 +17,9 @@
 //!   cargo test -p fluree-db-api --features iceberg \
 //!   --test it_iceberg_generate_live -- --ignored --nocapture
 //! ```
-//! Connection defaults target the `ENTERPRISE_DEMO.DW` 16-table star schema; any
-//! field is overridable via env (`ICEBERG_CATALOG_URI`, `ICEBERG_WAREHOUSE`,
+//! Connection defaults target the `ENTERPRISE_DEMO.DW` 16-table star schema.
+//! `ICEBERG_CATALOG_URI` is REQUIRED (no account default is committed; the test
+//! skips without it). Other fields are overridable via env (`ICEBERG_WAREHOUSE`,
 //! `ICEBERG_OAUTH2_TOKEN_URL`, `ICEBERG_OAUTH2_SCOPE`, `ICEBERG_OAUTH2_CLIENT_ID`,
 //! `ICEBERG_OAUTH2_CLIENT_SECRET`).
 
@@ -82,14 +83,19 @@ fn resolve_pat() -> Option<String> {
     None
 }
 
+/// Resolve the REST catalog URI from `ICEBERG_CATALOG_URI`. REQUIRED: no
+/// account default is committed to the repo — `None` is the skip signal.
+fn resolve_catalog_uri() -> Option<String> {
+    std::env::var("ICEBERG_CATALOG_URI")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Build the connection EXACTLY as solo's `build_iceberg_connection` does:
 /// REST + OAuth2 client-credentials with an EMPTY `client_id`, a `session:role:`
 /// scope, and the warehouse.
-fn build_connection(pat: &str) -> IcebergConnectionConfig {
-    let catalog_uri = env_or(
-        "ICEBERG_CATALOG_URI",
-        "https://abacyou-pp85756.snowflakecomputing.com/polaris/api/catalog",
-    );
+fn build_connection(pat: &str, catalog_uri: String) -> IcebergConnectionConfig {
     let token_url = env_or(
         "ICEBERG_OAUTH2_TOKEN_URL",
         &format!("{catalog_uri}/v1/oauth/tokens"),
@@ -138,9 +144,13 @@ async fn generate_r2rml_multitable_live_snowflake() {
         eprintln!("SKIP: no PAT resolvable (set ICEBERG_OAUTH2_CLIENT_SECRET or ICEBERG_PAT_FILE)");
         return;
     };
+    let Some(catalog_uri) = resolve_catalog_uri() else {
+        eprintln!("SKIP: set ICEBERG_CATALOG_URI (no account default is committed)");
+        return;
+    };
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let conn = build_connection(&pat);
+    let conn = build_connection(&pat, catalog_uri);
 
     let all: Vec<&str> = DIMENSIONS.iter().chain(FACTS.iter()).copied().collect();
 

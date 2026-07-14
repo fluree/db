@@ -86,7 +86,7 @@ impl Engine {
             .enable_all()
             .build()
             .context("building multi-thread tokio runtime")?;
-        let worker_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let worker_threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         Ok(Self {
             rt,
             capture,
@@ -127,7 +127,11 @@ impl Engine {
             });
         }
         builder.build().map_err(|e| {
-            anyhow::anyhow!("opening target '{}' at {}: {e}", target.id, storage.display())
+            anyhow::anyhow!(
+                "opening target '{}' at {}: {e}",
+                target.id,
+                storage.display()
+            )
         })
     }
 
@@ -220,7 +224,11 @@ impl Engine {
                     .query()
                     .sparql(sparql)
                     .format(FormatterConfig::sparql_json());
-                let builder = if is_virtual { builder.with_r2rml() } else { builder };
+                let builder = if is_virtual {
+                    builder.with_r2rml()
+                } else {
+                    builder
+                };
                 builder.execute_formatted().await
             })
             .await
@@ -229,7 +237,10 @@ impl Engine {
         match out {
             Ok(Ok(doc)) => Ok((wall, doc)),
             Ok(Err(e)) => Err(anyhow::anyhow!("query error: {e}")),
-            Err(_) => Err(anyhow::anyhow!("probe timed out after {}s", timeout.as_secs())),
+            Err(_) => Err(anyhow::anyhow!(
+                "probe timed out after {}s",
+                timeout.as_secs()
+            )),
         }
     }
 
@@ -283,7 +294,11 @@ impl Engine {
                     .sparql(sparql)
                     .format(fmt)
                     .execution_options(exec_opts);
-                let builder = if is_virtual { builder.with_r2rml() } else { builder };
+                let builder = if is_virtual {
+                    builder.with_r2rml()
+                } else {
+                    builder
+                };
                 builder.execute_formatted().await
             };
             tokio::time::timeout(timeout + grace, fut).await
@@ -296,21 +311,34 @@ impl Engine {
         let timed_out = cancel.reason() == Some(QueryCancellationReason::Timeout);
 
         match result {
-            Ok(Ok(doc)) => {
-                let canonical = canon::canonicalize(&doc);
-                let rows = canonical.rows;
-                let heads = keep_heads.then(|| canonical.heads(HEADS));
-                let hash = canonical.hash;
-                Outcome {
-                    wall: elapsed,
-                    status: Status::Ok,
-                    rows,
-                    hash,
-                    heads,
-                    counters,
-                    error: None,
+            Ok(Ok(doc)) => match canon::canonicalize(&doc) {
+                Ok(canonical) => {
+                    let rows = canonical.rows;
+                    let heads = keep_heads.then(|| canonical.heads(HEADS));
+                    let hash = canonical.hash;
+                    Outcome {
+                        wall: elapsed,
+                        status: Status::Ok,
+                        rows,
+                        hash,
+                        heads,
+                        counters,
+                        error: None,
+                    }
                 }
-            }
+                // A result document the canonicalizer doesn't recognize is a
+                // hard error, not an empty success — otherwise a formatter
+                // shape change could bless 0-row oracles.
+                Err(e) => Outcome {
+                    wall: elapsed,
+                    status: Status::Error,
+                    rows: 0,
+                    hash: String::new(),
+                    heads: None,
+                    counters,
+                    error: Some(format!("canonicalization failed: {e}")),
+                },
+            },
             Ok(Err(_e)) if timed_out => Outcome {
                 // Cooperative cancel returned an engine error; record the cap.
                 wall: timeout,
@@ -458,37 +486,81 @@ pub fn clear_cold_cache(cache_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Flags for one cold `exec-one` child, mirroring the parent `run`'s overrides
+/// so a cold run honors the same `--cache-dir` / `--timeout-s` a hot run would.
+pub struct ColdRunOpts<'a> {
+    pub keep_heads: bool,
+    /// The parent's global `--cache-dir` override, forwarded to the child
+    /// (which clears it before opening — the guard in [`clear_cold_cache`]
+    /// still applies, so it must look like a vbench cache dir).
+    pub cache_dir: Option<&'a Path>,
+    /// The parent's `--timeout-s` per-query deadline override.
+    pub timeout_s: Option<u64>,
+}
+
+/// The child argv for one cold `exec-one` (factored out so the flag forwarding
+/// is unit-testable without spawning).
+fn cold_exec_args(
+    corpus_dir: &Path,
+    targets_dir: &Path,
+    target_id: &str,
+    query_id: &str,
+    opts: &ColdRunOpts<'_>,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--corpus-dir".into(),
+        corpus_dir.into(),
+        "--targets-dir".into(),
+        targets_dir.into(),
+    ];
+    if let Some(dir) = opts.cache_dir {
+        args.push("--cache-dir".into());
+        args.push(dir.into());
+    }
+    args.extend::<[std::ffi::OsString; 6]>([
+        "exec-one".into(),
+        "--query".into(),
+        query_id.into(),
+        "--target".into(),
+        target_id.into(),
+        "--cold".into(),
+    ]);
+    if let Some(secs) = opts.timeout_s {
+        args.push("--timeout-s".into());
+        args.push(secs.to_string().into());
+    }
+    if opts.keep_heads {
+        args.push("--keep-heads".into());
+    }
+    args
+}
+
 /// Cold-run one query by spawning `vbench exec-one --cold` in a fresh subprocess.
 ///
 /// The **child** clears the home-scoped disk cache before executing (see
 /// `cmd_exec_one`), and a fresh process empties the in-process caches (catalog
 /// TTL, OAuth token, Parquet footer LRU, leaflet), so the child pays the full
 /// cold cost. The child inherits this process's environment, so `VBENCH_PAT`
-/// flows through to virtual targets. The parent parses the child's stdout
-/// `RunRecord` (already `cache_state = "cold"`). Pacing between children is the
-/// caller's responsibility.
+/// flows through to virtual targets, and the parent's `--cache-dir` /
+/// `--timeout-s` overrides are forwarded as flags. The parent parses the
+/// child's stdout `RunRecord` (already `cache_state = "cold"`). Pacing between
+/// children is the caller's responsibility.
 pub fn cold_run_query(
     exe: &Path,
     corpus_dir: &Path,
     targets_dir: &Path,
     target: &Target,
     query_id: &str,
-    keep_heads: bool,
+    opts: &ColdRunOpts<'_>,
 ) -> Result<RunRecord> {
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--corpus-dir")
-        .arg(corpus_dir)
-        .arg("--targets-dir")
-        .arg(targets_dir)
-        .arg("exec-one")
-        .arg("--query")
-        .arg(query_id)
-        .arg("--target")
-        .arg(&target.id)
-        .arg("--cold");
-    if keep_heads {
-        cmd.arg("--keep-heads");
-    }
+    cmd.args(cold_exec_args(
+        corpus_dir,
+        targets_dir,
+        &target.id,
+        query_id,
+        opts,
+    ));
     let output = cmd
         .output()
         .with_context(|| format!("spawning cold exec-one for {query_id}/{}", target.id))?;
@@ -505,7 +577,10 @@ fn install_span_capture() -> BenchSpanCapture {
     use tracing_subscriber::prelude::*;
     let capture = BenchSpanCapture::new();
     let layer = capture.layer(Some(spans::SPAN_ALLOWLIST));
-    let allowlist: Vec<String> = spans::SPAN_ALLOWLIST.iter().map(|s| (*s).to_string()).collect();
+    let allowlist: Vec<String> = spans::SPAN_ALLOWLIST
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     let _ = tracing_subscriber::registry()
         .with(layer.with_filter(span_name_filter(Some(allowlist))))
         .try_init();
@@ -515,6 +590,58 @@ fn install_span_capture() -> BenchSpanCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cold child must receive the parent's `--cache-dir` and
+    /// `--timeout-s` overrides — they were silently dropped once.
+    #[test]
+    fn cold_exec_args_forward_parent_overrides() {
+        let opts = ColdRunOpts {
+            keep_heads: true,
+            cache_dir: Some(Path::new("/homes/t/.vbench-iceberg-cache")),
+            timeout_s: Some(35),
+        };
+        let args = cold_exec_args(
+            Path::new("/c/corpus"),
+            Path::new("/c/targets"),
+            "virtual-sf01",
+            "q011",
+            &opts,
+        );
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let has_pair = |k: &str, v: &str| args.windows(2).any(|w| w[0] == k && w[1] == v);
+        assert!(has_pair("--cache-dir", "/homes/t/.vbench-iceberg-cache"));
+        assert!(has_pair("--timeout-s", "35"));
+        assert!(has_pair("--query", "q011"));
+        assert!(has_pair("--target", "virtual-sf01"));
+        assert!(args.contains(&"--cold".to_string()));
+        assert!(args.contains(&"--keep-heads".to_string()));
+        // Global flags must precede the subcommand for clap to accept them.
+        let sub = args.iter().position(|a| a == "exec-one").unwrap();
+        let cache = args.iter().position(|a| a == "--cache-dir").unwrap();
+        assert!(cache < sub, "--cache-dir is a global flag");
+        // No override, no flag.
+        let bare = cold_exec_args(
+            Path::new("/c/corpus"),
+            Path::new("/c/targets"),
+            "virtual-sf01",
+            "q011",
+            &ColdRunOpts {
+                keep_heads: false,
+                cache_dir: None,
+                timeout_s: None,
+            },
+        );
+        let bare: Vec<String> = bare
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!bare.contains(&"--cache-dir".to_string()));
+        assert!(!bare.contains(&"--timeout-s".to_string()));
+        assert!(!bare.contains(&"--keep-heads".to_string()));
+    }
 
     #[test]
     fn clear_cold_cache_refuses_non_cache_paths() {

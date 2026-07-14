@@ -10,11 +10,17 @@
 //!   JSON array.
 //!
 //! It powers the LLM agent's "look at the data" tool and solo #756 (row
-//! preview). **Cheap by construction**: it mirrors `preview_iceberg_table`'s
+//! preview). **Bounded by construction**: it mirrors `preview_iceberg_table`'s
 //! catalog/storage/snapshot handling, plans a *projected* single-table scan, and
 //! reads only the **first row group** of the first data file, bounded to `n`
-//! rows (see [`SendParquetReader::read_task_sample`]). For a small `n` that is
-//! just the footer plus a few projected column chunks — not a full-table scan.
+//! rows (see [`SendParquetReader::read_task_sample`]) — never a full-table (or
+//! even full-file) scan. The unit of cost is the row group, not the row: the
+//! read fetches the footer plus the first row group's chunk for EVERY projected
+//! column, so a narrow projection costs a few column chunks while an all-columns
+//! sample (`projection: None`) of a wide table decodes the entire first row
+//! group across all columns regardless of how small `n` is. There is
+//! deliberately no column/byte cap — silently dropping columns from an
+//! "all columns" peek would be worse than the bounded extra read.
 //! Consequently it returns at most `min(n, rows-in-first-row-group)` rows.
 //!
 //! Values are rendered to JSON through the same typed path the stats preview

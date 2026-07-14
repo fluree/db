@@ -1,10 +1,13 @@
 //! Term parsing: subjects, predicates, objects, IRIs, literals, blank nodes.
 
-use crate::ast::annotation::{Annotation, AnnotationBlock, AnnotationEntry, ReifierId, TripleTerm};
+use crate::ast::annotation::{
+    Annotation, AnnotationBlock, AnnotationEntry, AnnotationUnit, AnnotationVerb, ReifierId,
+    TripleTerm,
+};
 use crate::ast::path::PropertyPath;
 use crate::ast::{
-    BlankNode, GraphPattern, Iri, IriValue, Literal, ObjectTerm, PredicateTerm, QuotedTriple,
-    SubjectTerm, Term, TriplePattern, Var, VarOrIri,
+    BlankNode, GraphPattern, Iri, IriValue, Literal, ObjectTerm, PredicateTerm, QtReifier,
+    QuotedTriple, SubjectTerm, Term, TriplePattern, Var, VarOrIri,
 };
 use crate::lex::TokenKind;
 use crate::span::SourceSpan;
@@ -85,18 +88,23 @@ impl super::Parser<'_> {
         }
 
         // RDF collection (list) syntax: ( item1 item2 ... ) or ()
-        // Not yet implemented — skip and emit error so the parser doesn't infinite-loop.
         if self.stream.check(&TokenKind::LParen) || self.stream.check(&TokenKind::Nil) {
-            self.stream
-                .error_at_current("RDF collection (list) syntax is not yet supported");
-            self.skip_collection();
-            return None;
+            return match self.parse_collection()? {
+                Term::Iri(iri) => Some(SubjectTerm::Iri(iri)),
+                Term::BlankNode(bnode) => Some(SubjectTerm::BlankNode(bnode)),
+                _ => unreachable!("parse_collection returns an IRI or blank node"),
+            };
         }
 
         None
     }
 
-    /// Parse an RDF-star quoted triple: `<< subject predicate object >>`
+    /// Parse an RDF-star / RDF 1.2 (reified) quoted triple:
+    /// `<< subject predicate object ( ~ reifier? )? >>`
+    ///
+    /// The optional in-triple `~ reifier` tail is the RDF 1.2
+    /// `ReifiedTriple` form; without it the node stays eligible for the
+    /// legacy Fluree `f:t`/`f:op` history reading (decided at lowering).
     pub(super) fn parse_quoted_triple(&mut self) -> Option<QuotedTriple> {
         let start = self.stream.current_span();
 
@@ -105,10 +113,30 @@ impl super::Parser<'_> {
             return None;
         }
 
-        // Parse the inner triple: subject, predicate, object
+        // Parse the inner triple: subject, predicate, object.
+        // Collections are not legal inside a quoted triple — the RDF 1.2
+        // grammar's rtSubject/rtObject exclude `Collection`/`NIL` (W3C
+        // negative tests list-anonreifier-01/02, quoted-list-*-anonreifier).
+        self.reject_collection_in_quoted_context()?;
         let subject = self.parse_subject()?;
         let predicate = self.parse_simple_predicate()?;
+        self.reject_collection_in_quoted_context()?;
         let object = self.parse_object()?;
+
+        // Optional RDF 1.2 reifier: `~ id?` before `>>`
+        // (`Reifier ::= '~' VarOrReifierId?`).
+        let reifier = if self.stream.check(&TokenKind::Tilde) {
+            let tilde_span = self.stream.current_span();
+            self.stream.advance(); // consume `~`
+            let id = self.parse_reifier_id_after_tilde();
+            let span = id
+                .as_ref()
+                .map(|r| tilde_span.union(r.span()))
+                .unwrap_or(tilde_span);
+            Some(QtReifier { id, span })
+        } else {
+            None
+        };
 
         // Expect >>
         if !self.stream.match_token(&TokenKind::TripleEnd) {
@@ -118,7 +146,58 @@ impl super::Parser<'_> {
         }
 
         let span = start.union(self.stream.previous_span());
-        Some(QuotedTriple::new(subject, predicate, object, span))
+        Some(QuotedTriple::new(subject, predicate, object, span).with_reifier(reifier))
+    }
+
+    /// Convert a parsed reified triple `<< s p o ~ r? >>` used as a
+    /// *statement* (standalone, no property list — SPARQL 1.2 allows
+    /// `ReifiedTriple` with an empty `PropertyListPath`) into the
+    /// equivalent `GraphPattern::AnnotationTarget`:
+    /// `r rdf:reifies <<( s p o )>>`, minting a fresh blank-node
+    /// reifier when none was named. This is exactly the spec's
+    /// desugaring; nested reified triples inside `s`/`o` ride along on
+    /// the `TripleTerm` and are desugared recursively at lowering.
+    pub(super) fn reified_triple_to_annotation_target(&mut self, qt: QuotedTriple) -> GraphPattern {
+        let span = qt.span;
+        let reifier = match qt.reifier.and_then(|r| r.id) {
+            Some(ReifierId::Iri(iri)) => SubjectTerm::Iri(iri),
+            Some(ReifierId::BlankNode(b)) => SubjectTerm::BlankNode(b),
+            Some(ReifierId::Var(v)) => SubjectTerm::Var(v),
+            None => {
+                // `#` is outside PN_CHARS, so this synthetic label can
+                // never collide with a user-written `_:…` label (same
+                // scheme as `#bnpl…` / `#coll…`).
+                let label = format!("#reif{}", self.bnode_counter);
+                self.bnode_counter += 1;
+                SubjectTerm::BlankNode(BlankNode::labeled(&label, span))
+            }
+        };
+        let triple_term = TripleTerm {
+            subject: *qt.subject,
+            predicate: qt.predicate,
+            object: *qt.object,
+            span,
+        };
+        GraphPattern::AnnotationTarget {
+            reifier,
+            predicate: PredicateTerm::Iri(Iri::full(fluree_vocab::rdf::REIFIES, span)),
+            triple_term: Box::new(triple_term),
+            span,
+        }
+    }
+
+    /// Error out when the current token starts an RDF collection (`(` or
+    /// `()`), which is not legal in quoted-triple / triple-term positions
+    /// (the RDF 1.2 grammar's rt/tt subject and object productions exclude
+    /// `Collection` and `NIL`).
+    fn reject_collection_in_quoted_context(&mut self) -> Option<()> {
+        if self.stream.check(&TokenKind::LParen) || self.stream.check(&TokenKind::Nil) {
+            self.stream.error_at_current(
+                "RDF collections ('( ... )') are not allowed inside a quoted triple or triple term",
+            );
+            return None;
+        }
+        Some(())
     }
 
     /// Parse a verb (predicate or property path).
@@ -217,13 +296,19 @@ impl super::Parser<'_> {
             return Some(Term::BlankNode(bnode));
         }
 
+        // RDF 1.2 reified triple in object position:
+        // `:s :p << :a :b :c ~ reifier? >>`. The term denotes the
+        // reifier node; lowering performs the
+        // `r rdf:reifies <<( a b c )>>` desugaring.
+        if self.stream.check(&TokenKind::TripleStart) {
+            return self
+                .parse_quoted_triple()
+                .map(|qt| Term::QuotedTriple(Box::new(qt)));
+        }
+
         // RDF collection (list) syntax: ( item1 item2 ... ) or ()
-        // Not yet implemented — skip and emit error so the parser doesn't infinite-loop.
         if self.stream.check(&TokenKind::LParen) || self.stream.check(&TokenKind::Nil) {
-            self.stream
-                .error_at_current("RDF collection (list) syntax is not yet supported");
-            self.skip_collection();
-            return None;
+            return self.parse_collection();
         }
 
         self.stream.error_at_current("expected object");
@@ -450,12 +535,25 @@ impl super::Parser<'_> {
                 Verb::Simple(predicate) => {
                     self.parse_object_list(&subject, &predicate, &mut triples, &mut bgp_start)?;
                 }
-                Verb::Path(_) => {
-                    self.stream.error_at_current(
-                        "property paths inside a blank-node property list \
-                         ('[ path obj ]') are not yet supported",
-                    );
-                    return None;
+                Verb::Path(path) => {
+                    // `[ path obj ]` — the grammar's `PropertyListPathNotEmpty`
+                    // allows a `VerbPath` here. A path is not a `TriplePattern`,
+                    // so it rides the `pending_bnpl_patterns` channel (drained
+                    // by the enclosing triples-block / path-object-list parser)
+                    // instead of this list's local triples.
+                    loop {
+                        let object = self.parse_object()?;
+                        let span = subject.span().union(path.span()).union(object.span());
+                        self.pending_bnpl_patterns.push(GraphPattern::Path {
+                            subject: subject.clone(),
+                            path: path.clone(),
+                            object,
+                            span,
+                        });
+                        if !self.stream.match_token(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -480,23 +578,93 @@ impl super::Parser<'_> {
         Some(BlankNode::labeled(&label, span))
     }
 
-    /// Skip an RDF collection (list) in the token stream.
+    /// Parse an RDF collection `( item1 … itemN )` or the empty list `()`
+    /// (which lexes as a single `Nil` token), desugaring per SPARQL 1.1
+    /// §4.2.4 into `rdf:first`/`rdf:rest`/`rdf:nil` triples over fresh
+    /// blank-node list cells:
     ///
-    /// Handles both `Nil` (empty list `()`) and `LParen ... RParen` (non-empty list).
-    /// Used for error recovery when encountering unsupported collection syntax.
-    fn skip_collection(&mut self) {
-        if self.stream.match_token(&TokenKind::Nil) {
-            return;
+    /// - `()` → the plain IRI `rdf:nil`; no triples.
+    /// - `( g1 … gn )` → `_ci rdf:first gi . _ci rdf:rest _c(i+1) .` with
+    ///   `_cn rdf:rest rdf:nil .`; the collection term is `_c1`.
+    ///
+    /// Items are full `GraphNode`s — vars, IRIs, literals, blank-node
+    /// property lists, and nested collections all recurse through
+    /// `parse_object`. The desugared triples ride the existing
+    /// `pending_bnpl_triples` channel, so every enclosing drain site folds
+    /// them into its BGP exactly like blank-node property-list triples;
+    /// they add only ordinary triples (no new AST/IR/engine surface). This
+    /// mirrors Fluree's Turtle ingest, which desugars collections to the
+    /// same `rdf:first`/`rdf:rest` predicates.
+    fn parse_collection(&mut self) -> Option<ObjectTerm> {
+        // `()` (with optional interior whitespace) lexes as a single Nil
+        // token — the empty list is just the IRI rdf:nil.
+        if self.stream.check(&TokenKind::Nil) {
+            let span = self.stream.current_span();
+            self.stream.advance();
+            return Some(Term::Iri(Iri::rdf_nil(span)));
         }
-        debug_assert!(
-            self.stream.check(&TokenKind::LParen),
-            "skip_collection called on non-collection token: {:?}",
-            self.stream.peek().kind
-        );
-        if self.stream.match_token(&TokenKind::LParen) {
+
+        let start = self.stream.current_span();
+        if !self.stream.match_token(&TokenKind::LParen) {
             self.stream
-                .skip_balanced(&TokenKind::LParen, &TokenKind::RParen);
+                .error_at_current("expected '(' to open RDF collection");
+            return None;
         }
+
+        // Parse the GraphNode items. Nested `[ … ]` / `( … )` items emit
+        // their own triples into `pending_bnpl_triples` as they parse.
+        let mut items: Vec<ObjectTerm> = Vec::new();
+        while !self.stream.check(&TokenKind::RParen) && !self.stream.is_eof() {
+            items.push(self.parse_object()?);
+        }
+        if !self.stream.match_token(&TokenKind::RParen) {
+            self.stream
+                .error_at_current("expected ')' to close RDF collection");
+            return None;
+        }
+        let span = start.union(self.stream.previous_span());
+
+        // `( )` lexes as Nil, so an empty item list is unreachable via the
+        // grammar (`Collection ::= '(' GraphNode+ ')'`); handle it as the
+        // empty list anyway for safety.
+        if items.is_empty() {
+            return Some(Term::Iri(Iri::rdf_nil(span)));
+        }
+
+        // Mint the list-cell blank nodes. `#` is outside PN_CHARS, so a
+        // user-written `_:…` label can never collide with these (same
+        // scheme as the `#bnpl…` property-list labels).
+        let cells: Vec<String> = (0..items.len())
+            .map(|_| {
+                let label = format!("#coll{}", self.bnode_counter);
+                self.bnode_counter += 1;
+                label
+            })
+            .collect();
+
+        for (i, item) in items.into_iter().enumerate() {
+            let cell = SubjectTerm::BlankNode(BlankNode::labeled(&cells[i], span));
+            let item_span = item.span();
+            self.pending_bnpl_triples.push(TriplePattern::new(
+                cell.clone(),
+                PredicateTerm::Iri(Iri::rdf_first(item_span)),
+                item,
+                item_span,
+            ));
+            let rest_object = if i + 1 < cells.len() {
+                Term::BlankNode(BlankNode::labeled(&cells[i + 1], span))
+            } else {
+                Term::Iri(Iri::rdf_nil(span))
+            };
+            self.pending_bnpl_triples.push(TriplePattern::new(
+                cell,
+                PredicateTerm::Iri(Iri::rdf_rest(span)),
+                rest_object,
+                span,
+            ));
+        }
+
+        Some(Term::BlankNode(BlankNode::labeled(&cells[0], span)))
     }
 
     /// Check if current token can start a verb (predicate or path).
@@ -527,10 +695,38 @@ impl super::Parser<'_> {
         // Parse subject
         let subject = self.parse_subject()?;
 
-        // A blank-node property-list subject (`[ :p ?o ] …`) emitted its inner
-        // triples; fold them in before the (optional) predicate-object list.
-        let had_bnpl_subject = !self.pending_bnpl_triples.is_empty();
-        if had_bnpl_subject {
+        // SPARQL 1.2 standalone reified triple: `<< s p o ~ r? >> .`
+        // (`ReifiedTriple PropertyListPath` with an empty property
+        // list). Desugars to `r rdf:reifies <<( s p o )>>`.
+        if matches!(&subject, SubjectTerm::QuotedTriple(_)) && !self.is_verb_start() {
+            let SubjectTerm::QuotedTriple(qt) = subject else {
+                unreachable!("matched QuotedTriple above")
+            };
+            let target = self.reified_triple_to_annotation_target(qt);
+            // Defensive: fold any triples emitted by `[ … ]` terms
+            // nested inside the reified triple.
+            if !self.pending_bnpl_triples.is_empty() {
+                let triples = std::mem::take(&mut self.pending_bnpl_triples);
+                let bgp_span = super::span_of_triples(&triples);
+                patterns.push(GraphPattern::bgp(triples, bgp_span));
+            }
+            patterns.push(target);
+            if !self.pending_bnpl_patterns.is_empty() {
+                patterns.append(&mut self.pending_bnpl_patterns);
+            }
+            // Optional dot at end
+            self.stream.match_token(&TokenKind::Dot);
+            return Some(patterns);
+        }
+
+        // A blank-node property-list or collection subject (`[ :p ?o ] …`,
+        // `( ?x ) …`) emitted its inner triples (and, for a path verb inside
+        // `[ … ]`, path patterns); fold the triples in before the (optional)
+        // predicate-object list. The path patterns are drained at the end of
+        // this block, once the BGP is flushed.
+        let had_bnpl_subject =
+            !self.pending_bnpl_triples.is_empty() || !self.pending_bnpl_patterns.is_empty();
+        if !self.pending_bnpl_triples.is_empty() {
             if bgp_start.is_none() {
                 bgp_start = Some(subject.span());
             }
@@ -560,8 +756,22 @@ impl super::Parser<'_> {
             });
         }
 
-        // Optional dot at end
-        self.stream.match_token(&TokenKind::Dot);
+        // Drain path patterns emitted by `[ path obj ]` property lists nested
+        // anywhere in this block (subject or object position).
+        if !self.pending_bnpl_patterns.is_empty() {
+            patterns.append(&mut self.pending_bnpl_patterns);
+        }
+
+        // TriplesBlock ::= TriplesSameSubjectPath ( '.' TriplesBlock? )?
+        // The '.' separating two same-subject blocks is mandatory: after this
+        // block, a new subject term may only follow a consumed '.' (the group
+        // loop re-enters `parse_triples_block` for it). The dot itself stays
+        // optional before '}' or a GraphPatternNotTriples keyword (V1
+        // dot-structure validation, W3C syn-bad-02/03).
+        if !self.stream.match_token(&TokenKind::Dot) && self.stream.is_term_start() {
+            self.stream
+                .error_at_current("expected '.' between triple patterns");
+        }
 
         Some(patterns)
     }
@@ -704,6 +914,7 @@ impl super::Parser<'_> {
             return None;
         }
 
+        self.reject_collection_in_quoted_context()?;
         let subject = self.parse_subject()?;
         if matches!(subject, SubjectTerm::QuotedTriple(_)) {
             self.stream
@@ -718,6 +929,15 @@ impl super::Parser<'_> {
                 .error_at_current("nested triple terms are not supported in v1");
             return None;
         }
+        // Reified triples are not grammatical inside a triple term
+        // either (`ttObject` has no `ReifiedTriple` production).
+        if self.stream.check(&TokenKind::TripleStart) {
+            self.stream.error_at_current(
+                "reified triples (<< s p o >>) are not allowed inside a triple term",
+            );
+            return None;
+        }
+        self.reject_collection_in_quoted_context()?;
         let object = self.parse_object()?;
 
         if !self.stream.match_token(&TokenKind::TripleTermEnd) {
@@ -754,7 +974,7 @@ impl super::Parser<'_> {
         patterns.push(GraphPattern::AnnotationTarget {
             reifier: subject.clone(),
             predicate: predicate.clone(),
-            triple_term,
+            triple_term: Box::new(triple_term),
             span,
         });
 
@@ -772,8 +992,14 @@ impl super::Parser<'_> {
     /// Parse the optional RDF 1.2 annotation tail after an object.
     ///
     /// Grammar: `annotation ::= ( reifier | annotationBlock )*`
-    /// v1 narrowing: at most one reifier and one block, any order.
     /// Returns `Ok(None)` when no tail is present.
+    ///
+    /// Elements group into [`AnnotationUnit`]s per the RDF 1.2
+    /// attachment rule: each `~ reifier` starts a new unit; an
+    /// annotation block attaches to an immediately preceding reifier
+    /// element, otherwise it starts a fresh (anonymous-reifier) unit.
+    /// So `~ :r1 {| … |} ~ :r2 {| … |}` is two units and
+    /// `{| … |} {| … |}` is two units with two fresh reifiers.
     ///
     /// Literal-valued objects are accepted: the constraint-preserving
     /// lowering path (`lower_object_with_constraint`) pins the literal's
@@ -789,43 +1015,51 @@ impl super::Parser<'_> {
         }
 
         let start = self.stream.current_span();
-        let mut reifier: Option<ReifierId> = None;
-        let mut block: Option<AnnotationBlock> = None;
+        let mut units: Vec<AnnotationUnit> = Vec::new();
+        // True while the last element parsed was a `~ reifier` that has
+        // not yet received a block — the only position a block attaches
+        // to instead of minting a fresh reifier.
+        let mut last_was_reifier = false;
         let mut last_span = start;
 
         loop {
             if self.stream.check(&TokenKind::Tilde) {
-                if reifier.is_some() {
-                    self.stream
-                        .error_at_current("at most one reifier (`~`) is allowed per triple in v1");
-                    return None;
-                }
                 let r_span = self.stream.current_span();
                 self.stream.advance(); // consume `~`
                 let r = self.parse_reifier_id_after_tilde();
-                last_span = r.as_ref().map(ReifierId::span).unwrap_or(r_span);
-                reifier = r;
+                let span = r.as_ref().map(ReifierId::span).unwrap_or(r_span);
+                last_span = span;
+                units.push(AnnotationUnit {
+                    reifier: r,
+                    block: None,
+                    span: r_span.union(span),
+                });
+                last_was_reifier = true;
             } else if self.stream.check(&TokenKind::AnnotationOpen) {
-                if block.is_some() {
-                    self.stream.error_at_current(
-                        "at most one annotation block (`{| ... |}`) is allowed per triple in v1",
-                    );
-                    return None;
-                }
                 let b = self.parse_annotation_block()?;
                 last_span = b.span;
-                block = Some(b);
+                if last_was_reifier {
+                    // Attach to the reifier element just parsed.
+                    let unit = units.last_mut().expect("reifier unit exists");
+                    unit.span = unit.span.union(b.span);
+                    unit.block = Some(b);
+                } else {
+                    // Block with no immediately preceding reifier mints
+                    // a fresh one.
+                    units.push(AnnotationUnit {
+                        reifier: None,
+                        span: b.span,
+                        block: Some(b),
+                    });
+                }
+                last_was_reifier = false;
             } else {
                 break;
             }
         }
 
         let span = start.union(last_span);
-        Some(Some(Annotation {
-            reifier,
-            block,
-            span,
-        }))
+        Some(Some(Annotation { units, span }))
     }
 
     /// Parse the optional id following `~`. The bare `~` form (no id)
@@ -849,11 +1083,13 @@ impl super::Parser<'_> {
         None
     }
 
-    /// Parse a `{| predicateObjectList |}` annotation block.
+    /// Parse a `{| propertyListPathNotEmpty |}` annotation block.
     ///
-    /// Each entry is a predicate-object pair applied to the enclosing
-    /// reifier. v1 rejects nested annotation tails on body entries
-    /// (annotations-on-annotations are deferred).
+    /// Each entry is a verb-object pair applied to the enclosing
+    /// reifier; verbs may be property paths (`{| :r/:q 'ABC' |}`, W3C
+    /// `annotation-*reifier-06`). Nested annotation tails on body
+    /// entries are illegal per the RDF 1.2 grammar and rejected here
+    /// (W3C negative `nested-annotated-path-*`).
     fn parse_annotation_block(&mut self) -> Option<AnnotationBlock> {
         let start = self.stream.current_span();
         if !self.stream.match_token(&TokenKind::AnnotationOpen) {
@@ -867,7 +1103,10 @@ impl super::Parser<'_> {
         // depends on RDF/LPG mode — see plan).
         if !self.stream.check(&TokenKind::AnnotationClose) {
             loop {
-                let predicate = self.parse_simple_predicate()?;
+                let verb = match self.parse_verb()? {
+                    Verb::Simple(p) => AnnotationVerb::Simple(p),
+                    Verb::Path(p) => AnnotationVerb::Path(p),
+                };
                 loop {
                     // Reject nested triple terms here too.
                     if self.stream.check(&TokenKind::TripleTermStart) {
@@ -879,9 +1118,9 @@ impl super::Parser<'_> {
                     }
                     let object = self.parse_object()?;
 
-                    // Reject nested annotation tails: annotations-on-annotations
-                    // are deferred per the design doc. Surfacing a clear error
-                    // here is friendlier than letting it parse and lower-rejecting.
+                    // Reject nested annotation tails: the RDF 1.2
+                    // annotation-block body is a plain property list —
+                    // annotations-on-annotations are not grammatical.
                     if self.stream.check(&TokenKind::Tilde)
                         || self.stream.check(&TokenKind::AnnotationOpen)
                     {
@@ -892,9 +1131,9 @@ impl super::Parser<'_> {
                         return None;
                     }
 
-                    let span = predicate.span().union(object.span());
+                    let span = verb.span().union(object.span());
                     entries.push(AnnotationEntry {
-                        predicate: predicate.clone(),
+                        verb: verb.clone(),
                         object,
                         span,
                     });
@@ -944,11 +1183,18 @@ impl super::Parser<'_> {
             });
 
             // A blank-node property-list object emitted its inner triples; flush
-            // them as their own BGP alongside the path pattern.
+            // them as their own BGP alongside the path pattern. (Same-group
+            // BGPs are re-merged by the group-pattern loop, so this does not
+            // introduce a join-scope boundary.)
             if !self.pending_bnpl_triples.is_empty() {
                 let triples = std::mem::take(&mut self.pending_bnpl_triples);
                 let bgp_span = super::span_of_triples(&triples);
                 patterns.push(GraphPattern::bgp(triples, bgp_span));
+            }
+
+            // A `[ path obj ]` nested in the object emitted path patterns.
+            if !self.pending_bnpl_patterns.is_empty() {
+                patterns.append(&mut self.pending_bnpl_patterns);
             }
 
             // Check for comma (more objects)
@@ -1094,6 +1340,18 @@ impl super::Parser<'_> {
                 // not dropped (and cannot leak into a later WHERE BGP).
                 triples.append(&mut self.pending_bnpl_triples);
 
+                // Property paths are not legal in templates (`ConstructTriples`
+                // has no VerbPath); reject a `[ path obj ]` rather than
+                // silently dropping its pattern.
+                if !self.pending_bnpl_patterns.is_empty() {
+                    self.pending_bnpl_patterns.clear();
+                    self.stream.error_at_current(
+                        "property paths inside a blank-node property list are not \
+                         allowed in CONSTRUCT/UPDATE templates",
+                    );
+                    return None;
+                }
+
                 if !self.stream.match_token(&TokenKind::Comma) {
                     break;
                 }
@@ -1123,6 +1381,16 @@ impl super::Parser<'_> {
         subject: &SubjectTerm,
         triples: &mut Vec<TriplePattern>,
     ) -> Option<()> {
+        // Property paths are not legal in templates; reject a `[ path obj ]`
+        // subject rather than silently dropping its pattern.
+        if !self.pending_bnpl_patterns.is_empty() {
+            self.pending_bnpl_patterns.clear();
+            self.stream.error_at_current(
+                "property paths inside a blank-node property list are not \
+                 allowed in CONSTRUCT/UPDATE templates",
+            );
+            return None;
+        }
         let had_bnpl_subject = !self.pending_bnpl_triples.is_empty();
         if had_bnpl_subject {
             triples.append(&mut self.pending_bnpl_triples);

@@ -9,6 +9,33 @@ use crate::span::SourceSpan;
 
 use super::expr::parse_expression;
 
+/// Grammar predicate for `Constraint ::= BrackettedExpression | BuiltInCall
+/// | FunctionCall`, mapped onto the expression AST after parsing.
+///
+/// `Bracketed` is the BrackettedExpression alternative. `FunctionCall`,
+/// `If`, `Coalesce`, `Exists`, `NotExists`, and `Aggregate` cover the
+/// BuiltInCall alternatives (an aggregate in FILTER is grammatically a
+/// BuiltInCall — rejecting it there is a semantic-validation concern, not a
+/// parse error) plus extension-function calls. Everything else — bare
+/// variables, literals, IRIs, and unparenthesized unary/binary operator
+/// expressions — is not a Constraint.
+///
+/// PR-1's P5b (bare Constraint as an ORDER BY condition) admits the same
+/// alternatives; keep the two aligned if either changes.
+fn is_constraint_expression(expr: &crate::ast::Expression) -> bool {
+    use crate::ast::Expression;
+    matches!(
+        expr,
+        Expression::Bracketed { .. }
+            | Expression::FunctionCall { .. }
+            | Expression::If { .. }
+            | Expression::Coalesce { .. }
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::Aggregate { .. }
+    )
+}
+
 impl super::Parser<'_> {
     /// Parse a WHERE clause.
     pub(super) fn parse_where_clause(&mut self) -> Option<WhereClause> {
@@ -73,6 +100,16 @@ impl super::Parser<'_> {
         let mut patterns: Vec<GraphPattern> = Vec::new();
         let mut current_triples: Vec<crate::ast::TriplePattern> = Vec::new();
 
+        // SPARQL grammar:
+        //   GroupGraphPatternSub ::= TriplesBlock? ( GraphPatternNotTriples '.'? TriplesBlock? )*
+        // A '.' at group level is legal ONLY as the single optional separator
+        // immediately after a GraphPatternNotTriples (OPTIONAL, UNION group,
+        // MINUS, GRAPH, SERVICE, FILTER, BIND, VALUES). Separator dots inside
+        // a TriplesBlock are owned by `parse_triples_block`, which consumes
+        // its own single optional trailing dot. Every other dot — leading,
+        // doubled, or standalone — is a syntax error (W3C syn-bad-05..14).
+        let mut dot_allowed = false;
+
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
             // Safety: track position to detect sub-parsers that return None
             // without advancing. If we make no progress, force-advance to
@@ -86,6 +123,7 @@ impl super::Parser<'_> {
                 if let Some(optional) = self.parse_optional_pattern() {
                     patterns.push(optional);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwUnion) {
                 // UNION requires a preceding pattern
                 self.stream.error_at_current("UNION must follow a pattern");
@@ -112,12 +150,14 @@ impl super::Parser<'_> {
                         span,
                     });
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwFilter) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(filter) = self.parse_filter_pattern() {
                     patterns.push(filter);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwGraph) {
                 // GRAPH pattern - GRAPH <iri>|?var { ... }
                 super::flush_current_triples(&mut current_triples, &mut patterns);
@@ -125,24 +165,72 @@ impl super::Parser<'_> {
                 if let Some(graph) = self.parse_graph_pattern() {
                     patterns.push(graph);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwService) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(service) = self.parse_service_pattern() {
                     patterns.push(service);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwBind) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(bind) = self.parse_bind_pattern() {
+                    // SPARQL 1.1 §10.1 / grammar note 12 (V5): the variable
+                    // assigned by BIND must not already be in scope in this
+                    // group graph pattern *up to this point* (`patterns` =
+                    // the preceding siblings of this group only — a nested
+                    // `{ BIND ... }` group starts a fresh scope, which is
+                    // why this check lives HERE and not in `validate()`:
+                    // after the single-pattern group simplification below,
+                    // `{ ... { BIND(e AS ?v) } }` (legal) and
+                    // `{ ... BIND(e AS ?v) }` (illegal) produce identical
+                    // ASTs, so only the parser can tell them apart.
+                    //
+                    // `parse_sparql` refuses to produce an AST when this
+                    // diagnostic fires (D-4: reject-more errors must prevent
+                    // AST production; recovered-error ASTs would otherwise
+                    // execute through the API's diagnostic-swallowing path).
+                    if let GraphPattern::Bind { var, span, .. } = &bind {
+                        let mut in_scope = Vec::new();
+                        for preceding in &patterns {
+                            preceding.add_in_scope_variables(&mut in_scope);
+                        }
+                        if let Some(first) = in_scope.iter().find(|v| v.name == var.name) {
+                            self.stream.add_diagnostic(
+                                Diagnostic::error(
+                                    DiagCode::BindTargetAlreadyInScope,
+                                    format!(
+                                        "BIND target variable ?{} is already in scope \
+                                         in this group",
+                                        var.name
+                                    ),
+                                    *span,
+                                )
+                                .with_label(crate::diag::Label::new(
+                                    first.span,
+                                    "already bound here",
+                                ))
+                                .with_help(
+                                    "The variable assigned by BIND(expr AS ?v) must not \
+                                     be used earlier in the same group graph pattern \
+                                     (SPARQL 1.1 §10.1). Bind to a fresh variable, or \
+                                     wrap the BIND in its own { } group.",
+                                ),
+                            );
+                        }
+                    }
                     patterns.push(bind);
                 }
+                dot_allowed = true;
             } else if self.stream.check_keyword(TokenKind::KwValues) {
                 super::flush_current_triples(&mut current_triples, &mut patterns);
 
                 if let Some(values) = self.parse_values_pattern() {
                     patterns.push(values);
                 }
+                dot_allowed = true;
             } else if self.stream.check(&TokenKind::LBrace) {
                 // Nested group or sub-SELECT.
                 super::flush_current_triples(&mut current_triples, &mut patterns);
@@ -166,6 +254,7 @@ impl super::Parser<'_> {
                         patterns.push(inner);
                     }
                 }
+                dot_allowed = true;
             } else if self.stream.is_term_start() {
                 // Parse triple patterns (may include path patterns)
                 if let Some(block_patterns) = self.parse_triples_block() {
@@ -186,9 +275,23 @@ impl super::Parser<'_> {
                         }
                     }
                 }
+                // `parse_triples_block` already consumed the TriplesBlock's own
+                // optional trailing dot; another dot here would be doubled.
+                dot_allowed = false;
             } else if self.stream.check(&TokenKind::Dot) {
-                // Skip dots between patterns
-                self.stream.advance();
+                if dot_allowed {
+                    // The single optional '.' after a GraphPatternNotTriples.
+                    self.stream.advance();
+                    dot_allowed = false;
+                } else {
+                    // Leading, doubled, or standalone dot: forbidden by
+                    // GroupGraphPatternSub (V1 dot-structure validation).
+                    self.stream.error_at_current(
+                        "unexpected '.': a dot may only follow a triple pattern or a \
+                         graph pattern (OPTIONAL, FILTER, GRAPH, BIND, VALUES, ...)",
+                    );
+                    self.stream.advance();
+                }
             } else {
                 // Unknown token
                 self.stream
@@ -386,6 +489,20 @@ impl super::Parser<'_> {
         // Parse the filter expression
         match parse_expression(self.stream) {
             Ok(expr) => {
+                // Filter ::= 'FILTER' Constraint
+                // Constraint ::= BrackettedExpression | BuiltInCall | FunctionCall
+                // A bare variable, literal, IRI, or unparenthesized operator
+                // expression (`FILTER ?x`, `FILTER ?x > 5`) is not a
+                // Constraint (V2, W3C filter-missing-parens). The Filter
+                // pattern is still produced for tooling; the error-severity
+                // diagnostic makes the parse authoritative-fail at the API.
+                if !is_constraint_expression(&expr) {
+                    self.stream.error_at(
+                        "FILTER requires a bracketted expression, built-in call, or \
+                         function call — wrap the expression in parentheses: FILTER(...)",
+                        expr.span(),
+                    );
+                }
                 let span = start.union(self.stream.previous_span());
                 Some(GraphPattern::Filter { expr, span })
             }
@@ -460,9 +577,18 @@ impl super::Parser<'_> {
         let start = self.stream.current_span();
         self.stream.advance(); // consume VALUES
 
+        // Row shape follows the VAR-LIST shape, not the variable count:
+        //   InlineDataOneVar ::= Var '{' DataBlockValue* '}'
+        //   InlineDataFull   ::= ( NIL | '(' Var* ')' ) '{' ( '(' DataBlockValue* ')' | NIL )* '}'
+        // A parenthesized single-var list (`VALUES (?x) { (:b) }`) therefore
+        // takes parenthesized rows (W3C bindings#values7), and a bare var
+        // never does.
+        let parenthesized_vars =
+            self.stream.check(&TokenKind::LParen) || self.stream.check(&TokenKind::Nil);
+
         // Parse variable list
         let vars = self.parse_values_variables()?;
-        let multi_var = vars.len() > 1;
+        let multi_var = parenthesized_vars;
 
         // Expect opening brace for data block
         if !self.stream.match_token(&TokenKind::LBrace) {
@@ -475,7 +601,18 @@ impl super::Parser<'_> {
         let mut data: Vec<Vec<Option<Term>>> = Vec::new();
 
         while !self.stream.check(&TokenKind::RBrace) && !self.stream.is_eof() {
-            if multi_var {
+            if vars.is_empty() {
+                // Zero-variable data block (`VALUES () { () … }`): each row
+                // is `()` — lexed as a single Nil token — and carries no
+                // bindings (`InlineDataFull ::= ( NIL | … ) '{' ( … | NIL )* '}'`).
+                if self.stream.match_token(&TokenKind::Nil) {
+                    data.push(Vec::new());
+                } else {
+                    self.stream
+                        .error_at_current("expected '()' row in zero-variable VALUES data block");
+                    self.stream.advance();
+                }
+            } else if multi_var {
                 // Multiple variables: expect parenthesized row
                 if let Some(row) = self.parse_values_row(vars.len()) {
                     data.push(row);
@@ -513,6 +650,13 @@ impl super::Parser<'_> {
     /// Returns variables either from `?var` or `(?var1 ?var2 ...)`.
     fn parse_values_variables(&mut self) -> Option<Vec<Var>> {
         let mut vars = Vec::new();
+
+        // `VALUES () { … }` — a NIL var list (`InlineDataFull ::= ( NIL |
+        // '(' Var* ')' ) …`) declares zero variables. `()` lexes as one Nil
+        // token, so the LParen branch below never sees the empty case.
+        if self.stream.match_token(&TokenKind::Nil) {
+            return Some(vars);
+        }
 
         // Check for parenthesized list
         if self.stream.match_token(&TokenKind::LParen) {
@@ -673,6 +817,16 @@ impl super::Parser<'_> {
         // stops at the first non-modifier token (here, the closing `}`).
         let modifiers = self.parse_solution_modifiers();
 
+        // Optional trailing VALUES clause:
+        // `SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause`
+        // (same position as a top-level query's post-query VALUES;
+        // W3C bindings#inline2).
+        let values = if self.stream.check_keyword(TokenKind::KwValues) {
+            self.parse_values_pattern().map(Box::new)
+        } else {
+            None
+        };
+
         // Expect closing brace for the subquery
         if !self.stream.match_token(&TokenKind::RBrace) {
             self.stream
@@ -687,6 +841,7 @@ impl super::Parser<'_> {
             variables,
             pattern: Box::new(pattern),
             modifiers,
+            values,
             span,
         };
 

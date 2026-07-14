@@ -192,13 +192,13 @@ async fn notify_large_gap_falls_back_to_reload() {
 
 #[tokio::test]
 async fn notify_index_only_trims_novelty() {
-    let fluree = FlureeBuilder::memory()
-        .with_ledger_cache_config(LedgerManagerConfig::default())
-        .build_memory();
+    let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/notify-index-only:main";
-    let manager = fluree
-        .ledger_manager()
-        .expect("ledger_manager should be present");
+    // A peer manager (not `fluree.ledger_manager()`): the built-in manager's
+    // event listener reconciles the cache as soon as the indexer publishes,
+    // which would make this notify() observe `Current` instead of exercising
+    // the IndexOnly path.
+    let manager = peer_manager(&fluree);
 
     // Start a background indexer
     let (local, indexer_handle) = start_background_indexer_local(

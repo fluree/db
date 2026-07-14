@@ -91,9 +91,9 @@ pub fn workspace_root() -> Option<PathBuf> {
                 }
             }
         }
-        match current.parent() {
-            Some(p) => current = p,
-            None => return None,
+        {
+            let p = current.parent()?;
+            current = p
         }
     }
 }

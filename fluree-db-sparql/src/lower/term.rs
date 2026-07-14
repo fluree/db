@@ -88,25 +88,28 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Ref::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:b{}", self.vars.len()));
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Ref::Var(var_id))
                 }
             },
             SubjectTerm::QuotedTriple(_qt) => {
-                // This path is reached when a quoted triple appears in a context
-                // other than a top-level BGP subject with f:t/f:op predicates.
+                // This path is reached when a quoted triple appears in a
+                // context without a reified-triple desugaring hook.
                 //
-                // Supported case (handled in lower_bgp_with_rdf_star):
-                //   << ex:s ex:p ?o >> f:t ?t ; f:op ?op .
+                // Supported cases (handled elsewhere):
+                //   - legacy history form `<< s p ?o >> f:t ?t` and RDF 1.2
+                //     reified-triple subjects/objects in BGPs
+                //     (lower_bgp_with_rdf_star / lower/annotation.rs);
+                //   - standalone reified triples (`GraphPattern::
+                //     AnnotationTarget`).
                 //
-                // Unsupported cases that reach this error:
-                //   - Nested quoted triples: << << ex:s ex:p ?o >> ex:annotatedBy ?who >> ...
-                //   - Quoted triples in property paths: ?s ex:path+/<< ex:s ex:p ?o >> ...
-                //   - Quoted triples converted to generic Term in unsupported contexts
-                //
-                // Full RDF-star support would require reifying quoted triples.
+                // Unsupported cases that reach this error (deferred per
+                // burn-down decision D-1, accept-then-defer):
+                //   - quoted triples as property-path subjects;
+                //   - quoted triples as the reifier subject of rdf:reifies;
+                //   - CONSTRUCT/UPDATE template positions.
                 Err(LowerError::not_implemented(
-                    "RDF-star quoted triples in this context (only top-level BGP with f:t/f:op annotations supported)",
+                    "RDF-star quoted triples in this position",
                     term.span(),
                 ))
             }
@@ -140,10 +143,21 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Ok(Term::Var(var_id))
                 }
                 BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:b{}", self.vars.len()));
+                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
                     Ok(Term::Var(var_id))
                 }
             },
+            SparqlTerm::QuotedTriple(qt) => {
+                // Reified-triple objects are desugared by
+                // `lower_object_desugared` before this is reached on
+                // the BGP/annotation paths; positions without a
+                // desugaring context (e.g. property-path objects)
+                // defer cleanly.
+                Err(LowerError::not_implemented(
+                    "RDF 1.2 reified triples (`<< s p o >>`) in this position",
+                    qt.span,
+                ))
+            }
         }
     }
 
@@ -173,6 +187,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::Iri(iri) => Ok((self.lower_iri(iri)?, None)),
             SparqlTerm::Literal(lit) => self.lower_literal_with_constraint(lit),
             SparqlTerm::BlankNode(_) => Ok((self.lower_object(term)?, None)),
+            SparqlTerm::QuotedTriple(_) => Ok((self.lower_object(term)?, None)),
         }
     }
 
@@ -391,43 +406,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     }
 
     pub(super) fn expand_iri(&self, iri: &Iri) -> Result<String> {
-        match &iri.value {
-            IriValue::Full(s) => {
-                // Check for common mistake: <prefix:local> instead of prefix:local
-                // This happens when users wrap a prefixed name in angle brackets.
-                // We detect this by checking if the IRI looks like "prefix:local"
-                // where "prefix" matches a declared PREFIX.
-                if !s.contains("://") {
-                    if let Some(colon_pos) = s.find(':') {
-                        let potential_prefix = &s[..colon_pos];
-                        if let Some(ns) = self.prefixes.get(potential_prefix) {
-                            let local = &s[colon_pos + 1..];
-                            let expanded = format!("{ns}{local}");
-                            return Err(LowerError::misused_prefix_syntax(
-                                s.to_string(),
-                                expanded,
-                                iri.span,
-                            ));
-                        }
-                    }
-                }
-
-                // Handle relative IRIs
-                if let Some(base) = &self.base {
-                    if !s.contains("://") && !s.starts_with('#') {
-                        return Ok(format!("{base}{s}"));
-                    }
-                }
-                Ok(s.to_string())
-            }
-            IriValue::Prefixed { prefix, local } => {
-                let ns = self
-                    .prefixes
-                    .get(prefix.as_ref())
-                    .ok_or_else(|| LowerError::undefined_prefix(prefix.clone(), iri.span))?;
-                Ok(format!("{ns}{local}"))
-            }
-        }
+        expand_iri_with(&self.prefixes, self.base.as_deref(), iri)
     }
 
     /// Convert a SPARQL term to a Binding (for VALUES rows).
@@ -450,9 +429,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     FlakeValue::String(value.to_string()),
                     lang.clone(),
                 )),
+                // RDF 1.1: a bare integer literal is xsd:integer. Storage,
+                // the Turtle parser, arithmetic results, and triple-pattern
+                // lowering all agree on xsd:integer — tagging VALUES rows
+                // xsd:long made the same number two distinct terms in
+                // term-identity contexts (DISTINCT/GROUP BY/sameTerm), #1319.
                 LiteralValue::Integer(i) => Ok(Binding::lit(
                     FlakeValue::Long(*i),
-                    Sid::new(XSD, xsd_names::LONG),
+                    Sid::new(XSD, xsd_names::INTEGER),
                 )),
                 LiteralValue::Double(d) => Ok(Binding::lit(
                     FlakeValue::Double(*d),
@@ -495,6 +479,68 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // Blank nodes in VALUES treated as unbound
                 Ok(Binding::Unbound)
             }
+            SparqlTerm::QuotedTriple(qt) => Err(LowerError::not_implemented(
+                "RDF 1.2 reified triples (`<< s p o >>`) as VALUES data",
+                qt.span,
+            )),
+        }
+    }
+}
+
+/// Expand a SPARQL IRI (full or prefixed) to an absolute IRI string using a
+/// prologue environment (prefix map + optional BASE).
+///
+/// Free function so callers without a full [`LoweringContext`] (e.g. dataset
+/// clause resolution, which runs before/without an encoder) share the exact
+/// same expansion semantics:
+///
+/// - Prefixed names expand against `prefixes` (whose namespaces the caller
+///   must already have base-resolved — see `prologue_environment`).
+/// - Full IRI references resolve against `base` per RFC 3986 §5: `<>` → the
+///   base itself, `<#x>` → base + fragment, `<data.ttl>` → sibling of the
+///   base document. Absolute references (any valid scheme, including `urn:` /
+///   `did:` — not just `://` forms) pass through verbatim.
+/// - Without a BASE, relative references stay as written (Fluree accepts
+///   them as ledger-local names).
+pub(super) fn expand_iri_with(
+    prefixes: &std::collections::HashMap<Arc<str>, Arc<str>>,
+    base: Option<&str>,
+    iri: &Iri,
+) -> Result<String> {
+    match &iri.value {
+        IriValue::Full(s) => {
+            // Check for common mistake: <prefix:local> instead of prefix:local
+            // This happens when users wrap a prefixed name in angle brackets.
+            // We detect this by checking if the IRI looks like "prefix:local"
+            // where "prefix" matches a declared PREFIX.
+            if !s.contains("://") {
+                if let Some(colon_pos) = s.find(':') {
+                    let potential_prefix = &s[..colon_pos];
+                    if let Some(ns) = prefixes.get(potential_prefix) {
+                        let local = &s[colon_pos + 1..];
+                        let expanded = format!("{ns}{local}");
+                        return Err(LowerError::misused_prefix_syntax(
+                            s.to_string(),
+                            expanded,
+                            iri.span,
+                        ));
+                    }
+                }
+            }
+
+            // Resolve relative IRI references against the query BASE.
+            if let Some(base) = base {
+                if !fluree_vocab::iri::is_absolute_iri(s) {
+                    return Ok(fluree_vocab::iri::resolve_iri(base, s));
+                }
+            }
+            Ok(s.to_string())
+        }
+        IriValue::Prefixed { prefix, local } => {
+            let ns = prefixes
+                .get(prefix.as_ref())
+                .ok_or_else(|| LowerError::undefined_prefix(prefix.clone(), iri.span))?;
+            Ok(format!("{ns}{local}"))
         }
     }
 }

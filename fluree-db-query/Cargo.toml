@@ -35,6 +35,7 @@ bigdecimal = "0.4"
 once_cell = "1"
 # LRU cache for compiled regexes
 lru = "0.12"
+parking_lot = "0.12"
 # TinyLFU cache for fulltext novelty deltas
 moka = { workspace = true }
 # BM25 index serialization

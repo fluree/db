@@ -249,8 +249,9 @@ fn parse_primary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
     // Full IRI - could be function call or just an IRI
     if let Some((iri_str, iri_span)) = tokens.consume_iri() {
         let iri = Iri::full(iri_str, iri_span);
-        if tokens.check(&TokenKind::LParen) {
-            // Function call with IRI
+        if tokens.check(&TokenKind::LParen) || tokens.check(&TokenKind::Nil) {
+            // Function call with IRI (`ArgList ::= NIL | '(' … ')'` — an
+            // empty arg list `()` lexes as a single Nil token)
             return parse_function_call_with_iri(tokens, iri, start);
         }
         return Ok(Expression::iri(iri));
@@ -262,8 +263,8 @@ fn parse_primary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
             value: IriValue::Prefixed { prefix, local },
             span: pn_span,
         };
-        if tokens.check(&TokenKind::LParen) {
-            // Function call with prefixed IRI
+        if tokens.check(&TokenKind::LParen) || tokens.check(&TokenKind::Nil) {
+            // Function call with prefixed IRI (Nil = empty arg list)
             return parse_function_call_with_iri(tokens, iri, start);
         }
         return Ok(Expression::iri(iri));
@@ -278,7 +279,7 @@ fn parse_primary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
             },
             span: ns_span,
         };
-        if tokens.check(&TokenKind::LParen) {
+        if tokens.check(&TokenKind::LParen) || tokens.check(&TokenKind::Nil) {
             return parse_function_call_with_iri(tokens, iri, start);
         }
         return Ok(Expression::iri(iri));

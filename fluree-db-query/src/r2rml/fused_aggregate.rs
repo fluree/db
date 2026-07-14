@@ -40,7 +40,9 @@ use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
-use fluree_db_r2rml::mapping::{extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap};
+use fluree_db_r2rml::mapping::{
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap,
+};
 use fluree_db_r2rml::materialize::materialize_object_from_batch;
 use fluree_db_tabular::Column;
 use futures::StreamExt;
@@ -936,7 +938,10 @@ impl Operator for FusedR2rmlAggregateOperator {
                 self.done = true;
                 self.state = OperatorState::Exhausted;
                 let count = Acc::Count(n).finalize();
-                return Ok(Some(Batch::new(Arc::clone(&self.schema), vec![vec![count]])?));
+                return Ok(Some(Batch::new(
+                    Arc::clone(&self.schema),
+                    vec![vec![count]],
+                )?));
             }
         }
 
@@ -1155,6 +1160,10 @@ impl FusedR2rmlAggregateOperator {
         if rr.unconverted_count > 0 {
             return Ok(None);
         }
+        // The single-`R2rml` shape gate below also keeps this path decline-safe
+        // against non-lowered sub-scopes (`rr.unsupported`): a surviving
+        // PropertyPath/Subquery breaks the shape, so we fall back to the normal
+        // GRAPH path, which raises the loud `unsupported_subscope_error`.
         let pattern = match rr.patterns.as_slice() {
             [Pattern::R2rml(p)] => p.clone(),
             _ => return Ok(None), // multiple scans / star not handled in slice 1

@@ -5,7 +5,7 @@ use fluree_graph_ir::{Graph, GraphCollectorSink, Term};
 use fluree_graph_turtle::parse;
 
 use crate::files::{read_file_to_string, resolve_relative_iri};
-use crate::vocab::{mf, qt, rdf, rdfs, rdft};
+use crate::vocab::{mf, qt, rdf, rdfs, rdft, ut};
 
 /// A single W3C test case extracted from a manifest.
 #[derive(Debug)]
@@ -28,6 +28,17 @@ pub struct Test {
     pub graph_data: Vec<(String, String)>,
     /// Expected result URL.
     pub result: Option<String>,
+    /// Update request file URL (`ut:request`, for UpdateEvaluationTest).
+    pub update_request: Option<String>,
+    /// Expected default-graph state after an update (`ut:data` on mf:result).
+    pub result_data: Option<String>,
+    /// Expected named-graph state after an update: (graph_name, data_url)
+    /// (`ut:graphData` on mf:result).
+    pub result_graph_data: Vec<(String, String)>,
+    /// Whether the update result carried an explicit `ut:result` marker
+    /// (e.g. `ut:success`) — distinguishes "expected: empty store" declared
+    /// on purpose from an unrecognized/mis-parsed `mf:result` shape.
+    pub result_success: bool,
 }
 
 /// Iterator over W3C test cases, loading manifests lazily.
@@ -184,24 +195,42 @@ impl TestManifest {
 
         // Parse action — can be a simple IRI or a blank node with structured data
         let action_term = self.object_for(&subject, mf::ACTION);
-        let (action, query, data, graph_data) = match action_term {
+        let (action, query, data, graph_data, update_request) = match action_term {
             Some(term) if term.is_iri() => {
                 // Simple action: just a URL (used for syntax tests)
-                (term_to_string(term), None, None, vec![])
+                (term_to_string(term), None, None, vec![], None)
             }
             Some(term) if term.is_blank() => {
-                // Structured action: blank node with qt:query, qt:data, etc.
+                // Structured action: blank node with qt:query / qt:data /
+                // qt:graphData (query eval) or ut:request / ut:data /
+                // ut:graphData (update eval).
                 let query = self.object_for(term, qt::QUERY).and_then(term_to_string);
-                let data = self.object_for(term, qt::DATA).and_then(term_to_string);
-                let graph_data = self.get_graph_data(term);
-                (None, query, data, graph_data)
+                let update_request = self.object_for(term, ut::REQUEST).and_then(term_to_string);
+                let data = self
+                    .object_for(term, qt::DATA)
+                    .or_else(|| self.object_for(term, ut::DATA))
+                    .and_then(term_to_string);
+                let mut graph_data = self.get_graph_data(term, qt::GRAPH_DATA);
+                graph_data.extend(self.get_graph_data(term, ut::GRAPH_DATA));
+                (None, query, data, graph_data, update_request)
             }
-            _ => (None, None, None, vec![]),
+            _ => (None, None, None, vec![], None),
         };
 
-        let result = self
-            .object_for(&subject, mf::RESULT)
-            .and_then(term_to_string);
+        // Parse result — a simple IRI (query eval: expected result file) or a
+        // blank node with ut:data / ut:graphData (update eval: expected
+        // post-update graph store state).
+        let result_term = self.object_for(&subject, mf::RESULT);
+        let (result, result_data, result_graph_data, result_success) = match result_term {
+            Some(term) if term.is_iri() => (term_to_string(term), None, vec![], false),
+            Some(term) if term.is_blank() => {
+                let result_data = self.object_for(term, ut::DATA).and_then(term_to_string);
+                let result_graph_data = self.get_graph_data(term, ut::GRAPH_DATA);
+                let result_success = self.object_for(term, ut::RESULT).is_some();
+                (None, result_data, result_graph_data, result_success)
+            }
+            _ => (None, None, vec![], false),
+        };
 
         Ok(Some(Test {
             id: test_id.to_string(),
@@ -213,6 +242,10 @@ impl TestManifest {
             data,
             graph_data,
             result,
+            update_request,
+            result_data,
+            result_graph_data,
+            result_success,
         }))
     }
 
@@ -224,22 +257,29 @@ impl TestManifest {
             .map(|t| &t.o)
     }
 
-    /// Extract named graph data from a structured action node.
-    fn get_graph_data(&self, action: &Term) -> Vec<(String, String)> {
+    /// Extract named graph data from a structured action/result node.
+    ///
+    /// Two W3C shapes:
+    /// - `qt:graphData <url>` — the IRI is both the graph name and data URL
+    ///   (query eval tests)
+    /// - `ut:graphData [ ut:graph <url> ; rdfs:label "name" ]` — labeled form
+    ///   (update eval tests): `rdfs:label` is the graph name, `ut:graph` the
+    ///   data file URL
+    fn get_graph_data(&self, node: &Term, predicate: &str) -> Vec<(String, String)> {
         self.graph
             .iter()
-            .filter(|t| t.s == *action && t.p.as_iri() == Some(qt::GRAPH_DATA))
+            .filter(|t| t.s == *node && t.p.as_iri() == Some(predicate))
             .filter_map(|t| {
                 if t.o.is_iri() {
                     // Simple named graph: IRI is both the graph name and data URL
                     let url = t.o.as_iri()?.to_string();
                     Some((url.clone(), url))
                 } else if t.o.is_blank() {
-                    // Labeled graph data
+                    // Labeled graph data: name from rdfs:label, URL from ut:graph
                     let label = self
                         .object_for(&t.o, rdfs::LABEL)
                         .and_then(term_to_string)?;
-                    let graph_url = term_to_string(&t.o)?;
+                    let graph_url = self.object_for(&t.o, ut::GRAPH).and_then(term_to_string)?;
                     Some((label, graph_url))
                 } else {
                     None

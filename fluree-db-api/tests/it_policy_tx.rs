@@ -694,3 +694,306 @@ async fn turtle_insert_enforces_modify_policy() {
         ok.err()
     );
 }
+
+/// Test: `identity` + `policy-class` together — classes select, identity is
+/// bind-only.
+///
+/// A request carrying BOTH an identity and an explicit policy-class must have
+/// its policy set selected by the class (stored policies typed with it), with
+/// the identity only binding `?$identity`. This is the shape gateways send
+/// when they resolve grant-derived classes per request and forward them with
+/// the authenticated identity — including identities that are not resolvable
+/// IRIs (bare emails / UUID subjects), which must not poison the context.
+#[tokio::test]
+async fn identity_with_policy_class_selects_class_policies() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "identity_with_policy_class");
+
+    // Store class-typed policies IN the ledger (class selection, not inline):
+    // a view policy on ex:Lead and a modify property-whitelist.
+    let policies = json!({
+        "@context": {
+            "f": "https://ns.flur.ee/db#",
+            "ex": "http://example.org/ns/",
+            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:leadView",
+                "@type": ["f:AccessPolicy", "ex:LeadAppAccess"],
+                "f:action": {"@id": "f:view"},
+                "f:allow": true,
+                "f:onClass": {"@id": "ex:Lead"}
+            },
+            {
+                "@id": "ex:leadModify",
+                "@type": ["f:AccessPolicy", "ex:LeadAppAccess"],
+                "f:action": {"@id": "f:modify"},
+                "f:allow": true,
+                "f:onProperty": [
+                    {"@id": "rdf:type"},
+                    {"@id": "ex:name"},
+                    {"@id": "ex:campaign"}
+                ]
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &policies).await.unwrap().ledger;
+
+    let insert_lead = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead-1",
+        "@type": "ex:Lead",
+        "ex:name": "Maya",
+        "ex:campaign": "trailhead"
+    });
+    let index_config = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // ── identity + policy-class: classes select; insert is allowed ──
+    // The identity is deliberately NOT a resolvable IRI: it must be treated
+    // as bind-only (unbound `?$identity`), not poison rule selection.
+    let qc_opts = GovernanceOptions {
+        identity: Some("admin@fluree.local".to_string()),
+        policy_class: Some(vec!["http://example.org/ns/LeadAppAccess".to_string()]),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    let input = TrackedTransactionInput::new(
+        TxnType::Insert,
+        &insert_lead,
+        TxnOpts::default(),
+        &policy_ctx,
+    );
+    // Transacting consumes the LedgerState; the denial sections below each
+    // work on their own clone of the post-policies state.
+    let ledger_for_identity_only = ledger.clone();
+    let ledger_for_sneaky = ledger.clone();
+    let result = fluree
+        .transact_tracked_with_policy(ledger, input, CommitOpts::default(), &index_config)
+        .await;
+    assert!(
+        result.is_ok(),
+        "class-selected whitelist must allow the lead insert: {:?}",
+        result.err()
+    );
+
+    // ── same identity WITHOUT policy-class: identity-mode → deny ──
+    // Pins that the allow above came from the class arm, not a loosening of
+    // identity-mode.
+    let identity_only = GovernanceOptions {
+        identity: Some("admin@fluree.local".to_string()),
+        default_allow: false,
+        ..Default::default()
+    };
+    let ledger = ledger_for_identity_only;
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &identity_only,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+    let insert_lead2 = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead-2",
+        "@type": "ex:Lead",
+        "ex:name": "Denied"
+    });
+    let input = TrackedTransactionInput::new(
+        TxnType::Insert,
+        &insert_lead2,
+        TxnOpts::default(),
+        &policy_ctx,
+    );
+    let result = fluree
+        .transact_tracked_with_policy(ledger, input, CommitOpts::default(), &index_config)
+        .await;
+    assert!(
+        result.is_err(),
+        "identity-mode without classes must stay default-deny"
+    );
+    let ledger = ledger_for_sneaky;
+
+    // ── class-selected but non-whitelisted property: still denied ──
+    let qc_opts = GovernanceOptions {
+        identity: Some("admin@fluree.local".to_string()),
+        policy_class: Some(vec!["http://example.org/ns/LeadAppAccess".to_string()]),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+    let sneaky = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:secret-1",
+        "@type": "ex:Secret",
+        "ex:val": "x"
+    });
+    let input =
+        TrackedTransactionInput::new(TxnType::Insert, &sneaky, TxnOpts::default(), &policy_ctx);
+    let result = fluree
+        .transact_tracked_with_policy(ledger, input, CommitOpts::default(), &index_config)
+        .await;
+    assert!(
+        result.is_err(),
+        "non-whitelisted property must be denied even with the class selected"
+    );
+}
+
+/// Modify `f:onClass` policies govern ALL flakes of the class's instances —
+/// including properties the class has never used in committed data. The
+/// former stats-driven expansion only covered stats-known properties, so a
+/// class-scoped allow silently failed to cover novel properties (denied
+/// under default-deny).
+#[tokio::test]
+async fn onclass_modify_allows_never_used_property() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "onclass_novel_property");
+
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead1",
+        "@type": "ex:Lead",
+        "ex:name": "First"
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    let qc_opts = GovernanceOptions {
+        policy: Some(json!([{
+            "@id": "ex:leadEditors",
+            "f:onClass": [{"@id": "http://example.org/ns/Lead"}],
+            "f:action": "f:modify",
+            "f:allow": true
+        }])),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    // ex:campaignScore has never been used by any Lead (absent from stats).
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:lead1",
+        "ex:campaignScore": 42
+    });
+    let input =
+        TrackedTransactionInput::new(TxnType::Insert, &insert, TxnOpts::default(), &policy_ctx);
+    let result = fluree
+        .transact_tracked_with_policy(
+            ledger,
+            input,
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "class-scoped modify allow must cover a never-used property on an instance: {:?}",
+        result.err()
+    );
+}
+
+/// A property that stats show as exclusive to a class must NOT extend that
+/// class's modify allow to other subjects. The staged flake itself may be
+/// the first counterexample to the stats — the former exclusivity shortcut
+/// skipped the class check and let the allow leak.
+#[tokio::test]
+async fn onclass_modify_denies_exclusive_property_on_non_instance() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "onclass_exclusive_leak");
+
+    // ex:salary is used ONLY by Lead instances → stats mark it exclusive.
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:lead1", "@type": "ex:Lead", "ex:salary": 100},
+            {"@id": "ex:bob", "@type": "ex:Person", "ex:nickname": "Bob"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    let qc_opts = GovernanceOptions {
+        policy: Some(json!([{
+            "@id": "ex:leadEditors",
+            "f:onClass": [{"@id": "http://example.org/ns/Lead"}],
+            "f:action": "f:modify",
+            "f:allow": true
+        }])),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    // Write the Lead-"exclusive" property onto a Person subject.
+    let attack = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:bob",
+        "ex:salary": 999
+    });
+    let input =
+        TrackedTransactionInput::new(TxnType::Insert, &attack, TxnOpts::default(), &policy_ctx);
+    let result = fluree
+        .transact_tracked_with_policy(
+            ledger,
+            input,
+            CommitOpts::default(),
+            &IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "Lead-scoped allow must not permit writing onto a Person subject"
+    );
+}

@@ -302,6 +302,79 @@ fn cast_to_string(
     v.into_string_value_with_namespaces(namespace_codes)
 }
 
+// ---------------------------------------------------------------------------
+// xsd:dateTime / xsd:date / xsd:time
+// ---------------------------------------------------------------------------
+
+/// Extract the string form of a castable temporal source value: a plain or
+/// typed string literal. Non-string, non-temporal values (numbers, booleans,
+/// IRIs) are not castable to temporal types (W3C SPARQL 1.1 §17.5 / XPath
+/// casting) — the cast produces no value.
+fn temporal_source_string(v: &ComparableValue) -> Option<&str> {
+    match v {
+        ComparableValue::String(s) => Some(s.as_ref()),
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            ..
+        } => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+pub fn eval_xsd_datetime<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:dateTime")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::DateTime(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::DateTime::parse(s).ok())
+            .map(ComparableValue::DateTime),
+    })
+}
+
+pub fn eval_xsd_date<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:date")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::Date(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::Date::parse(s).ok())
+            .map(ComparableValue::Date),
+    })
+}
+
+pub fn eval_xsd_time<R: RowAccess>(
+    args: &[Expression],
+    row: &R,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<Option<ComparableValue>> {
+    check_arity(args, 1, "xsd:time")?;
+    let Some(v) = args[0].eval_to_comparable(row, ctx)? else {
+        return Ok(None);
+    };
+    Ok(match v {
+        // Identity cast.
+        ComparableValue::Time(_) => Some(v),
+        other => temporal_source_string(&other)
+            .and_then(|s| fluree_db_core::temporal::Time::parse(s).ok())
+            .map(ComparableValue::Time),
+    })
+}
+
 /// Produce the XSD canonical string form of a decimal value.
 ///
 /// Strips trailing zeros after the decimal point and removes the decimal

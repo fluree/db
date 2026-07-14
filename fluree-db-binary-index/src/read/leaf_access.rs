@@ -165,7 +165,11 @@ impl LeafHandle for FullBlobLeafHandle {
 /// cache — this handle only supplies the bytes for a cold decode. Raw leaf bytes
 /// are never copied into the cache budget.
 pub struct MmapLeafHandle {
-    mmap: memmap2::Mmap,
+    /// Shared mapping: leaf files are immutable CAS artifacts, so one
+    /// mapping is created per leaf and shared across concurrent handles
+    /// (see `LeafletCache::try_get_or_load_leaf_mmap`). `Mmap` does not
+    /// keep the file descriptor alive — sharing costs address space only.
+    mmap: Arc<memmap2::Mmap>,
     dir: Arc<DecodedLeafDirV3>,
     sidecar: Option<Vec<u8>>,
     leaf_id: u128,
@@ -173,7 +177,7 @@ pub struct MmapLeafHandle {
 
 impl MmapLeafHandle {
     pub fn new(
-        mmap: memmap2::Mmap,
+        mmap: Arc<memmap2::Mmap>,
         dir: Arc<DecodedLeafDirV3>,
         sidecar: Option<Vec<u8>>,
         leaf_id: u128,

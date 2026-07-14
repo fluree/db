@@ -294,6 +294,26 @@ async fn transact_via_consensus(
     tx_id: String,
     headers: &HeaderMap,
 ) -> Result<Response> {
+    let receipt = submit_via_consensus(state, request, headers).await?;
+    let response_json = Json(transact_response(
+        ledger_id.to_string(),
+        receipt.commit.t,
+        tx_id,
+        receipt.commit.commit_id.to_string(),
+        receipt.tally.as_ref(),
+    ));
+    Ok(build_consensus_response(response_json, &receipt))
+}
+
+/// Submit a transaction through consensus and return the receipt, recording
+/// the tracking tally on the current span. Shared by the commit-receipt
+/// response path ([`transact_via_consensus`]) and the Cypher write-RETURN
+/// path, which shapes its own response body from the receipt.
+pub(crate) async fn submit_via_consensus(
+    state: &AppState,
+    request: TransactionRequest,
+    headers: &HeaderMap,
+) -> Result<fluree_db_consensus::TransactionReceipt> {
     let correlation = IndexRequestCorrelation::new(
         extract_request_id(headers, &state.telemetry_config),
         extract_trace_id(headers),
@@ -322,14 +342,7 @@ async fn transact_via_consensus(
     if let Some(tally) = &receipt.tally {
         record_tracking_on_span(&tracing::Span::current(), tally);
     }
-    let response_json = Json(transact_response(
-        ledger_id.to_string(),
-        receipt.commit.t,
-        tx_id,
-        receipt.commit.commit_id.to_string(),
-        receipt.tally.as_ref(),
-    ));
-    Ok(build_consensus_response(response_json, &receipt))
+    Ok(receipt)
 }
 
 /// If the request was signed (credentialed), return the *original* signed envelope
@@ -1843,6 +1856,26 @@ async fn execute_cypher_transact(
         &handle,
     );
     let tracking = tracking_from_headers(headers);
+
+    // A trailing RETURN on the write ships a skolemization id with the
+    // request so the created-entity rows are reconstructible post-commit
+    // (see `fluree_db_api::cypher_write`). Validation errors surface here,
+    // pre-submission; parse errors fall through to the consensus path's
+    // full-diagnostic error.
+    let return_plan =
+        fluree_db_api::cypher_write::plan_write_return_source(&cypher, params.as_ref())
+            .map_err(ServerError::Api)
+            .inspect_err(|_| {
+                set_span_error_code(span, "error:BadRequest");
+            })?;
+    let skolem_txn_id = return_plan
+        .as_ref()
+        .map(|_| fluree_db_api::cypher_write::fresh_skolem_txn_id());
+    let txn_opts = TxnOpts {
+        skolem_txn_id: skolem_txn_id.clone(),
+        ..TxnOpts::default()
+    };
+
     let request = TransactionRequest {
         idempotency_key: extract_idempotency_key(&credential.headers)?,
         ledger_id: ledger_id.to_string(),
@@ -1850,12 +1883,69 @@ async fn execute_cypher_transact(
             query: cypher,
             params,
         },
-        txn_opts: TxnOpts::default(),
+        txn_opts,
         commit_opts,
         tracking,
         governance: qc_opts,
     };
-    transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await
+
+    let (Some(plan), Some(skolem_id)) = (return_plan, skolem_txn_id) else {
+        return transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await;
+    };
+
+    // Write with RETURN: commit, then answer the RETURN as a Cypher-JSON
+    // envelope (matching the read path's tabular format).
+    let receipt = submit_via_consensus(state, request, &credential.headers).await?;
+    let ledger_state =
+        wait_for_committed_state(state, ledger_id, receipt.commit.t, &receipt).await?;
+    let envelope = fluree_db_api::cypher_write::write_return_rows(&plan, &skolem_id, &ledger_state)
+        .await
+        .map_err(ServerError::Api)?;
+
+    let mut response_headers = HeaderMap::new();
+    if let Some(key) = &receipt.idempotency_key {
+        if let Ok(value) = HeaderValue::from_str(key.as_str()) {
+            response_headers.insert("Idempotency-Key", value);
+        }
+    }
+    if let Some(tally) = &receipt.tally {
+        response_headers.extend(tracking_headers(tally));
+    }
+    response_headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.fluree.cypher+json; charset=utf-8"),
+    );
+    Ok((response_headers, envelope.to_string()).into_response())
+}
+
+/// Wait (briefly) until the cached ledger state includes commit `t`. Local
+/// consensus updates the cache before the receipt returns, so this passes
+/// immediately; a Raft follower may lag until the commit event applies.
+pub(crate) async fn wait_for_committed_state(
+    state: &AppState,
+    ledger_id: &str,
+    commit_t: i64,
+    receipt: &fluree_db_consensus::TransactionReceipt,
+) -> Result<fluree_db_api::LedgerState> {
+    for _ in 0..40 {
+        let handle = state
+            .fluree
+            .ledger_cached(ledger_id)
+            .await
+            .map_err(ServerError::Api)?;
+        let view = handle.snapshot().await;
+        if view.t >= commit_t {
+            return Ok(view.to_ledger_state());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    Err(ServerError::Api(fluree_db_api::ApiError::internal(
+        format!(
+            "commit {} (t={commit_t}) is not yet visible in the local ledger state; \
+         the write succeeded but its RETURN rows could not be produced",
+            receipt.commit.commit_id
+        ),
+    )))
 }
 
 /// Execute a SPARQL UPDATE request

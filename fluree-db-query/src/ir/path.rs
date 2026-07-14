@@ -3,6 +3,7 @@
 //! the data lives.
 
 use super::triple::Ref;
+use crate::ir::Expression;
 use crate::var_registry::VarId;
 use fluree_db_core::Sid;
 
@@ -248,6 +249,13 @@ pub enum ShortestPathMode {
     Single,
     /// `allShortestPaths(...)` — every path of the minimal length.
     All,
+    /// Path *enumeration* — every relationship-unique (trail) path whose hop
+    /// count is in `[min_hops, max_hops]` (Cypher `p = (a)-[:T*]->(b)`,
+    /// `-[r:T*]->`): no edge is traversed twice, but a node may be revisited via
+    /// a different edge (matches Neo4j). Unlike the shortest modes, the **end may
+    /// be unbound**: the operator binds it per discovered path (a bound end
+    /// filters instead). Only the start anchors the search.
+    Enumerate,
 }
 
 /// Anchored shortest-path pattern — Cypher `shortestPath` / `allShortestPaths`.
@@ -263,8 +271,11 @@ pub struct ShortestPathPattern {
     pub start: Ref,
     /// End node ref (Var or Sid — literals not allowed).
     pub end: Ref,
-    /// Predicate to traverse (resolved to Sid).
-    pub predicate: Sid,
+    /// Predicate to traverse (resolved to Sid). `None` is the untyped
+    /// (wildcard) form: any relationship edge is followed — reference-valued
+    /// objects only, excluding `rdf:type` and the `f:reifies*` system
+    /// predicates (the same edge-set as the wildcard [`PropertyPathPattern`]).
+    pub predicate: Option<Sid>,
     /// Traversal direction.
     pub direction: PathDirection,
     /// Single vs. all-shortest-paths.
@@ -278,13 +289,35 @@ pub struct ShortestPathPattern {
     /// Whether the emitted path value's per-hop `edges` are consumed (only
     /// Cypher's `relationships(p)` reads them). When `false` the operator skips
     /// building the per-hop edge tuples — a pure allocation/clone savings on the
-    /// JSON-LD/FQL surface, which has no `relationships()` function. Edges are
-    /// derivable from `nodes` + this pattern's single `predicate`/`direction`.
+    /// JSON-LD/FQL surface, which has no `relationships()` function. For a
+    /// typed pattern edges are derivable from `nodes` + `predicate`/`direction`;
+    /// a wildcard pattern resolves each found hop's predicate with a post-hoc
+    /// probe.
     pub needs_relationships: bool,
+    /// Optional per-node predicate pushed in from a trailing
+    /// `WHERE all(x IN nodes(p) WHERE …)`. When set, the search only traverses
+    /// nodes that satisfy it (endpoints included), finding the shortest
+    /// *qualifying* path rather than post-filtering the unconstrained shortest
+    /// path. `None` = unconstrained.
+    pub node_filter: Option<PathNodeFilter>,
+}
+
+/// A per-node predicate pushed into a shortest-path search from an
+/// `all(x IN nodes(p) WHERE …)` filter over the path's nodes. A node qualifies
+/// iff `predicate` evaluates true with `var` bound to it — the same check the
+/// post-filter applies, moved into the search so BFS returns the shortest path
+/// whose every node passes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathNodeFilter {
+    /// The iteration variable (`x` in `all(x IN nodes(p) …)`).
+    pub var: VarId,
+    /// The boolean predicate evaluated per node.
+    pub predicate: Expression,
 }
 
 impl ShortestPathPattern {
-    /// Variables that must be bound before this pattern runs (both endpoints).
+    /// Endpoint variables this pattern touches (bound-input or, for an
+    /// `Enumerate` end, produced). Used for join-variable counting.
     pub fn referenced_vars(&self) -> Vec<VarId> {
         let mut vars = Vec::with_capacity(2);
         if let Ref::Var(v) = &self.start {
@@ -296,8 +329,33 @@ impl ShortestPathPattern {
         vars
     }
 
-    /// Variables this pattern adds to the binding set (the path value).
+    /// Variables that must be bound before this pattern runs. The shortest
+    /// modes are anchored on both endpoints; `Enumerate` anchors only the
+    /// start — an end bound by an earlier pattern filters at runtime, an
+    /// unbound end is produced per path.
+    pub fn required_input_vars(&self) -> Vec<VarId> {
+        let mut vars = Vec::with_capacity(2);
+        if let Ref::Var(v) = &self.start {
+            vars.push(*v);
+        }
+        if !matches!(self.mode, ShortestPathMode::Enumerate) {
+            if let Ref::Var(v) = &self.end {
+                vars.push(*v);
+            }
+        }
+        vars
+    }
+
+    /// Variables this pattern adds to the binding set: the path value, and —
+    /// under `Enumerate` — the end variable (bound per discovered path when
+    /// no earlier pattern bound it).
     pub fn produced_vars(&self) -> Vec<VarId> {
-        vec![self.path_var]
+        let mut vars = vec![self.path_var];
+        if matches!(self.mode, ShortestPathMode::Enumerate) {
+            if let Ref::Var(v) = &self.end {
+                vars.push(*v);
+            }
+        }
+        vars
     }
 }

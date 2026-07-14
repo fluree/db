@@ -287,6 +287,65 @@ impl EncodedPreFilter {
     }
 }
 
+/// Whether every row of `p_id` in graph `g_id` — persisted and overlay —
+/// provably carries object type `ot16`.
+///
+/// Base side: every non-empty leaflet in the predicate's POST range must be
+/// `o_type_const == ot16` (directory-only reads, cached). Overlay side: when
+/// live novelty exists, every translated overlay op for the predicate must
+/// carry `ot16`; an untranslatable overlay declines. Used to prove that an
+/// equality value seek cannot miss a differently-typed representation of the
+/// same number.
+fn predicate_otype_uniform(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    ot16: u16,
+) -> Result<bool> {
+    for leaf_entry in crate::fast_path_common::leaf_entries_for_predicate(
+        store,
+        g_id,
+        fluree_db_binary_index::format::run_record::RunSortOrder::Post,
+        p_id,
+    ) {
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+        for entry in &dir.entries {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const != Some(ot16) {
+                return Ok(false);
+            }
+        }
+    }
+    if crate::fast_path_common::overlay_has_novelty(ctx) {
+        let Some(pred_sid) = store.predicate_sid(p_id) else {
+            return Ok(false);
+        };
+        // Requires an Arc'd store for the shared ops cache.
+        let Some(store_arc) = ctx.binary_store.as_ref() else {
+            return Ok(false);
+        };
+        let Some(ops) = crate::fast_path_common::cached_overlay_ops(
+            ctx,
+            store_arc,
+            g_id,
+            fluree_db_binary_index::format::run_record::RunSortOrder::Post,
+            &pred_sid,
+        )?
+        else {
+            return Ok(false);
+        };
+        if ops.iter().any(|op| op.o_type != ot16) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
     inline_ops: &[InlineOperator],
     pattern: &TriplePattern,
@@ -352,7 +411,7 @@ pub(crate) fn compile_encoded_pre_filters_and_prune_inline_ops(
         // FILTER(LANG(?o) = "en")  (either side order)
         let is_lang_o = |e: &Expression| match (e, obj_var) {
             (Expression::Call { func, args }, Some(ov)) => {
-                *func == Function::Lang
+                matches!(func, Function::Lang { .. })
                     && args.len() == 1
                     && matches!(&args[0], Expression::Var(v) if *v == ov)
             }
@@ -1614,24 +1673,21 @@ fn build_match_val_for_snapshot(
     };
 
     let reencode_sid = |sid: &Sid| -> Option<Sid> {
-        // Pattern SIDs are encoded in the primary snapshot's namespace space.
-        // Decode to canonical IRI and re-encode into the target snapshot.
-        // Use `original_snapshot` (the primary) rather than `snapshot`
-        // (which may be a per-graph snapshot with different namespace codes).
-        if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
-            if let Some(store) = ctx.binary_store.as_deref() {
+        // Pattern SIDs are encoded in the primary snapshot's namespace space;
+        // re-encode into `snapshot` (a per-graph snapshot may code the same IRI
+        // differently) via the shared `context::reencode_sid`. The binary
+        // store's own persisted subject SID, when present, takes precedence.
+        if let Some(store) = ctx.binary_store.as_deref() {
+            if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
                 if let Ok(Some(persisted_sid)) = store.find_subject_sid(&iri) {
                     return Some(persisted_sid);
                 }
             }
-            snapshot.encode_iri(&iri)
-        } else {
-            // If the SID can't be decoded (namespace code missing), preserve the
-            // raw SID. This is important when the namespace table has been
-            // extended in novelty but the snapshot's namespace map is not yet
-            // able to decode the SID. Range scans can still match by raw SID.
-            Some(sid.clone())
         }
+        // Fall back to the raw SID when it can't be decoded/re-encoded: a range
+        // scan can still match by raw SID (e.g. a novelty-extended namespace the
+        // snapshot's map cannot yet decode).
+        crate::context::reencode_sid(ctx, snapshot, sid).or_else(|| Some(sid.clone()))
     };
 
     match &pattern.s {
@@ -1988,6 +2044,37 @@ impl Operator for BinaryScanOperator {
                     range_o_type = Some(o_type);
                     // Also set the filter o_type so directory-level pre-skip can eliminate non-matching leaflets.
                     filter.o_type = Some(o_type);
+                }
+
+                // Integer EQUALITY bounds (`FILTER(?v = 4112)`, the id-lookup
+                // shape) narrow to a point seek. Cross-type numeric equality
+                // is the hazard (an `xsd:double 4112.0` row matches the
+                // decoded filter but lives in a different POST region), so
+                // the seek only engages when every persisted leaflet AND
+                // every overlay op for this predicate carries the candidate
+                // o_type — then no other representation can exist and the
+                // point range is exact. Mixed or unverifiable predicates keep
+                // the broad scan + decoded filter. Under live novelty this is
+                // what keeps a specific-value lookup at seek speed instead of
+                // a full predicate scan (BUG-1b).
+                if range_min_okey.is_none() && range_max_okey.is_none() {
+                    if let (Some((lo, true)), Some((hi, true))) =
+                        (bounds.lower.as_ref(), bounds.upper.as_ref())
+                    {
+                        if lo == hi && matches!(lo, FlakeValue::Long(_)) {
+                            if let (Ok((ot, key)), Some(p_id)) =
+                                (value_to_otype_okey_simple(lo, store_ref), filter.p_id)
+                            {
+                                let ot16 = ot.as_u16();
+                                if predicate_otype_uniform(ctx, store_ref, self.g_id, p_id, ot16)? {
+                                    range_o_type = Some(ot16);
+                                    range_min_okey = Some(key);
+                                    range_max_okey = Some(key);
+                                    filter.o_type = Some(ot16);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -666,6 +666,19 @@ where
             .await?
             .ok_or_else(|| NameServiceError::not_found(ledger_id))?;
 
+        // Refuse a branch that still has children — the same lineage
+        // guard the raft state machine enforces. The authoritative
+        // drop policy in the api layer defers (retracts) a branch
+        // with children rather than reaching this primitive, so this
+        // only fires on a direct out-of-order call, failing loud
+        // instead of stranding a child with a dangling `source_branch`.
+        if record.branches > 0 {
+            return Err(NameServiceError::storage(format!(
+                "drop_branch refused: {ledger_id} still has {} child branch(es)",
+                record.branches
+            )));
+        }
+
         let parent_source = record.source_branch.clone();
 
         // Remove the NS files
@@ -2348,5 +2361,32 @@ mod tests {
             ns.lookup_any("realdb:main").await.unwrap(),
             NsLookupResult::Ledger(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn drop_branch_refuses_parent_with_children() {
+        let ns = make_storage_ns();
+        ns.init("mydb:main").await.unwrap();
+        ns.create_branch("mydb", "feature", "main", None)
+            .await
+            .unwrap();
+
+        // `main` has a child — the drop must refuse and leave both
+        // records intact rather than strand `feature` with a
+        // dangling `source_branch`.
+        let err = ns
+            .drop_branch("mydb:main")
+            .await
+            .expect_err("dropping a parent with children must fail");
+        assert!(
+            err.to_string().contains("child branch"),
+            "expected child-branch refusal, got: {err}"
+        );
+        assert!(ns.lookup("mydb:main").await.unwrap().is_some());
+        assert!(ns.lookup("mydb:feature").await.unwrap().is_some());
+
+        // Leaf-first drop succeeds.
+        ns.drop_branch("mydb:feature").await.unwrap();
+        ns.drop_branch("mydb:main").await.unwrap();
     }
 }

@@ -39,6 +39,10 @@ pub struct DataPrincipal {
     pub write_all: bool,
     /// Write access to specific ledgers (HashSet for O(1) lookup)
     pub write_ledgers: HashSet<String>,
+    /// Token expiry (Unix seconds). HTTP re-verifies per request so this is
+    /// redundant there; long-lived transports (Bolt sessions) re-check it
+    /// before each statement.
+    pub expires_unix: u64,
 }
 
 impl DataPrincipal {
@@ -83,15 +87,23 @@ impl FromRequestParts<Arc<AppState>> for MaybeDataBearer {
             }
         };
 
-        verify_data_token(&token, state).await
+        verify_data_principal(&token, state)
+            .await
+            .map(|p| MaybeDataBearer(Some(p)))
     }
 }
 
-/// Verify token and build `DataPrincipal`.
+/// Verify a data-plane bearer token and build the `DataPrincipal`.
 ///
-/// When `oidc` feature is enabled, uses dual-path dispatch (embedded JWK or JWKS).
-/// When `oidc` feature is disabled, only the embedded JWK path is available.
-async fn verify_data_token(token: &str, state: &AppState) -> Result<MaybeDataBearer, ServerError> {
+/// The complete, transport-agnostic identity pipeline: signature
+/// verification (dual-path dispatch when `oidc` is enabled), claim
+/// validation, issuer trust for did:key tokens, and the permission-scope
+/// check. Every transport that accepts data-plane tokens (HTTP extractor,
+/// Bolt LOGON) must resolve identity through this one function.
+pub(crate) async fn verify_data_principal(
+    token: &str,
+    state: &AppState,
+) -> Result<DataPrincipal, ServerError> {
     let config = state.config.data_auth();
 
     // Verify the token and extract claims
@@ -148,8 +160,7 @@ async fn verify_data_token(token: &str, state: &AppState) -> Result<MaybeDataBea
         return Err(ServerError::unauthorized("token authorizes no resources"));
     }
 
-    let principal = build_principal(&payload);
-    Ok(MaybeDataBearer(Some(principal)))
+    Ok(build_principal(&payload))
 }
 
 /// Build a `DataPrincipal` from verified claims.
@@ -174,5 +185,6 @@ fn build_principal(payload: &EventsTokenPayload) -> DataPrincipal {
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        expires_unix: payload.exp,
     }
 }

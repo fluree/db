@@ -335,3 +335,102 @@ async fn policy_class_blocks_other_user_ssn_in_where() {
         "Query for John's SSN should return empty, got: {arr:?}"
     );
 }
+
+/// JSON-LD positional `?$identity` condition, anonymous request. The stored
+/// idiom `{"where": {"@id": "?$identity", "ex:user": {"@id": "?$this"}}}`
+/// binds `?$identity` in subject position. An unbound identity seeded as
+/// UNDEF (null VALUES cell) would match any row, leaking every SSN; the
+/// never-match sentinel makes it fail closed. Mirrors the SPARQL positional
+/// test in `it_policy_sparql.rs`.
+#[tokio::test]
+async fn policy_class_positional_identity_unbound_fails_closed() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "policy_class_unbound_identity");
+
+    let setup = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "schema": "http://schema.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "http://example.org/ns/alice",
+                "@type": "http://example.org/ns/User",
+                "http://schema.org/name": "Alice",
+                "http://schema.org/ssn": "111-11-1111"
+            },
+            {
+                "@id": "http://example.org/ns/john",
+                "@type": "http://example.org/ns/User",
+                "http://schema.org/name": "John",
+                "http://schema.org/ssn": "888-88-8888"
+            },
+            {
+                "@id": "http://example.org/ns/aliceIdentity",
+                "https://ns.flur.ee/db#policyClass": [{"@id": "http://example.org/ns/EmployeePolicy"}],
+                "http://example.org/ns/user": {"@id": "http://example.org/ns/alice"}
+            },
+            {
+                "@id": "http://example.org/ns/ssnRestriction",
+                "@type": ["https://ns.flur.ee/db#AccessPolicy", "http://example.org/ns/EmployeePolicy"],
+                "https://ns.flur.ee/db#required": true,
+                "https://ns.flur.ee/db#onProperty": [{"@id": "http://schema.org/ssn"}],
+                "https://ns.flur.ee/db#action": {"@id": "https://ns.flur.ee/db#view"},
+                "https://ns.flur.ee/db#query": serde_json::to_string(&json!({
+                    "@context": {"ex": "http://example.org/ns/"},
+                    "where": {
+                        "@id": "?$identity",
+                        "http://example.org/ns/user": {"@id": "?$this"}
+                    }
+                })).unwrap()
+            },
+            {
+                "@id": "http://example.org/ns/defaultAllowView",
+                "@type": ["https://ns.flur.ee/db#AccessPolicy", "http://example.org/ns/EmployeePolicy"],
+                "https://ns.flur.ee/db#action": {"@id": "https://ns.flur.ee/db#view"},
+                "https://ns.flur.ee/db#query": serde_json::to_string(&json!({})).unwrap()
+            }
+        ]
+    });
+
+    let ledger = fluree.insert(ledger0, &setup).await.unwrap().ledger;
+
+    // Anonymous request: class selected, no identity provided.
+    let anon_opts = GovernanceOptions {
+        policy_class: Some(vec!["http://example.org/ns/EmployeePolicy".to_string()]),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &anon_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    let query = json!({
+        "select": ["?s", "?ssn"],
+        "where": {
+            "@id": "?s",
+            "@type": "http://example.org/ns/User",
+            "http://schema.org/ssn": "?ssn"
+        }
+    });
+
+    let result = support::query_jsonld_with_policy(&fluree, &ledger, &query, &policy_ctx)
+        .await
+        .expect("query with policy");
+    let rendered = result.to_jsonld(&ledger.snapshot).unwrap().to_string();
+
+    assert!(
+        !rendered.contains("111-11-1111") && !rendered.contains("888-88-8888"),
+        "unbound identity must not satisfy a positional ?$identity condition; \
+         no SSN may leak, got: {rendered}"
+    );
+}

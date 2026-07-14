@@ -43,6 +43,10 @@ pub mod config_resolver;
 pub mod credential;
 pub mod cross_ledger;
 pub mod csv_import;
+pub mod cypher_import;
+pub(crate) mod cypher_lang;
+mod cypher_procedures;
+pub mod cypher_txn;
 pub mod cypher_write;
 pub mod dataset;
 mod error;
@@ -80,6 +84,7 @@ mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
+pub(crate) mod sparql_lang;
 mod time_resolve;
 pub mod tx;
 pub mod tx_builder;
@@ -159,8 +164,8 @@ pub use ledger_manager::{
 pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
-    AncestorRef, BranchDelta, ConflictDetail, ConflictResolutionPreview, ConflictSummary,
-    MergePreview, MergePreviewOpts,
+    AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
+    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, DEFAULT_MAX_CHANGES,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
@@ -1220,6 +1225,10 @@ fn derive_index_config(config: &ConnectionConfig) -> IndexConfig {
 ///   at compile time.
 /// - **Dynamic build** (`build_client()`) returns `FlureeClient` (type-erased) —
 ///   used when the storage backend is determined at runtime from config.
+///
+/// All `build*` methods (including the synchronous ones) must be called
+/// within a tokio runtime: whenever ledger caching is enabled (the
+/// default), building spawns the local cache event listener task.
 #[derive(Debug, Clone, Default)]
 pub struct FlureeBuilder {
     config: ConnectionConfig,
@@ -1241,6 +1250,11 @@ pub struct FlureeBuilder {
     novelty_thresholds: Option<IndexConfig>,
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
+    /// Externally-supplied event bus. When set, `Fluree` uses this
+    /// instance instead of allocating its own, so external publishers
+    /// and subscribers on `Fluree::event_bus()` share one broadcast
+    /// channel.
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     /// Read-only remote mounts applied at build time (alias-prefixed).
     remote_mounts: Vec<RemoteMountSpec>,
 }
@@ -1323,12 +1337,10 @@ struct RuntimeParts {
 /// `ledger_manager` on every commit / index publish; drops loaded
 /// ledgers on retract.
 ///
-/// `FlureeBuilder::build` calls this with Fluree's internal bus when
-/// indexing is enabled. Deployments that publish commit events on a
-/// separate bus (e.g. raft's `LedgerEventBus`) should call this again
-/// with that bus so cache reconciliation also fires on those events —
-/// otherwise follower nodes only refresh on initial load, and writes
-/// that land between the initial load and the next reload are invisible.
+/// `FlureeBuilder::build` calls this during `finalize_with_backend`
+/// whenever a `LedgerManager` exists. External embedders constructing
+/// `Fluree` via `Fluree::new` bypass the builder and may call this
+/// directly if they want the same cache reconciliation.
 pub fn spawn_local_cache_event_listener(
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     ledger_manager: Arc<LedgerManager>,
@@ -1459,6 +1471,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         }
     }
@@ -1474,6 +1487,7 @@ impl FlureeBuilder {
             indexing_config: None,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         }
     }
@@ -1541,6 +1555,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         }
     }
@@ -1734,6 +1749,7 @@ impl FlureeBuilder {
             indexing_config,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         })
     }
@@ -1871,6 +1887,28 @@ impl FlureeBuilder {
         self
     }
 
+    /// Use a caller-supplied `LedgerEventBus` instead of allocating
+    /// a new one on `build*`.
+    ///
+    /// Every consumer that subscribes via `Fluree::event_bus()`
+    /// (including the cache event listener spawned on build) then
+    /// observes notifications from every publisher wired to the
+    /// supplied bus, with no bridge task between separate instances.
+    pub fn with_event_bus(mut self, bus: Arc<fluree_db_nameservice::LedgerEventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
+    }
+
+    /// Returns the caller-supplied event bus if one was set via
+    /// [`with_event_bus`](Self::with_event_bus), otherwise allocates
+    /// a fresh bus with the historical default capacity. Called from
+    /// every `build_*` path so the override behaviour is uniform.
+    fn resolve_event_bus(&self) -> Arc<fluree_db_nameservice::LedgerEventBus> {
+        self.event_bus
+            .clone()
+            .unwrap_or_else(|| Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)))
+    }
+
     /// Register a remote Fluree connection for SERVICE federation.
     ///
     /// The `name` is used in SPARQL queries as `SERVICE <fluree:remote:name/ledger> { ... }`.
@@ -1919,7 +1957,7 @@ impl FlureeBuilder {
 
         let storage = FileStorage::new(&path);
         let nameservice = FileNameService::new(&path);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let backend = StorageBackend::Managed(Arc::new(storage));
@@ -1956,7 +1994,7 @@ impl FlureeBuilder {
         storage: impl Storage + 'static,
         nameservice: NameServiceMode,
     ) -> Fluree {
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
             self.ledger_cache_config,
@@ -2056,7 +2094,7 @@ impl FlureeBuilder {
         let key_provider = StaticKeyProvider::new(encryption_key);
         let storage = EncryptedStorage::new(file_storage, key_provider);
         let nameservice = FileNameService::new(&path);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let index_config = self.derive_indexing();
@@ -2097,7 +2135,7 @@ impl FlureeBuilder {
     pub fn build_memory(self) -> Fluree {
         let storage = MemoryStorage::new();
         let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
@@ -2131,7 +2169,7 @@ impl FlureeBuilder {
         let key_provider = StaticKeyProvider::new(encryption_key);
         let storage = EncryptedStorage::new(mem_storage, key_provider);
         let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
@@ -2182,7 +2220,7 @@ impl FlureeBuilder {
         });
         let backend = StorageBackend::Permanent(Arc::new(ipfs_store));
         let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2259,7 +2297,7 @@ impl FlureeBuilder {
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2361,7 +2399,7 @@ impl FlureeBuilder {
             .await
             .map_err(|e| ApiError::config(format!("Failed to ensure DynamoDB table: {e}")))?;
 
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(dynamo_ns, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2447,7 +2485,7 @@ impl FlureeBuilder {
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2615,6 +2653,11 @@ impl FlureeBuilder {
         let leaflet_cache = make_leaflet_cache(&config);
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
+        // Register SPARQL lowering hooks for f:sparql policy queries and
+        // datalog rules (idempotent; must precede any policy/rule evaluation).
+        sparql_lang::ensure_sparql_support_registered();
+        cypher_lang::ensure_cypher_support_registered();
+
         let ledger_manager = ledger_cache_config.map(|mut lm_config| {
             if lm_config.leaflet_cache.is_none() {
                 lm_config.leaflet_cache = Some(std::sync::Arc::clone(&leaflet_cache));
@@ -2634,10 +2677,8 @@ impl FlureeBuilder {
             let _ = attachment_provider_cell.set(Arc::clone(mgr));
         }
 
-        if indexing_mode.is_enabled() {
-            if let Some(manager) = &ledger_manager {
-                spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
-            }
+        if let Some(manager) = &ledger_manager {
+            spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
         }
 
         Fluree {
@@ -2728,7 +2769,7 @@ impl FlureeBuilder {
         // Wrap with address identifier routing if configured
         let storage = self.wrap_address_identifiers(base_storage)?;
         let backend = StorageBackend::Managed(storage);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         let attachment_provider_cell = Self::new_attachment_provider_cell();
 
@@ -2796,7 +2837,7 @@ impl FlureeBuilder {
             // Wrap with address identifier routing if configured
             let storage = self.wrap_address_identifiers(base_storage)?;
             let backend = StorageBackend::Managed(storage);
-            let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+            let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
             let attachment_provider_cell = Self::new_attachment_provider_cell();
 
@@ -2863,7 +2904,7 @@ impl FlureeBuilder {
             .wrap_address_identifiers_aws(base_storage, aws_handle.config())
             .await?;
         let backend = StorageBackend::Managed(storage);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         let attachment_provider_cell = Self::new_attachment_provider_cell();
 
@@ -3452,14 +3493,14 @@ impl Fluree {
     /// `docs/concepts/cypher.md` for the surface.
     ///
     /// Context resolution: the ledger's configured `default_context`
-    /// (if any) supplies `@vocab` and bare-identifier overrides.
-    /// A CAS read or parse failure on a configured context
-    /// propagates as an error — writes never silently fall back to
-    /// the built-in vocab when a custom context was specified.
-    /// The built-in fallback (`http://example.org/`) applies only
-    /// when (a) the ledger has no nameservice record yet
-    /// (genesis / pre-commit), or (b) the record exists but no
-    /// `default_context` CID is configured.
+    /// (if any) supplies `@vocab` and bare-identifier overrides
+    /// (RDF-compat mode). A CAS read or parse failure on a configured
+    /// context propagates as an error — writes never silently fall
+    /// back to bare names when a custom context was specified. Bare
+    /// namespace-0 names (the default) apply only when (a) the ledger
+    /// has no nameservice record yet (genesis / pre-commit), or
+    /// (b) the record exists but no `default_context` CID is
+    /// configured.
     pub async fn transact_cypher(
         &self,
         ledger: LedgerState,
@@ -3485,11 +3526,97 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<TransactResult> {
+        Ok(self
+            .transact_cypher_returning(ledger, cypher, params)
+            .await?
+            .0)
+    }
+
+    /// Like [`transact_cypher_with_params`](Self::transact_cypher_with_params)
+    /// but also answers a trailing `RETURN` on the write statement: the second
+    /// tuple element is the Cypher-JSON envelope of the created entities
+    /// (`None` when the statement has no RETURN clause). See
+    /// [`crate::cypher_write::plan_write_return`] for the v1 surface.
+    ///
+    /// ## Scripts
+    ///
+    /// A semicolon-separated script of write statements executes
+    /// sequentially, one commit per statement, matching `cypher-shell`
+    /// autocommit semantics: later statements see earlier ones' effects, a
+    /// failure aborts the remainder but keeps prior commits, and only the
+    /// final statement may carry a `RETURN`. (For atomic multi-statement,
+    /// use an explicit Bolt transaction.) Statement splitting respects
+    /// string literals, backticked identifiers, and comments.
+    pub async fn transact_cypher_returning(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<(TransactResult, Option<serde_json::Value>)> {
+        let statements = crate::cypher_import::split_statements(cypher);
+        if statements.len() > 1 {
+            let mut ledger = ledger;
+            let (last, init) = statements.split_last().expect("len > 1");
+            for (i, stmt) in init.iter().enumerate() {
+                if !crate::cypher_write::cypher_statement_is_write(stmt)? {
+                    return Err(ApiError::cypher(
+                        format!(
+                            "statement {} of the script is a read — a script executes write \
+                             statements; only the final statement may carry a RETURN",
+                            i + 1
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                ledger = self
+                    .transact_cypher_statement(ledger, stmt, params)
+                    .await?
+                    .0
+                    .ledger;
+            }
+            return self.transact_cypher_statement(ledger, last, params).await;
+        }
+        // Single statement (any trailing `;` was consumed by the splitter).
+        let single = statements.first().map_or(cypher, String::as_str);
+        self.transact_cypher_statement(ledger, single, params).await
+    }
+
+    /// Execute exactly one Cypher write statement (the single-commit body of
+    /// [`Self::transact_cypher_returning`]).
+    async fn transact_cypher_statement(
+        &self,
+        ledger: LedgerState,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<(TransactResult, Option<serde_json::Value>)> {
+        // Plan the RETURN from the same parse+substitution the write plan
+        // uses; a Some plan needs a caller-known skolem id so the created
+        // Sids are reconstructible post-commit.
+        let return_plan = {
+            match crate::query::helpers::substituted_cypher_ast(cypher, params) {
+                Ok(ast) => crate::cypher_write::plan_write_return(&ast)
+                    .map_err(|e| ApiError::cypher(e, Vec::new()))?,
+                // Parse errors surface with full diagnostics below.
+                Err(_) => None,
+            }
+        };
+        let skolem_txn_id = return_plan
+            .as_ref()
+            .map(|_| fluree_db_transact::generate_txn_id());
+
         let plan = self
-            .cypher_write_plan(cypher, params, ledger.ledger_id(), &ledger.snapshot)
+            .cypher_write_plan_with_skolem(
+                cypher,
+                params,
+                ledger.ledger_id(),
+                &ledger.snapshot,
+                skolem_txn_id.clone(),
+            )
             .await?;
-        let txn = match plan {
-            crate::cypher_write::WritePlan::Single(txn) => *txn,
+        let resolved = match plan {
+            crate::cypher_write::WritePlan::Single(txn) => {
+                crate::cypher_write::ResolvedConditional::single(*txn)
+            }
             crate::cypher_write::WritePlan::Conditional(cw) => {
                 // Unwrapped probe: this method has no policy. See the method doc.
                 let probe = GraphDb::from_ledger_state(&ledger);
@@ -3497,7 +3624,19 @@ impl Fluree {
                     .await?
             }
         };
-        self.stage_owned(ledger).txn(txn).execute().await
+        let mut builder = self.stage_owned(ledger).txn(resolved.primary);
+        if let Some(followup) = resolved.followup {
+            builder = builder.txn_followup(followup);
+        }
+        let result = builder.execute().await?;
+
+        let rows = match (&return_plan, &skolem_txn_id) {
+            (Some(plan), Some(id)) => {
+                Some(crate::cypher_write::write_return_rows(plan, id, &result.ledger).await?)
+            }
+            _ => None,
+        };
+        Ok((result, rows))
     }
 
     /// Parse + param-substitute a Cypher write and classify it as a single
@@ -3509,29 +3648,37 @@ impl Fluree {
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
     ) -> Result<crate::cypher_write::WritePlan> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
+        self.cypher_write_plan_with_skolem(cypher, params, ledger_id, snapshot, None)
+            .await
+    }
+
+    /// [`cypher_write_plan`](Self::cypher_write_plan) with a caller-supplied
+    /// skolemization id (`TxnOpts::skolem_txn_id`), which makes the write's
+    /// created-entity Sids reconstructible — the mechanism behind
+    /// `CREATE … RETURN n` (see [`crate::cypher_write::write_return_rows`]).
+    pub async fn cypher_write_plan_with_skolem(
+        &self,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        skolem_txn_id: Option<String>,
+    ) -> Result<crate::cypher_write::WritePlan> {
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
+
+        // Validate a trailing RETURN up front (lowering ignores it): the v1
+        // surface is bare created-entity variables, and it never combines with
+        // the conditional (probe-based) shapes.
+        crate::cypher_write::plan_write_return(&ast)
+            .map_err(|e| ApiError::cypher(e, Vec::new()))?;
 
         if let Some(cw) = crate::cypher_write::detect_conditional(&ast) {
             return Ok(crate::cypher_write::WritePlan::Conditional(Box::new(cw)));
         }
-        let txn = self
+        let mut txn = self
             .lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await?;
+        txn.opts.skolem_txn_id = skolem_txn_id;
         Ok(crate::cypher_write::WritePlan::Single(Box::new(txn)))
     }
 
@@ -3553,8 +3700,9 @@ impl Fluree {
         probe_view: GraphDb,
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
-    ) -> Result<fluree_db_transact::ir::Txn> {
+    ) -> Result<crate::cypher_write::ResolvedConditional> {
         use crate::cypher_write::ConditionalCypherWrite;
+        use crate::cypher_write::ResolvedConditional;
         // Attach the ledger's default context so the probe resolves bare
         // identifiers the same way the write does.
         let default_context = match self.get_default_context(ledger_id).await {
@@ -3565,28 +3713,72 @@ impl Fluree {
         let probe_view = probe_view.with_default_context(default_context);
 
         match cw {
-            ConditionalCypherWrite::MergeOnMatch(merge) => {
-                let node = &merge.pattern.parts[0].head;
-                // ON MATCH SET references the MERGE variable, so the node needs one.
-                if node.var.is_none() {
-                    return Err(ApiError::cypher(
-                        "MERGE … ON MATCH SET requires a node variable".to_string(),
-                        Vec::new(),
-                    ));
-                }
-                let probe = crate::cypher_write::build_merge_probe_ast(node);
+            ConditionalCypherWrite::MergeSet { merge, trailing } => {
+                let part = &merge.pattern.parts[0];
+                let probe = if part.tail.is_empty() {
+                    // The SET items reference the MERGE variable, so the node
+                    // needs one.
+                    if part.head.var.is_none() {
+                        return Err(ApiError::cypher(
+                            "MERGE with ON MATCH SET or a trailing SET requires a node variable"
+                                .to_string(),
+                            Vec::new(),
+                        ));
+                    }
+                    crate::cypher_write::build_merge_probe_ast(&part.head)
+                } else {
+                    crate::cypher_write::build_merge_path_probe_ast(merge)
+                };
                 let exists = self
                     .query_cypher_ast(&probe_view, &probe)
                     .await?
                     .row_count()
                     > 0;
                 let ast = if exists {
-                    crate::cypher_write::build_on_match_ast(merge)
+                    crate::cypher_write::build_on_match_ast(merge, trailing)
                 } else {
-                    crate::cypher_write::build_create_ast(merge)
+                    crate::cypher_write::build_create_ast(merge, trailing)
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
+            }
+            ConditionalCypherWrite::MergePerRowSet(update) => {
+                // Per-row find-or-create (relationship, or an UNWIND-batch node
+                // upsert) with an ON MATCH / trailing SET. Decompose into two
+                // branches over the same leading rows, staged into one commit:
+                // the ON MATCH SET over already-existing edges/nodes FIRST (it
+                // only mutates properties, never existence), then the create
+                // branch over the absent rows (its NOT EXISTS guard is thus
+                // unaffected by the first branch). No probe needed — each branch's
+                // guard partitions the rows.
+                let merge = update
+                    .write_clauses
+                    .iter()
+                    .find_map(|w| match w {
+                        fluree_db_cypher::ast::WriteClause::Merge(m) => Some(m),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        ApiError::cypher(
+                            "per-row MERGE plan has no MERGE clause".to_string(),
+                            Vec::new(),
+                        )
+                    })?;
+                let on_match_ast =
+                    crate::cypher_write::build_merge_per_row_on_match_ast(update, merge);
+                let create_ast = crate::cypher_write::build_merge_per_row_create_ast(update);
+                let primary = self
+                    .lower_cypher_ast_to_txn(&on_match_ast, ledger_id, snapshot)
+                    .await?;
+                let followup = self
+                    .lower_cypher_ast_to_txn(&create_ast, ledger_id, snapshot)
+                    .await?;
+                Ok(ResolvedConditional {
+                    primary,
+                    followup: Some(followup),
+                })
             }
             ConditionalCypherWrite::DeleteNode(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3628,8 +3820,10 @@ impl Fluree {
                 // No relationships → the node retraction is identical to
                 // DETACH DELETE.
                 let ast = crate::cypher_write::build_detach_delete_ast(update);
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
             }
             ConditionalCypherWrite::DeleteRel(update) => {
                 let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
@@ -3682,8 +3876,10 @@ impl Fluree {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,
                 };
-                self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
-                    .await
+                Ok(ResolvedConditional::single(
+                    self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
+                        .await?,
+                ))
             }
         }
     }
@@ -3703,6 +3899,8 @@ impl Fluree {
             &probe_ast,
             &probe_view.snapshot,
             probe_view.default_context.as_ref(),
+            Some((&*probe_view.overlay, probe_view.graph_id)),
+            probe_view.policy_enforcer().map(|e| &**e),
         )?;
 
         let target_var = vars.get(&target.name).ok_or_else(|| {
@@ -3787,27 +3985,7 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<fluree_db_transact::ir::Txn> {
-        let out = fluree_db_cypher::parse_cypher(cypher);
-        if out.has_errors() {
-            let msg = out
-                .diagnostics
-                .iter()
-                .map(|d| format!("{}: {}", d.code, d.message))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(ApiError::cypher(msg, out.diagnostics));
-        }
-        let mut ast = out
-            .ast
-            .ok_or_else(|| ApiError::cypher("Cypher parse returned no AST", Vec::new()))?;
-
-        // Substitute `$param` references before lowering. Always run (empty
-        // map when no params were supplied) so an unfilled `$param` reports a
-        // clear missing-parameter error.
-        let empty = fluree_db_cypher::ParamMap::new();
-        fluree_db_cypher::substitute_params(&mut ast, params.unwrap_or(&empty))
-            .map_err(|e| ApiError::cypher(e.to_string(), Vec::new()))?;
-
+        let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
         self.lower_cypher_ast_to_txn(&ast, ledger_id, snapshot)
             .await
     }
@@ -3826,8 +4004,9 @@ impl Fluree {
         // write Cypher resolves bare identifiers the same way `query_cypher`
         // does. `Ok(None)` (no default_context configured) and
         // `Err(NotFound)` (genesis / no nameservice record yet) both mean "no
-        // context"; every other error propagates so writes never silently land
-        // under the built-in vocab when a custom context couldn't be loaded.
+        // context" (bare namespace-0 names); every other error propagates so
+        // writes never silently land under bare names when a custom context
+        // couldn't be loaded.
         let default_context = match self.get_default_context(ledger_id).await {
             Ok(ctx) => ctx,
             Err(ApiError::NotFound(_)) => None,
@@ -3835,10 +4014,8 @@ impl Fluree {
         };
         let (vocab, overrides) =
             crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
-        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
-            vocab: Some(vocab),
-            overrides,
-        };
+        let cypher_opts =
+            fluree_db_transact::lower_cypher_update::CypherLowerOpts { vocab, overrides };
 
         let mut ns = NamespaceRegistry::from_db(snapshot);
         Ok(
@@ -4548,18 +4725,16 @@ pub fn fluree_memory() -> Fluree {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_fluree_builder_memory() {
+    #[tokio::test]
+    async fn test_fluree_builder_memory() {
         let fluree = FlureeBuilder::memory().cache_max_mb(500).build_memory();
 
         assert_eq!(fluree.config.cache.max_mb, 500);
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "native")]
-    fn test_fluree_builder_file() {
-        // `without_indexing()` keeps this a plain `#[test]` — the default
-        // background indexer would require a tokio runtime.
+    async fn test_fluree_builder_file() {
         let result = FlureeBuilder::file("/tmp/test")
             .without_indexing()
             .parallelism(8)
@@ -4578,8 +4753,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_fluree_memory_convenience() {
+    #[tokio::test]
+    async fn test_fluree_memory_convenience() {
         let _fluree = fluree_memory();
     }
 
@@ -4587,8 +4762,8 @@ mod tests {
     // IndexConfig propagation tests (commit e6d0044)
     // ========================================================================
 
-    #[test]
-    fn test_default_index_config_returns_defaults_without_thresholds() {
+    #[tokio::test]
+    async fn test_default_index_config_returns_defaults_without_thresholds() {
         let fluree = FlureeBuilder::memory().build_memory();
         let cfg = fluree.default_index_config();
         let expected = server_defaults::default_index_config();
@@ -4596,8 +4771,8 @@ mod tests {
         assert_eq!(cfg.reindex_max_bytes, expected.reindex_max_bytes);
     }
 
-    #[test]
-    fn test_with_indexing_thresholds_propagates_to_default_index_config() {
+    #[tokio::test]
+    async fn test_with_indexing_thresholds_propagates_to_default_index_config() {
         // This is the exact scenario that was broken before e6d0044:
         // custom thresholds set via the builder were silently dropped.
         let fluree = FlureeBuilder::memory()
@@ -5008,9 +5183,9 @@ mod tests {
             .unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "ipfs")]
-    fn test_build_ipfs_constructs_fluree() {
+    async fn test_build_ipfs_constructs_fluree() {
         // No real Kubo node needed — this only verifies the type plumbing.
         let fluree = FlureeBuilder::memory().build_ipfs("http://127.0.0.1:5001");
         // Backend should be Permanent (IPFS), not Managed.

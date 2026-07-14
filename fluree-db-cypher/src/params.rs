@@ -22,6 +22,12 @@ use crate::span::SourceSpan;
 /// Map of parameter name → JSON value, as supplied in the request envelope.
 pub type ParamMap = serde_json::Map<String, JsonValue>;
 
+/// Reserved `MapLit` entry key marking a whole-map parameter in `SET n = $p` /
+/// `SET n += $p` (see `parse::stmt::parse_set_map`). Map keys parse as
+/// identifiers, so an empty key cannot occur in real input; substitution
+/// expands the entry into one entry per key of the object param.
+pub(crate) const WHOLE_MAP_PARAM_KEY: &str = "";
+
 /// Error raised while substituting `$param` references.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParamError {
@@ -50,13 +56,332 @@ impl std::error::Error for ParamError {}
 /// from `params`. No-op when `params` is empty (but still errors if the query
 /// references a `$param` that isn't supplied).
 pub fn substitute_params(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    // A constant inline UNWIND source on a write statement (`UNWIND
+    // range(1, 100) AS x`, `UNWIND [1, 2, 3] AS x`) folds into a synthetic
+    // list parameter so the `$param` desugars below apply unchanged.
+    let augmented = inline_constant_unwind(ast, params)?;
+    let params = augmented.as_ref().unwrap_or(params);
     // Compile-time unroll of `UNWIND $list AS row CREATE (...)` (pure node
     // batch) and the VALUES desugaring of `UNWIND $list AS row MATCH … CREATE`
     // (batched edge insert) both run first, so the generic substitution below
     // never sees the list-of-maps parameter it would otherwise reject.
     expand_unwind_create(ast, params)?;
     expand_unwind_match(ast, params)?;
+    expand_foreach(ast, params)?;
     subst_statement(&mut ast.statement, params)
+}
+
+/// Unroll `FOREACH (x IN <constant list> | <writes>)` into repeated write
+/// clauses with `x` substituted per element. Constant lists are inline
+/// literal lists, `range()` over integer literals, and `$param` arrays —
+/// runtime lists (e.g. a collected list) are deferred with a clear error.
+/// Body CREATE variables are freshened per element (each iteration creates
+/// distinct nodes), except variables bound by the statement's read clauses,
+/// which keep referring to the matched entities.
+fn expand_foreach(ast: &mut CypherAst, params: &ParamMap) -> Result<(), ParamError> {
+    let Statement::Update(u) = &mut ast.statement else {
+        return Ok(());
+    };
+    if !u
+        .write_clauses
+        .iter()
+        .any(|w| matches!(w, WriteClause::Foreach(_)))
+    {
+        return Ok(());
+    }
+
+    // Variables bound by MATCH / UNWIND read clauses keep their names inside
+    // unrolled CREATE bodies (they reference the matched entities).
+    let mut read_bound: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in &u.read_clauses {
+        match c {
+            ReadClause::Match(m) | ReadClause::OptionalMatch(m) => {
+                for part in &m.pattern.parts {
+                    if let Some(v) = &part.head.var {
+                        read_bound.insert(v.name.clone());
+                    }
+                    for (rel, node) in &part.tail {
+                        if let Some(v) = &rel.var {
+                            read_bound.insert(v.name.clone());
+                        }
+                        if let Some(v) = &node.var {
+                            read_bound.insert(v.name.clone());
+                        }
+                    }
+                }
+            }
+            ReadClause::Unwind(uw) => {
+                read_bound.insert(uw.alias.name.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let clauses = std::mem::take(&mut u.write_clauses);
+    let mut out = Vec::with_capacity(clauses.len());
+    let mut anon = 0u32;
+    let mut iteration = 0usize;
+    for w in clauses {
+        match w {
+            WriteClause::Foreach(f) => {
+                unroll_foreach(&f, params, &read_bound, &mut out, &mut anon, &mut iteration)?;
+            }
+            other => out.push(other),
+        }
+    }
+    u.write_clauses = out;
+    Ok(())
+}
+
+fn unroll_foreach(
+    f: &crate::ast::ForeachClause,
+    params: &ParamMap,
+    read_bound: &std::collections::HashSet<String>,
+    out: &mut Vec<WriteClause>,
+    anon: &mut u32,
+    iteration: &mut usize,
+) -> Result<(), ParamError> {
+    let alias = f.var.name.as_str();
+    let elems: Vec<JsonValue> = if let Expr::Param(p) = &f.list {
+        match params.get(&p.name) {
+            Some(JsonValue::Array(a)) => a.clone(),
+            Some(_) => {
+                return Err(unsupported_param(
+                    &p.name,
+                    "FOREACH parameter must be a list",
+                ))
+            }
+            None => return Err(ParamError::Missing(p.name.clone())),
+        }
+    } else if let Some(v) = const_list_value(&f.list)? {
+        v
+    } else {
+        return Err(unsupported_param(
+            alias,
+            "FOREACH iterates an inline literal list, a constant range(), or a `$param` \
+             list in v1 — runtime lists (e.g. a collected list) are deferred",
+        ));
+    };
+
+    let mut produced: Vec<WriteClause> = Vec::new();
+    for elem in &elems {
+        *iteration += 1;
+        if *iteration > MAX_INLINE_UNWIND_ROWS {
+            return Err(unsupported_param(
+                alias,
+                "FOREACH unrolling is capped at 10000 iterations — batch via `UNWIND $param`",
+            ));
+        }
+        for clause in &f.body {
+            match clause {
+                WriteClause::Create(c) => {
+                    let mut c = c.clone();
+                    replace_alias_in_pattern(&mut c.pattern, alias, elem, alias)?;
+                    rename_unbound_pattern_vars(&mut c.pattern, *iteration, anon, read_bound);
+                    produced.push(WriteClause::Create(c));
+                }
+                WriteClause::Set(s) => {
+                    let mut s = s.clone();
+                    for item in &mut s.items {
+                        replace_alias_in_set_item_value(item, alias, elem)?;
+                    }
+                    produced.push(WriteClause::Set(s));
+                }
+                WriteClause::Remove(r) => produced.push(WriteClause::Remove(r.clone())),
+                WriteClause::Merge(_) | WriteClause::Delete(_) | WriteClause::Foreach(_) => {
+                    return Err(unsupported_param(
+                        alias,
+                        "FOREACH bodies support CREATE / SET / REMOVE in v1 — MERGE, DELETE, \
+                         and nested FOREACH are deferred",
+                    ));
+                }
+            }
+        }
+    }
+    dedupe_last_wins_sets(&mut produced);
+    out.append(&mut produced);
+    Ok(())
+}
+
+/// Cypher FOREACH iterations apply *sequentially*, so a `SET n.p = x` body
+/// leaves the LAST element's value on the property. The unrolled clauses
+/// execute as one transaction against the pre-write state, which would
+/// multi-value the property instead — keep only the last unrolled SET item
+/// per (target, property) shape.
+fn dedupe_last_wins_sets(clauses: &mut Vec<WriteClause>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for clause in clauses.iter_mut().rev() {
+        let WriteClause::Set(s) = clause else {
+            continue;
+        };
+        s.items.retain(|item| {
+            let key = match item {
+                SetItem::Property {
+                    target, property, ..
+                } => format!("p\u{0}{}\u{0}{property}", target.name),
+                SetItem::MapReplace { target, .. } => format!("r\u{0}{}", target.name),
+                SetItem::MapMerge { target, map } => {
+                    let keys: Vec<&str> = map.entries.iter().map(|(k, _)| k.as_str()).collect();
+                    format!("m\u{0}{}\u{0}{}", target.name, keys.join("\u{0}"))
+                }
+                SetItem::Labels { target, labels } => {
+                    format!("l\u{0}{}\u{0}{labels:?}", target.name)
+                }
+            };
+            seen.insert(key)
+        });
+    }
+    clauses.retain(|c| !matches!(c, WriteClause::Set(s) if s.items.is_empty()));
+}
+
+/// Substitute the FOREACH element into a SET item's value expressions.
+fn replace_alias_in_set_item_value(
+    s: &mut SetItem,
+    alias: &str,
+    elem: &JsonValue,
+) -> Result<(), ParamError> {
+    match s {
+        SetItem::Property { value, .. } => replace_alias_in_expr(value, alias, elem, alias),
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => {
+            replace_alias_in_maplit(map, alias, elem, alias)
+        }
+        SetItem::Labels { .. } => Ok(()),
+    }
+}
+
+/// Freshen the CREATE pattern's variables per FOREACH iteration so each
+/// element creates distinct nodes — except read-clause-bound variables,
+/// which keep referring to the matched entities. Mirrors
+/// [`rename_pattern_vars`] with an exclusion set.
+fn rename_unbound_pattern_vars(
+    pat: &mut Pattern,
+    row: usize,
+    anon: &mut u32,
+    bound: &std::collections::HashSet<String>,
+) {
+    let mut rename_node = |n: &mut NodePattern| match &mut n.var {
+        Some(v) if !bound.contains(&v.name) => v.name = format!("{}__cyfe{}", v.name, row),
+        Some(_) => {}
+        None => {
+            let name = format!("__cyfeanon{anon}__cyfe{row}");
+            *anon += 1;
+            n.var = Some(Variable { name, span: n.span });
+        }
+    };
+    for part in &mut pat.parts {
+        rename_node(&mut part.head);
+        for (rel, node) in &mut part.tail {
+            if let Some(v) = &mut rel.var {
+                if !bound.contains(&v.name) {
+                    v.name = format!("{}__cyfe{}", v.name, row);
+                }
+            }
+            rename_node(node);
+        }
+    }
+}
+
+/// Upper bound on rows a constant inline `UNWIND` may expand to on the write
+/// path (each row unrolls to its own CREATE / VALUES row).
+const MAX_INLINE_UNWIND_ROWS: usize = 10_000;
+
+/// Rewrite `UNWIND <constant list> AS x` on a *write* statement into
+/// `UNWIND $#__cy_inline_unwind_N AS x` with the value synthesized into a
+/// cloned params map. Supports inline list literals of scalars and `range()`
+/// with integer literal arguments. Read-path UNWIND evaluates natively and is
+/// left alone; non-constant sources fall through to the generic rejection.
+fn inline_constant_unwind(
+    ast: &mut CypherAst,
+    params: &ParamMap,
+) -> Result<Option<ParamMap>, ParamError> {
+    let Statement::Update(u) = &mut ast.statement else {
+        return Ok(None);
+    };
+    let mut augmented: Option<ParamMap> = None;
+    for (i, c) in u.read_clauses.iter_mut().enumerate() {
+        let ReadClause::Unwind(uw) = c else { continue };
+        if matches!(uw.expr, Expr::Param(_)) {
+            continue;
+        }
+        let Some(values) = const_list_value(&uw.expr)? else {
+            continue;
+        };
+        // `#` can't appear in a user Cypher identifier, so this name can't be
+        // referenced from the query text.
+        let name = format!("#__cy_inline_unwind_{i}");
+        augmented
+            .get_or_insert_with(|| params.clone())
+            .insert(name.clone(), JsonValue::Array(values));
+        uw.expr = Expr::Param(crate::ast::ParamRef {
+            name,
+            span: uw.span,
+        });
+    }
+    Ok(augmented)
+}
+
+/// Evaluate a constant list expression to JSON values: a list literal of
+/// scalar literals, or `range(start, end[, step])` over integer literals
+/// (inclusive bounds, Cypher semantics). Returns `None` for anything else.
+fn const_list_value(e: &Expr) -> Result<Option<Vec<JsonValue>>, ParamError> {
+    match e {
+        Expr::List(items, _) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let Expr::Lit(lit) = item else {
+                    return Ok(None);
+                };
+                out.push(lit_to_json(lit));
+            }
+            Ok(Some(out))
+        }
+        Expr::Call(call) if call.name.eq_ignore_ascii_case("range") => {
+            let ints: Option<Vec<i64>> = call
+                .args
+                .iter()
+                .map(|a| match a {
+                    Expr::Lit(Literal::Integer(n, _)) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            let (start, end, step) = match ints.as_deref() {
+                Some([s, e]) => (*s, *e, 1i64),
+                Some([s, e, st]) => (*s, *e, *st),
+                _ => return Ok(None),
+            };
+            if step == 0 {
+                return Err(unsupported_param("range", "range() step must be non-zero"));
+            }
+            let mut out = Vec::new();
+            let mut v = start;
+            while (step > 0 && v <= end) || (step < 0 && v >= end) {
+                out.push(JsonValue::from(v));
+                if out.len() > MAX_INLINE_UNWIND_ROWS {
+                    return Err(unsupported_param(
+                        "range",
+                        "inline UNWIND range() on a write is capped at 10000 rows — \
+                         batch via a `$param` list instead",
+                    ));
+                }
+                let Some(next) = v.checked_add(step) else {
+                    break;
+                };
+                v = next;
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lit_to_json(lit: &Literal) -> JsonValue {
+    match lit {
+        Literal::Integer(n, _) => JsonValue::from(*n),
+        Literal::Float(f, _) => JsonValue::from(*f),
+        Literal::String(s, _) => JsonValue::from(s.as_str()),
+        Literal::Bool(b, _) => JsonValue::from(*b),
+        Literal::Null(_) => JsonValue::Null,
+    }
 }
 
 fn unsupported_param(name: &str, reason: &str) -> ParamError {
@@ -160,20 +485,27 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
         let Some(found) = found else {
             return Ok(());
         };
-        // The edge-batch desugar needs a *mandatory* MATCH — its endpoints feed
-        // a CREATE, and an OPTIONAL (possibly-unbound) endpoint could assert a
-        // partial reifier bundle. An OPTIONAL-only body is rejected; no match at
-        // all means this isn't the edge case (handled by `expand_unwind_create`
-        // or left to the generic path).
+        // This desugar fires for the batched **edge** insert (MATCH endpoints →
+        // CREATE) and the batched **node upsert** (`UNWIND $rows AS row MERGE
+        // (n {id: row.id}) …`). Both need per-row independence — the edge's
+        // endpoints come from a mandatory MATCH; the node upsert's per-row
+        // NOT EXISTS guard comes from the MERGE. Either qualifies. An
+        // OPTIONAL-only body (no mandatory MATCH, no MERGE) is rejected; no
+        // trigger at all leaves this to `expand_unwind_create` / the generic
+        // path.
         let has_mandatory = u
             .read_clauses
             .iter()
             .any(|c| matches!(c, ReadClause::Match(_)));
+        let has_merge = u
+            .write_clauses
+            .iter()
+            .any(|w| matches!(w, WriteClause::Merge(_)));
         let has_optional = u
             .read_clauses
             .iter()
             .any(|c| matches!(c, ReadClause::OptionalMatch(_)));
-        if !has_mandatory {
+        if !has_mandatory && !has_merge {
             if has_optional {
                 return Err(unsupported_param(
                     &found.2,
@@ -192,6 +524,23 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
     let JsonValue::Array(elems) = val else {
         return Err(unsupported_param(&pname, "UNWIND parameter must be a list"));
     };
+
+    // A per-row node MERGE keyed on `row.<field>` lowers to one NOT EXISTS
+    // guard evaluated per row against the same pre-write snapshot: two rows
+    // in this batch sharing a not-yet-existing key would both pass the guard
+    // and both create, silently duplicating the "unique" key. Neo4j's
+    // sequential LOAD CSV doesn't have this problem (each row's write is
+    // visible to the next row's guard); a vectorized batch is, so dedup by
+    // the MERGE identity key here — last row per key wins — to converge on
+    // the same end state sequential execution would reach.
+    let identity_fields = {
+        let Statement::Update(u) = &ast.statement else {
+            unreachable!("checked above");
+        };
+        merge_identity_fields(u, &alias)
+    };
+    let elems = dedup_rows_by_merge_identity(elems, &identity_fields);
+    let elems = &elems;
 
     // Which fields of `row` are referenced, and is the bare alias used?
     let (fields, bare_used) = {
@@ -278,6 +627,70 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
     Ok(())
 }
 
+/// Field names of `row` used in a single-node MERGE's identifying prop map
+/// (e.g. `MERGE (n:Person {id: row.id})` → `["id"]`). Empty when there's no
+/// per-row node MERGE, or its identifying props don't reference `row.field`
+/// directly (a computed key can't be deduped this way, so it's left alone).
+fn merge_identity_fields(u: &Update, alias: &str) -> Vec<String> {
+    for w in &u.write_clauses {
+        let WriteClause::Merge(m) = w else { continue };
+        if m.pattern.parts.len() != 1 {
+            continue;
+        }
+        let part = &m.pattern.parts[0];
+        if !part.tail.is_empty() {
+            continue;
+        }
+        let Some(props) = &part.head.props else {
+            continue;
+        };
+        return props
+            .entries
+            .iter()
+            .filter_map(|(_, expr)| match expr {
+                Expr::Prop(inner, field, _) if matches!(&**inner, Expr::Var(v) if v.name == alias) => {
+                    Some(field.clone())
+                }
+                _ => None,
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Dedup `UNWIND $batch` elements by the MERGE identity key fields (last row
+/// per key wins), so a within-batch duplicate key produces one create/update
+/// instead of two. A no-op when `identity_fields` is empty or an element
+/// isn't a map — the existing per-row type checks raise the real error for
+/// the latter.
+fn dedup_rows_by_merge_identity(elems: &[JsonValue], identity_fields: &[String]) -> Vec<JsonValue> {
+    if identity_fields.is_empty() {
+        return elems.to_vec();
+    }
+    let mut last_idx: std::collections::HashMap<Vec<String>, usize> =
+        std::collections::HashMap::new();
+    for (i, elem) in elems.iter().enumerate() {
+        let JsonValue::Object(map) = elem else {
+            return elems.to_vec();
+        };
+        let key: Vec<String> = identity_fields
+            .iter()
+            .map(|f| map.get(f).cloned().unwrap_or(JsonValue::Null).to_string())
+            .collect();
+        last_idx.insert(key, i);
+    }
+    if last_idx.len() == elems.len() {
+        return elems.to_vec();
+    }
+    let keep: std::collections::HashSet<usize> = last_idx.into_values().collect();
+    elems
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, e)| e.clone())
+        .collect()
+}
+
 // ---- alias collection (which `row.field`s are referenced) -------------------
 
 fn collect_alias_in_update(
@@ -313,6 +726,46 @@ fn collect_alias_in_update(
                 }
             }
             WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+            WriteClause::Foreach(f) => {
+                collect_alias_in_expr(&f.list, alias, fields, bare);
+                if f.var.name != alias {
+                    for inner in &f.body {
+                        collect_alias_in_write_clause(inner, alias, fields, bare);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FOREACH-body recursion for [`collect_alias_in_update`].
+fn collect_alias_in_write_clause(
+    w: &WriteClause,
+    alias: &str,
+    fields: &mut Vec<String>,
+    bare: &mut bool,
+) {
+    match w {
+        WriteClause::Create(c) => collect_alias_in_pattern(&c.pattern, alias, fields, bare),
+        WriteClause::Merge(m) => {
+            collect_alias_in_pattern(&m.pattern, alias, fields, bare);
+            for s in m.on_create.iter().chain(&m.on_match) {
+                collect_alias_in_set_item(s, alias, fields, bare);
+            }
+        }
+        WriteClause::Set(s) => {
+            for it in &s.items {
+                collect_alias_in_set_item(it, alias, fields, bare);
+            }
+        }
+        WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+        WriteClause::Foreach(f) => {
+            collect_alias_in_expr(&f.list, alias, fields, bare);
+            if f.var.name != alias {
+                for inner in &f.body {
+                    collect_alias_in_write_clause(inner, alias, fields, bare);
+                }
+            }
         }
     }
 }
@@ -494,6 +947,48 @@ fn rewrite_alias_in_update<F: Fn(&str) -> String>(
                 }
             }
             WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+            WriteClause::Foreach(f) => {
+                rewrite_alias_in_expr_to_var(&mut f.list, alias, col_var, bare_var);
+                if f.var.name != alias {
+                    for inner in &mut f.body {
+                        rewrite_alias_in_write_clause(inner, alias, col_var, bare_var);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// FOREACH-body recursion for [`rewrite_alias_in_update`].
+fn rewrite_alias_in_write_clause<F: Fn(&str) -> String>(
+    w: &mut WriteClause,
+    alias: &str,
+    col_var: &F,
+    bare_var: Option<&str>,
+) {
+    match w {
+        WriteClause::Create(c) => {
+            rewrite_alias_in_pattern(&mut c.pattern, alias, col_var, bare_var);
+        }
+        WriteClause::Merge(m) => {
+            rewrite_alias_in_pattern(&mut m.pattern, alias, col_var, bare_var);
+            for s in m.on_create.iter_mut().chain(&mut m.on_match) {
+                rewrite_alias_in_set_item(s, alias, col_var, bare_var);
+            }
+        }
+        WriteClause::Set(s) => {
+            for it in &mut s.items {
+                rewrite_alias_in_set_item(it, alias, col_var, bare_var);
+            }
+        }
+        WriteClause::Remove(_) | WriteClause::Delete(_) => {}
+        WriteClause::Foreach(f) => {
+            rewrite_alias_in_expr_to_var(&mut f.list, alias, col_var, bare_var);
+            if f.var.name != alias {
+                for inner in &mut f.body {
+                    rewrite_alias_in_write_clause(inner, alias, col_var, bare_var);
+                }
+            }
         }
     }
 }
@@ -876,6 +1371,23 @@ fn subst_statement(s: &mut Statement, p: &ParamMap) -> Result<(), ParamError> {
     match s {
         Statement::Query(q) => subst_query(q, p),
         Statement::Update(u) => subst_update(u, p),
+        // A schema no-op carries no expressions.
+        Statement::Schema(_) => Ok(()),
+        Statement::CallProcedure(call) => {
+            for a in &mut call.args {
+                subst_expr(a, p)?;
+            }
+            if let Some(w) = &mut call.where_clause {
+                subst_expr(w, p)?;
+            }
+            for c in &mut call.rest {
+                subst_read_clause(c, p)?;
+            }
+            if let Some(r) = &mut call.return_clause {
+                subst_return(r, p)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -973,15 +1485,50 @@ fn subst_write_clause(w: &mut WriteClause, p: &ParamMap) -> Result<(), ParamErro
             Ok(())
         }
         WriteClause::Remove(_) | WriteClause::Delete(_) => Ok(()),
+        WriteClause::Foreach(f) => {
+            subst_expr(&mut f.list, p)?;
+            for inner in &mut f.body {
+                subst_write_clause(inner, p)?;
+            }
+            Ok(())
+        }
     }
 }
 
 fn subst_set_item(s: &mut SetItem, p: &ParamMap) -> Result<(), ParamError> {
     match s {
         SetItem::Property { value, .. } => subst_expr(value, p),
-        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => subst_maplit(map, p),
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => subst_set_map(map, p),
         SetItem::Labels { .. } => Ok(()),
     }
+}
+
+/// Substitute the map side of a `SET n = …` / `SET n += …`. A whole-map
+/// parameter (`SET n += $props`, parsed as a single entry under
+/// [`WHOLE_MAP_PARAM_KEY`]) expands into one entry per key of the object
+/// param; an inline map literal substitutes its entry values as usual.
+fn subst_set_map(map: &mut MapLit, p: &ParamMap) -> Result<(), ParamError> {
+    if let [(key, Expr::Param(pref))] = map.entries.as_slice() {
+        if key == WHOLE_MAP_PARAM_KEY {
+            let val = p
+                .get(&pref.name)
+                .ok_or_else(|| ParamError::Missing(pref.name.clone()))?;
+            let JsonValue::Object(obj) = val else {
+                return Err(ParamError::Unsupported {
+                    name: pref.name.clone(),
+                    reason: "`SET … = $param` / `SET … += $param` needs an object (map) value"
+                        .to_string(),
+                });
+            };
+            let (name, span) = (pref.name.clone(), pref.span);
+            map.entries = obj
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), json_to_expr(v, &name, span)?)))
+                .collect::<Result<Vec<_>, ParamError>>()?;
+            return Ok(());
+        }
+    }
+    subst_maplit(map, p)
 }
 
 fn subst_pattern(pat: &mut Pattern, p: &ParamMap) -> Result<(), ParamError> {

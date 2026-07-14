@@ -20,8 +20,8 @@ use fluree_db_core::{FlakeValue, GraphDbRef, IndexType, LedgerSnapshot, Sid};
 use fluree_db_core::{RangeMatch, RangeOptions, RangeTest};
 use fluree_db_novelty::{Novelty, StatsAssemblyError, StatsLookup};
 use fluree_db_policy::{
-    build_policy_set, PolicyAction, PolicyContext, PolicyQuery, PolicyRestriction, PolicyValue,
-    PolicyWrapper, TargetMode,
+    build_policy_set, ConditionState, PolicyAction, PolicyContext, PolicyQuery,
+    PolicyQueryLanguage, PolicyRestriction, PolicyValue, PolicyWrapper, TargetMode, WriteVerbs,
 };
 use fluree_db_query::{execute_pattern, Binding, Ref, Term, TriplePattern, VarRegistry};
 use fluree_vocab::rdf::TYPE as RDF_TYPE_IRI;
@@ -99,7 +99,8 @@ pub fn resolve_policy_source_g_ids(
 /// 2. **policy_class**: Query for policies of the given class types
 /// 3. **policy**: Parse inline policy JSON-LD
 ///
-/// Priority: identity > policy_class > policy
+/// Priority: (identity + policy_class: classes select, identity binds) >
+/// identity > policy_class > policy
 ///
 /// # Arguments
 ///
@@ -257,9 +258,12 @@ async fn build_policy_context_from_opts_inner(
     // when we have a concrete SID), not for gating access — `opts.default_allow`
     // governs in all three cases.
     //
-    // Priority: cross-ledger restrictions > identity > policy_class > policy >
-    // policy_values["?$identity"]
-    let (identity_sid, restrictions) = if let Some(mut merged) = cross_ledger_restrictions {
+    // Stored-policy selection priority: cross-ledger restrictions >
+    // identity + policy_class (classes select, identity binds) > identity >
+    // policy_class. Inline `opts.policy` is not part of the chain — it merges
+    // additively after selection.
+    // `?$identity` binding priority: identity > policy_values["?$identity"].
+    let (identity_sid, mut restrictions) = if let Some(merged) = cross_ledger_restrictions {
         // Cross-ledger short-circuit: the resolver already materialized
         // restrictions from the model ledger, filtered by the policy-class
         // chain. Rule selection is complete before this function runs.
@@ -274,10 +278,11 @@ async fn build_policy_context_from_opts_inner(
         // `?$identity` (f:query rules referencing it won't match), same as
         // identity-mode's NotFound.
         //
-        // opts.policy (inline JSON-LD) still applies and gets merged below.
-        // Moving — not cloning — the owned input keeps model-ledger policy
-        // sets (which can be large: each `PolicyRestriction` carries
-        // strings + hash sets) from paying a per-request copy.
+        // opts.policy (inline JSON-LD) still applies — it merges after the
+        // selection chain. Moving — not cloning — the owned input keeps
+        // model-ledger policy sets (which can be large: each
+        // `PolicyRestriction` carries strings + hash sets) from paying a
+        // per-request copy.
         let identity_sid = if let Some(identity_iri) = &opts.identity {
             let resolved =
                 resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
@@ -299,10 +304,35 @@ async fn build_policy_context_from_opts_inner(
             None
         };
 
-        if let Some(policy_json) = &opts.policy {
-            merged.extend(parse_inline_policy(snapshot, policy_json)?);
-        }
         (identity_sid, merged)
+    } else if let (Some(identity_iri), Some(classes)) = (
+        &opts.identity,
+        opts.policy_class.as_ref().filter(|c| !c.is_empty()),
+    ) {
+        // Same-ledger identity + explicit `policy-class`: the request's
+        // classes select the policy set; the identity is BIND-ONLY — it
+        // resolves to populate `?$identity` for f:query rules and never
+        // drives rule selection. This mirrors the cross-ledger identity
+        // contract above.
+        //
+        // Without this arm, a request carrying both fields silently ignored
+        // `policy-class` and fell through to identity-mode selection below —
+        // which yields an empty policy set (deny-all under default-deny)
+        // whenever the identity has no `f:policyClass` triples in the
+        // ledger, and can never work for identities that are not resolvable
+        // IRIs (bare emails / UUID subjects minted by application auth
+        // systems). Gateways that resolve grant-derived classes per request
+        // and forward them alongside the authenticated identity depend on
+        // the classes being honored.
+        let identity_sid =
+            resolve_identity_binding_sid(snapshot, overlay, to_t, identity_iri, policy_graphs)
+                .await?;
+        if let Some(sid) = &identity_sid {
+            policy_values.insert("?$identity".to_string(), sid.clone());
+        }
+        let restrictions =
+            load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?;
+        (identity_sid, restrictions)
     } else if let Some(identity_iri) = &opts.identity {
         match load_policies_by_identity(snapshot, overlay, to_t, identity_iri, policy_graphs)
             .await?
@@ -342,8 +372,6 @@ async fn build_policy_context_from_opts_inner(
 
         let restrictions = if let Some(classes) = &opts.policy_class {
             load_policies_by_class(snapshot, overlay, to_t, classes, policy_graphs).await?
-        } else if let Some(policy_json) = &opts.policy {
-            parse_inline_policy(snapshot, policy_json)?
         } else {
             vec![]
         };
@@ -351,11 +379,23 @@ async fn build_policy_context_from_opts_inner(
         (identity_sid, restrictions)
     };
 
+    // Inline `opts.policy` merges additively in every selection mode: the
+    // modes above choose which STORED policies load; they never gate an
+    // explicitly supplied inline policy. Merging once here keeps the arms
+    // consistent — selection-specific merging silently dropped inline
+    // policies on the identity-only and class-only paths, which under
+    // default-deny meant deny-all with no signal.
+    if let Some(policy_json) = &opts.policy {
+        restrictions.extend(parse_inline_policy(snapshot, policy_json)?);
+    }
+
     // Build policy sets (view and modify)
     //
-    // Stats are critical for f:onClass policies - they need class→property relationships
-    // to know which properties to index. Without stats, OnClass policies only match
-    // @id and rdf:type properties (the implicit ones).
+    // Stats are critical for VIEW-side f:onClass policies - they need
+    // class→property relationships to know which properties to index.
+    // Without stats, view-set OnClass policies only match @id and rdf:type
+    // properties (the implicit ones). Modify sets index OnClass policies by
+    // class instead (`PolicySet::by_class`) and don't consult stats.
     //
     // Policies need the full novelty-aware class/property view so `f:onClass`
     // restrictions apply even when novelty adds properties without restating
@@ -761,7 +801,7 @@ pub(crate) async fn load_policy_restriction(
     let mut on_class: HashSet<Sid> = HashSet::new();
     let mut required = false;
     let mut message: Option<String> = None;
-    let mut policy_query_json: Option<String> = None;
+    let mut policy_query_source: Option<(String, PolicyQueryLanguage)> = None;
 
     // Resolve predicate SIDs we need to query (system IRIs must resolve strictly).
     let view_sid = resolve_system_iri_to_sid(snapshot, policy_iris::VIEW, "f:view")?;
@@ -792,9 +832,13 @@ pub(crate) async fn load_policy_restriction(
         }
     }
 
-    // f:action - collect all action values to determine View, Modify, or Both
-    let action: Option<PolicyAction> = {
+    // f:action - collect action values: f:view / f:modify plus the write
+    // verbs f:create / f:update / f:delete. Any verb implies the modify side.
+    let (action, verbs): (Option<PolicyAction>, Option<WriteVerbs>) = {
         let action_sid = resolve_system_iri_to_sid(snapshot, policy_iris::ACTION, "f:action")?;
+        let create_sid = resolve_system_iri_to_sid(snapshot, policy_iris::CREATE, "f:create")?;
+        let update_sid = resolve_system_iri_to_sid(snapshot, policy_iris::UPDATE, "f:update")?;
+        let delete_sid = resolve_system_iri_to_sid(snapshot, policy_iris::DELETE, "f:delete")?;
         let bindings = query_predicate(
             snapshot,
             overlay,
@@ -806,21 +850,43 @@ pub(crate) async fn load_policy_restriction(
         .await?;
         let mut has_view = false;
         let mut has_modify = false;
+        let mut v = WriteVerbs::default();
         for binding in bindings {
             if let Some(action_ref) = binding.as_sid() {
                 if &view_sid == action_ref {
                     has_view = true;
                 } else if &modify_sid == action_ref {
                     has_modify = true;
+                } else if &create_sid == action_ref {
+                    v.create = true;
+                } else if &update_sid == action_ref {
+                    v.update = true;
+                } else if &delete_sid == action_ref {
+                    v.delete = true;
                 }
             }
         }
-        match (has_view, has_modify) {
+        // Explicit verbs select exact lifecycle semantics. Bare f:modify
+        // alongside verbs still means "all writes", so it widens the verb
+        // set to ALL (keeping exact semantics); bare f:modify alone stays
+        // legacy (verbs: None).
+        let verbs = if v.any() {
+            if has_modify {
+                Some(WriteVerbs::ALL)
+            } else {
+                Some(v)
+            }
+        } else {
+            None
+        };
+        let has_modify_side = has_modify || v.any();
+        let action = match (has_view, has_modify_side) {
             (true, true) => Some(PolicyAction::Both),
             (true, false) => Some(PolicyAction::View),
             (false, true) => Some(PolicyAction::Modify),
             (false, false) => None,
-        }
+        };
+        (action, verbs)
     };
 
     // f:onProperty (can have multiple values)
@@ -947,20 +1013,47 @@ pub(crate) async fn load_policy_restriction(
                     val: FlakeValue::Json(s),
                     ..
                 } => {
-                    policy_query_json = Some(s.clone());
+                    policy_query_source = Some((s.clone(), PolicyQueryLanguage::JsonLd));
                     break;
                 }
+                // Plain-string literals: the datatype selects the language.
+                // `f:sparql` → SPARQL; `f:cypher` → Cypher; anything else
+                // (bare xsd:string) keeps the legacy JSON-LD interpretation.
                 Binding::Lit {
                     val: FlakeValue::String(s),
+                    dtc,
                     ..
                 } => {
-                    policy_query_json = Some(s.clone());
+                    let language = if is_language_datatype(&dtc, fluree_vocab::db::SPARQL) {
+                        PolicyQueryLanguage::Sparql
+                    } else if is_language_datatype(&dtc, fluree_vocab::db::CYPHER) {
+                        PolicyQueryLanguage::Cypher
+                    } else {
+                        PolicyQueryLanguage::JsonLd
+                    };
+                    policy_query_source = Some((s.clone(), language));
                     break;
                 }
                 _ => {}
             }
         }
     }
+
+    // f:queryState — which transaction state the f:query condition
+    // evaluates against (f:preState default / f:postState).
+    let query_state: ConditionState = {
+        let qs_sid = resolve_system_iri_to_sid(snapshot, policy_iris::QUERY_STATE, "f:queryState")?;
+        let post_sid = resolve_system_iri_to_sid(snapshot, policy_iris::POST_STATE, "f:postState")?;
+        let bindings =
+            query_predicate(snapshot, overlay, to_t, policy_sid, &qs_sid, policy_graphs).await?;
+        let mut state = ConditionState::Pre;
+        for binding in bindings {
+            if binding.as_sid() == Some(&post_sid) {
+                state = ConditionState::Post;
+            }
+        }
+        state
+    };
 
     // Determine target mode and targets
     let (target_mode, targets, for_classes) = if !on_property.is_empty() {
@@ -986,21 +1079,12 @@ pub(crate) async fn load_policy_restriction(
         Some(false) => PolicyValue::Deny,
         None => {
             // No explicit allow/deny - check for f:query
-            if let Some(query_json) = policy_query_json {
-                // Store raw policy query JSON. Parsing/lowering is handled by the query engine.
-                // We still validate that it's valid JSON to preserve previous "deny on parse error"
-                // behavior without duplicating query parsing logic.
-                match serde_json::from_str::<JsonValue>(&query_json) {
-                    Ok(_) => PolicyValue::Query(PolicyQuery { json: query_json }),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Policy '{}': failed to parse f:query JSON, defaulting to deny: {}",
-                            policy_id,
-                            e
-                        );
-                        PolicyValue::Deny // Fall back to deny on parse error
-                    }
-                }
+            if let Some((source, language)) = policy_query_source {
+                // Store the raw policy query source. Parsing/lowering is handled
+                // by the query engine. We still validate the source parses to
+                // preserve the "deny on parse error" behavior without
+                // duplicating query lowering logic.
+                make_policy_query_value(&policy_id, source, language, query_state)
             } else {
                 // No f:allow and no f:query - this is likely a misconfigured policy
                 tracing::warn!(
@@ -1026,6 +1110,7 @@ pub(crate) async fn load_policy_restriction(
         target_mode,
         targets,
         action: action.unwrap_or(PolicyAction::Both),
+        verbs,
         value,
         required,
         message,
@@ -1136,35 +1221,72 @@ fn parse_inline_policy(
         // Extract f:query (optional). For inline policies we accept:
         // - String: JSON query string
         // - Object: {"@type":"@json","@value":{...}} where @value is serialized to JSON string
+        // - Object: {"@type":"f:sparql","@value":"ASK ..."} for SPARQL policies
+        // - Object: {"@type":"f:cypher","@value":"MATCH ..."} for Cypher policies
         //
         // `@json` values can use object `@value` (not just string).
-        let policy_query_json: Option<String> = obj
+        let policy_query_source: Option<(String, PolicyQueryLanguage)> = obj
             .get("f:query")
             .or_else(|| obj.get(&format!("{}query", fluree::DB)))
             .and_then(|v| match v {
-                JsonValue::String(s) => Some(s.clone()),
+                JsonValue::String(s) => Some((s.clone(), PolicyQueryLanguage::JsonLd)),
                 JsonValue::Object(o) => {
-                    // Handle @json typed values
                     let inner = o.get("@value")?;
+                    let type_str = o.get("@type").and_then(JsonValue::as_str);
+                    // SPARQL typed value: {"@type": "f:sparql", "@value": "ASK ..."}
+                    if type_str
+                        .is_some_and(|t| t == "f:sparql" || t == fluree_vocab::fluree::SPARQL)
+                    {
+                        return inner
+                            .as_str()
+                            .map(|s| (s.to_string(), PolicyQueryLanguage::Sparql));
+                    }
+                    // Cypher typed value: {"@type": "f:cypher", "@value": "MATCH ..."}
+                    if type_str
+                        .is_some_and(|t| t == "f:cypher" || t == fluree_vocab::fluree::CYPHER)
+                    {
+                        return inner
+                            .as_str()
+                            .map(|s| (s.to_string(), PolicyQueryLanguage::Cypher));
+                    }
+                    // @json typed values
                     match inner {
                         // @value is a string (already serialized JSON)
-                        JsonValue::String(s) => Some(s.clone()),
+                        JsonValue::String(s) => Some((s.clone(), PolicyQueryLanguage::JsonLd)),
                         // @value is an object (needs serialization)
-                        JsonValue::Object(_) | JsonValue::Array(_) => {
-                            serde_json::to_string(inner).ok()
-                        }
+                        JsonValue::Object(_) | JsonValue::Array(_) => serde_json::to_string(inner)
+                            .ok()
+                            .map(|s| (s, PolicyQueryLanguage::JsonLd)),
                         _ => None,
                     }
                 }
                 _ => None,
             });
 
+        // f:queryState — which transaction state the f:query condition
+        // evaluates against (f:preState default / f:postState).
+        let query_state = obj
+            .get("f:queryState")
+            .or_else(|| obj.get(&format!("{}queryState", fluree::DB)))
+            .map(|v| {
+                let iris = extract_iris(v);
+                if iris
+                    .iter()
+                    .any(|i| i == "f:postState" || i == policy_iris::POST_STATE)
+                {
+                    ConditionState::Post
+                } else {
+                    ConditionState::Pre
+                }
+            })
+            .unwrap_or_default();
+
         // Extract f:action - can be string, object with @id, or array of these
         let action_value = obj
             .get("f:action")
             .or_else(|| obj.get(&format!("{}action", fluree::DB)));
 
-        let action = parse_action_value(action_value);
+        let (action, verbs) = parse_action_value(action_value);
 
         // Extract targets - track whether targeting was specified for validation
         let mut on_property: HashSet<Sid> = HashSet::new();
@@ -1301,14 +1423,8 @@ fn parse_inline_policy(
             Some(true) => PolicyValue::Allow,
             Some(false) => PolicyValue::Deny,
             None => {
-                if let Some(query_json) = policy_query_json {
-                    match serde_json::from_str::<JsonValue>(&query_json) {
-                        Ok(_) => PolicyValue::Query(PolicyQuery { json: query_json }),
-                        Err(e) => {
-                            tracing::warn!("Failed to parse inline policy query JSON: {}", e);
-                            PolicyValue::Deny
-                        }
-                    }
+                if let Some((source, language)) = policy_query_source {
+                    make_policy_query_value(&id, source, language, query_state)
                 } else {
                     PolicyValue::Deny
                 }
@@ -1320,6 +1436,7 @@ fn parse_inline_policy(
             target_mode,
             targets,
             action,
+            verbs,
             value,
             required,
             message,
@@ -1339,6 +1456,66 @@ fn parse_inline_policy(
 // NOTE: Policy query parsing is intentionally delegated to the query engine
 // (`fluree-db-query`) to avoid duplicating query parsing/lowering and to ensure
 // full feature support (e.g., FILTER patterns) in f:query policies.
+
+/// True when a literal's datatype is the given `f:` language datatype
+/// (local name under the fluree-db namespace, e.g. `f:sparql` / `f:cypher`).
+fn is_language_datatype(dtc: &fluree_db_core::DatatypeConstraint, local_name: &str) -> bool {
+    matches!(
+        dtc,
+        fluree_db_core::DatatypeConstraint::Explicit(sid)
+            if *sid == Sid::new(fluree_vocab::namespaces::FLUREE_DB, local_name)
+    )
+}
+
+/// Build the `PolicyValue` for an `f:query` source, validating per language.
+///
+/// Validation preserves the historical "deny on parse error" behavior: a
+/// source that fails to parse (or is not the language's condition form —
+/// ASK/SELECT for SPARQL, a read-only query for Cypher) yields
+/// `PolicyValue::Deny` with a warning rather than an error.
+///
+/// For SPARQL / Cypher sources this also registers the corresponding
+/// lowering hooks so the policy executor can evaluate the query later.
+fn make_policy_query_value(
+    policy_id: &str,
+    source: String,
+    language: PolicyQueryLanguage,
+    state: ConditionState,
+) -> PolicyValue {
+    let validation = match language {
+        PolicyQueryLanguage::JsonLd => serde_json::from_str::<JsonValue>(&source)
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        PolicyQueryLanguage::Sparql => {
+            crate::sparql_lang::ensure_sparql_support_registered();
+            crate::sparql_lang::validate_sparql_policy_source(&source)
+        }
+        PolicyQueryLanguage::Cypher => {
+            crate::cypher_lang::ensure_cypher_support_registered();
+            crate::cypher_lang::validate_cypher_policy_source(&source)
+        }
+        other => Err(format!(
+            "unsupported policy query language {}",
+            other.as_str()
+        )),
+    };
+    match validation {
+        Ok(()) => PolicyValue::Query(PolicyQuery {
+            source,
+            language,
+            state,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                "Policy '{}': invalid {} f:query, defaulting to deny: {}",
+                policy_id,
+                language.as_str(),
+                e
+            );
+            PolicyValue::Deny
+        }
+    }
+}
 
 /// Resolve an IRI string to a SID using the snapshot's namespace table.
 ///
@@ -1426,19 +1603,24 @@ fn build_policy_values(
     Ok(result)
 }
 
-/// Parse f:action value into PolicyAction.
+/// Parse f:action value into PolicyAction plus optional write verbs.
 ///
 /// Handles multiple formats:
 /// - String: "f:view", "f:modify", or full IRI
 /// - Object with @id: {"@id": "f:view"}
 /// - Array of the above: [{"@id": "f:view"}, {"@id": "f:modify"}]
 ///
-/// Returns PolicyAction::Both if both view and modify are specified or if
-/// the value cannot be parsed.
-fn parse_action_value(value: Option<&JsonValue>) -> PolicyAction {
+/// The write verbs `f:create` / `f:update` / `f:delete` imply the modify
+/// side and select exact lifecycle semantics; bare `f:modify` alone keeps
+/// legacy semantics (`verbs: None`), and `f:modify` alongside a verb widens
+/// the verb set to ALL while keeping exact semantics.
+///
+/// Returns PolicyAction::Both if both view and modify sides are specified
+/// or if the value cannot be parsed.
+fn parse_action_value(value: Option<&JsonValue>) -> (PolicyAction, Option<WriteVerbs>) {
     let value = match value {
         Some(v) => v,
-        None => return PolicyAction::Both,
+        None => return (PolicyAction::Both, None),
     };
 
     // Collect all action IRIs from the value
@@ -1446,6 +1628,7 @@ fn parse_action_value(value: Option<&JsonValue>) -> PolicyAction {
 
     let mut has_view = false;
     let mut has_modify = false;
+    let mut v = WriteVerbs::default();
 
     for s in action_strs {
         if s.contains("view") {
@@ -1454,14 +1637,35 @@ fn parse_action_value(value: Option<&JsonValue>) -> PolicyAction {
         if s.contains("modify") {
             has_modify = true;
         }
+        if s == "f:create" || s.ends_with("#create") {
+            v.create = true;
+        }
+        if s == "f:update" || s.ends_with("#update") {
+            v.update = true;
+        }
+        if s == "f:delete" || s.ends_with("#delete") {
+            v.delete = true;
+        }
     }
 
-    match (has_view, has_modify) {
+    let verbs = if v.any() {
+        if has_modify {
+            Some(WriteVerbs::ALL)
+        } else {
+            Some(v)
+        }
+    } else {
+        None
+    };
+    let has_modify_side = has_modify || v.any();
+
+    let action = match (has_view, has_modify_side) {
         (true, true) => PolicyAction::Both,
         (true, false) => PolicyAction::View,
         (false, true) => PolicyAction::Modify,
         (false, false) => PolicyAction::Both, // Default if no recognized action
-    }
+    };
+    (action, verbs)
 }
 
 /// Extract action strings from a JSON value (string, object with @id, or array).
@@ -1537,49 +1741,49 @@ mod tests {
 
     #[test]
     fn test_parse_action_none() {
-        assert_eq!(parse_action_value(None), PolicyAction::Both);
+        assert_eq!(parse_action_value(None).0, PolicyAction::Both);
     }
 
     #[test]
     fn test_parse_action_string_view() {
         let v = serde_json::json!("f:view");
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::View);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::View);
     }
 
     #[test]
     fn test_parse_action_string_modify() {
         let v = serde_json::json!("f:modify");
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Modify);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Modify);
     }
 
     #[test]
     fn test_parse_action_object_view() {
         let v = serde_json::json!({"@id": "f:view"});
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::View);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::View);
     }
 
     #[test]
     fn test_parse_action_object_modify() {
         let v = serde_json::json!({"@id": "https://ns.flur.ee/db#modify"});
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Modify);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Modify);
     }
 
     #[test]
     fn test_parse_action_array_view_only() {
         let v = serde_json::json!([{"@id": "f:view"}]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::View);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::View);
     }
 
     #[test]
     fn test_parse_action_array_modify_only() {
         let v = serde_json::json!([{"@id": "f:modify"}]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Modify);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Modify);
     }
 
     #[test]
     fn test_parse_action_array_both() {
         let v = serde_json::json!([{"@id": "f:view"}, {"@id": "f:modify"}]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Both);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Both);
     }
 
     #[test]
@@ -1588,6 +1792,6 @@ mod tests {
             {"@id": "https://ns.flur.ee/db#view"},
             {"@id": "https://ns.flur.ee/db#modify"}
         ]);
-        assert_eq!(parse_action_value(Some(&v)), PolicyAction::Both);
+        assert_eq!(parse_action_value(Some(&v)).0, PolicyAction::Both);
     }
 }

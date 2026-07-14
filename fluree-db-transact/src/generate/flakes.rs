@@ -464,6 +464,48 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
     Ok(())
 }
 
+/// Shared core of the two `emit_reified_triple` impls (`FlakeSink` /
+/// `ImportSink`): a resolved Turtle-star reifier attachment → validated →
+/// the `EdgeKey::to_reifies_facts_jsonld_compatible` bundle. The
+/// construction sequence lives in exactly one place so the
+/// bit-identical-bundles guarantee (Turtle-star ≡ JSON-LD `@annotation`
+/// at the flake level; cascade retracts cancel either surface) cannot
+/// drift between the transactional and bulk-import sinks — each sink
+/// keeps only its own error channel and emission (Vec-extend vs
+/// commit-writer/spool).
+///
+/// Plain-Turtle surfaces are default-graph only (named graphs are TriG,
+/// a different ingest path) → `g = None`; list-occurrence annotations are
+/// deferred in v1 → `list_i = None`.
+///
+/// The validation is the same late hard guard as `build_flake` /
+/// `push_triple`: a bad (value, dt) pair must fail the whole ingest, not
+/// silently drop or corrupt the bundle. The base triple hit the same
+/// guard already, so this only fires on shapes the base emission also
+/// rejected.
+pub(crate) fn reified_triple_bundle(
+    s: Sid,
+    p: Sid,
+    o: FlakeValue,
+    dtc: &fluree_db_core::DatatypeConstraint,
+    ann: &Sid,
+    t: i64,
+) -> Result<Vec<Flake>> {
+    let dt = dtc.datatype().clone();
+    let lang = dtc.lang_tag().map(std::string::ToString::to_string);
+    validate_value_dt_pair(&o, &dt)?;
+    let key = fluree_db_core::edge::EdgeKey {
+        g: None,
+        s,
+        p,
+        o,
+        dt,
+        lang,
+        list_i: None,
+    };
+    Ok(key.to_reifies_facts_jsonld_compatible(ann, t, true))
+}
+
 /// Infer datatype from a FlakeValue
 ///
 /// Returns the appropriate XSD/RDF datatype Sid for the given value.

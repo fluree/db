@@ -106,14 +106,22 @@ pub fn eval_str<R: RowAccess>(
     }))
 }
 
+/// `strict` selects the SPARQL behavior for non-literal arguments: a type
+/// error, evaluated as "no value" (`Ok(None)`) so a FILTER excludes the row
+/// and a project-expression/BIND leaves the variable unbound (§17.2/§18.5).
+/// The lenient (JSON-LD surface) mode keeps the historical behavior of
+/// returning `""` for any non-literal. See decision D-12.
 pub fn eval_lang<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
+    strict: bool,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "LANG")?;
-    let tag = match &args[0] {
-        Expression::Var(var_id) => match row.get(*var_id) {
+    // Fast path: a bare variable reads the binding's language tag directly,
+    // without materializing the value.
+    if let Expression::Var(var_id) = &args[0] {
+        let tag = match row.get(*var_id) {
             Some(Binding::Lit { dtc, .. }) => dtc
                 .lang_tag()
                 .map(std::string::ToString::to_string)
@@ -128,11 +136,25 @@ pub fn eval_lang<R: RowAccess>(
                     String::new()
                 }
             }
+            // SPARQL §17.4.2.2: LANG of a non-literal (IRI/ref, bnode) or an
+            // unbound variable is a type error → no value.
+            _ if strict => return Ok(None),
             _ => String::new(),
-        },
-        _ => String::new(),
+        };
+        return Ok(Some(ComparableValue::String(Arc::from(tag))));
+    }
+    // General case: evaluate the argument expression and read the tag off the
+    // resulting value (only lang-tagged strings carry one).
+    let tag: Arc<str> = match args[0].eval_to_comparable(row, ctx)? {
+        Some(ComparableValue::TypedLiteral {
+            dtc: Some(fluree_vocab::UnresolvedDatatypeConstraint::LangTag(tag)),
+            ..
+        }) => tag,
+        Some(ComparableValue::Sid(_) | ComparableValue::Iri(_)) if strict => return Ok(None),
+        None if strict => return Ok(None),
+        _ => Arc::from(""),
     };
-    Ok(Some(ComparableValue::String(Arc::from(tag))))
+    Ok(Some(ComparableValue::String(tag)))
 }
 
 pub fn eval_lcase<R: RowAccess>(

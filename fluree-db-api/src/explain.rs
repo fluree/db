@@ -697,6 +697,29 @@ pub async fn explain_sparql(
     explain_from_parsed(snapshot, &vars, &parsed, json!(sparql), None)
 }
 
+/// Explain an openCypher query against a LedgerSnapshot.
+///
+/// Lowers the Cypher statement to the shared query IR (resolving bare
+/// labels/keys via `default_context`, exactly like execution) and returns the
+/// same `{ "query": ..., "plan": { ... } }` report as the SPARQL/JSON-LD
+/// explains.
+pub async fn explain_cypher(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    cypher: &str,
+    default_context: Option<&JsonValue>,
+) -> Result<JsonValue> {
+    let (vars, parsed) = crate::query::helpers::parse_cypher_to_ir(
+        cypher,
+        snapshot,
+        default_context,
+        None,
+        None,
+        None,
+    )?;
+
+    explain_from_parsed(snapshot, &vars, &parsed, json!(cypher), None)
+}
+
 /// Explain a SPARQL query against a LedgerSnapshot, using a default JSON-LD context.
 ///
 /// The `default_context` is used for prefix expansion during parsing and for

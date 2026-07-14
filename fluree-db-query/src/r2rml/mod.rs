@@ -32,4 +32,7 @@ pub use provider::{
     ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
     ScanCmpOp, ScanFilter, ScanValue,
 };
-pub use rewrite::{convert_triple_to_r2rml, rewrite_patterns_for_r2rml, R2rmlRewriteResult};
+pub use rewrite::{
+    convert_triple_to_r2rml, rewrite_patterns_for_r2rml, unsupported_subscope_error,
+    R2rmlRewriteResult,
+};

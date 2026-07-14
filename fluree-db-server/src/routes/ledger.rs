@@ -1802,6 +1802,18 @@ const PREVIEW_HARD_MAX_COMMITS: usize = 5_000;
 /// should pass `include_conflicts=false`.
 const PREVIEW_HARD_MAX_CONFLICT_KEYS: usize = 5_000;
 
+/// Hard cap on `max_changes`. 10x the recommended default.
+///
+/// **What this protects:** the size of `changes.entries` in the response
+/// (counted in flakes; cut at subject boundaries, so a single huge subject
+/// may overshoot by its own size).
+///
+/// **What this does NOT protect:** the change computation. When
+/// `include_changes=true`, the source-side commit chain since the ancestor
+/// is fully replayed (one commit blob load per commit) regardless of cap —
+/// the same cost the merge itself pays. Each pagination page re-pays it.
+const PREVIEW_HARD_MAX_CHANGES: usize = 5_000;
+
 /// Query parameters for [`merge_preview`].
 #[derive(Deserialize)]
 pub struct MergePreviewQuery {
@@ -1825,6 +1837,17 @@ pub struct MergePreviewQuery {
     /// Strategy used for conflict resolution labels. Defaults to take-both.
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Include the aggregate netted change set the merge would apply.
+    #[serde(default)]
+    pub include_changes: Option<bool>,
+    /// Cap on change entries returned, counted in flakes and cut at subject
+    /// boundaries. `0` = stats-only (exact counts, no payload). Defaults to 500.
+    #[serde(default)]
+    pub max_changes: Option<usize>,
+    /// Pagination cursor: return only subjects sorting strictly after this
+    /// full IRI. Pass the previous response's `changes.next_cursor`.
+    #[serde(default)]
+    pub changes_after_subject: Option<String>,
 }
 
 /// Read-only branch merge preview.
@@ -1913,6 +1936,18 @@ pub async fn merge_preview(
                 "strategy=abort requires include_conflicts=true for mergeable preview",
             ));
         }
+        if let Some(b) = params.include_changes {
+            opts.include_changes = b;
+        }
+        if let Some(n) = params.max_changes {
+            opts.max_changes = Some(n.min(PREVIEW_HARD_MAX_CHANGES));
+        }
+        if params.changes_after_subject.is_some() && !opts.include_changes {
+            return Err(ServerError::bad_request(
+                "changes_after_subject requires include_changes=true",
+            ));
+        }
+        opts.changes_after_subject = params.changes_after_subject.clone();
 
         let preview = state
             .fluree

@@ -107,6 +107,12 @@ jobs:
         working-directory: testsuite-sparql
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Check compiles (test targets)
+      # Full W3C compliance run. Every suite must be green: each test either
+      # passes or is listed in tests/registers/mod.rs. check_testsuite fails a
+      # suite on any unexpected failure AND on any stale register entry (a
+      # registered test that now passes), so the registers can only shrink.
+      # See docs/contributing/sparql-compliance.md.
+      - name: Run W3C SPARQL test suites
         working-directory: testsuite-sparql
-        run: cargo test --no-run
+        timeout-minutes: 45
+        run: cargo test

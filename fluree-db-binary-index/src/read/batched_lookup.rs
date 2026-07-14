@@ -17,7 +17,7 @@ use crate::format::run_record_v2::RunRecordV2;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::GraphId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,7 +52,6 @@ pub fn batched_lookup_predicate_refs(
     sorted_subjects.sort_unstable();
     sorted_subjects.dedup();
 
-    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
     let mut out: HashMap<u64, Vec<u64>> = HashMap::new();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
@@ -177,20 +176,20 @@ pub fn batched_lookup_predicate_refs(
         );
         cursor.set_to_t(to_t);
 
+        // The cursor's p_id filter pins PSOT's leading key, so s_id is
+        // non-decreasing across the returned rows — gallop the chunk's
+        // wanted ids instead of testing every row. Spillover rows for a
+        // neighboring chunk's subjects are excluded by construction.
         while let Some(batch) = cursor.next_batch()? {
             scanned_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             scanned_rows.fetch_add(batch.row_count as u64, std::sync::atomic::Ordering::Relaxed);
-            for i in 0..batch.row_count {
-                let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
-                    continue;
-                }
+            for_each_subject_run(&batch, chunk, |s_id, i, batch| {
                 let ot = batch.o_type.get_or(i, 0);
                 if ot != iri_ref {
-                    continue;
+                    return;
                 }
                 out.entry(s_id).or_default().push(batch.o_key.get(i));
-            }
+            });
             subjects_with_hits.store(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -247,7 +246,6 @@ pub fn batched_lookup_subject_properties(
     let mut sorted_subjects = subjects.to_vec();
     sorted_subjects.sort_unstable();
     sorted_subjects.dedup();
-    let s_id_set: HashSet<u64> = sorted_subjects.iter().copied().collect();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
         return Ok(out);
@@ -303,21 +301,102 @@ pub fn batched_lookup_subject_properties(
         );
         cursor.set_to_t(to_t);
 
+        // Batches are leaflet-granular and spill far past the wanted
+        // subjects, so testing every row is the dominant cost for small
+        // subject sets (a single-node hydration paid a full-leaflet
+        // membership scan). SPOT's primary sort key is `s_id`, so gallop
+        // instead: binary-search each wanted subject's contiguous run and
+        // copy only those rows. Spillover rows for a neighboring chunk's
+        // subjects are excluded by construction (only this chunk's ids are
+        // searched), preserving the no-double-collect invariant the
+        // per-chunk membership set used to provide.
         while let Some(batch) = cursor.next_batch()? {
-            for i in 0..batch.row_count {
-                let s_id = batch.s_id.get(i);
-                if !s_id_set.contains(&s_id) {
-                    continue;
-                }
+            for_each_subject_run(&batch, chunk, |s_id, i, batch| {
                 let p_id = batch.p_id.get_or(i, 0);
                 let o_type = batch.o_type.get_or(i, 0);
                 let o_key = batch.o_key.get(i);
                 out.entry(s_id).or_default().push((p_id, o_type, o_key));
-            }
+            });
         }
     }
 
     Ok(out)
+}
+
+/// Visit every row of `batch` whose `s_id` is in the sorted id list
+/// `wanted`, in row order, via sorted merge with galloping binary search.
+///
+/// Requires the batch's `s_id` column to be non-decreasing over the visited
+/// range — true for SPOT-order leaflets (subject is the primary sort key),
+/// including time-travel replayed ones, and for PSOT batches after the
+/// cursor's `p_id` filter pinned the leading key.
+fn for_each_subject_run(
+    batch: &super::column_types::ColumnBatch,
+    wanted: &[u64],
+    mut visit: impl FnMut(u64, usize, &super::column_types::ColumnBatch),
+) {
+    let n = batch.row_count;
+    for_each_wanted_run(&batch.s_id, 0, n, wanted, |target, i| {
+        visit(target, i, batch);
+    });
+}
+
+/// Sorted-merge core: visit every row index in `[lo, hi)` whose value in
+/// `keys` is in the sorted list `wanted`. `keys` must be non-decreasing
+/// over `[lo, hi)`.
+fn for_each_wanted_run(
+    keys: &super::column_types::ColumnData<u64>,
+    lo: usize,
+    hi: usize,
+    wanted: &[u64],
+    mut visit: impl FnMut(u64, usize),
+) {
+    let mut row = lo;
+    let mut w = 0usize;
+    while row < hi && w < wanted.len() {
+        let target = wanted[w];
+        // First row with key >= target (binary search over [row, hi)).
+        let (mut a, mut b) = (row, hi);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if keys.get(mid) < target {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        row = a;
+        if row >= hi {
+            break;
+        }
+        let k = keys.get(row);
+        if k > target {
+            // No rows for `target` here; skip wanted ids below `k`.
+            w += wanted[w..].partition_point(|&x| x < k);
+            continue;
+        }
+        while row < hi && keys.get(row) == target {
+            visit(target, row);
+            row += 1;
+        }
+        w += 1;
+    }
+}
+
+/// The contiguous `[start, end)` row range of `batch` whose `o_type` column
+/// equals `ot` (OPST leaflets sort by `(o_type, o_key, ...)`, so the range
+/// is well-defined and `o_key` ascends within it).
+fn o_type_run(batch: &super::column_types::ColumnBatch, ot: u16) -> (usize, usize) {
+    use super::column_types::ColumnData;
+    match &batch.o_type {
+        ColumnData::Block(arr) => {
+            let start = arr.partition_point(|&x| x < ot);
+            let end = arr.partition_point(|&x| x <= ot);
+            (start, end)
+        }
+        ColumnData::Const(c) if *c == ot => (0, batch.row_count),
+        _ => (0, 0),
+    }
 }
 
 /// Batched OPST lookup: all inbound `IRI_REF` edges pointing at each requested
@@ -345,7 +424,6 @@ pub fn batched_lookup_inbound_refs(
     let mut sorted = objects.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let obj_set: HashSet<u64> = sorted.iter().copied().collect();
 
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Opst) else {
         return Ok(out);
@@ -405,19 +483,17 @@ pub fn batched_lookup_inbound_refs(
         );
         cursor.set_to_t(to_t);
 
+        // OPST sorts by (o_type, o_key, ...): binary-search the IRI_REF
+        // o_type run (boundary leaflets can carry neighboring o_types),
+        // then gallop the chunk's wanted o_keys within it. Spillover rows
+        // for a neighboring chunk's objects are excluded by construction.
         while let Some(batch) = cursor.next_batch()? {
-            for i in 0..batch.row_count {
-                if batch.o_type.get_or(i, 0) != iri_ref {
-                    continue;
-                }
-                let o_key = batch.o_key.get(i);
-                if !obj_set.contains(&o_key) {
-                    continue;
-                }
+            let (lo, hi) = o_type_run(&batch, iri_ref);
+            for_each_wanted_run(&batch.o_key, lo, hi, chunk, |o_key, i| {
                 out.entry(o_key)
                     .or_default()
                     .push((batch.p_id.get_or(i, 0), batch.s_id.get(i)));
-            }
+            });
         }
     }
 
@@ -431,6 +507,17 @@ pub fn batched_lookup_inbound_refs(
 /// Break sorted subjects into chunks where each chunk spans at most
 /// `max_span` IDs and contains at most `max_chunk` subjects.
 fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]> {
+    // Gap threshold: split only when the id gap is wide enough that the
+    // leaflets it crosses cost more to visit than a fresh cursor descent.
+    // With shared leaf mmaps and cached leaflet decodes, crossing a leaflet
+    // that holds none of the wanted ids costs ~3 µs (decode-cache hit +
+    // galloped no-op) and a descent ~4 µs; at ~1k subjects per leaflet the
+    // break-even gap is a few thousand ids. An aggressive threshold (64)
+    // measurably hurt dense-ish sets (node-emit hydration ~2x: ~8 µs
+    // descent per near-point-seek, nothing saved); no threshold at all makes a
+    // scattered BFS frontier sweep every leaflet between its members.
+    const MAX_GAP: u64 = 4096;
+
     if sorted.is_empty() {
         return Vec::new();
     }
@@ -438,8 +525,9 @@ fn chunk_subjects(sorted: &[u64], max_span: u64, max_chunk: usize) -> Vec<&[u64]
     let mut start = 0;
     for i in 1..sorted.len() {
         let span = sorted[i] - sorted[start];
+        let gap = sorted[i] - sorted[i - 1];
         let size = i - start;
-        if span > max_span || size >= max_chunk {
+        if span > max_span || gap > MAX_GAP || size >= max_chunk {
             chunks.push(&sorted[start..i]);
             start = i;
         }

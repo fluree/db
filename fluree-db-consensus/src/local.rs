@@ -15,7 +15,7 @@ use crate::{
 use async_trait::async_trait;
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, GovernanceOptions, GraphDb, LedgerHandle, LedgerManager,
-    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError, Txn,
+    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError,
 };
 use fluree_db_ledger::IndexConfig;
 use std::sync::Arc;
@@ -132,6 +132,7 @@ impl Committer for LocalCommitter {
                         query,
                         params.as_ref(),
                         &governance,
+                        txn_opts.skolem_txn_id.clone(),
                     )
                     .await
                     .map_err(execution_failure)?,
@@ -154,7 +155,12 @@ impl Committer for LocalCommitter {
                 }
                 TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
                 TransactionBody::Cypher { .. } => {
-                    staged.txn(cypher_txn.expect("cypher_txn is Some for a Cypher body"))
+                    let resolved = cypher_txn.expect("cypher_txn is Some for a Cypher body");
+                    let staged = staged.txn(resolved.primary);
+                    match resolved.followup {
+                        Some(followup) => staged.txn_followup(followup),
+                        None => staged,
+                    }
                 }
             };
             let mut builder = staged
@@ -410,7 +416,8 @@ pub(crate) async fn build_policy_context(
 /// policy wrap mirrors the Cypher read / SPARQL surfaces so a
 /// restricted writer's branch selection sees only policy-visible data.
 ///
-/// Returns the lowered `Txn`; the caller maps [`ApiError`] into its own
+/// Returns the resolved write (a primary `Txn` plus an optional follow-up that
+/// must commit atomically with it); the caller maps [`ApiError`] into its own
 /// failure type.
 pub(crate) async fn resolve_cypher_under_lock(
     fluree: &Fluree,
@@ -419,13 +426,17 @@ pub(crate) async fn resolve_cypher_under_lock(
     query: &str,
     params: Option<&serde_json::Map<String, serde_json::Value>>,
     governance: &GovernanceOptions,
-) -> Result<Txn, ApiError> {
+    skolem_txn_id: Option<String>,
+) -> Result<fluree_db_api::cypher_write::ResolvedConditional, ApiError> {
+    use fluree_db_api::cypher_write::ResolvedConditional;
     let snap = ledger_handle.snapshot().await;
     let plan = fluree
-        .cypher_write_plan(query, params, ledger_id, &snap.snapshot)
+        .cypher_write_plan_with_skolem(query, params, ledger_id, &snap.snapshot, skolem_txn_id)
         .await?;
     match plan {
-        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(*txn),
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => {
+            Ok(ResolvedConditional::single(*txn))
+        }
         fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
             // Fresh owned state for the branch-choosing probe (cheap — the
             // snapshot is Arc-shared); `snap` stays borrowed for the resolve.

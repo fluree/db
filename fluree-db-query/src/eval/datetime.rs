@@ -34,6 +34,14 @@ pub fn eval_now(args: &[Expression]) -> Result<Option<ComparableValue>> {
     Ok(Some(ComparableValue::DateTime(parsed)))
 }
 
+/// Current UTC calendar date — Cypher's zero-arg `date()`.
+pub fn eval_today(args: &[Expression]) -> Result<Option<ComparableValue>> {
+    check_arity(args, 0, "date")?;
+    Ok(Some(ComparableValue::Date(
+        fluree_db_core::temporal::Date::today_utc(),
+    )))
+}
+
 pub fn eval_year<R: RowAccess>(
     args: &[Expression],
     row: &R,

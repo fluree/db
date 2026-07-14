@@ -42,6 +42,8 @@ mimalloc = { workspace = true, optional = true }
 fluree-db-api = { path = "../fluree-db-api" }
 # Temp dir for streaming CSV → .jsonl into the bulk import pipeline.
 tempfile = "3"
+# `fluree load` reads CSV rows client-side into batched Cypher upserts.
+csv = "1.4"
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-core = { path = "../fluree-db-core" }

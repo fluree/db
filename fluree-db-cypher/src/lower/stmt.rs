@@ -228,6 +228,42 @@ fn lower_single_branch<E: IriEncoder>(
     q: &crate::ast::Query,
     outer_scope: &[VarId],
 ) -> Result<SingleBranch> {
+    // Anonymous-hop chains may fuse to a frontier-BFS path only when walk
+    // multiplicity is unobservable: DISTINCT output, no aggregates anywhere
+    // in the projection or ORDER BY, and no clause that could observe or
+    // aggregate per-walk rows (WITH / CALL). See
+    // `LoweringContext::fuse_reachability_chains`.
+    let saved_fusion = ctx.fuse_reachability_chains;
+    ctx.fuse_reachability_chains = q.return_clause.distinct
+        && !q
+            .return_clause
+            .items
+            .iter()
+            .any(|item| expr_has_aggregate(&item.expr))
+        && !q
+            .return_clause
+            .order_by
+            .iter()
+            .any(|o| expr_has_aggregate(&o.expr))
+        && q.clauses.iter().all(|c| {
+            matches!(
+                c,
+                ReadClause::Match(_)
+                    | ReadClause::OptionalMatch(_)
+                    | ReadClause::Unwind(_)
+                    | ReadClause::InlineRows { .. }
+            )
+        });
+    let result = lower_single_branch_inner(ctx, q, outer_scope);
+    ctx.fuse_reachability_chains = saved_fusion;
+    result
+}
+
+fn lower_single_branch_inner<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
+    q: &crate::ast::Query,
+    outer_scope: &[VarId],
+) -> Result<SingleBranch> {
     let mut patterns: Vec<Pattern> = Vec::new();
     // Variables visible from an ENCLOSING scope (a CALL body sees its imports);
     // empty at the top level. A `WITH` narrows scope to its projection, so once
@@ -1568,10 +1604,29 @@ fn lower_inline_rows<E: IriEncoder>(
 }
 
 fn literal_to_binding(e: &Expr) -> Result<Binding> {
-    let Expr::Lit(lit) = e else {
-        return Err(LowerError::unsupported(
-            "UNWIND list elements must be literals in v1 (no nested expressions yet)",
-        ));
+    let lit = match e {
+        Expr::Lit(lit) => lit,
+        // Constant list/map cells (procedure-shim rows like dbms.components'
+        // `versions` column) recurse element-wise.
+        Expr::List(items, _) => {
+            return items
+                .iter()
+                .map(literal_to_binding)
+                .collect::<Result<Vec<_>>>()
+                .map(Binding::List);
+        }
+        Expr::Map(entries, _) => {
+            return entries
+                .iter()
+                .map(|(k, v)| Ok((std::sync::Arc::from(k.as_str()), literal_to_binding(v)?)))
+                .collect::<Result<Vec<_>>>()
+                .map(Binding::Map);
+        }
+        _ => {
+            return Err(LowerError::unsupported(
+                "UNWIND list elements must be literals in v1 (no nested expressions yet)",
+            ));
+        }
     };
     Ok(match lit {
         Literal::Integer(n, _) => {

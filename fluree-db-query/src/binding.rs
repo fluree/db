@@ -1554,6 +1554,16 @@ impl<'a> BatchView<'a> {
 pub trait RowAccess: Send + Sync {
     /// Get a binding by variable ID.
     fn get(&self, var: VarId) -> Option<&Binding>;
+
+    /// Visit every (variable, binding) pair of the row.
+    ///
+    /// Used by `BNODE(label)` to fold a per-solution identity into the
+    /// generated blank node (SPARQL 1.1 §17.4.2.9: the same label maps to the
+    /// same blank node *within* one solution but to distinct blank nodes
+    /// *across* solutions). Callers must not depend on visit order — derived
+    /// identities have to fold commutatively, because different operators
+    /// present the same solution with different schema orders.
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding));
 }
 
 /// Zero-copy view of a single row in a batch
@@ -1566,6 +1576,14 @@ pub struct RowView<'a> {
 impl RowAccess for RowView<'_> {
     fn get(&self, var: VarId) -> Option<&Binding> {
         self.batch.get(self.row, var)
+    }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        for (col, var) in self.batch.schema().iter().enumerate() {
+            if let Some(b) = self.batch.columns.get(col).and_then(|c| c.get(self.row)) {
+                f(*var, b);
+            }
+        }
     }
 }
 
@@ -1622,6 +1640,12 @@ impl RowAccess for BindingRow<'_> {
             .iter()
             .position(|&v| v == var)
             .and_then(|idx| self.bindings.get(idx))
+    }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        for (var, b) in self.schema.iter().zip(self.bindings.iter()) {
+            f(*var, b);
+        }
     }
 }
 

@@ -81,9 +81,10 @@ impl LowerCypherError {
 /// even though Cypher writes default to LPG mode.
 #[derive(Debug, Default)]
 pub struct CypherLowerOpts {
-    /// Default vocab IRI used to resolve bare Cypher identifiers
-    /// (labels, types, property keys). Defaults to
-    /// `http://example.org/`.
+    /// Optional `@vocab` IRI prefix used to resolve bare Cypher
+    /// identifiers (labels, types, property keys) — the RDF-compat
+    /// mode. `None` (the default) writes bare names under namespace 0
+    /// (no IRI prefix), the native LPG mode.
     pub vocab: Option<String>,
     /// Per-term IRI overrides. A bare Cypher identifier (label,
     /// relationship type, property key) that has an entry here resolves
@@ -103,7 +104,20 @@ pub fn lower_cypher_update(
 ) -> Result<Txn, LowerCypherError> {
     let update = match &ast.statement {
         Statement::Update(u) => u,
-        Statement::Query(_) => return Err(LowerCypherError::NotAnUpdate),
+        Statement::Query(_) | Statement::CallProcedure(_) => {
+            return Err(LowerCypherError::NotAnUpdate)
+        }
+        // Schema DDL (CREATE/DROP INDEX|CONSTRAINT) is a no-op: Fluree
+        // indexes everything. An empty Update-typed Txn rides the ordinary
+        // staging path and takes the zero-effect early return (Insert-typed
+        // empties are rejected as EmptyTransaction).
+        Statement::Schema(_) => {
+            let mut lower = CypherLowering::new(ns, opts, cypher_opts);
+            lower.txn_type = TxnType::Update;
+            let mut txn = lower.finish();
+            txn.namespace_delta = ns.delta().clone();
+            return Ok(txn);
+        }
     };
 
     let mut lower = CypherLowering::new(ns, opts, cypher_opts);
@@ -115,7 +129,7 @@ pub fn lower_cypher_update(
 
 struct CypherLowering<'a> {
     ns: &'a mut NamespaceRegistry,
-    vocab: String,
+    vocab: Option<String>,
     overrides: std::collections::HashMap<String, String>,
     vars: VarRegistry,
     txn_type: TxnType,
@@ -139,22 +153,26 @@ struct CypherLowering<'a> {
     /// `DELETE r` retract the base edge (the `f:reifies*` cascade then removes
     /// the bundle).
     rel_var_edges: std::collections::HashMap<String, (String, Sid, String)>,
+    /// Relationship variables already used for a CREATE relationship — each
+    /// names one created edge's annotation (label `_:cy_rel_{name}`), so a
+    /// reuse would silently merge two edges' annotations.
+    created_rel_vars: std::collections::HashSet<String>,
     /// Stable per-pattern-occurrence node labels, keyed by node span.
     /// Used so two appearances of the same node pattern in `CREATE
     /// (a)-[]->(b), (a)-[]->(c)` resolve to the same SID at staging
     /// time — when `a` has no `var`, the second occurrence reuses the
     /// span of the first.
     node_subject_cache: std::collections::HashMap<(usize, usize), TemplateTerm>,
+    /// Lazily-captured statement timestamp: every zero-arg `datetime()` /
+    /// `date()` in one statement folds to the same instant.
+    stmt_now: Option<fluree_db_core::temporal::DateTime>,
 }
 
 impl<'a> CypherLowering<'a> {
     fn new(ns: &'a mut NamespaceRegistry, opts: TxnOpts, cypher_opts: CypherLowerOpts) -> Self {
-        let vocab = cypher_opts
-            .vocab
-            .unwrap_or_else(|| "http://example.org/".to_string());
         Self {
             ns,
-            vocab,
+            vocab: cypher_opts.vocab,
             overrides: cypher_opts.overrides,
             vars: VarRegistry::new(),
             txn_type: TxnType::Insert,
@@ -166,7 +184,9 @@ impl<'a> CypherLowering<'a> {
             synth_counter: 0,
             bound_vars: std::collections::HashSet::new(),
             rel_var_edges: std::collections::HashMap::new(),
+            created_rel_vars: std::collections::HashSet::new(),
             node_subject_cache: std::collections::HashMap::new(),
+            stmt_now: None,
         }
     }
 
@@ -189,11 +209,10 @@ impl<'a> CypherLowering<'a> {
     }
 
     fn lower_update(&mut self, update: &Update) -> Result<(), LowerCypherError> {
-        if update.return_clause.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "RETURN on a write statement is deferred in v1",
-            ));
-        }
+        // A trailing RETURN is not part of the Txn: the API layer validates it
+        // (created-entity variables only in v1), supplies a skolem txn id via
+        // `TxnOpts::skolem_txn_id`, and reconstructs the returned rows after
+        // the commit (see `fluree-db-api::cypher_write`). Lowering ignores it.
 
         // A MERGE must be the only write. Each MERGE appends a top-level NOT
         // EXISTS guard evaluated against the pre-transaction snapshot, so
@@ -222,10 +241,26 @@ impl<'a> CypherLowering<'a> {
                      single-Txn staging can't provide",
                 ));
             }
-            if !update.read_clauses.is_empty() && !is_relationship_merge(merges[0]) {
+            // A node MERGE fed by an `UNWIND $batch` row set (which desugars to
+            // an inline VALUES join) is a per-row find-or-create: the NOT EXISTS
+            // guard's identifying props reference the row's columns
+            // (`MERGE (n:Person {id: row.id})`), so it runs once per row against
+            // the pre-write snapshot. A leading *plain MATCH* before a node
+            // MERGE stays rejected — with a row-independent identifying value it
+            // would create one duplicate per matched row (a cartesian footgun);
+            // the batch form carries a per-row key.
+            let node_merge_ok = update
+                .read_clauses
+                .iter()
+                .all(|c| matches!(c, ReadClause::InlineRows { .. }));
+            if !update.read_clauses.is_empty()
+                && !is_relationship_merge(merges[0])
+                && !node_merge_ok
+            {
                 return Err(LowerCypherError::unsupported(
-                    "a leading MATCH is only allowed before a relationship MERGE \
-                     (`MATCH (a),(b) MERGE (a)-[:T]->(b)`) in v1 — a node MERGE must stand alone",
+                    "a leading MATCH before a node MERGE is not supported (it would create one \
+                     duplicate per matched row). Use `UNWIND $batch AS row MERGE (n {id: row.id})` \
+                     for per-row node upsert, or a standalone MERGE.",
                 ));
             }
         }
@@ -298,6 +333,15 @@ impl<'a> CypherLowering<'a> {
                 }
                 // MERGE-standalone is guaranteed by the merge-count guard above.
                 WriteClause::Merge(m) => self.lower_merge(m)?,
+                // Constant-list FOREACH unrolls at param substitution;
+                // reaching here means the list is a runtime expression.
+                WriteClause::Foreach(_) => {
+                    return Err(LowerCypherError::unsupported(
+                        "FOREACH iterates an inline literal list, a constant range(), or a \
+                         `$param` list in v1 — runtime lists (e.g. a collected list) are \
+                         deferred",
+                    ));
+                }
             }
         }
         Ok(())
@@ -557,11 +601,6 @@ impl<'a> CypherLowering<'a> {
                 "variable-length paths in a write MATCH are not allowed",
             ));
         }
-        if rel.props.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "relationship property filters in a write MATCH are deferred — match the connecting nodes instead",
-            ));
-        }
         if rel.types.len() != 1 {
             return Err(LowerCypherError::unsupported(
                 "write MATCH relationships need exactly one type (`-[:T]->`); untyped and alternation forms are deferred",
@@ -581,15 +620,17 @@ impl<'a> CypherLowering<'a> {
             dtc: None,
         };
 
-        match &rel.var {
-            // Anonymous relationship → plain base-edge triple (set semantics).
-            None => out.push(UnresolvedPattern::Triple(edge)),
+        match (&rel.var, &rel.props) {
+            // Anonymous bare relationship → plain base-edge triple (set
+            // semantics).
+            (None, None) => out.push(UnresolvedPattern::Triple(edge)),
             // Named relationship → bind `r` to the annotation SID via an
             // EdgeAnnotation pattern (only matches reifier-bundled edges, which
             // is every LPG/Cypher-written relationship). This makes `SET r.prop`
             // / `REMOVE r.prop` target the relationship's annotation metadata,
-            // and `DELETE r` retract the base edge it reifies.
-            Some(v) => {
+            // and `DELETE r` retract the base edge it reifies. Inline props
+            // (`-[r:T {w: 3}]->`) filter on the annotation's metadata.
+            (Some(v), props) => {
                 // A relationship variable may bind only one edge in a MATCH;
                 // reusing it would make the probe (first occurrence) and the
                 // delete lowering (last occurrence) disagree.
@@ -604,14 +645,50 @@ impl<'a> CypherLowering<'a> {
                 let p_sid = self.ns.sid_for_iri(&type_iri);
                 self.rel_var_edges
                     .insert(v.name.clone(), (s_name, p_sid, o_name));
+                let annotation = UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str()));
+                let body = self.annotation_props_body(&annotation, props.as_ref())?;
                 out.push(UnresolvedPattern::EdgeAnnotation {
                     edge,
-                    annotation: UnresolvedTerm::Var(Arc::from(var_name(&v.name).as_str())),
-                    body: Vec::new(),
+                    annotation,
+                    body,
+                });
+            }
+            // Anonymous property-bearing relationship → filter on a synthetic
+            // annotation subject.
+            (None, Some(_)) => {
+                let annotation = self.fresh_merge_probe();
+                let body = self.annotation_props_body(&annotation, rel.props.as_ref())?;
+                out.push(UnresolvedPattern::EdgeAnnotation {
+                    edge,
+                    annotation,
+                    body,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Annotation-metadata triples for a relationship's inline props
+    /// (`-[r:T {w: 3}]->` → `?r <w> 3`), for an `EdgeAnnotation` body.
+    fn annotation_props_body(
+        &mut self,
+        annotation: &UnresolvedTerm,
+        props: Option<&MapLit>,
+    ) -> Result<Vec<UnresolvedPattern>, LowerCypherError> {
+        let mut body = Vec::new();
+        if let Some(map) = props {
+            for (key, val_expr) in &map.entries {
+                let pred_iri = self.resolve_predicate(key)?;
+                let obj = self.match_object_term(val_expr)?;
+                body.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+                    s: annotation.clone(),
+                    p: UnresolvedTerm::Iri(Arc::from(pred_iri.as_str())),
+                    o: obj,
+                    dtc: None,
+                }));
+            }
+        }
+        Ok(body)
     }
 
     /// The interned variable name for a node: its named variable (`?name`), or
@@ -1126,10 +1203,17 @@ impl<'a> CypherLowering<'a> {
             ));
         }
         if !m.on_match.is_empty() {
+            // MERGE … ON MATCH SET resolves as a conditional write
+            // (probe-or-branch) before reaching this single-Txn lowering:
+            // standalone MERGE probes once; a per-row *relationship* MERGE
+            // (leading MATCH) stages an ON-MATCH-SET branch and a create branch
+            // into one commit. Reaching here means an unsupported shape — a
+            // per-row *node* MERGE with ON MATCH SET, which has no relationship
+            // to partition rows on.
             return Err(LowerCypherError::unsupported(
-                "MERGE … ON MATCH SET is deferred — it needs a complementary guarded \
-                 operation (create is the NOT EXISTS branch; ON MATCH SET is the EXISTS \
-                 branch). v1 supports MERGE [ON CREATE SET …].",
+                "ON MATCH SET on a per-row node MERGE (a leading MATCH before a node MERGE) is \
+                 not supported. Per-row relationship MERGE … ON MATCH SET and standalone \
+                 MERGE … ON MATCH SET are supported.",
             ));
         }
 
@@ -1215,16 +1299,12 @@ impl<'a> CypherLowering<'a> {
                 "MERGE relationship needs exactly one type — `-[:T]->`",
             ));
         }
-        if rel.props.is_some() {
-            return Err(LowerCypherError::unsupported(
-                "properties on a MERGE relationship are deferred — matching them needs an \
-                 annotation-sidecar guard; MERGE the bare edge, or use CREATE",
-            ));
-        }
-
         // NOT EXISTS guard over the whole path: a bound endpoint contributes its
         // MATCH variable (per-row check); an unbound one a fresh existential
-        // probe. Both are joined by the directed type triple.
+        // probe. Both are joined by the directed type triple; inline rel props
+        // (`-[r:T {w: 3}]->`) narrow the guard to edges whose annotation
+        // sidecar carries those values (an unmatched value creates a parallel
+        // edge, per Cypher).
         let head_term = self.merge_endpoint_term(head_node);
         let tail_term = self.merge_endpoint_term(tail_node);
         let mut guard = self.build_merge_guard(head_node, &head_term)?;
@@ -1235,37 +1315,84 @@ impl<'a> CypherLowering<'a> {
             Direction::Incoming => (tail_term, head_term),
             Direction::Either => unreachable!(),
         };
-        guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
+        let edge = UnresolvedTriplePattern {
             s: gs,
             p: UnresolvedTerm::Iri(Arc::from(type_iri.as_str())),
             o: go,
             dtc: None,
-        }));
+        };
+        if rel.props.is_some() {
+            let annotation = self.fresh_merge_probe();
+            let body = self.annotation_props_body(&annotation, rel.props.as_ref())?;
+            guard.push(UnresolvedPattern::EdgeAnnotation {
+                edge,
+                annotation,
+                body,
+            });
+        } else {
+            guard.push(UnresolvedPattern::Triple(edge));
+        }
         self.where_patterns
             .push(UnresolvedPattern::NotExists(guard));
 
-        // Create branch: both endpoints + the directed edge with its bundle.
-        self.lower_create_part(part)?;
+        // ON CREATE SET on the relationship variable folds into the created
+        // edge's inline props (both land on the annotation subject); node-var
+        // items route to their endpoint below.
+        let rel_var = rel.var.as_ref().map(|v| v.name.clone());
+        let mut node_items: Vec<&SetItem> = Vec::new();
+        let mut rel_prop_items: Vec<(String, Expr)> = Vec::new();
+        for item in &m.on_create {
+            if rel_var.as_deref() == Some(set_item_target(item).name.as_str()) {
+                let SetItem::Property {
+                    property, value, ..
+                } = item
+                else {
+                    return Err(LowerCypherError::unsupported(
+                        "ON CREATE SET on a MERGE relationship variable supports single \
+                         properties (`r.prop = value`) in v1",
+                    ));
+                };
+                rel_prop_items.push((property.clone(), value.clone()));
+            } else {
+                node_items.push(item);
+            }
+        }
 
-        // ON CREATE SET — route each item to whichever endpoint var it targets.
-        if !m.on_create.is_empty() {
+        // Create branch: both endpoints + the directed edge with its bundle
+        // (rel-var ON CREATE items appended to the edge's props).
+        if rel_prop_items.is_empty() {
+            self.lower_create_part(part)?;
+        } else {
+            let mut part = part.clone();
+            let rel = &mut part.tail[0].0;
+            rel.props
+                .get_or_insert_with(|| MapLit {
+                    entries: Vec::new(),
+                    span: rel.span,
+                })
+                .entries
+                .extend(rel_prop_items);
+            self.lower_create_part(&part)?;
+        }
+
+        // ON CREATE SET — route each remaining item to its endpoint var.
+        if !node_items.is_empty() {
             let head_subj = self.node_subject(head_node);
             let tail_subj = self.node_subject(tail_node);
             let head_var = head_node.var.as_ref().map(|v| v.name.as_str());
             let tail_var = tail_node.var.as_ref().map(|v| v.name.as_str());
             let head_keys = node_identity_keys(head_node);
             let tail_keys = node_identity_keys(tail_node);
-            for item in &m.on_create {
+            for item in node_items {
                 let tgt = set_item_target(item).name.as_str();
                 if head_var == Some(tgt) {
                     self.emit_on_create_set(&head_subj, head_var, &head_keys, item)?;
                 } else if tail_var == Some(tgt) {
                     self.emit_on_create_set(&tail_subj, tail_var, &tail_keys, item)?;
                 } else {
-                    return Err(LowerCypherError::unsupported(
-                        "ON CREATE SET on a MERGE relationship targets only the endpoint node \
-                         variables in v1 (the relationship variable is deferred)",
-                    ));
+                    return Err(LowerCypherError::unsupported(format!(
+                        "ON CREATE SET target `{tgt}` is not a variable of the MERGE pattern",
+                    )));
                 }
             }
         }
@@ -1482,15 +1609,19 @@ impl<'a> CypherLowering<'a> {
     }
 
     fn lower_create_part(&mut self, part: &PatternPart) -> Result<(), LowerCypherError> {
-        require_node_anchored(&part.head)?;
         let head_subj = self.node_subject(&part.head);
         self.lower_node_create(&part.head, head_subj.clone())?;
+        // An isolated fresh node with no labels and no properties (`CREATE ()`
+        // / `CREATE (n)`) still needs a triple to exist as an RDF subject —
+        // mark it with the system node class (hidden from `labels()`).
+        // Relationship endpoints are anchored by the edge and need no marker.
+        if part.tail.is_empty() && self.is_fresh_bare_node(&part.head) {
+            self.push_node_marker(head_subj.clone());
+        }
 
         let mut prev_subj = head_subj;
         let mut prev_node = &part.head;
         for (rel, next) in &part.tail {
-            // Both nodes must be anchored if they appear in CREATE.
-            require_node_anchored(next)?;
             let next_subj = self.node_subject(next);
             self.lower_node_create(next, next_subj.clone())?;
             self.lower_rel_create(prev_node, &prev_subj, rel, next, &next_subj)?;
@@ -1569,7 +1700,24 @@ impl<'a> CypherLowering<'a> {
         // freshened per WHERE solution (SPARQL §3.1.3), so batched edge inserts
         // mint a distinct annotation per row. The base triple above also makes
         // the edge visible to anonymous (plain-RDF) reads.
-        let ann = self.fresh_bnode();
+        //
+        // A named relationship (`CREATE (a)-[e:T]->(b)`) uses a label derived
+        // from the variable so a trailing `RETURN e` can reconstruct the
+        // created annotation's Sid (the `cy_rel_` prefix keeps it disjoint
+        // from node-variable labels `cy_{name}`).
+        let ann = match &rel.var {
+            Some(v) => {
+                if !self.created_rel_vars.insert(v.name.clone()) {
+                    return Err(LowerCypherError::rejected(format!(
+                        "relationship variable `{}` is bound more than once in CREATE; \
+                         use a distinct name for each relationship",
+                        v.name
+                    )));
+                }
+                TemplateTerm::BlankNode(format!("_:cy_rel_{}", v.name))
+            }
+            None => self.fresh_bnode(),
+        };
         self.emit_reifier_bundle(&ann, &s, &type_sid, &o)?;
         if let Some(props) = &rel.props {
             self.emit_property_triples(&ann, props)?;
@@ -1635,9 +1783,100 @@ impl<'a> CypherLowering<'a> {
             // column, or a MATCH-bound value) fires the property template per
             // solution. Unbound on a given row → that flake is skipped.
             Expr::Var(v) => Ok(self.var_term(&v.name)),
+            // Temporal constructors fold to typed constants at lowering time:
+            // a literal argument parses; zero-arg datetime()/date() take the
+            // statement timestamp (one instant per statement).
+            Expr::Call(call) => self
+                .fold_temporal_constructor(call)?
+                .map(TemplateTerm::Value)
+                .ok_or_else(|| {
+                    LowerCypherError::unsupported(
+                        "CREATE property values must be literals, bound variables, or \
+                         temporal constructors (date/datetime/time/duration) in v1",
+                    )
+                }),
             _ => Err(LowerCypherError::unsupported(
                 "CREATE property values must be literals or bound variables in v1",
             )),
+        }
+    }
+
+    /// Fold a temporal constructor call to a typed value. `Ok(None)` when the
+    /// call is not a temporal constructor (the caller reports its own error).
+    fn fold_temporal_constructor(
+        &mut self,
+        call: &fluree_db_cypher::ast::FuncCall,
+    ) -> Result<Option<FlakeValue>, LowerCypherError> {
+        use fluree_db_core::temporal::{cypher_temporal_constructor, DateTime};
+        let name = call.name.to_ascii_lowercase();
+        match (name.as_str(), call.args.as_slice()) {
+            ("datetime" | "date", []) => {
+                let now = self
+                    .stmt_now
+                    .get_or_insert_with(DateTime::now_utc)
+                    .to_string();
+                let value = match name.as_str() {
+                    "datetime" => cypher_temporal_constructor("datetime", &now),
+                    // The date part of the statement timestamp.
+                    _ => cypher_temporal_constructor("date", &now[..10]),
+                };
+                match value {
+                    Some(Ok(v)) => Ok(Some(v)),
+                    _ => Err(LowerCypherError::unsupported(
+                        "internal: statement timestamp did not parse",
+                    )),
+                }
+            }
+            (
+                "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration",
+                [Expr::Lit(Literal::String(s, _))],
+            ) => match cypher_temporal_constructor(&name, s) {
+                Some(Ok(v)) => Ok(Some(v)),
+                Some(Err(e)) => Err(LowerCypherError::unsupported(format!(
+                    "invalid {name}() literal `{s}`: {e}"
+                ))),
+                None => Ok(None),
+            },
+            // Component map: `date({year: 2024, month: 1, day: 15})` etc.,
+            // with constant components.
+            (
+                "date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration",
+                [Expr::Map(entries, _)],
+            ) => {
+                use fluree_db_core::temporal::{
+                    cypher_temporal_from_components, TemporalComponent,
+                };
+                let fields = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        let c = match v {
+                            Expr::Lit(Literal::Integer(n, _)) => TemporalComponent::Int(*n),
+                            Expr::Lit(Literal::String(s, _)) => TemporalComponent::Str(s.clone()),
+                            _ => {
+                                return Err(LowerCypherError::unsupported(format!(
+                                    "{name}({{…}}) components must be constant integers (or a \
+                                     timezone string) in v1 — `{k}` is not"
+                                )))
+                            }
+                        };
+                        Ok((k.clone(), c))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match cypher_temporal_from_components(&name, &fields) {
+                    Some(Ok(v)) => Ok(Some(v)),
+                    Some(Err(e)) => Err(LowerCypherError::unsupported(format!(
+                        "invalid {name}({{…}}): {e}"
+                    ))),
+                    None => Ok(None),
+                }
+            }
+            ("date" | "datetime" | "localdatetime" | "time" | "localtime" | "duration", _) => {
+                Err(LowerCypherError::unsupported(format!(
+                    "{name}() takes a literal string (e.g. {name}('2024-01-15')) or a constant \
+                     component map; for date()/datetime(), no argument"
+                )))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -1663,6 +1902,27 @@ impl<'a> CypherLowering<'a> {
             terms.push(self.expr_to_object(item)?);
         }
         Ok(terms)
+    }
+
+    /// Whether a CREATE node is freshly minted (not a MATCH-bound reference)
+    /// and carries no labels or inline properties.
+    fn is_fresh_bare_node(&self, n: &NodePattern) -> bool {
+        let bound = n
+            .var
+            .as_ref()
+            .is_some_and(|v| self.bound_vars.contains(&v.name));
+        !bound && n.labels.is_empty() && n.props.is_none()
+    }
+
+    /// Assert the `db:Node` existence marker for a bare created node.
+    fn push_node_marker(&mut self, subj: TemplateTerm) {
+        let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
+        let node_sid = self.ns.sid_for_iri(fluree_vocab::fluree::NODE);
+        self.insert_templates.push(TripleTemplate::new(
+            subj,
+            TemplateTerm::Sid(rdf_type_sid),
+            TemplateTerm::Sid(node_sid),
+        ));
     }
 
     fn node_subject(&mut self, n: &NodePattern) -> TemplateTerm {
@@ -1696,7 +1956,13 @@ impl<'a> CypherLowering<'a> {
         if let Some(iri) = self.overrides.get(name) {
             return iri.clone();
         }
-        format!("{}{}", self.vocab, name)
+        match &self.vocab {
+            Some(vocab) => format!("{vocab}{name}"),
+            // No @vocab: bare names land under namespace 0 (the empty
+            // prefix is a pre-registered builtin, so `sid_for_iri`
+            // never allocates for them).
+            None => name.to_string(),
+        }
     }
 
     fn resolve_predicate(&self, name: &str) -> Result<String, LowerCypherError> {
@@ -1726,15 +1992,6 @@ fn set_item_target(item: &SetItem) -> &Variable {
         | SetItem::MapReplace { target, .. }
         | SetItem::Labels { target, .. } => target,
     }
-}
-
-fn require_node_anchored(node: &NodePattern) -> Result<(), LowerCypherError> {
-    if node.labels.is_empty() && node.props.is_none() && node.var.is_none() {
-        return Err(LowerCypherError::rejected(
-            "bare `()` node in CREATE — every node needs a variable, a label, or a property",
-        ));
-    }
-    Ok(())
 }
 
 /// A standalone node in a write-statement MATCH must carry a label or a

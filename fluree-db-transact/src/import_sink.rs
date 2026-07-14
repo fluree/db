@@ -751,8 +751,13 @@ mod inner {
                     id
                 }
                 None => {
+                    // Anonymous mint: leading '-' keeps the namespace
+                    // disjoint from every lexable user label (labels cannot
+                    // start with '-'), while the full skolemized
+                    // `fdb-{txn}--b{N}` stays serializable — see
+                    // `FlakeSink::term_blank` for the full rationale.
                     self.blank_counter += 1;
-                    let label = format!("b{}", self.blank_counter);
+                    let label = format!("-b{}", self.blank_counter);
                     let sid = self.skolemize(&label);
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
@@ -805,6 +810,71 @@ mod inner {
             index: i32,
         ) {
             self.push_triple(subject, predicate, object, Some(index));
+        }
+
+        fn supports_reified_triples(&self) -> bool {
+            true
+        }
+
+        /// Turtle-star reifier attachment → the durable `f:reifies*` bundle,
+        /// built by the shared
+        /// [`crate::generate::flakes::reified_triple_bundle`] (bit-identical
+        /// with the JSON-LD `@annotation` lowering and with `FlakeSink`'s
+        /// transactional path) and streamed through the commit writer (and
+        /// spool, when attached) exactly like ordinary triples. The base
+        /// triple has already been emitted by the parser via `emit_triple`.
+        fn emit_reified_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            reifier: TermId,
+        ) {
+            let Some(s) = self.resolve_sid(subject) else {
+                return;
+            };
+            let Some(p) = self.resolve_sid(predicate) else {
+                return;
+            };
+            let Some((o, dtc)) = self.resolve_object(object) else {
+                return;
+            };
+            let Some(ann) = self.resolve_sid(reifier) else {
+                return;
+            };
+
+            let bundle =
+                match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
+                    Ok(bundle) => bundle,
+                    Err(e) => {
+                        if self.encode_error.is_none() {
+                            let msg = format!("invariant violation in reifier bundle: {e}");
+                            tracing::error!("ImportSink: {msg}");
+                            self.encode_error = Some(CommitCodecError::InvalidOp(msg));
+                        }
+                        return;
+                    }
+                };
+            for flake in bundle {
+                if let Err(e) = self.writer.push_flake(&flake) {
+                    if self.encode_error.is_none() {
+                        tracing::error!("ImportSink: reifier bundle flake encode failed: {}", e);
+                        self.encode_error = Some(e);
+                    }
+                    return; // Don't spool a flake that failed to encode
+                }
+                if let Some(ctx) = &mut self.spool_ctx {
+                    ctx.write_record(FlakeRecord {
+                        s: &flake.s,
+                        p: &flake.p,
+                        o: &flake.o,
+                        dt: &flake.dt,
+                        lang: flake.m.as_ref().and_then(|m| m.lang.as_deref()),
+                        list_index: None,
+                        t: self.t,
+                    });
+                }
+            }
         }
     }
 
@@ -962,6 +1032,41 @@ mod inner {
             assert_eq!(f.dt, Sid::new(fluree_vocab::namespaces::RDF, "langString"));
             let meta = f.m.as_ref().expect("should have meta");
             assert_eq!(meta.lang.as_deref(), Some("en"));
+        }
+
+        #[test]
+        fn test_reified_triple_streams_jsonld_compatible_bundle() {
+            // The import path must write the SAME bundle shape as the
+            // transactional FlakeSink / JSON-LD lowering: base triple +
+            // S/P/O bundle, no f:reifiesDatatype, decodable to the base
+            // edge's EdgeKey.
+            use fluree_db_core::edge::EdgeKey;
+            use fluree_db_core::namespaces::is_reifies_datatype;
+
+            let mut ns = NamespaceRegistry::new();
+            let mut sink = make_sink_and_parse(&mut ns, 1).unwrap();
+
+            let s = sink.term_iri("http://example.org/alice");
+            let p = sink.term_iri("http://example.org/worksFor");
+            let o = sink.term_iri("http://example.org/acme");
+            let r = sink.term_iri("http://example.org/reifier");
+            sink.emit_triple(s, p, o);
+            sink.emit_reified_triple(s, p, o, r);
+
+            let (writer, _prefix_map, _spool) = sink.finish().unwrap();
+            assert_eq!(writer.op_count(), 4, "base + 3 bundle flakes");
+
+            let result = writer.finish(&make_envelope(1)).unwrap();
+            let decoded = read_commit(&result.bytes).unwrap();
+            assert_eq!(decoded.flakes.len(), 4);
+            let base = &decoded.flakes[0];
+            let bundle = &decoded.flakes[1..];
+            assert!(
+                !bundle.iter().any(|f| is_reifies_datatype(&f.p)),
+                "import bundle must omit f:reifiesDatatype: {bundle:?}"
+            );
+            let key = EdgeKey::from_reifies_facts(bundle).expect("bundle decodes");
+            assert_eq!(key, EdgeKey::from_flake(base));
         }
 
         #[test]

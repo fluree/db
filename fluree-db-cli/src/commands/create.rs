@@ -13,10 +13,12 @@ pub struct ImportOpts {
     pub chunk_size_mb: usize,
     pub leaflet_rows: usize,
     pub leaflets_per_leaf: usize,
-    /// CSV import: how relationship (edge) properties are encoded.
+    /// CSV/Cypher import: how relationship (edge) properties are encoded.
     pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
-    /// CSV import: base IRI namespace for minted ids/predicates/classes.
-    pub base_iri: String,
+    /// CSV/Cypher import: base IRI namespace for minted ids/predicates/classes.
+    /// `None` = the format's default (CSV: `http://example.org/`; Cypher: bare
+    /// namespace-0 names).
+    pub base_iri: Option<String>,
 }
 
 /// `fluree create <ledger> --remote <name>` — create an empty ledger on the
@@ -319,6 +321,12 @@ pub async fn run(
         // understand RDF/JSON-LD.
         Some(path) if is_csv_input(path) => {
             run_csv_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
+        }
+        // Cypher scripts (.cypher/.cyp/.cql of CREATE / MATCH…CREATE
+        // statements) are converted to newline-delimited JSON-LD and loaded
+        // through the same chunked bulk-import pipeline.
+        Some(path) if is_cypher_input(path) => {
+            run_cypher_import(&fluree, ledger, path, dirs, verbose, quiet, import_opts).await?;
         }
         Some(path) if path.is_dir() => {
             // Validate directory format (catches mixed formats & empty dirs).
@@ -956,6 +964,28 @@ fn has_csv_extension(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
 }
 
+/// Whether `--from` points at a Cypher script: a single `.cypher`/`.cyp`/`.cql`
+/// file, or a directory containing at least one.
+fn is_cypher_input(path: &Path) -> bool {
+    if path.is_dir() {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .any(|e| has_cypher_extension(&e.path()))
+    } else {
+        has_cypher_extension(path)
+    }
+}
+
+fn has_cypher_extension(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        e.eq_ignore_ascii_case("cypher")
+            || e.eq_ignore_ascii_case("cyp")
+            || e.eq_ignore_ascii_case("cql")
+    })
+}
+
 /// Convert CSV node/relationship files (neo4j-admin header convention) to
 /// newline-delimited JSON-LD in a temp directory, then load through the existing
 /// **chunked, parallel bulk-import pipeline** (the same path as `--from data/`
@@ -993,7 +1023,10 @@ async fn run_csv_import(
 
     let opts = CsvImportOptions {
         edge_policy: import_opts.edge_policy,
-        base_iri: import_opts.base_iri.clone(),
+        base_iri: import_opts
+            .base_iri
+            .clone()
+            .unwrap_or_else(|| CsvImportOptions::default().base_iri),
         ..Default::default()
     };
 
@@ -1033,6 +1066,144 @@ async fn run_csv_import(
     }
     if !quiet {
         println!("Converted {total_objects} object(s); importing...");
+    }
+
+    // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).
+    run_bulk_import(
+        fluree,
+        ledger,
+        tmp.path(),
+        dirs.data_dir(),
+        verbose,
+        quiet,
+        import_opts,
+    )
+    .await
+}
+
+/// Convert Cypher scripts (CREATE / MATCH…CREATE statements, the Neo4j /
+/// Memgraph dump convention) to newline-delimited JSON-LD in a temp directory,
+/// then load through the existing **chunked, parallel bulk-import pipeline** —
+/// instead of replaying statements one at a time over the transactional write
+/// path. Three sequential passes over the input (each statement parsed once):
+/// learn match-key property sets, emit nodes, emit edges.
+async fn run_cypher_import(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    verbose: bool,
+    quiet: bool,
+    import_opts: &ImportOpts,
+) -> CliResult<()> {
+    use fluree_db_api::cypher_import::{CypherImportOptions, CypherImporter};
+    use std::io::{BufReader, BufWriter, Write};
+
+    let files: Vec<std::path::PathBuf> = if path.is_dir() {
+        let mut v: Vec<_> = std::fs::read_dir(path)
+            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| has_cypher_extension(p))
+            .collect();
+        v.sort();
+        v
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if files.is_empty() {
+        return Err(CliError::Input(format!(
+            "no .cypher files found in {}",
+            path.display()
+        )));
+    }
+
+    let mut importer = CypherImporter::new(CypherImportOptions {
+        edge_policy: import_opts.edge_policy,
+        vocab: import_opts.base_iri.clone(),
+    });
+
+    let open = |p: &Path| {
+        std::fs::File::open(p)
+            .map(BufReader::new)
+            .map_err(|e| CliError::Input(format!("failed to open {}: {e}", p.display())))
+    };
+    let convert_err =
+        |p: &Path, e| CliError::Input(format!("Cypher import ({}): {e}", p.display()));
+
+    if !quiet {
+        println!(
+            "Converting {} Cypher file(s) → JSON-LD (edge properties: {:?})...",
+            files.len(),
+            import_opts.edge_policy
+        );
+    }
+
+    // Pass 1 over all files: learn each label's match-key property set, so
+    // node ids derive identically regardless of which file MATCHes them.
+    for p in &files {
+        importer
+            .learn_keys(open(p)?)
+            .map_err(|e| convert_err(p, e))?;
+    }
+
+    // Passes 2 + 3: one `.jsonl` shard per source file per pass (node shards
+    // first), letting the bulk pipeline parallelize across shards. Temp dir is
+    // cleaned up on drop, after the import completes.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
+    let mut total_objects = 0usize;
+    for pass in 0..2 {
+        for (i, src) in files.iter().enumerate() {
+            let stem = src
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(sanitize_for_filename)
+                .unwrap_or_else(|| format!("part{i}"));
+            let (kind, shard) = match pass {
+                0 => ("nodes", i),
+                _ => ("edges", files.len() + i),
+            };
+            let out_path = tmp.path().join(format!("{shard:05}_{stem}_{kind}.jsonl"));
+            let mut writer = BufWriter::new(
+                std::fs::File::create(&out_path)
+                    .map_err(|e| CliError::Input(format!("failed to write temp jsonl: {e}")))?,
+            );
+            let written = match pass {
+                0 => importer.write_nodes_ndjson(open(src)?, &mut writer),
+                _ => importer.write_edges_ndjson(open(src)?, &mut writer),
+            }
+            .map_err(|e| convert_err(src, e))?;
+            writer
+                .into_inner()
+                .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))
+                .and_then(|mut f| {
+                    f.flush()
+                        .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))
+                })?;
+            if written == 0 {
+                std::fs::remove_file(&out_path).ok(); // keep the shard set dense
+            }
+            total_objects += written;
+        }
+    }
+    if total_objects == 0 {
+        return Err(CliError::Input(
+            "Cypher input produced no data (no CREATE statements found)".to_string(),
+        ));
+    }
+
+    let stats = importer.stats;
+    if !quiet {
+        println!(
+            "Converted {} object(s) ({} nodes, {} edges); importing...",
+            total_objects, stats.nodes, stats.edges
+        );
+    }
+    if stats.edges_skipped > 0 {
+        eprintln!(
+            "warning: skipped {} MATCH…CREATE edge(s) whose endpoint node was never created",
+            stats.edges_skipped
+        );
     }
 
     // Hand the temp dir of `.jsonl` to the bulk import (chunked + progress).

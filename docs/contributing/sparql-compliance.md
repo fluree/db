@@ -25,7 +25,13 @@ cd testsuite-sparql
 cargo test
 ```
 
-This runs all non-ignored W3C test suites. Currently that includes SPARQL 1.0 and 1.1 syntax tests. Query evaluation tests (12 categories, 327 tests) are registered but `#[ignore]`'d — run them with `--include-ignored` or via the Makefile.
+This runs **every** registered W3C test suite: SPARQL 1.0 and 1.1 syntax,
+all 1.1 query-evaluation categories, SPARQL UPDATE (syntax + evaluation),
+result formats (JSON/CSV/TSV), SPARQL 1.2, and the infrastructure suites.
+Every suite must be green: each test either passes or appears in that suite's
+explicit skip register (see "Managing the Skip List"). CI runs exactly this
+command — a new failure *or* a stale skip entry (a registered test that now
+passes) fails the build.
 
 ### Run a Specific Suite
 
@@ -36,11 +42,14 @@ cargo test sparql11_syntax_query_tests
 # SPARQL 1.0 syntax only
 cargo test sparql10_syntax_tests
 
-# Full query evaluation (~5 min, includes all 12 categories)
-cargo test sparql11_query_w3c_testsuite -- --include-ignored
-
 # Single evaluation category
-cargo test sparql11_functions -- --include-ignored
+cargo test sparql11_functions
+
+# SPARQL UPDATE (syntax + evaluation)
+cargo test sparql11_update_tests
+
+# SPARQL 1.2 (RDF-star) suites
+cargo test sparql12_
 ```
 
 ### Run With Verbose Output
@@ -57,33 +66,25 @@ The `testsuite-sparql/Makefile` provides convenience targets:
 
 ```bash
 # --- Running tests ---
-make test              # Run syntax tests (live output)
-make test-syntax11     # SPARQL 1.1 syntax tests only
-make test-syntax10     # SPARQL 1.0 syntax tests only
-make test-eval         # Full eval suite, all 12 categories
-make test-eval-cat CAT=functions
-                       # Run one eval category
-make test-eval10       # Run SPARQL 1.0 eval tests
+make test              # Full compliance suite (identical to CI)
+make test-cat CAT=sparql11_functions
+                       # Run one suite (fn names in tests/w3c_sparql.rs)
 
 # --- Reports ---
-make count-eval        # Quick pass/fail counts for eval tests
-make report-eval-json  # JSON report for 1.1 eval → report-eval.json
-make report-10-json    # JSON report for 1.0 eval → report-10.json
-make cat-json CAT=functions
-                       # JSON report for a single category
+make report-cat CAT=sparql11_update_tests
+                       # JSON report for one suite -> report-<suite>.json
+make report-10-json    # JSON report for the SPARQL 1.0 eval suite
 
-# --- Analysis (requires report-eval.json) ---
-make summary           # Per-category pass/fail breakdown
-make classify          # Group failures by error type
-make failures-eval     # List all eval failures with type
-make failures-eval CAT=functions
-                       # Filter failures to one category
+# --- Analysis (on a report generated above) ---
+make summary REPORT=report-sparql11_update_tests.json
+make classify REPORT=report-sparql11_update_tests.json
+make failures-cat REPORT=report-sparql11_update_tests.json
 
 # --- Investigating specific tests ---
-make investigate-eval TEST=substring01
-                       # Search eval report for a test
+make investigate TEST=pp16
+                       # Register entries + matching files for a test
 make show-query TEST=syntax-select-expr-04.rq
-                       # Print the .rq file for a test
+                       # Print the .rq/.ru file for a test
 make clean             # Remove generated report files
 ```
 
@@ -139,13 +140,14 @@ The fragment (`#test_34`) identifies the specific test within that manifest. The
 
 ### Per-Category Breakdown
 
-Use `make summary` to see pass/fail rates by W3C category:
+Generate a per-suite JSON report, then summarize it:
 
 ```bash
-make summary
+make report-cat CAT=sparql10_query_eval_tests
+make summary REPORT=report-sparql10_query_eval_tests.json
 ```
 
-This requires `report-eval.json` (generated automatically if missing). Output looks like:
+Output looks like:
 
 ```
 Category                  Pass  Fail Total    Rate
@@ -160,10 +162,10 @@ TOTAL                      167   160   327   51.1%
 
 ### Error Classification
 
-Use `make classify` to group failures by root cause:
+Use `make classify` to group a report's failures by root cause:
 
 ```bash
-make classify
+make classify REPORT=report-sparql10_query_eval_tests.json
 ```
 
 Error types:
@@ -179,11 +181,10 @@ Error types:
 
 ### Listing Failures
 
-Use `make failures-eval` to list all failures with their type and first error line:
+Use `make failures-cat` to list a report's failures with their type and first error line:
 
 ```bash
-make failures-eval               # All failures
-make failures-eval CAT=functions # Just one category
+make failures-cat REPORT=report-sparql11_update_tests.json
 ```
 
 ### JSON Reports
@@ -191,9 +192,8 @@ make failures-eval CAT=functions # Just one category
 For programmatic analysis, generate a JSON report:
 
 ```bash
-make report-eval-json    # → report-eval.json
-make report-10-json      # → report-10.json
-make cat-json CAT=bind   # → report-bind.json
+make report-cat CAT=sparql11_bind   # → report-sparql11_bind.json
+make report-10-json                 # → report-sparql10_query_eval_tests.json
 ```
 
 Report format:
@@ -211,9 +211,9 @@ Report format:
 The analysis script at `scripts/analyze_report.py` can also be used directly:
 
 ```bash
-python3 scripts/analyze_report.py summary report-eval.json
-python3 scripts/analyze_report.py classify report-eval.json
-python3 scripts/analyze_report.py failures report-eval.json --category functions
+python3 scripts/analyze_report.py summary report-<suite>.json
+python3 scripts/analyze_report.py classify report-<suite>.json
+python3 scripts/analyze_report.py failures report-<suite>.json --category functions
 ```
 
 ## From Failure to Fix: The Workflow
@@ -323,7 +323,7 @@ After making code changes:
 cargo test sparql11_syntax_query_tests -- --nocapture 2>&1 | grep "test_34"
 
 # Verify you haven't regressed other tests
-make count-eval
+make test
 
 # Run the parser's own tests (from workspace root)
 cd .. && cargo test -p fluree-db-sparql
@@ -414,15 +414,19 @@ The parser code for BIND is in fluree-db-sparql/src/parser/. Please find the
 common root cause and fix all three.
 ```
 
-## JSON-LD Query Parity
+## Query Surface Parity (JSON-LD)
 
-SPARQL and JSON-LD queries in Fluree compile to the **same intermediate representation** (`fluree-db-query/src/ir.rs`) and share the entire execution engine. This means:
+SPARQL, JSON-LD query, and Cypher (`fluree-db-cypher`) all compile to the **same intermediate representation** (`fluree-db-query/src/ir.rs`) and share the entire execution engine. Team guideline — every W3C compliance fix must classify itself as one of:
 
-1. **Shared code changes affect both languages.** If you add a new `Expression` variant, `Pattern` variant, or `AggregateFn` for SPARQL, it automatically becomes available to JSON-LD query as well. Ensure JSON-LD tests still pass.
+1. **IR/engine-level fix** (evaluation semantics, planner, operators, storage): the fix lands once and applies to all surfaces implicitly — the user-facing syntax of each surface is unchanged. Still add a JSON-LD regression test for the fixed behavior (see below): the W3C submodule guards the SPARQL surface, but nothing guards the same semantics through the JSON-LD surface unless we write it.
 
-2. **New SPARQL features may need JSON-LD test coverage.** If a feature you're implementing for SPARQL compliance (e.g., a new built-in function, a new filter operator) is also expressible in JSON-LD query syntax, add corresponding JSON-LD integration tests.
+2. **Surface-syntax addition**: if we make something newly *possible in SPARQL* (new function, operator, clause, or syntax), it must also be made possible in JSON-LD query syntax as part of the same effort — with its own tests. Fluree **owns** the JSON-LD query syntax, so this is always within our power.
 
-3. **Some features are SPARQL-only.** Property paths, RDF-star, ASK query form, and SPARQL Update don't have JSON-LD equivalents. These don't require parity testing.
+3. **SPARQL-only surface features**: property paths syntax, RDF-star/annotation syntax, ASK query form, and SPARQL UPDATE text forms have no JSON-LD equivalent. These don't require syntax parity — but if the underlying IR/engine capability is new (e.g., a new pattern type), consider whether JSON-LD should be able to express it and record the decision.
+
+**Cypher is deliberately excluded from this guideline.** We do not own the openCypher grammar and do not introduce custom Cypher syntax, so SPARQL compliance work carries no Cypher syntax obligations. Cypher benefits from IR/engine-level fixes automatically; what openCypher exposes is governed separately by `docs/reference/cypher-support-matrix.md`.
+
+**Regression-test rule:** a compliance fix is not done when the W3C test goes green — it is done when the register entry is removed AND an equivalent JSON-LD test exists for behavior that JSON-LD can express.
 
 ### Where to add parity tests
 
@@ -430,13 +434,14 @@ SPARQL and JSON-LD queries in Fluree compile to the **same intermediate represen
 | -------- | ---------- |
 | SPARQL   | `fluree-db-api/tests/it_query_sparql.rs` |
 | JSON-LD  | `fluree-db-api/tests/it_query.rs`, `it_query_analytical.rs`, `it_query_grouping.rs` |
+| UPDATE / transact | `fluree-db-api/tests/it_transact_update.rs`, `it_named_graphs.rs` (SPARQL UPDATE and JSON-LD transactions share the `Txn` IR — fixes to either surface add the counterpart test here) |
 | Shared   | Unit tests in `fluree-db-query/src/` modules |
 
 ### Validation after shared-code changes
 
 ```bash
 # SPARQL W3C tests (from testsuite-sparql/)
-make test-eval-cat CAT=<category>
+make test-cat CAT=<suite fn name>
 
 # JSON-LD query tests (from workspace root) — integration tests are grouped
 # into grp_* binaries; run a whole group or filter to one file's module.
@@ -480,7 +485,7 @@ testsuite-sparql/
 
 **2. Handler Dispatch** (`evaluator.rs`): `TestEvaluator` maps test type URIs (e.g., `mf:PositiveSyntaxTest11`) to handler functions. For each test, it finds the matching handler and invokes it.
 
-**3. SPARQL Handlers** (`sparql_handlers.rs` + `query_handler.rs`): The Fluree-specific logic. Both syntax and evaluation tests run in isolated **subprocesses** via the `run-w3c-test` binary (`subprocess.rs`). For syntax tests, the subprocess calls `parse_sparql()` + `validate()` and reports whether errors were found (5-second timeout). For evaluation tests, the subprocess creates an in-memory Fluree ledger, loads Turtle test data, executes the SPARQL query, and compares results against expected `.srx`/`.srj` files using isomorphic matching (10-second timeout). If a test exceeds its timeout, the parent kills the child process — no zombie threads.
+**3. SPARQL Handlers** (`sparql_handlers.rs` + `query_handler.rs`): The Fluree-specific logic. Syntax, query-evaluation, and update-evaluation tests all run in isolated **subprocesses** via the `run-w3c-test` binary (`subprocess.rs`). For syntax tests, the subprocess calls `parse_sparql()` + `validate()` and reports whether errors were found (5-second timeout). Note the surface split: syntax tests validate with the strict `Capabilities::default()`, while the production update seam (`fluree-db-api`'s `parse_and_lower_sparql_update`) runs the same `validate()` pass with `Capabilities::with_delete_where_extensions()` — identical rules except that Fluree's documented DELETE WHERE extensions (existential blank nodes; anonymous annotation tails) are admitted. The negative-update-syntax tests that reject those two shapes therefore guard the strict surface only; the production seam's behavior is pinned by `fluree-db-api` integration tests (`it_transact_update.rs`). For query evaluation tests, the subprocess creates an in-memory Fluree ledger, loads default-graph Turtle plus named graphs (each wrapped as a TriG `GRAPH` block through the transact builder), executes the SPARQL query, and compares results against expected `.srx`/`.srj`/`.ttl`/`.csv`/`.tsv` files using isomorphic matching (10-second timeout). For update evaluation tests (`mf:UpdateEvaluationTest`), the subprocess loads the initial graph-store state (`ut:data`/`ut:graphData`), applies the update through the public `sparql_update` transact surface, and compares the resulting default-graph and named-graph states against `mf:result`'s expected state, including a check for unexpected non-empty named graphs. If a test exceeds its timeout, the parent kills the child process — no zombie threads.
 
 **4. Test Entry Points** (`tests/w3c_sparql.rs`): Each test function is ~5 lines — just a manifest URL and a skip list. The harness does the rest.
 
@@ -503,7 +508,7 @@ testsuite-sparql/
 
 ### Query Evaluation Tests (Phase 2)
 
-Each test creates an in-memory Fluree ledger, loads RDF data, executes a SPARQL query, and compares results against W3C expected outputs. Run with `make test-eval-cat CAT=<name>`.
+Each test creates an in-memory Fluree ledger, loads RDF data, executes a SPARQL query, and compares results against W3C expected outputs. Run with `make test-cat CAT=<suite fn name>`.
 
 | Suite              | What It Tests                                   | Manifest                          |
 | ------------------ | ----------------------------------------------- | --------------------------------- |
@@ -535,7 +540,12 @@ Each test creates an in-memory Fluree ledger, loads RDF data, executes a SPARQL 
 
 ## Managing the Skip List
 
-Skip entries are the `ignored_tests` parameter in `check_testsuite()` calls:
+Skip entries live in `tests/registers/mod.rs` — one `pub const` per suite,
+passed as the `ignored_tests` parameter of that suite's `check_testsuite()`
+call. The register is enforced in **both directions**: an unregistered
+failure fails the suite, and a registered test that now *passes* also fails
+the suite (stale entry — remove it in the same change that fixes the
+feature). Entries look like:
 
 ```rust
 check_testsuite(

@@ -46,12 +46,37 @@ pub struct R2rmlRewriteResult {
     /// Non-lowered sub-scope patterns that would evaluate against the R2RML
     /// graph source's (empty) native index and **silently return no rows** —
     /// property paths, shortest paths, and subqueries, whose bodies traverse or
-    /// scan the enclosing graph. The caller MUST error when this is non-empty
-    /// rather than hand back a silently-wrong empty result. Holds each SPARQL
-    /// kind name for the error message. Deliberately excludes the search
-    /// patterns (index/vector/geo/s2): they carry their own `graph_source_id`
-    /// and route independently of this scope.
+    /// scan the enclosing graph. The caller MUST error (via
+    /// [`unsupported_subscope_error`]) when this is non-empty rather than hand
+    /// back a silently-wrong empty result. Holds each SPARQL kind name for the
+    /// error message. Deliberately excludes the search patterns
+    /// (index/vector/geo/s2): they carry their own `graph_source_id` and route
+    /// independently of this scope.
     pub unsupported: Vec<&'static str>,
+}
+
+/// Build the loud-refuse error for [`R2rmlRewriteResult::unsupported`].
+///
+/// Shared by every GRAPH execution path that consumes a rewrite result (the
+/// seeded and batched operators in `graph.rs`) so the user-facing message
+/// cannot drift between them. Kind names are deduplicated preserving first
+/// occurrence: two property paths in one scope read "property path", not
+/// "property path, property path".
+pub fn unsupported_subscope_error(graph_iri: &str, kinds: &[&str]) -> crate::error::QueryError {
+    let mut unique: Vec<&str> = Vec::with_capacity(kinds.len());
+    for &kind in kinds {
+        if !unique.contains(&kind) {
+            unique.push(kind);
+        }
+    }
+    crate::error::QueryError::InvalidQuery(format!(
+        "R2RML graph source '{}' contains pattern(s) that cannot be evaluated over a \
+         virtual dataset (an R2RML source has no native index, so these would silently \
+         return no rows): {}. Rewrite them as basic triple patterns or move them outside \
+         the GRAPH block.",
+        graph_iri,
+        unique.join(", ")
+    ))
 }
 
 /// Rewrite patterns for an R2RML graph source.
@@ -898,10 +923,10 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(v) => (Some(*v), None),
         Ref::Iri(iri) => (None, Some(iri.to_string())),
         // A bound SID subject we cannot decode to an IRI is left unconverted.
-        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
-            Some(iri) => (None, Some(iri)),
-            None => return None,
-        },
+        Ref::Sid(sid) => {
+            let iri = snapshot.decode_sid(sid)?;
+            (None, Some(iri))
+        }
     };
 
     // Build a pattern for `object_var`, carrying either the subject variable or
@@ -1671,7 +1696,31 @@ mod tests {
             )),
         ];
         let r = rewrite_patterns_for_r2rml(&patterns, "gs:main", &snapshot, None, false, false);
-        assert!(r.unsupported.is_empty(), "VALUES must not be flagged unsupported");
+        assert!(
+            r.unsupported.is_empty(),
+            "VALUES must not be flagged unsupported"
+        );
         assert_eq!(r.converted_count, 1, "the wildcard triple still converts");
+    }
+
+    /// PR-0/0a (review follow-up): repeated kind names collapse in the
+    /// user-facing message — two property paths in one scope read
+    /// "property path", not "property path, property path" — and first-seen
+    /// order is preserved.
+    #[test]
+    fn unsupported_subscope_error_dedups_kinds() {
+        let err =
+            unsupported_subscope_error("gs:main", &["property path", "property path", "subquery"]);
+        let msg = err.to_string();
+        assert_eq!(
+            msg.matches("property path").count(),
+            1,
+            "repeated kinds must collapse to one mention: {msg}"
+        );
+        assert!(
+            msg.contains("property path, subquery"),
+            "first-seen order must be preserved: {msg}"
+        );
+        assert!(msg.contains("gs:main"), "names the graph source: {msg}");
     }
 }

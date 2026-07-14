@@ -69,6 +69,7 @@
 - [Guides (cookbooks)](guides/README.md)
   - [Query patterns](guides/cookbook-query-patterns.md)
   - [Cypher](guides/cookbook-cypher.md)
+  - [Connecting with Neo4j drivers (Bolt)](guides/bolt.md)
   - [SPARQL](guides/cookbook-sparql.md)
   - [Full-text and vector search](guides/cookbook-search.md)
   - [Time travel patterns](guides/cookbook-time-travel.md)
@@ -100,6 +101,7 @@
   - [Endpoints](api/endpoints.md)
   - [Multi-query envelope](api/multi-query.md)
   - [Streaming query (NDJSON)](api/streaming-query.md)
+  - [Bolt protocol](api/bolt.md)
   - [Headers, content types, and request sizing](api/headers.md)
   - [Signed requests (JWS/VC)](api/signed-requests.md)
   - [Errors and status codes](api/errors.md)
@@ -223,7 +225,6 @@
   - [Standards and feature flags](reference/compatibility.md)
   - [Graph identities and naming](reference/graph-identities.md)
   - [OWL & RDFS support](reference/owl-rdfs-support.md)
-  - [openCypher support matrix](reference/cypher-support-matrix.md)
   - [Crate map](reference/crate-map.md)
 
 - [Contributing](contributing/README.md)

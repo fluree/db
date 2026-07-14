@@ -693,6 +693,18 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_STORAGE_PROXY_TOKEN_FILE")]
     pub storage_proxy_token_file: Option<PathBuf>,
 
+    // === Bolt protocol options ===
+    /// Address for the Bolt protocol listener (Neo4j drivers; conventional
+    /// port 7687). Unset disables Bolt. Requires the `bolt` build feature.
+    #[arg(long, env = "FLUREE_BOLT_LISTEN_ADDR")]
+    pub bolt_listen_addr: Option<SocketAddr>,
+
+    /// Ledger served to Bolt sessions that name no `db` (in HELLO defaults
+    /// or per-RUN metadata). Sessions with no `db` and no default fail
+    /// their RUNs with a clear error.
+    #[arg(long, env = "FLUREE_BOLT_DEFAULT_DB")]
+    pub bolt_default_db: Option<String>,
+
     // === MCP (Model Context Protocol) options ===
     /// Enable MCP (Model Context Protocol) endpoint at /mcp
     #[arg(long, env = "FLUREE_MCP_ENABLED")]
@@ -854,6 +866,9 @@ impl Default for ServerConfig {
             storage_access_mode: StorageAccessMode::Shared,
             storage_proxy_token: None,
             storage_proxy_token_file: None,
+            // Bolt defaults
+            bolt_listen_addr: None,
+            bolt_default_db: None,
             // MCP defaults
             mcp_enabled: false,
             mcp_auth_trusted_issuers: Vec::new(),

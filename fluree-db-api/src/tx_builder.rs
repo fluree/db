@@ -26,18 +26,31 @@ use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_transact::{
-    lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
+    lower_sparql_update_request, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
 
-/// Parse a SPARQL UPDATE string and lower it to the transaction IR against
-/// a snapshot's namespace registry. Errors map to HTTP 400 with the same
-/// shape the two builder paths previously emitted.
+/// Parse, validate, and lower a SPARQL UPDATE request to a sequence of
+/// transaction IRs (one per `;`-separated operation, in request order)
+/// against a snapshot's namespace registry. An empty vector is a valid
+/// no-op request (empty or prologue-only). Parse/lowering errors map to
+/// HTTP 400 with the same shape the two builder paths previously emitted;
+/// validation errors use the query seam's structured [`ApiError::sparql`]
+/// shape (the server maps both to 400).
+///
+/// This is the single production funnel for SPARQL UPDATE (both transact
+/// builders, and through them the HTTP route, consensus appliers, and CLI),
+/// so running `validate()` here means validator-side UPDATE rules apply to
+/// real updates — not only inside the W3C harness's own `validate()` call.
+///
+/// All operations share one namespace registry, so each `Txn`'s
+/// `namespace_delta` is a cumulative superset of its predecessors' — the
+/// last operation's delta carries the whole request's allocations.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
-) -> Result<Txn> {
+) -> Result<Vec<Txn>> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
     if parsed.has_errors() {
         let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
@@ -49,8 +62,32 @@ pub(crate) fn parse_and_lower_sparql_update(
     let ast = parsed
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
+
+    // Validation errors: the same `validate()` pass the query seam runs
+    // (helpers::parse_and_validate_sparql), differing only in admitting
+    // Fluree's documented DELETE WHERE extensions (existential blank nodes;
+    // anonymous annotation tails), which the strict W3C default rejects but
+    // the transact surface has always supported. Error-severity diagnostics
+    // reject before lowering — so validator-only rules (e.g. variables in
+    // INSERT/DELETE DATA, which previously lowered to never-bindable
+    // template variables and silently no-op'd) fail loudly; warnings never
+    // reject. The lowering keeps its own mirrors as defense-in-depth for
+    // direct `lower_sparql_update_ast` callers.
+    let capabilities = fluree_db_sparql::Capabilities::with_delete_where_extensions();
+    let errors: Vec<_> = fluree_db_sparql::validate(&ast, &capabilities)
+        .into_iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .collect();
+    if !errors.is_empty() {
+        let message = errors
+            .first()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "SPARQL UPDATE validation error".to_string());
+        return Err(ApiError::sparql(message, errors));
+    }
+
     let mut ns = NamespaceRegistry::from_db(snapshot);
-    lower_sparql_update_ast(&ast, &mut ns, txn_opts)
+    lower_sparql_update_request(&ast, &mut ns, txn_opts)
         .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
 }
 
@@ -167,6 +204,12 @@ pub(crate) struct TransactCore<'a> {
     pub(crate) operation: Option<TransactOperation<'a>>,
     /// Pre-built transaction IR (bypasses parsing).
     pub(crate) pre_built_txn: Option<Txn>,
+    /// A second pre-built `Txn` staged into the **same** commit immediately
+    /// after `pre_built_txn`, before publishing. Set only for a per-row
+    /// relationship `MERGE … ON MATCH SET`, whose two disjoint branches
+    /// (`ON MATCH SET`, then create) must commit atomically. See
+    /// [`crate::Fluree::stage_pair_from_txns`].
+    pub(crate) pre_built_txn_followup: Option<Txn>,
     /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
     /// `execute()` so its namespace allocation shares the staging registry.
     pub(crate) pending_sparql: Option<&'a str>,
@@ -183,6 +226,7 @@ impl<'a> TransactCore<'a> {
         Self {
             operation: None,
             pre_built_txn: None,
+            pre_built_txn_followup: None,
             pending_sparql: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
@@ -202,6 +246,20 @@ impl<'a> TransactCore<'a> {
             });
         } else {
             self.pre_built_txn = Some(txn);
+        }
+    }
+
+    /// Attach a follow-up `Txn` to stage into the same commit after the primary
+    /// (per-row relationship `MERGE … ON MATCH SET`). Requires the primary
+    /// `pre_built_txn` to be set first.
+    pub(crate) fn set_pre_built_txn_followup(&mut self, txn: Txn) {
+        if self.pre_built_txn.is_none() {
+            self.errors.push(BuilderError::Conflict {
+                field: "operation",
+                message: "follow-up txn requires a primary pre-built txn".to_string(),
+            });
+        } else {
+            self.pre_built_txn_followup = Some(txn);
         }
     }
 
@@ -375,6 +433,13 @@ impl<'a> OwnedTransactBuilder<'a> {
         self
     }
 
+    /// Attach a follow-up `Txn` staged into the same commit after the primary
+    /// (per-row relationship `MERGE … ON MATCH SET`). Requires [`Self::txn`].
+    pub fn txn_followup(mut self, txn: Txn) -> Self {
+        self.core.set_pre_built_txn_followup(txn);
+        self
+    }
+
     // -- Option setters --
 
     /// Set transaction options (author, context, etc.).
@@ -440,16 +505,30 @@ impl<'a> OwnedTransactBuilder<'a> {
                 ns_registry,
                 txn_meta,
                 graph_delta,
-            } = self
-                .fluree
-                .stage_transaction_from_txn(
-                    self.ledger,
-                    txn,
-                    Some(&index_config),
-                    self.core.policy.as_ref(),
-                    Some(&tracker),
-                )
-                .await?;
+            } = if let Some(followup) = self.core.pre_built_txn_followup {
+                // Per-row relationship MERGE … ON MATCH SET: both branches stage
+                // into one commit, or an error returns with nothing committed.
+                self.fluree
+                    .stage_pair_from_txns(
+                        self.ledger,
+                        txn,
+                        followup,
+                        Some(&index_config),
+                        self.core.policy.as_ref(),
+                        Some(&tracker),
+                    )
+                    .await?
+            } else {
+                self.fluree
+                    .stage_transaction_from_txn(
+                        self.ledger,
+                        txn,
+                        Some(&index_config),
+                        self.core.policy.as_ref(),
+                        Some(&tracker),
+                    )
+                    .await?
+            };
 
             // Add extracted transaction metadata and graph delta to commit opts
             let commit_opts = self
@@ -757,6 +836,13 @@ impl<'a> RefTransactBuilder<'a> {
         self
     }
 
+    /// Attach a follow-up `Txn` staged into the same commit after the primary
+    /// (per-row relationship `MERGE … ON MATCH SET`). Requires [`Self::txn`].
+    pub fn txn_followup(mut self, txn: Txn) -> Self {
+        self.core.set_pre_built_txn_followup(txn);
+        self
+    }
+
     /// Set the operation to a SPARQL UPDATE.
     ///
     /// Unlike [`txn`](Self::txn), the query is parsed and lowered during
@@ -979,25 +1065,45 @@ impl Fluree {
     ) -> Result<(StageResult, TxnType, CommitOpts)> {
         if let Some(txn) = core.pre_built_txn {
             let txn_type = txn.txn_type;
-            let stage_result = self
-                .stage_transaction_from_txn(
+            let stage_result = if let Some(followup) = core.pre_built_txn_followup {
+                // Per-row relationship MERGE … ON MATCH SET: stage both branches
+                // against the locked state and merge into one commit. Either both
+                // stage and publish, or an error returns with nothing committed.
+                self.stage_pair_from_txns(
+                    ledger_state,
+                    txn,
+                    followup,
+                    Some(index_config),
+                    core.policy.as_ref(),
+                    Some(tracker),
+                )
+                .await?
+            } else {
+                self.stage_transaction_from_txn(
                     ledger_state,
                     txn,
                     Some(index_config),
                     core.policy.as_ref(),
                     Some(tracker),
                 )
-                .await?;
+                .await?
+            };
             return Ok((stage_result, txn_type, core.commit_opts));
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let txn = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
-            let txn_type = txn.txn_type;
+            let txns =
+                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
+            // A single-op request reports its own type; a multi-op (or
+            // empty no-op) request is reported as a generic update.
+            let txn_type = match txns.as_slice() {
+                [only] => only.txn_type,
+                _ => TxnType::Update,
+            };
             let stage_result = self
-                .stage_transaction_from_txn(
+                .stage_transaction_from_txns(
                     ledger_state,
-                    txn,
+                    txns,
                     Some(index_config),
                     core.policy.as_ref(),
                     Some(tracker),

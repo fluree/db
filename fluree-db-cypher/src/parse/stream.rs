@@ -16,6 +16,11 @@ const MAX_PARSE_DEPTH: u32 = 256;
 
 pub struct TokenStream {
     tokens: Vec<Token>,
+    /// Original statement text, for recovering the as-written form of
+    /// keyword tokens in identifier position (`{end: 1}`, `YIELD count`) —
+    /// a token's `Display` is its canonical uppercase keyword, not what the
+    /// user typed.
+    src: String,
     pos: usize,
     depth: u32,
 }
@@ -29,11 +34,44 @@ pub struct Mark {
 }
 
 impl TokenStream {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    pub fn new(tokens: Vec<Token>, src: impl Into<String>) -> Self {
         Self {
             tokens,
+            src: src.into(),
             pos: 0,
             depth: 0,
+        }
+    }
+
+    /// The original source text under `span`, when the span is a valid slice.
+    pub fn source_slice(&self, span: SourceSpan) -> Option<&str> {
+        self.src.get(span.start..span.end)
+    }
+
+    /// If the current token can stand in as an identifier — a real `Ident` or a
+    /// keyword used in name position — return its **as-written** text (the
+    /// source slice, so `end` is not canonicalized to `END`). Returns `None`
+    /// for punctuation, literals, and EOF. Does not advance.
+    ///
+    /// Keyword tokens all `Display` as their all-alphabetic uppercase form; no
+    /// literal or punctuation token does, so that shape is a sound classifier.
+    pub fn peek_ident_text(&self) -> Option<String> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => Some(name.clone()),
+            other => {
+                let display = format!("{other}");
+                if !display.is_empty()
+                    && display.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
+                {
+                    Some(
+                        self.source_slice(self.peek_span())
+                            .map(str::to_string)
+                            .unwrap_or(display),
+                    )
+                } else {
+                    None
+                }
+            }
         }
     }
 

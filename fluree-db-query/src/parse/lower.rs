@@ -289,7 +289,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                 Some(predicate) => Ok(vec![Pattern::ShortestPath(ShortestPathPattern {
                     start: start_ref,
                     end: end_ref,
-                    predicate,
+                    predicate: Some(predicate),
                     direction: *direction,
                     mode: *mode,
                     path_var: path_var_id,
@@ -297,6 +297,7 @@ pub fn lower_unresolved_pattern<E: IriEncoder>(
                     max_hops: *max_hops,
                     // JSON-LD/FQL has no `relationships()`; never build edges.
                     needs_relationships: false,
+                    node_filter: None,
                 })]),
                 // Predicate IRI not in the dictionary → no edges of that type
                 // exist → the search yields no rows.
@@ -525,7 +526,9 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
                 None => {
                     let sid = match value {
                         LiteralValue::String(_) => dts.xsd_string,
-                        LiteralValue::Long(_) => dts.xsd_long,
+                        // RDF 1.1: a bare integer is xsd:integer, matching
+                        // storage and arithmetic tagging (#1319).
+                        LiteralValue::Long(_) => dts.xsd_integer,
                         LiteralValue::Double(_) => dts.xsd_double,
                         LiteralValue::Decimal(_) => dts.xsd_decimal,
                         LiteralValue::BigInt(_) => dts.xsd_integer,
@@ -1707,9 +1710,11 @@ fn lower_function_name(name: &str) -> Function {
         "isblank" | "is-blank" => Function::IsBlank,
         "isliteral" | "is-literal" => Function::IsLiteral,
         "isnumeric" | "is-numeric" => Function::IsNumeric,
-        // RDF term functions
-        "lang" => Function::Lang,
-        "datatype" => Function::Datatype,
+        // RDF term functions — JSON-LD surface: lenient non-literal handling
+        // (DATATYPE of an IRI reports `@id`; LANG of a non-literal is "").
+        // See the Function docs / decision D-12.
+        "lang" => Function::Lang { strict: false },
+        "datatype" => Function::Datatype { strict: false },
         "langmatches" => Function::LangMatches,
         "sameterm" => Function::SameTerm,
         // Fluree-specific: transaction time

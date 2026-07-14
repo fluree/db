@@ -154,6 +154,9 @@ A few operational knobs are environment-only (no CLI flag):
 |----------|---------|---------|
 | `FLUREE_REASONING_MAX_FACTS` | 1,000,000 | Server-wide default OWL2-RL materialization budget (max derived facts). Overridden per ledger by `f:reasoningMaxFacts` and per query by `"reasoningBudget"`; see [Reasoning](../query/reasoning.md#materialization-budget). |
 | `FLUREE_REASONING_MAX_SECONDS` | 30 | Server-wide default OWL2-RL materialization budget (wall-clock seconds). Same override chain as above. |
+| `FLUREE_CYPHER_ALLOW_FULL_SCAN` | off | Allow bare Cypher `MATCH (n)` (no label/property/relationship constraint) to run as a whole-graph distinct-subject scan. Off by default — intended for benchmarks and ad-hoc exploration, not production queries. |
+| `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
+| `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
 
 ### Precedence
 
@@ -183,6 +186,36 @@ Address and port to bind to:
 
 ```bash
 fluree-server --listen-addr 0.0.0.0:9090
+```
+
+### Bolt Protocol Listener
+
+The server can additionally speak the Bolt protocol (Neo4j drivers)
+against the openCypher surface. The listener binds only when an address
+is configured — unset = disabled. (The `bolt` build feature is on by
+default; minimal builds may exclude it.)
+See the [Bolt guide](../guides/bolt.md) for driver examples and the
+[Bolt reference](../api/bolt.md) for protocol and value-mapping notes.
+
+| Flag                | Env Var                   | Default    |
+| ------------------- | ------------------------- | ---------- |
+| `--bolt-listen-addr`| `FLUREE_BOLT_LISTEN_ADDR` | (disabled) |
+| `--bolt-default-db` | `FLUREE_BOLT_DEFAULT_DB`  | (none)     |
+
+`--bolt-default-db` names the ledger served to sessions that select no
+database; drivers can select one per session (`database=` / `db`).
+Authentication follows `data_auth_mode` per session, exactly like the
+HTTP data plane (bearer tokens through the same verification pipeline);
+see the [Bolt reference](../api/bolt.md#authentication).
+
+```bash
+fluree-server --bolt-listen-addr 0.0.0.0:7687 --bolt-default-db mydb:main
+```
+
+```toml
+[server.bolt]
+listen_addr = "0.0.0.0:7687"
+default_db = "mydb:main"
 ```
 
 ### Storage Path

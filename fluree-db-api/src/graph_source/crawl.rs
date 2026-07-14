@@ -9,11 +9,13 @@
 //! virtual-dataset "View Instances" screen come back empty.
 //!
 //! This module expands a wildcard crawl over a graph source through the R2RML
-//! operator instead: it rewrites the crawl into a flat wildcard scan
-//! (`?s ?p ?o` + `?s a ?type`, which the operator now binds — see
-//! `fluree_db_query::r2rml` `predicate_var` / `type_var`), executes it via the
-//! same R2RML query path the rest of the engine uses, and regroups the flat
-//! `(subject, predicate, object, type)` rows into per-subject JSON-LD documents.
+//! operator instead: it rewrites the crawl into a SINGLE flat wildcard scan
+//! (`?s ?p ?o`, which the operator binds via `predicate_var` — see
+//! `fluree_db_query::r2rml` — and on which it also emits each subject's
+//! `rr:class`-derived `rdf:type` rows), executes it via the same R2RML query
+//! path the rest of the engine uses, and regroups the flat
+//! `(subject, predicate, object)` rows into per-subject JSON-LD documents,
+//! folding `rdf:type` rows into `@type`.
 //!
 //! Scope: only a **wildcard** (`["*"]`) single-column crawl is expanded here.
 //! Explicit-predicate selections, nested ref-crawls, and multi-column projections
@@ -47,6 +49,13 @@ const CRAWL_TYPE: &str = "?__crawl_type";
 /// more than `BUDGET` triples may be truncated (acceptable for the tabular
 /// dimension/fact tables R2RML maps; rows are wide in columns, not in triples).
 const TRIPLES_PER_SUBJECT_BUDGET: usize = 64;
+
+/// Maximum subject OFFSET a crawl may request. OFFSET paging re-scans and then
+/// discards the first `offset` subjects on every page (the flat triple budget
+/// covers `offset + limit` subjects), so a deep offset silently becomes a large
+/// remote scan; past this depth the crawl errors with guidance instead. Browse
+/// paging (the surface this exists for) stays far below it.
+const MAX_CRAWL_OFFSET_SUBJECTS: usize = 10_000;
 
 /// Distinct object-var name for the i-th explicit predicate of a predicate-list
 /// crawl. A DISTINCT var per predicate is REQUIRED: a shared object var makes
@@ -153,6 +162,14 @@ pub(crate) async fn expand_wildcard_crawl(
         return Ok(None);
     };
 
+    if offset > MAX_CRAWL_OFFSET_SUBJECTS {
+        return Err(crate::ApiError::query(format!(
+            "crawl offset {offset} exceeds the virtual-dataset paging ceiling \
+             ({MAX_CRAWL_OFFSET_SUBJECTS}); narrow the query with a WHERE filter \
+             instead of paging this deep"
+        )));
+    }
+
     // Rewrite the crawl into a flat scan: keep the original WHERE (it binds and
     // filters `?s`), then project the columns the projection needs. The flat scan
     // is LIMITed to bound work (an unbounded multi-scan join over a remote table
@@ -224,8 +241,8 @@ pub(crate) async fn expand_wildcard_crawl(
             }
         }
         CrawlProjection::Wildcard => {
-            // Columns: [?s, ?p, ?o, ?type].
-            let (Some(p_var), Some(o_var), Some(t_var)) = (var_at(1), var_at(2), var_at(3)) else {
+            // Columns: [?s, ?p, ?o].
+            let (Some(p_var), Some(o_var)) = (var_at(1), var_at(2)) else {
                 return Ok(None);
             };
             for batch in &result.batches {
@@ -238,11 +255,18 @@ pub(crate) async fn expand_wildcard_crawl(
                         order.push(key);
                         SubjectAcc::empty()
                     });
-                    if let Some(type_iri) = batch.get(row, t_var).and_then(Binding::get_iri) {
-                        acc.add_type(compactor.compact_vocab_iri(type_iri));
-                    }
                     if let Some(pred_iri) = batch.get(row, p_var).and_then(Binding::get_iri) {
-                        if let Some(obj_binding) = batch.get(row, o_var) {
+                        // The wildcard scan emits the subject's classes as
+                        // `rr:class`-derived `rdf:type` rows (native parity);
+                        // fold them into `@type` rather than rendering the
+                        // class as an "rdf:type" property.
+                        if &**pred_iri == fluree_vocab::rdf::TYPE {
+                            if let Some(class_iri) =
+                                batch.get(row, o_var).and_then(Binding::get_iri)
+                            {
+                                acc.add_type(compactor.compact_vocab_iri(class_iri));
+                            }
+                        } else if let Some(obj_binding) = batch.get(row, o_var) {
                             let value =
                                 format_binding_with_result(&result, obj_binding, &compactor)?;
                             acc.add_value(compactor.compact_vocab_iri(pred_iri), value);
@@ -294,8 +318,13 @@ pub(crate) async fn expand_wildcard_crawl(
     }
 
     // Assemble per-subject JSON-LD documents, honoring the crawl's subject
-    // OFFSET then LIMIT (subject order is the deterministic scan order, so paging
-    // is stable across requests).
+    // OFFSET then LIMIT. Paging is BEST-EFFORT: subject order follows the scan's
+    // first-seen order, which is deterministic for a stable table but is not
+    // enforced across separately-executed requests (per-file reads run
+    // concurrently, and a table can compact/append between pages), so a page
+    // boundary can skip or repeat a subject when the underlying scan order
+    // shifts. Fine for shallow browse paging; a real pagination surface wants
+    // keyset/cursor paging instead of OFFSET.
     let normalize = format_config.normalize_arrays;
     let take = limit.unwrap_or(usize::MAX);
     let mut docs: Vec<JsonValue> = Vec::new();
@@ -508,15 +537,16 @@ fn build_flat_query(
     let select: Vec<JsonValue> = match projection {
         CrawlProjection::Wildcard => {
             // `?s ?__crawl_p ?__crawl_o` — every (predicate, object) of `?s`.
+            // The subject's declared class(es) arrive on this SAME scan as
+            // `rr:class`-derived `rdf:type` rows (the operator emits them for a
+            // true wildcard; the regroup folds `?p == rdf:type` into `@type`).
+            // No separate `?s a ?type` pattern is injected: a standalone
+            // type-var scan was a REQUIRED join (inner-joining out subjects
+            // whose TriplesMap declares no `rr:class`) and, when not fused,
+            // the topmost budgeted scan (starving the wildcard of the LIMIT
+            // budget). One scan does it all.
             where_patterns.push(json!({ "@id": subject_var, CRAWL_PRED: CRAWL_OBJ }));
-            // `?s a ?__crawl_type` — the subject's declared class(es).
-            where_patterns.push(json!({ "@id": subject_var, "@type": CRAWL_TYPE }));
-            vec![
-                json!(subject_var),
-                json!(CRAWL_PRED),
-                json!(CRAWL_OBJ),
-                json!(CRAWL_TYPE),
-            ]
+            vec![json!(subject_var), json!(CRAWL_PRED), json!(CRAWL_OBJ)]
         }
         CrawlProjection::IdOnly => vec![json!(subject_var)],
         CrawlProjection::Predicates {
@@ -653,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn flat_query_injects_wildcard_and_type_scans() {
+    fn flat_query_injects_single_wildcard_scan() {
         let context = json!({"v": "http://example/org/ns"});
         let where_clause = json!({"@id": "?s", "@type": "v:Geography"});
         let flat = build_flat_query(
@@ -664,18 +694,17 @@ mod tests {
             &CrawlProjection::Wildcard,
         );
 
-        assert_eq!(
-            flat["select"],
-            json!(["?s", CRAWL_PRED, CRAWL_OBJ, CRAWL_TYPE])
-        );
+        assert_eq!(flat["select"], json!(["?s", CRAWL_PRED, CRAWL_OBJ]));
         assert_eq!(flat["@context"], context);
         assert_eq!(flat["limit"], json!(256));
-        // where = [ original, wildcard(?s ?p ?o), type-projection(?s a ?type) ]
+        // where = [ original, wildcard(?s ?p ?o) ] — ONE injected scan. No
+        // separate `?s a ?type` pattern: the class arrives on the wildcard as
+        // `rdf:type` rows (a standalone type-var scan was a REQUIRED join that
+        // dropped class-less subjects and, unfused, starved the LIMIT budget).
         let patterns = flat["where"].as_array().expect("where array");
-        assert_eq!(patterns.len(), 3);
+        assert_eq!(patterns.len(), 2);
         assert_eq!(patterns[0], where_clause);
         assert_eq!(patterns[1], json!({"@id": "?s", CRAWL_PRED: CRAWL_OBJ}));
-        assert_eq!(patterns[2], json!({"@id": "?s", "@type": CRAWL_TYPE}));
     }
 
     #[test]
@@ -683,8 +712,8 @@ mod tests {
         let where_clause = json!([{"@id": "?s", "v:country": "?c"}]);
         let flat = build_flat_query("?s", &where_clause, None, None, &CrawlProjection::Wildcard);
         let patterns = flat["where"].as_array().expect("where array");
-        // Original single pattern + injected wildcard + type projection.
-        assert_eq!(patterns.len(), 3);
+        // Original single pattern + the one injected wildcard scan.
+        assert_eq!(patterns.len(), 2);
         assert_eq!(patterns[0], json!({"@id": "?s", "v:country": "?c"}));
         assert!(flat.get("@context").is_none());
         assert!(flat.get("limit").is_none());
@@ -1129,6 +1158,50 @@ mod e2e {
         // Offset past the end -> empty.
         let past = run_crawl(&provider, &view, &paged(2, 10)).await;
         assert!(past.is_empty(), "offset past the end returns no subjects");
+    }
+
+    // (g2) An offset past the paging ceiling errors with guidance instead of
+    //      silently launching an O(offset) remote scan.
+    #[tokio::test]
+    async fn crawl_wildcard_offset_past_ceiling_errors() {
+        let mapping = CompiledR2rmlMapping::new(vec![tm(
+            "#People",
+            "people",
+            "http://example.org/person/{id}",
+            "http://example.org/Person",
+            "http://example.org/name",
+            "name",
+        )]);
+        let mut tables = HashMap::new();
+        tables.insert(
+            "people".to_string(),
+            vec![id_str_batch("name", &[1], &["Alice"])],
+        );
+        let provider = MockCrawlProvider::new(mapping, tables);
+        let (_ledger, view) = genesis_view();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Person"},
+            "limit": 2,
+            "offset": MAX_CRAWL_OFFSET_SUBJECTS + 1
+        });
+        let err = expand_wildcard_crawl(
+            &fluree,
+            &view,
+            &crawl,
+            &provider,
+            &provider,
+            QueryExecutionOptions::new(),
+            &FormatterConfig::default(),
+        )
+        .await
+        .expect_err("an offset past the ceiling must error, not scan");
+        assert!(
+            err.to_string().contains("paging ceiling"),
+            "error must explain the ceiling, got: {err}"
+        );
     }
 
     /// A batch with `id` (Int64), one nullable String column, and one FK column

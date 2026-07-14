@@ -36,7 +36,7 @@ Industry-standard SPARQL 1.1 query language. Fluree provides full SPARQL support
 - Neo4j-compatible `cypher-json` output (or RDF JSON-LD)
 - Auto-detected by the CLI; `Content-Type: application/cypher` over HTTP
 
-See the [openCypher support matrix](../reference/cypher-support-matrix.md) for a feature-by-feature status view.
+See [Cypher → Differences from Neo4j](cypher.md#differences-from-neo4j) for the model divergences and deferred forms.
 
 [opencypher]: https://opencypher.org/resources/
 
