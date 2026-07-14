@@ -231,6 +231,22 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 ---
 
+## F18 — q031 parent-memo does not engage on the LIMIT-pushdown driving path *(perf — PRE-EXISTING, cache-sensitive; NOT a regression)*
+
+**Shape.** q031 = `?inv a InventorySnapshot ; edw:onHandQty ?oh ; edw:reorderPoint ?rp ; edw:product ?p . ?p edw:name ?pn . FILTER(?oh<?rp) LIMIT 5000`. Clean north-star re-baseline (#1499 head): **72.1 s** cache-thrashed. `scan_table.n = 1448`, `load_table.n = 7` (~21 s), `files_selected = 0` (dim `loadTable` lookups, no scan_plan).
+
+**Mechanism.** PR-8b's query-scoped parent-memo (`R2rmlParentMemo`, `r2rml/operator.rs:77`; unit tests `pr8b::parent_lookup_survives_operator_rebuild` PASS) is **not reached** by q031's plan → the DimProduct RefObjectMap parent lookup rebuilds per driving batch (~1448 un-memoized re-scans; the pre-PR-8b 1306 shape). The seam is the **LIMIT-pushdown driving path**: `FLUREE_R2RML_LIMIT_PUSHDOWN=0` → `scan_table 1448→8` (memo engages) **but 88 s** (LIMIT no longer cuts the fact scan). So it's a memo × limit-pushdown interaction: neither current setting gives both.
+
+**NOT a regression (forensics).** Two-point bisect: A @ `2a07bbbc4` (PR-7 head, pre-PR-5) and B @ `b1cb988c2` (PR-4c head, pre-PR-7) **both = 1448 / ~70 s**. PR-8b's OWN gate `pf8b_virtual.jsonl` recorded q031 at **65 s / scan_table 1448** — identical to now. Seven-switch A/B refutes every candidate (BATCHED_OPTIONAL(_STAR)=PR-4c, PARENT_MEMO, NUMERIC_STATS=PR-7, TOPK, STAR_TM_PRUNE, FILTER_CONSUMPTION, SCAN_CACHE). No q031 corpus drift in `118a25587..HEAD`. So the 1448-scan plan is **unchanged since PR-8b**; PR-4c/PR-5/PR-7/PR-8b all exonerated. **Cache-sensitive:** 188 ms fully-warm ↔ 65–72 s cache-thrashed — the "188 ms PR-8b sentinel" was a fully-warm reps=3 artifact (q029, 125 s cold, ran **156 ms** in that same phase; whole corpus sub-second, zero I/O).
+
+**Remedy.** Make the query-scoped parent-memo engage on the LIMIT-pushdown batched driving path — get BOTH the memo (8 scans, not 1448) AND the LIMIT cut on the fact scan. **Expected end-state: low-single-digit s cache-thrashed / sub-second warm** (partial LIMIT-cut fact scan + one memoized dim load; meets the ≤~3 s north-star bar — NOT the 0.2 s warm-only artifact). The differential MUST include a **q031-shaped hermetic case** (N driving batches under LIMIT pushdown ⇒ 1 parent scan) so this interaction cannot silently regress.
+
+**Gate-protocol lesson.** The 188 ms sentinel was warm-cache, hiding the 65 s cold cost in the SAME gate (~350× optimism) → sentinel numbers must be cache-thrashed (or report warm AND cold); consider a full-corpus baseline per stacked-PR head (q031 wasn't in PR-5's sentinel set; only the full corpus caught it).
+
+**Fix owner.** engine (parent-memo × limit-pushdown) — pre-existing perf, north-star slate.
+
+---
+
 ## Summary & routing
 
 | Finding | Class | Query | Root | Fix owner |
@@ -252,6 +268,7 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | **F15** | correctness-latent (armed + fixed in-PR by PR-7) | (synthetic — NaN float bounds) | `TypedValue::lt`/`le` `Float` arms used a raw `<`, so a NaN bound returns `Some(false)` → `bounds_can_contain` could over-prune a row group holding NaN rows (strict-superset violation). **Unreachable until PR-7's `ScanValue::Double` push produces a float bound.** Fixed in-PR: NaN operand → `None` → keep; guarded by two unit tests. | engine (fixed in PR-7) |
 | **F16** | consistency (follow-up, not in PR-F9) | (virtual, non-`sparql_json` formats) | the other output formatters render virtual graph-source `Binding::Iri` raw (no CURIE alignment): `jsonld.rs:206,409`, `sparql_xml.rs:212`, `typed.rs:189,389`, `delimited.rs:382`; needs own per-format test gates (corpus only covers `sparql_json`). Related native provenance-rendering question → **fluree/db#1496**. | engine (formatter consistency) — deferred |
 | **F17** | perf-residual (known since PR-2) | q029 | `UNION(purchase, add_to_cart) LIMIT 100` re-drives both `FACT_WEB_EVENT` branch scans ~253× → **1.94M file reads for 100 rows**; the UNION absorbs the LIMIT budget (H2). ~142–150s (manifest `timeout_s=180`); the F9 gate's blanket 120s deadline caused a spurious DNF. Remedy: **budget propagation through UNION** (mechanism-class D, never shipped; mirror PR-5 wrapper-forwarding) — likely subsumed by F14/PR-4d. Harness: honor per-query `timeout_s`. | engine (UNION budget — AJ's call) + harness (per-query timeout) |
+| **F18** | perf (**pre-existing, NOT a regression**) | q031 | PR-8b query-scoped parent-memo not reached on the LIMIT-pushdown driving path → 1448 un-memoized DimProduct re-scans (72s cache-thrashed; `FLUREE_R2RML_LIMIT_PUSHDOWN=0`→scan_table 8 but 88s). Cache-sensitive (188ms warm ↔ 65–72s thrashed); ALL PRs exonerated (bisect A@2a07bbbc4 + B@b1cb988c2 both 1448/~70s; PR-8b gate recorded 65s/1448). The 188ms "sentinel" was warm-cache (~350× optimism). Remedy: memo-engage-WITH-limit-pushdown (8 scans + LIMIT cut) + q031-shaped hermetic differential. | engine (memo × limit-pushdown) — north-star slate |
 
 **Gate observation (non-blocking, PR-F9 gate 2026-07-14) — q029 DNF was a harness deadline mismatch, NOT a regression.** During the F9 gate q029 (`purchase_or_cart_events`, `hash_gate=rows_only`) DNF'd in both switch phases because the gate script applied a **blanket 120s deadline**, but q029's **manifest `timeout_s` is 180** and it completes at ~142–150s (§3 classifies it: **scan-bound / re-scan-amplified**, 142s at PR-2; a healthy-network rerun here = ok/rows=100/~150s, within variance). It is F9-neutral (formatter-only). Two fixes: the mechanism is now filed as **F17** (below), and the gate scripts must honor per-query `timeout_s` (see F17). The earlier "healthy at corpus close / upstream scan variance" framing was wrong — q029 has been a known ~142s scan-bound completer since PR-2.
 
