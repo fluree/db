@@ -736,4 +736,68 @@ mod tests {
         let _ = parse_sparql_to_ir("SELECT * WHERE { ?s ?p ?o }", &snapshot, None).expect("lower");
         assert_eq!(sparql_parse_count(), 1);
     }
+
+    /// End-to-end parse-once through the ENTRY methods (#1483 review: the
+    /// primitive tests above can't catch a second parse reintroduced inside
+    /// an entry method). Counter is thread-local, so the single-threaded
+    /// `#[tokio::test]` runtime keeps the count coherent.
+    #[tokio::test]
+    async fn entry_methods_parse_sparql_once_end_to_end() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        fluree
+            .create_ledger("parseonce:main")
+            .await
+            .expect("create ledger");
+        let db = fluree.db("parseonce:main").await.expect("db");
+
+        // Buffered entry, no dataset clause.
+        reset_sparql_parse_count();
+        let _ = fluree
+            .query_with_options(
+                &db,
+                "SELECT * WHERE { ?s ?p ?o }",
+                crate::QueryExecutionOptions::default(),
+            )
+            .await
+            .expect("no-FROM query");
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "query_with_options (no FROM) must parse exactly once"
+        );
+
+        // Buffered entry, within-ledger FROM (the ledger alias addresses the
+        // default graph) — the dataset route previously re-lexed up to 3x.
+        reset_sparql_parse_count();
+        let _ = fluree
+            .query_with_options(
+                &db,
+                "SELECT * FROM <parseonce:main> WHERE { ?s ?p ?o }",
+                crate::QueryExecutionOptions::default(),
+            )
+            .await
+            .expect("FROM query");
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "query_with_options (within-ledger FROM) must parse exactly once"
+        );
+
+        // Tracked entry, no dataset clause.
+        reset_sparql_parse_count();
+        let _ = fluree
+            .query_tracked_with_options(
+                &db,
+                crate::QueryInput::Sparql("SELECT * WHERE { ?s ?p ?o }"),
+                None,
+                None,
+                crate::QueryExecutionOptions::default(),
+            )
+            .await;
+        assert_eq!(
+            sparql_parse_count(),
+            1,
+            "query_tracked_with_options must parse exactly once"
+        );
+    }
 }

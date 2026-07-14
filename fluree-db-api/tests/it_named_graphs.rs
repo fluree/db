@@ -3026,3 +3026,54 @@ INSERT DATA { <http://example.org/MyClass> a rdfs:Class }",
         "the ontology was wiped by a view-only identity — the pinned N3 contract"
     );
 }
+
+/// §13.2 on the UPDATE-WHERE path (#1483 review): `USING <g1> USING <g2>`
+/// forms a default-graph UNION whose members must set-merge — a triple present
+/// in both graphs binds ONE WHERE solution. Observable through per-solution
+/// INSERT-template blank minting: a bag WHERE minted TWO fresh blanks for the
+/// shared triple, a set mints one.
+#[tokio::test]
+async fn test_using_multi_default_union_is_a_set() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/using-set-merge:main";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    // The SAME triple in both graphs.
+    let seed = format!(
+        r#"INSERT DATA {{
+            GRAPH <{g1}> {{ <http://example.org/s> <http://example.org/p> "shared" }}
+            GRAPH <{g2}> {{ <http://example.org/s> <http://example.org/p> "shared" }}
+        }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // One WHERE solution → one minted template blank carrying ex:saw.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "PREFIX ex: <http://example.org/> \
+             INSERT {{ [] ex:saw ?o }} USING <{g1}> USING <{g2}> \
+             WHERE {{ ?s ex:p ?o }}"
+        ),
+    )
+    .await
+    .ledger;
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/> SELECT ?b WHERE { ?b ex:saw ?o }",
+    )
+    .await
+    .expect("blank probe")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        rows.as_array().map(Vec::len).unwrap_or(0),
+        1,
+        "the shared triple must bind ONE set-merged WHERE solution (one minted \
+         blank), not one per USING member: {rows}"
+    );
+}

@@ -364,13 +364,15 @@ pub async fn execute_where_streaming<'a>(
     if let Some(ds) = dataset {
         ctx = ctx.with_dataset(ds);
     }
-    let mut operator = build_where_operators_seeded(
-        None,
-        patterns,
-        stats,
-        None,
-        &temporal_mode::PlanningContext::current(),
-    )?;
+    // The UPDATE-WHERE path can carry a multi-member default union
+    // (`USING <g1> USING <g2>`): arm the SPARQL §13.2 set-merge exactly as
+    // the query path does (#1469), so a triple present in both graphs binds
+    // ONE solution — observable e.g. through per-solution INSERT-template
+    // blank minting. Single-graph datasets keep the flag off (byte-identical
+    // planning).
+    let planning = temporal_mode::PlanningContext::current()
+        .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2));
+    let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)?;
     operator.open(&ctx).await?;
     Ok(WhereCursor {
         inner: CursorInner::Operator(Box::new(WhereCursorOperator {

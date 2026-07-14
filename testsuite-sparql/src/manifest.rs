@@ -48,9 +48,12 @@ pub struct Test {
     pub result_present: bool,
     /// Whether a blank `mf:result` node carried ANY outgoing predicate. A bare
     /// `mf:result []` has none (the deliberate empty-store expectation); a
-    /// `mf:result [ ut:graphData <unresolvable> ]` whose predicates all resolved
-    /// to nothing has ≥1. This distinguishes the two so a present-but-empty
-    /// result is treated as a parse/skip rather than "expected empty store".
+    /// `mf:result [ ut:graphData [ ut:graph <g> ] ]` missing its `rdfs:label`
+    /// (or one carrying only non-content predicates) resolves no content yet
+    /// has ≥1. This distinguishes the two so a present-but-empty result is
+    /// treated as a parse/skip rather than "expected empty store". (An IRI
+    /// object like `ut:graphData <file>` resolves at PARSE time regardless of
+    /// file existence, so it never trips this guard — it fails at load.)
     pub result_has_predicates: bool,
 }
 

@@ -1154,4 +1154,30 @@ mod tests {
         let r = eval_contains::<_>(&[Expression::Var(VarId(0)), s_const("x")], &row, None);
         assert!(r.is_err());
     }
+
+    #[test]
+    fn test_contains_accepts_explicit_xsd_string() {
+        // The two string choke-points must agree: STRBEFORE (str_arg_and_lang)
+        // already accepted an explicit xsd:string datatype as a simple
+        // literal; CONTAINS (string_arg) type-errored on the same value.
+        let batch = make_string_batch();
+        let row = batch.row_view(0).unwrap();
+        let r = eval_contains::<_>(
+            &[
+                strdt_const("hello", "http://www.w3.org/2001/XMLSchema#string"),
+                s_const("ell"),
+            ],
+            &row,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r, Some(ComparableValue::Bool(true)));
+        // A foreign datatype stays a type error.
+        let err = eval_contains::<_>(
+            &[strdt_const("hello", "http://example.org/dt"), s_const("l")],
+            &row,
+            None,
+        );
+        assert!(err.is_err(), "foreign-datatype arg must stay a type error");
+    }
 }

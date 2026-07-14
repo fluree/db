@@ -463,9 +463,19 @@ impl ComparableValue {
             ComparableValue::TypedLiteral {
                 val: FlakeValue::String(s),
                 dtc,
-            } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => {
-                Some(s.as_str())
-            }
+            } => match dtc {
+                None | Some(UnresolvedDatatypeConstraint::LangTag(_)) => Some(s.as_str()),
+                // An explicit xsd:string IS a string — `STRDT(?x, xsd:string)`
+                // behaves like a simple literal, matching `str_arg_and_lang`'s
+                // accept-set (the two choke-points previously disagreed:
+                // STRBEFORE accepted it while CONTAINS type-errored).
+                Some(UnresolvedDatatypeConstraint::Explicit(iri))
+                    if iri.as_ref() == fluree_vocab::xsd::STRING =>
+                {
+                    Some(s.as_str())
+                }
+                Some(UnresolvedDatatypeConstraint::Explicit(_)) => None,
+            },
             _ => None,
         }
     }
