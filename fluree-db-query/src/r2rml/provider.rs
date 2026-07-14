@@ -36,9 +36,11 @@ pub enum ScanCmpOp {
 /// A literal value for a pushed-down scan filter.
 ///
 /// Limited to types that prune safely against Iceberg column min/max bounds and
-/// that the Arrow row filter can evaluate: date/int/bool, plus strings
-/// (lexicographic, e.g. equality on a name/code column). Decimal / float
-/// predicates are left to the in-engine FILTER.
+/// that the Arrow row filter can evaluate: date/int/bool, strings (lexicographic,
+/// e.g. equality on a name/code column), plus double and decimal — the last two
+/// gated by `FLUREE_ICEBERG_NUMERIC_STATS` and only ever produced from a numeric
+/// FILTER predicate (see `to_scan_value`). A missed push is never wrong: the
+/// in-engine FILTER remains the authority.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanValue {
     Bool(bool),
@@ -47,6 +49,18 @@ pub enum ScanValue {
     Date(i32),
     /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
     Str(String),
+    /// An `xsd:double`/`xsd:float` value — pushed against a physically-`double`
+    /// column only (see `build_iceberg_filter`). NaN bounds never over-prune (the
+    /// Iceberg compare treats a NaN operand as incomparable → keep).
+    Double(f64),
+    /// A decimal value as its unscaled i128 + precision/scale (mirrors
+    /// `LiteralValue::Decimal`). Carries the LITERAL's scale; the column's scale
+    /// may differ and is normalized during comparison.
+    Decimal {
+        unscaled: i128,
+        precision: u8,
+        scale: i8,
+    },
     /// A raw column value recovered by reversing a subject template (bound-subject
     /// pushdown). The physical type is unknown here — it is resolved against the
     /// Iceberg field type when the pushdown predicate is built, and the pushdown is

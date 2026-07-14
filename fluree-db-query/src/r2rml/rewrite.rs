@@ -574,14 +574,51 @@ fn const_object(value: &FlakeValue) -> Option<ObjectConstant> {
     }
 }
 
+/// Convert a FILTER comparison's constant literal to a prunable `ScanValue`.
+/// Integer / boolean / date / string always push. Double and decimal push only
+/// when `FLUREE_ICEBERG_NUMERIC_STATS` is on (PR-7) — this is the single gate for
+/// numeric pushdown, so with it off no numeric `LiteralValue` reaches the reader
+/// and the iceberg-side numeric widening stays inert. Anything else (refs,
+/// big-integers beyond i128, temporal beyond date, …) stays with the in-engine
+/// FILTER.
 fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     match value {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
         FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
         FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
         FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
+        FlakeValue::Double(f) if crate::r2rml::iceberg_numeric_stats_enabled() => {
+            Some(ScanValue::Double(*f))
+        }
+        FlakeValue::Decimal(d) if crate::r2rml::iceberg_numeric_stats_enabled() => {
+            scan_value_from_bigdecimal(d)
+        }
         _ => None,
     }
+}
+
+/// Decompose a `BigDecimal` into `ScanValue::Decimal { unscaled, precision, scale }`.
+/// Normalizes first (so `9.99` and `9.990` decompose identically), then reads the
+/// unscaled mantissa and base-10 exponent. Returns `None` if the unscaled value
+/// exceeds i128 or the scale exceeds i8 — those stay with the in-engine FILTER.
+fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> {
+    use num_traits::ToPrimitive;
+    // value = unscaled * 10^-scale. Normalize so scale-equivalent forms (9.99 vs
+    // 9.990) decompose identically.
+    let (unscaled_bi, scale) = bd.normalized().as_bigint_and_exponent();
+    let scale = i8::try_from(scale).ok()?;
+    let unscaled = unscaled_bi.to_i128()?;
+    // precision is cosmetic for pruning (`decimal_cmp` ignores it); derive it from
+    // the unscaled magnitude so it is self-consistent across scale-equivalent
+    // forms, clamped to the decimal128 max.
+    let precision = u8::try_from(unscaled.unsigned_abs().checked_ilog10().unwrap_or(0) + 1)
+        .unwrap_or(38)
+        .clamp(1, 38);
+    Some(ScanValue::Decimal {
+        unscaled,
+        precision,
+        scale,
+    })
 }
 
 /// The subject var of a regular-predicate R2RML pattern that can join a
@@ -1867,5 +1904,34 @@ mod tests {
             "first-seen order must be preserved: {msg}"
         );
         assert!(msg.contains("gs:main"), "names the graph source: {msg}");
+    }
+
+    #[test]
+    fn bigdecimal_decomposes_scale_insensitively() {
+        use std::str::FromStr;
+        let bd = |s: &str| bigdecimal::BigDecimal::from_str(s).unwrap();
+        // 9.99 and 9.990 are the SAME value → identical decomposition (the exact
+        // cross-scale shape the pruning layer must then compare correctly).
+        let want = Some(ScanValue::Decimal {
+            unscaled: 999,
+            precision: 3,
+            scale: 2,
+        });
+        assert_eq!(scan_value_from_bigdecimal(&bd("9.99")), want);
+        assert_eq!(scan_value_from_bigdecimal(&bd("9.990")), want);
+        // Trailing-zero integer forms also normalize to one representation.
+        assert_eq!(
+            scan_value_from_bigdecimal(&bd("100")),
+            scan_value_from_bigdecimal(&bd("100.00"))
+        );
+        // Negative value.
+        assert_eq!(
+            scan_value_from_bigdecimal(&bd("-0.05")),
+            Some(ScanValue::Decimal {
+                unscaled: -5,
+                precision: 1,
+                scale: 2,
+            })
+        );
     }
 }

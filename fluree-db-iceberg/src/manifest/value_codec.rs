@@ -47,13 +47,37 @@ impl TypedValue {
             (TypedValue::Boolean(a), TypedValue::Boolean(b)) => Some(!a && *b),
             (TypedValue::Int32(a), TypedValue::Int32(b)) => Some(a < b),
             (TypedValue::Int64(a), TypedValue::Int64(b)) => Some(a < b),
-            (TypedValue::Float32(a), TypedValue::Float32(b)) => Some(a < b),
-            (TypedValue::Float64(a), TypedValue::Float64(b)) => Some(a < b),
+            // NaN is unordered: a NaN operand yields None (incomparable), so
+            // `bounds_can_contain`'s `unwrap_or(true)` KEEPS the row group. Raw
+            // `<` would return `Some(false)` and could prune a group holding NaN
+            // rows — a strict-superset violation. (Reachable only once a float
+            // predicate is pushed to the reader; see F15.)
+            (TypedValue::Float32(a), TypedValue::Float32(b)) => {
+                (!a.is_nan() && !b.is_nan()).then(|| a < b)
+            }
+            (TypedValue::Float64(a), TypedValue::Float64(b)) => {
+                (!a.is_nan() && !b.is_nan()).then(|| a < b)
+            }
             (TypedValue::Date(a), TypedValue::Date(b)) => Some(a < b),
             (TypedValue::Timestamp(a), TypedValue::Timestamp(b)) => Some(a < b),
             (TypedValue::TimestampTz(a), TypedValue::TimestampTz(b)) => Some(a < b),
             (TypedValue::String(a), TypedValue::String(b)) => Some(a < b),
             (TypedValue::Bytes(a), TypedValue::Bytes(b)) => Some(a < b),
+            // Decimals compare by real value across differing scales (see
+            // `decimal_cmp`). Without this arm a pushed decimal predicate compares
+            // None → the row group is always kept (never pruned).
+            (
+                TypedValue::Decimal {
+                    unscaled: a,
+                    scale: sa,
+                    ..
+                },
+                TypedValue::Decimal {
+                    unscaled: b,
+                    scale: sb,
+                    ..
+                },
+            ) => decimal_cmp(*a, *sa, *b, *sb).map(std::cmp::Ordering::is_lt),
             _ => None,
         }
     }
@@ -64,13 +88,30 @@ impl TypedValue {
             (TypedValue::Boolean(a), TypedValue::Boolean(b)) => Some(a <= b),
             (TypedValue::Int32(a), TypedValue::Int32(b)) => Some(a <= b),
             (TypedValue::Int64(a), TypedValue::Int64(b)) => Some(a <= b),
-            (TypedValue::Float32(a), TypedValue::Float32(b)) => Some(a <= b),
-            (TypedValue::Float64(a), TypedValue::Float64(b)) => Some(a <= b),
+            // NaN → None → keep the row group (see `lt` and F15).
+            (TypedValue::Float32(a), TypedValue::Float32(b)) => {
+                (!a.is_nan() && !b.is_nan()).then(|| a <= b)
+            }
+            (TypedValue::Float64(a), TypedValue::Float64(b)) => {
+                (!a.is_nan() && !b.is_nan()).then(|| a <= b)
+            }
             (TypedValue::Date(a), TypedValue::Date(b)) => Some(a <= b),
             (TypedValue::Timestamp(a), TypedValue::Timestamp(b)) => Some(a <= b),
             (TypedValue::TimestampTz(a), TypedValue::TimestampTz(b)) => Some(a <= b),
             (TypedValue::String(a), TypedValue::String(b)) => Some(a <= b),
             (TypedValue::Bytes(a), TypedValue::Bytes(b)) => Some(a <= b),
+            (
+                TypedValue::Decimal {
+                    unscaled: a,
+                    scale: sa,
+                    ..
+                },
+                TypedValue::Decimal {
+                    unscaled: b,
+                    scale: sb,
+                    ..
+                },
+            ) => decimal_cmp(*a, *sa, *b, *sb).map(std::cmp::Ordering::is_le),
             _ => None,
         }
     }
@@ -633,5 +674,45 @@ mod tests {
     #[test]
     fn test_error_on_unsupported_type() {
         assert!(decode_by_type_string(&[1, 2, 3, 4], Some("unknown_type")).is_err());
+    }
+
+    #[test]
+    fn nan_float_compare_is_incomparable() {
+        // A NaN operand must yield None (incomparable) so pruning keeps the group,
+        // never `Some(false)` (which would let `bounds_can_contain` over-prune a
+        // row group holding NaN rows — the F15 hazard).
+        let nan = TypedValue::Float64(f64::NAN);
+        let five = TypedValue::Float64(5.0);
+        assert_eq!(nan.lt(&five), None);
+        assert_eq!(nan.le(&five), None);
+        assert_eq!(nan.gt(&five), None);
+        assert_eq!(nan.ge(&five), None);
+        assert_eq!(five.lt(&nan), None);
+        assert_eq!(five.le(&nan), None);
+        // Finite floats still compare normally.
+        assert_eq!(five.lt(&TypedValue::Float64(6.0)), Some(true));
+        // Same for f32.
+        let nan32 = TypedValue::Float32(f32::NAN);
+        assert_eq!(nan32.lt(&TypedValue::Float32(1.0)), None);
+        assert_eq!(TypedValue::Float32(1.0).le(&nan32), None);
+    }
+
+    #[test]
+    fn decimal_lt_le_cross_scale() {
+        let d = |unscaled, scale| TypedValue::Decimal {
+            unscaled,
+            precision: 38,
+            scale,
+        };
+        // 9.99 (scale 2) vs 9.990 (scale 3) are the SAME value.
+        assert_eq!(d(999, 2).lt(&d(9990, 3)), Some(false));
+        assert_eq!(d(999, 2).le(&d(9990, 3)), Some(true));
+        assert_eq!(d(9990, 3).le(&d(999, 2)), Some(true));
+        // 9.99 < 20.000.
+        assert_eq!(d(999, 2).lt(&d(20000, 3)), Some(true));
+        assert_eq!(d(20000, 3).lt(&d(999, 2)), Some(false));
+        // gt/ge delegate through le/lt.
+        assert_eq!(d(20000, 3).gt(&d(999, 2)), Some(true));
+        assert_eq!(d(999, 2).ge(&d(9990, 3)), Some(true));
     }
 }

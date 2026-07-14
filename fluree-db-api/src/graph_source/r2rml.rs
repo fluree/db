@@ -86,6 +86,51 @@ pub(crate) fn rest_client_cache_key(graph_source_id: &str, config: &str) -> Stri
     format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
 }
 
+/// Whether numeric (double / decimal) FILTER pushdown — including the integer →
+/// scale-0-decimal coercion against a decimal column — is enabled (PR-7). Mirrors
+/// the query-crate `FLUREE_ICEBERG_NUMERIC_STATS` switch (the two crates can't
+/// share the `pub(crate)` symbol); read once, cached for the process. Off restores
+/// the pre-PR-7 behavior: an integer literal against a decimal column pushes as
+/// `Int64`, which the decimal bound compare declines → no prune (full revert).
+pub(crate) fn iceberg_numeric_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_NUMERIC_STATS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// The Iceberg pushdown literal for an integer scan value against a column of
+/// `type_str`. Against a `decimal(p,s)` column with `numeric_stats` on, the
+/// integer is pushed as an EXACT scale-0 decimal (comparable to the column's
+/// decimal bounds — `decimal_cmp` normalizes the scale gap); with it off it stays
+/// `Int64` (which the decimal bound compare declines → no prune), preserving the
+/// switch's revert guarantee. This is what lets an integer FILTER (`?deb >
+/// 1000000`) prune an `xsd:decimal` column (q019 / H4). An `int`-typed column
+/// narrows to `Int32`, skipping (`None`) an out-of-range literal rather than
+/// wrapping. `None` = skip the push (the operator still enforces).
+fn int_pushdown_literal(
+    n: i64,
+    type_str: Option<&str>,
+    numeric_stats: bool,
+) -> Option<LiteralValue> {
+    match type_str {
+        Some("int") => i32::try_from(n).ok().map(LiteralValue::Int32),
+        Some(t) if t.starts_with("decimal") && numeric_stats => Some(LiteralValue::Decimal {
+            unscaled: i128::from(n),
+            // precision is cosmetic for pruning (`decimal_cmp` ignores it); an i64
+            // is ≤19 digits, so the decimal128 max always covers it.
+            precision: 38,
+            scale: 0,
+        }),
+        _ => Some(LiteralValue::Int64(n)),
+    }
+}
+
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
 /// file pruning. Filters on unknown columns are skipped; an empty result is
 /// `None`. Conservative — pruning never drops matching rows because the
@@ -119,18 +164,64 @@ fn build_iceberg_filter(
                 Some("date") => LiteralValue::Date(*d),
                 _ => continue,
             },
-            // Iceberg `int` is 32-bit, `long` 64-bit. For an `int` column a
-            // literal outside i32 range must NOT be truncated with `as` (it would
-            // wrap and could prune files the residual filter keeps); skip the
-            // pushdown for that predicate instead.
-            ScanValue::Int(n) => match field.type_string() {
-                Some("int") => match i32::try_from(*n) {
-                    Ok(v) => LiteralValue::Int32(v),
-                    Err(_) => continue,
-                },
-                _ => LiteralValue::Int64(*n),
-            },
+            // Iceberg `int` is 32-bit, `long` 64-bit; against a `decimal` column an
+            // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
+            // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
+            // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
+            ScanValue::Int(n) => {
+                match int_pushdown_literal(*n, field.type_string(), iceberg_numeric_stats_enabled())
+                {
+                    Some(v) => v,
+                    None => continue,
+                }
+            }
             ScanValue::Str(s) => LiteralValue::String(s.clone()),
+            // xsd:double / xsd:float FILTER value. Push only against a physically
+            // `double` column (exact f64 bounds); a `float` column would need an
+            // f64→f32 narrowing that can round the literal and over-prune a range,
+            // so skip it — the in-engine FILTER still applies.
+            ScanValue::Double(d) => match field.type_string() {
+                Some("double") => LiteralValue::Float64(*d),
+                // A binary float → decimal coercion is not exact in general, so a
+                // double literal is NOT pushed against a decimal column (keep is
+                // correct; the in-engine FILTER enforces). Breadcrumb per the
+                // decline-observably ruling.
+                Some(t) if t.starts_with("decimal") => {
+                    debug!(
+                        column = %f.column,
+                        "double literal vs decimal column: pushdown declined (inexact float→decimal); in-engine FILTER enforces"
+                    );
+                    continue;
+                }
+                _ => continue,
+            },
+            // xsd:decimal FILTER value. Push only against a `decimal(...)` column;
+            // the literal keeps its own scale and the bound compare normalizes it
+            // against the column's scale. Row-group stats prune only when the
+            // column is FLBA-encoded (see `prunable_stats`); file-level manifest
+            // bounds prune regardless.
+            ScanValue::Decimal {
+                unscaled,
+                precision,
+                scale,
+            } => match field.type_string() {
+                Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
+                    unscaled: *unscaled,
+                    precision: *precision,
+                    scale: *scale,
+                },
+                // A decimal literal against an integer column has no exact
+                // cross-type bound compare, so it is NOT pushed (keep is correct).
+                // Breadcrumb per the decline-observably ruling.
+                Some("int" | "long") => {
+                    debug!(
+                        column = %f.column,
+                        "decimal literal vs integer column: pushdown declined (no exact cross-type bound compare); in-engine FILTER enforces"
+                    );
+                    continue;
+                }
+                _ => continue,
+            },
             // A reversed subject-template key: coerce the raw string to the
             // column's physical type. A key that parses as an integer pushes as an
             // integer literal against an `int`/`long`/`decimal` column — including
@@ -1648,6 +1739,8 @@ mod tests {
                 field(3, "dec_key", json!("decimal(38,0)")),
                 field(4, "str_key", json!("string")),
                 field(5, "date_key", json!("date")),
+                field(6, "double_key", json!("double")),
+                field(7, "float_key", json!("float")),
             ],
         }
     }
@@ -1709,6 +1802,108 @@ mod tests {
         // Utf8 `"2024-01-15"`) would drop — pushing here would remove an
         // operator-kept row.
         assert!(build_iceberg_filter(&[date_filter("str_key")], &s).is_none());
+    }
+
+    #[test]
+    fn double_pushed_only_against_double_column() {
+        let s = key_schema();
+        let dbl = |col: &str| ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Lt,
+            value: ScanValue::Double(9.99),
+        };
+        // Physically-`double`: pushes as an exact f64 bound.
+        assert!(matches!(
+            only_literal(&[dbl("double_key")], &s),
+            Some(LiteralValue::Float64(v)) if v == 9.99
+        ));
+        // Physically-`float`: skipped (an f64→f32 narrowing could round the
+        // literal and over-prune a range).
+        assert!(build_iceberg_filter(&[dbl("float_key")], &s).is_none());
+        // Non-numeric column: skipped.
+        assert!(build_iceberg_filter(&[dbl("str_key")], &s).is_none());
+    }
+
+    #[test]
+    fn int_literal_coerces_to_scale0_decimal_only_when_numeric_stats_on() {
+        // On: an integer against a decimal column → EXACT scale-0 decimal (prunable).
+        assert!(matches!(
+            int_pushdown_literal(1_000_000, Some("decimal(38,2)"), true),
+            Some(LiteralValue::Decimal {
+                unscaled: 1_000_000,
+                scale: 0,
+                ..
+            })
+        ));
+        // Off (revert guarantee): stays Int64 → the decimal bound compare declines
+        // → no prune, exactly the pre-PR-7 behavior.
+        assert!(matches!(
+            int_pushdown_literal(1_000_000, Some("decimal(38,2)"), false),
+            Some(LiteralValue::Int64(1_000_000))
+        ));
+        // An `int` column narrows to Int32; an out-of-range literal skips (no wrap).
+        assert!(matches!(
+            int_pushdown_literal(5, Some("int"), true),
+            Some(LiteralValue::Int32(5))
+        ));
+        assert!(int_pushdown_literal(i64::from(i32::MAX) + 1, Some("int"), true).is_none());
+        // `long` / other columns: Int64 unchanged, on or off.
+        assert!(matches!(
+            int_pushdown_literal(5, Some("long"), true),
+            Some(LiteralValue::Int64(5))
+        ));
+        assert!(matches!(
+            int_pushdown_literal(5, Some("long"), false),
+            Some(LiteralValue::Int64(5))
+        ));
+    }
+
+    #[test]
+    fn int_scalar_against_decimal_column_pushes_scale0_decimal() {
+        // End-to-end through build_iceberg_filter with the default (on) switch: an
+        // integer FILTER literal on a decimal column becomes a scale-0 decimal.
+        let s = key_schema();
+        let f = ScanFilter {
+            column: "dec_key".to_string(),
+            op: ScanCmpOp::Gt,
+            value: ScanValue::Int(1_000_000),
+        };
+        assert!(matches!(
+            only_literal(&[f], &s),
+            Some(LiteralValue::Decimal {
+                unscaled: 1_000_000,
+                scale: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decimal_pushed_only_against_decimal_column_preserving_literal_scale() {
+        let s = key_schema();
+        // The `ScanValue::Decimal` carries the LITERAL's scale (9.99 → scale 2);
+        // the column is decimal(38,0). The bridge preserves the literal scale —
+        // the bound compare normalizes across the column/literal scale gap.
+        let dec = |col: &str| ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Lt,
+            value: ScanValue::Decimal {
+                unscaled: 999,
+                precision: 3,
+                scale: 2,
+            },
+        };
+        assert!(matches!(
+            only_literal(&[dec("dec_key")], &s),
+            Some(LiteralValue::Decimal {
+                unscaled: 999,
+                scale: 2,
+                ..
+            })
+        ));
+        // Non-decimal columns: skipped (no cross-type bound compare exists).
+        assert!(build_iceberg_filter(&[dec("long_key")], &s).is_none());
+        assert!(build_iceberg_filter(&[dec("str_key")], &s).is_none());
     }
 
     #[test]

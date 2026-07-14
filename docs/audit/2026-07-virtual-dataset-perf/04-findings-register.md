@@ -191,6 +191,18 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 ---
 
+## F15 — Latent NaN over-prune in the Float bounds compare *(latent — unreachable pre-PR-7; armed AND fixed in-PR)*
+
+**Discovery.** While widening pruning to double/decimal (PR-7, H4), the recon found that `bounds_can_contain` reasons via `TypedValue::lt`/`le` (NOT `partial_cmp`), and the `Float32`/`Float64` arms used a raw `<`/`<=`. A NaN operand therefore yielded `Some(false)`, which in `bounds_can_contain` can PRUNE: e.g. `column >= v` against a row group whose upper bound is NaN evaluates `lit.le(NaN) = Some(false)` → `false` → prune, even though NaN rows exist. That is an **over-prune** — a strict-superset violation (the pushdown may only ever over-KEEP; the in-engine FILTER is the sole authority).
+
+**Why it was unreachable pre-PR-7.** No float/double predicate ever reached the Iceberg reader: `to_scan_value` returned `None` for `Double`/`Decimal`, so `build_iceberg_filter` never emitted a `LiteralValue::Float64`, so `stat_bounds` never produced a `Float*` bound and the raw-`<` arms were never exercised. PR-7's `ScanValue::Double` push is exactly what ARMS the hazard — so its fix must ship in the same PR (the F12 pattern: a latent hazard gets a register entry, not just a silent fix).
+
+**Fix (in-PR).** The `Float32`/`Float64` arms of `lt`/`le` now return `None` when either operand is NaN (`(!a.is_nan() && !b.is_nan()).then(|| a < b)`), so `bounds_can_contain`'s `unwrap_or(true)` KEEPS the group. `±0.0` collapses to one bound (`-0.0 == +0.0`, neither `<` the other) with no ordering hazard. Guarded by `bounds_can_contain_keeps_on_nan_bound` (pruning.rs) + `nan_float_compare_is_incomparable` (value_codec.rs).
+
+**Hypothesis linkage.** H4 (numeric pruning). Same "latent hazard armed by the widening → register entry + in-PR fix" shape as F12.
+
+---
+
 ## Summary & routing
 
 | Finding | Class | Query | Root | Fix owner |
@@ -209,5 +221,6 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 | **F12** | correctness-latent (unreachable today) | q022 | single-table fused agg mishandles an un-annotated string GROUP BY key + a constant-object `star_constraint`; masked by the `group_kind(None)` decline. **Must fix before extending the string default to single-table** | engine (deferred — not PR-6) |
 | **F13** | harness-note / baseline-drift | q034, q050 (q009/q010 class) | native micro-query blessed baselines drift with machine state → recurring false `SLOW` alarms. PR-8b: q034 1.84×/q050 2.98× confirmed at 5 reps, then a base A/B (`c4a9b799e`, no PR-8b) reproduced 1.83×/2.93× — i.e. the ratio pre-dates the change. Chronic (twice now). **Re-bless these micro-query baselines on a quiet machine before the next gating cycle.** | harness (baseline re-bless) |
 | **F14** | perf-residual (post-PR-4b/4c) | q050, q016 | the batched R2RML OPTIONAL hash-left-join drives the seed in WINDOWS and **re-scans the main (inner) table per window** — it was never scan-once. Attributed on q016 (PR-4c): 182 `scan_table` = 180 FACT_SHIPMENT (inner, per-window) + 2 FACT_ORDER (outer, collapsed); q050 (PR-4b, shipped): 92 scans. So it flips DNF→ok (q016 39s hot, q050 9.3s) but not to seconds. Fix class: **consume the WHOLE seed in one inner scan + in-memory hash-join** (IN-set/probe extension — the real successor to `07` open-Q2); prize q016 ~39s→seconds, q050 ~9.3s→~1s. **PR-4d candidate — not a blocker** (uniform with shipped PR-4b). | engine (batched-OPTIONAL seed-windowing) |
+| **F15** | correctness-latent (armed + fixed in-PR by PR-7) | (synthetic — NaN float bounds) | `TypedValue::lt`/`le` `Float` arms used a raw `<`, so a NaN bound returns `Some(false)` → `bounds_can_contain` could over-prune a row group holding NaN rows (strict-superset violation). **Unreachable until PR-7's `ScanValue::Double` push produces a float bound.** Fixed in-PR: NaN operand → `None` → keep; guarded by two unit tests. | engine (fixed in PR-7) |
 
 **The two correctness bugs (F1/F2) share one root** and are the highest priority — they deliver wrong answers as silent successes. **F3 is a second, independent correctness gap** (root-caused) on the most common inspector shape — small fix surface, high user-visible impact (missing `@type` in the solo subject inspector). **F5-q050** is the sharpest perf signal (dims-only, 377 scans). **F4 is corpus hygiene, not an engine bug** — but it must be fixed (the determinism amendment) so nondeterministic-selection queries stop masking real divergences. F1/F2/F3/F5 feed the WP7 diagnosis and WP8 roadmap; F4 feeds the corpus determinism amendment; F7 feeds back into WP6 harness tuning.

@@ -64,3 +64,16 @@ pub(crate) fn parallel_catalog_resolution_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_PARALLEL_CATALOG"))
 }
+
+/// Whether numeric (double / decimal) FILTER predicates may be pushed to the
+/// Iceberg scan for file / row-group pruning (PR-7). Default on;
+/// `FLUREE_ICEBERG_NUMERIC_STATS=0|false|off|no` reverts to leaving them with the
+/// in-engine FILTER only, independently of the shipped int/date/string pushdown.
+/// Gating at the single push site (`to_scan_value`) keeps the iceberg-side
+/// widening inert when off — no numeric `LiteralValue` is ever produced, so the
+/// new `stat_bounds` arms and FLBA-decimal relax are never exercised. Cached in a
+/// `OnceLock` — set at process startup, not per query.
+pub(crate) fn iceberg_numeric_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_ICEBERG_NUMERIC_STATS"))
+}
