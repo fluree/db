@@ -813,7 +813,7 @@ impl FlureeR2rmlProvider<'_> {
         // ignores it (matching breadcrumb in `scan_table_inner`); if time-travel
         // semantics ever land on the scan, this method MUST follow, or a COUNT and
         // a scan in one query could answer from different snapshots.
-        let (storage, metadata, _metadata_location) =
+        let (storage, metadata, metadata_location) =
             self.load_table_context(graph_source_id, table_name).await?;
 
         // The count must equal a full scan of THIS snapshot — the one the scan
@@ -828,23 +828,39 @@ impl FlureeR2rmlProvider<'_> {
 
         // Manifest-only read (never a Parquet/data file): the live data files, and
         // whether the snapshot carries merge-on-read delete manifests.
+        //
+        // PR-8 slice 2: this manifest read (the COUNT(*) path's, ~450ms cold) is
+        // keyed by the content-addressed `metadata_location`, so persist it to the
+        // disk catalog cache and serve it from there on a warm-catalog cold
+        // process (no S3 read, no `r2rml.count_manifest_read` span).
+        //
         // Measurement sub-span (PR-8 cold decomposition): the COUNT(*) path's
         // manifest-list + manifest read (the scan path's equivalent is
         // `iceberg.scan_plan`). For a bare `COUNT(*)` (q036) this plus
         // `r2rml.load_table` + `r2rml.read_metadata` accounts for the entire cold
         // wall — no data file is read. Allowlisted in `fluree-bench-virtual::spans`.
-        let (data_files, _manifests_read, has_delete_manifests) =
-            send_read_snapshot_data_files(storage.as_ref(), snapshot)
-                .instrument(tracing::debug_span!(
-                    "r2rml.count_manifest_read",
-                    table_name
-                ))
-                .await
-                .map_err(|e| {
-                    QueryError::Internal(format!(
-                        "Failed to read manifests for row count of '{table_name}': {e}"
+        let catalog_cache = self.catalog_disk_cache();
+        let (data_files, has_delete_manifests) = if let Some(hit) =
+            catalog_cache.get_count_stats(&metadata_location)
+        {
+            debug!(table_name = %table_name, "COUNT(*) manifest stats disk-cache hit");
+            hit
+        } else {
+            let (data_files, _manifests_read, has_delete_manifests) =
+                send_read_snapshot_data_files(storage.as_ref(), snapshot)
+                    .instrument(tracing::debug_span!(
+                        "r2rml.count_manifest_read",
+                        table_name
                     ))
-                })?;
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read manifests for row count of '{table_name}': {e}"
+                        ))
+                    })?;
+            catalog_cache.put_count_stats(&metadata_location, &data_files, has_delete_manifests);
+            (data_files, has_delete_manifests)
+        };
 
         let count =
             sound_manifest_row_count(schema, &data_files, has_delete_manifests, non_null_cols);
@@ -881,6 +897,17 @@ impl FlureeR2rmlProvider<'_> {
             &id.table,
         );
         self.session.is_pinned(&key)
+    }
+
+    /// The persistent on-disk catalog cache (PR-8 slice 2), rooted in a dedicated
+    /// dir sibling to this instance's Parquet/binary artifact cache so the cold
+    /// benchmark protocol can clear data while keeping catalog persistence. Cheap
+    /// to build per call (a `create_dir_all` that no-ops once the dir exists).
+    fn catalog_disk_cache(&self) -> super::disk_catalog_cache::DiskCatalogCache {
+        let artifact_dir = self.fluree.binary_store_cache_dir();
+        super::disk_catalog_cache::DiskCatalogCache::for_dir(
+            &super::disk_catalog_cache::catalog_cache_dir(&artifact_dir),
+        )
     }
 
     /// Resolve a graph source down to its pinned Iceberg table context: the S3
@@ -1206,31 +1233,43 @@ impl FlureeR2rmlProvider<'_> {
         } else {
             debug!(metadata_location = %metadata_location, "Table metadata cache miss");
 
-            // Measurement sub-span (PR-8 cold decomposition): isolate the
-            // metadata-JSON S3 GET + parse — the `load_table_context` component
-            // between the loadTable REST GET (`r2rml.load_table`) and the manifest
-            // read (`iceberg.scan_plan` / `r2rml.count_manifest_read`). Allowlisted
-            // in `fluree-bench-virtual::spans`; keyed by the content-addressed
-            // `metadata_location`, so it is exactly the layer §2.1 can persist.
-            let metadata = async {
-                let metadata_bytes =
-                    storage
-                        .as_ref()
-                        .read(metadata_location)
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to read table metadata: {e}"))
-                        })?;
-                let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
-                    QueryError::Internal(format!("Failed to parse table metadata: {e}"))
-                })?;
-                Ok::<_, QueryError>(Arc::new(parsed))
-            }
-            .instrument(tracing::debug_span!(
-                "r2rml.read_metadata",
-                metadata_location = %metadata_location,
-            ))
-            .await?;
+            // PR-8 slice 2: on the in-memory miss, try the persistent disk catalog
+            // cache before hitting S3. `metadata_location` is content-addressed, so
+            // a hit is always current for that snapshot. A cold process with a warm
+            // catalog dir serves the parsed metadata from local disk (no S3 GET,
+            // no `r2rml.read_metadata` span).
+            let catalog_cache = self.catalog_disk_cache();
+            let metadata = if let Some(disk) = catalog_cache.get_metadata(metadata_location) {
+                debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
+                disk
+            } else {
+                // Measurement sub-span (PR-8 cold decomposition): isolate the
+                // metadata-JSON S3 GET + parse — the `load_table_context` component
+                // between the loadTable REST GET (`r2rml.load_table`) and the
+                // manifest read (`iceberg.scan_plan` / `r2rml.count_manifest_read`).
+                // Allowlisted in `fluree-bench-virtual::spans`.
+                let metadata = async {
+                    let metadata_bytes =
+                        storage
+                            .as_ref()
+                            .read(metadata_location)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!("Failed to read table metadata: {e}"))
+                            })?;
+                    let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                        QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+                    })?;
+                    Ok::<_, QueryError>(Arc::new(parsed))
+                }
+                .instrument(tracing::debug_span!(
+                    "r2rml.read_metadata",
+                    metadata_location = %metadata_location,
+                ))
+                .await?;
+                catalog_cache.put_metadata(metadata_location, metadata.as_ref());
+                metadata
+            };
             cache
                 .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
                 .await;
@@ -1332,82 +1371,119 @@ impl FlureeR2rmlProvider<'_> {
         // The scan-files cache is keyed only by metadata location, so it is
         // bypassed when a pushdown filter is present (different filter → a
         // different pruned file set).
-        let (tasks, files_selected, files_pruned, estimated_row_count) =
-            if let Some(filter) = &filter_expr {
-                let scan_config = ScanConfig::new()
-                    .with_projection(projected_field_ids.clone())
-                    .with_filter(filter.clone());
-                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-                let plan = planner
-                    .plan_scan()
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
-                (
-                    plan.tasks,
-                    plan.files_selected,
-                    plan.files_pruned,
-                    plan.estimated_row_count,
-                )
-            } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
-                debug!(
-                    metadata_location = %metadata_location,
-                    cached_files = cached.data_files.len(),
-                    "Iceberg scan-files cache hit"
-                );
+        let (tasks, files_selected, files_pruned, estimated_row_count) = if let Some(filter) =
+            &filter_expr
+        {
+            let scan_config = ScanConfig::new()
+                .with_projection(projected_field_ids.clone())
+                .with_filter(filter.clone());
+            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+            let plan = planner
+                .plan_scan()
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+            (
+                plan.tasks,
+                plan.files_selected,
+                plan.files_pruned,
+                plan.estimated_row_count,
+            )
+        } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = cached.data_files.len(),
+                "Iceberg scan-files cache hit"
+            );
 
-                let tasks = cached
-                    .data_files
-                    .iter()
-                    .cloned()
-                    .map(|data_file| {
-                        FileScanTask::for_whole_file_with_schema(
-                            data_file,
-                            projected_field_ids.clone(),
-                            None,
-                            Arc::clone(&schema_arc),
-                        )
-                    })
-                    .collect::<Vec<_>>();
+            let tasks = cached
+                .data_files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    FileScanTask::for_whole_file_with_schema(
+                        data_file,
+                        projected_field_ids.clone(),
+                        None,
+                        Arc::clone(&schema_arc),
+                    )
+                })
+                .collect::<Vec<_>>();
 
-                (
-                    tasks,
-                    cached.files_selected,
-                    cached.files_pruned,
-                    cached.estimated_row_count,
-                )
-            } else {
-                debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
+            (
+                tasks,
+                cached.files_selected,
+                cached.files_pruned,
+                cached.estimated_row_count,
+            )
+        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&metadata_location) {
+            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
+            // cache has this snapshot's (unfiltered) file list — a warm-catalog
+            // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
+            // tasks from the file list exactly as the in-memory-hit arm does, and
+            // populate the in-memory cache for the rest of the process.
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = disk.data_files.len(),
+                "Iceberg scan-files disk-cache hit"
+            );
+            cache
+                .put_scan_files(metadata_location.clone(), Arc::clone(&disk))
+                .await;
+            let tasks = disk
+                .data_files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    FileScanTask::for_whole_file_with_schema(
+                        data_file,
+                        projected_field_ids.clone(),
+                        None,
+                        Arc::clone(&schema_arc),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                tasks,
+                disk.files_selected,
+                disk.files_pruned,
+                disk.estimated_row_count,
+            )
+        } else {
+            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
 
-                // Create scan configuration with projection for the first plan.
-                let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
-                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-                let plan = planner
-                    .plan_scan()
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+            // Create scan configuration with projection for the first plan.
+            let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
+            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+            let plan = planner
+                .plan_scan()
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
 
-                let cached = Arc::new(CachedScanFiles {
-                    data_files: Arc::new(
-                        plan.tasks
-                            .iter()
-                            .map(|task| task.data_file.clone())
-                            .collect(),
-                    ),
-                    estimated_row_count: plan.estimated_row_count,
-                    files_selected: plan.files_selected,
-                    files_pruned: plan.files_pruned,
-                });
-                cache
-                    .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
-                    .await;
+            let cached = Arc::new(CachedScanFiles {
+                data_files: Arc::new(
+                    plan.tasks
+                        .iter()
+                        .map(|task| task.data_file.clone())
+                        .collect(),
+                ),
+                estimated_row_count: plan.estimated_row_count,
+                files_selected: plan.files_selected,
+                files_pruned: plan.files_pruned,
+            });
+            cache
+                .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
+                .await;
+            // Persist to the disk catalog cache (content-addressed, immutable).
+            self.catalog_disk_cache()
+                .put_scan_files(&metadata_location, &cached);
 
-                (
-                    plan.tasks,
-                    cached.files_selected,
-                    cached.files_pruned,
-                    cached.estimated_row_count,
-                )
-            };
+            (
+                plan.tasks,
+                cached.files_selected,
+                cached.files_pruned,
+                cached.estimated_row_count,
+            )
+        };
 
         info!(
             files_selected,

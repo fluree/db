@@ -171,3 +171,73 @@ The original §5.3 cold gate is **wrong for slice 1**, and the underpowered q008
 - **OAuth stays n=1 even under fully-concurrent prefetch (verified live).** `buffered` polls cooperatively on one task and the REST-client build is synchronous, so the first future builds + caches the process-wide client (and its OAuth token) before any other future resumes past its async nameservice lookup; every later table reuses them. No cold OAuth storm, and no serial-first warm is needed. **Fragility note:** if the client build ever becomes `async`, this dedup breaks and a serial first-table warm would be required — commented at the callsite.
 - **Pre-existing defect, independently fixed by the fold-in:** the per-query `IcebergCatalogSession` pinned the loadTable *response* but not the `S3IcebergStorage` client built *from* it, so **every scan rebuilt the AWS SDK client** (`aws_config` load + S3 + HTTP client) — a correlated join re-scanning a dim paid it per re-scan, and naive prefetch paid it twice (warm + scan), which canceled the parallelization gain on q008. Slice 1 caches `Arc<S3IcebergStorage>` in the session keyed like the pin and reuses it; `store_load_table` invalidates it on any fresh loadTable so a **creds refresh rebuilds the client** (never serves a stale-creds client — unit-tested). This is the natural completion of the session-pin design, not scope creep.
 - **Cross-pattern non-fused joins are a documented follow-up.** Slice-1's prefetch fires within a single operator (the fused chain, or one pattern's multi-TriplesMap set). A non-fused join across *separate* patterns resolves its tables in *separate* `R2rmlScanOperator`s that the join pulls serially, so an in-operator prefetch can't reach them; parallelizing that would need a query-plan-level prefetch (walk the plan for all R2RML tables, warm once before execution) — a bigger design for **un-measured** value (none of the cold subset hits that path). Deferred, noted here with the operator-boundary reason.
+
+---
+
+## 8. Slice-2 (DiskCatalogCache: persist metadata + scan_files + count-stats) — implementation
+
+Persists the three SECRET-FREE, IMMUTABLE catalog layers to disk so a cold
+process with a warm catalog dir skips the S3 metadata + manifest reads (it still
+pays the one `loadTable` GET for fresh vended creds — ruling ii). New module
+`fluree-db-api/src/graph_source/disk_catalog_cache.rs`; wired at the three read
+sites in `r2rml.rs` (in-memory miss → disk → S3), switch
+`FLUREE_ICEBERG_CATALOG_DISK_CACHE` (default on).
+
+### 8.1 The pointer and the TTL are UNNECESSARY (§2.2 simplification)
+
+§2.2 proposed persisting a `metadata_location` pointer under a drift-TTL. Under
+the no-creds ruling the `loadTable` GET **always runs** (for creds) and returns
+the CURRENT `metadata_location`, so the disk cache keyed by that content-addressed
+location is trivially correct with **no pointer and no TTL**: a table commit
+yields a new location = a new key = a clean miss; a given key's value is immutable
+and can never go stale. So slice 2 is just three content-addressed stores keyed by
+`metadata_location`:
+- `TableMetadata` (serde-ready) — removes the `r2rml.read_metadata` S3 GET.
+- `scan_files` (the unfiltered full file list; the in-memory cache is already
+  bypassed when a pushdown filter prunes, so this is immutable per snapshot) —
+  removes the scan path's `iceberg.scan_plan` manifest read.
+- COUNT-path manifest stats (`data_files` + `has_delete_manifests`) — removes the
+  `r2rml.count_manifest_read` manifest read (q036's ~450 ms slice).
+
+`DataFile` (+ `FileFormat`, `PartitionData`) gained `Serialize/Deserialize` in
+`fluree-db-iceberg` to persist the file lists (they derived only `Debug/Clone`);
+`Arc`-wrapped fields are persisted as plain `Vec` (serde's `rc` feature is off).
+Entries are serde_json (no bincode in the workspace).
+
+### 8.2 Dedicated dir = the cold-data / warm-catalog gate, expressed
+
+The cache lives in a dir **sibling** to the Parquet/binary `DiskArtifactCache`
+(`<artifact_dir>-catalog`), never inside it. The vbench cold protocol clears the
+pinned artifact dir (`clear_cold_cache` → `remove_dir_all`); the sibling survives.
+So **two `--cold` runs against the same `--cache-dir`** are exactly the
+cold-data/warm-catalog state: run 1 populates `<dir>-catalog`; run 2 clears the
+data artifacts (cold data) but reads metadata/scan_files/count-stats from the warm
+catalog sibling — `r2rml.read_metadata`, `iceberg.scan_plan`, and
+`r2rml.count_manifest_read` drop to **n=0** on run 2. That span-count collapse (+
+q036's wall dropping by the metadata+manifest slice, + run1==run2==oracle parity)
+is slice-2's DoD gate. The cache is a pure optimization — every I/O or parse
+failure degrades to a miss, never a query error — and hermetic round-trip tests
+(`disk_catalog_cache::tests`) cover the serde path; the disabled switch and a
+non-creatable dir both fall back to today's S3-every-cold behavior.
+
+### 8.3 Robustness (lead cautions) — versioning, atomic writes, bounded dir
+
+Content-addressing the KEY does not protect the VALUE layout across releases, so:
+- **Versioned envelope.** Every entry is `{format_version, payload}`; `read`
+  checks the version and treats a mismatch — or ANY deserialize failure — as a
+  miss (and deletes the stale/corrupt file). `CACHE_FORMAT_VERSION` MUST be bumped
+  whenever a persisted payload type changes, so an added `DataFile` field can't be
+  silently misread from an old entry. Unit-tested (`version_mismatch_is_a_miss`,
+  `corrupt_entry_is_a_miss`).
+- **Atomic writes.** Entries are written to a `.tmp` sibling then `rename`d, so a
+  crash mid-write can't leave a torn file a later read would trust (the torn temp
+  is just orphaned).
+- **Bounded dir.** At process startup (first `for_dir`, gated by a `OnceLock`) the
+  dir is pruned oldest-first (by mtime) to `MAX_CACHE_BYTES` (512 MiB) — metadata
+  entries are tiny but a ~7,670-file `scan_files` entry is not, and unbounded
+  growth under `~/.fluree` would eventually be a support ticket.
+
+The serde surface is narrow: `DataFile`/`FileFormat`/`PartitionData` hold only
+primitives, enums with unit variants, and `HashMap<i32, …>` / `Vec<…>` of the
+same — no borrowed or in-memory-only fields, so the derive is clean (no
+purpose-built record needed). Persistence is serde_json (no bincode in-tree).
