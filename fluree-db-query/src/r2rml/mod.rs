@@ -30,7 +30,7 @@ pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOpera
 pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
     ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
-    ScanCmpOp, ScanFilter, ScanValue,
+    ScanCmpOp, ScanFilter, ScanTopK, ScanValue,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, rewrite_patterns_for_r2rml, unsupported_subscope_error,

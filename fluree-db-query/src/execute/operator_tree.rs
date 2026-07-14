@@ -3380,6 +3380,21 @@ pub(crate) fn apply_solution_modifiers(
                 (Some(limit), None) => limit,
                 _ => 0,
             };
+            // PR-5: offer the primary DESC sort key + k to the row-preserving scan
+            // below, so a single-column `ORDER BY DESC(<scan col>) LIMIT k` over an
+            // R2RML scan can read only the files that can hold the top-k. Offered
+            // only for a DESCENDING primary key (ASC declines — SPARQL orders
+            // unbound first, so a null-bearing file can't be pruned); the scan
+            // honors it ONLY if the key resolves to a single scalar scan column,
+            // else no-op. Pure optimization — this `SortOperator` remains the
+            // authority for the exact (compound) order + LIMIT.
+            if can_topk {
+                if let Some(primary) = ordering.first() {
+                    if primary.direction == crate::sort::SortDirection::Descending {
+                        operator.set_topk(primary.var, k);
+                    }
+                }
+            }
             let mut sort_op = if can_topk {
                 SortOperator::new_topk(operator, ordering.to_vec(), k)
             } else {

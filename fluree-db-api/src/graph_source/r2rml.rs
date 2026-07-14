@@ -15,19 +15,31 @@ use fluree_db_iceberg::{
     catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
-    scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
+    scan::{
+        topk::{batch_sort_values, plan_topk_read, TopKBound},
+        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
+    },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
     IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue,
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
+    ScanValue,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
 use std::sync::Arc;
 use tracing::{debug, info, warn, Instrument};
+
+/// Max files a scan-side top-k (PR-5) reads SEQUENTIALLY (bound-ordered, with
+/// early-stop) before conceding the prune is ineffective and handing the rest to
+/// the normal bounded-parallel reader. Caps the worst case (adversarial layout /
+/// all files tie at the bound / a heap that never fills) so the topk path can
+/// never be slower than the parallel path it replaces. The win case (q046) reads
+/// ~10-15 files and stops well under this.
+const TOPK_SEQUENTIAL_CAP: usize = 128;
 
 /// How many data files to read concurrently. Defaults to
 /// `min(available_parallelism, files, 32)`; override with
@@ -774,6 +786,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         // Time the whole scan SETUP (loadTable + planning) as one span; it closes
@@ -787,9 +800,16 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             table_name,
             projection_len = projection.len()
         );
-        self.scan_table_inner(graph_source_id, table_name, projection, filters, _as_of_t)
-            .instrument(span)
-            .await
+        self.scan_table_inner(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            _as_of_t,
+        )
+        .instrument(span)
+        .await
     }
 
     /// The table's exact live row count from the pinned Iceberg manifest — **only
@@ -1391,6 +1411,7 @@ impl FlureeR2rmlProvider<'_> {
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         // GREP: r2rml-as-of-t — time-travel is not implemented for Iceberg scans;
@@ -1596,6 +1617,135 @@ impl FlureeR2rmlProvider<'_> {
         // resident — the consumer (R2rmlScanOperator) materializes and aggregates
         // incrementally instead of the whole table being collected here.
         let footers = cache.parquet_footers();
+
+        // PR-5 scan-side top-k. When a resolvable single-column DESC directive is
+        // present, read files in `upper_bound(sort_col)`-DESC order with a running
+        // k-th bound and stop once no unread file can beat it — streaming a strict
+        // SUPERSET of the top-k (the `SortOperator` above is authoritative). The
+        // pruned subset MUST bypass the operator's scan cache (handled by its
+        // `cacheable` guard gaining `&& topk.is_none()`); the disk *artifact* cache
+        // is keyed by file path+size with whole-file entries, so a pruned subset
+        // never poisons it. Falls through to the parallel path if the sort column
+        // is unresolvable. Sequential reads are bounded by `TOPK_SEQUENTIAL_CAP`:
+        // if the prune is ineffective (adversarial layout / all files tie at the
+        // bound / a heap that can't fill), the remaining files are handed to the
+        // normal parallel reader so the topk path can never be slower than it.
+        if let Some(tk) = topk {
+            if let Some(field) = schema.field_by_name(&tk.sort_column) {
+                let sort_field_id = field.id;
+                let sort_type = field.type_string().map(str::to_string);
+                let order = plan_topk_read(
+                    tasks.iter().map(|t| &t.data_file),
+                    sort_field_id,
+                    sort_type.as_deref(),
+                );
+
+                let mut bound = TopKBound::new(tk.k);
+                let mut collected: Vec<ColumnBatch> = Vec::new();
+                let mut tail: Vec<FileScanTask> = Vec::new();
+                for pos in 0..order.len() {
+                    if pos >= TOPK_SEQUENTIAL_CAP {
+                        // Prune ineffective after the cap — finish in parallel.
+                        tail = order[pos..]
+                            .iter()
+                            .map(|(orig, _)| tasks[*orig].clone())
+                            .collect();
+                        break;
+                    }
+                    let (orig, _) = order[pos];
+                    let read_span = tracing::debug_span!(
+                        "iceberg.parquet_read",
+                        path = %tasks[orig].data_file.file_path,
+                        file_size = tasks[orig].data_file.file_size_in_bytes,
+                    );
+                    let batches = SendParquetReader::with_caches(
+                        storage.as_ref(),
+                        footers.as_ref(),
+                        &disk_cache,
+                        &cache_dir,
+                    )
+                    .read_task(&tasks[orig])
+                    .instrument(read_span)
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read Parquet file '{}': {e}",
+                            tasks[orig].data_file.file_path
+                        ))
+                    })?;
+                    for b in &batches {
+                        bound.observe_all(batch_sort_values(b, sort_field_id));
+                    }
+                    collected.extend(batches);
+                    // Stop iff the heap is full and the NEXT (highest-remaining)
+                    // file's bound is strictly below the k-th (over-keep on ties;
+                    // a no-bound next → never stops). See `TopKBound::can_stop`.
+                    if let Some((_, next_upper)) = order.get(pos + 1) {
+                        if bound.can_stop(next_upper.as_ref()) {
+                            break;
+                        }
+                    }
+                }
+                debug!(
+                    files_read = order.len() - tail.len(),
+                    tail_parallel = tail.len(),
+                    total_files = order.len(),
+                    k = tk.k,
+                    "scan-side top-k read"
+                );
+                let prefix = futures::stream::iter(collected.into_iter().map(Ok));
+                if tail.is_empty() {
+                    return Ok(Box::pin(prefix));
+                }
+                // Parallel fallback tail (same bounded-parallel read as the normal
+                // path). The bound still holds; we just stop paying sequentiality.
+                let concurrency = iceberg_scan_concurrency(tail.len());
+                let tail_stream =
+                    futures::stream::iter(tail)
+                        .map(move |task| {
+                            let storage = Arc::clone(&storage);
+                            let footers = Arc::clone(&footers);
+                            let disk_cache = Arc::clone(&disk_cache);
+                            let cache_dir = cache_dir.clone();
+                            let read_span = tracing::debug_span!(
+                                "iceberg.parquet_read",
+                                path = %task.data_file.file_path,
+                                file_size = task.data_file.file_size_in_bytes,
+                            );
+                            async move {
+                                tokio::spawn(async move {
+                                    let reader = SendParquetReader::with_caches(
+                                        storage.as_ref(),
+                                        footers.as_ref(),
+                                        &disk_cache,
+                                        &cache_dir,
+                                    );
+                                    reader.read_task(&task).instrument(read_span).await.map_err(
+                                        |e| {
+                                            QueryError::Internal(format!(
+                                                "Failed to read Parquet file '{}': {e}",
+                                                task.data_file.file_path
+                                            ))
+                                        },
+                                    )
+                                })
+                                .await
+                                .map_err(|e| {
+                                    QueryError::Internal(format!("Parquet read worker failed: {e}"))
+                                })?
+                            }
+                        })
+                        .buffer_unordered(concurrency)
+                        .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+                            Ok(batches) => futures::stream::iter(
+                                batches.into_iter().map(Ok).collect::<Vec<_>>(),
+                            ),
+                            Err(e) => futures::stream::iter(vec![Err(e)]),
+                        });
+                return Ok(Box::pin(prefix.chain(tail_stream)));
+            }
+        }
+
         let concurrency = iceberg_scan_concurrency(tasks.len());
         debug!(
             files = tasks.len(),

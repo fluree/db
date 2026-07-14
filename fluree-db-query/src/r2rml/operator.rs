@@ -222,6 +222,17 @@ fn limit_pushdown_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_LIMIT_PUSHDOWN"))
 }
 
+/// Whether a single-column DESC `ORDER BY … LIMIT` may push a scan-side top-k
+/// directive into the R2RML scan (PR-5), so it reads only the files that can hold
+/// the top-k. Read once from `FLUREE_R2RML_TOPK_PUSHDOWN` (family falsy
+/// spellings); off restores the full-materialize top-k (scan streams every row,
+/// the `SortOperator` keeps k). Gating in `set_topk` means off ⇒ no directive ⇒
+/// the scan takes its normal path (a full revert).
+fn topk_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_TOPK_PUSHDOWN"))
+}
+
 /// How a window of produced rows is combined with the buffered child rows.
 ///
 /// The join is *flipped* relative to a naive per-child probe: the (small,
@@ -381,6 +392,13 @@ pub struct R2rmlScanOperator {
     row_budget: Option<usize>,
     /// Output rows emitted so far, counted against `row_budget`.
     emitted: usize,
+    /// Scan-side top-k directive (PR-5): `(primary DESC sort var, LIMIT+OFFSET)`,
+    /// set by a `SortOperator` for a `ORDER BY DESC(<scan col>) LIMIT k` directly
+    /// above this scan. Resolved to the sort column against the mapping at scan
+    /// time ([`Self::resolve_topk_directive`]); `None` = no pushdown (full scan +
+    /// the authoritative sort above). Only ever consulted for the main table scan,
+    /// never a parent/dimension lookup.
+    topk: Option<(VarId, usize)>,
     /// A scan-local FILTER the planner folded into this scan (see
     /// [`R2rmlPattern::consumed_filter`]). Applied to each output batch with the
     /// same evaluator the dropped `FilterOperator` would use, so results are
@@ -462,6 +480,7 @@ impl R2rmlScanOperator {
             parent_memo: parent_memo_enabled(),
             row_budget: None,
             emitted: 0,
+            topk: None,
             consumed_filter,
             state: OperatorState::Created,
         }
@@ -529,6 +548,37 @@ impl R2rmlScanOperator {
     /// table columns for the given TriplesMap, producing scan filters. A
     /// variable maps to a column via its predicate IRI; only plain `rr:column`
     /// scalar object maps are pushable (see [`value_pushdown_column`]).
+    /// Resolve the stored top-k directive (`(sort_var, k)`) to a [`crate::r2rml::ScanTopK`]
+    /// for THIS table scan, or `None` (→ full scan) when the sort var doesn't map
+    /// to exactly one scalar pushdown column of `triples_map` — the same soundness
+    /// gate `build_scan_filters` uses. The scan-side prune uses only this primary
+    /// column; the `SortOperator` above still applies the exact compound order +
+    /// LIMIT, so a `None` here is only a missed optimization, never wrong.
+    fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
+        let (sort_var, k) = self.topk?;
+        let pred_iri = if Some(sort_var) == self.pattern.object_var {
+            self.pattern.predicate_filter.as_deref()
+        } else {
+            self.pattern
+                .star_bindings
+                .iter()
+                .find(|(_, v)| *v == sort_var)
+                .map(|(p, _)| p.as_str())
+        }?;
+        let mut matching = triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+        let (Some(pom), None) = (matching.next(), matching.next()) else {
+            return None;
+        };
+        let col = value_pushdown_column(&pom.object_map)?;
+        Some(crate::r2rml::ScanTopK {
+            sort_column: col.to_string(),
+            k,
+        })
+    }
+
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
         let mut out = Vec::new();
         for pd in &self.pattern.scan_filters {
@@ -913,8 +963,17 @@ impl R2rmlScanOperator {
             // would defeat the LIMIT. A budgeted scan is the topmost
             // row-preserving scan, so it stops after ~a batch and gains little
             // from cross-batch reuse anyway.
-            let cacheable =
-                scan_cache_enabled() && scan_filters.is_empty() && self.row_budget.is_none();
+            //
+            // A top-k scan (PR-5) ALSO bypasses the cache: it returns a pruned
+            // file SUBSET, and the cache key `(table, projection)` does not carry
+            // the directive — replaying that subset for a later FULL scan of the
+            // same table+projection would silently drop rows (the exact silent-
+            // wrong class the differential's second-scan case guards).
+            let main_scan_topk = self.resolve_topk_directive(triples_map);
+            let cacheable = scan_cache_enabled()
+                && scan_filters.is_empty()
+                && self.row_budget.is_none()
+                && self.topk.is_none();
             let cache_key = (table_name.to_string(), projection.clone());
             let stream: ColumnBatchStream = if !cacheable {
                 table_provider
@@ -923,6 +982,7 @@ impl R2rmlScanOperator {
                         table_name,
                         &projection,
                         &scan_filters,
+                        main_scan_topk.as_ref(),
                         as_of_t,
                     )
                     .await?
@@ -935,6 +995,7 @@ impl R2rmlScanOperator {
                         table_name,
                         &projection,
                         &scan_filters,
+                        main_scan_topk.as_ref(),
                         as_of_t,
                     )
                     .await?;
@@ -1126,6 +1187,7 @@ impl R2rmlScanOperator {
                             parent_table,
                             &parent_projection,
                             &[],
+                            None,
                             as_of_t,
                         )
                         .await?;
@@ -2218,6 +2280,16 @@ impl Operator for R2rmlScanOperator {
         }
     }
 
+    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+        // Record the DESC top-k directive; it is resolved to a scan column against
+        // the mapping at scan time and honored only for the main table scan. Like
+        // `row_budget`, do NOT forward to the child — an inner correlated scan must
+        // still produce every row the join needs; only a topmost scan is eligible.
+        if topk_pushdown_enabled() {
+            self.topk = Some((sort_var, k));
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         // Open child first
         self.child.open(ctx).await?;
@@ -3031,6 +3103,7 @@ mod tests {
                 table_name: &str,
                 _projection: &[String],
                 _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
                 _as_of_t: Option<i64>,
             ) -> Result<ColumnBatchStream> {
                 *self
@@ -3153,6 +3226,7 @@ mod tests {
                 table_name: &str,
                 _projection: &[String],
                 _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
                 _as_of_t: Option<i64>,
             ) -> Result<ColumnBatchStream> {
                 *self

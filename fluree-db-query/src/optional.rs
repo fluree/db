@@ -2491,6 +2491,7 @@ mod tests {
                 table: &str,
                 _proj: &[String],
                 _filters: &[ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
                 _t: Option<i64>,
             ) -> Result<ColumnBatchStream> {
                 // products: PID 1 (FK 10 -> exists) and PID 2 (FK 99 -> DANGLING).
@@ -2706,6 +2707,7 @@ mod tests {
                 table: &str,
                 _proj: &[String],
                 _filters: &[ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
                 _t: Option<i64>,
             ) -> Result<ColumnBatchStream> {
                 // shipments: SH 100/101 → order 1 (TWO → cartesian); 102 → order 3

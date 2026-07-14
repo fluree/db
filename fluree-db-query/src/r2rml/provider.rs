@@ -103,6 +103,24 @@ pub struct ScanFilter {
     pub value: ScanValue,
 }
 
+/// A scan-side top-k directive for a single-column **DESCENDING** `ORDER BY …
+/// LIMIT k` directly above a single-table R2RML scan (PR-5). The scan reads files
+/// in `upper_bound(sort_column)`-DESC order, keeps a running k-th bound, and stops
+/// once no unread file can beat it — reading far fewer than the whole table.
+///
+/// A pure perf optimization: the scan still streams a strict SUPERSET of the true
+/// top-k (it only skips files that provably cannot contribute), and the
+/// authoritative `SortOperator` above applies the exact (compound) order + LIMIT.
+/// Ignored by the provider unless `sort_column` resolves to a pushable scalar
+/// column of the scanned table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanTopK {
+    /// The primary DESC sort column (an R2RML-mapped table column name).
+    pub sort_column: String,
+    /// How many top rows the bound must retain — the query's `LIMIT + OFFSET`.
+    pub k: usize,
+}
+
 /// Provider for compiled R2RML mappings.
 ///
 /// This trait is used by the R2RML operator to load mappings at query time.
@@ -182,12 +200,17 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     /// `filters` are conservative pushdown predicates (resolved to columns) for
     /// Iceberg file pruning. Implementations may ignore them (correctness is
     /// preserved by the in-engine FILTER) but honoring them skips data files.
+    /// `topk`, when set, is a single-column DESC `ORDER BY … LIMIT` directive
+    /// (PR-5): the implementation MAY read only the files that can hold the top-k
+    /// and stream a superset of them; ignoring it is always correct (the sort
+    /// above is authoritative).
     async fn scan_table(
         &self,
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
 
@@ -277,6 +300,7 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
         _table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream> {
         Err(crate::error::QueryError::Internal(format!(
