@@ -152,14 +152,6 @@ impl RestCatalogClient {
         })
     }
 
-    /// Override the catalog-request semaphore (tests only), so a bounded-pool test
-    /// isn't at the mercy of the process-wide `OnceLock`'s first-caller init.
-    #[cfg(test)]
-    pub(crate) fn with_catalog_semaphore(mut self, sem: Arc<tokio::sync::Semaphore>) -> Self {
-        self.catalog_semaphore = sem;
-        self
-    }
-
     /// Make a GET request to the catalog API.
     ///
     /// Handles authentication headers and 401 retry with token refresh.

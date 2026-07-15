@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn plan_orders_desc_with_no_bound_last() {
-        let dfs = vec![
+        let dfs = [
             df_with_upper(1, Some(10.0), 0), // 0
             df_with_upper(1, Some(30.0), 0), // 1
             df_with_upper(1, None, 5),       // 2 — all-null column, no upper_bound
@@ -364,13 +364,13 @@ mod tests {
     /// holding the top-k.
     #[test]
     fn read_loop_prunes_after_heap_fills() {
-        let vals = vec![
+        let vals = [
             vec![Some(4999.98), Some(100.0)], // 0: holds the max
             vec![Some(4999.60), Some(50.0)],  // 1: holds the 2nd
             vec![Some(3000.0), Some(10.0)],   // 2: below the top-2 once full
             vec![None, None],                 // 3: all-null
         ];
-        let dfs = vec![
+        let dfs = [
             df_with_upper(1, Some(4999.98), 0),
             df_with_upper(1, Some(4999.60), 0),
             df_with_upper(1, Some(3000.0), 0),
@@ -401,8 +401,8 @@ mod tests {
     /// authoritative sort). Rider 1.
     #[test]
     fn read_loop_reads_all_when_k_exceeds_nonnull() {
-        let vals = vec![vec![Some(5.0)], vec![Some(3.0)], vec![None]];
-        let dfs = vec![
+        let vals = [vec![Some(5.0)], vec![Some(3.0)], vec![None]];
+        let dfs = [
             df_with_upper(1, Some(5.0), 0),
             df_with_upper(1, Some(3.0), 0),
             df_with_upper(1, None, 1), // all-null
