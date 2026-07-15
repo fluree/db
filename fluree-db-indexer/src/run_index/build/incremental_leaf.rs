@@ -72,6 +72,9 @@ pub struct NewLeafBlob {
 pub struct LeafUpdateOutput {
     /// New leaf blobs (1 in common case; 2+ if splits occurred).
     pub leaves: Vec<NewLeafBlob>,
+    /// Novelty ops whose identity matched an existing base row, aggregated
+    /// across this leaf's merged leaflets (see [`MergeOutput::matched`]).
+    pub matched: Vec<RunRecordV2>,
 }
 
 // ============================================================================
@@ -126,6 +129,7 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
     let mut processed: Vec<ProcessedLeafletV3> = Vec::with_capacity(
         header.leaflet_count as usize + input.novelty.len() / input.leaflet_target_rows,
     );
+    let mut matched: Vec<RunRecordV2> = Vec::new();
 
     for (i, (nov_slice, ops_slice)) in novelty_slices.iter().enumerate() {
         let entry = &dir.entries[i];
@@ -140,14 +144,22 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
             )?);
         } else {
             // Decode, merge, re-encode.
-            let mut merged =
-                merge_and_encode_leaflet(input, entry, dir.payload_base, nov_slice, ops_slice)?;
+            let mut merged = merge_and_encode_leaflet(
+                input,
+                entry,
+                dir.payload_base,
+                nov_slice,
+                ops_slice,
+                &mut matched,
+            )?;
             processed.append(&mut merged);
         }
     }
 
     // Assemble processed leaflets into leaf blob(s).
-    assemble_output_leaves(processed, input)
+    let mut output = assemble_output_leaves(processed, input)?;
+    output.matched = matched;
+    Ok(output)
 }
 
 // ============================================================================
@@ -249,6 +261,7 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
                 re_encoded_leaflet_count: 0,
             },
         }],
+        matched: Vec::new(),
     })
 }
 
@@ -290,6 +303,7 @@ fn merge_and_encode_leaflet(
     payload_base: usize,
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
+    matched: &mut Vec<RunRecordV2>,
 ) -> io::Result<Vec<ProcessedLeafletV3>> {
     // 1. Load existing leaflet columns.
     let projection = ColumnProjection::all();
@@ -319,7 +333,9 @@ fn merge_and_encode_leaflet(
     let MergeOutput {
         records: merged,
         history,
+        matched: leaflet_matched,
     } = merge_novelty(&merge_input);
+    matched.extend(leaflet_matched);
 
     // 4. Handle empty-after-retract: valid in V3 (history preserved in sidecar).
     //    Preserve the original leaflet's key range and constants so branch
@@ -475,7 +491,10 @@ fn assemble_output_leaves(
     use fluree_db_binary_index::format::leaflet::EncodedLeaflet;
 
     if processed.is_empty() {
-        return Ok(LeafUpdateOutput { leaves: vec![] });
+        return Ok(LeafUpdateOutput {
+            leaves: vec![],
+            matched: Vec::new(),
+        });
     }
 
     // Convert ProcessedLeafletV3 into (EncodedLeaflet, Vec<HistEntryV2>, was_re_encoded)
@@ -521,7 +540,10 @@ fn assemble_output_leaves(
         output.push(NewLeafBlob { info: leaf_info });
     }
 
-    Ok(LeafUpdateOutput { leaves: output })
+    Ok(LeafUpdateOutput {
+        leaves: output,
+        matched: Vec::new(),
+    })
 }
 
 /// Build a single leaf blob from a group of (EncodedLeaflet, history, was_re_encoded) triples.

@@ -47,6 +47,12 @@ pub struct MergeOutput {
     pub records: Vec<RunRecordV2>,
     /// History entries: new merge events ++ existing history, reverse chronological.
     pub history: Vec<HistEntryV2>,
+    /// Novelty ops whose fact identity matched an existing base row (the
+    /// Equal arm), asserts and retracts alike. A matched assert replaced a
+    /// base row and a matched retract removed one, so consumers deriving
+    /// materialized-state deltas (e.g. stats counts) can tell real
+    /// transitions from no-ops.
+    pub matched: Vec<RunRecordV2>,
 }
 
 // ============================================================================
@@ -287,6 +293,7 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
 
     let mut out: Vec<RunRecordV2> = Vec::with_capacity(existing_len + novelty_len);
     let mut new_history: Vec<HistEntryV2> = Vec::with_capacity(novelty_len * 2);
+    let mut matched: Vec<RunRecordV2> = Vec::new();
 
     let mut ei = 0usize; // existing row index
     let mut ni = 0usize; // novelty index
@@ -312,6 +319,7 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
             }
             Ordering::Equal => {
                 // Same fact identity.
+                matched.push(*nov);
                 if op == 1 {
                     // Assert (update): emit novelty, record retraction of old + new assert.
                     out.push(*nov);
@@ -351,6 +359,7 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     MergeOutput {
         records: out,
         history,
+        matched,
     }
 }
 
@@ -509,6 +518,25 @@ mod tests {
         assert_eq!(out.history[0].op, 0); // retract first (same t, op=0 < op=1)
         assert_eq!(out.history[1].t, 5);
         assert_eq!(out.history[1].op, 1); // then assert
+    }
+
+    /// Equal-arm ops (assert or retract of a base-present fact) are reported
+    /// in `matched`; Greater-arm ops (base-absent identities) are not.
+    #[test]
+    fn test_merge_matched_reports_base_row_hits() {
+        let existing = vec![rec2(1, 1, 10, 1), rec2(3, 1, 30, 1)];
+        let batch = batch_from_records(&existing);
+        let novelty = vec![
+            rec2(1, 1, 10, 5), // re-assert of existing fact -> matched
+            rec2(2, 1, 20, 5), // new fact -> not matched
+            rec2(3, 1, 30, 5), // retract of existing fact -> matched
+        ];
+        let ops = vec![1u8, 1, 0];
+        let input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+
+        let out = merge_novelty(&input);
+        let matched_subjects: Vec<u64> = out.matched.iter().map(|r| r.s_id.as_u64()).collect();
+        assert_eq!(matched_subjects, vec![1, 3]);
     }
 
     #[test]
