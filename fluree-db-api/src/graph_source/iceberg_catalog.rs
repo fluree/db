@@ -218,6 +218,34 @@ fn split_qualified_table(queried_ns: &str, qualified: &str) -> TableRef {
 }
 
 impl crate::Fluree {
+    /// Resolve any `ConfigValue::SecretRef` auth references in a REST connection
+    /// via this instance's injected secret resolver, returning a connection whose
+    /// auth is resolver-free (literal / env-var / none) and therefore safe to
+    /// hand to the SYNCHRONOUS [`rest_catalog_client`].
+    ///
+    /// Pass-through for Direct mode (no catalog auth) and for connections with no
+    /// secret reference. Fails closed with an actionable error when a `SecretRef`
+    /// is present but no resolver was injected (the OSS/CLI path). This is the
+    /// single hydration hop the impl-`Fluree` catalog wrappers call at their top,
+    /// keeping `rest_catalog_client` and the free functions unchanged for
+    /// external literal/env-var users.
+    pub(crate) async fn hydrate_conn(
+        &self,
+        mut conn: IcebergConnectionConfig,
+    ) -> Result<IcebergConnectionConfig> {
+        if let CatalogMode::Rest(ref mut rest) = conn.catalog_mode {
+            let hydrated = rest
+                .auth
+                .hydrate(self.secret_resolver())
+                .await
+                .map_err(|e| {
+                    crate::ApiError::config(format!("Failed to resolve catalog auth secret: {e}"))
+                })?;
+            rest.auth = hydrated;
+        }
+        Ok(conn)
+    }
+
     /// Browse an Iceberg REST catalog (namespaces, and tables at
     /// `depth = Tables`). Convenience wrapper over the stateless
     /// [`browse_iceberg_catalog`] free function — browse needs no engine state.
@@ -226,6 +254,7 @@ impl crate::Fluree {
         conn: IcebergConnectionConfig,
         depth: BrowseDepth,
     ) -> Result<CatalogBrowse> {
+        let conn = self.hydrate_conn(conn).await?;
         browse_iceberg_catalog(conn, depth).await
     }
 }
@@ -884,6 +913,7 @@ impl crate::Fluree {
         table: TableIdentifier,
         tier: StatsTier,
     ) -> Result<TablePreview> {
+        let conn = self.hydrate_conn(conn).await?;
         preview_iceberg_table(conn, table, tier).await
     }
 }
@@ -1183,5 +1213,58 @@ mod tests {
             ),
             Some("xsd:decimal")
         );
+    }
+
+    // ── secret-resolver injection + fail-closed hydration gate ──
+
+    #[derive(Debug)]
+    struct StubResolver;
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for StubResolver {
+        async fn resolve_secret(
+            &self,
+            secret_ref: &str,
+        ) -> std::result::Result<String, fluree_db_iceberg::SecretResolveError> {
+            Ok(format!("resolved:{secret_ref}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn with_secret_resolver_clones_and_leaves_original_untouched() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        assert!(fluree.secret_resolver().is_none());
+
+        let resolver: std::sync::Arc<dyn fluree_db_iceberg::SecretResolver> =
+            std::sync::Arc::new(StubResolver);
+        let derived = fluree.with_secret_resolver(resolver);
+
+        // The derived clone carries the resolver; the original is untouched.
+        assert!(derived.secret_resolver().is_some());
+        assert!(fluree.secret_resolver().is_none());
+    }
+
+    #[tokio::test]
+    async fn hydrate_conn_fails_closed_before_network_when_ref_has_no_resolver() {
+        // No resolver injected + SecretRef auth ⇒ hydrate_conn errors with an
+        // actionable message BEFORE any catalog client is built or network I/O
+        // happens (the same gate the connection test relies on).
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let conn = IcebergConnectionConfig::rest("https://unreachable.invalid")
+            .with_auth_bearer_token_ref("vault://team/bearer");
+        let err = fluree.hydrate_conn(conn).await.unwrap_err().to_string();
+        assert!(
+            err.contains("secret resolver"),
+            "actionable message expected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_conn_passes_through_literal_auth() {
+        // A literal-auth connection with no resolver hydrates to itself (no error).
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let conn = IcebergConnectionConfig::rest("https://c.example.com")
+            .with_auth_bearer("literal-token");
+        assert!(fluree.hydrate_conn(conn).await.is_ok());
     }
 }

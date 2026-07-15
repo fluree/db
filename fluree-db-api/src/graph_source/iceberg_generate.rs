@@ -337,6 +337,11 @@ impl crate::Fluree {
             ));
         }
 
+        // Resolve any SecretRef auth once (fail closed if a ref has no resolver);
+        // the per-table previews below each clone this hydrated, literal-auth
+        // connection so no per-table resolver calls happen.
+        let connection = self.hydrate_conn(req.connection.clone()).await?;
+
         // Fetch each requested table's Tier-A+B preview (metadata-only) with
         // BOUNDED CONCURRENCY. Each preview is an independent chain of network
         // round trips (OAuth token exchange + REST `loadTable` + manifest-list /
@@ -357,7 +362,7 @@ impl crate::Fluree {
         let previews: Vec<(TableIdentifier, TablePreview)> =
             futures::stream::iter(req.tables.iter().cloned())
                 .map(|table| {
-                    let connection = req.connection.clone();
+                    let connection = connection.clone();
                     async move {
                         let preview =
                             preview_iceberg_table(connection, table.clone(), StatsTier::Stats)

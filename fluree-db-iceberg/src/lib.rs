@@ -66,7 +66,7 @@ pub mod stats;
 
 // Re-export commonly used types
 pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
-pub use config_value::ConfigValue;
+pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
 pub use error::{IcebergError, Result};
 
 // Re-export Phase 2 types for convenience

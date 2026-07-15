@@ -283,6 +283,10 @@ impl crate::Fluree {
         mapping_ttl: String,
         sparql: String,
     ) -> Result<crate::QueryResult> {
+        // Resolve any SecretRef auth up front (fail closed if a ref has no
+        // resolver) so the sync catalog-client build below sees literal creds.
+        let conn = self.hydrate_conn(conn).await?;
+
         // Compile the candidate mapping inline (same loader the validate/persist
         // paths use). A compile failure is the agent's first signal.
         let compiled = R2rmlLoader::from_turtle(&mapping_ttl)

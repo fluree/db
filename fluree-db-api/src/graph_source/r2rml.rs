@@ -459,9 +459,19 @@ impl crate::Fluree {
             }
         };
 
-        // Create auth provider
-        let auth = rest
+        // Hydrate any SecretRef auth BEFORE building the provider — this is the
+        // connection-test gate, so a secret reference with no resolver (or a
+        // Denied resolution) must error HERE, actionably, before any network call.
+        let hydrated_auth = rest
             .auth
+            .hydrate(self.secret_resolver())
+            .await
+            .map_err(|e| {
+                crate::ApiError::Config(format!("Failed to resolve catalog auth secret: {e}"))
+            })?;
+
+        // Create auth provider
+        let auth = hydrated_auth
             .create_provider_arc()
             .map_err(|e| crate::ApiError::Config(format!("Failed to create auth provider: {e}")))?;
 
@@ -1339,7 +1349,22 @@ impl FlureeR2rmlProvider<'_> {
                 let catalog = match cache.rest_client(&client_fp) {
                     Some(c) => c,
                     None => {
-                        let auth_provider = auth.create_provider_arc().map_err(|e| {
+                        // ORDERING TRAP — hydrate ONLY here, inside the cache-miss
+                        // arm, strictly AFTER `client_fp` was computed (above) over
+                        // the RAW, reference-bearing config. Hydrating before the
+                        // fingerprint would re-key the client cache on every secret
+                        // rotation → a resolver call + full OAuth token exchange PER
+                        // QUERY instead of once per ~900s client lifetime. The
+                        // fingerprint-stability test in this module guards this.
+                        let hydrated_auth = auth
+                            .hydrate(self.fluree.secret_resolver())
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to resolve catalog auth secret: {e}"
+                                ))
+                            })?;
+                        let auth_provider = hydrated_auth.create_provider_arc().map_err(|e| {
                             QueryError::Internal(format!("Failed to create auth provider: {e}"))
                         })?;
                         let catalog_config = RestCatalogConfig {
@@ -2740,5 +2765,98 @@ mod tests {
             "fallback path must perform exactly one storage read"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ORDERING-TRAP GUARD: rest_client_cache_key must fingerprint the RAW,
+    //    reference-bearing config, NOT a hydrated one. ──
+
+    #[derive(Debug)]
+    struct FixedResolver(&'static str);
+
+    #[async_trait]
+    impl fluree_db_iceberg::SecretResolver for FixedResolver {
+        async fn resolve_secret(
+            &self,
+            _secret_ref: &str,
+        ) -> std::result::Result<String, fluree_db_iceberg::SecretResolveError> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    fn oauth2_auth(
+        client_secret: fluree_db_iceberg::ConfigValue,
+    ) -> fluree_db_iceberg::auth::AuthConfig {
+        fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+            token_url: "https://c.example.com/token".to_string(),
+            client_id: fluree_db_iceberg::ConfigValue::literal("svc"),
+            client_secret,
+            scope: None,
+            audience: None,
+        }
+    }
+
+    fn gs_config_json(auth: fluree_db_iceberg::auth::AuthConfig) -> String {
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+        fluree_db_iceberg::IcebergGsConfig {
+            catalog: CatalogConfig::Rest {
+                catalog_type: "rest".to_string(),
+                uri: "https://c.example.com".to_string(),
+                auth,
+                warehouse: None,
+            },
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig::default(),
+            mapping: None,
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    /// The fingerprint keys the process-wide REST client cache. It MUST be stable
+    /// across secret rotations (so a warm server does one OAuth exchange per client
+    /// lifetime, not one per query) — which holds ONLY because it is computed over
+    /// the raw, reference-bearing config, BEFORE hydration. This test proves that
+    /// discipline: fingerprinting the ref-bearing config is rotation-stable, while
+    /// fingerprinting a hydrated config would re-key on every rotation.
+    #[tokio::test]
+    async fn secret_ref_fingerprint_is_rotation_stable() {
+        use std::sync::Arc;
+        let gsid = "gs-1";
+
+        // Raw stored config carries the REFERENCE (this is `record.config` at the
+        // scan site). Recomputing over it is identical even though the secret
+        // behind the ref may have rotated between queries: the cache is NOT re-keyed.
+        let raw = gs_config_json(oauth2_auth(fluree_db_iceberg::ConfigValue::SecretRef {
+            secret_ref: "vault://cs".to_string(),
+        }));
+        let key_raw = rest_client_cache_key(gsid, &raw);
+        assert_eq!(
+            rest_client_cache_key(gsid, &raw),
+            key_raw,
+            "the ref-bearing fingerprint must be stable across rotations"
+        );
+
+        // Hydrate the SAME auth with two different resolver outputs (a rotation),
+        // serialize the hydrated configs, and fingerprint those. They differ —
+        // which is EXACTLY why hydration must run AFTER the fingerprint, never
+        // before (hydrating first would re-key the client cache every rotation).
+        let auth = oauth2_auth(fluree_db_iceberg::ConfigValue::SecretRef {
+            secret_ref: "vault://cs".to_string(),
+        });
+        let r1: Arc<dyn fluree_db_iceberg::SecretResolver> = Arc::new(FixedResolver("secret-v1"));
+        let r2: Arc<dyn fluree_db_iceberg::SecretResolver> = Arc::new(FixedResolver("secret-v2"));
+        let hydrated_v1 = gs_config_json(auth.hydrate(Some(&r1)).await.unwrap());
+        let hydrated_v2 = gs_config_json(auth.hydrate(Some(&r2)).await.unwrap());
+        let key_h1 = rest_client_cache_key(gsid, &hydrated_v1);
+        let key_h2 = rest_client_cache_key(gsid, &hydrated_v2);
+        assert_ne!(
+            key_h1, key_h2,
+            "hydrated configs with rotated secrets differ → hydrating before the \
+             fingerprint would re-key the client cache every rotation"
+        );
+        assert_ne!(
+            key_raw, key_h1,
+            "the raw ref-bearing key must differ from the hydrated key"
+        );
     }
 }

@@ -995,6 +995,19 @@ fn is_secret_config_key(key: &str) -> bool {
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
 }
 
+/// True iff `v` is EXACTLY `{"secret_ref": "<string>"}` — the wire shape of
+/// `ConfigValue::SecretRef`. Strict (a single key named `secret_ref` with a
+/// string value) so that any OTHER object shape under a secret key falls through
+/// to normal, fail-closed redaction rather than being blanket-preserved.
+fn is_secret_ref_object(v: &JsonValue) -> bool {
+    match v {
+        JsonValue::Object(m) => {
+            m.len() == 1 && matches!(m.get("secret_ref"), Some(JsonValue::String(_)))
+        }
+        _ => false,
+    }
+}
+
 /// Recursively replace secret-bearing scalar values with `"[redacted]"`.
 ///
 /// A secret held as an env-var reference object (`{"env_var": "...",
@@ -1006,9 +1019,24 @@ fn redact_json_secrets(value: &mut JsonValue) -> bool {
     match value {
         JsonValue::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if is_secret_config_key(k) && !v.is_object() && !v.is_array() && !v.is_null() {
-                    *v = JsonValue::String("[redacted]".to_string());
-                    redacted = true;
+                if is_secret_config_key(k) {
+                    if is_secret_ref_object(v) {
+                        // A secret *reference* is not a secret (same policy as
+                        // env-var names, which the redactor deliberately keeps):
+                        // the opaque ref stays visible for display and solo
+                        // consumes it. Leave it intact and do NOT recurse — its
+                        // lone `secret_ref` key is not on the allowlist anyway.
+                    } else if !v.is_object() && !v.is_array() && !v.is_null() {
+                        // Scalar under a secret key → redact.
+                        *v = JsonValue::String("[redacted]".to_string());
+                        redacted = true;
+                    } else if redact_json_secrets(v) {
+                        // Object/array under a secret key that is NOT a clean
+                        // secret_ref (e.g. an env-var `Dynamic`): recurse so inner
+                        // secret leaves (`default_val`) are redacted while
+                        // non-secret keys (`env_var`) stay visible.
+                        redacted = true;
+                    }
                 } else if redact_json_secrets(v) {
                     redacted = true;
                 }
@@ -1533,7 +1561,18 @@ async fn fetch_virtual_table_row_counts(
     let catalog: Arc<RestCatalogClient> = match cache.rest_client(&client_fp) {
         Some(c) => c,
         None => {
-            let auth_provider = match auth.create_provider_arc() {
+            // Hydrate any SecretRef auth INSIDE the miss arm — after `client_fp`
+            // was computed over the raw config (same ordering discipline as the
+            // scan path). Best-effort: a resolver failure just omits counts, like
+            // every other failure in this display-only path.
+            let hydrated_auth = match auth.hydrate(fluree.secret_resolver()).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!(error = %e, "virtual ledger-info: auth secret resolution failed; counts omitted");
+                    return (HashMap::new(), None);
+                }
+            };
+            let auth_provider = match hydrated_auth.create_provider_arc() {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
@@ -2801,6 +2840,10 @@ mod tests {
 
         const SENTINEL_A: &str = "sentinel-secret-value-AAAA";
         const SENTINEL_B: &str = "sentinel-secret-value-BBBB";
+        // A secret REFERENCE is not a secret; it must stay visible after redaction
+        // (same policy as env-var names). Chosen so it shares no substring with the
+        // sentinels above.
+        const VISIBLE_REF: &str = "vault://team/ref-ID-VISIBLE";
 
         let auths: Vec<AuthConfig> = vec![
             AuthConfig::None,
@@ -2823,6 +2866,17 @@ mod tests {
                     default_val: Some(SENTINEL_A.to_string()),
                 },
                 scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+                audience: None,
+            },
+            // SecretRef under the `client_secret` secret key: the opaque ref must
+            // survive redaction (a reference is not a secret).
+            AuthConfig::OAuth2ClientCredentials {
+                token_url: "https://c.example.com/tokens".to_string(),
+                client_id: ConfigValue::literal("svc-client"),
+                client_secret: ConfigValue::SecretRef {
+                    secret_ref: VISIBLE_REF.to_string(),
+                },
+                scope: None,
                 audience: None,
             },
         ];
@@ -2867,6 +2921,13 @@ mod tests {
                 assert!(
                     redacted.contains("MY_SECRET"),
                     "env var name lost: {redacted}"
+                );
+            }
+            // A SecretRef's opaque reference survives (it is not a secret).
+            if stored.contains(VISIBLE_REF) {
+                assert!(
+                    redacted.contains(VISIBLE_REF),
+                    "secret ref must stay visible on redaction: {redacted}"
                 );
             }
         }
