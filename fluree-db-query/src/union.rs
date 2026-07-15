@@ -368,7 +368,19 @@ impl Operator for UnionOperator {
                 // trip it, so a rare branch-1 still lets branch-2 run and add its
                 // rows. Whole-query correctness holds for a correlated union too:
                 // once `budget` rows exist, no later input row is needed either.
-                if self.row_budget.is_some_and(|b| self.pending_output_rows >= b) {
+                //
+                // COUPLING (read before "simplifying" the budget path): count (1)
+                // rests entirely on the forward/absorb classification documented at
+                // `Operator::set_row_budget` — a budget only reaches this union under
+                // row/order-preserving operators. An operator author who FORWARDS a
+                // budget through an order-SENSITIVE operator would silently break
+                // count (1) here, not the forwarding site. That classification is the
+                // load-bearing contract; it lives in the trait doc, so this lever
+                // stays sound only as long as the doc's absorb list does.
+                if self
+                    .row_budget
+                    .is_some_and(|b| self.pending_output_rows >= b)
+                {
                     self.budget_met = true;
                     break;
                 }
@@ -666,8 +678,10 @@ mod tests {
     fn sort_absorbs_row_budget() {
         use crate::sort::{SortOperator, SortSpec};
         let received = Arc::new(std::sync::Mutex::new(None));
-        let mut sort =
-            SortOperator::new(Box::new(budget_recorder(&received)), vec![SortSpec::asc(VarId(0))]);
+        let mut sort = SortOperator::new(
+            Box::new(budget_recorder(&received)),
+            vec![SortSpec::asc(VarId(0))],
+        );
         sort.set_row_budget(7);
         // ORDER BY must rank every row → absorbs; a union under it is never budgeted.
         assert_eq!(*received.lock().unwrap(), None);
@@ -723,7 +737,10 @@ mod tests {
             }],
             vec![Pattern::Values {
                 vars: vec![VarId(1)],
-                rows: vec![vec![Binding::lit(FlakeValue::Long(30), Sid::new(2, "long"))]],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::Long(30),
+                    Sid::new(2, "long"),
+                )]],
             }],
         ];
         let union = UnionOperator::new(
@@ -795,7 +812,10 @@ mod tests {
         );
         op.set_row_budget(2);
         let (branch_execs, total) = run_union(op, &ctx).await;
-        assert_eq!(branch_execs, 1, "branch-2 must be skipped once branch-1 fills the budget");
+        assert_eq!(
+            branch_execs, 1,
+            "branch-2 must be skipped once branch-1 fills the budget"
+        );
         assert_eq!(total, 2);
     }
 
@@ -814,7 +834,10 @@ mod tests {
         );
         op.set_row_budget(3);
         let (branch_execs, total) = run_union(op, &ctx).await;
-        assert_eq!(branch_execs, 2, "an under-filled branch-1 must not skip branch-2");
+        assert_eq!(
+            branch_execs, 2,
+            "an under-filled branch-1 must not skip branch-2"
+        );
         assert_eq!(total, 3);
     }
 
