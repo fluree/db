@@ -42,6 +42,52 @@ pub(crate) fn disk_catalog_cache_enabled() -> bool {
     )
 }
 
+/// Own switch for the loadTable `metadata_location` POINTER cache (default on),
+/// gated ADDITIONALLY by the master [`disk_catalog_cache_enabled`] and a positive
+/// TTL. Off restores "every cold process issues a loadTable GET for the pointer".
+/// `FLUREE_ICEBERG_LOADTABLE_PTR_CACHE`. Read once, cached for the process.
+pub(crate) fn loadtable_ptr_cache_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_LOADTABLE_PTR_CACHE") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// TTL (seconds) for the persisted `lt_key → metadata_location` pointer. Unlike
+/// the content-addressed entries (whose key IS the immutable snapshot, so they can
+/// never go stale), the pointer CAN go stale — a table commit moves it — so it
+/// carries a freshness bound: **the max cross-process snapshot staleness for a
+/// latest-snapshot REST read.** The same tradeoff class the 60s in-memory
+/// cross-query cache already accepts, extended deliberately and consistent with
+/// the disk-cache-is-steady-state ruling. Default 300s; **`0` disables pointer
+/// persistence entirely.** `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`. Read once.
+pub(crate) fn loadtable_ptr_ttl_secs() -> u64 {
+    use std::sync::OnceLock;
+    static TTL: OnceLock<u64> = OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(300)
+    })
+}
+
+/// Wall-clock milliseconds since the Unix epoch (saturating; a pre-epoch clock
+/// reads 0, which only makes a pointer look older = a conservative miss).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// The dedicated catalog-cache directory sibling to the Parquet/binary artifact
 /// dir `artifact_dir`: same parent, name suffixed `-catalog`. A sibling (not a
 /// child) so clearing the artifact dir — the cold protocol's data clear — leaves
@@ -107,6 +153,46 @@ struct PersistedScanFiles {
 struct PersistedCountStats {
     data_files: Vec<DataFile>,
     has_delete_manifests: bool,
+}
+
+/// On-disk form of the loadTable `metadata_location` POINTER, keyed by `lt_key`
+/// (graph source + namespace + table) rather than the content-addressed
+/// `metadata_location` — because the pointer's whole job is to RESOLVE that
+/// location without a REST GET. **CREDENTIAL-FREE by construction:** the only S3
+/// path here is the immutable, non-secret `metadata_location`; no vended
+/// credential, OAuth token, or catalog config is a field, so none can be
+/// persisted (the AJ hard constraint, enforced structurally + asserted by
+/// `pointer_persists_no_credential_bytes`).
+#[derive(Serialize, Deserialize)]
+struct PersistedMetadataPointer {
+    /// The immutable `metadata_location` (an `s3://…` content-addressed path).
+    metadata_location: String,
+    /// The current snapshot's `timestamp_ms` at cache time — the `as_of_t` rider
+    /// compares a time-travel request against this (see [`pointer_is_usable`]).
+    snapshot_ms: i64,
+    /// Wall-clock ms when cached — the TTL freshness bound is measured from here.
+    cached_at_ms: u64,
+}
+
+/// Whether a persisted pointer may be served for a request, given the current
+/// time, the TTL, and an optional minimum-snapshot bound. Pure (no I/O, no env,
+/// no clock) so the TTL + `as_of_t`-rider logic is unit-testable without racing
+/// the process-wide env/clock. A pointer is usable iff BOTH hold:
+/// - **fresh**: `now_ms - cached_at_ms ≤ ttl_ms` (bounded staleness); and
+/// - **rider**: `min_snapshot_ms` is `None` (a latest-snapshot read) OR the cached
+///   snapshot is at-or-after it (`snapshot_ms ≥ min`). A time-travel query asking
+///   for a snapshot NEWER than the cached one is NOT served — it must force a
+///   fresh GET, so bounded staleness can never answer from an older snapshot than
+///   requested (the lead's non-negotiable correctness rider).
+fn pointer_is_usable(
+    p: &PersistedMetadataPointer,
+    now_ms: u64,
+    ttl_ms: u64,
+    min_snapshot_ms: Option<i64>,
+) -> bool {
+    let fresh = now_ms.saturating_sub(p.cached_at_ms) <= ttl_ms;
+    let rider_ok = min_snapshot_ms.is_none_or(|min| p.snapshot_ms >= min);
+    fresh && rider_ok
 }
 
 /// On-disk value-schema version. Content-addressing the KEY (by
@@ -284,6 +370,57 @@ impl DiskCatalogCache {
         };
         self.write(metadata_location, "countstats", &p);
     }
+
+    /// Resolve the persisted `metadata_location` for `lt_key` WITHOUT a REST GET,
+    /// or `None` (a miss ⇒ the caller does the GET). Gated by the master switch,
+    /// the pointer switch, and a positive TTL; then the freshness + `as_of_t`-rider
+    /// check ([`pointer_is_usable`]). `min_snapshot_ms` is the caller's
+    /// requested-snapshot lower bound (`None` = latest, the current default; a
+    /// future time-travel read passes the requested `timestamp_ms`). An expired or
+    /// rider-rejected entry is a miss; an expired one is also deleted so it stops
+    /// occupying the cap.
+    pub(crate) fn get_metadata_location(
+        &self,
+        lt_key: &str,
+        min_snapshot_ms: Option<i64>,
+    ) -> Option<String> {
+        let ttl_secs = loadtable_ptr_ttl_secs();
+        if !self.enabled || !loadtable_ptr_cache_enabled() || ttl_secs == 0 {
+            return None;
+        }
+        let p: PersistedMetadataPointer = self.read(lt_key, "pointer")?;
+        let ttl_ms = ttl_secs.saturating_mul(1000);
+        if pointer_is_usable(&p, now_ms(), ttl_ms, min_snapshot_ms) {
+            Some(p.metadata_location)
+        } else {
+            // A TTL-expired entry is dead weight; drop it. (A rider miss keeps the
+            // entry — it is still valid for a latest-snapshot read.)
+            if now_ms().saturating_sub(p.cached_at_ms) > ttl_ms {
+                let _ = std::fs::remove_file(self.path(lt_key, "pointer"));
+            }
+            None
+        }
+    }
+
+    /// Persist the credential-free `lt_key → metadata_location` pointer with the
+    /// current snapshot's `timestamp_ms` (for the rider) and the cache time (for
+    /// the TTL). No-op when disabled or TTL=0.
+    pub(crate) fn put_metadata_location(
+        &self,
+        lt_key: &str,
+        metadata_location: &str,
+        snapshot_ms: i64,
+    ) {
+        if !self.enabled || !loadtable_ptr_cache_enabled() || loadtable_ptr_ttl_secs() == 0 {
+            return;
+        }
+        let p = PersistedMetadataPointer {
+            metadata_location: metadata_location.to_string(),
+            snapshot_ms,
+            cached_at_ms: now_ms(),
+        };
+        self.write(lt_key, "pointer", &p);
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +554,94 @@ mod tests {
         assert!(
             cache.get_count_stats(a).is_some(),
             "A's own entry still hits"
+        );
+    }
+
+    #[test]
+    fn metadata_location_pointer_round_trip() {
+        let cache = DiskCatalogCache::for_dir(&tmp_dir("pointer"));
+        let lt_key = "gs:enterprise::DW_SF01::FACT_INVENTORY_SNAPSHOT";
+        let loc = "s3://bucket/warehouse/t/metadata/00042-abc.metadata.json";
+        assert!(
+            cache.get_metadata_location(lt_key, None).is_none(),
+            "empty is a miss"
+        );
+        cache.put_metadata_location(lt_key, loc, 1_700_000_000_000);
+        assert_eq!(
+            cache.get_metadata_location(lt_key, None).as_deref(),
+            Some(loc),
+            "latest-snapshot read hits the persisted pointer"
+        );
+        assert!(
+            cache
+                .get_metadata_location("gs:enterprise::DW_SF01::OTHER_TABLE", None)
+                .is_none(),
+            "a different lt_key is a clean miss"
+        );
+    }
+
+    #[test]
+    fn pointer_ttl_and_as_of_rider() {
+        // Pure freshness + rider logic, independent of the process env/clock.
+        let p = PersistedMetadataPointer {
+            metadata_location: "s3://b/m.json".to_string(),
+            snapshot_ms: 100,
+            cached_at_ms: 1_000_000,
+        };
+        let ttl_ms = 300_000;
+        // Fresh + latest read (no bound) ⇒ usable.
+        assert!(pointer_is_usable(&p, 1_100_000, ttl_ms, None));
+        // Past the TTL ⇒ NOT usable (bounded staleness).
+        assert!(!pointer_is_usable(&p, 1_000_000 + ttl_ms + 1, ttl_ms, None));
+        // as_of_t rider: a request for a snapshot NEWER than cached (min > 100) ⇒
+        // NOT usable, must force a fresh GET.
+        assert!(!pointer_is_usable(&p, 1_100_000, ttl_ms, Some(150)));
+        // A request satisfiable by the cached snapshot (min ≤ 100) ⇒ usable.
+        assert!(pointer_is_usable(&p, 1_100_000, ttl_ms, Some(100)));
+        assert!(pointer_is_usable(&p, 1_100_000, ttl_ms, Some(50)));
+        // Rider is checked AND-wise with freshness: newer-request on a stale entry
+        // is still a miss.
+        assert!(!pointer_is_usable(&p, 1_000_000 + ttl_ms + 1, ttl_ms, Some(50)));
+    }
+
+    #[test]
+    fn pointer_persists_no_credential_bytes() {
+        // The AJ hard constraint, asserted structurally: the on-disk pointer entry
+        // contains ONLY the location + timestamps — never a vended credential,
+        // token, secret, or catalog config.
+        let dir = tmp_dir("pointer-nocreds");
+        let cache = DiskCatalogCache::for_dir(&dir);
+        cache.put_metadata_location(
+            "gs:x::ns::tbl",
+            "s3://bucket/warehouse/t/metadata/00001-x.metadata.json",
+            1_700_000_000_000,
+        );
+        let bytes = std::fs::read(only_entry(&dir)).expect("pointer entry written");
+        let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+        for forbidden in [
+            "credential",
+            "token",
+            "secret",
+            "access_key",
+            "session",
+            "password",
+            "sig=",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "pointer payload must not persist `{forbidden}`: {text}"
+            );
+        }
+        // And the payload envelope carries exactly the three expected fields.
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let payload = &v["payload"];
+        assert!(payload["metadata_location"].is_string());
+        assert!(payload["snapshot_ms"].is_number());
+        assert!(payload["cached_at_ms"].is_number());
+        assert_eq!(
+            payload.as_object().unwrap().len(),
+            3,
+            "exactly {{metadata_location, snapshot_ms, cached_at_ms}} — no extra fields"
         );
     }
 

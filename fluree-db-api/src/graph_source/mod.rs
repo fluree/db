@@ -118,6 +118,9 @@ mod catalog_session;
 mod disk_catalog_cache;
 
 #[cfg(feature = "iceberg")]
+mod lazy_storage;
+
+#[cfg(feature = "iceberg")]
 pub(crate) mod crawl;
 
 #[cfg(feature = "iceberg")]

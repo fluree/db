@@ -11,8 +11,13 @@ use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
+use super::lazy_storage::LazyS3Storage;
+use fluree_db_iceberg::error::IcebergError;
 use fluree_db_iceberg::{
-    catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
+    catalog::{
+        LoadTableResponse, RestCatalogClient, RestCatalogConfig, SendCatalogClient, TableIdentifier,
+    },
+    config::IoConfig,
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
     scan::{
@@ -909,6 +914,105 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     }
 }
 
+/// Resolve `loadTable` (the REST catalog GET, honoring the query pin + the
+/// cross-query cache) and build the vended-credential S3 storage — the SAME
+/// session-pin path the eager scan used before the lazy split (PR-8 loadTable-
+/// metadata cache, `21-loadtable-metadata-cache.md`).
+///
+/// Takes OWNED handles (Arcs + owned config) so it can be called BOTH eagerly and
+/// from the deferred [`LazyS3Storage`] builder — which must be `'static`, because
+/// the Parquet reads `Arc::clone` the storage into `tokio::spawn` and the provider
+/// holds `fluree: &'a` (a borrow that cannot cross the spawn). This runs ONLY when
+/// a real S3 read is needed: its `r2rml.load_table` span, and the REST client's
+/// first-use OAuth token exchange, are exactly what the deterministic cache gate
+/// proves absent (`load_table.n=0` AND `oauth_token.n=0`) on a fully disk-cached
+/// query. No duplicate ladder — this IS the ladder both paths share.
+async fn resolve_rest_load_and_storage(
+    catalog: Arc<RestCatalogClient>,
+    cache: Arc<R2rmlCache>,
+    session: Arc<super::catalog_session::IcebergCatalogSession>,
+    table_id: TableIdentifier,
+    io: IoConfig,
+    lt_key: String,
+) -> QueryResult<(Arc<S3IcebergStorage>, LoadTableResponse)> {
+    // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
+    // the cross-query cache (skips the ~1–3s GET), then a real REST load.
+    let load_response = if let Some(cached) = session.cached_load_table(&lt_key) {
+        cached
+    } else {
+        let pinned = session.pinned_metadata_location(&lt_key);
+        let cross_query = if pinned.is_none() {
+            cache.get_rest_load_table(&lt_key)
+        } else {
+            None
+        };
+        let mut resp = if let Some(cq) = cross_query {
+            cq.to_response()
+        } else {
+            // The cold REST/OAuth catalog round-trip — the `r2rml.load_table` span
+            // the cache gate proves absent when disk-warm.
+            let actual = catalog
+                .load_table(&table_id, io.vended_credentials)
+                .instrument(tracing::debug_span!(
+                    "r2rml.load_table",
+                    namespace = %table_id.namespace,
+                    table = %table_id.table,
+                ))
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to load table from catalog: {e}"))
+                })?;
+            cache.put_rest_load_table(
+                lt_key.clone(),
+                Arc::new(super::catalog_session::CachedLoadTable::from_response(
+                    &actual,
+                )),
+            );
+            let mut r = actual;
+            if let Some(ref pinned_loc) = pinned {
+                if *pinned_loc != r.metadata_location {
+                    r.metadata_location = pinned_loc.clone();
+                }
+            }
+            r
+        };
+        session.store_load_table(lt_key.clone(), &resp);
+        if let Some(pinned_loc) = session.pinned_metadata_location(&lt_key) {
+            resp.metadata_location = pinned_loc;
+        }
+        resp
+    };
+
+    // (2) Build (or reuse the query session's) S3 storage from the vended creds.
+    let storage = if let Some(cached) = session.cached_storage(&lt_key) {
+        cached
+    } else {
+        let built = if let Some(ref credentials) = load_response.credentials {
+            S3IcebergStorage::from_vended_credentials(
+                credentials,
+                io.s3_region.as_deref(),
+                io.s3_endpoint.as_deref(),
+                io.s3_path_style,
+            )
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
+        } else {
+            S3IcebergStorage::from_default_chain(
+                io.s3_region.as_deref(),
+                io.s3_endpoint.as_deref(),
+                io.s3_path_style,
+            )
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
+        };
+        let built = Arc::new(built);
+        session.store_storage(lt_key.clone(), Arc::clone(&built));
+        built
+    };
+
+    Ok((storage, load_response))
+}
+
 impl FlureeR2rmlProvider<'_> {
     /// Body of [`R2rmlTableProvider::table_row_count`], split out so the trait
     /// method can wrap it in the `r2rml.count_manifest` timing span via
@@ -1033,11 +1137,30 @@ impl FlureeR2rmlProvider<'_> {
     /// `self.session`, exactly as the scan did before this was extracted. It
     /// excludes the scan-only concerns — the "Starting Iceberg table scan" log and
     /// the Parquet disk cache — which stay in `scan_table_inner`.
+    /// Warm the in-memory + disk metadata caches for `metadata_location` WITHOUT
+    /// any S3 read — the in-memory moka first, then the persistent slice-2 disk
+    /// cache (warming the moka layer on a disk hit). `None` when neither has it (a
+    /// real S3 read would be required, which the caller does via `storage`). Used
+    /// by the pointer rung to serve metadata with zero storage.
+    async fn metadata_from_caches(&self, metadata_location: &str) -> Option<Arc<TableMetadata>> {
+        let cache = self.fluree.r2rml_cache();
+        if let Some(m) = cache.get_metadata(metadata_location).await {
+            return Some(m);
+        }
+        if let Some(m) = self.catalog_disk_cache().get_metadata(metadata_location) {
+            cache
+                .put_metadata(metadata_location.to_string(), Arc::clone(&m))
+                .await;
+            return Some(m);
+        }
+        None
+    }
+
     async fn load_table_context(
         &self,
         graph_source_id: &str,
         table_name: &str,
-    ) -> QueryResult<(Arc<S3IcebergStorage>, Arc<TableMetadata>, String)> {
+    ) -> QueryResult<(Arc<LazyS3Storage<'static>>, Arc<TableMetadata>, String)> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -1080,6 +1203,94 @@ impl FlureeR2rmlProvider<'_> {
                 QueryError::Internal(format!("Failed to parse table identifier: {e}"))
             })?
         };
+
+        // PR-8 loadTable-metadata cache: before building storage, try to resolve
+        // this table WITHOUT the ~1–3s loadTable REST GET. The persisted pointer
+        // (credential-free) gives the `metadata_location`; slice-2 gives the parsed
+        // metadata — both with zero S3. When they hit, storage construction (and
+        // thus the GET + its OAuth token exchange) is DEFERRED behind a
+        // `LazyS3Storage` and never forced if every Parquet file is also disk-
+        // cached → the deterministic gate's `load_table.n=0` AND `oauth_token.n=0`.
+        // REST only; Direct mode has its own metadata-location cache.
+        let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+            graph_source_id,
+            &table_id.namespace,
+            &table_id.table,
+        );
+        let disk = self.catalog_disk_cache();
+        if let CatalogConfig::Rest {
+            uri, warehouse, auth, ..
+        } = &iceberg_config.catalog
+        {
+            // `None` = a latest-snapshot read. GREP: r2rml-as-of-t — when Iceberg
+            // snapshot time-travel lands, the requested snapshot's `timestamp_ms`
+            // MUST be threaded here as `min_snapshot_ms` so bounded staleness can
+            // never downgrade a time-travel request (the guard + hermetic already
+            // exist in `disk_catalog_cache::pointer_is_usable`).
+            if let Some(loc) = disk.get_metadata_location(&lt_key, None) {
+                if let Some(md) = self.metadata_from_caches(&loc).await {
+                    // Build/get the process-wide REST client. Client construction
+                    // does NO network; the OAuth token exchange rides the first
+                    // catalog op (the loadTable GET, deferred) — a property ENFORCED
+                    // by the cache gate's `oauth_token.n=0`, which fails forever if
+                    // construction ever starts doing the token exchange.
+                    let cache = self.fluree.r2rml_cache();
+                    let client_fp = rest_client_cache_key(graph_source_id, &record.config);
+                    let catalog = match cache.rest_client(&client_fp) {
+                        Some(c) => c,
+                        None => {
+                            let auth_provider = auth.create_provider_arc().map_err(|e| {
+                                QueryError::Internal(format!("Failed to create auth provider: {e}"))
+                            })?;
+                            let client = Arc::new(
+                                RestCatalogClient::new(
+                                    RestCatalogConfig {
+                                        uri: uri.clone(),
+                                        warehouse: warehouse.clone(),
+                                        ..Default::default()
+                                    },
+                                    auth_provider,
+                                )
+                                .map_err(|e| {
+                                    QueryError::Internal(format!(
+                                        "Failed to create catalog client: {e}"
+                                    ))
+                                })?,
+                            );
+                            cache.put_rest_client(client_fp, Arc::clone(&client));
+                            client
+                        }
+                    };
+                    // Owned captures for the `'static` deferred builder (the
+                    // provider's `fluree: &'a` borrow can't cross the Parquet
+                    // `tokio::spawn`). The builder runs the SAME session-pin ladder
+                    // as the eager path (`resolve_rest_load_and_storage`), deferred.
+                    let cache = Arc::clone(cache);
+                    let session = Arc::clone(&self.session);
+                    let io = iceberg_config.io.clone();
+                    let table_id = table_id.clone();
+                    let lt_key_b = lt_key.clone();
+                    let builder: super::lazy_storage::StorageBuilder<'static, S3IcebergStorage> =
+                        Arc::new(move || {
+                            let catalog = Arc::clone(&catalog);
+                            let cache = Arc::clone(&cache);
+                            let session = Arc::clone(&session);
+                            let io = io.clone();
+                            let table_id = table_id.clone();
+                            let lt_key = lt_key_b.clone();
+                            Box::pin(async move {
+                                resolve_rest_load_and_storage(
+                                    catalog, cache, session, table_id, io, lt_key,
+                                )
+                                .await
+                                .map(|(storage, _)| storage)
+                                .map_err(|e| IcebergError::Catalog(e.to_string()))
+                            })
+                        });
+                    return Ok((Arc::new(LazyS3Storage::deferred(builder)), md, loc));
+                }
+            }
+        }
 
         // Resolve metadata location and create storage based on catalog mode
         let (load_response, storage) = match &iceberg_config.catalog {
@@ -1395,7 +1606,23 @@ impl FlureeR2rmlProvider<'_> {
 
             metadata
         };
-        Ok((storage, metadata, load_response.metadata_location.clone()))
+        // Persist the credential-free pointer so the NEXT process resolves this
+        // table's `metadata_location` without a loadTable GET. `snapshot_ms` feeds
+        // the as_of_t rider (grep r2rml-as-of-t). The eager `storage` is already
+        // built (a pointer/metadata miss forced the GET), so it wraps in `ready`.
+        disk.put_metadata_location(
+            &lt_key,
+            &load_response.metadata_location,
+            metadata
+                .current_snapshot()
+                .map(|s| s.timestamp_ms)
+                .unwrap_or(0),
+        );
+        Ok((
+            Arc::new(LazyS3Storage::ready(storage)),
+            metadata,
+            load_response.metadata_location.clone(),
+        ))
     }
 
     /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
