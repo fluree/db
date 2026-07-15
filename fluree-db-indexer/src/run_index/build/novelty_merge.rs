@@ -275,7 +275,12 @@ fn dedup_adjacent_asserts(entries: &mut Vec<HistEntryV2>) {
 /// - **Existing < Novelty**: Emit existing row unchanged.
 /// - **Novelty < Existing**:
 ///   - Assert: Emit novelty to output; record in history.
-///   - Retract: Skip (retract of non-existent fact); still record in history.
+///   - Retract: Skip entirely — no row and no history entry. The fact was
+///     never materialized in this leaf, so the retraction is not a state
+///     transition; the history sidecar is a transition log (replay undoes a
+///     retract entry by marking the fact present before it), and a bare
+///     retract entry makes replay fabricate the fact's presence at every
+///     `t` before the retraction.
 /// - **Same identity** (Equal):
 ///   - Assert: Emit novelty (update); record retraction of old + new assert in history.
 ///   - Retract: Omit from output; record retraction in history.
@@ -310,11 +315,13 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
                 ei += 1;
             }
             Ordering::Greater => {
-                // Novelty comes first (not in existing data).
+                // Novelty comes first (not in existing data). A retract of a
+                // fact this leaf never materialized is not a transition and
+                // records no history (see the doc comment above).
                 if op == 1 {
                     out.push(*nov);
+                    new_history.push(record_to_hist_entry(nov, op));
                 }
-                new_history.push(record_to_hist_entry(nov, op));
                 ni += 1;
             }
             Ordering::Equal => {
@@ -344,14 +351,15 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
         ei += 1;
     }
 
-    // Drain remaining novelty.
+    // Drain remaining novelty. Same rule as the Greater arm: these identities
+    // have no base row, so only asserts transition state and record history.
     while ni < novelty_len {
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
         if op == 1 {
             out.push(*nov);
+            new_history.push(record_to_hist_entry(nov, op));
         }
-        new_history.push(record_to_hist_entry(nov, op));
         ni += 1;
     }
 
@@ -539,6 +547,12 @@ mod tests {
         assert_eq!(matched_subjects, vec![1, 3]);
     }
 
+    /// A retract of a fact this leaf never materialized changes no rows and
+    /// records no history: replay undoes a retract entry by marking the fact
+    /// present before it, so a bare retract entry (no paired assert anywhere)
+    /// would fabricate the fact's presence at every `t` before the
+    /// retraction — both for a user retracting an absent fact and for an
+    /// in-window assert+retract lifecycle deduped to its final retract.
     #[test]
     fn test_merge_retract_nonexistent() {
         let existing = vec![rec2(1, 1, 10, 1)];
@@ -550,10 +564,22 @@ mod tests {
         let out = merge_novelty(&input);
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].s_id.as_u64(), 1);
+        assert!(out.history.is_empty(), "non-transition records no history");
+    }
 
-        // History still records the retraction
-        assert_eq!(out.history.len(), 1);
-        assert_eq!(out.history[0].op, 0);
+    /// Same rule in the drain loop: retracts sorting after every existing row
+    /// have no base row either.
+    #[test]
+    fn test_merge_retract_nonexistent_after_last_row() {
+        let existing = vec![rec2(1, 1, 10, 1)];
+        let batch = batch_from_records(&existing);
+        let novelty = vec![rec2(5, 1, 50, 6)]; // after s=1
+        let ops = vec![0u8]; // retract
+        let input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+
+        let out = merge_novelty(&input);
+        assert_eq!(out.records.len(), 1);
+        assert!(out.history.is_empty(), "non-transition records no history");
     }
 
     #[test]

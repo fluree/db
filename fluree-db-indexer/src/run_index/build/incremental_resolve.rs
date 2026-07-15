@@ -766,6 +766,13 @@ fn same_sort_prefix(a: &RunRecord, b: &RunRecord) -> bool {
 /// Within a sort-prefix group, records for one full identity arrive in
 /// `(t, op)` order even when several identities interleave, so a linear walk
 /// per identity sees its events chronologically.
+///
+/// Dropped intermediate transitions do not reach the history sidecars, so
+/// index-served time travel cannot see a state a fact held only *within*
+/// this window (e.g. a fact asserted and retracted between two index builds
+/// has no lived interval in the index; `merge_novelty` records no history
+/// for its final retract). The live novelty view retains those intermediate
+/// ops until the window is indexed.
 fn dedup_fact_lifecycles(records: Vec<RunRecord>) -> Vec<RunRecord> {
     let mut out: Vec<RunRecord> = Vec::with_capacity(records.len());
     // Winners for the current sort-prefix group, one per full identity
