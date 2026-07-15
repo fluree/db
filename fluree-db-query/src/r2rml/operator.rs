@@ -575,6 +575,13 @@ impl R2rmlScanOperator {
             .iter()
             .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
         let (Some(pom), None) = (matching.next(), matching.next()) else {
+            // Decline observably (PR-7's decline-breadcrumb convention, #1495
+            // review): a mapping with duplicate predicates silently loses the
+            // scan-side top-k otherwise, with nothing in the logs.
+            tracing::debug!(
+                predicate = %pred_iri,
+                "r2rml topk declined: sort predicate does not map to exactly one POM"
+            );
             return None;
         };
         let col = value_pushdown_column(&pom.object_map)?;
