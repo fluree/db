@@ -670,6 +670,31 @@ enum GKey {
     Null,
 }
 
+/// Insert a dim join-key → group-keys mapping for the fused-aggregate FK chain,
+/// declining (returns `false`) on a CONFLICTING duplicate — the same dim join-key
+/// mapping to *different* group-keys. There the generic pipeline (the reference
+/// semantics) gives the dim subject two attribute triples, so a joined fact row
+/// legitimately lands in two groups, while this single-value probe keeps one and
+/// silently under-counts; the caller must fall back (`Ok(None)`). Equal-value
+/// duplicates are harmless and kept. Reachable via this stack's own #1450
+/// unverified subject-keys / name-based FK inference / hand-written mappings — SF01
+/// dims have unique PKs so the corpus can't catch it, hence a checked invariant
+/// rather than the old `last-wins` comment.
+fn insert_dim_gkeys(
+    map: &mut std::collections::HashMap<Vec<String>, Vec<GKey>>,
+    key: Vec<String>,
+    gkeys: Vec<GKey>,
+) -> bool {
+    match map.get(&key) {
+        Some(prev) if *prev != gkeys => false,
+        Some(_) => true,
+        None => {
+            map.insert(key, gkeys);
+            true
+        }
+    }
+}
+
 impl GroupCol {
     /// Read this column's group-key value at a row.
     fn key_at(&self, col: Option<&Column>, row: usize) -> GKey {
@@ -1608,8 +1633,14 @@ impl FusedR2rmlAggregateOperator {
                 return Ok(None);
             };
             hops.push((
-                rom.child_columns().iter().map(|s| (*s).to_string()).collect(),
-                rom.parent_columns().iter().map(|s| (*s).to_string()).collect(),
+                rom.child_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                rom.parent_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
                 parent_tm,
             ));
             src_tm = parent_tm;
@@ -1746,7 +1777,11 @@ impl FusedR2rmlAggregateOperator {
                     if any_null {
                         continue;
                     }
-                    map.insert(key, gkeys); // last-wins (a dim join key is unique)
+                    // Decline the fused plan on a CONFLICTING duplicate dim join-key
+                    // (see `insert_dim_gkeys` for the soundness argument).
+                    if !insert_dim_gkeys(&mut map, key, gkeys) {
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -1779,7 +1814,10 @@ impl FusedR2rmlAggregateOperator {
                         continue;
                     };
                     if let Some(gkeys) = map.get(&fk_next) {
-                        next_map.insert(pk, gkeys.clone());
+                        // Same conflicting-duplicate soundness as the terminal scan.
+                        if !insert_dim_gkeys(&mut next_map, pk, gkeys.clone()) {
+                            return Ok(None);
+                        }
                     }
                 }
             }
@@ -1853,6 +1891,39 @@ mod tests {
         let (s, o, c) = (VarId(0), VarId(1), VarId(2));
         let q = count_query(vec![], vec![graph_triple(s, o)], c, o);
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
+    }
+
+    #[test]
+    fn dim_dup_join_key_conflict_declines_equal_dup_kept() {
+        // The dim-scan map's soundness gate (#1490 review): a duplicate join-key
+        // mapping to DIFFERENT group-keys must decline the fused plan (caller returns
+        // Ok(None) → generic pipeline), while an equal-value duplicate is harmless.
+        use std::collections::HashMap;
+        let mut m: HashMap<Vec<String>, Vec<GKey>> = HashMap::new();
+        let k = vec!["1".to_string()];
+        assert!(insert_dim_gkeys(
+            &mut m,
+            k.clone(),
+            vec![GKey::Str("A".into())]
+        ));
+        // equal-value duplicate → kept, no decline
+        assert!(insert_dim_gkeys(
+            &mut m,
+            k.clone(),
+            vec![GKey::Str("A".into())]
+        ));
+        // conflicting duplicate (different attrs) → decline
+        assert!(!insert_dim_gkeys(
+            &mut m,
+            k.clone(),
+            vec![GKey::Str("B".into())]
+        ));
+        // a distinct key still inserts
+        assert!(insert_dim_gkeys(
+            &mut m,
+            vec!["2".to_string()],
+            vec![GKey::Int(9)]
+        ));
     }
 
     #[test]
@@ -2021,7 +2092,10 @@ mod tests {
         let (chain, jvs) =
             FusedR2rmlAggregateOperator::order_chain(&[&dim2, &fact, &dim1]).expect("linear chain");
         assert_eq!(
-            chain.iter().map(|p| p.subject_var.unwrap()).collect::<Vec<_>>(),
+            chain
+                .iter()
+                .map(|p| p.subject_var.unwrap())
+                .collect::<Vec<_>>(),
             vec![VarId(0), VarId(1), VarId(2)]
         );
         assert_eq!(jvs, vec![VarId(1), VarId(2)], "one join var per hop");
@@ -2033,7 +2107,8 @@ mod tests {
 
         // Branch: the fact ref-joins to TWO dims → declines (not a linear chain).
         let mut branch_fact = R2rmlPattern::new("gs", VarId(0), None);
-        branch_fact.star_bindings = vec![("p1".to_string(), VarId(1)), ("p2".to_string(), VarId(2))];
+        branch_fact.star_bindings =
+            vec![("p1".to_string(), VarId(1)), ("p2".to_string(), VarId(2))];
         let d1 = R2rmlPattern::new("gs", VarId(1), None);
         let d2 = R2rmlPattern::new("gs", VarId(2), None);
         assert!(FusedR2rmlAggregateOperator::order_chain(&[&branch_fact, &d1, &d2]).is_none());

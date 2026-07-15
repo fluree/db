@@ -113,6 +113,10 @@ In R2RML a RefObjectMap whose child FK value matches **no** parent subject produ
 
 The measure fold keeps the existing exact-decimal path and datatype-by-declared-datatype typing (§3.2). The only new surface: the **group key's** datatype Sid must be encoded from the terminal dim's object map exactly as the single-table group path does (`:1189-1200`), so a fused group key binding is byte-identical to the generic materialized one.
 
+### 5.5 Duplicate dim join-key ⇒ conflicting mapping ⇒ decline (checked invariant, #1490 review)
+
+The FK-chain lookup builds `dim join-key → group-keys` maps by scanning each dim. The original code did `map.insert(key, gkeys)` with a `// last-wins (a dim join key is unique)` comment — an **unchecked** assumption. If a dim has a **duplicate join-key whose group attributes differ**, the generic pipeline (the reference semantics) materializes *both* attribute triples on that dim subject, so a joined fact row legitimately lands in **two** groups, while the single-value fused probe keeps only the last — a silent under-count. Pre-PR-6 ref lookups were immune (a duplicate key produces the same templated subject IRI ⇒ the same triple); PR-6 introduced *attribute*-valued lookups where the values can differ. The shape is reachable via this stack's own #1450 unverified subject-keys, name-based FK inference onto a non-unique column, and hand-written mappings — SF01 dims have unique PKs, so the corpus cannot catch it. **Fix:** the shared `insert_dim_gkeys` helper turns the comment into a checked invariant — a **conflicting** duplicate (same key, different group-keys) returns `false` and the resolver falls back with `Ok(None)` (the operator's decline contract); **equal-value** duplicates are harmless and kept. Unit-tested (`dim_dup_join_key_conflict_declines_equal_dup_kept`). Both the terminal scan and every interior hop route through the one helper, so the invariant holds across the whole chain.
+
 ---
 
 ## 6. F9 rider — CURIE-compact virtual predicate/type IRIs (one line, reuse native's compactor)
