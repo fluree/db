@@ -4342,3 +4342,158 @@ async fn guard_constant_object_decimal_scale_insensitive() {
     let rows = result.iter().fold(0, |acc, b| acc + b.len());
     assert_eq!(rows, 1, "decimal 9.99 matches only the 9.990-scaled row");
 }
+
+// =============================================================================
+// PR-F20: RefObjectMap-target resolution prune — CROSS-SCOPE pre-bound ?p
+//
+// The static in-scope analysis (`compute_ref_prune_targets`) cannot see a ?p
+// seeded from OUTSIDE the graph scope (an outer VALUES / cross-graph join). The
+// prune stays sound there by CONJUNCTION: the in-scope required ref member
+// (`?inv product ?p`) restricts ?p to actual DIM_PRODUCT FK objects, so a pre-bound
+// NON-product ?p yields no fact row and its solution dies — identically whether or
+// not the sibling `?p name` star is pruned to Product. This test exercises that
+// runtime path (the compute-level unit tests can't seed a binding).
+// =============================================================================
+
+const F20_REFPRUNE_MAPPING_TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<http://example.org/mapping#Fact> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.fact" ] ;
+    rr:subjectMap [ rr:template "http://example.org/inv/{inv_key}" ; rr:class ex:Inv ] ;
+    rr:predicateObjectMap [
+        rr:predicate ex:product ;
+        rr:objectMap [
+            rr:parentTriplesMap <http://example.org/mapping#Product> ;
+            rr:joinCondition [ rr:child "product_key" ; rr:parent "product_key" ]
+        ]
+    ] .
+
+<http://example.org/mapping#Product> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.product" ] ;
+    rr:subjectMap [ rr:template "http://example.org/product/{product_key}" ; rr:class ex:Product ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "product_name" ] ] .
+
+<http://example.org/mapping#Store> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+"#;
+
+fn f20_refprune_provider() -> CountingProvider {
+    let mapping = R2rmlLoader::from_turtle(F20_REFPRUNE_MAPPING_TTL)
+        .expect("parse F20 mapping")
+        .compile()
+        .expect("compile F20 mapping");
+    let mut batches_by_table = HashMap::new();
+    // Fact row: inv/1 -> product_key 1 (renders product/1). No store FK exists.
+    batches_by_table.insert(
+        "dw.fact".to_string(),
+        vec![batch_from(vec![
+            col_i64("inv_key", 1, vec![Some(1)]),
+            col_i64("product_key", 2, vec![Some(1)]),
+        ])],
+    );
+    batches_by_table.insert(
+        "dw.product".to_string(),
+        vec![batch_from(vec![
+            col_i64("product_key", 1, vec![Some(1)]),
+            col_str("product_name", 2, &["Widget"]),
+        ])],
+    );
+    // A second `ex:name`-bearing dim (the fan-out target) with a DISJOINT template.
+    batches_by_table.insert(
+        "dw.store".to_string(),
+        vec![batch_from(vec![
+            col_i64("store_key", 1, vec![Some(9)]),
+            col_str("store_name", 2, &["StoreName"]),
+        ])],
+    );
+    CountingProvider {
+        mapping: Arc::new(mapping),
+        batches_by_table,
+        scans: Mutex::new(Vec::new()),
+    }
+}
+
+/// Run `VALUES ?p { <seed> } GRAPH edw-gs:main { ?inv ex:product ?p . ?p ex:name ?pn }`
+/// and return (scan_counts, produced_row_total). The VALUES is OUTSIDE the GRAPH
+/// block, so it is invisible to the in-scope ref-prune analysis (which still fires
+/// on `?p ex:name`, constraining it to Product).
+async fn run_f20_prebound(provider: &CountingProvider, seed_iri: &str) -> (HashMap<String, usize>, usize) {
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let inv = vars.get_or_insert("?inv");
+    let p = vars.get_or_insert("?p");
+    let pn = vars.get_or_insert("?pn");
+    let p_product = ledger
+        .snapshot
+        .encode_iri("http://example.org/product")
+        .unwrap();
+    let p_name = ledger
+        .snapshot
+        .encode_iri("http://example.org/name")
+        .unwrap();
+    let inner = vec![
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(inv),
+            Ref::Sid(p_product),
+            Term::Var(p),
+        )),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(p),
+            Ref::Sid(p_name),
+            Term::Var(pn),
+        )),
+    ];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    // Outer VALUES ?p { <seed> } — seeds ?p from OUTSIDE the graph scope.
+    let values = Pattern::Values {
+        vars: vec![p],
+        rows: vec![vec![fluree_db_query::Binding::iri(seed_iri)]],
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![values, graph];
+    parsed.output = QueryOutput::select_all(vec![inv, p, pn]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let result = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("F20 pre-bound query should execute");
+    let rows = result.iter().fold(0, |acc, b| acc + b.len());
+    (provider.scan_counts(), rows)
+}
+
+#[tokio::test]
+async fn f20_prebound_valid_product_yields_the_row() {
+    // Self-check + soundness: a pre-bound VALID product IRI joins the fact row and,
+    // with the prune firing (?p name -> Product only), still returns the name. If
+    // the ref-prune dropped it, this would be 0. Proves the prune keeps kept rows.
+    let provider = f20_refprune_provider();
+    let (_counts, rows) = run_f20_prebound(&provider, "http://example.org/product/1").await;
+    assert_eq!(rows, 1, "pre-bound valid product ?p must still produce its name row");
+}
+
+#[tokio::test]
+async fn f20_prebound_nonproduct_iri_dies_by_conjunction() {
+    // The dangerous shape: a pre-bound NON-product IRI (a Store subject) invisible
+    // to the in-scope scan. The prune fires (?p name -> Product), yet the row dies
+    // regardless because the in-scope ref member (?inv product ?p) has no fact row
+    // with product = store/9. Sound: pruned and un-pruned both yield 0 for this row.
+    let provider = f20_refprune_provider();
+    let (_counts, rows) = run_f20_prebound(&provider, "http://example.org/store/9").await;
+    assert_eq!(
+        rows, 0,
+        "a pre-bound non-product ?p must die via the ref-member conjunction, not survive"
+    );
+}
