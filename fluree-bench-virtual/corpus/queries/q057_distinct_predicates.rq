@@ -1,0 +1,9 @@
+# q057 distinct_predicates
+# Intent: Schema discovery — "what properties / fields exist here?".
+# BI lineage (BI-explore-3): the distinct set of predicates in the dataset.
+# Exploration family: DISTINCT over the object-position-free ?p of an
+# unconstrained pattern. The predicate set is finite (the mapping's POMs), but
+# there is no mapping-metadata short-circuit — it scans + dedups.
+SELECT DISTINCT ?p
+WHERE { ?s ?p ?o }
+LIMIT 100

@@ -1171,6 +1171,189 @@
       "subsets": [
         "smoke"
       ]
+    },
+    {
+      "id": "q055",
+      "file": "queries/q055_wildcard_peek.rq",
+      "bi_question": "BI-explore-1: Let me see what's in here.",
+      "tags": [
+        "wildcard",
+        "exploration"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": 5,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q056",
+      "file": "queries/q056_triple_count.rq",
+      "bi_question": "BI-explore-2: How big is this dataset (total triples)?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 300,
+      "subsets": []
+    },
+    {
+      "id": "q057",
+      "file": "queries/q057_distinct_predicates.rq",
+      "bi_question": "BI-explore-3: What properties exist in this dataset?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "distinct"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        100
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q058",
+      "file": "queries/q058_class_census.rq",
+      "bi_question": "BI-explore-4: How many of each kind of thing are there?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        30
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q059",
+      "file": "queries/q059_predicate_histogram.rq",
+      "bi_question": "BI-explore-5: Which fields dominate the data?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate",
+        "group_by",
+        "order_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        10
+      ],
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
     }
   ]
 }

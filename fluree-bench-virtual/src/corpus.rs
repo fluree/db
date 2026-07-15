@@ -42,6 +42,11 @@ pub enum Tag {
     Negation,
     PropertyPath,
     Construct,
+    /// Unconstrained triple pattern (`?s ?p ?o`) — variable in every position.
+    Wildcard,
+    /// The naive first-touch "profile a new dataset" family (q055+): wildcard
+    /// peek, triple count, schema discovery, class census, predicate histogram.
+    Exploration,
 }
 
 /// A per-target-kind expected terminal outcome. Defaults to [`Self::Ok`], so a
@@ -310,8 +315,8 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            54,
-            "full corpus has 54 queries (design Q01-Q54)"
+            59,
+            "full corpus: 54 design queries (Q01-Q54) + the 5 exploration family (q055-q059)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));
@@ -330,8 +335,8 @@ mod tests {
             .collect();
         assert_eq!(
             smoke_tags.len(),
-            20,
-            "smoke must exercise all 20 feature tags"
+            22,
+            "smoke must exercise all 22 feature tags (20 design + wildcard + exploration)"
         );
     }
 
@@ -376,8 +381,8 @@ mod tests {
             declared_error,
             vec!["q013", "q034", "q051"],
             "exactly the loud-refuse queries declare virtual=error (q013/q051 subquery, \
-             q034 transitive path — q013 was a pre-existing test/manifest drift \
-             corrected here)"
+             q034 transitive path — q013 was a pre-existing test/manifest drift corrected \
+             here; the exploration DNF members are blessed separately from their run)"
         );
         for id in ["q013", "q034", "q051"] {
             let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
@@ -410,6 +415,12 @@ mod tests {
             .collect();
         let expected: BTreeSet<&str> = [
             "q015", "q016", "q028", "q029", "q031", "q045", "q048", "q049", "q053",
+            // Exploration family: q055 `?s ?p ?o LIMIT 5` and q057 `DISTINCT ?p
+            // LIMIT 100` both truncate an unordered set with LIMIT, so they gate on
+            // row count, not hash. q057's set is the ~120 distinct predicates (119
+            // rr:predicate + rdf:type) > the LIMIT 100, making the 100-subset
+            // nondeterministic — empirically the sole parity failure in the run.
+            "q055", "q057",
         ]
         .into_iter()
         .collect();
