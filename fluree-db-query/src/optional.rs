@@ -1172,7 +1172,9 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     /// may coalesce the whole driving side into one seed (one inner scan) rather
     /// than one scan per outer batch. Mirrors `build_batch`'s own admission gate.
     fn supports_seed_coalescing(&self) -> bool {
-        self.inner_patterns.iter().all(inner_pattern_is_hash_join_safe)
+        self.inner_patterns
+            .iter()
+            .all(inner_pattern_is_hash_join_safe)
     }
 
     /// Batched correlated OPTIONAL as a hash left-join.
@@ -3149,8 +3151,7 @@ mod tests {
             start_row: usize,
             _ctx: &ExecutionContext<'_>,
         ) -> Result<Option<Vec<OptionalBatchRow>>> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             // Every driving row is an OPTIONAL miss (empty optional batches) → the
             // row survives the left join with its optional-only var unbound.
             Ok(Some(
@@ -3195,8 +3196,10 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let builder = CountingCoalesceBuilder::new(&rs, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
-        let mut op = OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let builder =
+            CountingCoalesceBuilder::new(&rs, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
         let snapshot = LedgerSnapshot::genesis("test/main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
@@ -3237,7 +3240,8 @@ mod tests {
         };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let builder = CountingCoalesceBuilder::new(&rs, Arc::clone(&calls));
-        let mut op = OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
         let snapshot = LedgerSnapshot::genesis("test/main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
