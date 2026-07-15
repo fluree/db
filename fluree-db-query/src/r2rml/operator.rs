@@ -2391,6 +2391,35 @@ mod tests {
         assert!(!tm_passes_star_prune(&customer, &required, None));
     }
 
+    #[test]
+    fn parent_memo_refuses_insert_past_total_cap() {
+        // PR-8b review: the total-rows cap must REFUSE an insert that would exceed it
+        // (the caller then falls back to a per-batch rebuild for that key), while an
+        // already-present key stays idempotent. The cap is passed directly to keep
+        // the test env-hermetic (no FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS).
+        let mut memo = R2rmlParentMemoInner::default();
+        let lookup = |n: usize| -> std::sync::Arc<ParentLookup> {
+            let mut m = ParentLookup::new();
+            for i in 0..n {
+                m.insert(vec![i.to_string()], RdfTerm::iri(format!("http://ex/{i}")));
+            }
+            std::sync::Arc::new(m)
+        };
+        let key = |s: &str| -> R2rmlParentMemoKey {
+            (
+                "gs".to_string(),
+                s.to_string(),
+                vec!["id".to_string()],
+                None,
+            )
+        };
+        assert!(memo.try_insert(key("A"), &lookup(2), 3)); // 2 <= 3
+        assert!(memo.try_insert(key("A"), &lookup(2), 3)); // same key, idempotent
+        assert!(!memo.try_insert(key("B"), &lookup(2), 3)); // 2 + 2 = 4 > 3 -> refused
+        assert!(memo.try_insert(key("C"), &lookup(1), 3)); // 2 + 1 = 3 fits exactly
+        assert!(!memo.try_insert(key("D"), &lookup(1), 3)); // at cap -> refused
+    }
+
     // PR-3 fix (b'): with a (template-disjoint) class prune, only class-declaring
     // maps survive resolution; the class's own scan enforces membership.
     #[test]
