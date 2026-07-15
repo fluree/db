@@ -3,6 +3,7 @@
 # BI lineage (BI-explore-1): "Let me see what's in here." (unconstrained ?s ?p ?o)
 # Exploration family: variable subject/predicate/object, LIMIT-bounded peek. No
 # constraints to prune the TriplesMap fan-out.
+# Determinism: unordered LIMIT 5 over an unconstrained pattern truncates a far larger triple set (any 5 rows are valid) -> hash_gate=rows_only; gated on row count + shape, not an exact hash.
 SELECT ?s ?p ?o
 WHERE { ?s ?p ?o }
 LIMIT 5
