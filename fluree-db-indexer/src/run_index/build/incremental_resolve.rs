@@ -775,6 +775,9 @@ type ResolvedIdentity = (u16, u32);
 /// distinct language tags and list positions stay distinct.
 ///
 /// Input must be sorted by `(g_id, SPOT)`; output preserves that order.
+/// Compacts in place behind a write cursor — winners are always a subset of
+/// already-read input, so the stream-dominant case (every group a single
+/// event) copies nothing and allocates nothing.
 ///
 /// Dropped intermediate transitions do not reach the history sidecars, so
 /// index-served time travel cannot see a state a fact held only *within*
@@ -782,81 +785,94 @@ type ResolvedIdentity = (u16, u32);
 /// has no lived interval in the index; `merge_novelty` records no history
 /// for its final retract). The live novelty view retains those intermediate
 /// ops until the window is indexed.
-fn dedup_fact_lifecycles(records: Vec<RunRecord>, o_types: &OTypeRegistry) -> Vec<RunRecord> {
-    let mut out: Vec<RunRecord> = Vec::with_capacity(records.len());
-    // Raw records of the current sort-prefix group (all dt/lang/list
-    // variants of one value); identities resolve at flush time.
-    let mut group: Vec<RunRecord> = Vec::new();
+fn dedup_fact_lifecycles(mut records: Vec<RunRecord>, o_types: &OTypeRegistry) -> Vec<RunRecord> {
+    let len = records.len();
+    let mut write = 0;
+    let mut start = 0;
+    // Scratch for multi-record groups, reused across groups.
+    let mut keyed: Vec<(ResolvedIdentity, RunRecord)> = Vec::new();
 
-    for rec in records {
-        if group.last().is_some_and(|g| !same_sort_prefix(g, &rec)) {
-            flush_deduped_group(&mut group, o_types, &mut out);
+    while start < len {
+        let mut end = start + 1;
+        while end < len && same_sort_prefix(&records[start], &records[end]) {
+            end += 1;
         }
-        group.push(rec);
+
+        if end - start == 1 {
+            // Overwhelmingly common: a single event needs no identity
+            // resolution and, absent earlier compaction, no copy.
+            if write != start {
+                records[write] = records[start];
+            }
+            write += 1;
+        } else {
+            dedup_group(&records[start..end], o_types, &mut keyed);
+            for &(_, winner) in &keyed {
+                records[write] = winner;
+                write += 1;
+            }
+        }
+        start = end;
     }
-    flush_deduped_group(&mut group, o_types, &mut out);
-    out
+
+    records.truncate(write);
+    records
 }
 
-/// Dedup one sort-prefix group to its per-identity winners and emit them in
-/// comparator order (`dt`, `t`, `op`), clearing the group.
+/// Dedup one multi-record sort-prefix group, leaving the per-identity winners
+/// in `keyed` in comparator order (`dt`, `t`, `op`).
 ///
-/// The group is keyed by resolved V2 identity and re-sorted by
+/// The group is keyed by resolved V2 identity and sorted by
 /// `(identity, t, op)` first: the incoming `(g_id, SPOT)` order interleaves
 /// `dt` before `t`, so events of one identity spread across `dt` variants
 /// would otherwise arrive out of chronological order.
-fn flush_deduped_group(
-    group: &mut Vec<RunRecord>,
+fn dedup_group(
+    group: &[RunRecord],
     o_types: &OTypeRegistry,
-    out: &mut Vec<RunRecord>,
+    keyed: &mut Vec<(ResolvedIdentity, RunRecord)>,
 ) {
-    if group.len() == 1 {
-        // Overwhelmingly common: a single event needs no identity resolution.
-        out.append(group);
-        return;
-    }
-    if group.is_empty() {
-        return;
-    }
-
-    let mut keyed: Vec<(ResolvedIdentity, RunRecord)> = group
-        .drain(..)
-        .map(|rec| {
-            let o_type = o_types
-                .resolve(
-                    rec.obj_kind(),
-                    DatatypeDictId::from_u16(rec.dt),
-                    rec.lang_id,
-                )
-                .as_u16();
-            ((o_type, rec.i), rec)
-        })
-        .collect();
+    keyed.clear();
+    keyed.extend(group.iter().map(|&rec| {
+        let o_type = o_types
+            .resolve(
+                rec.obj_kind(),
+                DatatypeDictId::from_u16(rec.dt),
+                rec.lang_id,
+            )
+            .as_u16();
+        ((o_type, rec.i), rec)
+    }));
     keyed.sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
             .then(a.1.t.cmp(&b.1.t))
             .then(a.1.op.cmp(&b.1.op))
     });
 
-    let mut winners: Vec<RunRecord> = Vec::new();
-    let mut current: Option<ResolvedIdentity> = None;
-    for (key, rec) in keyed {
-        if current != Some(key) {
+    // Compact each identity run to its winner, in place.
+    let mut w = 0;
+    for r in 1..keyed.len() {
+        if keyed[r].0 != keyed[w].0 {
             // First event of a new identity always counts.
-            winners.push(rec);
-            current = Some(key);
+            w += 1;
+            keyed[w] = keyed[r];
             continue;
         }
-        let winner = winners.last_mut().expect("identity run has a winner");
+        let rec = keyed[r].1;
+        let winner = &mut keyed[w].1;
         let noop_reassert = rec.op == 1 && winner.op == 1;
         let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
         if !noop_reassert && !same_t_retract_wins {
             *winner = rec;
         }
     }
+    keyed.truncate(w + 1);
 
-    winners.sort_unstable_by(|a, b| a.dt.cmp(&b.dt).then(a.t.cmp(&b.t)).then(a.op.cmp(&b.op)));
-    out.append(&mut winners);
+    keyed.sort_unstable_by(|a, b| {
+        a.1.dt
+            .cmp(&b.1.dt)
+            .then(a.1.t.cmp(&b.1.t))
+            .then(a.1.op.cmp(&b.1.op))
+    });
 }
 
 // ============================================================================
@@ -1736,6 +1752,27 @@ mod tests {
             keys(&out),
             keys(&[stray]),
             "first assert wins; lang ignored"
+        );
+    }
+
+    /// In-place compaction: records after a collapsed group shift backward
+    /// behind the write cursor without loss or reordering.
+    #[test]
+    fn records_after_a_collapsed_group_shift_back_intact() {
+        let records = vec![
+            bool_rec(1, 1, 10, 5, 5, OP_ASSERT),
+            bool_rec(1, 1, 10, 9, 6, OP_ASSERT), // collapses into the above
+            rec(2, 1, 20, 7, OP_ASSERT),
+            rec(3, 1, 30, 8, OP_RETRACT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                bool_rec(1, 1, 10, 5, 5, OP_ASSERT),
+                rec(2, 1, 20, 7, OP_ASSERT),
+                rec(3, 1, 30, 8, OP_RETRACT),
+            ])
         );
     }
 
