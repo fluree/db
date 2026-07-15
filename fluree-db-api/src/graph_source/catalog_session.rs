@@ -96,6 +96,16 @@ pub(crate) struct IcebergCatalogSession {
     /// `store_load_table`: any fresh loadTable (including a creds-expiry reload)
     /// drops the entry, so a client built from stale credentials is never served.
     storages: Mutex<HashMap<String, Arc<S3IcebergStorage>>>,
+    /// Location-only snapshot pins from the loadTable-metadata cache's pointer
+    /// rung (`21-loadtable-metadata-cache.md`): that path resolves a snapshot's
+    /// `metadata_location` from disk WITHOUT a loadTable GET, so it has NO vended
+    /// credentials to store in `load_tables`. Kept in a SEPARATE map so
+    /// `cached_load_table` never hands out a credential-less entry (which would
+    /// build ambient-cred storage). `pinned_metadata_location` consults it, so a
+    /// later touch of the same table this query stays on ONE snapshot even if the
+    /// disk pointer's TTL expires between touches — the eager path then reloads
+    /// only the credentials and re-pins to this location.
+    location_pins: Mutex<HashMap<String, String>>,
 }
 
 impl IcebergCatalogSession {
@@ -141,11 +151,40 @@ impl IcebergCatalogSession {
         if !cache_enabled() {
             return None;
         }
-        self.load_tables
+        // The credential-bearing pin (from an actual loadTable) is authoritative;
+        // fall back to a location-only pin from the pointer rung. They can only
+        // AGREE (the eager path re-pins to the location-pin's value), so the order
+        // is a preference, not a correctness choice.
+        if let Some(loc) = self
+            .load_tables
             .lock()
             .unwrap()
             .get(key)
             .map(|e| e.metadata_location.clone())
+        {
+            return Some(loc);
+        }
+        self.location_pins.lock().unwrap().get(key).cloned()
+    }
+
+    /// Pin ONLY the `metadata_location` for `key` (no credentials) — for the
+    /// loadTable-metadata cache's pointer rung, which serves a snapshot's metadata
+    /// from disk WITHOUT a loadTable GET. First-writer-wins (like the loadTable
+    /// pin): a later touch of the same table this query resolves the SAME snapshot
+    /// even if the disk pointer's TTL expires between touches. Deliberately does
+    /// NOT touch `load_tables`, so `cached_load_table` keeps forcing a fresh-creds
+    /// GET rather than serving a credential-less entry (ambient-cred storage). The
+    /// snapshot pin machinery's whole reason for existing (`cache_enabled` /
+    /// snapshot consistency, this module's doc). No-op when the cache is disabled.
+    pub(crate) fn pin_metadata_location(&self, key: String, metadata_location: String) {
+        if !cache_enabled() {
+            return;
+        }
+        self.location_pins
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert(metadata_location);
     }
 
     /// Cache a `loadTable` response for reuse by later scans of the same
@@ -290,6 +329,58 @@ mod tests {
         assert_eq!(
             hit.metadata_location, "s3://snap-A.json",
             "later scans read the pinned snapshot, not the reloaded one"
+        );
+    }
+
+    #[test]
+    fn location_pin_keeps_query_on_one_snapshot_across_pointer_ttl_expiry() {
+        // The loadTable-metadata cache's pointer rung serves a snapshot's metadata
+        // from disk (no loadTable GET) and PINS its location. A LATER touch of the
+        // same table this query — even after the disk pointer's TTL expired and
+        // would resolve a NEWER snapshot — must read the SAME snapshot. This is the
+        // exact two-snapshots-in-one-query bug the pin machinery prevents; before
+        // the pin was registered on the never-forced metadata path, the pointer rung
+        // could violate it.
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "FACT_INVENTORY");
+        assert_eq!(s.pinned_metadata_location(&key), None);
+
+        // Touch 1: the rung serves + pins snap-A (credential-less — metadata came
+        // from the disk caches, no vended creds).
+        s.pin_metadata_location(key.clone(), "s3://snap-A.json".to_string());
+        assert_eq!(
+            s.pinned_metadata_location(&key).as_deref(),
+            Some("s3://snap-A.json")
+        );
+        // A location-only pin must NOT masquerade as a cached loadTable response
+        // (that would build ambient-cred storage); the eager path still reloads
+        // credentials.
+        assert!(
+            s.cached_load_table(&key).is_none(),
+            "a credential-less location pin never serves as a cached loadTable"
+        );
+
+        // Touch 2's disk pointer has expired and advanced to snap-B; first-writer-
+        // wins keeps the query on snap-A.
+        s.pin_metadata_location(key.clone(), "s3://snap-B.json".to_string());
+        assert_eq!(
+            s.pinned_metadata_location(&key).as_deref(),
+            Some("s3://snap-A.json"),
+            "the query stays on the first-pinned snapshot even if the pointer advances"
+        );
+
+        // If touch 2 falls to the EAGER path, resolve_rest_load_and_storage reloads
+        // credentials and overrides its GET-observed snap-B back to the pinned
+        // snap-A (then stores it). Model that store: the query still reads snap-A,
+        // now with fresh creds.
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(3600)))),
+        );
+        let hit = s.cached_load_table(&key).expect("fresh creds now valid");
+        assert_eq!(
+            hit.metadata_location, "s3://snap-A.json",
+            "later scans read the pinned snapshot with fresh creds"
         );
     }
 

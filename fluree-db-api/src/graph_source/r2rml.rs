@@ -1222,13 +1222,28 @@ impl FlureeR2rmlProvider<'_> {
             uri, warehouse, auth, ..
         } = &iceberg_config.catalog
         {
+            // A snapshot pin from an EARLIER touch of this table THIS query wins
+            // unconditionally over the disk pointer (correlated re-loads must read
+            // ONE snapshot). Only when unpinned do we consult the disk pointer.
             // `None` = a latest-snapshot read. GREP: r2rml-as-of-t — when Iceberg
             // snapshot time-travel lands, the requested snapshot's `timestamp_ms`
             // MUST be threaded here as `min_snapshot_ms` so bounded staleness can
             // never downgrade a time-travel request (the guard + hermetic already
             // exist in `disk_catalog_cache::pointer_is_usable`).
-            if let Some(loc) = disk.get_metadata_location(&lt_key, None) {
+            let candidate = self
+                .session
+                .pinned_metadata_location(&lt_key)
+                .or_else(|| disk.get_metadata_location(&lt_key, None));
+            if let Some(loc) = candidate {
                 if let Some(md) = self.metadata_from_caches(&loc).await {
+                    // Pin the location BEFORE serving: a later touch whose disk
+                    // pointer has since expired (TTL boundary mid-query) then still
+                    // resolves THIS snapshot via `pinned_metadata_location` — the
+                    // eager path reloads only credentials and re-pins here. Without
+                    // this, the never-forced metadata path could read two snapshots
+                    // in one query (the pin contract, `catalog_session.rs`).
+                    self.session
+                        .pin_metadata_location(lt_key.clone(), loc.clone());
                     // Build/get the process-wide REST client. Client construction
                     // does NO network; the OAuth token exchange rides the first
                     // catalog op (the loadTable GET, deferred) — a property ENFORCED
