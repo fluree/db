@@ -766,6 +766,13 @@ pub(crate) fn storage_query_error(
             region,
             message,
         },
+        // §2's fail-closed error, raised inside a deferred `LazyS3Storage` build and
+        // ferried out through the builder's `IcebergError` channel. Lift it back so
+        // the 403 + `err:catalog/CredentialsNotVended` wire code survives the lazy
+        // path exactly as it does the eager one.
+        fluree_db_iceberg::IcebergError::CatalogCredentialsNotVended { catalog_uri } => {
+            fluree_db_query::QueryError::CatalogCredentialsNotVended { catalog_uri }
+        }
         other => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
     }
 }

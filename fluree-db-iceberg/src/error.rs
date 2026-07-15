@@ -53,6 +53,25 @@ pub enum IcebergError {
         message: String,
     },
 
+    /// The source is configured to require catalog-vended storage credentials
+    /// (`io.vended_credentials = true`) but the catalog's `loadTable` returned none.
+    ///
+    /// Carried as an `IcebergError` ONLY so the typed error survives the deferred
+    /// `LazyS3Storage` builder's `Result` channel (which is `IcebergError`-typed);
+    /// `storage_query_error` lifts it straight back to
+    /// `QueryError::CatalogCredentialsNotVended` and its `err:catalog/CredentialsNotVended`
+    /// wire code, so the lazy path reports identically to the eager one. Never
+    /// construct it for a Direct-mode source — Direct never requests vending.
+    #[error(
+        "Catalog {catalog_uri} authorized the table but vended no storage credentials; \
+         either fix the catalog's credential vending or set vended_credentials=false \
+         on the source to explicitly use ambient AWS credentials"
+    )]
+    CatalogCredentialsNotVended {
+        /// The REST catalog URI that authorized the table but vended nothing.
+        catalog_uri: String,
+    },
+
     /// Snapshot not found
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
@@ -129,6 +148,9 @@ impl From<IcebergError> for fluree_db_core::error::Error {
             // (core has no unauthorized variant); the full message is preserved.
             IcebergError::StorageAccessDenied { .. } => {
                 fluree_db_core::error::Error::storage(err.to_string())
+            }
+            IcebergError::CatalogCredentialsNotVended { .. } => {
+                fluree_db_core::error::Error::other(err.to_string())
             }
             // Auth and other errors map to generic "other" since core doesn't have unauthorized
             _ => fluree_db_core::error::Error::other(err.to_string()),
