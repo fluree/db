@@ -116,13 +116,20 @@ struct PersistedCountStats {
 /// misread an old entry (a defaulted field) instead of refetching. **BUMP THIS
 /// whenever any persisted payload type changes** — an entry whose stored version
 /// differs is dropped and refetched.
-const CACHE_FORMAT_VERSION: u32 = 1;
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Versioned on-disk envelope. The version is checked before the payload is
 /// trusted; a mismatch (or any deserialize failure) is a miss, never an error.
 #[derive(Serialize, Deserialize)]
 struct Envelope<T> {
     format_version: u32,
+    /// The FULL cache key (an `s3://…` metadata_location, or an `lt_key`). The
+    /// filename stem is only a 64-bit `DefaultHasher` of the key, so two distinct
+    /// keys can collide onto one path; verifying the stored key on read turns a
+    /// collision into a clean miss instead of silently serving another entry's
+    /// payload — a wrong *table*'s metadata for the pointer entry (#1491/#1503
+    /// review). Hash quality is then irrelevant to correctness.
+    key: String,
     payload: T,
 }
 
@@ -170,17 +177,25 @@ impl DiskCatalogCache {
     /// Read + version-check an entry. A deserialize failure (corrupt, truncated by
     /// a crash mid-write, or an old value layout) OR a version mismatch is a miss;
     /// a stale-version file is deleted so it stops occupying the cap.
-    fn read<T: for<'de> Deserialize<'de>>(&self, path: &Path) -> Option<T> {
-        let bytes = std::fs::read(path).ok()?;
+    fn read<T: for<'de> Deserialize<'de>>(&self, key: &str, suffix: &str) -> Option<T> {
+        let path = self.path(key, suffix);
+        let bytes = std::fs::read(&path).ok()?;
         let env: Envelope<T> = match serde_json::from_slice(&bytes) {
             Ok(e) => e,
             Err(_) => {
-                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(&path);
                 return None;
             }
         };
         if env.format_version != CACHE_FORMAT_VERSION {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        // Hash-collision guard: the filename is only a 64-bit hash of `key`, so a
+        // colliding entry deserializes but carries a DIFFERENT key. Verify it and
+        // treat a mismatch as a miss (do NOT delete — the entry is valid for its
+        // own key, which a future read under that key will want).
+        if env.key != key {
             return None;
         }
         Some(env.payload)
@@ -189,16 +204,18 @@ impl DiskCatalogCache {
     /// Write an entry via temp-file + atomic rename, so a crash mid-write can't
     /// leave a torn file a later read would trust (a torn temp is just orphaned).
     /// Best-effort: any failure just means a future miss.
-    fn write<T: Serialize>(&self, path: &Path, value: &T) {
+    fn write<T: Serialize>(&self, key: &str, suffix: &str, value: &T) {
+        let path = self.path(key, suffix);
         let env = Envelope {
             format_version: CACHE_FORMAT_VERSION,
+            key: key.to_string(),
             payload: value,
         };
         let Ok(bytes) = serde_json::to_vec(&env) else {
             return;
         };
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        if std::fs::write(&tmp, &bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
     }
@@ -207,7 +224,7 @@ impl DiskCatalogCache {
         if !self.enabled {
             return None;
         }
-        self.read::<TableMetadata>(&self.path(metadata_location, "metadata"))
+        self.read::<TableMetadata>(metadata_location, "metadata")
             .map(Arc::new)
     }
 
@@ -215,14 +232,14 @@ impl DiskCatalogCache {
         if !self.enabled {
             return;
         }
-        self.write(&self.path(metadata_location, "metadata"), metadata);
+        self.write(metadata_location, "metadata", metadata);
     }
 
     pub(crate) fn get_scan_files(&self, metadata_location: &str) -> Option<Arc<CachedScanFiles>> {
         if !self.enabled {
             return None;
         }
-        let p: PersistedScanFiles = self.read(&self.path(metadata_location, "scanfiles"))?;
+        let p: PersistedScanFiles = self.read(metadata_location, "scanfiles")?;
         Some(Arc::new(CachedScanFiles {
             data_files: Arc::new(p.data_files),
             estimated_row_count: p.estimated_row_count,
@@ -241,14 +258,14 @@ impl DiskCatalogCache {
             files_selected: sf.files_selected,
             files_pruned: sf.files_pruned,
         };
-        self.write(&self.path(metadata_location, "scanfiles"), &p);
+        self.write(metadata_location, "scanfiles", &p);
     }
 
     pub(crate) fn get_count_stats(&self, metadata_location: &str) -> Option<(Vec<DataFile>, bool)> {
         if !self.enabled {
             return None;
         }
-        let p: PersistedCountStats = self.read(&self.path(metadata_location, "countstats"))?;
+        let p: PersistedCountStats = self.read(metadata_location, "countstats")?;
         Some((p.data_files, p.has_delete_manifests))
     }
 
@@ -265,7 +282,7 @@ impl DiskCatalogCache {
             data_files: data_files.to_vec(),
             has_delete_manifests,
         };
-        self.write(&self.path(metadata_location, "countstats"), &p);
+        self.write(metadata_location, "countstats", &p);
     }
 }
 
@@ -379,6 +396,28 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].record_count, 100);
         assert!(has_deletes);
+    }
+
+    #[test]
+    fn collided_entry_carrying_another_key_is_a_miss() {
+        // Hash-collision guard (#1491/#1503 review): the filename is only a 64-bit
+        // DefaultHasher of the key, so two distinct keys can collide onto one path. A
+        // read must verify the stored FULL key and MISS on a mismatch — never serve
+        // another table's payload. Simulate the collision deterministically by
+        // placing entry A's stored file at B's path.
+        let cache = DiskCatalogCache::for_dir(&tmp_dir("collision"));
+        let a = "s3://bucket/TABLE_A/metadata/00001-a.metadata.json";
+        let b = "s3://bucket/TABLE_B/metadata/00002-b.metadata.json";
+        cache.put_count_stats(a, &[data_file("s3://b/a.parquet", 100)], true);
+        std::fs::copy(cache.path(a, "countstats"), cache.path(b, "countstats")).unwrap();
+        assert!(
+            cache.get_count_stats(b).is_none(),
+            "a collided entry whose stored key mismatches is a clean miss, not a misread"
+        );
+        assert!(
+            cache.get_count_stats(a).is_some(),
+            "A's own entry still hits"
+        );
     }
 
     #[test]
