@@ -1561,24 +1561,26 @@ impl FlureeR2rmlProvider<'_> {
                     "Loading table via direct S3 access"
                 );
 
-                // Direct mode: create storage once, share via Arc. gs://-backed
-                // tables (GCS S3-interop endpoint) are read through the same S3
-                // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK
-                // HTTP/2 range-read bug against that endpoint.
-                let storage: Arc<S3IcebergStorage> = Arc::new(
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?,
+                // Session cache key for this table's storage client — the same
+                // key the REST branch uses (source id + fully-qualified table),
+                // so repeated scans of one Direct table in a query reuse a single
+                // S3 client instead of rebuilding it (credential-chain resolution
+                // + a fresh connection pool) per scan (fluree/db#1498).
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
                 );
 
                 let cache = self.fluree.r2rml_cache();
-                let load_response = if let Some(metadata_location) =
+                // Storage construction sits BELOW the metadata-location check so a
+                // hit resolves through `direct_session_storage`, which serves the
+                // session-cached client when this table was already resolved this
+                // query and skips `from_default_chain` entirely. Both arms still
+                // need storage (the scan reads data files; the miss arm also reads
+                // version-hint/metadata via the direct catalog), so this is a
+                // reordering — the session cache covers it, not an elision.
+                let (load_response, storage) = if let Some(metadata_location) =
                     cache.get_direct_metadata_location(table_location).await
                 {
                     debug!(
@@ -1586,14 +1588,34 @@ impl FlureeR2rmlProvider<'_> {
                         metadata_location = %metadata_location,
                         "Direct metadata-location cache hit"
                     );
-                    fluree_db_iceberg::catalog::LoadTableResponse {
+                    let storage = direct_session_storage(
+                        &self.session,
+                        &lt_key,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await?;
+                    let load_response = fluree_db_iceberg::catalog::LoadTableResponse {
                         metadata_location,
                         config: std::collections::HashMap::default(),
                         credentials: None,
                         metadata: None,
-                    }
+                    };
+                    (load_response, storage)
                 } else {
                     debug!(table_location = %table_location, "Direct metadata-location cache miss");
+
+                    // The direct catalog reads version-hint.text + metadata from
+                    // S3, so it needs the storage client up front.
+                    let storage = direct_session_storage(
+                        &self.session,
+                        &lt_key,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await?;
 
                     let direct_catalog =
                         SendDirectCatalogClient::new(table_location.clone(), Arc::clone(&storage));
@@ -1616,7 +1638,7 @@ impl FlureeR2rmlProvider<'_> {
                             load_response.metadata_location.clone(),
                         )
                         .await;
-                    load_response
+                    (load_response, storage)
                 };
 
                 info!(
@@ -2268,6 +2290,43 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
     Ok(metadata)
 }
 
+/// Acquire the S3 storage client for a Direct-mode table, reusing the query
+/// session's cached client when one is present.
+///
+/// Direct mode builds from the ambient AWS credential chain
+/// (`from_default_chain`: env → `~/.aws` → IMDS/ECS network round-trips) and
+/// stands up a fresh connection pool — not free, and repeated for every scan of
+/// a table that a correlated join (or the slice-1 prefetch→scan) re-resolves.
+/// This mirrors the REST branch's `cached_storage`/`store_storage` reuse
+/// (fluree/db#1498). Unlike REST, Direct never calls `store_load_table` (it has
+/// no vended credentials to rotate), so the cached client is never invalidated
+/// mid-query: the first build is stored and every later resolution of the same
+/// table returns that Arc. `cached_storage`/`store_storage` are gated on
+/// `cache_enabled()`, so with caching disabled this still builds per call
+/// (matching REST and the pre-#1498 behavior).
+async fn direct_session_storage(
+    session: &super::catalog_session::IcebergCatalogSession,
+    lt_key: &str,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+    path_style: bool,
+) -> QueryResult<Arc<S3IcebergStorage>> {
+    if let Some(cached) = session.cached_storage(lt_key) {
+        debug!("S3 storage client reused (query-scoped, direct)");
+        return Ok(cached);
+    }
+    // gs://-backed tables (GCS S3-interop endpoint) are read through this same S3
+    // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK HTTP/2
+    // range-read bug against that endpoint.
+    let built = Arc::new(
+        S3IcebergStorage::from_default_chain(region, endpoint, path_style)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?,
+    );
+    session.store_storage(lt_key.to_string(), Arc::clone(&built));
+    Ok(built)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2857,6 +2916,45 @@ mod tests {
         assert_ne!(
             key_raw, key_h1,
             "the raw ref-bearing key must differ from the hydrated key"
+        );
+    }
+
+    /// fluree/db#1498: Direct mode resolves its S3 client through the query
+    /// session cache, so two resolutions of the same table in one query share ONE
+    /// client instead of rebuilding it (credential-chain resolution + a fresh
+    /// connection pool) per scan. Direct mode never calls `store_load_table`, so
+    /// nothing invalidates the cached client mid-query — the second acquisition
+    /// must return the first Arc. `from_default_chain(Some(region), ..)` builds an
+    /// SDK client offline (region set, ambient creds resolved lazily, no request),
+    /// so this runs in CI without AWS credentials. This is the strongest seam that
+    /// exercises the actual fix without a live catalog: it drives the exact helper
+    /// the Direct branch now calls in both metadata-location arms.
+    #[tokio::test]
+    async fn direct_session_storage_reuses_arc_across_calls() {
+        use crate::graph_source::catalog_session::IcebergCatalogSession;
+        let session = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+
+        let first = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
+            .await
+            .expect("offline SDK client construction");
+        let second = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
+            .await
+            .expect("offline SDK client construction");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second Direct-mode acquisition must reuse the session-cached S3 client"
+        );
+
+        // A different table (different key) is a distinct client — the cache keys
+        // per (source, table), so unrelated tables never alias one client.
+        let other_key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_GEOGRAPHY");
+        let other = direct_session_storage(&session, &other_key, Some("us-east-2"), None, false)
+            .await
+            .expect("offline SDK client construction");
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a different table must not reuse another table's cached client"
         );
     }
 }
