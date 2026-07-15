@@ -374,10 +374,12 @@ mod tests {
             .collect();
         assert_eq!(
             declared_error,
-            vec!["q034", "q051"],
-            "exactly the PR-0 loud-refuse queries declare virtual=error"
+            vec!["q013", "q034", "q051"],
+            "exactly the loud-refuse queries declare virtual=error (q013/q051 subquery, \
+             q034 transitive path — q013 was a pre-existing test/manifest drift \
+             corrected here)"
         );
-        for id in ["q034", "q051"] {
+        for id in ["q013", "q034", "q051"] {
             let q = corpus.queries.iter().find(|q| q.id == id).expect(id);
             assert_eq!(
                 q.expected_status.for_target(false),
