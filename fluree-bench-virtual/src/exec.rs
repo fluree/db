@@ -179,6 +179,9 @@ impl Engine {
     /// clearing happens in the caller (`cmd_exec_one`) *before* `open`, since the
     /// cache is read at open time. Pacing is the parent's job (2 s between cold
     /// children), so a single exec-one does not sleep.
+    // Bench-harness plumbing: the params mirror the exec-one CLI surface 1:1;
+    // bundling them into a struct would just move the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub fn exec_one(
         &self,
         fluree: &Fluree,
