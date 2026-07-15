@@ -152,7 +152,14 @@ fn curie_align_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("FLUREE_R2RML_CURIE_ALIGN")
-            .map(|v| v != "0")
+            // Match the R2RML switch family's falsy set (not just "0"), so
+            // `=false`/`off`/`no` disable too (#1499 review).
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
             .unwrap_or(true)
     })
 }

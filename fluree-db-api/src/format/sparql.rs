@@ -334,9 +334,9 @@ fn write_term(out: &mut String, binding: &Binding, compactor: &IriCompactor) -> 
         // result so virtual output matches native (F9); otherwise emitted verbatim.
         Binding::Iri(iri) => {
             if compactor.compacts_graph_source_iris() {
-                write_node(out, &compactor.compact_id_iri(iri))
+                write_node(out, &compactor.compact_id_iri(iri));
             } else {
-                write_node(out, iri.as_ref())
+                write_node(out, iri.as_ref());
             }
         }
         Binding::Lit { val, dtc, .. } => {
