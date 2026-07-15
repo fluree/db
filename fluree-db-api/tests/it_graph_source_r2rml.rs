@@ -4422,7 +4422,10 @@ fn f20_refprune_provider() -> CountingProvider {
 /// and return (scan_counts, produced_row_total). The VALUES is OUTSIDE the GRAPH
 /// block, so it is invisible to the in-scope ref-prune analysis (which still fires
 /// on `?p ex:name`, constraining it to Product).
-async fn run_f20_prebound(provider: &CountingProvider, seed_iri: &str) -> (HashMap<String, usize>, usize) {
+async fn run_f20_prebound(
+    provider: &CountingProvider,
+    seed_iri: &str,
+) -> (HashMap<String, usize>, usize) {
     let (_fluree, ledger) = edw_guard_ledger();
     let mut vars = VarRegistry::new();
     let inv = vars.get_or_insert("?inv");
@@ -4481,7 +4484,10 @@ async fn f20_prebound_valid_product_yields_the_row() {
     // the ref-prune dropped it, this would be 0. Proves the prune keeps kept rows.
     let provider = f20_refprune_provider();
     let (_counts, rows) = run_f20_prebound(&provider, "http://example.org/product/1").await;
-    assert_eq!(rows, 1, "pre-bound valid product ?p must still produce its name row");
+    assert_eq!(
+        rows, 1,
+        "pre-bound valid product ?p must still produce its name row"
+    );
 }
 
 #[tokio::test]

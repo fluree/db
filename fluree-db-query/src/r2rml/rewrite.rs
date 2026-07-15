@@ -252,7 +252,12 @@ pub fn rewrite_patterns_for_r2rml(
     // `FLUREE_R2RML_REF_TARGET_PRUNE`.
     let ref_prune_targets = if ref_target_prune_enabled() {
         let class_group_subjects: Vec<VarId> = class_groups.iter().map(|(s, _)| *s).collect();
-        compute_ref_prune_targets(&star_groups, &result_patterns, &class_group_subjects, mapping)
+        compute_ref_prune_targets(
+            &star_groups,
+            &result_patterns,
+            &class_group_subjects,
+            mapping,
+        )
     } else {
         std::collections::HashMap::new()
     };
@@ -1678,7 +1683,10 @@ mod tests {
     fn f20_declines_on_second_object_binding() {
         // ?p is the object of a second (non-ref) star member → not a lone FK → decline.
         let mut sg = q031_star_groups();
-        sg.push((VarId(3), vec![member(VarId(3), "http://ex/other", VarId(1))]));
+        sg.push((
+            VarId(3),
+            vec![member(VarId(3), "http://ex/other", VarId(1))],
+        ));
         let m = q031_mapping();
         let out = compute_ref_prune_targets(&sg, &[], &[], Some(&m));
         assert!(out.is_empty(), "a second binding of ?p must decline");
@@ -1745,7 +1753,10 @@ mod tests {
         // it; the ref-prune must not also fire. Decline.
         let m = q031_mapping();
         let out = compute_ref_prune_targets(&q031_star_groups(), &[], &[VarId(1)], Some(&m));
-        assert!(out.is_empty(), "a class assertion on ?p must decline the ref-prune");
+        assert!(
+            out.is_empty(),
+            "a class assertion on ?p must decline the ref-prune"
+        );
     }
 
     #[test]
