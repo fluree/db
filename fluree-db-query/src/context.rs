@@ -1214,12 +1214,22 @@ impl<'a> ExecutionContext<'a> {
             // This per-graph context switches to `graph`'s own store/snapshot
             // (see `binary_store`/`active_snapshot` above) while clearing
             // `multi_ledger`, so the single-ledger const→s_id fast path DOES run
-            // here — against a different store than the parent. A fresh memo is
-            // mandatory: sharing the parent's would alias an s_id resolved in one
-            // graph/store into another. (`with_active_graph`/`with_default_graph`
-            // keep the same store, so they correctly share the parent's memo.)
+            // here — against a different store than the parent. A fresh
+            // `const_sid_cache` is mandatory: its key is the const IRI ALONE
+            // (store-implicit), so sharing the parent's would alias an s_id
+            // resolved in one graph/store into another.
             const_sid_cache: ConstSidCache::default(),
-            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
+            // The R2RML parent-lookup memo, by contrast, is SAFE to share here
+            // (F19): its key carries `graph_source_id` + `as_of_t`
+            // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
+            // one graph source can never be served for another — the store switch
+            // that forces a fresh `const_sid_cache` cannot alias the memo. Sharing
+            // lets PR-8b's query-scoped memo survive a correlated inner-join
+            // rebuilt across a `with_graph_ref` boundary (SERVICE / multi-source
+            // default R2RML), the one path `with_active_graph`'s clone doesn't
+            // cover. (`with_active_graph`/`with_default_graph` keep the same store,
+            // so they share BOTH caches.)
+            r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }

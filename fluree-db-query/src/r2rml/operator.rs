@@ -3373,6 +3373,44 @@ mod tests {
             );
         }
 
+        // F19 residual fix: a correlated inner join rebuilt across a `with_graph_ref`
+        // boundary (SERVICE / multi-source default R2RML) must ALSO keep the memo.
+        // `with_graph_ref` switches store, so it re-creates `const_sid_cache` fresh —
+        // but the parent-memo key is store-disambiguated (graph_source_id + as_of_t),
+        // so it now CLONES the memo Arc. Deriving the ctx per rebuild via
+        // `with_graph_ref` therefore scans the DIM parent ONCE, not once per rebuild.
+        // (Before the fix, `with_graph_ref` used `R2rmlParentMemo::default()` and this
+        // asserted 5 — the `with_active_graph`-only coverage missed this path.)
+        #[test]
+        fn parent_memo_survives_with_graph_ref_rebuild() {
+            use crate::dataset::GraphRef;
+            let mapping = mapping();
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let vars = VarRegistry::new();
+            let no_overlay = fluree_db_core::NoOverlay;
+            let graph = GraphRef::new(&snapshot, 0, &no_overlay, snapshot.t, "test/main");
+            let provider = CountingProvider::default();
+            {
+                let mut base = ExecutionContext::new(&snapshot, &vars);
+                base.r2rml_table_provider = Some(&provider);
+                for _ in 0..5 {
+                    let gctx = base.with_graph_ref(&graph);
+                    build_once(&gctx, &mapping, "gs:main");
+                }
+            }
+            assert_eq!(
+                provider
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .get("customers")
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "with_graph_ref shares the parent memo: parent scanned once across 5 rebuilds"
+            );
+        }
+
         // A query-scoped memo shared across R2RML operators must NOT cross-pollute
         // two graph sources holding a same-named parent table: the key carries
         // `graph_source_id`, so `gs:A` and `gs:B` each scan `customers` once.
