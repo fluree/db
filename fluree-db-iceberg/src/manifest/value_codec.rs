@@ -714,5 +714,13 @@ mod tests {
         // gt/ge delegate through le/lt.
         assert_eq!(d(20000, 3).gt(&d(999, 2)), Some(true));
         assert_eq!(d(999, 2).ge(&d(9990, 3)), Some(true));
+        // Negative scale: a round literal normalized via `normalized()` becomes
+        // (unscaled 1, scale -6) = 1_000_000. decimal_cmp rescales to the max scale
+        // keeping exponents >= 0, so a negative-scale operand still compares exactly
+        // against a positive-scale one (#1494 review — the last untested arm).
+        assert_eq!(d(1, -6).lt(&d(999_999_999, 3)), Some(false)); // 1_000_000 !< 999_999.999
+        assert_eq!(d(999_999_999, 3).lt(&d(1, -6)), Some(true)); // 999_999.999 < 1_000_000
+        assert_eq!(d(1, -6).le(&d(1_000_000_000, 3)), Some(true)); // 1_000_000 == 1_000_000.000
+        assert_eq!(d(1, -6).ge(&d(1_000_000_000, 3)), Some(true));
     }
 }
