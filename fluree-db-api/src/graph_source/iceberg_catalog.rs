@@ -651,10 +651,10 @@ pub async fn preview_iceberg_table(
                         send_read_snapshot_data_files(&storage, snapshot)
                             .await
                             .map_err(|e| {
-                                crate::ApiError::config(format!(
-                                    "Failed to read manifests for {}: {e}",
-                                    table.qualified()
-                                ))
+                                storage_api_error(
+                                    &format!("Failed to read manifests for {}", table.qualified()),
+                                    e,
+                                )
                             })?;
 
                     let agg = aggregate_column_stats(&data_files, iceberg_schema);
@@ -710,30 +710,152 @@ pub async fn preview_iceberg_table(
     }
 }
 
+/// Lift an [`IcebergError`](fluree_db_iceberg::IcebergError) raised at a
+/// **storage-read** site into a [`QueryError`](fluree_db_query::QueryError),
+/// preserving the typed access-denied case.
+///
+/// [`StorageAccessDenied`](fluree_db_iceberg::IcebergError::StorageAccessDenied)
+/// becomes `QueryError::StorageAccessDenied` (→ HTTP 403); every other variant
+/// becomes `QueryError::Internal("{context}: {err}")`, byte-for-byte the
+/// pre-existing wrapping. Use ONLY at storage-read sites (metadata / manifest /
+/// Parquet / resolve-from-table-location) — client-construction failures stay
+/// `Internal`.
+pub(crate) fn storage_query_error(
+    context: &str,
+    err: fluree_db_iceberg::IcebergError,
+) -> fluree_db_query::QueryError {
+    match err {
+        fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        } => fluree_db_query::QueryError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        },
+        other => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
+    }
+}
+
+/// Preview/browse-path analogue of [`storage_query_error`]: lift a
+/// storage-read [`IcebergError`](fluree_db_iceberg::IcebergError) into an
+/// [`ApiError`](crate::ApiError). The access-denied case becomes
+/// `ApiError::StorageAccessDenied` (→ HTTP 403); everything else becomes
+/// `ApiError::config("{context}: {err}")`, matching the pre-existing preview
+/// wrapping.
+pub(crate) fn storage_api_error(
+    context: &str,
+    err: fluree_db_iceberg::IcebergError,
+) -> crate::ApiError {
+    match err {
+        fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        } => crate::ApiError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        },
+        other => crate::ApiError::config(format!("{context}: {other}")),
+    }
+}
+
+/// Which credential source a scan/preview should use, given the source's
+/// `vended_credentials` flag, whether the catalog actually vended credentials,
+/// and whether this is a REST catalog. See [`decide_credential_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    /// Use the catalog-vended credentials (they are present).
+    Vended,
+    /// Use the ambient AWS credential chain (explicit `vended_credentials =
+    /// false` opt-in, or Direct mode which never vends).
+    Ambient,
+    /// Refuse: the REST source requires vending but the catalog vended none.
+    FailClosed,
+}
+
+/// §2 credential-source decision — the single source of truth for the scan and
+/// preview paths, factored out so the full matrix is unit-testable.
+///
+/// | `vended_credentials` | vended creds present | REST | decision |
+/// |----------------------|----------------------|------|----------|
+/// | any                  | yes                  | any  | `Vended` (response-driven) |
+/// | true                 | no                   | yes  | `FailClosed` |
+/// | true                 | no                   | no (Direct) | `Ambient` (Direct never vends) |
+/// | false                | no                   | any  | `Ambient` (explicit opt-in) |
+///
+/// The `(false, present)` case stays `Vended` to preserve today's
+/// response-driven behavior: `vended_credentials = false` suppresses the
+/// delegation request, so credentials should not arrive — but if a catalog vends
+/// them anyway, using them (rather than ignoring them) matches prior behavior.
+pub(crate) fn decide_credential_source(
+    vended_credentials_cfg: bool,
+    has_vended_creds: bool,
+    is_rest_catalog: bool,
+) -> CredentialSource {
+    if has_vended_creds {
+        CredentialSource::Vended
+    } else if vended_credentials_cfg && is_rest_catalog {
+        CredentialSource::FailClosed
+    } else {
+        CredentialSource::Ambient
+    }
+}
+
 /// Build S3 storage for reading manifests during a Tier-B preview, mirroring the
-/// scan path's policy: vended credentials when the catalog delegated them,
-/// otherwise the ambient AWS credential chain.
+/// scan path's policy via [`decide_credential_source`]: vended credentials when
+/// the catalog delegated them, otherwise — for `vended_credentials = false` or
+/// Direct mode — the ambient AWS credential chain.
+///
+/// §2 fail-closed: a REST source configured to require vended credentials
+/// (`io.vended_credentials = true`, the default) must NOT silently downgrade to
+/// ambient credentials when the catalog vended none — that would read from
+/// whatever ambient identity the process happens to have. Direct mode never
+/// vends (it sends no delegation request), so it is exempt.
 pub(crate) async fn build_preview_storage(
     conn: &IcebergConnectionConfig,
     credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
 ) -> Result<S3IcebergStorage> {
     let io = &conn.io;
-    let storage = if let Some(creds) = credentials {
-        S3IcebergStorage::from_vended_credentials(
-            creds,
-            io.s3_region.as_deref(),
-            io.s3_endpoint.as_deref(),
-            io.s3_path_style,
-        )
-        .await
-    } else {
-        S3IcebergStorage::from_default_chain(
-            io.s3_region.as_deref(),
-            io.s3_endpoint.as_deref(),
-            io.s3_path_style,
-        )
-        .await
-    };
+    let is_rest = matches!(conn.catalog_mode, CatalogMode::Rest(_));
+    let storage =
+        match decide_credential_source(io.vended_credentials, credentials.is_some(), is_rest) {
+            CredentialSource::Vended => {
+                let creds = credentials.expect("Vended decision implies credentials are present");
+                S3IcebergStorage::from_vended_credentials(
+                    creds,
+                    io.s3_region.as_deref(),
+                    io.s3_endpoint.as_deref(),
+                    io.s3_path_style,
+                )
+                .await
+            }
+            CredentialSource::Ambient => {
+                S3IcebergStorage::from_default_chain(
+                    io.s3_region.as_deref(),
+                    io.s3_endpoint.as_deref(),
+                    io.s3_path_style,
+                )
+                .await
+            }
+            CredentialSource::FailClosed => {
+                // FailClosed only arises for a REST catalog (see the decision table),
+                // so this destructure always matches.
+                let catalog_uri = match &conn.catalog_mode {
+                    CatalogMode::Rest(rest) => rest.catalog_uri.clone(),
+                    CatalogMode::Direct { .. } => {
+                        unreachable!("FailClosed is only produced for REST catalogs")
+                    }
+                };
+                return Err(crate::ApiError::CatalogCredentialsNotVended { catalog_uri });
+            }
+        };
     storage.map_err(|e| crate::ApiError::config(format!("Failed to create S3 storage: {e}")))
 }
 
@@ -769,6 +891,55 @@ impl crate::Fluree {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── §2 credential-source decision (pure; the full matrix) ──
+
+    #[test]
+    fn creds_present_always_vended() {
+        // Response-driven: if the catalog vended credentials, use them —
+        // regardless of the flag or catalog kind.
+        for &cfg in &[true, false] {
+            for &rest in &[true, false] {
+                assert_eq!(
+                    decide_credential_source(cfg, true, rest),
+                    CredentialSource::Vended,
+                    "cfg={cfg} rest={rest}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rest_requires_vending_fails_closed_when_none() {
+        // vended_credentials = true (default) + REST + no creds → refuse.
+        assert_eq!(
+            decide_credential_source(true, false, true),
+            CredentialSource::FailClosed
+        );
+    }
+
+    #[test]
+    fn direct_mode_never_fails_closed() {
+        // Direct never vends; vended_credentials = true must NOT start failing —
+        // it uses the ambient chain (item 8).
+        assert_eq!(
+            decide_credential_source(true, false, false),
+            CredentialSource::Ambient
+        );
+    }
+
+    #[test]
+    fn explicit_opt_in_uses_ambient() {
+        // vended_credentials = false + no creds → ambient (both catalog kinds).
+        assert_eq!(
+            decide_credential_source(false, false, true),
+            CredentialSource::Ambient
+        );
+        assert_eq!(
+            decide_credential_source(false, false, false),
+            CredentialSource::Ambient
+        );
+    }
 
     #[tokio::test]
     async fn browse_direct_mode_errors() {

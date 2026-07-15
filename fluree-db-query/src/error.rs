@@ -69,6 +69,44 @@ pub enum QueryError {
         reason: fluree_db_core::QueryCancellationReason,
     },
 
+    /// Object storage denied a read of an external table's data (S3 403 /
+    /// `AccessDenied`).
+    ///
+    /// Kept iceberg-agnostic (plain fields, no crate dependency): the API layer
+    /// lifts `IcebergError::StorageAccessDenied` into this so the server can
+    /// surface HTTP 403 instead of a generic 400/500. Because S3 also returns
+    /// `AccessDenied` for a missing object without `s3:ListBucket`, this means
+    /// the credentials lack access **or** the object was moved/removed.
+    #[error(
+        "Storage access denied for s3://{bucket}/{key}{region_suffix}: {message}",
+        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
+    )]
+    StorageAccessDenied {
+        /// Bucket parsed from the object path.
+        bucket: String,
+        /// Object key parsed from the object path.
+        key: String,
+        /// Configured/resolved region, if known.
+        region: Option<String>,
+        /// The underlying storage error detail.
+        message: String,
+    },
+
+    /// The catalog authorized the table but vended no storage credentials while
+    /// the source requires them (`vended_credentials = true`).
+    ///
+    /// Fail-closed: the scan is refused rather than silently downgrading to
+    /// ambient (process-default) AWS credentials.
+    #[error(
+        "Catalog {catalog_uri} authorized the table but vended no storage credentials; \
+         either fix the catalog's credential vending or set vended_credentials=false on \
+         the source to explicitly use ambient AWS credentials"
+    )]
+    CatalogCredentialsNotVended {
+        /// The REST catalog URI that authorized the table.
+        catalog_uri: String,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),
@@ -191,5 +229,43 @@ mod tests {
             !QueryError::dictionary_lookup("missing string id".to_string())
                 .demotes_to_unbound_in_extend()
         );
+    }
+
+    #[test]
+    fn storage_access_denied_display_names_object_and_region() {
+        let e = QueryError::StorageAccessDenied {
+            bucket: "b".to_string(),
+            key: "warehouse/t/data/f.parquet".to_string(),
+            region: Some("us-east-2".to_string()),
+            message: "service error: AccessDenied".to_string(),
+        };
+        let shown = e.to_string();
+        assert!(
+            shown.contains("s3://b/warehouse/t/data/f.parquet"),
+            "{shown}"
+        );
+        assert!(shown.contains("region us-east-2"), "{shown}");
+
+        // Region is omitted cleanly when unknown.
+        let no_region = QueryError::StorageAccessDenied {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            region: None,
+            message: "m".to_string(),
+        };
+        assert_eq!(
+            no_region.to_string(),
+            "Storage access denied for s3://b/k: m"
+        );
+    }
+
+    #[test]
+    fn catalog_credentials_not_vended_display_is_actionable() {
+        let e = QueryError::CatalogCredentialsNotVended {
+            catalog_uri: "https://catalog.example/v1".to_string(),
+        };
+        let shown = e.to_string();
+        assert!(shown.contains("https://catalog.example/v1"), "{shown}");
+        assert!(shown.contains("vended_credentials=false"), "{shown}");
     }
 }

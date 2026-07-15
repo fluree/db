@@ -29,6 +29,30 @@ pub enum IcebergError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    /// Object storage denied a read (S3 403 / `AccessDenied`).
+    ///
+    /// Structured so callers can surface a 403 (rather than a generic 400/500)
+    /// and name the exact object. AWS returns `AccessDenied` both for a genuine
+    /// permission failure and — when the caller lacks `s3:ListBucket` — for a
+    /// missing object (S3 cannot reveal 404 vs 403 without list permission), so
+    /// this means the credentials lack access **or** the object was moved/removed.
+    #[error(
+        "S3 access denied reading s3://{bucket}/{key}{region_suffix}: {message}. \
+         The credentials lack permission for this object, or — without s3:ListBucket — \
+         the object no longer exists (a missing object also surfaces as AccessDenied).",
+        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
+    )]
+    StorageAccessDenied {
+        /// Bucket parsed from the `s3://`/`gs://` path.
+        bucket: String,
+        /// Object key parsed from the path.
+        key: String,
+        /// Configured/resolved region, if known.
+        region: Option<String>,
+        /// The underlying SDK error chain (status, request id, etc.).
+        message: String,
+    },
+
     /// Snapshot not found
     #[error("Snapshot not found: {0}")]
     SnapshotNotFound(String),
@@ -101,6 +125,11 @@ impl From<IcebergError> for fluree_db_core::error::Error {
         match &err {
             IcebergError::TableNotFound(msg) => fluree_db_core::error::Error::not_found(msg),
             IcebergError::Storage(msg) => fluree_db_core::error::Error::storage(msg),
+            // Access-denied is still a storage-read failure at the core layer
+            // (core has no unauthorized variant); the full message is preserved.
+            IcebergError::StorageAccessDenied { .. } => {
+                fluree_db_core::error::Error::storage(err.to_string())
+            }
             // Auth and other errors map to generic "other" since core doesn't have unauthorized
             _ => fluree_db_core::error::Error::other(err.to_string()),
         }

@@ -8,6 +8,9 @@
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
+use crate::graph_source::iceberg_catalog::{
+    decide_credential_source, storage_query_error, CredentialSource,
+};
 use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
@@ -1074,9 +1077,10 @@ impl FlureeR2rmlProvider<'_> {
                     ))
                     .await
                     .map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read manifests for row count of '{table_name}': {e}"
-                        ))
+                        storage_query_error(
+                            &format!("Failed to read manifests for row count of '{table_name}'"),
+                            e,
+                        )
                     })?;
             catalog_cache.put_count_stats(&metadata_location, &data_files, has_delete_manifests);
             (data_files, has_delete_manifests)
@@ -1442,6 +1446,32 @@ impl FlureeR2rmlProvider<'_> {
                     resp
                 };
 
+                // §2 fail-closed: the source is configured to require
+                // catalog-vended storage credentials (io.vended_credentials =
+                // true, the default), but the loadTable response carried none. Do
+                // NOT silently downgrade to ambient AWS credentials — a BYO-IAM
+                // misconfiguration (or a catalog that stopped vending) must
+                // surface as an actionable error, not read from whatever ambient
+                // identity the process happens to have. `vended_credentials =
+                // false` is the explicit opt-in to ambient (the else-branch
+                // below), and Direct mode never reaches here (`is_rest = true`).
+                // This holds on cache hits too: the loadTable caches preserve
+                // `credentials` verbatim and only ever MISS-and-reload on expiry,
+                // so a resolved `credentials == None` always means the catalog
+                // genuinely vended nothing (never a dropped-credential
+                // reconstruction). The Vended/Ambient split is left to the
+                // `if let Some(..)` construction below.
+                if decide_credential_source(
+                    iceberg_config.io.vended_credentials,
+                    load_response.credentials.is_some(),
+                    true,
+                ) == CredentialSource::FailClosed
+                {
+                    return Err(QueryError::CatalogCredentialsNotVended {
+                        catalog_uri: uri.clone(),
+                    });
+                }
+
                 // GCS-backed tables (S3-interop endpoint) are read through this
                 // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
                 // GCS HTTP/2 range-read bug cannot occur.
@@ -1548,9 +1578,12 @@ impl FlureeR2rmlProvider<'_> {
                             .load_table(&table_id, false)
                             .await
                             .map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to resolve table metadata from {table_location}: {e}"
-                                ))
+                                storage_query_error(
+                                    &format!(
+                                        "Failed to resolve table metadata from {table_location}"
+                                    ),
+                                    e,
+                                )
                             })?;
                     cache
                         .put_direct_metadata_location(
@@ -1706,7 +1739,7 @@ impl FlureeR2rmlProvider<'_> {
             let plan = planner
                 .plan_scan()
                 .await
-                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
             (
                 plan.tasks,
                 plan.files_selected,
@@ -1782,7 +1815,7 @@ impl FlureeR2rmlProvider<'_> {
             let plan = planner
                 .plan_scan()
                 .await
-                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
 
             let cached = Arc::new(CachedScanFiles {
                 data_files: Arc::new(
@@ -1881,10 +1914,13 @@ impl FlureeR2rmlProvider<'_> {
                     .instrument(read_span)
                     .await
                     .map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read Parquet file '{}': {e}",
-                            tasks[orig].data_file.file_path
-                        ))
+                        storage_query_error(
+                            &format!(
+                                "Failed to read Parquet file '{}'",
+                                tasks[orig].data_file.file_path
+                            ),
+                            e,
+                        )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
                     // rows this scan EMITS — which are the QUALIFYING result rows
@@ -1959,10 +1995,13 @@ impl FlureeR2rmlProvider<'_> {
                                     );
                                     reader.read_task(&task).instrument(read_span).await.map_err(
                                         |e| {
-                                            QueryError::Internal(format!(
-                                                "Failed to read Parquet file '{}': {e}",
-                                                task.data_file.file_path
-                                            ))
+                                            storage_query_error(
+                                                &format!(
+                                                    "Failed to read Parquet file '{}'",
+                                                    task.data_file.file_path
+                                                ),
+                                                e,
+                                            )
                                         },
                                     )
                                 })
@@ -2020,10 +2059,13 @@ impl FlureeR2rmlProvider<'_> {
                             .instrument(read_span)
                             .await
                             .map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to read Parquet file '{}': {e}",
-                                    task.data_file.file_path
-                                ))
+                                storage_query_error(
+                                    &format!(
+                                        "Failed to read Parquet file '{}'",
+                                        task.data_file.file_path
+                                    ),
+                                    e,
+                                )
                             })
                     })
                     .await
@@ -2174,7 +2216,7 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
             let metadata_bytes = storage
                 .read(metadata_location)
                 .await
-                .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
+                .map_err(|e| storage_query_error("Failed to read table metadata", e))?;
             let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
                 QueryError::Internal(format!("Failed to parse table metadata: {e}"))
             })?;

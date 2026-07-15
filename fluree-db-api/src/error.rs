@@ -240,6 +240,45 @@ pub enum ApiError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// Object storage denied a read of an external table's data (S3 403 /
+    /// `AccessDenied`), on the preview/browse path.
+    ///
+    /// Surfaced as HTTP 403 (not the generic 400/500) so the caller can tell a
+    /// permission problem from a bad query. Because S3 also returns
+    /// `AccessDenied` for a missing object without `s3:ListBucket`, this means
+    /// the credentials lack access **or** the object was moved/removed. The scan
+    /// path produces the equivalent [`fluree_db_query::QueryError::StorageAccessDenied`]
+    /// (wrapped here via [`ApiError::Query`]); both map to the same server code.
+    #[error(
+        "Storage access denied for s3://{bucket}/{key}{region_suffix}: {message}",
+        region_suffix = .region.as_deref().map(|r| format!(" (region {r})")).unwrap_or_default()
+    )]
+    StorageAccessDenied {
+        /// Bucket parsed from the object path.
+        bucket: String,
+        /// Object key parsed from the object path.
+        key: String,
+        /// Configured/resolved region, if known.
+        region: Option<String>,
+        /// The underlying storage error detail.
+        message: String,
+    },
+
+    /// The catalog authorized the table but vended no storage credentials while
+    /// the source requires them (`vended_credentials = true`).
+    ///
+    /// Fail-closed on the preview/browse path: refused rather than silently
+    /// downgrading to ambient (process-default) AWS credentials.
+    #[error(
+        "Catalog {catalog_uri} authorized the table but vended no storage credentials; \
+         either fix the catalog's credential vending or set vended_credentials=false on \
+         the source to explicitly use ambient AWS credentials"
+    )]
+    CatalogCredentialsNotVended {
+        /// The REST catalog URI that authorized the table.
+        catalog_uri: String,
+    },
+
     /// HTTP error with explicit status code
     ///
     /// Used when the error source already has a known HTTP status (e.g., TrackedErrorResponse
@@ -418,6 +457,16 @@ impl ApiError {
             // Builder validation errors
             ApiError::Builder(_) => 400,
             ApiError::Query(fluree_db_query::QueryError::Cancelled { .. }) => 408,
+            // Storage-permission / fail-closed errors are 403 (Forbidden),
+            // whether raised directly (preview path) or wrapped from the query
+            // engine (scan path). These arms MUST precede the generic
+            // `ApiError::Query(_) => 400` below.
+            ApiError::StorageAccessDenied { .. }
+            | ApiError::CatalogCredentialsNotVended { .. }
+            | ApiError::Query(
+                fluree_db_query::QueryError::StorageAccessDenied { .. }
+                | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
+            ) => 403,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)
@@ -463,3 +512,59 @@ impl ApiError {
 
 /// Result type alias for API operations
 pub type Result<T> = std::result::Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_permission_errors_are_403() {
+        // Direct (preview path) and query-wrapped (scan path) both → 403, and
+        // the query-wrapped ones must NOT fall through to the generic
+        // `ApiError::Query(_) => 400`.
+        assert_eq!(
+            ApiError::StorageAccessDenied {
+                bucket: "b".into(),
+                key: "k".into(),
+                region: None,
+                message: "m".into(),
+            }
+            .status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::CatalogCredentialsNotVended {
+                catalog_uri: "https://c/v1".into(),
+            }
+            .status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::StorageAccessDenied {
+                bucket: "b".into(),
+                key: "k".into(),
+                region: Some("us-east-2".into()),
+                message: "m".into(),
+            })
+            .status_code(),
+            403
+        );
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::CatalogCredentialsNotVended {
+                catalog_uri: "https://c/v1".into(),
+            })
+            .status_code(),
+            403
+        );
+    }
+
+    #[test]
+    fn generic_query_error_still_400() {
+        // Guard against the new 403 arms accidentally swallowing other query
+        // errors.
+        assert_eq!(
+            ApiError::Query(fluree_db_query::QueryError::InvalidQuery("bad".into())).status_code(),
+            400
+        );
+    }
+}
