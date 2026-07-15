@@ -5,13 +5,13 @@
 //!
 //! This module is only available with the `iceberg` feature.
 
+use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
 use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
-use super::lazy_storage::LazyS3Storage;
 use fluree_db_iceberg::error::IcebergError;
 use fluree_db_iceberg::{
     catalog::{
@@ -921,8 +921,11 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 ///
 /// Takes OWNED handles (Arcs + owned config) so it can be called BOTH eagerly and
 /// from the deferred [`LazyS3Storage`] builder — which must be `'static`, because
-/// the Parquet reads `Arc::clone` the storage into `tokio::spawn` and the provider
-/// holds `fluree: &'a` (a borrow that cannot cross the spawn). This runs ONLY when
+/// the Parquet reads `Arc::clone` the storage into `tokio::spawn` (in
+/// `fluree-db-iceberg/src/io/send_parquet.rs`) and the provider holds `fluree: &'a`
+/// (a borrow that cannot cross the spawn). A future refactor that narrows this back
+/// to `&'a` will not fail here — it surfaces as a `'static`-bound lifetime error at
+/// that spawn site, so the ownership is load-bearing, not incidental. This runs ONLY when
 /// a real S3 read is needed: its `r2rml.load_table` span, and the REST client's
 /// first-use OAuth token exchange, are exactly what the deterministic cache gate
 /// proves absent (`load_table.n=0` AND `oauth_token.n=0`) on a fully disk-cached
@@ -1219,7 +1222,10 @@ impl FlureeR2rmlProvider<'_> {
         );
         let disk = self.catalog_disk_cache();
         if let CatalogConfig::Rest {
-            uri, warehouse, auth, ..
+            uri,
+            warehouse,
+            auth,
+            ..
         } = &iceberg_config.catalog
         {
             // A snapshot pin from an EARLIER touch of this table THIS query wins

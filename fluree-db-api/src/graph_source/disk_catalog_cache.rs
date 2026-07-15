@@ -601,7 +601,12 @@ mod tests {
         assert!(pointer_is_usable(&p, 1_100_000, ttl_ms, Some(50)));
         // Rider is checked AND-wise with freshness: newer-request on a stale entry
         // is still a miss.
-        assert!(!pointer_is_usable(&p, 1_000_000 + ttl_ms + 1, ttl_ms, Some(50)));
+        assert!(!pointer_is_usable(
+            &p,
+            1_000_000 + ttl_ms + 1,
+            ttl_ms,
+            Some(50)
+        ));
     }
 
     #[test]

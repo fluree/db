@@ -71,7 +71,10 @@ type LookupCacheKey = (String, Vec<String>);
 /// operators in a query, so the key MUST carry `graph_source_id` (two sources can
 /// hold a same-named table — no cross-source pollution) and `as_of_t` (cheap
 /// insurance: the per-query snapshot pin should keep it constant, but a
-/// query-wide share must not alias two snapshots).
+/// query-wide share must not alias two snapshots). This is also what makes the F19
+/// `with_graph_ref` memo-share sound: a referenced graph shares the one memo Arc,
+/// but its parent lookups stay keyed under its own `graph_source_id` — so removing
+/// that component would silently merge two stores' lookups (see `context.rs`).
 pub type R2rmlParentMemoKey = (String, String, Vec<String>, Option<i64>);
 
 /// The query-scoped parent-lookup memo (PR-8b). Extends PR-4's per-operator

@@ -166,7 +166,11 @@ mod tests {
             })
         }));
         assert!(!lazy.is_forced());
-        assert_eq!(builds.load(Ordering::SeqCst), 0, "no read ⇒ no build ⇒ no GET");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            0,
+            "no read ⇒ no build ⇒ no GET"
+        );
     }
 
     // The lead's expectation (b): N Parquet reads racing to force dedup to ONE
@@ -189,9 +193,17 @@ mod tests {
         // needed; join_all polls them concurrently so they race the OnceCell).
         let futs = (0..16).map(|_| lazy.read("s3://b/f.parquet"));
         let results = futures::future::join_all(futs).await;
-        assert!(results.iter().all(|res| res.is_ok()), "every read resolves");
-        assert_eq!(builds.load(Ordering::SeqCst), 1, "concurrent forces dedup to ONE build");
-        assert_eq!(reads.load(Ordering::SeqCst), 16, "all 16 reads reach the backend");
+        assert!(results.iter().all(Result::is_ok), "every read resolves");
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "concurrent forces dedup to ONE build"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            16,
+            "all 16 reads reach the backend"
+        );
         assert!(lazy.is_forced());
     }
 
@@ -208,9 +220,13 @@ mod tests {
         }));
         let err = lazy.read("s3://b/f").await.unwrap_err();
         assert!(
-            err.to_string().contains("Failed to load table from catalog"),
+            err.to_string()
+                .contains("Failed to load table from catalog"),
             "the eager path's cause is preserved: {err}"
         );
-        assert!(!lazy.is_forced(), "a failed build leaves the cell empty for a retry");
+        assert!(
+            !lazy.is_forced(),
+            "a failed build leaves the cell empty for a retry"
+        );
     }
 }
