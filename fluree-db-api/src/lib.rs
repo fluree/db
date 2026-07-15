@@ -154,7 +154,7 @@ pub use import::{
     EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
     ImportSummary, RemoteSource,
 };
-pub use ledger_info::LedgerInfoBuilder;
+pub use ledger_info::{redact_graph_source_config, LedgerInfoBuilder};
 pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,

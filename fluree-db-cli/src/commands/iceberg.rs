@@ -566,13 +566,15 @@ fn print_remote_graph_source_info(info: &serde_json::Value) {
             println!("Dependencies:   {}", dep_strs.join(", "));
         }
     }
+    // Defense-in-depth: the server already redacts this config field, but an
+    // older server (version skew) may not — redaction is idempotent, so passing
+    // an already-redacted config through again is a no-op (issue #1497).
     if let Some(config) = info.get("config") {
-        println!();
-        println!("Configuration:");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(config).unwrap_or_default()
-        );
+        if let Some(config_block) = redact_config_pretty(&config.to_string()) {
+            println!();
+            println!("Configuration:");
+            println!("{config_block}");
+        }
     }
 }
 
@@ -596,16 +598,36 @@ fn print_graph_source_info(gs: &fluree_db_nameservice::GraphSourceRecord) {
         println!("Dependencies:   {}", gs.dependencies.join(", "));
     }
 
-    if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&gs.config) {
-            println!();
-            println!("Configuration:");
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| gs.config.clone())
-            );
-        }
+    // The stored config holds live catalog credentials (e.g. a Snowflake PAT
+    // under `catalog.auth.client_secret`); LOCAL mode reads it verbatim, so it
+    // MUST be redacted before display — issue #1497.
+    if let Some(config_block) = redact_config_pretty(&gs.config) {
+        println!();
+        println!("Configuration:");
+        println!("{config_block}");
     }
+}
+
+/// Redact secret leaves from a graph-source config JSON string and pretty-print
+/// it for display, or `None` when there is nothing worth showing (empty / `{}` /
+/// not JSON — the last preserving the prior "skip unparseable config" behavior).
+///
+/// Routes through [`fluree_db_api::redact_graph_source_config`]: allowlist
+/// redaction that FAILS CLOSED (non-JSON input becomes a placeholder, never the
+/// raw bytes). This is the single guard that keeps a stored `client_secret`/PAT
+/// off the terminal for both local records and remote responses (issue #1497).
+/// Redaction is idempotent, so a server response that was already redacted
+/// server-side is displayed unchanged. See the canary test
+/// `test_redact_graph_source_config_fails_closed_on_non_json` in `fluree-db-api`.
+fn redact_config_pretty(config: &str) -> Option<String> {
+    if config.is_empty() || config == "{}" {
+        return None;
+    }
+    // Preserve the prior gate: only render configs that parse as JSON.
+    serde_json::from_str::<serde_json::Value>(config).ok()?;
+    let redacted = fluree_db_api::redact_graph_source_config(config);
+    let parsed = serde_json::from_str::<serde_json::Value>(&redacted).ok()?;
+    Some(serde_json::to_string_pretty(&parsed).unwrap_or(redacted))
 }
 
 // =============================================================================
@@ -948,5 +970,47 @@ mod tests {
         args.r2rml_type = Some("application/ld+json".to_string());
         let body = args_to_json(&args).unwrap();
         assert_eq!(body["r2rml_type"], "application/ld+json");
+    }
+
+    // A stored Iceberg config carrying a live PAT under
+    // `catalog.auth.client_secret`, mirroring the local record shape that
+    // `fluree iceberg info` reads verbatim.
+    const CONFIG_WITH_SECRET: &str = r#"{"catalog":{"type":"rest","uri":"https://polaris.example.com","auth":{"type":"oauth2_client_credentials","client_id":"svc-client","client_secret":"SUPER-SECRET-PAT","scope":"PRINCIPAL_ROLE:ALL"}}}"#;
+
+    #[test]
+    fn redact_config_pretty_masks_secret_keeps_identifiers() {
+        let out = redact_config_pretty(CONFIG_WITH_SECRET).expect("config should render");
+        // The live secret must NOT reach the terminal (issue #1497)...
+        assert!(!out.contains("SUPER-SECRET-PAT"), "secret leaked: {out}");
+        assert!(out.contains("[redacted]"), "expected placeholder: {out}");
+        // ...while non-secret identifiers are preserved for debugging.
+        assert!(out.contains("svc-client"), "client_id dropped: {out}");
+        assert!(
+            out.contains("https://polaris.example.com"),
+            "catalog uri dropped: {out}"
+        );
+        // Output stays pretty-printed (multi-line), matching prior formatting.
+        assert!(out.contains('\n'), "expected pretty JSON: {out}");
+    }
+
+    #[test]
+    fn redact_config_pretty_skips_empty_and_non_json() {
+        assert!(redact_config_pretty("").is_none());
+        assert!(redact_config_pretty("{}").is_none());
+        // Non-JSON is gated out (skip), preserving prior CLI behavior.
+        assert!(redact_config_pretty("client_secret=not-json").is_none());
+    }
+
+    #[test]
+    fn redact_config_pretty_is_idempotent() {
+        let once = redact_config_pretty(CONFIG_WITH_SECRET).expect("first pass");
+        // Feed a compact re-serialization of the redacted output back through.
+        let compact =
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&once).unwrap())
+                .unwrap();
+        let twice = redact_config_pretty(&compact).expect("second pass");
+        assert!(!twice.contains("SUPER-SECRET-PAT"));
+        assert!(twice.contains("svc-client"));
+        assert_eq!(once, twice, "redaction must be idempotent");
     }
 }
