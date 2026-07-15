@@ -88,10 +88,13 @@ pub trait Operator: Send + Sync {
     ///
     /// **Default = ABSORB** (no-op). An operator forwards a budget to its
     /// children only by explicitly overriding this, and only when it is
-    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`.
-    /// Row-dropping / reordering / materializing operators (`Bind`, `Filter`,
-    /// `Sort`, `Distinct`, `GroupAggregate`, hash-join build) absorb, so a
-    /// budget never leaks past a boundary where it would be unsound.
+    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`,
+    /// and (switch-gated, F17) `Bind` (1:1, order-preserving) and `Union`
+    /// (to *each* branch — a single branch may supply all `budget` rows, so
+    /// the whole budget is forwarded, not split). Row-dropping / reordering /
+    /// materializing operators (`Filter`, `Sort`, `Distinct`, `GroupAggregate`,
+    /// hash-join build) absorb, so a budget never leaks past a boundary where
+    /// it would be unsound.
     ///
     /// Set **before** `open()`. Consult only at batch/leaflet boundaries —
     /// never inside fused per-row/per-group loops (hot-loop purity).

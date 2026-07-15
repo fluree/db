@@ -60,6 +60,11 @@ pub struct UnionOperator {
     output_rows_emitted: usize,
     max_emitted_batch_len: usize,
     pending_output_rows: usize,
+    /// F17: advisory row budget from a top-of-tree `LIMIT`, forwarded to *each*
+    /// branch operator tree (any single branch may supply all `budget` rows, so
+    /// the whole budget is passed, not split). Set before `open()` via
+    /// `set_row_budget`; `None` = unbudgeted (full branch drain).
+    row_budget: Option<usize>,
 }
 
 impl UnionOperator {
@@ -113,6 +118,7 @@ impl UnionOperator {
             output_rows_emitted: 0,
             max_emitted_batch_len: 0,
             pending_output_rows: 0,
+            row_budget: None,
         }
     }
 
@@ -217,6 +223,16 @@ impl Operator for UnionOperator {
         &self.effective_schema
     }
 
+    fn set_row_budget(&mut self, budget: usize) {
+        // F17: forward the LIMIT budget to each branch (applied per branch build
+        // in `next_batch`). Sound because the consuming LIMIT truncates the
+        // branch concatenation to `budget`, so a branch stopping at `budget` rows
+        // can never drop a row the LIMIT would keep. Switch-gated for OFF-parity.
+        if crate::r2rml::union_budget_enabled() {
+            self.row_budget = Some(budget);
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
@@ -307,6 +323,13 @@ impl Operator for UnionOperator {
                     &self.planning,
                 )?;
 
+                // F17: give each freshly-built branch tree the LIMIT budget so
+                // its scan caps its materialize window at `budget` rows instead
+                // of draining the whole table. Re-applied per branch (each branch
+                // independently gets the full budget); no cross-branch decrement.
+                if let Some(b) = self.row_budget {
+                    branch_op.set_row_budget(b);
+                }
                 branch_op.open(ctx).await?;
                 while let Some(batch) = branch_op.next_batch(ctx).await? {
                     ctx.check_cancelled()?;
@@ -546,5 +569,151 @@ mod tests {
         }
 
         fn close(&mut self) {}
+    }
+
+    // ---- F17: UNION / BIND row-budget forwarding ----
+    //
+    // These cover the forwarding CONTRACT hermetically: BIND forwards a budget to
+    // its child (the reclassification that unblocks q029), and the absorb boundary
+    // (Sort / Distinct receive a budget but do NOT forward it — so an ORDER BY /
+    // DISTINCT above a union means the union is never budgeted and declines for
+    // free). The union stores a forwarded budget and re-applies it per branch.
+    //
+    // The per-branch SCAN early-stop, the real q029 ON==OFF byte-identical result,
+    // and nested-union recursion are covered by the live q029 gate — only the R2RML
+    // scan honors `row_budget`, and union branches are pattern-built with no
+    // hermetic mock-scan injection point, so scan early-stop cannot be observed
+    // without Iceberg.
+
+    struct BudgetRecorder {
+        received: Arc<std::sync::Mutex<Option<usize>>>,
+        schema: Arc<[VarId]>,
+        state: OperatorState,
+    }
+
+    #[async_trait]
+    impl Operator for BudgetRecorder {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            self.state = OperatorState::Open;
+            Ok(())
+        }
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(None)
+        }
+        fn close(&mut self) {
+            self.state = OperatorState::Closed;
+        }
+        fn set_row_budget(&mut self, budget: usize) {
+            *self.received.lock().unwrap() = Some(budget);
+        }
+    }
+
+    fn budget_recorder(received: &Arc<std::sync::Mutex<Option<usize>>>) -> BudgetRecorder {
+        BudgetRecorder {
+            received: Arc::clone(received),
+            schema: Arc::from(vec![VarId(0)].into_boxed_slice()),
+            state: OperatorState::Created,
+        }
+    }
+
+    #[test]
+    fn bind_forwards_row_budget_to_child() {
+        use crate::bind::BindOperator;
+        use crate::ir::expression::Expression;
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let mut bind = BindOperator::new(
+            Box::new(budget_recorder(&received)),
+            VarId(1),
+            Expression::Const(FlakeValue::Long(42)),
+            vec![],
+        );
+        bind.set_row_budget(7);
+        // BIND is 1:1 / order-preserving → forwards the budget to the scan below.
+        assert_eq!(*received.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn sort_absorbs_row_budget() {
+        use crate::sort::{SortOperator, SortSpec};
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let mut sort =
+            SortOperator::new(Box::new(budget_recorder(&received)), vec![SortSpec::asc(VarId(0))]);
+        sort.set_row_budget(7);
+        // ORDER BY must rank every row → absorbs; a union under it is never budgeted.
+        assert_eq!(*received.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn distinct_absorbs_row_budget() {
+        use crate::distinct::DistinctOperator;
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let mut distinct = DistinctOperator::new(Box::new(budget_recorder(&received)));
+        distinct.set_row_budget(7);
+        // DISTINCT may need > k raw rows to yield k unique → absorbs.
+        assert_eq!(*received.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn union_stores_forwarded_row_budget() {
+        let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let child: BoxedOperator = Box::new(TestEmptyWithSchema {
+            schema: child_schema,
+        });
+        let mut op = UnionOperator::new(
+            child,
+            vec![vec![], vec![]],
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(9);
+        // Stored (switch default-on); re-applied to each branch build in next_batch.
+        assert_eq!(op.row_budget, Some(9));
+    }
+
+    #[tokio::test]
+    async fn union_budget_preserves_limit_result() {
+        use crate::limit::LimitOperator;
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // One seed row; branches emit {10,20} and {30} → a 3-row union.
+        let child: BoxedOperator = Box::new(ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![VarId(0)],
+            vec![vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]],
+        ));
+        let branches = vec![
+            vec![Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![
+                    vec![Binding::lit(FlakeValue::Long(10), Sid::new(2, "long"))],
+                    vec![Binding::lit(FlakeValue::Long(20), Sid::new(2, "long"))],
+                ],
+            }],
+            vec![Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(FlakeValue::Long(30), Sid::new(2, "long"))]],
+            }],
+        ];
+        let union = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        // LIMIT 2 forwards budget = 2 into the union (→ each branch build). The
+        // result stays the correct first 2 rows: the F17 forwarding path preserves
+        // correctness (scan early-stop is the live q029 gate).
+        let mut limit = LimitOperator::new(Box::new(union), 2);
+        limit.open(&ctx).await.unwrap();
+        let mut total = 0;
+        while let Some(b) = limit.next_batch(&ctx).await.unwrap() {
+            total += b.len();
+        }
+        assert_eq!(total, 2);
     }
 }

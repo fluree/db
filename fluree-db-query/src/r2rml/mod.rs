@@ -55,6 +55,17 @@ pub(crate) fn env_switch_enabled(name: &str) -> bool {
     }
 }
 
+/// F17: whether `UnionOperator` and `BindOperator` forward a top-of-tree `LIMIT`
+/// row budget down toward the scan (UNION to each branch — a single branch may
+/// supply all `k` rows; BIND straight to its child, being 1:1/order-preserving).
+/// Both forwards are categorically sound; the switch exists for differential
+/// hygiene, so an OFF run is byte-identical to pre-F17. Default on;
+/// `FLUREE_R2RML_UNION_BUDGET=0|false|off|no` disables. Read once (process-wide).
+pub(crate) fn union_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_UNION_BUDGET"))
+}
+
 /// Whether a multi-table query may warm its per-table catalog contexts
 /// (`loadTable` GET + metadata) CONCURRENTLY before the serial scan loop, so the
 /// per-table GETs overlap instead of summing (PR-8 slice 1). Default on;
