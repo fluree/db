@@ -242,9 +242,11 @@ fn print_graph_source_info(gs: &fluree_db_nameservice::GraphSourceRecord) {
 /// it for display, or `None` when there is nothing worth showing (empty / `{}` /
 /// not JSON — the last preserving the prior "skip unparseable config" behavior).
 ///
-/// Routes through [`fluree_db_api::redact_graph_source_config`]: allowlist
-/// redaction that FAILS CLOSED (non-JSON input becomes a placeholder, never the
-/// raw bytes). This is the single guard that keeps a stored `client_secret`/PAT
+/// Routes through [`fluree_db_api::redact_graph_source_config`]: redacts values
+/// under a fixed set of KNOWN secret key names (`SECRET_CONFIG_KEYS` — a
+/// denylist: fields not on it print verbatim, so new secret-bearing config
+/// fields MUST be added there). Unparseable input fails closed to a
+/// placeholder. This is the guard that keeps a stored `client_secret`/PAT
 /// off the terminal for both local records and remote responses (issue #1497).
 /// Redaction is idempotent, so a server response that was already redacted
 /// server-side is displayed unchanged. See the canary test
