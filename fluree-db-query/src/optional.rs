@@ -1506,6 +1506,12 @@ fn r2rml_leaf_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool 
 /// it needs no gate here. `star_constraints` are constant-object existence
 /// filters (no var). EXCLUDES `type_var` (multi-class cartesian — a separate
 /// shape), a wildcard `predicate_var`, and a bound/constant subject.
+/// Admission for the batched-OPTIONAL hash join over an R2RML star. This does NOT
+/// require a base member (`predicate_filter`/`object_var`): any pattern with a
+/// subject var and non-empty `star_bindings` qualifies. Sound because partition
+/// completeness comes from `referenced_vars`, not from the star's shape (#1493
+/// review) — the rewrite always builds stars with a base, but admission must not
+/// assume one.
 fn r2rml_star_is_hash_join_safe(rp: &crate::ir::adapters::R2rmlPattern) -> bool {
     rp.subject_var.is_some()
         && !rp.star_bindings.is_empty()
