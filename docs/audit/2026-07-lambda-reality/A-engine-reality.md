@@ -825,11 +825,14 @@ non-forwarding wrapper:**
 - **Fix:** mirror `GraphOperator`'s forwarding (`graph.rs:639/647`) onto `DatasetOperator` — thread
   `set_row_budget`/`set_topk` to each member's inner operator. Well-understood, built three times.
   **Rescues Family D** (~11 shapes) — a `LIMIT 20` becomes a ~20-row scan.
-- **Open confirmation (solo lane):** that the deployed `full-enterprise-byo-1:main` query actually
-  routes through `DatasetOperator` (dataset path) rather than the single-view `GraphOperator` path
-  (which already forwards). The full-scan-on-`LIMIT 20` symptom is strong indirect evidence it does;
-  an `EXPLAIN` of a `LIMIT 20` on the dataset would confirm directly. If some shapes use the
-  single-view path, they are already capped and Family D is smaller than 11.
+- **Path CONFIRMED (solo lane, lambda-audit):** the deployed chat query DOES route through the
+  dataset path. Solo's query handler executes **all** single-ledger chat SPARQL via
+  `fluree.query_from().sparql(inject_sparql_from(…))` (solo `fluree-lambda-query/src/handler.rs:787-833`)
+  — the single-view `GraphDb` path *rejects* SPARQL outright ("use `query_connection_sparql`",
+  `:788-789`), so every chat SPARQL is a `FROM <ledger>` dataset query → `DatasetOperator`. So the
+  forwarding gap affects **every LIMIT-carrying chat query**, not a subset; an 8 M-row `LIMIT 20`
+  full scan is the smoking gun. (Family A/B/C's LIMIT is post-aggregation and wouldn't push into the
+  scan regardless — T1.3 rescues Family D's pre-aggregation LIMITs.)
 
 **Also folded from lambda-audit's cross-answers (F2/F5):** one `Fluree` instance persists per warm
 container (`OnceCell`, solo `handler.rs:36`), so §1c's in-memory caches (R2RML mapping, moka) DO

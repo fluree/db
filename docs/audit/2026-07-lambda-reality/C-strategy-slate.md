@@ -57,7 +57,8 @@ fact→dim(Product) join on `PRODUCT_KEY`, exactly the family-C `GROUP BY dim at
 
 - **DAYS (ship first — cheap, high-certainty):**
   1. **T1.3 — DatasetOperator LIMIT/top-k forwarding** (family D, ~11 shapes). A *confirmed* bug
-     (A.7): the dataset-path operator doesn't forward the row budget, so `LIMIT 20` full-scans.
+     (A.7), path CONFIRMED: solo routes all chat SPARQL via the dataset path (`handler.rs:787-833`),
+     and `DatasetOperator` doesn't forward the row budget, so every chat `LIMIT 20` full-scans.
      Full-scan → sub-second. The forwarding pattern we've built 3×.
   2. **T1.2 — Manifest-backed info-stats routing** (family E, the runaway). The metadata-only path
      already exists; route the virtual-dataset stats to it. 900 s → sub-second. Consumers are
@@ -110,12 +111,15 @@ dependencies · does NOT fix · first concrete step.**
 - **Family:** **D** (~11 shapes).
 - **Predicted effect:** a `LIMIT 20` becomes a ~20-row scan → **full scan (≥55 s) → sub-second**.
 - **Owner-surface:** **engine PR** (low — one operator gains two methods + a forwarding test).
-- **Dependencies:** confirm the deployed query uses the dataset path (below).
-- **Does NOT fix:** families A/B/C (no LIMIT to push — LIMIT is post-aggregation there); E.
-- **First concrete step:** `EXPLAIN` a `SELECT … LIMIT 20` on `full-enterprise-byo-1:main` and read
-  the operator tree — confirm a `DatasetOperator` sits between `Limit` and the graph-source scan
-  (vs the single-view `GraphOperator` path, which already forwards). Then mirror `graph.rs:639/647`
-  onto `DatasetOperator`, threading the budget/top-k to each member's inner op.
+- **Dependencies:** none — the path is CONFIRMED. Solo executes **all** single-ledger chat SPARQL via
+  `fluree.query_from()` with an injected `FROM <ledger>` (solo `handler.rs:787-833`; the single-view
+  path rejects SPARQL, `:788-789`), so every chat SPARQL is a dataset query → `DatasetOperator`. The
+  gap therefore bites **every LIMIT-carrying chat query** (8 M-row `LIMIT 20` full scan = the smoking
+  gun), not a subset.
+- **Does NOT fix:** families A/B/C (their LIMIT is post-aggregation — you must aggregate all rows
+  first, so it can't push into the scan); E.
+- **First concrete step:** mirror `graph.rs:639/647` onto `DatasetOperator` — thread the budget/top-k
+  to each member's inner op; add a forwarding test (a `LIMIT` over a dataset scan caps the scan).
 
 ### T1.2 — Manifest-backed virtual info-stats routing *(kills the runaway; rank #2)*
 - **Mechanism:** route a graph-source-federated dataset's `/info` stats to the **existing**
@@ -330,9 +334,9 @@ unlock-per-cost and rides the same engine work as T1.2.
 ---
 
 # Open items for the record (evidence gaps, not conclusions)
-- **T1.3 path confirmation** (the one thing that sizes rank #1): `EXPLAIN` a dataset `LIMIT 20` to
-  confirm the `DatasetOperator` (vs single-view `GraphOperator`) path. Strong indirect evidence (D's
-  full scans) says it does.
+- **T1.3 path — CONFIRMED, no longer open:** solo routes all single-ledger chat SPARQL via the
+  dataset path (`handler.rs:787-833`), so the `DatasetOperator` gap bites every LIMIT-carrying chat
+  query (8 M-row `LIMIT 20` full scan = smoking gun). Rank #1 is de-risked.
 - **The 336k aggregate is inferred** (O3): no multi-file FACT completed; if the 6 decodes contend,
   FACT queries are slower than predicted — which only strengthens Tier 1.
 - **T1.1 sub-family split:** how many of the ~25 A/B/C shapes are pure COUNT (cheap) vs SUM/AVG (the
