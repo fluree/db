@@ -372,6 +372,62 @@ round-trip latency, not CPU** — so concurrency is a direct multiplier on the f
 
 ---
 
+# Cross-track reconciliation — does the query Lambda have an Iceberg disk cache? (Track A × Track B)
+
+Track A (§1a) said the Iceberg parquet cache is the shared budgeted `DiskArtifactCache` at
+`/tmp/fluree_binary_cache`, env-governed. Track B (§2) said "there is no Iceberg/parquet disk
+cache configured at all in the query Lambda … `FLUREE_DISK_CACHE_BUDGET_BYTES` … is read *nowhere*
+by the query Lambda … irrelevant to Iceberg query perf." Discriminated at the **wiring level**,
+both observations are correct about their own layer, but **Track B's conclusion is not**.
+
+**The wiring chain (deployed query Lambda, both repos at the shipped pin):**
+
+1. **Solo configures no cache — TRUE.** `build_connection_config` (solo
+   `fluree-lambda-common/src/connection.rs:46-103`) emits JSON-LD with only `commitStorage` +
+   `indexStorage` + `dynamodbNs` + indexing defaults — **no `cache_dir`, no disk budget, no Iceberg
+   cache config.** Built via `FlureeBuilder::from_json_ld(&conn_config).build_client()`
+   (`connection.rs:127-131`). Track B is right that *solo* wires no Iceberg cache.
+2. **The engine wires it anyway.** With no `cache_dir` configured, `binary_store_cache_dir()`
+   returns `LedgerManagerConfig::default().cache_dir = std::env::temp_dir()/"fluree_binary_cache"`
+   = **`/tmp/fluree_binary_cache`** (db `lib.rs:3466-3471`, `ledger_manager.rs:728-736`). Every
+   Iceberg scan constructs `DiskArtifactCache::for_dir(&binary_store_cache_dir())`
+   (db `r2rml.rs:1780-1781`) and the sibling `DiskCatalogCache` at `{..}-catalog`
+   (`r2rml.rs:1238-1243`, `disk_catalog_cache.rs:94-102`).
+3. **The env var DOES reach the parquet cache — via the engine, not solo.** `DiskArtifactCache::new`
+   reads `FLUREE_DISK_CACHE_BUDGET_BYTES` **unconditionally** (db `disk_cache.rs:216`), and the
+   deployed query Lambda env **has `FLUREE_DISK_CACHE_BUDGET_BYTES=8589934592`** (Track B §3 table).
+   So the deployed query Lambda's Iceberg parquet cache is constructed at `/tmp/fluree_binary_cache`
+   with an **8 GiB budget**, and the catalog cache at `/tmp/fluree_binary_cache-catalog` (512 MiB).
+4. **Track B's own logs prove the scan path runs it:** "Starting Iceberg table scan …" +
+   "Scan planning complete files_selected=… files_pruned=…" (Track B §4) are emitted by the *same*
+   `scan_table_inner` that builds the cache one line earlier.
+
+> **Track B's specific claim is wrong; its instinct is right.** "The env var is read nowhere by the
+> query Lambda / irrelevant to Iceberg" was grepped over the **solo source tree only**, missing
+> `fluree-db-api` (a git dependency compiled *into* the query binary), which reads it and applies it
+> to the Iceberg parquet cache. The knob is **not** irrelevant — it sets the parquet cache budget.
+> **But** Track B's *effective* conclusion — "the cache buys nothing here" — is correct, for reasons
+> other than "not configured":
+> 1. Per-container `/tmp` is **cold on every cold container**; the conversation used **16 distinct
+>    containers** (Track B §5) → 16 cold caches.
+> 2. Heavy scans are **cancelled at 55 s** (deadline guard) before a full warm file set is written;
+>    a cancelled scan leaves at most a partial set.
+> 3. **Cross-region** (us-east-1 Lambda → us-east-2 parquet) dominates the *first* (cold) read —
+>    the only read most cancelled queries reach.
+> 4. `DW_SVL.DIM_PRODUCT` is `files_selected=1` (a single large file); the second scan's narrow
+>    `[PRODUCT_KEY]` projection of a >32 MB file is **not** whole-file-admitted
+>    (`send_parquet.rs:103,150`) → range-reads from source, uncached even warm.
+
+**Verdict for the slate** (the team-lead's exact fork — config-only / solo-wiring / engine change):
+**"enable the cache" is NOT a fix — it is already enabled** (engine default + env budget). The
+cache's problem is not existence but **persistence and warming**: per-container ephemeral `/tmp` is
+cold on every cold container, scans don't survive 55 s to warm it, and cross-region makes the cold
+read the expensive one. The fix space is therefore **architecture-level** (a shared/persistent
+catalog+data cache across containers — EFS or S3-backed), **region colocation**, and the
+**deadline/async** fixes — *not* a config-flag flip and *not* a solo one-line cache wire.
+
+---
+
 # Appendix — Lever arithmetic (predictions, not remedies)
 
 Everything below is **arithmetic prediction**, not measurement and **not a remedy commitment**.
@@ -573,3 +629,84 @@ ceiling.
 - **Every number here rides on `L≈30 ms` and `C_dev≈12`** (two independent anchors, q029 + q056).
   The highest-value thing Track B/lambda-audit can return is a **measured** cold in-Lambda `L` and a
   **measured** `available_parallelism` — those two collapse the ranges above into commitments.
+
+## A.5 Track B corrections to the model (deployed `DW_SVL`, cross-region)
+
+Track B's forensics change three things in the model. Folded here; the cross-flag answers from
+lambda-audit fold in when they land.
+
+### (i) Cross-region multiplies `L`
+
+The deployed stack is **cross-region**: Lambda us-east-1 → parquet `s3://…-use2` (us-east-2) +
+Snowflake Polaris REST catalog (Track B §5). The per-file term `F/C × L` is RTT-dominated for tiny
+files, so cross-region inflates `L`: a same-region S3 GET first-byte is ~10–20 ms (network RTT
+~1–5 ms); cross-region us-east-1↔us-east-2 adds ~12–15 ms RTT, so with connection-pool reuse `L`
+runs **~1.5–3× higher** cross-region (the "~3–10×" framing holds at the RTT-only layer; on the full
+GET incl. S3 processing it compresses to ~1.5–3×). **Caveat on the anchors:** q029's 57 s and
+q056's 168 s were measured **dev-Mac → S3** — *neither* Lambda-same-region *nor* cross-region — so
+they validate the model **form** `F/C×L`, not the absolute Lambda `L`. A same-region Lambda would be
+**faster** than the dev anchor; this cross-region stack is **comparable-to-worse**.
+
+| Sweep (7,670-file fact) | L=15 ms (same-region) | L=30 ms (dev anchor / mild cross) | L=45 ms (cross-region) |
+|---|---|---|---|
+| C=6 | 19.2 s | 38.4 s | 57.5 s |
+| C=16 | 7.2 s | 14.4 s | 21.6 s |
+
+**Region colocation** (Lambda + parquet in one region, or replicate parquet to us-east-1) removes
+the cross-region term outright — a pure multiplier win, orthogonal to compaction and concurrency.
+
+### (ii) The failing dataset is a DIFFERENT file shape than A.1–A.4 assume — the corpus has THREE shapes
+
+A.1–A.4 model the `DW_SF01` tiny-file fact (7,670 files, 39 rows/file) → a per-file **request**
+floor. `DW_SVL.DIM_PRODUCT` is the **opposite**: `files_selected=1`, **167,705 rows in ONE file**
+(Track B §4). For that shape:
+- **`files_pruned=0` is EXPECTED, not a missed prune.** One file, no selective `FILTER`, no
+  `ORDER BY DESC LIMIT` ⇒ PR-5 top-k, PR-7 numeric, and PR-3 star prune all correctly **decline**
+  (nothing to prune). `files_pruned=0` here is the sound answer.
+- **The wall is single-file cross-region TRANSFER + 167K-row MATERIALIZATION,** not request-count
+  fan-out. Compaction and file-count levers (PR-5, PR-3, PR-2a) are **MOOT** on an already-single-
+  file table.
+
+So the corpus splits into **three** shapes, and a lever helps at most one or two:
+- **(a) tiny-file fact** (DW_SF01) — request-floor bound → compaction / concurrency.
+- **(b) single-large-file dim** (DW_SVL `DIM_PRODUCT`) — transfer+materialize bound → region
+  colocation + a materialization/join-key lever; compaction irrelevant.
+- **(c) catalog-bound many-table first-touch** (q055 / `get_data_model`) — catalog persistence.
+
+**The deployed timeout is shape (b); the epic optimized shape (a).** That mismatch — not a broken
+win — is why `DW_SVL` chat times out despite the wave. (Unverified whether `DW_SVL`'s FACT tables
+are shape (a) or (b); Track B only profiled `DIM_PRODUCT`.)
+
+### (iii) The two `DIM_PRODUCT` scans
+
+Consistent with the FK/crawl pattern: one scan materializes the `DIM_PRODUCT` subject star, a second
+projects only `[PRODUCT_KEY]` as a join/parent key (the engine scans one parent per `RefObjectMap`
+POM, db `operator.rs:1085-1099`). On the shipped pin, F20 ref-target-prune cuts *loadTables* and
+PR-8b parent memo caches *within-query* parent lookups, but a distinct **subject-scan + FK-key-scan
+of the same table** remains two scans by design unless the key column is obtained without a rescan.
+Two caveats: (1) the narrow `[PRODUCT_KEY]` range-read of a >32 MB file is exactly the case the
+whole-file disk cache does **not** admit — so **even a warm cache would not have collapsed the
+second scan**; (2) whether the second scan *should* have been served from the first scan's output
+needs the exact SPARQL (Track B open item). This is a candidate **engine** lever (avoid the second
+same-table scan / retain the key column), not a data or config fix.
+
+### (iv) `get_data_model` — the worst real offender — added to the predicted-walls table
+
+Shape: a single JSON `@context` query that **serially** `loadTable`s the entire star schema (all
+~10 tables: `DIM_*` + `FACT_*`; Track B §4), with **no server-side deadline** — solo's `/data-model`
+path sends no `x-query-timeout-secs` and carries no `opts.timeout`, so the engine's deadline guard
+is inert. This is the concrete manifestation of §3b (the embedded single-query path arms no deadline
+of its own): with neither solo nor engine arming one, the query runs to the 900 s Lambda ceiling and
+pins **both** the query Lambda **and** the router container (Track B X-Ray, §4). It is a **runaway**,
+not merely a >55 s scan.
+
+| Query/op | Shape class | SF01 cold prediction (C=6) | Deployed reality (`DW_SVL`, cross-region) |
+|---|---|---|---|
+| `get_data_model` | (c) catalog-bound, **serial**, **un-deadlined** | Σ ~10 tables × T_catalog (serial): ~40–90 s catalog alone, + per-table first scan | **900 s runaway** (no server deadline); pins query **and** router 15 min |
+
+The engine-side arithmetic: `get_data_model` ≈ Σ over ~10 tables of `(T_catalog + ≥1 scan)`,
+**serial** (not the fan-out `buffer_unordered` of a single scan), cross-region. At ~7 s/fact +
+~2 s/dim cold cross-region, the catalog chain alone is ~40–90 s before any data — already past 55 s —
+and because it is un-deadlined it does not stop. This is the single shape where the **engine finding**
+(§3b, no self-timeout) and the **solo finding** (no `/data-model` server deadline) compound into a
+capacity-risk runaway, and it is the most fixable (wire a deadline on that path).
