@@ -575,6 +575,12 @@ pub struct HashJoinOperator {
     /// must match EVERY probe row (with the join var taking the probe value), not be
     /// dropped. Empty in the common case (join var always bound), so zero overhead.
     wildcard_rows: Vec<Vec<Binding>>,
+    /// R3-B: the query memory budget in bytes (0 = disabled). The build side buffers
+    /// the ENTIRE build input in `open()`; a multi-FACT build was the round-3 OOM
+    /// driver, so the accumulated size is checked against this per build batch.
+    mem_budget: usize,
+    /// R3-B: approximate bytes accumulated in `table` + `wildcard_rows` so far.
+    build_bytes: usize,
     /// Current probe batch being consumed and the next row to process.
     cur_probe: Option<Batch>,
     cur_probe_row: usize,
@@ -640,6 +646,8 @@ impl HashJoinOperator {
             probe_emit_cols,
             table: FxHashMap::default(),
             wildcard_rows: Vec::new(),
+            mem_budget: crate::context::query_memory_budget_bytes(),
+            build_bytes: 0,
             cur_probe: None,
             cur_probe_row: 0,
             state: OperatorState::Created,
@@ -685,6 +693,18 @@ impl HashJoinOperator {
                     // Poisoned join var: blocks matching — drop the row (no output).
                     JoinKeyClass::Dead => {}
                 }
+            }
+            // R3-B: account this batch's contribution to the build buffer and abort
+            // typed BEFORE the runtime OOMs. The build side is inherently
+            // un-LIMIT-able (every build row is needed for correctness), so a memory
+            // budget is the only pre-OOM guard for a big-FACT build — the round-3
+            // OOM driver. Batch-granularity, approximate (rows × cols × est/binding).
+            self.build_bytes += batch.len() * ncols * crate::context::BINDING_EST_BYTES;
+            if self.mem_budget != 0 && self.build_bytes > self.mem_budget {
+                return Err(crate::error::QueryError::MemoryBudgetExceeded {
+                    used_bytes: self.build_bytes,
+                    budget_bytes: self.mem_budget,
+                });
             }
         }
         build.close();
@@ -1089,6 +1109,53 @@ mod tests {
         assert!(
             matches!(err, crate::error::QueryError::Cancelled { .. }),
             "build drain must poll the deadline, got {err:?}"
+        );
+    }
+
+    /// R3-B: a tiny memory budget makes the HashJoin build abort typed
+    /// (`MemoryBudgetExceeded`) before OOM — distinguishable from a timeout.
+    #[tokio::test]
+    async fn r3b_hash_join_build_budget_aborts_typed() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let build_batch =
+            Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let probe_batch =
+            Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let right_pattern =
+            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+        let mut hj = HashJoinOperator::new(
+            Box::new(OnceOp {
+                schema: build_schema,
+                batch: Some(build_batch),
+            }),
+            Box::new(OnceOp {
+                schema: probe_schema,
+                batch: Some(probe_batch),
+            }),
+            x,
+            None,
+            right_pattern,
+            None,
+            crate::temporal_mode::PlanningContext::current().mode(),
+        );
+        hj.mem_budget = 1; // 1 byte → the first build batch exceeds it
+        let err = hj.open(&ctx).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::MemoryBudgetExceeded { .. }),
+            "build must abort typed on the memory budget, got {err:?}"
         );
     }
 

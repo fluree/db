@@ -69,6 +69,16 @@ pub enum QueryError {
         reason: fluree_db_core::QueryCancellationReason,
     },
 
+    /// An in-memory join build or GROUP-BY aggregate fold exceeded the query
+    /// memory budget (R3-B). A cooperative pre-OOM abort: it fails the query with
+    /// a typed error the caller can DISTINGUISH from a timeout (`Cancelled`) and
+    /// degrade on, instead of the runtime killing the container with a raw OOM.
+    #[error("Query memory budget exceeded: used ~{used_bytes} B > budget {budget_bytes} B")]
+    MemoryBudgetExceeded {
+        used_bytes: usize,
+        budget_bytes: usize,
+    },
+
     /// Object storage denied a read of an external table's data (S3 403 /
     /// `AccessDenied`).
     ///

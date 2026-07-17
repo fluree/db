@@ -627,6 +627,11 @@ pub struct GroupAggregateOperator {
     agg_specs: Vec<StreamingAggSpec>,
     /// Accumulated groups: composite_key -> group_state
     groups: HashMap<CompositeGroupKey, GroupState>,
+    /// R3-B: query memory budget in bytes (0 = disabled). The `groups` map grows
+    /// with distinct group cardinality; it is checked against this per batch so a
+    /// high-cardinality GROUP BY aborts typed before OOM. (SUM/COUNT rollups have
+    /// few groups, so this never trips for them — their OOM is the join build.)
+    mem_budget: usize,
     /// If true, input is already partitioned by the GROUP BY key(s), so we can
     /// aggregate per-run without hashing each row into a map.
     partitioned: bool,
@@ -691,6 +696,7 @@ impl GroupAggregateOperator {
             group_key_indices,
             agg_specs,
             groups: HashMap::new(),
+            mem_budget: crate::context::query_memory_budget_bytes(),
             partitioned,
             partitioned_groups: Vec::new(),
             emit_iter: None,
@@ -957,6 +963,17 @@ impl Operator for GroupAggregateOperator {
                             }
                         }
                     }
+                    // R3-B: guard the groups map size per batch (an O(1) len read);
+                    // a high-cardinality GROUP BY aborts typed before OOM. SUM/COUNT
+                    // rollups have few groups so this never trips — their OOM is the
+                    // join build, guarded in hash_join.rs.
+                    let used = self.groups.len() * crate::context::GROUP_EST_BYTES;
+                    if self.mem_budget != 0 && used > self.mem_budget {
+                        return Err(crate::error::QueryError::MemoryBudgetExceeded {
+                            used_bytes: used,
+                            budget_bytes: self.mem_budget,
+                        });
+                    }
                 }
 
                 // SPARQL semantics: with no GROUP BY keys, aggregates are computed over a single
@@ -1194,6 +1211,64 @@ mod tests {
         assert!(
             matches!(result, Err(crate::error::QueryError::Cancelled { .. })),
             "fold must poll the deadline, got {result:?}"
+        );
+    }
+
+    /// R3-B: a tiny memory budget makes the GroupAggregate fold abort typed
+    /// (`MemoryBudgetExceeded`) as the groups map grows, before OOM.
+    #[tokio::test]
+    async fn r3b_group_aggregate_budget_aborts_typed() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+
+        let snapshot = make_test_snapshot();
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                vec![Binding::sid(Sid::new(100, "v"))],
+                vec![Binding::sid(Sid::new(200, "p"))],
+            ],
+        )
+        .unwrap();
+
+        struct BatchOperator {
+            schema: Arc<[VarId]>,
+            batch: Option<Batch>,
+        }
+        #[async_trait]
+        impl Operator for BatchOperator {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(self.batch.take())
+            }
+            fn close(&mut self) {}
+        }
+
+        let child: BoxedOperator = Box::new(BatchOperator {
+            schema: schema.clone(),
+            batch: Some(batch),
+        });
+        let agg_specs = vec![StreamingAggSpec {
+            function: AggregateFn::Count(VarId(1)),
+            input_col: Some(1),
+            output_var: VarId(2),
+        }];
+        let mut op = GroupAggregateOperator::new(child, vec![VarId(0)], agg_specs, None, false);
+        op.mem_budget = 1; // 1 byte → the first group exceeds it
+        op.open(&ctx).await.unwrap();
+        let err = op.next_batch(&ctx).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::MemoryBudgetExceeded { .. }),
+            "fold must abort typed on the memory budget, got {err:?}"
         );
     }
 

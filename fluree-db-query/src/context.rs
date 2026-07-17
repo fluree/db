@@ -25,6 +25,67 @@ use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use fluree_vocab::{geo_names, xsd_names};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
+
+/// R3-B: the query memory budget in bytes for the in-memory join-build / aggregate
+/// fold guards, computed ONCE per process. `FLUREE_QUERY_MEMORY_BUDGET_BYTES`
+/// overrides (0 disables the guard); otherwise ~78% of the detected container /
+/// system memory limit, or an 8 GiB absolute fallback if detection fails. On the
+/// 10240 MB query Lambda (its cgroup limit) this is ~8 GiB — aborting typed ~2 GiB
+/// before the hard `Runtime.OutOfMemory`.
+pub fn query_memory_budget_bytes() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if let Ok(v) = std::env::var("FLUREE_QUERY_MEMORY_BUDGET_BYTES") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                return n; // explicit override; 0 disables the guard
+            }
+        }
+        const FALLBACK: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+        match detect_container_memory_bytes() {
+            Some(total) => total / 100 * 78,
+            None => FALLBACK,
+        }
+    })
+}
+
+/// R3-B: conservative per-binding byte estimate for the approximate memory-budget
+/// accounting (a `Binding` is a small enum, occasionally with a heap `String`;
+/// over-counting is safe — a too-tight budget only aborts a query already near OOM).
+pub const BINDING_EST_BYTES: usize = 64;
+/// R3-B: conservative per-group overhead estimate (key bindings + aggregate state).
+pub const GROUP_EST_BYTES: usize = 128;
+
+/// Best-effort container/system memory limit (cgroup v2 → cgroup v1 →
+/// `/proc/meminfo`). `None` where none is readable (e.g. macOS dev), where the
+/// caller uses the absolute fallback. A cgroup "unlimited" sentinel (non-numeric
+/// `max`, or an absurd v1 value) reads as undetectable so the guard uses the
+/// fallback, not a bogus huge budget.
+fn detect_container_memory_bytes() -> Option<usize> {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            return Some(n); // numeric v2 limit; "max" (unlimited) falls through
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            if n < (1usize << 62) {
+                return Some(n);
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let rest = rest.trim().strip_suffix("kB").unwrap_or(rest).trim();
+                if let Ok(kb) = rest.parse::<usize>() {
+                    return Some(kb * 1024);
+                }
+            }
+        }
+    }
+    None
+}
 use std::sync::{Arc, Mutex};
 
 /// Key for the per-query constant→`s_id` memo.

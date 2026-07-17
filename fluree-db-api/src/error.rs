@@ -457,6 +457,9 @@ impl ApiError {
             // Builder validation errors
             ApiError::Builder(_) => 400,
             ApiError::Query(fluree_db_query::QueryError::Cancelled { .. }) => 408,
+            // R3-B: memory-budget abort → 507 (Insufficient Storage), distinct from
+            // the 408 timeout so the caller can degrade on it specifically.
+            ApiError::Query(fluree_db_query::QueryError::MemoryBudgetExceeded { .. }) => 507,
             // Storage-permission / fail-closed errors are 403 (Forbidden),
             // whether raised directly (preview path) or wrapped from the query
             // engine (scan path). These arms MUST precede the generic

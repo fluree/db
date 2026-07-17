@@ -568,6 +568,10 @@ pub(crate) fn status_for_query_error(err: &fluree_db_query::QueryError) -> u16 {
     match err {
         fluree_db_query::QueryError::FuelLimitExceeded(_) => 400,
         fluree_db_query::QueryError::Cancelled { .. } => 408,
+        // R3-B: the in-memory join/aggregate budget guard — 507 (Insufficient
+        // Storage), distinct from the 408 timeout so the caller degrades on it
+        // specifically (a query too memory-heavy, not a slow one).
+        fluree_db_query::QueryError::MemoryBudgetExceeded { .. } => 507,
         fluree_db_query::QueryError::InvalidQuery(_) => 400,
         fluree_db_query::QueryError::InvalidFilter(_) => 400,
         fluree_db_query::QueryError::InvalidExpression(_) => 400,
