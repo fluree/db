@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "query_id": "q061",
+  "result_hash": "520932a587130e3823d647bcea87829542bca1bd5186b6e92ad3993ad52f491d",
+  "rows": 3,
+  "head_rows": [
+    "199733\u001fConsumer",
+    "50038\u001fEnterprise",
+    "50229\u001fSMB"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXR2ADH8TH3Q7RGT7E2D15DM",
+    "commit": "40bfb04bf"
+  }
+}

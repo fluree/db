@@ -123,6 +123,23 @@ pub enum HashGate {
     RowsOnly,
 }
 
+/// Which engine entry point a corpus query is executed through.
+///
+/// `Graph` (the default) runs `fluree.graph(alias).query()…` — a single graph
+/// source targeted directly. `From` runs `fluree.query_from().sparql(…)` where
+/// the query text itself carries a `FROM <graph-source>` clause — the deployed
+/// solo chat shape (a `FROM <ledger>` dataset query through `DatasetOperator`).
+/// The `From` members gate the C1 dataset-path budget forwarding AND the C5
+/// dataset-path fused-aggregate admission together (the pre-existing corpus is
+/// GRAPH-wrapped only). Absent ⇒ `Graph`, so existing entries need no edit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecPath {
+    #[default]
+    Graph,
+    From,
+}
+
 /// Expected row count: an exact value or an inclusive `[min, max]` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -175,6 +192,9 @@ pub struct QueryDef {
     /// How native-vs-virtual parity is gated. Absent ⇒ `Full` (exact hash).
     #[serde(default)]
     pub hash_gate: HashGate,
+    /// Which engine entry point runs this query. Absent ⇒ `Graph`.
+    #[serde(default)]
+    pub exec_path: ExecPath,
 }
 
 impl QueryDef {
@@ -315,8 +335,9 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            59,
-            "full corpus: 54 design queries (Q01-Q54) + the 5 exploration family (q055-q059)"
+            61,
+            "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
+             2 C5 dataset-path members (q060 family-A, q061 family-B)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));
@@ -459,6 +480,7 @@ mod tests {
             subsets: vec!["smoke".to_string()],
             expected_status: ExpectedStatus::default(),
             hash_gate: HashGate::default(),
+            exec_path: ExecPath::default(),
         };
         let corpus = Corpus {
             dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus"),

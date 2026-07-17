@@ -1354,6 +1354,52 @@
       "order_sensitive": "by_keys",
       "timeout_s": 180,
       "subsets": []
+    },
+    {
+      "id": "q060",
+      "file": "queries/q060_stores_by_channel_type_dataset.rq",
+      "bi_question": "BI-01: How many stores do we have by channel and store type? (C5 dataset-path family-A)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_STORE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        2,
+        40
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q061",
+      "file": "queries/q061_current_customers_by_segment_dataset.rq",
+      "bi_question": "BI-13: How are current customers distributed across segments? (C5 dataset-path family-B over-count trap)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        2,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }

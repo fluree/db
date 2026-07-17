@@ -287,22 +287,42 @@ impl Engine {
             FormatterConfig::sparql_json()
         };
 
+        // A query whose text carries a top-level `FROM <graph-source>` clause runs
+        // through the dataset path (`query_from`) — the deployed solo chat shape (a
+        // `FROM <ledger>` query through `DatasetOperator`) — so its corpus member
+        // gates the C1 dataset-path budget forwarding AND the C5 dataset-path fused
+        // aggregate admission. Everything else targets a single graph directly.
+        let use_from = is_from_query(sparql);
         let start = Instant::now();
         let result = self.rt.block_on(async move {
             let fut = async move {
-                // Bind the Graph to a local (see `probe` for the borrow rationale).
-                let graph = fluree.graph(&alias);
-                let builder = graph
-                    .query()
-                    .sparql(sparql)
-                    .format(fmt)
-                    .execution_options(exec_opts);
-                let builder = if is_virtual {
-                    builder.with_r2rml()
+                if use_from {
+                    // `query_from()` auto-applies `.with_r2rml()` under the iceberg
+                    // feature, so the graph source resolves from the FROM IRI in the
+                    // query text (works on the native handle and the virtual target,
+                    // which share `fluree_home`).
+                    fluree
+                        .query_from()
+                        .sparql(sparql)
+                        .format(fmt)
+                        .execution_options(exec_opts)
+                        .execute_formatted()
+                        .await
                 } else {
-                    builder
-                };
-                builder.execute_formatted().await
+                    // Bind the Graph to a local (see `probe` for the borrow rationale).
+                    let graph = fluree.graph(&alias);
+                    let builder = graph
+                        .query()
+                        .sparql(sparql)
+                        .format(fmt)
+                        .execution_options(exec_opts);
+                    let builder = if is_virtual {
+                        builder.with_r2rml()
+                    } else {
+                        builder
+                    };
+                    builder.execute_formatted().await
+                }
             };
             tokio::time::timeout(timeout + grace, fut).await
         });
@@ -443,6 +463,18 @@ fn is_graph_query(sparql: &str) -> bool {
         return upper.starts_with("CONSTRUCT") || upper.starts_with("DESCRIBE");
     }
     false
+}
+
+/// True when the query text carries a top-level dataset `FROM <graph-source>`
+/// clause — routing it through the `query_from()` (dataset) path rather than
+/// `fluree.graph(alias)`. Comment lines are ignored; a `FROM <…>` clause always
+/// names an IRI, so the `<` disambiguates it from any incidental token.
+fn is_from_query(sparql: &str) -> bool {
+    sparql
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with('#'))
+        .any(|l| l.to_ascii_uppercase().contains("FROM <"))
 }
 
 /// Extract the single scalar COUNT value from a `SELECT (COUNT(*) AS ?n)` result.
