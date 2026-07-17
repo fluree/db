@@ -1234,9 +1234,50 @@ fn fold_over_star_constraints(pats: &[&R2rmlPattern]) -> bool {
     pats.iter().any(|p| !p.star_constraints.is_empty())
 }
 
+/// C5 O2 core predicate: a dataset resolves to a single data source iff its
+/// constituent graphs carry EXACTLY ONE distinct `ledger_id`. The deployed
+/// `FROM <gs>` shape lists the graph source as both a default and a named graph
+/// (both the same ledger), so it collapses to one; a mixed dataset (a native
+/// member, or a second graph source) yields ≥2 and is declined; an empty dataset
+/// yields 0 and is declined (materialize — the safe default). Pure so the guard's
+/// arithmetic is hermetic; the `GraphRef` enumeration wiring is trivial.
+fn ledgers_are_single_source<'s>(ledgers: impl IntoIterator<Item = &'s str>) -> bool {
+    let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    set.extend(ledgers);
+    set.len() == 1
+}
+
 impl FusedR2rmlAggregateOperator {
+    /// C5 O2: true when the query's dataset (if any) resolves to a SINGLE data
+    /// source — so the fused single-`graph_iri` scan sees every row the
+    /// materialized union would. The GRAPH path (`ctx.dataset == None`) is a
+    /// single graph and always single-source. In dataset (FROM) mode the deployed
+    /// `FROM <gs>` shape registers the graph source as BOTH a default and a named
+    /// graph (both the same `ledger_id`), so "exactly one distinct ledger_id"
+    /// admits it while any genuinely mixed dataset — a native member, or a second
+    /// graph source over the same class — has ≥2 distinct ledger_ids and DECLINES,
+    /// because the single-source fold would otherwise UNDER-COUNT vs the
+    /// `DatasetOperator` union.
+    fn dataset_is_single_source(&self, ctx: &ExecutionContext<'_>) -> bool {
+        let Some(ds) = ctx.dataset else {
+            return true; // single-graph GRAPH path
+        };
+        ledgers_are_single_source(
+            ds.default_graphs()
+                .iter()
+                .map(|g| g.ledger_id.as_ref())
+                .chain(ds.named_graphs_iter().map(|(_, g)| g.ledger_id.as_ref())),
+        )
+    }
+
     /// Rewrite inner triples → R2RML at `open` and resolve column folds.
     async fn resolve_at_open(&self, ctx: &ExecutionContext<'_>) -> Result<Option<Resolved>> {
+        // C5 O2 mixed-dataset guard: the fused fold reads ONLY `self.graph_iri`'s
+        // single R2RML scan. Placed here it gates BOTH the single-table path and
+        // the join path (which is reached by delegation below).
+        if !self.dataset_is_single_source(ctx) {
+            return Ok(None);
+        }
         // Load the compiled mapping first so the rewrite can decide whether a
         // same-subject `rdf:type` is safe to fuse into the star (see
         // `rewrite::class_fusion_is_safe`); it is then reused as the resolved
@@ -1328,15 +1369,22 @@ impl FusedR2rmlAggregateOperator {
             let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *gv) else {
                 return Ok(None);
             };
-            // The single-table path keeps its original behavior byte-for-byte (an
-            // un-annotated column key declines → generic). The `None → xsd:string`
-            // default is applied ONLY on the join path (`resolve_join_at_open`),
-            // where it is hash-validated; enabling it here would fuse shapes the
-            // single-table fold has not been validated for (the q022 sentinel).
-            let Some(kind) = group_kind(datatype.as_deref()) else {
-                return Ok(None);
-            };
-            let Some(dt_iri) = datatype.as_deref() else {
+            // C5 slice-1: default an un-annotated column group key to `xsd:string`
+            // — the R2RML natural mapping for a string column (the DIM string
+            // attributes in this schema, e.g. DimAccount.INDUSTRY / DimStore.CHANNEL,
+            // carry no `rr:datatype`). This mirrors the join path
+            // (`resolve_join_at_open`, the `unwrap_or(xsd::STRING)` there) and admits
+            // the family-A single-table rollups (single-DIM COUNT, and single-table
+            // COUNT+SUM) that the deployed corpus hits. Sound because the generic
+            // materialize path emits the identical `xsd:string` literal for such a
+            // column (hash parity — covered by the family-A parity hermetics). The
+            // `q022`-sentinel OVER-COUNT the old byte-for-byte decline guarded
+            // against is now caught earlier by the `star_constraints` guard above
+            // (`:1304`): any constant-object flag declines before this loop, so the
+            // xsd:string default here can only widen admission for un-flagged,
+            // sound-to-fuse shapes.
+            let dt_iri = datatype.as_deref().unwrap_or(fluree_vocab::xsd::STRING);
+            let Some(kind) = group_kind(Some(dt_iri)) else {
                 return Ok(None);
             };
             let Some(dt_sid) = ctx.active_snapshot.encode_iri(dt_iri) else {
@@ -1928,6 +1976,34 @@ mod tests {
         // joined dim) — the broadened guard.
         assert!(fold_over_star_constraints(&[&plain, &constrained]));
         assert!(!fold_over_star_constraints(&[&plain, &plain]));
+    }
+
+    /// C5 O2 mixed-dataset guard (the `dataset_is_single_source` core): the fused
+    /// single-`graph_iri` scan is sound ONLY when every constituent graph resolves
+    /// to the SAME source. The deployed `FROM <gs>` shape lists the graph source as
+    /// both a default and a named graph (both the same ledger_id) → one distinct
+    /// ledger → admit. A genuinely mixed dataset (native + graph-source, or two
+    /// graph sources) → ≥2 distinct ledgers → DECLINE (the single-scan fold would
+    /// UNDER-COUNT vs the DatasetOperator union). An empty dataset → 0 → decline
+    /// (materialize, the safe default).
+    #[test]
+    fn o2_single_source_admits_deployed_shape_declines_mixed() {
+        // Deployed FROM <gs>: default + named graph, both the SAME source.
+        assert!(
+            ledgers_are_single_source(["enterprise-sf01-v:main", "enterprise-sf01-v:main"]),
+            "one graph source listed as both default+named must admit"
+        );
+        // Single member.
+        assert!(ledgers_are_single_source(["gs:main"]));
+        // Mixed: graph source unioned with a native ledger → decline.
+        assert!(
+            !ledgers_are_single_source(["enterprise-sf01-v:main", "native-orders:main"]),
+            "a native member alongside the graph source must decline (else under-count)"
+        );
+        // Two distinct graph sources over the same class → decline.
+        assert!(!ledgers_are_single_source(["gs-a:main", "gs-b:main"]));
+        // Empty dataset → decline (materialize).
+        assert!(!ledgers_are_single_source(std::iter::empty()));
     }
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::{Query, QueryOutput, ReasoningConfig};
