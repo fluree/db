@@ -2095,6 +2095,20 @@ pub struct LedgerInfoBuilder<'a> {
     options: LedgerInfoOptions,
 }
 
+/// T1.2 routing decision (pure): serve `/info` stats from the metadata-only
+/// graph-source path — not native full-stats — iff the id resolves to an **empty
+/// genesis ledger shell** (`ledger_t == 0`) **AND** a graph source is registered
+/// under it. That is the shape of a virtual (query-in-place) Iceberg/R2RML
+/// dataset: an empty native shell whose data lives in the backing tables. Native
+/// full-stats over such a shell federates into a full-table scan of every backing
+/// table — the `get_data_model` 900s runaway. The empty-shell gate keeps a real
+/// native ledger (`t > 0`), a non-graph-source id, and the exotic hybrid that has
+/// BOTH committed flakes AND graph sources all on the complete native path, so
+/// nothing is under-reported.
+const fn serve_virtual_stats_from_metadata(ledger_t: i64, graph_source_registered: bool) -> bool {
+    ledger_t == 0 && graph_source_registered
+}
+
 impl<'a> LedgerInfoBuilder<'a> {
     /// Create a new builder (called by `Fluree::ledger_info()`).
     pub(crate) fn new(fluree: &'a Fluree, ledger_id: String) -> Self {
@@ -2190,6 +2204,29 @@ impl<'a> LedgerInfoBuilder<'a> {
             }
             Err(e) => return Err(e),
         };
+
+        // T1.2: reroute an empty-shell virtual dataset's stats to the metadata-only
+        // graph-source path, so `/info` (e.g. MCP `get_data_model`) reads counts
+        // from Iceberg manifests + the mapping instead of scanning every backing
+        // table (the 900s runaway). The graph-source lookup runs ONLY for an empty
+        // shell (`t == 0`) — no extra work on the native hot path — and a lookup
+        // failure falls through to native (fail-safe). See
+        // `serve_virtual_stats_from_metadata` for the precise predicate.
+        let graph_source = if ledger.t() == 0 {
+            self.fluree
+                .nameservice()
+                .lookup_graph_source(&self.ledger_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if serve_virtual_stats_from_metadata(ledger.t(), graph_source.is_some()) {
+            if let Some(gs) = graph_source {
+                return build_graph_source_info(self.fluree, &gs).await;
+            }
+        }
 
         // Optional API-level cache: when ledger caching is enabled, a global LeafletCache
         // exists with a single memory budget (TinyLFU). We store ledger-info response
@@ -2287,6 +2324,24 @@ impl<'a> LedgerInfoBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T1.2 routing predicate — the empty-shell gate that decides native
+    /// full-stats vs the metadata-only graph-source path. Covers the team-lead's
+    /// (a)/(b)/(e) cases as a truth table (the wiring in `execute` then does the
+    /// async graph-source lookup only when the shell qualifies).
+    #[test]
+    fn serve_virtual_stats_only_for_empty_shell_graph_source() {
+        // (a) empty genesis shell (t==0) + a registered graph source = a virtual
+        // dataset → metadata path (fixes the get_data_model runaway).
+        assert!(serve_virtual_stats_from_metadata(0, true));
+        // (b) pure native ledger (no graph source) → native full-stats, unchanged.
+        assert!(!serve_virtual_stats_from_metadata(0, false));
+        assert!(!serve_virtual_stats_from_metadata(42, false));
+        // (e) hybrid: a ledger with committed native data (t>0) that ALSO has a
+        // graph source registered → native path, so its real flakes are never
+        // under-reported by the manifest-only path.
+        assert!(!serve_virtual_stats_from_metadata(42, true));
+    }
 
     #[test]
     fn test_compute_selectivity() {
