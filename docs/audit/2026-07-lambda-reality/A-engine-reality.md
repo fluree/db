@@ -1,0 +1,371 @@
+# Track A — Engine-side reality mapping for the Lambda runtime
+
+**Scope.** Evidence only, no remedies. Every claim carries a `file:line` receipt against
+the branch `assess/lambda-reality` (`210cf4833`, off `origin/feat/external-s3-iceberg` —
+the BYO-IAM ambient-credential work stacked above the perf wave head `c948f0a2b`). No code
+changes; no live Snowflake.
+
+**The runtime we are mapping onto (given).** `fluree-db-api` runs embedded inside the
+solo AWS Lambda: 10 GB ephemeral `/tmp` per container (a cold container starts empty),
+900 s Lambda timeout but a ~55 s effective chat-path cap (CloudFront 60 s), X-Ray Active,
+`FLUREE_DISK_CACHE_BUDGET_BYTES=8GiB` set (its CFN comment says "binary index artifacts"),
+and **no** `FLUREE_ICEBERG_*` / `FLUREE_R2RML_*` env vars set. AJ's live chat tests still
+time out despite the perf wave.
+
+**The two facts that frame everything below:**
+
+1. `FLUREE_DISK_CACHE_BUDGET_BYTES` governs **both** the native binary-index cache **and**
+   the Iceberg Parquet data-file cache (they are the *same* budgeted cache instance in the
+   *same* directory) — but it does **not** govern the Iceberg *catalog* cache (metadata /
+   manifest / scan-files / loadTable pointer), which has a **separate, hardcoded 512 MiB
+   cap**. The CFN comment is therefore incomplete.
+
+2. The perf wave's "first-ask / cache-thrashed" bar was measured **cold-data / warm-catalog**
+   by construction. A cold Lambda container is **cold-data / cold-catalog** — it additionally
+   pays the loadTable GET + metadata + manifest round-trips that every north-star number got
+   for free. The ≤3 s bar assumes a warm `-catalog` dir that a cold container does not have.
+
+---
+
+## (1) Env / config inventory — every knob the Iceberg/R2RML query path reads
+
+### 1a. The budgeted disk cache — `DiskArtifactCache` (headline)
+
+`fluree-db-core/src/disk_cache.rs` is the process-wide, content-addressed, byte-budgeted,
+LRU-by-mtime disk cache.
+
+- **Budget source.** `FLUREE_DISK_CACHE_BUDGET_BYTES` is read **per cache instance** in
+  `DiskArtifactCache::new` (`disk_cache.rs:216`). `0` disables writes (`:218`); a valid
+  integer is the byte budget (`:225`); unset falls to `configured_or_auto(available)`
+  (`:243`), which is either the process-global configured default
+  (`set_configured_budget_bytes`, `:35`) or **90 % of available disk**
+  (`CACHE_BUDGET_NUMERATOR/DENOMINATOR = 9/10`, `:13-14`, applied `:40-47`).
+- **Eviction.** Over budget → evict oldest-by-mtime down to the 80 % low-water mark
+  (`CACHE_EVICT = 8/10`, `:15-16`; `low_water_mark` `:285`; `ensure_capacity` `:350`;
+  `evict_until` `:313`). Eviction has **no in-use pinning** — a file can be evicted mid-read
+  (the Parquet reader tolerates this by falling back to source, see
+  `send_parquet.rs:222-226`).
+- **Who routes through it.**
+  - Native binary index: `fluree-db-binary-index/src/read/artifact_cache.rs:7-8`
+    re-exports the core type; `binary_index_store.rs:366,3003` build it for the leaflet /
+    forward-pack fetch path.
+  - **Iceberg Parquet data files:** `fluree-db-iceberg/src/io/send_parquet.rs:23` imports it;
+    `fluree-db-api/src/graph_source/r2rml.rs:1780-1781` builds it via
+    `DiskArtifactCache::for_dir(&self.fluree.binary_store_cache_dir())` and hands it to the
+    scan (`r2rml.rs:2008-2009`, `:2091-2092`, `:2152-2153`).
+  - The `disk_cache_max_mb` builder that seeds the configured default is **`#[cfg(feature =
+    "native")]`** (`fluree-db-api/src/lib.rs:1811-1817`) — a non-`native` build silently
+    drops it — but the **env override is read unconditionally in core**, so it still applies.
+- **Singleton per dir.** `for_dir` returns a shared `Arc` keyed by directory
+  (`disk_cache.rs:180-190`, `CACHE_REGISTRY`). The native index and the Iceberg Parquet cache
+  both target `binary_store_cache_dir()` (below), so they are **one instance sharing one
+  budget in one directory** — the 8 GiB is split between leaflets and Parquet, not 8 GiB each.
+- **Built-in Lambda tell.** `disk_cache.rs:17-18` names `DEFAULT_LAMBDA_TMP_BYTES = 512 MiB`
+  and `:246-256` warns when available `/tmp` ≤ 512+64 MiB — the code already anticipates the
+  Lambda `/tmp` shape.
+
+> **Headline answer:** `FLUREE_DISK_CACHE_BUDGET_BYTES` is **not** binary-index-only. It caps
+> the shared `/tmp/fluree_binary_cache` directory that holds **both** native leaflets **and**
+> Iceberg Parquet files. It does **not** reach the catalog cache (§1b).
+
+### 1b. The catalog disk cache — `DiskCatalogCache` (separate, hardcoded cap)
+
+`fluree-db-api/src/graph_source/disk_catalog_cache.rs` — a **sibling** cache, explicitly "next
+to `DiskArtifactCache`, never inside it" (`:13-16`).
+
+- **Cap: hardcoded `MAX_CACHE_BYTES = 512 * 1024 * 1024`** (`:239`) — **not** env-configurable,
+  **not** under `FLUREE_DISK_CACHE_BUDGET_BYTES`. Pruned oldest-first **once per process at
+  startup** (`for_dir` + `PRUNED` OnceLock, `:302-308`; `prune_dir` `:107-136`).
+- **Path: `{binary_store_cache_dir}-catalog`** (`catalog_cache_dir`, `:94-102`) →
+  `/tmp/fluree_binary_cache-catalog` in Lambda. Sibling so the cold-benchmark protocol can
+  clear data while keeping catalog (`:14-16`).
+- **Holds** (all credential-free): parsed `TableMetadata` (`get/put_metadata` `:378-391`),
+  manifest-derived scan-file list `CachedScanFiles` (`:393-417`), COUNT(\*) stats
+  (`:419-441`), and the loadTable `metadata_location` pointer (`:451-492`). Keyed by the
+  content-addressed `metadata_location` (except the pointer, keyed by `lt_key`), so a table
+  commit yields a new key = clean miss, no invalidation (`:5-11`).
+- **Switches:** master `FLUREE_ICEBERG_CATALOG_DISK_CACHE` (`:34`, default on); pointer
+  `FLUREE_ICEBERG_LOADTABLE_PTR_CACHE` (`:52`, default on); pointer TTL
+  `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS` (`:70-79`, **default 300 s**, `0` disables).
+- `CACHE_FORMAT_VERSION = 2` (`:214`); on-disk names carry a stable xxh64 key hash + a
+  `CACHE_SCOPE = "shared"` segment (`:254-286`).
+
+### 1c. In-memory caches — `R2rmlCache` (per-Fluree-instance, container-only)
+
+`fluree-db-api/src/graph_source/cache.rs`, all `moka::sync::Cache` (in-memory):
+
+| Cache | Cap | TTL | Env |
+|---|---|---|---|
+| `compiled_mappings` | 64 | — | — |
+| `table_metadata` | 128 | — | — |
+| `scan_files` | 128 | — | — |
+| `parquet_footers` | `max(128/2,32)=64` | — | — (PR-2 footer cache) |
+| `direct_metadata_locations` | 128 | **2 s** (`DIRECT_METADATA_LOCATION_TTL`, `:32`) | — |
+| `rest_clients` | 64 | **900 s** (`DEFAULT_REST_CLIENT_TTL_SECS`, `:62`) | `FLUREE_ICEBERG_REST_CLIENT_TTL_SECS` |
+| `rest_load_tables` | 128 | **60 s** (`DEFAULT_REST_LOADTABLE_TTL_SECS`, `:42`) | `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` |
+
+Caps/TTLs wired at `cache.rs:150-190`. Also `FLUREE_ICEBERG_LOADTABLE_CACHE` toggles the
+in-memory loadTable cache (per `SWITCHES.md`). **All per-container: empty on a cold container,
+and gone the moment the `Fluree` instance is dropped** (the cache hangs off `Fluree`, reached
+via `self.fluree.r2rml_cache()`, e.g. `r2rml.rs:1261,1370,1472`). Whether solo keeps one
+`Fluree` alive across invocations is a cross-track question for lambda-audit; if it rebuilds
+per invocation, even a *warm* container loses these.
+
+### 1d. Concurrency, retry, and memory knobs
+
+- **Scan concurrency** `FLUREE_ICEBERG_SCAN_CONCURRENCY` (`r2rml.rs:72-84`): default
+  `min(available_parallelism, num_files).clamp(1, 32)`; override is uncapped. **Unset in the
+  stack** → runs at the clamped `available_parallelism`. See §4.
+- **Catalog concurrency** `FLUREE_ICEBERG_CATALOG_CONCURRENCY` (`catalog/rest.rs:65`):
+  **default 8** (`DEFAULT_CATALOG_CONCURRENCY`, `:52`) — a process-wide semaphore bounding
+  concurrent catalog ops (loadTable / manifest GETs).
+- **Catalog retry/backoff** `FLUREE_ICEBERG_CATALOG_MAX_RETRIES` (default 4, `:54`),
+  `FLUREE_ICEBERG_CATALOG_BACKOFF_BASE_MS` (default 250, cap 8000, `:56-57`).
+- **Materialize window** `FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS` (`operator.rs:209-217`):
+  default **512 K rows** resident.
+- **Native in-memory cache budget** `cache_max_mb` (`lib.rs:1799`): default = a tiered
+  fraction of **cgroup-clamped** RAM (`fluree-db-connection/src/cache.rs:40-68` — 30 %/40 %/35 %
+  by size tier; clamp via `fluree_db_core::sysmem::effective_memory_limit_bytes`, which reads
+  `/sys/fs/cgroup/memory.max` — `sysmem.rs:14-34,54`). **cgroup-aware** → a 10 GB Lambda sizes
+  this to ~35 % ≈ 3.5 GB (native leaflet/object cache; largely idle for a pure virtual query,
+  but it does claim that share of the memory limit). Contrast: `available_parallelism` (§4) is
+  `std`, **not** routed through this cgroup helper.
+- **Parquet read policy** (`send_parquet.rs`): whole-file admission ≤ 32 MiB
+  (`WHOLE_FILE_MAX_BYTES`, `:103`) or ≥ 50 % projection (`:107`, `admit_whole_file` `:150`);
+  footer-from-cache `FLUREE_ICEBERG_FOOTER_FROM_CACHE` (`:177`, default on); row-group/row
+  predicate pushdown `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` (`:51`, default on); numeric-stats
+  pruning `FLUREE_ICEBERG_NUMERIC_STATS` (`r2rml.rs:115`, default on). At SF01 the fact table
+  is ~51 MB / 7 670 files ≈ **6.6 KB/file**, so **every fact file is cached whole** to
+  `/tmp/fluree_binary_cache`.
+
+### 1e. Cache root derivation — where a Lambda-embedded Fluree lands its caches
+
+`Fluree::binary_store_cache_dir()` (`lib.rs:3466-3471`) returns the ledger manager's
+configured `cache_dir`, else **`LedgerManagerConfig::default().cache_dir`**, which is
+**`std::env::temp_dir().join("fluree_binary_cache")`** (`ledger_manager.rs:733`; doc `:709`
+says "Default: `$TMPDIR/fluree_binary_cache`"). In Lambda `std::env::temp_dir()` is `/tmp`
+(TMPDIR unset), so:
+
+- Parquet + binary-index budgeted cache → **`/tmp/fluree_binary_cache`** (8 GiB budget).
+- Catalog cache → **`/tmp/fluree_binary_cache-catalog`** (512 MiB hardcoded cap).
+
+Both live in the **10 GB per-container ephemeral `/tmp`**: **per-container-persistent** (survive
+warm invocations of the same container), **empty on a cold container**. Worst-case disk residency
+≈ 8 GiB + 512 MiB = 8.5 GiB, under 10 GB but not by much once the deployment's own `/tmp`
+scratch is counted. If solo sets `LedgerManagerConfig.cache_dir` to somewhere else, that
+overrides the default — **flag for lambda-audit: confirm solo's configured `cache_dir` (or that
+it is unset ⇒ `/tmp/fluree_binary_cache`).**
+
+---
+
+## (2) Cold-container first-ask arithmetic
+
+### 2a. The protocol gap (why the north-star numbers don't transfer)
+
+The epic's cold protocol clears the **data** artifact dir but keeps the **`-catalog`** dir warm
+(`disk_catalog_cache.rs:13-16`: "clear the data artifact cache while KEEPING catalog
+persistence — that cold-data / warm-catalog state is slice 2's DoD gate"). So every north-star
+"first-ask" number was measured with the loadTable pointer + metadata + scan-files already on
+disk. A **cold Lambda container has neither**.
+
+**Cold-container per-table sequence** (from `load_table_context`, `r2rml.rs:1322-1355`, +
+`metadata_from_caches` `:1260-1272`, + `disk_catalog_cache`):
+
+| Step | Cold container (empty caches) | Warm-catalog first-ask (dev) |
+|---|---|---|
+| 1. pointer resolve | session pin MISS + disk pointer MISS (`get_metadata_location` `:1354`) | **HIT** (disk pointer, within 300 s) |
+| 2. loadTable GET | **REST GET** — OAuth token exchange + GET, vended creds + `metadata_location` (~1–3 s/table) | skipped (`LazyS3Storage`, never forced) |
+| 3. metadata.json | **S3 fetch + parse** (`get_metadata` MISS) | **HIT** (disk catalog) |
+| 4. manifest → scan files | **manifest-list + manifest reads → derive scan-file list** (`get_scan_files` MISS) | **HIT** (disk catalog) |
+| 5. data sweep | **fetch selected Parquet files at concurrency C** | fetch (cold-data) / HIT (pure-warm) |
+
+Warm-catalog first-ask = **step 5 only**. Cold container = **steps 1–5, every table**. Steps
+1–4 are the epic's "~7 s fixed" per fact table (q029 model: "~7 s fixed (loadTable+oauth+
+scan_plan)", F17 memory); catalog fan-out across N tables is bounded at
+`CATALOG_CONCURRENCY = 8` (`rest.rs:65`).
+
+### 2b. Per-query cold-container estimates (SF01)
+
+Anchored to the epic's measured components (dev machine, dev concurrency ≈ 10–16) with the two
+Lambda multipliers applied: **(A) cold catalog is fully paid** (not amortized by a warm
+`-catalog` dir), and **(B) the data sweep runs at Lambda concurrency ≈ 6** (§4), ~2× the dev
+sweep because the per-file cost is S3-round-trip latency, not CPU (`send_parquet.rs` policy;
+doc 06). These are order-of-magnitude, clearly-labelled estimates, not measurements.
+
+| Query | Shape (post-wave plan) | Warm-catalog in-protocol (measured) | Cold-container Lambda estimate | Over 55 s cap? |
+|---|---|---|---|---|
+| **q029** | UNION of 2×FACT_WEB_EVENT, F17 → **1 sweep** | 2.61 s | ~7 s catalog + 1 sweep. Dev 1-sweep isolated ≈ 57 s (F17) → Lambda ≈ **~110–120 s** | **Yes** |
+| **q031** | InventorySnapshot star, F20 → **2 loadTables** (fact + DIM_PRODUCT) | 5.22 s | 2× (loadTable+meta+manifest ≈ 3–7 s) + 1 fact sweep (7 670 files @ C≈6) → **~60–90 s** | **Yes** |
+| **q016** | batched OPTIONAL, PR-4d → 3 scans; residual = 1 FACT_SHIPMENT sweep + ~11 s hash-join/materialize | 20.2 s | ~7 s catalog + fact sweep (Lambda ≈ 2×) + ~11 s join → **~60–100 s** | **Yes** |
+| **q055** | `?s ?p ?o LIMIT 5` — all 16 TMs, all-table loadTable wave | 2.44 s | **16×** cold loadTable+meta+manifest (bounded at CATALOG_CONCURRENCY 8) + small data → **~25–45 s** | Borderline |
+| **q056** | predicate-less `COUNT(*)` — un-fused, full object fetch over ~69 046 files (all 16 TMs) | **168 s** | already 168 s **with warm catalog**; cold adds the 16-table catalog cost and runs the whole fetch at C≈6 → **well past any cap** (minutes) | **Yes (hard)** |
+
+The pattern: every fact-scanning or wide-fan-out query that is ≤ low-seconds **warm-catalog** on
+dev crosses the 55 s chat cap **cold-container** in Lambda, because the two multipliers stack —
+the cold catalog cost that the bar was measured to exclude, times a data sweep at half the
+concurrency.
+
+### 2c. SF20 scaling (~20× data)
+
+The dominant cold cost is **file count**, not bytes (39 rows/file; fetch-bound). SF20 ≈ 20× the
+files. loadTable/metadata/manifest per table grows sub-linearly (one GET, a larger manifest
+tree), but **the data sweep grows ~linearly in file count**: an SF20 fact ≈ 150 K files → at
+C≈6 the sweep alone is ~20× the SF01 sweep. Plan-level pruning that cuts *files fetched*
+(PR-5 top-k 99.87 %, PR-7 numeric row-group prune, PR-3 star prune) is what keeps SF20 tractable
+cold; anything that still reads the whole fact (q016/q029/q031/q056 tails) scales linearly and is
+hopeless within 55 s at SF20 on a cold container. Also note the **512 MiB catalog cap**
+(`disk_catalog_cache.rs:239`): an SF20 scan-files entry for a ~150 K-file table is far larger
+than SF01's, so the catalog dir can start evicting entries it will want again — a warm-catalog
+container can partially cold-miss at SF20. And the shared 8 GiB Parquet budget begins to matter:
+SF20 across 16 TMs can approach it, triggering mtime eviction mid-workload.
+
+### 2d. Which shipped wins survive a cold container
+
+| **Survive cold** (plan-level — cut *planned* work regardless of cache state) | **Warm-container-only** (evaporate when `/tmp` is empty) |
+|---|---|
+| **PR-3** star_tm_prune — 16→3 tables (`FLUREE_R2RML_STAR_TM_PRUNE`): fewer loadTables + scans | **#1503** loadTable pointer cache (disk `-catalog`): cold ⇒ pays the GET; even warm, TTL-window-bounded 300 s (F21) |
+| **PR-5** scan top-k — q046 99.87 % files pruned (`FLUREE_R2RML_TOPK_PUSHDOWN`): cuts the data sweep itself — **biggest cold win** | **PR-8 slice-2** disk catalog cache (metadata/manifest/scanfiles): cold ⇒ full metadata+manifest S3 |
+| **PR-7** numeric row-group prune (`FLUREE_ICEBERG_NUMERIC_STATS`): fewer files fetched | **PR-2** footer cache (in-memory, 64 entries): cold ⇒ empty |
+| **PR-6** fused aggregate — Σ from manifest record counts, no data sweep (`FLUREE_FUSED_R2RML_AGG`) | **Parquet artifact cache** (`/tmp/fluree_binary_cache`): cold ⇒ full data sweep from S3 |
+| **F20** ref-target-prune — q031 7→2 loadTables (`FLUREE_R2RML_REF_TARGET_PRUNE`) | **In-memory moka** (loadTable 60 s / rest_client 900 s / table_metadata / scan_files): cold ⇒ empty |
+| **F17** UNION/BIND budget — q029 2 sweeps→1 (`FLUREE_R2RML_UNION_BUDGET`) | |
+| **PR-4d** OPTIONAL seed-coalesce — q016 182→3 scans (`FLUREE_R2RML_OPTIONAL_SEED_COALESCE`) | |
+| **PR-4b/4c** batched OPTIONAL; **PR-8b** parent memo / **F19** (fewer intra-query re-scans) | |
+
+Worked example — **q031's 72 s→5.2 s** is F20 (plan prune, *survives*) **plus** the loadTable
+cache + disk-catalog + data cache (*all warm-only*). On a cold container only the F20 part
+remains: 2 loadTables instead of 7, but each of those 2 pays the full cold GET + metadata +
+manifest + data sweep. The headline "≤3 s first-ask" wins that came from caching, not planning,
+**do not exist on a cold Lambda container.**
+
+---
+
+## (3) Timeout / abort wiring (engine side)
+
+### 3a. Cancellation is a cooperative atomic flag with no built-in timer
+
+`fluree-db-core/src/cancellation.rs`: `QueryCancellation` is a single `AtomicU8` reason
+(`:60-63`), cooperative, **no timer, no tokio integration** — the module doc is explicit:
+"Timeout and disconnect detection are external concerns: callers decide when to signal this
+handle" (`:66-69`). Reasons: `Cancelled`/`Timeout`/`ClientDisconnected` (`:17-24`). Observed via
+`reason()` (a relaxed atomic load, `:113-123`); `check_cancelled` (`context.rs:685-690`) is a
+**pure atomic read**, no deadline comparison.
+
+### 3b. The embedded single-query path installs no deadline of its own
+
+Traced in full (Explore sub-agent, receipts verified):
+
+- **No `QueryCancellation` is created inside `fluree-db-api`.** Repo-wide `QueryCancellation::new()`
+  exists only in `fluree-db-server/src/query_control.rs:58`,
+  `fluree-db-server/src/routes/stream_query.rs:693`, the bench (`fluree-bench-virtual/src/exec.rs:265`),
+  and core tests. On the embedded path the handle is a plumbed `Option` defaulting to `None`
+  (`fluree-db-api/src/query/mod.rs:29`, `QueryExecutionOptions.cancellation`), copied into the
+  context (`view/mod.rs:97`) and installed only if `Some`
+  (`fluree-db-query/src/execute/runner.rs:828-829`; else `QueryCancellation::disabled()`,
+  `context.rs:318`). The single-query entry passes `QueryExecutionOptions::default()` ⇒ `None`
+  (`view/query.rs:76`); nothing in the crate calls the `with_cancellation` setter.
+- **No timer, no timeout field.** `fluree-db-api/src` has **zero** `cancel_with(...)` calls, so
+  nothing ever flips the flag to `Timeout`. `QueryExecutionOptions` has **no** `timeout`/`timeout_ms`
+  field (`query/mod.rs:27-43`), and there is **no** `x-query-timeout-secs` handling in
+  `fluree-db-api` (that header lives in `fluree-db-server`). `timeoutMs` is honored **only** on
+  the multi-query envelope path (below).
+
+> **The embedded engine does not time itself out.** A per-query deadline exists **only** if the
+> embedder (solo's Lambda handler) constructs a `QueryCancellation`, arms its own timer to
+> `cancel_with(Timeout)`, and passes it in via `with_cancellation`. **Flag for lambda-audit:
+> does solo do this?** (The `#[doc(hidden)] with_lifecycle_guard`, `query/mod.rs:80-86`, exists
+> precisely so an embedder can keep its own timeout task alive — but nothing in-crate uses it.)
+
+### 3c. The multi-query path has a hard wall-clock timeout (but it still leaks)
+
+`fluree-db-api/src/query/multi/dispatch.rs:542` wraps each sub-query in
+`tokio::time::timeout(effective, exec)`, `effective = min(opts.timeoutMs, remaining envelope
+budget)` (`:522-529`; envelope `timeoutMs` clamped `:207-211`). On elapse it drops the future
+and returns `AliasOutcomeKind::Timeout` (`:571`). This drops the cooperative future — but see 3e.
+
+### 3d. The Iceberg scan never polls cancellation mid-sweep
+
+`check_cancelled()` is called only by operators — `join.rs` (~20 sites), `sort.rs`
+(`:653-748`), and the **R2RML operator** at `operator.rs:909, 1090, 1332, 2377` (per-batch /
+per-POM, e.g. "cancellation checkpoint before each FK-parent scan", `:1086-1090`). **There is no
+`check_cancelled` anywhere in `fluree-db-api/src/graph_source` or `fluree-db-iceberg/src`** —
+the Parquet fan-out (the S3-fetch-bound phase that dominates the cold wall) does **not** poll
+the flag. Cancellation is observed only *between* scan-stream pulls by the consuming operator.
+
+### 3e. tokio-spawned Parquet reads outlive a cancelled query
+
+The parallel scan spawns each file read via **`tokio::spawn`** (`r2rml.rs:2148`, top-k tail
+`:2087`) and awaits the `JoinHandle`, `buffer_unordered(concurrency)` (`:2173`, `:2112`). When
+the query future is dropped (timeout or unwind), `buffer_unordered` drops its in-flight inner
+futures — each was awaiting a `JoinHandle`, and **dropping a `JoinHandle` detaches the task, it
+does not abort it**. So up to `concurrency` (~6) Parquet reads **run to completion** after the
+query is gone — each finishing its S3 fetch + decode + best-effort disk-cache write
+(`disk_cache.rs:530`). It is **bounded** to the in-flight batch (unstarted files are never
+spawned because the stream stops being polled), not the whole table — but it is real burn after
+abandonment, and it warms the disk cache for a query nobody is waiting on.
+
+### 3f. HTTP disconnect is invisible during the scan phase
+
+Engine-side, the embedded path detects a dropped client only when a row batch is pushed to the
+response channel and the send fails: `view/stream_query.rs:534-538` maps a closed `mpsc` to
+`QueryError::Cancelled { ClientDisconnected }`. That fires **only at row-emission time**. For a
+query whose whole wall is spent *before the first output row* — the cold fact-scan / full
+materialization (q056, big fact sweeps) — the sink's `push` is never called, so **a disconnect
+is never observed** and the scan runs to completion. (The standalone `fluree-db-server` has an
+independent disconnect guard, `query_control.rs:47` — but solo embeds the api, not the server.)
+
+> **Product answer — "chat abandons at ~55 s, does the engine keep burning?"** With the current
+> engine wiring: **yes.** The embedded single-query path arms no deadline itself (3b); a
+> CloudFront/chat disconnect is invisible until a row is emitted (3f), which for the timing-out
+> fact-scan queries never happens before the scan finishes; the fetch-bound scan never polls the
+> flag mid-sweep (3d); and even if solo *does* arm a timer (3c-style) or pass a handle, the
+> in-flight ~6 Parquet reads finish anyway (3e) and cancellation only takes effect at the next
+> operator checkpoint. Whether solo arms *any* of this is lambda-audit's track — but nothing in
+> the engine makes it automatic.
+
+---
+
+## (4) Concurrency shape
+
+`iceberg_scan_concurrency` (`r2rml.rs:72-84`): with `FLUREE_ICEBERG_SCAN_CONCURRENCY` unset (the
+stack's state), the default is `min(available_parallelism, num_files).clamp(1, 32)`. The doc
+(`:52-71`) notes the ceiling was raised 8→32 (PR-2 Lever B) and that **per-file cost is fixed S3
+round-trip latency, not CPU** — so concurrency is a direct multiplier on the fetch-bound wall.
+
+- **Lambda vs dev.** A 10 GB Lambda ≈ 6 vCPUs; the dev machine where the wins were measured has
+  ≈ 10–16. So the default scan concurrency in Lambda is **≈ 6, roughly half the dev value**, and
+  the 32-ceiling-reaching override is **unset** → **data sweeps run ~2× longer in Lambda** than
+  in every north-star measurement. This is the single most under-appreciated multiplier in the
+  cold arithmetic (§2b) and it compounds at SF20.
+- **`available_parallelism` caveat (cross-check for lambda-audit).** Unlike the memory budget
+  (which *is* cgroup-aware via `sysmem.rs`), `iceberg_scan_concurrency` uses
+  `std::thread::available_parallelism()` (`r2rml.rs:80-82`), **not** the Fluree cgroup helper.
+  Whether that reflects the Lambda vCPU allotment (cgroup `cpu.max`) or the host CPU count
+  (`sched_getaffinity`) is genuinely uncertain in Lambda and Rust-version-dependent. **Confirm
+  the real value via X-Ray / a probe** — if it reads the *host* count it could be *higher* than 6
+  (helping), or if the cgroup throttles CPU the effective throughput is still ~6 vCPU regardless
+  of the count `available_parallelism` returns. Setting `FLUREE_ICEBERG_SCAN_CONCURRENCY`
+  explicitly removes the guesswork; it is currently unset.
+- **Catalog concurrency** is a fixed **8** (`rest.rs:65`), so a wide first-ask (q055's 16-table
+  loadTable wave) fans its cold catalog GETs out 8-at-a-time.
+- **Runtime shape (cross-ref lambda-audit).** The Parquet reads `tokio::spawn` onto whatever
+  runtime the Lambda handler built — that runtime construction is in **solo**, not this repo. If
+  solo builds a **single-thread** runtime (or a multi-thread one with `worker_threads` < vCPUs),
+  the "parallel" `buffer_unordered` fan-out is serialized on the executor regardless of the
+  concurrency number, and scan concurrency is moot. **Flag for lambda-audit: confirm solo's
+  tokio runtime flavor + worker_threads for the chat handler.**
+
+---
+
+## Cross-track flags for lambda-audit (deployed-stack forensics)
+
+1. Solo's configured `LedgerManagerConfig.cache_dir` — is it unset (⇒ `/tmp/fluree_binary_cache`)
+   or overridden? (§1e)
+2. Does one `Fluree` instance persist across warm invocations, or is it rebuilt per request?
+   (governs whether §1c in-memory caches survive warm-container reuse) (§1c)
+3. Does the chat handler construct a `QueryCancellation` + arm a ~55 s `cancel_with(Timeout)`
+   timer + pass it via `with_cancellation`? (§3b) If not, the engine never self-cancels.
+4. Tokio runtime flavor + `worker_threads` for the Lambda handler. (§4)
+5. Real `available_parallelism()` value inside the 10 GB Lambda (X-Ray / probe). (§4)
+6. Is `FLUREE_DISK_CACHE_BUDGET_BYTES=8GiB` right for a 10 GB `/tmp` given it is **shared** by
+   Parquet + binary index, with the catalog cache's 512 MiB **on top**? (§1a/§1b)
