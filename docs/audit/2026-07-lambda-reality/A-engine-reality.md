@@ -716,10 +716,23 @@ capacity-risk runaway, and it is the most fixable (wire a deadline on that path)
 lambda-audit's cross-answers supply the **measured in-Lambda anchor** that supersedes the model's
 weakest assumption (`L≈30 ms`, dev-Mac→S3). It changes what the primary lever is.
 
-**Measured anchor (a scan that COMPLETED under budget):** `DW_SVL.DIM_CUSTOMER`, one file,
-1,744,133 rows, projection of 4 columns, plan→complete = 30.95 s at `C = min(6, 1 file) = 1`
-⇒ **≈56,000 rows/s on one core** (Track B §4/§"Lever arithmetic"). The file is small (4 columns),
-so this is **not** fetch-bound — it is single-threaded R2RML row materialization.
+**Measured anchor — THREE completed single-file scans (O3), not one.** lambda-audit computed
+throughput for every scan that finished under the deadline:
+
+| Table | rows | cols | plan→complete | rows/s | metadata RTT |
+|---|---|---|---|---|---|
+| DIM_ACCOUNT | 67,082 | 3 | 1.19 s | **56,560** | 666 ms |
+| DIM_GEOGRAPHY | 111,803 | 3 | 2.10 s | **53,210** | 1,142 ms |
+| DIM_CUSTOMER | 1,744,133 | 4 | 30.95 s | **56,360** | 1,193 ms |
+
+Throughput is **flat at ~53–57k rows/s across a 26× row-count range and two projection widths** —
+the signature of **CPU-bound per-row materialization, not fetch** (fetch would penalize the *small*
+file's rows/s by amortizing a fixed GET over few rows; it doesn't). All at `C = min(6, 1 file) = 1`
+(single-threaded). **The ×6 step to ~336k rows/s at C=6 is INFERRED** — no multi-file FACT scan ever
+completed (all >55 s), so linear scaling is an assumption; if the 6 decodes contend (allocator,
+memory bandwidth, a shared lock) real C=6 throughput is *below* 336k and FACT queries are *even
+slower* than predicted (which only intensifies "reduce rows"). Label it measured-per-core /
+inferred-aggregate.
 
 **The dominant term is scan VOLUME (rows materialized), not cross-region latency and not file
 count.** `files_pruned=0` on every table (no selective predicate is pushed down), so **every row is

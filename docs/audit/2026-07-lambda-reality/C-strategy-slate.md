@@ -21,7 +21,11 @@ This phase changed its mind about the dominant cost twice before landing:
 1. **Per-file request floor** — the epic's `DW_SF01` shape (7,670 tiny files, 39 rows/file). Levers:
    compaction, concurrency, file pruning.
 2. **Cross-region latency** — the deployed data is cross-region (us-east-1 Lambda → us-east-2
-   parquet). A ~1.2 s/table cold constant.
+   parquet). A ~1.2 s/table cold constant. **Honesty note:** the test's parquet is
+   `s3://fl-svl-iceberg-smoke-use2`, a **Fluree-owned smoke bucket** read cross-region via ambient
+   creds — so this ~1.2 s is a **self-inflicted test artifact**, not the customer's cold floor (a
+   real BYO bucket's region is customer-owned; see T3.2). Fixable for the test by moving the smoke
+   bucket to us-east-1 — but it's hygiene, not a product lever.
 3. **Row materialization (the measured truth).** Three completed single-file scans give a **flat
    ≈56,000 rows/s per core** of R2RML materialization across a 26× row range (DIM_ACCOUNT 56,560;
    DIM_GEOGRAPHY 53,210; DIM_CUSTOMER 56,360) — the signature of a **CPU-bound** per-row cost, not
@@ -59,18 +63,26 @@ fact→dim(Product) join on `PRODUCT_KEY`, exactly the family-C `GROUP BY dim at
   1. **T1.3 — DatasetOperator LIMIT/top-k forwarding** (family D, ~11 shapes). A *confirmed* bug
      (A.7), path CONFIRMED: solo routes all chat SPARQL via the dataset path (`handler.rs:787-833`),
      and `DatasetOperator` doesn't forward the row budget, so every chat `LIMIT 20` full-scans.
-     Full-scan → sub-second. The forwarding pattern we've built 3×.
+     Full-scan → sub-second. The forwarding pattern we've built 3×. **→ First step:** mirror
+     `graph.rs:639/647` onto `DatasetOperator` (add `set_row_budget`/`set_topk` forwarding to each
+     member) + a test that a `LIMIT` over a dataset scan caps the scan.
   2. **T1.2 — Manifest-backed info-stats routing** (family E, the runaway). The metadata-only path
      already exists; route the virtual-dataset stats to it. 900 s → sub-second. Consumers are
-     null-safe (O4).
+     null-safe (O4). **→ First step:** at the info dispatch, branch a graph-source-federated committed
+     ledger to `build_graph_source_info` (counts-from-manifest); assert the null-safe consumers.
   3. **T3.1 — Deadline everywhere + cancellation that bites** (safety, all families). Solo attaches
      the timeout to *all* invokes incl. info; engine polls cancellation mid-sweep. Bounds the burn;
-     unconditional prerequisite for async.
+     unconditional prerequisite for async. **→ First step:** solo adds `x-query-timeout-secs` on the
+     `/data-model` invoke; engine adds a `check_cancelled()` in the parquet fan-out loop.
 - **WEEKS (the real ceiling-buster for the majority):**
   4. **T1.1 — Aggregate/GROUP-BY pushdown** (families A/B/C, ~25 shapes — the majority AND the
      killers). Compute the rollup columnar at the scan (aggregate by the FK-key column, join the
      small grouped result to the dim after) instead of materializing every FACT row to RDF. The one
      lever that matches the dominant deployed family. Large, soundness-heavy — the "new strategy."
+     Sub-split: ~5 grouped-COUNT-only (cheaper) + ~20 grouped-SUM/AVG (the real work); ~0 are
+     whole-table COUNT (manifest shortcut serves family E, not these). **→ First step:** prototype the
+     FK-key columnar aggregate on `FACT_ORDER … GROUP BY orderChannel`, gated vs the materialized
+     answer; ship grouped-COUNT-only first.
   5. **T1.5 — Async query pattern** (families A/B/C UX floor). The only near-term user-visible win
      for the grouped-aggregate family until T1.1 lands: return a result eventually instead of a 504.
   6. **T2.3 — Intra-file row-group parallelism** (family-D/A/B single-file tables). Breaks the
@@ -108,7 +120,9 @@ dependencies · does NOT fix · first concrete step.**
   (`graph.rs:639/647`). A dataset-path virtual query is `Project → Limit → DatasetOperator →
   [member: GraphOperator → R2RML scan]`; the LIMIT budget (`limit.rs:85`) dies at the
   `DatasetOperator` and never caps the scan's 512 K-row materialize window (A.7).
-- **Family:** **D** (~11 shapes).
+- **Family:** the budget is lost on **ALL chat SPARQL carrying a LIMIT** (every one takes the dataset
+  path); the **speedup** lands on the **pre-aggregation LIMITs = family D (~11)** — A/B/C's LIMIT is
+  post-aggregation (must aggregate all rows first), so forwarding can't push it into the scan there.
 - **Predicted effect:** a `LIMIT 20` becomes a ~20-row scan → **full scan (≥55 s) → sub-second**.
 - **Owner-surface:** **engine PR** (low — one operator gains two methods + a forwarding test).
 - **Dependencies:** none — the path is CONFIRMED. Solo executes **all** single-ledger chat SPARQL via
@@ -142,29 +156,36 @@ dependencies · does NOT fix · first concrete step.**
 
 ### T1.1 — Aggregate / GROUP-BY pushdown *(the majority ceiling-buster; rank #4, WEEKS)*
 - **Mechanism:** families A/B/C are `COUNT/SUM/AVG … GROUP BY <dim attribute>` with no row filter —
-  unprunable, so the only lever is to **not materialize every row to RDF.** Two sub-families, sized
-  separately:
-  - **(i) whole-table `COUNT(*)`** → Iceberg manifest `record_count` sum (already sound-guarded:
-    `table_row_count` / `sound_manifest_row_count`, `r2rml.rs:843,2212`; the F22 lineage). **Cheap.**
-  - **(ii) grouped `COUNT/SUM/AVG … GROUP BY <dim attr>`** (families A/C — the killers) → the
-    tractable design (P2): the GROUP-BY key is a **dim attribute reached via a fact→dim FK join**, so
-    **aggregate by the FK key COLUMN at the scan** (columnar over the Parquet chunks — count/sum per
-    FK value, **no per-row RDF term construction**), producing a *small* grouped result keyed by FK,
-    **then join that small result to the dim after** to attach the attribute labels. This covers the
-    family without opening generic join-aware pushdown. **Real column-level engine work.**
-- **Family:** **A, B, C** (~25 shapes — the majority and the 55 s/900 s killers).
-- **Predicted effect:** COUNT-class → **sub-second**. Grouped SUM/AVG → bounded by column-chunk
-  decode of the *aggregated + FK* columns only, not all columns × all rows to terms — removes the
-  336k-rows/s materialization term for the exact dominant family. Not sub-second for
-  extreme-cardinality GROUP BY, but the FACT killers drop from ~107–590 s to seconds.
-- **Owner-surface:** **engine PR — large** (the COUNT slice is moderate; the columnar grouped
-  aggregate + post-join is the real work). Risk: soundness (deletes, nulls, decimal), and the
-  fall-back boundary when the shape isn't a clean fact→dim FK aggregate.
+  unprunable, so the only lever is to **not materialize every row to RDF.** **Sub-family split
+  (hook-3 answer, from the 39 shapes) — and the key honesty note:**
+  - **Whole-table `COUNT(*)` (no GROUP BY)** → Iceberg manifest `record_count` sum, truly zero-read
+    (`table_row_count` / `sound_manifest_row_count`, `r2rml.rs:843,2212`; the F22 lineage). **BUT
+    ~0 of the deployed A/B/C rollups are whole-table** — they **all** `GROUP BY`, and a manifest
+    `record_count` **cannot** answer `COUNT(?o) GROUP BY <key>` (no per-group cardinality) or any
+    `SUM/AVG` (O1). So the cheap manifest shortcut serves **family E** (`get_data_model` whole-table
+    counts, = T1.2) and bare `COUNT(*)`, **not** the grouped chat rollups.
+  - **Grouped `COUNT`-only** (~5, family B: `COUNT … GROUP BY <key>`) → count rows per group-key
+    column at the scan (columnar, **no value-column decode** — cheaper half).
+  - **Grouped `SUM/AVG`** (~20, families A ~15 + C ~5: the killers, e.g. `SUM(?orderTotal) GROUP BY
+    ?orderChannel`) → the P2 design: the GROUP-BY key is a **dim attribute reached via a fact→dim FK
+    join**, so **aggregate by the FK-key COLUMN at the scan** (columnar over Parquet chunks — sum/avg
+    per FK value, **no per-row RDF term construction**) → a *small* grouped result keyed by FK →
+    **join that to the dim after** for the attribute labels. Covers the family without generic
+    join-aware pushdown. **The real column-level engine work.**
+- **Family:** **A, B, C** (~25 shapes). Manifest-cheap covers **~0** of them; **all ~25** need the
+  columnar aggregate (~5 count-only + ~20 sum/avg).
+- **Predicted effect:** grouped aggregate → bounded by column-chunk decode of the *aggregated + FK*
+  columns only, not all columns × all rows to terms — removes the 336k-rows/s materialization term
+  for the dominant family; the FACT killers drop from ~107–590 s toward seconds. Not sub-second for
+  extreme-cardinality GROUP BY.
+- **Owner-surface:** **engine PR — large** (grouped-COUNT-only is the moderate first slice; the
+  SUM/AVG columnar aggregate + post-join over ~20 shapes is the real work). Risk: soundness (deletes,
+  nulls, decimal), and the fall-back boundary when the shape isn't a clean fact→dim FK aggregate.
 - **Dependencies:** extends PR-6/F22 machinery.
 - **Does NOT fix:** family D (projection, not aggregate); E (use T1.2); queries needing row values.
-- **First concrete step:** confirm from the 39 shapes how many of the ~25 are pure `COUNT` (cheap,
-  ship first) vs `SUM/AVG` (the columnar work), then prototype the FK-key columnar aggregate on one
-  family-C shape (FACT_ORDER `GROUP BY orderChannel`) and gate it against the materialized answer.
+- **First concrete step:** prototype the FK-key columnar aggregate on one family-C shape (FACT_ORDER
+  `COUNT/SUM GROUP BY orderChannel`), gated against the materialized answer; ship grouped-COUNT-only
+  (~5) first as the cheaper slice.
 
 ### T1.5 — Async query pattern *(UX floor for the killers; rank #5, WEEKS)* — RAISED per O1.3
 - **Mechanism:** for known-heavy shapes (family C, `get_data_model`), return a job id + poll/stream
@@ -333,11 +354,15 @@ unlock-per-cost and rides the same engine work as T1.2.
 
 ---
 
-# Open items for the record (evidence gaps, not conclusions)
-- **T1.3 path — CONFIRMED, no longer open:** solo routes all single-ledger chat SPARQL via the
-  dataset path (`handler.rs:787-833`), so the `DatasetOperator` gap bites every LIMIT-carrying chat
-  query (8 M-row `LIMIT 20` full scan = smoking gun). Rank #1 is de-risked.
-- **The 336k aggregate is inferred** (O3): no multi-file FACT completed; if the 6 decodes contend,
-  FACT queries are slower than predicted — which only strengthens Tier 1.
-- **T1.1 sub-family split:** how many of the ~25 A/B/C shapes are pure COUNT (cheap) vs SUM/AVG (the
-  columnar work) — sizes the WEEKS effort.
+# Open items for the record
+Both prior open items are now **CLOSED**:
+- **T1.3 path — CONFIRMED:** solo routes all single-ledger chat SPARQL via the dataset path
+  (`handler.rs:787-833`), so the `DatasetOperator` gap bites every LIMIT-carrying chat query (8 M-row
+  `LIMIT 20` full scan = smoking gun). Rank #1 de-risked.
+- **T1.1 sub-family split — ANSWERED (T1.1):** ~0 whole-table COUNT (all rollups GROUP BY, so the
+  manifest shortcut serves family E, not them); ~5 grouped-COUNT-only (count per key, cheaper) + ~20
+  grouped-SUM/AVG (the columnar FK-key aggregate — the real WEEKS work).
+
+One genuine residual (an inference, not a gap):
+- **The 336k aggregate is inferred** (O3): no multi-file FACT completed under budget; if the 6 decodes
+  contend, FACT queries are slower than predicted — which only strengthens Tier 1.
