@@ -2121,9 +2121,18 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         let concurrency = iceberg_scan_concurrency(tasks.len());
+        // T2.3: split the vCPU budget between the file-level fan-out and per-file
+        // row-group parallelism. A single-file table (file concurrency 1) grants
+        // all cores to its row groups; a many-file scan (file concurrency already
+        // ≈ cores) grants 1 — no oversubscription. Deterministic integer division.
+        let rowgroup_concurrency = (std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            / concurrency)
+            .max(1);
         debug!(
             files = tasks.len(),
-            concurrency, "streaming Parquet files (bounded parallel)"
+            concurrency, rowgroup_concurrency, "streaming Parquet files (bounded parallel)"
         );
 
         let stream = futures::stream::iter(tasks)
@@ -2151,7 +2160,8 @@ impl FlureeR2rmlProvider<'_> {
                             footers.as_ref(),
                             &disk_cache,
                             &cache_dir,
-                        );
+                        )
+                        .with_rowgroup_concurrency(rowgroup_concurrency);
                         reader
                             .read_task(&task)
                             .instrument(read_span)
