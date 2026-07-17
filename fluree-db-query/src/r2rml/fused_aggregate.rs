@@ -1218,6 +1218,22 @@ impl Operator for FusedR2rmlAggregateOperator {
     }
 }
 
+/// C5 slice-1 MANDATORY soundness guard: whether ANY participating R2RML pattern
+/// (the aggregated fact AND every joined dim) carries a `star_constraints` entry —
+/// a constant-object member the rewrite folded into the pattern (e.g.
+/// `?c ex:isCurrent true` → `star_constraints=[(IS_CURRENT, true)]`, `rewrite.rs:344`).
+/// The fused fold reads only the GROUP-BY/aggregate/validity columns + the SPARQL
+/// FILTER; it has NO star_constraints handling (`grep star_constraints
+/// fused_aggregate.rs` = 0), while the normal scan DOES apply them
+/// (`operator.rs:524/1719/…`). So a fused plan over a constrained pattern would
+/// silently IGNORE the constraint and OVER-COUNT. Declining here keeps the fold
+/// sound; slice 1.5 teaches the fold to apply the constraint and lifts this for
+/// that shape. This is also a *current* correctness fix: any COUNT-over-a-flagged-
+/// star that reaches the fused path today over-counts.
+fn fold_over_star_constraints(pats: &[&R2rmlPattern]) -> bool {
+    pats.iter().any(|p| !p.star_constraints.is_empty())
+}
+
 impl FusedR2rmlAggregateOperator {
     /// Rewrite inner triples → R2RML at `open` and resolve column folds.
     async fn resolve_at_open(&self, ctx: &ExecutionContext<'_>) -> Result<Option<Resolved>> {
@@ -1281,6 +1297,13 @@ impl FusedR2rmlAggregateOperator {
             }
             _ => return Ok(None), // join sub-switch off, or non-R2rml pattern
         };
+
+        // C5 slice-1 MANDATORY guard: a folded constant-object constraint
+        // (star_constraints, e.g. `?c ex:isCurrent true`) on the single-table
+        // pattern is NOT applied by the fold and would OVER-COUNT. Decline.
+        if fold_over_star_constraints(&[&pattern]) {
+            return Ok(None);
+        }
 
         // The graph is genuinely R2RML-backed here; without the mapping fall back
         // to the normal path (which surfaces any real load error).
@@ -1594,6 +1617,14 @@ impl FusedR2rmlAggregateOperator {
         if self.filter.is_some() {
             return Ok(None);
         }
+        // C5 slice-1 MANDATORY guard (broadened to EVERY participating map): any
+        // fact- or dim-side folded constant-object constraint (star_constraints) is
+        // unhandled by this join fold and would OVER-COUNT — the q029 eventType
+        // family carries fact-side constant-object constraints; a dim-side flag has
+        // the same shape. Decline.
+        if fold_over_star_constraints(pats) {
+            return Ok(None);
+        }
         // Order the patterns into a linear `fact → dim1 → … → dimk` chain (single
         // ref-join per hop, no branch, no cycle). `join_vars[h]` is dim_{h+1}'s
         // subject var — the object bound by the hop-`h` RefObjectMap.
@@ -1867,6 +1898,37 @@ impl FusedR2rmlAggregateOperator {
 mod tests {
     use super::*;
     use crate::ir::grouping::AggregateSpec;
+
+    /// C5 slice-1 over-count TRIPWIRE: a participating R2RML pattern carrying a
+    /// folded constant-object constraint (`star_constraints`, e.g.
+    /// `?c ex:isCurrent true`) must DECLINE the fuse — the fused fold has no
+    /// star_constraints handling and would over-count. Red under a hypothetical
+    /// unguarded fuse, green with `fold_over_star_constraints`; also the guard
+    /// against slice 1.5 silently lifting it.
+    #[test]
+    fn fold_over_star_constraints_declines_a_constrained_pattern() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let plain = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)))
+            .with_predicate("http://ex/gender");
+        assert!(
+            !fold_over_star_constraints(&[&plain]),
+            "no constraint → foldable"
+        );
+
+        let mut constrained = plain.clone();
+        constrained.star_constraints = vec![(
+            "IS_CURRENT".to_string(),
+            ObjectConstant::Scalar(ScanValue::Bool(true)),
+        )];
+        assert!(
+            fold_over_star_constraints(&[&constrained]),
+            "a folded `isCurrent true` constraint must decline the fuse (else over-count)"
+        );
+        // Fires if ANY participating map is constrained (the aggregated fact OR a
+        // joined dim) — the broadened guard.
+        assert!(fold_over_star_constraints(&[&plain, &constrained]));
+        assert!(!fold_over_star_constraints(&[&plain, &plain]));
+    }
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::{Query, QueryOutput, ReasoningConfig};
     use fluree_db_core::Sid;
