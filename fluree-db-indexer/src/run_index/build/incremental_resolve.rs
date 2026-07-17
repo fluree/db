@@ -139,6 +139,14 @@ pub struct IncrementalNovelty {
     pub records: Vec<RunRecordV2>,
     /// Parallel ops array: 1=assert, 0=retract. Same length as `records`.
     pub ops: Vec<u8>,
+    /// Events superseded by lifecycle dedup: an identity's intermediate
+    /// steps, dropped from `records`. Routed to the leaf merges, which
+    /// record the ones that were real state transitions as history-sidecar
+    /// entries. Every superseded event's identity has a winner in
+    /// `records`.
+    pub superseded: Vec<RunRecordV2>,
+    /// Parallel ops array for `superseded`: 1=assert, 0=retract.
+    pub superseded_ops: Vec<u8>,
     /// The decoded base root (needed by downstream phases).
     pub base_root: IndexRoot,
     /// Updated resolver state.
@@ -547,6 +555,8 @@ pub async fn resolve_incremental_commits_v6(
         return Ok(IncrementalNovelty {
             records: Vec::new(),
             ops: Vec::new(),
+            superseded: Vec::new(),
+            superseded_ops: Vec::new(),
             base_root: root,
             shared,
             updated_watermarks: base_subject_watermarks,
@@ -672,13 +682,14 @@ pub async fn resolve_incremental_commits_v6(
     //      is resolved to its final state here.
     let t0 = Instant::now();
     let event_count = v1_records.len();
-    let v1_records = dedup_fact_lifecycles(v1_records, &o_type_registry);
+    let (v1_records, v1_superseded) = dedup_fact_lifecycles(v1_records, &o_type_registry);
     let t_dedup_ms = t0.elapsed().as_millis() as u64;
     let deduped_count = event_count - v1_records.len();
     if deduped_count > 0 {
         tracing::debug!(
             event_count,
             deduped_count,
+            superseded_count = v1_superseded.len(),
             "V6 incremental resolve: deduped fact lifecycles (set semantics)"
         );
     }
@@ -690,6 +701,12 @@ pub async fn resolve_incremental_commits_v6(
     for v1 in &v1_records {
         records.push(RunRecordV2::from_v1(v1, &o_type_registry));
         ops.push(v1.op);
+    }
+    let mut superseded = Vec::with_capacity(v1_superseded.len());
+    let mut superseded_ops = Vec::with_capacity(v1_superseded.len());
+    for v1 in &v1_superseded {
+        superseded.push(RunRecordV2::from_v1(v1, &o_type_registry));
+        superseded_ops.push(v1.op);
     }
     let t_convert_ms = t0.elapsed().as_millis() as u64;
 
@@ -718,6 +735,8 @@ pub async fn resolve_incremental_commits_v6(
     Ok(IncrementalNovelty {
         records,
         ops,
+        superseded,
+        superseded_ops,
         base_root: root,
         shared,
         new_subjects: reconcile.new_subjects,
@@ -774,21 +793,27 @@ type ResolvedIdentity = (u16, u32);
 /// `o_type`), so `dt`/`lang` variants of one fact dedup together while
 /// distinct language tags and list positions stay distinct.
 ///
-/// Input must be sorted by `(g_id, SPOT)`; output preserves that order.
-/// Compacts in place behind a write cursor — winners are always a subset of
-/// already-read input, so the stream-dominant case (every group a single
-/// event) copies nothing and allocates nothing.
+/// Input must be sorted by `(g_id, SPOT)`; winner output preserves that
+/// order. Compacts in place behind a write cursor — winners are always a
+/// subset of already-read input, so the stream-dominant case (every group a
+/// single event) copies nothing and allocates nothing.
 ///
-/// Dropped intermediate transitions do not reach the history sidecars, so
-/// index-served time travel cannot see a state a fact held only *within*
-/// this window (e.g. a fact asserted and retracted between two index builds
-/// has no lived interval in the index; `merge_novelty` records no history
-/// for its final retract). The live novelty view retains those intermediate
-/// ops until the window is indexed.
-fn dedup_fact_lifecycles(mut records: Vec<RunRecord>, o_types: &OTypeRegistry) -> Vec<RunRecord> {
+/// Superseded events — a winner replaced by a later op of the same identity —
+/// are returned as **transition superseded** (`op` embedded in each record,
+/// per identity in chronological order). They carry the intermediate
+/// lifecycle steps the winner stream collapses away; `merge_novelty` turns
+/// the ones that were real state transitions into history-sidecar entries so
+/// index-served time travel can see states a fact held only within this
+/// window. No-op re-asserts and same-`t` losers are discarded outright: they
+/// transition nothing anywhere.
+fn dedup_fact_lifecycles(
+    mut records: Vec<RunRecord>,
+    o_types: &OTypeRegistry,
+) -> (Vec<RunRecord>, Vec<RunRecord>) {
     let len = records.len();
     let mut write = 0;
     let mut start = 0;
+    let mut superseded: Vec<RunRecord> = Vec::new();
     // Scratch for multi-record groups, reused across groups.
     let mut keyed: Vec<(ResolvedIdentity, RunRecord)> = Vec::new();
 
@@ -806,7 +831,7 @@ fn dedup_fact_lifecycles(mut records: Vec<RunRecord>, o_types: &OTypeRegistry) -
             }
             write += 1;
         } else {
-            dedup_group(&records[start..end], o_types, &mut keyed);
+            dedup_group(&records[start..end], o_types, &mut keyed, &mut superseded);
             for &(_, winner) in &keyed {
                 records[write] = winner;
                 write += 1;
@@ -816,11 +841,12 @@ fn dedup_fact_lifecycles(mut records: Vec<RunRecord>, o_types: &OTypeRegistry) -
     }
 
     records.truncate(write);
-    records
+    (records, superseded)
 }
 
 /// Dedup one multi-record sort-prefix group, leaving the per-identity winners
-/// in `keyed` in comparator order (`dt`, `t`, `op`).
+/// in `keyed` in comparator order (`dt`, `t`, `op`) and appending superseded
+/// events to `superseded`.
 ///
 /// The group is keyed by resolved V2 identity and sorted by
 /// `(identity, t, op)` first: the incoming `(g_id, SPOT)` order interleaves
@@ -830,6 +856,7 @@ fn dedup_group(
     group: &[RunRecord],
     o_types: &OTypeRegistry,
     keyed: &mut Vec<(ResolvedIdentity, RunRecord)>,
+    superseded: &mut Vec<RunRecord>,
 ) {
     keyed.clear();
     keyed.extend(group.iter().map(|&rec| {
@@ -848,7 +875,8 @@ fn dedup_group(
             .then(a.1.op.cmp(&b.1.op))
     });
 
-    // Compact each identity run to its winner, in place.
+    // Compact each identity run to its winner, in place. Replaced winners
+    // are the identity's intermediate lifecycle steps → superseded.
     let mut w = 0;
     for r in 1..keyed.len() {
         if keyed[r].0 != keyed[w].0 {
@@ -862,6 +890,7 @@ fn dedup_group(
         let noop_reassert = rec.op == 1 && winner.op == 1;
         let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
         if !noop_reassert && !same_t_retract_wins {
+            superseded.push(*winner);
             *winner = rec;
         }
     }
@@ -1620,6 +1649,10 @@ mod tests {
     }
 
     fn dedup(records: Vec<RunRecord>) -> Vec<RunRecord> {
+        dedup_fact_lifecycles(records, &OTypeRegistry::builtin_only()).0
+    }
+
+    fn dedup_with_superseded(records: Vec<RunRecord>) -> (Vec<RunRecord>, Vec<RunRecord>) {
         dedup_fact_lifecycles(records, &OTypeRegistry::builtin_only())
     }
 
@@ -1753,6 +1786,48 @@ mod tests {
             keys(&[stray]),
             "first assert wins; lang ignored"
         );
+    }
+
+    /// Superseded lifecycle steps come back as transition superseded in
+    /// chronological order; discarded no-ops do not.
+    #[test]
+    fn superseded_events_are_surfaced() {
+        // assert@3 superseded by retract@4, superseded by assert@5.
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 3, OP_ASSERT),
+            rec(1, 1, 10, 4, OP_RETRACT),
+            rec(1, 1, 10, 5, OP_ASSERT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+        assert_eq!(
+            keys(&superseded),
+            keys(&[rec(1, 1, 10, 3, OP_ASSERT), rec(1, 1, 10, 4, OP_RETRACT)])
+        );
+    }
+
+    /// No-op re-asserts are discarded outright, not surfaced as superseded:
+    /// they transition nothing in any base state.
+    #[test]
+    fn noop_reasserts_are_discarded() {
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 5, OP_ASSERT),
+            rec(1, 1, 10, 6, OP_ASSERT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+        assert!(superseded.is_empty());
+    }
+
+    /// A superseded repeat retract is surfaced: whether it or the winner
+    /// was the real transition into absence depends on base state, which the
+    /// leaf merge resolves.
+    #[test]
+    fn superseded_repeat_retract_is_surfaced() {
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 5, OP_RETRACT),
+            rec(1, 1, 10, 6, OP_RETRACT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+        assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
     }
 
     /// In-place compaction: records after a collapsed group shift backward
