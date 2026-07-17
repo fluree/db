@@ -1448,6 +1448,29 @@
       "timeout_s": 120,
       "subsets": [],
       "exec_path": "from"
+    },
+    {
+      "id": "q064",
+      "file": "queries/q064_products_by_category_shared_predicate_dataset.rq",
+      "bi_question": "How many products are in each category? (E1 shared-predicate class-fusion; mirrors deployed Product-by-category)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_PRODUCT"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        60
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }
