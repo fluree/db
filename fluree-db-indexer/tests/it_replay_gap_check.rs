@@ -1,8 +1,9 @@
-//! End-to-end reachability check for the history-sidecar fidelity gaps
-//! described in `history-transition-log-plan.md`: drives the real pipeline
-//! (post-dedup winner stream → `update_branch` merge → sidecar encode →
-//! `replay_leaflet`) and asserts the TRUE historical state, so a failure
-//! here is a live wrong `AS OF` answer served from the index.
+//! End-to-end regression tests for the history-sidecar transition-log
+//! rework (`history-transition-log-plan.md`): drives the real pipeline
+//! (post-dedup winner + superseded streams → `update_branch` merge →
+//! sidecar encode → `replay_leaflet`) and asserts the true historical
+//! state, so a failure here is a live wrong `AS OF` answer served from
+//! the index.
 
 use std::collections::HashMap;
 
@@ -132,10 +133,10 @@ fn present_at(leaf_bytes: &[u8], sidecar_bytes: &[u8], t_target: i64, s_id: u64)
     (0..view.row_count).any(|i| view.s_id.get(i) == s_id)
 }
 
-/// Gap 2: fact present since t=1, deleted at t=4 and re-added at t=6 within
-/// one indexing window. The dedup resolves the window to the lone re-assert
-/// (assert@6), and the merge writes a synthesized retract+assert pair at t=6.
-/// Truth: the fact was ABSENT during [4, 6).
+/// Fact present since t=1, deleted at t=4 and re-added at t=6 within one
+/// indexing window. The superseded retract and the winning assert are both
+/// real transitions, so the sidecar records them (and no retract+assert pair
+/// is synthesized): the fact is absent during [4, 6).
 #[test]
 fn deleted_then_readded_fact_is_absent_during_the_gap() {
     let base = vec![int_rec(10, 100, 1)];
@@ -155,10 +156,9 @@ fn deleted_then_readded_fact_is_absent_during_the_gap() {
     );
 }
 
-/// Gap 1: fact created at t=5 and deleted at t=6 within one indexing window.
-/// The dedup resolves the window to the lone retract, which (by design after
-/// the phantom-retract fix) writes no row and no history. Truth: the fact
-/// was PRESENT during [5, 6).
+/// Fact created at t=5 and deleted at t=6 within one indexing window. No
+/// row survives, but both events are real transitions recorded in the
+/// sidecar, so the fact's brief life stays visible: present during [5, 6).
 #[test]
 fn fact_born_and_deleted_in_one_window_is_present_during_its_life() {
     let base = vec![int_rec(5, 50, 1)];
@@ -181,10 +181,10 @@ fn fact_born_and_deleted_in_one_window_is_present_during_its_life() {
     );
 }
 
-/// Gap 3: fact present since t=1, deleted at t=5, and (redundantly) deleted
-/// again at t=6 within one window. The dedup keeps the highest-t retract
-/// (novelty parity for current state), so the sidecar records the deletion
-/// at t=6. Truth: the fact was ABSENT from t=5 on.
+/// Fact present since t=1, deleted at t=5, and (redundantly) deleted again
+/// at t=6 within one window. The transition into absence is the FIRST
+/// retract, so the sidecar records the deletion at t=5 and the repeat is a
+/// no-op: the fact is absent from t=5 on.
 #[test]
 fn double_deleted_fact_is_absent_from_the_first_delete() {
     let base = vec![int_rec(5, 50, 1), int_rec(10, 100, 1)];

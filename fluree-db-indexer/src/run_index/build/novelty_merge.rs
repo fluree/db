@@ -13,7 +13,7 @@
 
 use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+use fluree_db_binary_index::format::run_record_v2::{same_identity_v2, RunRecordV2};
 use fluree_db_binary_index::read::column_types::ColumnBatch;
 use fluree_db_core::subject_id::SubjectId;
 use std::cmp::Ordering;
@@ -281,17 +281,34 @@ fn dedup_adjacent_asserts(entries: &mut Vec<HistEntryV2>) {
 /// Walks the existing batch rows and novelty cursors together in sort order:
 ///
 /// - **Existing < Novelty**: Emit existing row unchanged.
-/// - **Novelty < Existing**:
-///   - Assert: Emit novelty to output; record in history.
-///   - Retract: Skip entirely — no row and no history entry. The fact was
-///     never materialized in this leaf, so the retraction is not a state
-///     transition; the history sidecar is a transition log (replay undoes a
-///     retract entry by marking the fact present before it), and a bare
-///     retract entry makes replay fabricate the fact's presence at every
-///     `t` before the retraction.
-/// - **Same identity** (Equal):
-///   - Assert: Emit novelty (update); record retraction of old + new assert in history.
-///   - Retract: Omit from output; record retraction in history.
+/// - **Novelty < Existing** (base-absent):
+///   - Assert winner: emit the novelty row; its lifecycle's real
+///     transitions are recorded (a lone assert is one transition).
+///   - Retract winner: no row. A lone retract of a never-materialized fact
+///     is not a transition and records nothing — a bare retract entry would
+///     make replay fabricate the fact's presence at every `t` before the
+///     retraction. A superseded in-window assert, though, makes both it and
+///     the retract real transitions, so a fact born and deleted within one
+///     window keeps its lived interval visible to replay.
+/// - **Same identity** (Equal, base-present):
+///   - Assert winner: emit novelty row (replacement). With no real
+///     transitions — a plain re-assert of a continuously-present fact — the
+///     replacement is encoded as a synthesized same-`t` retract+assert pair,
+///     which is how replay reads "row replaced while present". When real
+///     transitions exist (an in-window retract preceded the assert), the
+///     real events are recorded instead and no pair is synthesized.
+///   - Retract winner: omit the row; the transition into absence carries the
+///     `t` of the first retract of the final retracted run (a superseded
+///     earlier retract rather than the winner, when both exist).
+///
+/// History entries are derived per identity by walking its full in-window
+/// event sequence — superseded events plus the winner, chronologically —
+/// from the identity's base presence (`Equal`: present, `Greater`/drain:
+/// absent). Each op that changes state records an entry; an op that repeats
+/// the current state (re-assert of a present fact, retract of an absent
+/// one) is a no-op and records nothing. This keeps the sidecar a strict
+/// transition log, which is the invariant `replay_leaflet`'s undo-walk
+/// depends on.
 ///
 /// After the walk, assembles history as `new_history ++ existing_history`
 /// (newest first), with adjacent duplicate-assert dedup.
@@ -315,6 +332,9 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
 
     let mut ei = 0usize; // existing row index
     let mut ni = 0usize; // novelty index
+    let mut si = 0usize; // superseded index
+                         // Scratch: one identity's full event sequence, reused across identities.
+    let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
 
     while ei < existing_len && ni < novelty_len {
         let nov = &input.novelty[ni];
@@ -328,30 +348,33 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
                 ei += 1;
             }
             Ordering::Greater => {
-                // Novelty comes first (not in existing data). A retract of a
-                // fact this leaf never materialized is not a transition and
-                // records no history (see the doc comment above).
+                // Novelty comes first (not in existing data): base-absent.
+                gather_identity_events(input, &mut si, nov, op, &mut events);
+                push_transition_entries(&mut events, false, &mut new_history);
                 if op == 1 {
                     out.push(*nov);
-                    new_history.push(record_to_hist_entry(nov, op));
                 }
                 ni += 1;
             }
             Ordering::Equal => {
-                // Same fact identity.
+                // Same fact identity: base-present.
                 matched.push(*nov);
+                gather_identity_events(input, &mut si, nov, op, &mut events);
+                let transitions = push_transition_entries(&mut events, true, &mut new_history);
                 if op == 1 {
-                    // Assert (update): emit novelty, record retraction of old + new assert.
                     out.push(*nov);
-                    // Retraction of old value: same identity columns as the old row,
-                    // but t = the novelty's t (the retraction occurs at the transaction
-                    // that caused it, not the old row's assertion time).
-                    let mut retract_entry = batch_row_to_hist_entry(input.batch, ei, 0);
-                    retract_entry.t = nov.t;
-                    new_history.push(retract_entry);
+                    if transitions == 0 {
+                        // Plain re-assert of a continuously-present fact: the
+                        // row is replaced but state never changed. Encode the
+                        // replacement as a retract of the old row + the new
+                        // assert, both at the novelty's `t` — replay's
+                        // representation of "row replaced while present".
+                        let mut retract_entry = batch_row_to_hist_entry(input.batch, ei, 0);
+                        retract_entry.t = nov.t;
+                        new_history.push(retract_entry);
+                        new_history.push(record_to_hist_entry(nov, op));
+                    }
                 }
-                // Record the novelty operation itself.
-                new_history.push(record_to_hist_entry(nov, op));
                 ei += 1;
                 ni += 1;
             }
@@ -365,16 +388,23 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
     }
 
     // Drain remaining novelty. Same rule as the Greater arm: these identities
-    // have no base row, so only asserts transition state and record history.
+    // have no base row, so their lifecycles walk from absent.
     while ni < novelty_len {
         let nov = &input.novelty[ni];
         let op = input.novelty_ops[ni];
+        gather_identity_events(input, &mut si, nov, op, &mut events);
+        push_transition_entries(&mut events, false, &mut new_history);
         if op == 1 {
             out.push(*nov);
-            new_history.push(record_to_hist_entry(nov, op));
         }
         ni += 1;
     }
+
+    debug_assert_eq!(
+        si,
+        input.superseded.len(),
+        "every superseded event's identity must have a winner in this leaflet's novelty"
+    );
 
     let history = assemble_history(new_history, input.existing_history);
     MergeOutput {
@@ -382,6 +412,50 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
         history,
         matched,
     }
+}
+
+/// Collect one identity's superseded events plus its winner into `events`,
+/// advancing the superseded cursor past the consumed entries. Superseded
+/// events sort adjacent to their winner (same identity, same order), so a
+/// linear scan from the cursor suffices.
+fn gather_identity_events(
+    input: &MergeInput<'_>,
+    si: &mut usize,
+    nov: &RunRecordV2,
+    op: u8,
+    events: &mut Vec<(RunRecordV2, u8)>,
+) {
+    events.clear();
+    while *si < input.superseded.len() && same_identity_v2(&input.superseded[*si], nov) {
+        events.push((input.superseded[*si], input.superseded_ops[*si]));
+        *si += 1;
+    }
+    events.push((*nov, op));
+}
+
+/// Walk one identity's in-window events chronologically from its base
+/// presence, recording a history entry for each real state transition. Ops
+/// that repeat the current state are no-ops and record nothing. Returns the
+/// number of entries recorded.
+fn push_transition_entries(
+    events: &mut [(RunRecordV2, u8)],
+    base_present: bool,
+    new_history: &mut Vec<HistEntryV2>,
+) -> usize {
+    // Same-`t` tie: retract sorts first, matching the same-`t` retract-wins
+    // resolution used by the dedup and the query overlay.
+    events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
+    let mut present = base_present;
+    let mut recorded = 0;
+    for &(rec, op) in events.iter() {
+        let asserts = op == 1;
+        if asserts != present {
+            new_history.push(record_to_hist_entry(&rec, op));
+            present = asserts;
+            recorded += 1;
+        }
+    }
+    recorded
 }
 
 /// Reconstitute `Vec<RunRecordV2>` from a `ColumnBatch`.
@@ -542,6 +616,133 @@ mod tests {
         assert_eq!(out.history[0].op, 0); // retract first (same t, op=0 < op=1)
         assert_eq!(out.history[1].t, 5);
         assert_eq!(out.history[1].op, 1); // then assert
+    }
+
+    fn hist_events(out: &MergeOutput) -> Vec<(u64, u32, u8)> {
+        let mut events: Vec<(u64, u32, u8)> = out
+            .history
+            .iter()
+            .map(|e| (e.s_id.as_u64(), e.t, e.op))
+            .collect();
+        events.sort_unstable();
+        events
+    }
+
+    /// Delete-then-re-add of a base-present fact in one window: the real
+    /// transitions (retract@4, assert@6) are recorded and no retract+assert
+    /// pair is synthesized — the synthesized pair would encode "present
+    /// before 6", which is false during the gap.
+    #[test]
+    fn test_merge_superseded_retract_suppresses_synth_pair() {
+        let existing = vec![rec2(1, 1, 10, 1)];
+        let batch = batch_from_records(&existing);
+        let novelty = vec![rec2(1, 1, 10, 6)];
+        let ops = vec![1u8];
+        let superseded = vec![rec2(1, 1, 10, 4)];
+        let superseded_ops = vec![0u8];
+        let mut input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+        input.superseded = &superseded;
+        input.superseded_ops = &superseded_ops;
+
+        let out = merge_novelty(&input);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].t, 6);
+        assert_eq!(
+            hist_events(&out),
+            vec![(1, 4, 0), (1, 6, 1)],
+            "real transitions only; no synthesized retract at t=6"
+        );
+    }
+
+    /// A fact born and deleted within one window (base-absent): both events
+    /// are real transitions, so its lived interval stays visible to replay
+    /// even though no row survives.
+    #[test]
+    fn test_merge_superseded_assert_keeps_lived_interval() {
+        let existing = vec![rec2(5, 1, 50, 1)];
+        let batch = batch_from_records(&existing);
+        let novelty = vec![rec2(10, 1, 100, 6)];
+        let ops = vec![0u8];
+        let superseded = vec![rec2(10, 1, 100, 5)];
+        let superseded_ops = vec![1u8];
+        let mut input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+        input.superseded = &superseded;
+        input.superseded_ops = &superseded_ops;
+
+        let out = merge_novelty(&input);
+        assert_eq!(out.records.len(), 1, "only the padding row survives");
+        assert_eq!(
+            hist_events(&out),
+            vec![(10, 5, 1), (10, 6, 0)],
+            "assert and retract are both recorded transitions"
+        );
+    }
+
+    /// Repeat retracts of a base-present fact: the transition into absence
+    /// is the FIRST retract; the later winner retract is a no-op against
+    /// already-absent state and records nothing.
+    #[test]
+    fn test_merge_repeat_retract_records_first_retract_t() {
+        let existing = vec![rec2(1, 1, 10, 1)];
+        let batch = batch_from_records(&existing);
+        let novelty = vec![rec2(1, 1, 10, 6)];
+        let ops = vec![0u8];
+        let superseded = vec![rec2(1, 1, 10, 5)];
+        let superseded_ops = vec![0u8];
+        let mut input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+        input.superseded = &superseded;
+        input.superseded_ops = &superseded_ops;
+
+        let out = merge_novelty(&input);
+        assert!(out.records.is_empty());
+        assert_eq!(
+            hist_events(&out),
+            vec![(1, 5, 0)],
+            "absence began at t=5; the t=6 repeat is a no-op"
+        );
+    }
+
+    /// A superseded no-op re-assert of a base-present fact records nothing;
+    /// the following retract is the only transition.
+    #[test]
+    fn test_merge_superseded_noop_reassert_is_discarded() {
+        let existing = vec![rec2(1, 1, 10, 1)];
+        let batch = batch_from_records(&existing);
+        let novelty = vec![rec2(1, 1, 10, 6)];
+        let ops = vec![0u8];
+        let superseded = vec![rec2(1, 1, 10, 5)];
+        let superseded_ops = vec![1u8];
+        let mut input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+        input.superseded = &superseded;
+        input.superseded_ops = &superseded_ops;
+
+        let out = merge_novelty(&input);
+        assert!(out.records.is_empty());
+        assert_eq!(
+            hist_events(&out),
+            vec![(1, 6, 0)],
+            "the re-assert of a present fact transitions nothing"
+        );
+    }
+
+    /// Superseded events for identities past the last existing row are
+    /// consumed by the drain loop with base-absent semantics.
+    #[test]
+    fn test_merge_superseded_in_drain_loop() {
+        let existing = vec![rec2(1, 1, 10, 1)];
+        let batch = batch_from_records(&existing);
+        // Identity s=5 sorts after every existing row.
+        let novelty = vec![rec2(5, 1, 50, 6)];
+        let ops = vec![0u8];
+        let superseded = vec![rec2(5, 1, 50, 5)];
+        let superseded_ops = vec![1u8];
+        let mut input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
+        input.superseded = &superseded;
+        input.superseded_ops = &superseded_ops;
+
+        let out = merge_novelty(&input);
+        assert_eq!(out.records.len(), 1, "only the existing row survives");
+        assert_eq!(hist_events(&out), vec![(5, 5, 1), (5, 6, 0)]);
     }
 
     /// Equal-arm ops (assert or retract of a base-present fact) are reported
