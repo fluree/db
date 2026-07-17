@@ -369,3 +369,207 @@ round-trip latency, not CPU** — so concurrency is a direct multiplier on the f
 5. Real `available_parallelism()` value inside the 10 GB Lambda (X-Ray / probe). (§4)
 6. Is `FLUREE_DISK_CACHE_BUDGET_BYTES=8GiB` right for a 10 GB `/tmp` given it is **shared** by
    Parquet + binary index, with the catalog cache's 512 MiB **on top**? (§1a/§1b)
+
+---
+
+# Appendix — Lever arithmetic (predictions, not remedies)
+
+Everything below is **arithmetic prediction**, not measurement and **not a remedy commitment**.
+It exists to make Track C's slate quantitative and to give the adversarial pass concrete
+parameters to attack. Each lever recomputes the same decomposed wall model with one term changed;
+the "does NOT fix" line under each is as load-bearing as the headline number.
+
+## A.1 The parametric wall model
+
+For one query on a **cold container**, wall ≈ Σ over touched tables of:
+
+```
+  T_catalog(table)              cold catalog chain: loadTable GET + metadata + manifest→scanfiles
++ T_sweep(F, C) = F / C × L     fetch F selected data files, C-at-a-time, per-file cold S3 GET = L
++ T_materialize                 row-count-bound work above the scan (joins, un-fused COUNT, sort)
+```
+
+Catalog fan-out across tables is bounded at `CATALOG_CONCURRENCY = 8` (`rest.rs:65`); the sweep
+concurrency is `C` (§4).
+
+**Parameters (with their anchors — these are what the adversarial pass should challenge):**
+
+| Param | Value used | Range | Basis |
+|---|---|---|---|
+| `L` — per-file cold S3 GET latency (tiny ~6.6 KB file) | **30 ms** | 20–40 ms | Back-out below; load-bearing. Assumes reqwest keep-alive connection reuse ⇒ `L` is the round-trip, not TLS setup. If GETs pay fresh TLS, `L` balloons; if HTTP/2 multiplexing helps, lower. |
+| `C` cold Lambda (10 GB ≈ 6 vCPU) | **6** | — | §4; `available_parallelism` caveat still open (could differ). Override unset. |
+| `C` dev (where wins were measured) | **12** | 10–16 | §4. |
+| `T_catalog` per **fact** table (cold) | **~7 s** | — | q029 model "~7 s fixed (loadTable+oauth+scan_plan)" (F17). Decomposes ~2 s loadTable GET + ~5 s metadata+manifest→scanfiles for a 7.7 K-file table. |
+| `T_catalog` per small **dim** (cold) | **~2 s** | — | ~1 loadTable GET + tiny metadata + 1 manifest. |
+| `T_materialize` q016 hash-join (SF01) | **~11 s** | — | Measured decomposition (#1501 body: ~11 s hash-left-join partition/materialize). |
+
+**Anchor cross-checks (why `L≈30 ms`, `C_dev≈12` are defensible):**
+- q029 cold-isolated one FACT_WEB_EVENT sweep = **57 s**, pure fetch, warm-catalog (F17). Solving
+  `F/C_dev × L = 57 s` at `C_dev=12, L=30 ms` ⇒ **F_WEB_EVENT ≈ 22,800 files** — a plausible size
+  for a large event fact. (I use **≈23 K** below.)
+- q056 warm-catalog = **168 s** over **69,046 files** (all 16 TMs), fetch-dominated (un-fused COUNT
+  reads every object column). Predicted `69046/12 × 30 ms = 172.6 s ≈ 168 s` — **independent
+  second anchor**, same `L` and `C_dev`, different file set. Two anchors agreeing on `L≈30 ms` is
+  the strongest evidence in this appendix; if either is wrong the whole table moves.
+
+**Authoritative file counts:** FACT_INVENTORY_SNAPSHOT = **7,670** (metadata.json, zero-cred);
+FACT_SHIPMENT ≈ **7,670** (q016 decomposition `n=23010 = 3×7670`); FACT_WEB_EVENT ≈ **23 K**
+(back-out above); q056 whole-dataset = **69,046** (span-attributed). SF20 = **20×** files/rows/bytes.
+
+`T_sweep(F, C) = F/C × L` (seconds), the term every lever moves:
+
+| F (files) | C=6 (Lambda) | C=12 (dev) | C=16 | C=32 |
+|---|---|---|---|---|
+| 7,670 (FACT_INVENTORY / FACT_SHIPMENT) | **38.4** | 19.2 | 14.4 | 7.2 |
+| 23,000 (FACT_WEB_EVENT) | **115.0** | 57.5 | 43.1 | 21.6 |
+| 69,046 (q056 whole dataset) | **345.2** | 172.6 | 129.5 | 64.7 |
+
+## A.2 Baseline cold-container walls (NO lever), SF01 and SF20, at C=6
+
+| Query | Terms (SF01, C=6, L=30 ms) | **SF01 cold** | SF20 cold (files ×20; materialize ×20; T_catalog grows w/ manifest size) | Fits 55 s? |
+|---|---|---|---|---|
+| q029 | 7 (cat) + 115 (sweep 23K) + 0.6 (decode) | **~123 s** | ~2,300 (sweep 460K) + ~22 ≈ **~2,320 s** | No / No |
+| q031 | 7 (cat, fact‖dim) + 38.4 (sweep 7.7K) + ~2 (materialize) | **~47 s** (L=40 ⇒ ~60 s) | ~767 (sweep 153K) + ~22 + ~2 ≈ **~790 s** | Borderline / No |
+| q016 | 7 (cat) + 38.4 (residual sweep) + 11 (join) | **~56 s** (residual up to ~3× ⇒ ~130 s) | ~767 + ~22 + ~220 (join ×20) ≈ **~1,010 s** | No / No |
+| q055 | ~14–20 (16-table catalog, 2 waves of 8) + small LIMIT-5 sweep | **~25–40 s** | ~44 (2 waves, bigger manifests) + small ≈ **~45–60 s** | Yes / Borderline |
+| q056 | ~20 (16-table catalog) + 345 (full fetch 69K) | **~365 s** | ~6,900 (fetch 1.38 M) + ~40 ≈ **~6,940 s** | No / No (hard) |
+
+The pattern from §2 in numbers: everything except the loadTable-dominated shapes (q055) is
+**sweep-bound**, so the two multipliers — cold catalog + half concurrency — are what push
+SF01-warm ≤3 s queries over the 55 s cap, and SF20 is categorically out of reach cold for any
+sweep-bound shape. (These refine §2b's rougher bands with the decomposed model; where they differ,
+the parametric figure here shows its work.)
+
+## A.3 Per-lever predictions
+
+### (a) Catalog-warm (a primed / persistent catalog cache) — removes `T_catalog`
+
+Exactly the epic's cold-data/warm-catalog protocol: subtract the `T_catalog` term (the loadTable
+GET + metadata + manifest→scanfiles). **Sweep and materialize are untouched.**
+
+| Query | Cold baseline | Catalog-warm (C=6) | Δ | Verdict |
+|---|---|---|---|---|
+| q029 | ~123 s | ~116 s | −7 s | negligible — sweep-bound |
+| q031 | ~47 s | ~40 s | −7 s | small |
+| q016 | ~56 s | ~49 s | −7 s | small |
+| q055 | ~30 s | **~5 s** | −25 s | **decisive** — q055 IS its catalog |
+| q056 | ~365 s | ~345 s | −20 s | negligible — sweep-bound |
+
+**Does NOT fix:** any sweep or materialize term. Helps only loadTable-dominated shapes (q055,
+the `?s ?p ?o LIMIT k` first-touch). This is what #1503 + PR-8-slice-2 already buy **within a warm
+container**; the lever question is making it survive a **cold** one (persistence beyond the
+container), which is architecture-level (EFS/S3-backed catalog), not a config flip.
+
+### (b) Scan concurrency 6 → 16 / 32 — scales the sweep term ~1/C
+
+`T_sweep ∝ 1/C` until S3 request-rate throttling (~5,500 GET/s per prefix — not reached at these
+values) **or** executor saturation. **Stated assumption:** the work is S3-latency-**wait**-bound,
+so concurrency above the ~6 vCPU still helps (threads park on I/O), but gains taper past C≈16 once
+per-request CPU (TLS, decode) competes for ~6 cores. Linear-until-taper.
+
+| Query | C=6 | C=16 | C=32 | Note |
+|---|---|---|---|---|
+| q029 | ~123 s | ~50 s | ~29 s | still over 55 s until ~C≈14 |
+| q031 | ~47 s | ~23 s | ~16 s | under 55 s at all C |
+| q016 | ~56 s | ~32 s | ~25 s | join floor (11 s) unmovable by C |
+| q056 | ~365 s | ~150 s | ~85 s | never under 55 s by concurrency alone |
+
+**Does NOT fix:** `T_catalog` (fixed), `T_materialize` (q016's 11 s join, q056's count decode —
+CPU-bound, competes with the very concurrency you raise). Pure win on sweep-bound tails, capped by
+the vCPU allotment; a bigger Lambda (more memory ⇒ more vCPU) is the same lever by another name.
+
+### (c) DATA COMPACTION — 39-rows/file → 64/128 MB target files (the lever to fight over)
+
+Compaction collapses **file count**, so it attacks the **per-file request floor** that dominates
+every sweep-bound wall — the single biggest term at SF01 and the *only* thing that makes SF20
+tractable cold. FACT_INVENTORY 51 MB / 7,670 files → **1 file @128 MB** (or ~1 @64 MB);
+7,670 → ~1–4 (row-group/split boundaries). The sweep term changes character: from `F/C × L` (tiny
+GETs, latency-bound) to `F' /C × L_big`, `F'` = a handful of files, `L_big ≈ file_MB / ~100 MB·s⁻¹
++ latency ≈ 1.3 s` for a 128 MB file.
+
+| Table / query | Files → compacted | Sweep SF01 C=6: before → after | Sweep SF20 C=6: before → after |
+|---|---|---|---|
+| FACT_INVENTORY (q031) | 7,670 → ~1–4 | 38.4 s → **~1–3 s** | 767 s → **~2 s** (1 GB → ~8 files) |
+| FACT_WEB_EVENT (q029) | ~23 K → ~4 | 115 s → **~2 s** | 2,300 s → **~35 s** (~20 GB → ~160 files) |
+| q056 whole dataset | 69,046 → ~70 | 345 s → **~5–15 s** (fetch overhead gone) | 6,900 s → **~20–40 s** |
+
+**Predicted post-compaction cold walls (C=6, SF01):** q029 ~7 (cat) + ~2 ≈ **~9 s**; q031 ~7 + ~2
++ ~2 ≈ **~11 s**; q016 ~7 + ~3 + **11 (join stays)** ≈ **~21 s**; q056 ~20 (cat) + ~10 (fetch) +
+**count-decode of ~456 MB of objects (stays)** ≈ **~40–60 s**.
+
+**What compaction does NOT fix — read this before betting on it:**
+- **loadTable GET** (~2 s/table) — O(1) in file count, untouched. A many-table first-ask (q055,
+  16 loadTables) is *unaffected* by compaction; its bottleneck is catalog round-trips, lever (a)/(d).
+- **metadata fetch** — untouched (small); **manifest derivation** — actually *helped* (fewer files
+  ⇒ smaller manifest tree), a secondary bonus folded into a lower `T_catalog`.
+- **`T_materialize`** — untouched. q016's ~11 s hash-join is **row-count**-bound; compaction moves
+  zero rows. q016 lands ~21 s cold even fully compacted — still needs a join/probe lever for ≤3 s.
+- **q056's un-fused COUNT** — compaction removes the 69 K-request floor but **the same object bytes
+  are still fetched and every row still decoded to count** (Σ rows × POM). Compaction takes q056
+  345 s → ~40–60 s; only a **fused predicate-less COUNT (F22, PR-6 sibling)** that reads manifest
+  `record_count`s takes it sub-second with **no data read at all**. Compaction and F22 are
+  orthogonal; the adversarial pass should not let one masquerade as the other.
+- **Write-side cost & freshness** (out of engine scope, but the honest counterweight): compaction is
+  a Snowflake/Iceberg maintenance job on the *source* — it has a cost, a cadence, and a
+  freshness/latency tradeoff (newly written 39-row files exist until compaction runs). This is why
+  it is a data-level lever, not an engine flip, and why it deserves the fight.
+
+### (d) Pointer / catalog-TTL widening — spares part of `T_catalog`
+
+Two sub-levers with very different reach (§1b):
+- **Pointer only** (#1503, `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`, currently 300 s): spares only
+  the **loadTable GET** (~2 s of the ~7 s). Metadata + manifest still run *unless their
+  content-addressed entries are also on disk* — and you need the pointer/GET to learn the
+  `metadata_location` that keys them, so past-TTL you pay ~2 s (GET) and then metadata/scanfiles hit
+  by content address. Net past-TTL ≈ ~2 s/table saved; within-TTL ≈ full ~7 s (pointer + catalog
+  both hit).
+- **Whole-catalog persistence** (the -catalog dir surviving cold containers): spares the full
+  ~7 s/table.
+
+| Query | Cold baseline | Pointer-only (−~2 s/table) | Whole-catalog (−~7 s/fact, −~2 s/dim) |
+|---|---|---|---|
+| q029 | ~123 s | ~121 s | ~116 s |
+| q031 | ~47 s | ~45 s | ~40 s |
+| q055 (16 tables) | ~30 s | ~18–22 s | **~5 s** |
+| q056 | ~365 s | ~345 s | ~345 s |
+
+**Does NOT fix:** any sweep/materialize. Same reach as (a); the distinction (a) vs (d) is *how* the
+catalog is kept warm — TTL-widening keeps a **within-container** win alive longer (F21), whereas
+true cold-container survival needs **shared/persistent** catalog storage (architecture-level). The
+pointer-vs-whole-chain split matters: widening the pointer TTL alone leaves ~5 s/fact-table of
+metadata+manifest on the table unless the content-addressed layers persist too.
+
+### (e) Null lever — no engine change, chat cap raised or made async
+
+Which shapes already fit under a higher sync cap or an async (job/poll) envelope, cold, at C=6:
+
+| Query | SF01 cold | < 120 s? | < 300 s? | SF20 cold | < 300 s? |
+|---|---|---|---|---|---|
+| q029 | ~123 s | ✗ (just over) | ✓ | ~2,320 s | ✗ |
+| q031 | ~47 s | ✓ | ✓ | ~790 s | ✗ |
+| q016 | ~56 s | ✓ | ✓ | ~1,010 s | ✗ |
+| q055 | ~30 s | ✓ | ✓ | ~50 s | ✓ |
+| q056 | ~365 s | ✗ | ✗ | ~6,940 s | ✗ |
+
+**Reach:** raising the sync cap to 120 s rescues q031/q016/q055 at **SF01 only**; an async envelope
+(≤300 s) additionally covers q029 at SF01. **q056 misses even 300 s at SF01, and every sweep-bound
+shape misses 300 s at SF20** — so the null lever is an SF01-scale band-aid that a real dataset
+(SF20) defeats. It also does nothing about §3's burn-after-abandon (a raised cap means the engine
+burns *longer* per timed-out ask unless cancellation is also wired). Cheapest to ship, smallest
+ceiling.
+
+## A.4 What the arithmetic says for the adversarial pass
+
+- **Sweep-bound vs catalog-bound is the primary split.** q055 is catalog-bound (levers a/d win);
+  q029/q031/q016/q056 are sweep-bound (levers b/c win). No single lever covers both families.
+- **Compaction (c) is the only lever that scales to SF20** and the only one that touches the
+  per-file request floor — but it stops at the loadTable GET, the hash-join, and the un-fused-COUNT
+  decode. Pair it with a catalog lever (a/d) for q055 and a join/COUNT lever for q016/q056, or the
+  tail re-emerges at scale.
+- **Concurrency (b) is a free ~2× that never reaches the bar alone** and competes with materialize
+  for the same ~6 vCPU.
+- **The null lever (e) is SF01-only.** Any plan that leans on "just raise the cap" should be made to
+  show its SF20 row.
+- **Every number here rides on `L≈30 ms` and `C_dev≈12`** (two independent anchors, q029 + q056).
+  The highest-value thing Track B/lambda-audit can return is a **measured** cold in-Lambda `L` and a
+  **measured** `available_parallelism` — those two collapse the ranges above into commitments.
