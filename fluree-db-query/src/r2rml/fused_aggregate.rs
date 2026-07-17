@@ -2231,7 +2231,10 @@ mod tests {
         ]));
         // Q1 residual: the SAME ledger at two different to_t views → decline
         // (materialize would union both snapshots).
-        assert!(!dataset_views_are_single_source([(gs, 0, None), (gs, 5, None)]));
+        assert!(!dataset_views_are_single_source([
+            (gs, 0, None),
+            (gs, 5, None)
+        ]));
         // Q1 residual: the SAME ledger+to_t under two different policy enforcers →
         // decline (materialize would union both filtered views).
         assert!(!dataset_views_are_single_source([
@@ -2298,7 +2301,9 @@ mod tests {
             })
             .with_predicate_object(PredicateObjectMap {
                 predicate_map: PredicateMap::constant(refp),
-                object_map: ObjectMap::RefObjectMap(RefObjectMap::new("#Geo", "GEO_KEY", "GEO_KEY")),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                    "#Geo", "GEO_KEY", "GEO_KEY",
+                )),
             });
         let constrained = |pred: &str, c: ObjectConstant| {
             let mut p = R2rmlPattern::new("gs", VarId(0), None);
@@ -2319,8 +2324,13 @@ mod tests {
             "a RefObjectMap constraint must decline (fold can't enforce it)"
         );
         // Missing predicate → declines.
-        let missing = constrained("http://ex/nope", ObjectConstant::Scalar(ScanValue::Bool(true)));
-        assert!(FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&missing, &tm).is_none());
+        let missing = constrained(
+            "http://ex/nope",
+            ObjectConstant::Scalar(ScanValue::Bool(true)),
+        );
+        assert!(
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&missing, &tm).is_none()
+        );
         // No constraints → admitted with an empty check set.
         let plain = R2rmlPattern::new("gs", VarId(0), None);
         assert_eq!(
@@ -2367,9 +2377,7 @@ mod tests {
         assert!(!ok(1), "isCurrent=false row is dropped");
         assert!(!ok(2), "isCurrent=null row is dropped (existence filter)");
         // No constraints → every row satisfied (a no-op).
-        assert!(
-            FusedR2rmlAggregateOperator::row_satisfies_constraints(&[], &batch, 1).unwrap()
-        );
+        assert!(FusedR2rmlAggregateOperator::row_satisfies_constraints(&[], &batch, 1).unwrap());
     }
 
     /// Q2 lang/IRI admission gate: a fused group key — the single-table key OR the
@@ -2384,10 +2392,11 @@ mod tests {
         use fluree_db_r2rml::mapping::{PredicateMap, PredicateObjectMap};
         let pred = "http://ex/attr";
         let make = |om: ObjectMap| {
-            let tm = TriplesMap::new("http://ex/TM", "T").with_predicate_object(PredicateObjectMap {
-                predicate_map: PredicateMap::constant(pred),
-                object_map: om,
-            });
+            let tm =
+                TriplesMap::new("http://ex/TM", "T").with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant(pred),
+                    object_map: om,
+                });
             let mut pat = R2rmlPattern::new("gs", VarId(0), None);
             pat.star_bindings = vec![(pred.to_string(), VarId(1))];
             (pat, tm)
