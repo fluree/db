@@ -658,3 +658,141 @@ async fn policy_fquery_with_path_context_term() {
         "u2 (member of teamB) must see only teamB's item through the path gate"
     );
 }
+
+/// Re-running `fluree model access enable` with `--connected` must actually
+/// narrow a previously allow-all read profile. The CLI installs policies with
+/// an atomic replace transaction (wildcard-delete the owned policy ids +
+/// insert the fresh compilation) — byte-for-byte the shape tested here.
+///
+/// This pins the failure mode the replace semantics exist to prevent: the
+/// policy loader gives `f:allow` precedence over `f:query`, so a
+/// property-merge upsert that left the old `f:allow: true` on the view
+/// policy would silently disable the new relationship gate and keep the
+/// policy allow-all.
+#[tokio::test]
+async fn policy_replace_swaps_allow_for_path_gate() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "policy/replace-gate:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let u1 = "http://example.org/identity/u1";
+    let class = "http://example.org/ns/Item/access/read";
+    let view_id = format!("{class}/view");
+    let write_id = format!("{class}/write");
+
+    // Data + the scaffolder's FIRST compilation: a plain read profile
+    // (f:allow: true view policy on the class).
+    let seed = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            { "@id": "ex:teamA", "@type": "ex:Team" },
+            { "@id": "ex:teamB", "@type": "ex:Team" },
+            { "@id": u1, "ex:memberOf": { "@id": "ex:teamA" } },
+            {
+                "@id": "ex:item-alpha",
+                "@type": "ex:Item",
+                "ex:name": "Alpha Item",
+                "ex:team": { "@id": "ex:teamA" }
+            },
+            {
+                "@id": "ex:item-beta",
+                "@type": "ex:Item",
+                "ex:name": "Beta Item",
+                "ex:team": { "@id": "ex:teamB" }
+            },
+            {
+                "@id": class,
+                "@type": "http://www.w3.org/2000/01/rdf-schema#Class"
+            },
+            {
+                "@id": view_id,
+                "@type": ["f:AccessPolicy", class],
+                "f:action": { "@id": "f:view" },
+                "f:onClass": { "@id": "ex:Item" },
+                "f:allow": true
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &seed).await.expect("seed").ledger;
+
+    let items_visible_to_u1 = || {
+        let query = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "from": ledger_id,
+            "opts": {
+                "identity": u1,
+                "policy-class": [class],
+                "default-allow": false
+            },
+            "select": "?name",
+            "where": [{ "@id": "?item", "@type": "ex:Item", "ex:name": "?name" }]
+        });
+        let fluree = &fluree;
+        async move {
+            let result = fluree.query_connection(&query).await.expect("query");
+            let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+            normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
+        }
+    };
+
+    assert_eq!(
+        items_visible_to_u1().await,
+        normalize_rows(&json!(["Alpha Item", "Beta Item"])),
+        "plain read profile must be allow-all before the switch"
+    );
+
+    // The SECOND compilation: same profile with --connected. The CLI's
+    // replace transaction — optional wildcard match + delete on both owned
+    // policy ids, insert the fresh nodes ({class}/write is owned even
+    // though read never emits it).
+    let gate = serde_json::to_string(&json!({
+        "@context": {
+            "connected": {
+                "@path": "<http://example.org/ns/memberOf>/^<http://example.org/ns/team>"
+            }
+        },
+        "where": [
+            { "@id": "?$identity", "connected": { "@id": "?$this" } }
+        ]
+    }))
+    .unwrap();
+    let replace = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "where": [
+            ["optional", { "@id": view_id, "?p0": "?o0" }],
+            ["optional", { "@id": write_id, "?p1": "?o1" }]
+        ],
+        "delete": [
+            { "@id": view_id, "?p0": "?o0" },
+            { "@id": write_id, "?p1": "?o1" }
+        ],
+        "insert": [
+            {
+                "@id": class,
+                "@type": "http://www.w3.org/2000/01/rdf-schema#Class"
+            },
+            {
+                "@id": view_id,
+                "@type": ["f:AccessPolicy", class],
+                "f:action": { "@id": "f:view" },
+                "f:onClass": { "@id": "http://example.org/ns/Item" },
+                "f:query": gate
+            }
+        ]
+    });
+    let _ = fluree.update(ledger, &replace).await.expect("replace");
+
+    // The stale f:allow is gone, so the gate governs: u1 sees only the
+    // item connected to their team.
+    assert_eq!(
+        items_visible_to_u1().await,
+        normalize_rows(&json!(["Alpha Item"])),
+        "after the switch the relationship gate must govern — a stale \
+         f:allow would keep this allow-all"
+    );
+}

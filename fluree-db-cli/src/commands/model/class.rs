@@ -13,7 +13,7 @@ use crate::cli::ModelClassAction;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
 
-const FM: &str = "https://ns.flur.ee/model#";
+const F: &str = "https://ns.flur.ee/db#";
 const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 const RDFS_SUBCLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
@@ -82,7 +82,10 @@ async fn run_define(
 
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
     upsert(&mode, &node).await?;
-    println!("Defined on '{dataset}'. Re-run with more --subclass-of to extend.");
+    println!(
+        "Defined on '{dataset}'. Re-running with --subclass-of replaces the \
+         parent set (list every parent each time)."
+    );
     Ok(())
 }
 
@@ -116,13 +119,16 @@ async fn run_show(
 
     // Policy classes are rdfs:Class too (the access compiler mints them);
     // they're governance plumbing, not domain vocabulary — exclude them.
+    // There is no stored intent to consult: a policy class is recognized
+    // by its role, the extra `@type` the compiler puts on its
+    // `f:AccessPolicy` nodes.
     let policy_classes: Vec<String> = {
         let q = json!({
-            "@context": {"fm": FM},
+            "@context": {"f": F},
             "select": ["?class"],
             "where": [
-                {"@id": "?p", "@type": "fm:AccessProfile"},
-                {"@id": "?p", "fm:policyClass": {"@id": "?class"}}
+                {"@id": "?p", "@type": "f:AccessPolicy"},
+                {"@id": "?p", "@type": "?class"}
             ]
         });
         iri_rows(&query(&mode, &q).await?)

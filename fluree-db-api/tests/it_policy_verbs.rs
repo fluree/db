@@ -826,7 +826,14 @@ async fn scaffolder_write_profile_grants_class_ownership_only() {
         "@type": "ex:Person",
         "ex:nickname": "Mallory"
     });
-    let denied = try_txn(&fluree, ledger.clone(), TxnType::Insert, &create_person, &ctx).await;
+    let denied = try_txn(
+        &fluree,
+        ledger.clone(),
+        TxnType::Insert,
+        &create_person,
+        &ctx,
+    )
+    .await;
     assert!(
         denied.is_err(),
         "Lead write profile must NOT mint a Person: {denied:?}"

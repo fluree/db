@@ -22,14 +22,22 @@
 //! cause which state transitions".
 //!
 //! There is NO stored intent language: the compiled policies are small and
-//! self-describing, idempotence comes from deterministic node ids
-//! (`{class}/view`, `{class}/write`), the `--connected` path survives
-//! verbatim inside the stored `f:query`'s `@path` context term, and
-//! hand-editing a policy is legitimate authorship — not drift.
+//! self-describing, the `--connected` path survives verbatim inside the
+//! stored `f:query`'s `@path` context term, and hand-editing a policy is
+//! legitimate authorship — not drift.
+//!
+//! Re-running `enable` REPLACES the two policy nodes it owns
+//! (`{class}/view`, `{class}/write`) atomically: one transaction
+//! wildcard-deletes both ids and inserts the fresh compilation. Anything
+//! less is unsafe — the policy loader gives `f:allow` precedence over
+//! `f:query`, so a property-merge that left a stale `f:allow: true` behind
+//! would silently disable a newly added `--connected` gate. Owning both
+//! ids on every run also makes profile switches on the same class exact
+//! (write → read revokes `{class}/write`; intake drops `{class}/view`).
 
 use serde_json::{json, Value};
 
-use super::{query, resolve_mode, upsert};
+use super::{query, replace_nodes, resolve_mode};
 use crate::cli::ModelAccessAction;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
@@ -205,8 +213,12 @@ async fn run_enable(
     // Transact (data plane — policies live in the ledger). Policies land
     // BEFORE the grant so a partial failure leaves unused policies
     // (harmless) rather than a grant naming classes that don't exist.
+    // Both policy ids are replaced atomically whether or not this profile
+    // emits them — see the module doc for why merge semantics are unsafe.
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
-    upsert(&mode, &graph).await?;
+    let view_id = format!("{class_iri}/view");
+    let write_id = format!("{class_iri}/write");
+    replace_nodes(&mode, &graph, &[&view_id, &write_id]).await?;
     println!("\nPolicies transacted to '{dataset}'.");
 
     if let (Some(space_id), Some(remote_name)) = (space, remote) {
@@ -251,7 +263,8 @@ fn validate_connected_path(path: &str) -> CliResult<()> {
 /// Compile the profile into its JSON-LD artifacts: the policy class (the
 /// assignment unit grants and tokens carry) and one or two thin policies.
 /// Deterministic ids ({class}/view, {class}/write) make re-running
-/// idempotent — `upsert` replaces listed properties in place.
+/// idempotent — `enable` atomically replaces both owned nodes with the
+/// fresh compilation.
 fn compile(
     class_iri: &str,
     entity: &str,

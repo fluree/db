@@ -13,7 +13,7 @@
 
 use serde_json::{json, Value};
 
-use super::{query, resolve_mode, upsert};
+use super::{query, replace_nodes, resolve_mode};
 use crate::cli::ModelEntityAction;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
@@ -240,8 +240,21 @@ async fn run_define(
         return Ok(());
     }
 
+    // The shape and its property-shape children are OWNED by this compiler
+    // and replaced atomically — a constraint from a previous definition
+    // (sh:closed, sh:minCount, sh:in, …) must not survive a re-run that
+    // dropped it, or validation keeps enforcing what the author removed.
+    // The entity class node is NOT owned: it's shared authorship with
+    // `model class define` (hierarchy, label), so it stays additive.
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
-    upsert(&mode, &graph).await?;
+    let shape_iri = format!("{}/shape", entity.trim_end_matches('/'));
+    let mut owned: Vec<String> = specs
+        .iter()
+        .map(|p| format!("{shape_iri}/{}", local_name(&p.path)))
+        .collect();
+    owned.insert(0, shape_iri);
+    let owned_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    replace_nodes(&mode, &graph, &owned_refs).await?;
 
     println!("\nDefined. Shape written to '{dataset}'.");
     println!(
