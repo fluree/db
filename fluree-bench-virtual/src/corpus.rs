@@ -335,11 +335,12 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            64,
+            65,
             "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
              4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
              q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
-             1 E1 shared-predicate member (q064 Product-by-category)"
+             1 E1 shared-predicate member (q064 Product-by-category) + \
+             1 E2 join+flag member (q065 orders-by-current-customer-segment)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));

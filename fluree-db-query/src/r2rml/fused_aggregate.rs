@@ -33,18 +33,23 @@ use crate::eval::PreparedBoolExpression;
 use crate::ir::grouping::{AggregateFn, Grouping, InputSemantics};
 use crate::ir::{Expression, Function, GraphName, Pattern, Query, R2rmlPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::r2rml::operator::LiteralEncoder;
+use crate::r2rml::operator::{
+    decimal_canonical_of, object_column_is_numeric, rdf_term_eq_object_constant_cached,
+    LiteralEncoder,
+};
 use crate::r2rml::rewrite_patterns_for_r2rml;
+use crate::r2rml::ObjectConstant;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::{
-    extract_template_columns, CompiledR2rmlMapping, ObjectMap, TermType, TriplesMap,
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, PredicateObjectMap, TermType,
+    TriplesMap,
 };
 use fluree_db_r2rml::materialize::{get_join_key_from_batch, materialize_object_from_batch};
-use fluree_db_tabular::Column;
+use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -770,6 +775,13 @@ struct Resolved {
     /// fact row — mirroring the R2RML/inner-join row-drop. `group_cols` still
     /// describes the key kinds/datatypes for materializing the output binding.
     group_resolver: Option<GroupKeyResolver>,
+    /// E2: fact-side folded constant-object constraints (`star_constraints`)
+    /// applied per fact row in `next_batch` — a fact row failing any is dropped
+    /// (existence-filter parity with the normal scan). Empty on the single-table
+    /// path (which still declines on any star_constraints via the O1 guard) and
+    /// for a join with no fact-side flag. Dim-side constraints are applied earlier,
+    /// during the FK→GKey map build, so they are not carried here.
+    fact_constraints: Vec<ResolvedConstraint>,
 }
 
 /// PR-6 fact⋈dim group-key resolver, built once at `open` by scanning the small
@@ -1032,6 +1044,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         // (`Acc::Count(n).finalize()`).
         if resolved.filter.is_none()
             && resolved.group_cols.is_empty()
+            && resolved.fact_constraints.is_empty()
             && matches!(resolved.folds.as_slice(), [Fold::CountRows])
         {
             let gs = resolved.pattern.graph_source_id.clone();
@@ -1114,6 +1127,15 @@ impl Operator for FusedR2rmlAggregateOperator {
                 if validity
                     .iter()
                     .any(|c| c.is_none_or(|col| col.is_null(row)))
+                {
+                    continue;
+                }
+                // E2: fact-side folded constant-object constraints (a fact flag) —
+                // a fact row that fails any is dropped, the existence-filter parity
+                // with the normal scan. Empty (a no-op) unless the fused join
+                // carried a fact-side constraint.
+                if !resolved.fact_constraints.is_empty()
+                    && !Self::row_satisfies_constraints(&resolved.fact_constraints, &batch, row)?
                 {
                     continue;
                 }
@@ -1260,6 +1282,29 @@ impl Operator for FusedR2rmlAggregateOperator {
 /// star that reaches the fused path today over-counts.
 fn fold_over_star_constraints(pats: &[&R2rmlPattern]) -> bool {
     pats.iter().any(|p| !p.star_constraints.is_empty())
+}
+
+/// E2: a folded constant-object constraint (`star_constraints`) resolved to a
+/// per-row scalar-column check. The predicate's column `PredicateObjectMap` is
+/// materialized per row and compared to `constant` with the normal scan's
+/// primitives (parity by construction); `canon` is the constant's precomputed
+/// decimal canonical (skips a per-row BigDecimal parse on an exact hit).
+struct ResolvedConstraint {
+    pom: PredicateObjectMap,
+    constant: ObjectConstant,
+    canon: Option<String>,
+}
+
+impl ResolvedConstraint {
+    /// The single scan column this constraint reads. `resolve_star_constraint_checks`
+    /// admits only `Column` object maps, so this is always present; it must be
+    /// projected into the scan so `row_satisfies_constraints` can read it.
+    fn column(&self) -> &str {
+        match &self.pom.object_map {
+            ObjectMap::Column { column, .. } => column,
+            _ => unreachable!("only Column object maps are admitted"),
+        }
+    }
 }
 
 /// C5 O2 core predicate: a dataset resolves to a single data VIEW iff its
@@ -1547,6 +1592,7 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             count_non_null_cols,
             group_resolver: None,
+            fact_constraints: Vec::new(),
         }))
     }
 
@@ -1718,6 +1764,64 @@ impl FusedR2rmlAggregateOperator {
     /// the admitted class: != 2 patterns, a FILTER, a composite/multi FK, a
     /// non-scalar group key, an aggregate that is not a fact column, or a
     /// non-linear / cyclic join (see [`Self::order_chain`]).
+    /// E2: resolve a pattern's folded constant-object constraints
+    /// (`star_constraints`, e.g. `?prod ex:isCurrent true`) to per-row checks
+    /// against its TriplesMap. Each `(predicate, constant)` must map to a SCALAR
+    /// column PredicateObjectMap so the fold can enforce the equality using the
+    /// SAME primitives as the normal scan. Declines (`None`) if any constraint's
+    /// predicate is a RefObjectMap object (needs the operator's parent lookups the
+    /// fold does not run) or is absent from the map.
+    fn resolve_star_constraint_checks(
+        pattern: &R2rmlPattern,
+        tm: &TriplesMap,
+    ) -> Option<Vec<ResolvedConstraint>> {
+        let mut checks = Vec::with_capacity(pattern.star_constraints.len());
+        for (pred, constant) in &pattern.star_constraints {
+            let pom = tm
+                .predicate_object_maps
+                .iter()
+                .find(|p| p.predicate_map.as_constant() == Some(pred.as_str()))?;
+            if !matches!(pom.object_map, ObjectMap::Column { .. }) {
+                return None; // RefObjectMap / template constraint: keep the materialize path
+            }
+            checks.push(ResolvedConstraint {
+                pom: pom.clone(),
+                constant: constant.clone(),
+                canon: decimal_canonical_of(constant),
+            });
+        }
+        Some(checks)
+    }
+
+    /// E2: whether a row satisfies EVERY resolved constraint — the existence-filter
+    /// semantics of the normal scan (`operator.rs:2019`): each constraint predicate
+    /// must materialize an object equal to its constant; a null/missing object
+    /// fails. Reuses `materialize_object_from_batch` + `object_column_is_numeric` +
+    /// `rdf_term_eq_object_constant_cached`, so a fused constraint is byte-parity
+    /// with the materialized answer.
+    fn row_satisfies_constraints(
+        checks: &[ResolvedConstraint],
+        batch: &ColumnBatch,
+        row: usize,
+    ) -> Result<bool> {
+        for c in checks {
+            let numeric = object_column_is_numeric(&c.pom, batch);
+            let matched = materialize_object_from_batch(&c.pom.object_map, batch, row)?
+                .is_some_and(|term| {
+                    rdf_term_eq_object_constant_cached(
+                        &term,
+                        &c.constant,
+                        numeric,
+                        c.canon.as_deref(),
+                    )
+                });
+            if !matched {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     async fn resolve_join_at_open(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -1729,14 +1833,12 @@ impl FusedR2rmlAggregateOperator {
         if self.filter.is_some() {
             return Ok(None);
         }
-        // C5 slice-1 MANDATORY guard (broadened to EVERY participating map): any
-        // fact- or dim-side folded constant-object constraint (star_constraints) is
-        // unhandled by this join fold and would OVER-COUNT — the q029 eventType
-        // family carries fact-side constant-object constraints; a dim-side flag has
-        // the same shape. Decline.
-        if fold_over_star_constraints(pats) {
-            return Ok(None);
-        }
+        // E2 (slice-1.5): a folded constant-object constraint (star_constraints,
+        // e.g. a dim `?prod ex:isCurrent true` or a fact-side flag) is no longer a
+        // blanket decline — the fold APPLIES it (dim-side while building the FK→GKey
+        // map, fact-side in the value fold), resolved below once the TriplesMaps are
+        // known. A constraint that does not resolve to a scalar column still
+        // declines (in `resolve_star_constraint_checks`).
         // Order the patterns into a linear `fact → dim1 → … → dimk` chain (single
         // ref-join per hop, no branch, no cycle). `join_vars[h]` is dim_{h+1}'s
         // subject var — the object bound by the hop-`h` RefObjectMap.
@@ -1793,6 +1895,23 @@ impl FusedR2rmlAggregateOperator {
             src_tm = parent_tm;
         }
         let terminal_tm = hops.last().expect("≥1 hop for a join").2;
+
+        // E2: resolve each participating pattern's folded constant-object
+        // constraints to per-row scalar-column checks against its TriplesMap.
+        // `fact_checks` guards the fact fold; `dim_checks[h]` guards `chain[h+1]`
+        // (the dim reached by hop `h`). A constraint that does not resolve to a
+        // scalar column declines the fuse (falls back to the materialize path), so
+        // a shape the fold cannot enforce is never silently ignored (no over-count).
+        let Some(fact_checks) = Self::resolve_star_constraint_checks(fact_p, fact_tm) else {
+            return Ok(None);
+        };
+        let mut dim_checks: Vec<Vec<ResolvedConstraint>> = Vec::with_capacity(hops.len());
+        for (h, hop) in hops.iter().enumerate() {
+            let Some(checks) = Self::resolve_star_constraint_checks(chain[h + 1], hop.2) else {
+                return Ok(None);
+            };
+            dim_checks.push(checks);
+        }
 
         // GROUP BY keys resolve to scalar attribute columns on the TERMINAL dim.
         let mut group_cols = Vec::with_capacity(self.group_by.len());
@@ -1873,6 +1992,10 @@ impl FusedR2rmlAggregateOperator {
         }
         validity_cols.sort();
         validity_cols.dedup();
+        // E2: scan the fact-side constraint columns so the fold can enforce them.
+        for c in &fact_checks {
+            projection.push(c.column().to_string());
+        }
         projection.sort();
         projection.dedup();
 
@@ -1921,6 +2044,10 @@ impl FusedR2rmlAggregateOperator {
         };
         let mut terminal_proj = terminal_parent_cols.clone();
         terminal_proj.extend(dim_attr_cols.iter().cloned());
+        // E2: scan the terminal dim's constraint columns (a dim flag lives here).
+        for c in dim_checks.last().expect("≥1 hop") {
+            terminal_proj.push(c.column().to_string());
+        }
         terminal_proj.sort();
         terminal_proj.dedup();
         let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
@@ -1941,6 +2068,17 @@ impl FusedR2rmlAggregateOperator {
                     else {
                         continue;
                     };
+                    // E2: skip a terminal dim row that fails its folded constraint
+                    // (a dim flag, e.g. `isCurrent true`); its join key never enters
+                    // the map, so fact rows probing it drop — the inner-join +
+                    // constraint semantics, applied before the group key is read.
+                    if !Self::row_satisfies_constraints(
+                        dim_checks.last().expect("≥1 hop"),
+                        &batch,
+                        row,
+                    )? {
+                        continue;
+                    }
                     let mut gkeys = Vec::with_capacity(group_cols.len());
                     let mut any_null = false;
                     for (g, c) in group_cols.iter().zip(&attr_cols) {
@@ -1974,6 +2112,10 @@ impl FusedR2rmlAggregateOperator {
             let fk_next_cols = hops[h + 1].0.clone();
             let mut proj = key_cols.clone();
             proj.extend(fk_next_cols.iter().cloned());
+            // E2: scan this interior dim's constraint columns.
+            for c in &dim_checks[h] {
+                proj.push(c.column().to_string());
+            }
             proj.sort();
             proj.dedup();
             let mut next_map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
@@ -1991,6 +2133,10 @@ impl FusedR2rmlAggregateOperator {
                     let Some(fk_next) = get_join_key_from_batch(&fk_next_cols, &batch, row) else {
                         continue;
                     };
+                    // E2: skip an interior dim row that fails its folded constraint.
+                    if !Self::row_satisfies_constraints(&dim_checks[h], &batch, row)? {
+                        continue;
+                    }
                     if let Some(gkeys) = map.get(&fk_next) {
                         // Same conflicting-duplicate soundness as the terminal scan.
                         if !insert_dim_gkeys(&mut next_map, pk, gkeys.clone()) {
@@ -2014,6 +2160,7 @@ impl FusedR2rmlAggregateOperator {
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
             group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
+            fact_constraints: fact_checks,
         }))
     }
 }
@@ -2132,6 +2279,97 @@ mod tests {
             Binding::Unbound
         ));
         assert!(matches!(gc.binding(&GKey::Null), Binding::Unbound));
+    }
+
+    /// E2: resolve_star_constraint_checks admits a SCALAR-column constraint (the
+    /// fold can enforce it) and DECLINES a ref-object or missing-predicate
+    /// constraint (which needs the operator's parent lookups the fold does not run
+    /// — declining falls back to materialize, never a silent over-count).
+    #[test]
+    fn e2_resolve_star_constraint_checks_scalar_vs_ref() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap};
+        let flag = "http://ex/isCurrent";
+        let refp = "http://ex/geography";
+        let tm = TriplesMap::new("#Cust", "DIM_CUSTOMER")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(flag),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(refp),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new("#Geo", "GEO_KEY", "GEO_KEY")),
+            });
+        let constrained = |pred: &str, c: ObjectConstant| {
+            let mut p = R2rmlPattern::new("gs", VarId(0), None);
+            p.star_constraints = vec![(pred.to_string(), c)];
+            p
+        };
+        // Scalar column flag → resolves to one check.
+        let scalar = constrained(flag, ObjectConstant::Scalar(ScanValue::Bool(true)));
+        assert_eq!(
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&scalar, &tm)
+                .map(|v| v.len()),
+            Some(1)
+        );
+        // Ref-object constraint → declines.
+        let refc = constrained(refp, ObjectConstant::Iri("http://ex/geo/1".into()));
+        assert!(
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&refc, &tm).is_none(),
+            "a RefObjectMap constraint must decline (fold can't enforce it)"
+        );
+        // Missing predicate → declines.
+        let missing = constrained("http://ex/nope", ObjectConstant::Scalar(ScanValue::Bool(true)));
+        assert!(FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&missing, &tm).is_none());
+        // No constraints → admitted with an empty check set.
+        let plain = R2rmlPattern::new("gs", VarId(0), None);
+        assert_eq!(
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&plain, &tm)
+                .map(|v| v.len()),
+            Some(0)
+        );
+    }
+
+    /// E2: row_satisfies_constraints enforces a boolean flag (`isCurrent true`) with
+    /// the NORMAL scan's equality primitives — a true row passes, a false or null
+    /// row fails. So the fused-join constrained fold keeps exactly the flagged rows
+    /// (parity with the materialized CONSTRAINED count; no over-count).
+    #[test]
+    fn e2_row_satisfies_boolean_flag() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        let constant = ObjectConstant::Scalar(ScanValue::Bool(true));
+        let check = ResolvedConstraint {
+            canon: decimal_canonical_of(&constant),
+            pom: PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            },
+            constant,
+        };
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "IS_CURRENT".to_string(),
+            field_type: FieldType::Boolean,
+            nullable: true,
+            field_id: 1,
+        }]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![Column::Boolean(vec![Some(true), Some(false), None])],
+        )
+        .unwrap();
+        let checks = [check];
+        let ok = |row| {
+            FusedR2rmlAggregateOperator::row_satisfies_constraints(&checks, &batch, row).unwrap()
+        };
+        assert!(ok(0), "isCurrent=true row is kept");
+        assert!(!ok(1), "isCurrent=false row is dropped");
+        assert!(!ok(2), "isCurrent=null row is dropped (existence filter)");
+        // No constraints → every row satisfied (a no-op).
+        assert!(
+            FusedR2rmlAggregateOperator::row_satisfies_constraints(&[], &batch, 1).unwrap()
+        );
     }
 
     /// Q2 lang/IRI admission gate: a fused group key — the single-table key OR the

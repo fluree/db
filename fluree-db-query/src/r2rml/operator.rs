@@ -1814,7 +1814,7 @@ fn materialize_pom_object(
 /// precomputed canonical string (see [`decimal_canonical_of`]); an exact lexical
 /// match (the common same-scale case) then skips the per-row `BigDecimal` parse,
 /// while a scale variant (`"9.990"` vs `"9.99"`) falls back to the numeric compare.
-fn rdf_term_eq_object_constant_cached(
+pub(crate) fn rdf_term_eq_object_constant_cached(
     term: &RdfTerm,
     constant: &crate::r2rml::ObjectConstant,
     numeric_column: bool,
@@ -1895,7 +1895,7 @@ fn subject_term_matches_iri(term: &RdfTerm, want: &str) -> bool {
 /// The constant's precomputed `BigDecimal::to_string()`, for an
 /// `ObjectConstant::Decimal` — computed once per scan so the hot per-row match
 /// can skip re-parsing. `None` for any other constant.
-fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
+pub(crate) fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
     match constant {
         crate::r2rml::ObjectConstant::Decimal(d) => Some(d.to_string()),
         _ => None,
@@ -1926,7 +1926,7 @@ fn decimal_lexical_eq_int(v: &str, n: i64) -> bool {
 /// type, so an integer constant may match a decimal lexical form. Only a plain
 /// `rr:column` object qualifies — anything else does not push a scan filter (see
 /// [`value_pushdown_column`]), so the strict lexical match already suffices.
-fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
+pub(crate) fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
     let ObjectMap::Column { column, .. } = &pom.object_map else {
         return false;
     };

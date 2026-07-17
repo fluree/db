@@ -1471,6 +1471,31 @@
       "timeout_s": 120,
       "subsets": [],
       "exec_path": "from"
+    },
+    {
+      "id": "q065",
+      "file": "queries/q065_orders_by_current_customer_segment_dataset.rq",
+      "bi_question": "How many orders per segment, from current customers only? (E2 join+flag slice-1.5; deployed #1/#2 dim-flag join analogue)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_CUSTOMER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }
