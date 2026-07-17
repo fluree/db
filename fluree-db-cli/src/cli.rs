@@ -1627,9 +1627,10 @@ pub enum ModelAccessAction {
         #[arg(long)]
         profile: String,
 
-        /// Entity class IRI (absolute, e.g. https://example.org/Lead)
+        /// Target class IRI whose instances the profile governs (absolute,
+        /// e.g. https://example.org/Lead) — compiles to f:onClass
         #[arg(long)]
-        entity: String,
+        class: String,
 
         /// Optional COLUMN narrowing for the write policy (absolute IRIs):
         /// the grant covers only these properties of the class ("may edit
@@ -1637,9 +1638,11 @@ pub enum ModelAccessAction {
         #[arg(long = "property")]
         properties: Vec<String>,
 
-        /// Policy class IRI override (default: {entity}/access/{profile})
+        /// Policy class IRI override (default: {class}/access/{profile}).
+        /// The policy class is the assignment unit grants and tokens carry
+        /// — how a request selects its policy set, not a data restriction.
         #[arg(long)]
-        class_iri: Option<String>,
+        policy_class: Option<String>,
 
         /// Attach the policy class to this space's grant on the dataset
         /// (hosted stacks; requires --remote). Merges with existing classes.
@@ -1647,7 +1650,7 @@ pub enum ModelAccessAction {
         space: Option<String>,
 
         /// Relationship gate (read profile only): a SPARQL property path
-        /// from the requesting identity to the entity, with angle-bracketed
+        /// from the requesting identity to the instance, with angle-bracketed
         /// IRIs. e.g. "^<https://example.org/owner>" (I see what I own) or
         /// "<https://example.org/memberOf>/^<https://example.org/team>"
         /// (I see entities whose team I'm a member of). Stored verbatim in

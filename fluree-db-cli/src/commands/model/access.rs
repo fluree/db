@@ -96,9 +96,9 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
         ModelAccessAction::Enable {
             dataset,
             profile,
-            entity,
+            class,
             properties,
-            class_iri,
+            policy_class,
             space,
             connected,
             dry_run,
@@ -107,9 +107,9 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
             run_enable(
                 dataset,
                 profile,
-                entity,
+                class,
                 properties,
-                class_iri.as_deref(),
+                policy_class.as_deref(),
                 space.as_deref(),
                 connected.as_deref(),
                 *dry_run,
@@ -131,9 +131,9 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
 async fn run_enable(
     dataset: &str,
     profile_str: &str,
-    entity: &str,
+    class: &str,
     properties: &[String],
-    class_iri_override: Option<&str>,
+    policy_class_override: Option<&str>,
     space: Option<&str>,
     connected: Option<&str>,
     dry_run: bool,
@@ -142,7 +142,7 @@ async fn run_enable(
     direct: bool,
 ) -> CliResult<()> {
     let profile = Profile::parse(profile_str)?;
-    require_absolute_iri("--entity", entity)?;
+    require_absolute_iri("--class", class)?;
     for p in properties {
         require_absolute_iri("--property", p)?;
     }
@@ -172,34 +172,34 @@ async fn run_enable(
         ));
     }
 
-    let class_iri = class_iri_override.map(String::from).unwrap_or_else(|| {
+    let policy_class = policy_class_override.map(String::from).unwrap_or_else(|| {
         format!(
             "{}/access/{}",
-            entity.trim_end_matches('/'),
+            class.trim_end_matches('/'),
             profile.as_str()
         )
     });
-    let graph = compile(&class_iri, entity, profile, properties, connected);
+    let graph = compile(&policy_class, class, profile, properties, connected);
 
-    println!("Profile:    {} {}", profile.as_str(), entity);
-    println!("Class:      {class_iri}");
+    println!("Profile:      {} {}", profile.as_str(), class);
+    println!("Policy class: {policy_class}");
     match profile {
-        Profile::Read => println!("Grants:     view"),
-        Profile::Write => println!("Grants:     view + create/update/delete"),
-        Profile::Intake => println!("Grants:     create only (no read-back)"),
+        Profile::Read => println!("Grants:       view"),
+        Profile::Write => println!("Grants:       view + create/update/delete"),
+        Profile::Intake => println!("Grants:       create only (no read-back)"),
     }
     if !properties.is_empty() {
         println!(
-            "Columns:    write narrowed to {} propert{} (f:onProperty)",
+            "Columns:      write narrowed to {} propert{} (f:onProperty)",
             properties.len(),
             if properties.len() == 1 { "y" } else { "ies" }
         );
     }
     if let Some(path) = connected {
-        println!("Connected:  {path} (view gated by relationship to the requesting identity)");
+        println!("Connected:    {path} (view gated by relationship to the requesting identity)");
     }
     println!(
-        "note: the property SURFACE of {entity} is governed by its SHACL shape\n\
+        "note: the property SURFACE of {class} is governed by its SHACL shape\n\
          \x20 (model entity define, ideally --closed) — validation owns what a valid\n\
          \x20 instance looks like; this policy owns who may create/change them."
     );
@@ -216,8 +216,8 @@ async fn run_enable(
     // Both policy ids are replaced atomically whether or not this profile
     // emits them — see the module doc for why merge semantics are unsafe.
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
-    let view_id = format!("{class_iri}/view");
-    let write_id = format!("{class_iri}/write");
+    let view_id = format!("{policy_class}/view");
+    let write_id = format!("{policy_class}/write");
     replace_nodes(&mode, &graph, &[&view_id, &write_id]).await?;
     println!("\nPolicies transacted to '{dataset}'.");
 
@@ -227,14 +227,14 @@ async fn run_enable(
             remote_name,
             dataset,
             space_id,
-            &class_iri,
+            &policy_class,
             !profile.write_verbs().is_empty(),
         )
         .await?;
     } else {
         println!(
             "Attach to a space grant so app tokens carry it:\n  \
-             fluree model access enable {dataset} --profile {} --entity {entity} \
+             fluree model access enable {dataset} --profile {} --class {class} \
              --space <spaceId> --remote <r>",
             profile.as_str()
         );
@@ -261,13 +261,14 @@ fn validate_connected_path(path: &str) -> CliResult<()> {
 // ── compile ─────────────────────────────────────────────────────────────
 
 /// Compile the profile into its JSON-LD artifacts: the policy class (the
-/// assignment unit grants and tokens carry) and one or two thin policies.
-/// Deterministic ids ({class}/view, {class}/write) make re-running
-/// idempotent — `enable` atomically replaces both owned nodes with the
-/// fresh compilation.
+/// assignment unit grants and tokens carry) and one or two thin policies
+/// targeting the governed class (`f:onClass`). Deterministic ids
+/// ({policy_class}/view, {policy_class}/write) make re-running idempotent
+/// — `enable` atomically replaces both owned nodes with the fresh
+/// compilation.
 fn compile(
-    class_iri: &str,
-    entity: &str,
+    policy_class: &str,
+    class: &str,
     profile: Profile,
     properties: &[String],
     connected: Option<&str>,
@@ -275,17 +276,17 @@ fn compile(
     let mut nodes: Vec<Value> = Vec::new();
 
     nodes.push(json!({
-        "@id": class_iri,
+        "@id": policy_class,
         "@type": RDFS_CLASS,
-        RDFS_LABEL: format!("{} access: {}", profile.as_str(), entity),
+        RDFS_LABEL: format!("{} access: {}", profile.as_str(), class),
     }));
 
     if profile.wants_view() {
         let mut view = json!({
-            "@id": format!("{class_iri}/view"),
-            "@type": [format!("{F}AccessPolicy"), class_iri],
+            "@id": format!("{policy_class}/view"),
+            "@type": [format!("{F}AccessPolicy"), policy_class],
             format!("{F}action"): {"@id": format!("{F}view")},
-            format!("{F}onClass"): {"@id": entity},
+            format!("{F}onClass"): {"@id": class},
         });
         match connected {
             Some(path) => {
@@ -316,10 +317,10 @@ fn compile(
             .map(|v| json!({"@id": format!("{F}{v}")}))
             .collect();
         let mut write = json!({
-            "@id": format!("{class_iri}/write"),
-            "@type": [format!("{F}AccessPolicy"), class_iri],
+            "@id": format!("{policy_class}/write"),
+            "@type": [format!("{F}AccessPolicy"), policy_class],
             format!("{F}action"): action,
-            format!("{F}onClass"): {"@id": entity},
+            format!("{F}onClass"): {"@id": class},
             format!("{F}allow"): true,
         });
         if !properties.is_empty() {
@@ -358,7 +359,7 @@ async fn run_show(
         println!("No access policies on '{dataset}'.");
         println!(
             "Enable a profile: fluree model access enable {dataset} \
-             --profile write --entity <iri>"
+             --profile write --class <iri>"
         );
         return Ok(());
     }
@@ -452,7 +453,7 @@ fn require_absolute_iri(flag: &str, v: &str) -> CliResult<()> {
     }
 }
 
-/// Merge `class_iri` into the space's grant on the dataset via the stack's
+/// Merge `policy_class` into the space's grant on the dataset via the stack's
 /// grants API. System-plane state (grants) is the one place the compiler
 /// talks to an API instead of the data plane — grants are router-owned
 /// invariants (scope validation, membership checks).
@@ -461,7 +462,7 @@ async fn attach_grant(
     remote_name: &str,
     dataset: &str,
     space_id: &str,
-    class_iri: &str,
+    policy_class: &str,
     wants_write: bool,
 ) -> CliResult<()> {
     use crate::config::TomlSyncConfigStore;
@@ -538,8 +539,8 @@ async fn attach_grant(
                 .collect()
         })
         .unwrap_or_default();
-    if !classes.iter().any(|c| c == class_iri) {
-        classes.push(class_iri.to_string());
+    if !classes.iter().any(|c| c == policy_class) {
+        classes.push(policy_class.to_string());
     }
 
     let existing_access = existing
@@ -582,8 +583,8 @@ async fn attach_grant(
 mod tests {
     use super::*;
 
-    const ENTITY: &str = "https://example.org/Lead";
-    const CLASS: &str = "https://example.org/Lead/access/write";
+    const LEAD: &str = "https://example.org/Lead";
+    const POLICY_CLASS: &str = "https://example.org/Lead/access/write";
 
     /// Exact-id lookup — the default class IRI itself ends in the profile
     /// name (…/access/write), so suffix matching would be ambiguous.
@@ -597,14 +598,14 @@ mod tests {
 
     #[test]
     fn write_profile_emits_class_view_and_verb_policy() {
-        let g = compile(CLASS, ENTITY, Profile::Write, &[], None);
+        let g = compile(POLICY_CLASS, LEAD, Profile::Write, &[], None);
         assert_eq!(g["@graph"].as_array().unwrap().len(), 3);
 
-        let view = node(&g, &format!("{CLASS}/view")).expect("view policy");
-        assert_eq!(view[format!("{F}onClass")]["@id"], ENTITY);
+        let view = node(&g, &format!("{POLICY_CLASS}/view")).expect("view policy");
+        assert_eq!(view[format!("{F}onClass")]["@id"], LEAD);
         assert_eq!(view[format!("{F}allow")], true);
 
-        let write = node(&g, &format!("{CLASS}/write")).expect("write policy");
+        let write = node(&g, &format!("{POLICY_CLASS}/write")).expect("write policy");
         let verbs: Vec<&str> = write[format!("{F}action")]
             .as_array()
             .unwrap()
@@ -619,7 +620,7 @@ mod tests {
                 "https://ns.flur.ee/db#delete"
             ]
         );
-        assert_eq!(write[format!("{F}onClass")]["@id"], ENTITY);
+        assert_eq!(write[format!("{F}onClass")]["@id"], LEAD);
         // No property allow-list, no rdf:type entry — verb semantics make
         // the class grant exact on their own.
         assert!(write.get(format!("{F}onProperty")).is_none());
@@ -629,7 +630,7 @@ mod tests {
     fn read_profile_has_no_write_policy() {
         let g = compile(
             "https://example.org/Lead/access/read",
-            ENTITY,
+            LEAD,
             Profile::Read,
             &[],
             None,
@@ -642,7 +643,7 @@ mod tests {
     fn intake_profile_is_create_only_without_view() {
         let g = compile(
             "https://example.org/Lead/access/intake",
-            ENTITY,
+            LEAD,
             Profile::Intake,
             &[],
             None,
@@ -658,8 +659,8 @@ mod tests {
     #[test]
     fn property_narrowing_adds_on_property_conjunction() {
         let props = vec!["https://example.org/status".to_string()];
-        let g = compile(CLASS, ENTITY, Profile::Write, &props, None);
-        let write = node(&g, &format!("{CLASS}/write")).unwrap();
+        let g = compile(POLICY_CLASS, LEAD, Profile::Write, &props, None);
+        let write = node(&g, &format!("{POLICY_CLASS}/write")).unwrap();
         assert_eq!(
             write[format!("{F}onProperty")][0]["@id"],
             "https://example.org/status"
@@ -671,7 +672,7 @@ mod tests {
         let path = "<https://example.org/memberOf>/^<https://example.org/team>";
         let g = compile(
             "https://example.org/Lead/access/read",
-            ENTITY,
+            LEAD,
             Profile::Read,
             &[],
             Some(path),
@@ -701,8 +702,8 @@ mod tests {
 
     #[test]
     fn absolute_iri_gate() {
-        assert!(require_absolute_iri("--entity", "https://example.org/Lead").is_ok());
-        assert!(require_absolute_iri("--entity", "ex:Lead").is_err());
+        assert!(require_absolute_iri("--class", "https://example.org/Lead").is_ok());
+        assert!(require_absolute_iri("--class", "ex:Lead").is_err());
     }
 
     #[test]

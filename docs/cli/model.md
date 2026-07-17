@@ -25,7 +25,7 @@ All write commands accept `--dry-run` (print the compiled JSON-LD without transa
 Compile an access profile into policies on a dataset.
 
 ```bash
-fluree model access enable <DATASET> --profile <read|write|intake> --entity <IRI> [OPTIONS]
+fluree model access enable <DATASET> --profile <read|write|intake> --class <IRI> [OPTIONS]
 fluree model access show <DATASET>
 ```
 
@@ -44,33 +44,35 @@ Verb semantics make the class grant exact: class targeting matches pre ∪ post 
 | Option | Description |
 |--------|-------------|
 | `--profile <p>` | `read`, `write`, or `intake` |
-| `--entity <iri>` | Entity class IRI (absolute) |
+| `--class <iri>` | Target class IRI whose instances the profile governs (absolute) — compiles to `f:onClass` |
 | `--property <iri>` | Narrow the **write** policy to a column set (`f:onProperty` conjunction; repeatable) — "may edit status of Leads, nothing else" |
-| `--connected <path>` | Relationship gate (**read** profile only): a SPARQL property path from the requesting identity to the entity, e.g. `"^<https://example.org/owner>"` (I see what I own). Stored verbatim in the policy via the engine's `@path` context term |
-| `--class-iri <iri>` | Policy class IRI override (default `{entity}/access/{profile}`) |
+| `--connected <path>` | Relationship gate (**read** profile only): a SPARQL property path from the requesting identity to the instance, e.g. `"^<https://example.org/owner>"` (I see what I own). Stored verbatim in the policy via the engine's `@path` context term |
+| `--policy-class <iri>` | Policy class IRI override (default `{class}/access/{profile}`). The policy class is the *assignment unit* grants and tokens carry — how a request selects its policy set, not a data restriction |
 | `--space <id>` | Attach the policy class to this space's grant on the dataset (hosted stacks; requires `--remote`). Merges with existing grant classes, never clobbers |
 | `--dry-run` | Print the compiled JSON-LD without transacting |
 
+Three class-shaped things are in play, with distinct roles: `--class` restricts *what data* is governed, `--property` optionally narrows it to columns, and the **policy class** selects *which policy set a request runs under* (via space grants / token `policy-class`).
+
 ### Semantics of re-running
 
-`enable` **replaces** the two policy nodes it owns (`{class}/view`, `{class}/write`) atomically: one transaction wildcard-deletes both ids and inserts the fresh compilation. A property from a previous run cannot linger (the policy loader gives `f:allow` precedence over `f:query`, so a stale `f:allow: true` would silently disable a newly added `--connected` gate), and profile switches on the same class are exact — switching `write` → `read` revokes `{class}/write`.
+`enable` **replaces** the two policy nodes it owns (`{policy-class}/view`, `{policy-class}/write`) atomically: one transaction wildcard-deletes both ids and inserts the fresh compilation. A property from a previous run cannot linger (the policy loader gives `f:allow` precedence over `f:query`, so a stale `f:allow: true` would silently disable a newly added `--connected` gate), and profile switches on the same policy class are exact — switching `write` → `read` revokes `{policy-class}/write`.
 
 ### Examples
 
 ```bash
 # Apps may fully own Lead instances
-fluree model access enable crm --profile write --entity https://example.org/Lead
+fluree model access enable crm --profile write --class https://example.org/Lead
 
 # Column-narrowed write: may edit status of Leads, nothing else
-fluree model access enable crm --profile write --entity https://example.org/Lead \
+fluree model access enable crm --profile write --class https://example.org/Lead \
   --property https://example.org/status
 
 # Relationship-gated read: I see Leads whose team I'm a member of
-fluree model access enable crm --profile read --entity https://example.org/Lead \
+fluree model access enable crm --profile read --class https://example.org/Lead \
   --connected "<https://example.org/memberOf>/^<https://example.org/team>"
 
-# Hosted stack: transact the policies AND attach the class to a space grant
-fluree model access enable crm --profile write --entity https://example.org/Lead \
+# Hosted stack: transact the policies AND attach the policy class to a space grant
+fluree model access enable crm --profile write --class https://example.org/Lead \
   --space 01hx... --remote prod
 ```
 

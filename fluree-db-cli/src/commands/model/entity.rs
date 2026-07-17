@@ -263,7 +263,7 @@ async fn run_define(
          \x20     not retro-validated; `fluree validate` produces a full report."
     );
     println!(
-        "next: fluree model access enable {dataset} --profile write --entity {entity}\n\
+        "next: fluree model access enable {dataset} --profile write --class {entity}\n\
          \x20     grants create/update/delete on the class — the shape above governs\n\
          \x20     what valid instances look like."
     );
