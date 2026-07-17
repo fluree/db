@@ -710,3 +710,85 @@ The engine-side arithmetic: `get_data_model` ≈ Σ over ~10 tables of `(T_catal
 and because it is un-deadlined it does not stop. This is the single shape where the **engine finding**
 (§3b, no self-timeout) and the **solo finding** (no `/data-model` server deadline) compound into a
 capacity-risk runaway, and it is the most fixable (wire a deadline on that path).
+
+## A.6 Measured-in-Lambda correction — the dominant term is ROW MATERIALIZATION, not fetch
+
+lambda-audit's cross-answers supply the **measured in-Lambda anchor** that supersedes the model's
+weakest assumption (`L≈30 ms`, dev-Mac→S3). It changes what the primary lever is.
+
+**Measured anchor (a scan that COMPLETED under budget):** `DW_SVL.DIM_CUSTOMER`, one file,
+1,744,133 rows, projection of 4 columns, plan→complete = 30.95 s at `C = min(6, 1 file) = 1`
+⇒ **≈56,000 rows/s on one core** (Track B §4/§"Lever arithmetic"). The file is small (4 columns),
+so this is **not** fetch-bound — it is single-threaded R2RML row materialization.
+
+**The dominant term is scan VOLUME (rows materialized), not cross-region latency and not file
+count.** `files_pruned=0` on every table (no selective predicate is pushed down), so **every row is
+materialized**. Cross-region metadata RTT is a measured ~0.9–1.3 s/table (≈30× same-region) — a real
+multi-second cold floor for a ~19-table star, but dwarfed by materialization once FACT tables are in
+play. So the model needs a materialization term, and it becomes the leading one:
+
+```
+  wall ≈ Σ_tables [ T_catalog(~1.2 s/table cross-region metadata RTT, cold)
+                    + max( request-floor  F/C × L        (DW_SF01 tiny-file regime),
+                           materialize     rows/(C × 56k) (DW_SVL volume regime) ) ]
+```
+
+For `DW_SVL` the materialize term dominates. FACT tables are 36 M–200 M rows across **64–129 files**
+each ⇒ `C = min(6, files) = 6` ⇒ ~6×56k ≈ 336k rows/s ⇒ a **36 M-row FACT ≈ 107 s**, a **200 M-row
+FACT ≈ ~590 s**. That one arithmetic explains BOTH the nine 55 s cancels (any query touching a FACT
+blows the budget) AND the 900 s `get_data_model` runaway (info-stats touches every FACT, ~0.5 B rows,
+un-pruned). **Correction to §A.5/(iii):** Track B's "a single 167K-row `DIM_PRODUCT` scan alone blew
+55 s" is not consistent with 56k rows/s (167K rows ≈ 3 s); that 52 s query must also have touched a
+FACT/join partner — the exact SPARQL is the open item, but the wall is a FACT materialization, not
+the dim.
+
+### The single-file regime is single-threaded by construction (engine receipt)
+
+A single-file table pins scan concurrency to `min(6, 1) = 1` (§4), and the large-file decode runs
+the whole Arrow decode on **one** `spawn_blocking` thread — `decode_large_file` (db
+`send_parquet.rs:678-705`, one `tokio::task::spawn_blocking` at `:691`) reads that file's row groups
+**sequentially**. So a single 1.7 M-row file uses **one of six cores**. **Intra-file (row-group)
+parallelism is a real, currently-absent engine lever:** Parquet row groups are independently
+decodable and are already enumerated (`surviving_row_groups`, `send_parquet.rs:68`); splitting them
+across `spawn_blocking` tasks would cut the single-file / few-file materialization wall ~×(cores).
+It is **plan-level and survives cold** — it needs no cache. This is the *only* engine lever for the
+single-large-file regime besides re-layout.
+
+### Compaction guidance changes — and is NOT the dominant fix here
+
+Because a single file → `C=1`, the compaction target is **not** "few files" but **N×128 MB where
+N ≥ available parallelism** — compacting `DW_SF01` to ONE file would drop it into `DW_SVL`'s
+single-thread pathology. And critically: **compaction moves zero rows**, so it does **not** reduce
+the dominant materialization term. The dominant lever is **pruning / predicate + row pushdown**
+(`files_pruned=0` is the smoking gun) and **intra-file parallelism**; compaction and same-region
+placement are secondary cold-floor trims.
+
+### The info-stats runaway is a ROUTING gap, not a missing capability (FACT 2 answer)
+
+**A metadata-only virtual info path already exists and already serves row counts from Iceberg with
+zero data reads.** `build_graph_source_info` → `build_iceberg_virtual_info` →
+`fetch_virtual_table_row_counts` reads the **loadTable snapshot summary only** — "no manifest-list,
+manifest, or Parquet/data file is read" (db `ledger_info.rs:1524-1526`, fan-out `:1607-1648`);
+classes/properties are derived from the R2RML mapping and NDV is set to `None`
+(`build_virtual_ledger_info`, `:1193`, `:1344-1345`); the count fetch is even time-boxed
+(`info_count_budget_ms`, `:1715-1735`).
+
+**But that path is reached only on the `is_not_found()` fallback.** `LedgerInfoBuilder::execute`
+(db `ledger_info.rs:2165-2191`) first resolves the id as a **committed** ledger; only if that returns
+not-found does it fall back to `lookup_graph_source` → the metadata-only path (`:2172-2188`). A
+virtual dataset that is **also a committed ledger** — which `full-enterprise-byo-1:main` is (a named
+dataset composed of 16 R2RML triples-maps) — resolves as a ledger and takes the **native**
+`build_ledger_info_with_options` → `assemble_full_stats` (`:487`, `:527`), which computes full stats
+by **materializing the federated R2RML tables** = the 900 s runaway.
+
+**Feasibility: HIGH — it is a routing + skip-scan fix, not new infrastructure.** Route a
+graph-source-federated dataset's stats to the metadata path (row counts from snapshot summaries,
+schema from the mapping) instead of `assemble_full_stats`. **What consumers need:** the info-stats
+`flakes`/`count`/`ndv-*` fields are already `Option` documented "null when unknown (virtual dataset,
+no scan)" (`ledger_info.rs:147,195,211-222,249,274`), so the schema already tolerates
+estimate/absent. The `get_data_model` consumer needs the **shape** (classes, properties, table
+structure) + **approximate counts** for LLM context — not exact flake totals or exact NDV. Iceberg
+snapshot summaries give **exact** row counts cheaply; column NDV is optional in Iceberg manifests
+(`distinct_counts`) — serve it if present, else `null`. **No full-table scan is required for the
+data-model use case.** This kills the runaway independent of any deadline fix (the deadline fix is
+the orthogonal solo-side belt-and-suspenders).
