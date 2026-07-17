@@ -41,8 +41,8 @@ fn apply_window(
     base: &[RunRecordV2],
     novelty: &[RunRecordV2],
     ops: &[u8],
-    candidates: &[RunRecordV2],
-    candidate_ops: &[u8],
+    superseded: &[RunRecordV2],
+    superseded_ops: &[u8],
 ) -> (Vec<u8>, Vec<u8>) {
     let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 1000, 1);
     for r in base {
@@ -77,8 +77,8 @@ fn apply_window(
         &branch_bytes,
         novelty,
         ops,
-        candidates,
-        candidate_ops,
+        superseded,
+        superseded_ops,
         &config,
         &|cid| Ok(leaf_store.get(cid).expect("leaf bytes").clone()),
         &|_cid| Ok(None),
@@ -140,12 +140,12 @@ fn present_at(leaf_bytes: &[u8], sidecar_bytes: &[u8], t_target: i64, s_id: u64)
 fn deleted_then_readded_fact_is_absent_during_the_gap() {
     let base = vec![int_rec(10, 100, 1)];
     // Post-dedup winner stream for window events [retract@4, assert@6]:
-    // the assert wins; the superseded retract flows as a candidate.
+    // the assert wins; the retract flows in the superseded stream.
     let novelty = vec![int_rec(10, 100, 6)];
     let ops = vec![1u8];
-    let candidates = vec![int_rec(10, 100, 4)];
-    let candidate_ops = vec![0u8];
-    let (leaf, sidecar) = apply_window(&base, &novelty, &ops, &candidates, &candidate_ops);
+    let superseded = vec![int_rec(10, 100, 4)];
+    let superseded_ops = vec![0u8];
+    let (leaf, sidecar) = apply_window(&base, &novelty, &ops, &superseded, &superseded_ops);
 
     assert!(present_at(&leaf, &sidecar, 7, 10), "present after re-add");
     assert!(present_at(&leaf, &sidecar, 2, 10), "present before delete");
@@ -163,12 +163,12 @@ fn deleted_then_readded_fact_is_absent_during_the_gap() {
 fn fact_born_and_deleted_in_one_window_is_present_during_its_life() {
     let base = vec![int_rec(5, 50, 1)];
     // Post-dedup winner stream for window events [assert@5, retract@6]:
-    // the retract wins; the superseded assert flows as a candidate.
+    // the retract wins; the assert flows in the superseded stream.
     let novelty = vec![int_rec(10, 100, 6)];
     let ops = vec![0u8];
-    let candidates = vec![int_rec(10, 100, 5)];
-    let candidate_ops = vec![1u8];
-    let (leaf, sidecar) = apply_window(&base, &novelty, &ops, &candidates, &candidate_ops);
+    let superseded = vec![int_rec(10, 100, 5)];
+    let superseded_ops = vec![1u8];
+    let (leaf, sidecar) = apply_window(&base, &novelty, &ops, &superseded, &superseded_ops);
 
     assert!(
         !present_at(&leaf, &sidecar, 2, 10),
@@ -189,12 +189,12 @@ fn fact_born_and_deleted_in_one_window_is_present_during_its_life() {
 fn double_deleted_fact_is_absent_from_the_first_delete() {
     let base = vec![int_rec(5, 50, 1), int_rec(10, 100, 1)];
     // Post-dedup winner stream for window events [retract@5, retract@6]:
-    // the later retract wins; the superseded first retract is a candidate.
+    // the later retract wins; the first retract flows in the superseded stream.
     let novelty = vec![int_rec(10, 100, 6)];
     let ops = vec![0u8];
-    let candidates = vec![int_rec(10, 100, 5)];
-    let candidate_ops = vec![0u8];
-    let (leaf, sidecar) = apply_window(&base, &novelty, &ops, &candidates, &candidate_ops);
+    let superseded = vec![int_rec(10, 100, 5)];
+    let superseded_ops = vec![0u8];
+    let (leaf, sidecar) = apply_window(&base, &novelty, &ops, &superseded, &superseded_ops);
 
     assert!(present_at(&leaf, &sidecar, 4, 10), "present before deletes");
     assert!(!present_at(&leaf, &sidecar, 7, 10), "absent after deletes");

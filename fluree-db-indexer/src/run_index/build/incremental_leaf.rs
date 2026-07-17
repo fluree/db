@@ -47,6 +47,12 @@ pub struct LeafUpdateInput<'a> {
     pub novelty: &'a [RunRecordV2],
     /// Parallel ops array (same length as `novelty`): 1=assert, 0=retract.
     pub novelty_ops: &'a [u8],
+    /// Superseded events for this leaf's key range, sorted by `order`
+    /// (see [`MergeInput::superseded`]). Every superseded event's identity
+    /// has a winner in `novelty`.
+    pub superseded: &'a [RunRecordV2],
+    /// Parallel ops array for `superseded`.
+    pub superseded_ops: &'a [u8],
     /// Sort order.
     pub order: RunSortOrder,
     /// Graph id (for routing context; not encoded in leaf V3).
@@ -121,9 +127,11 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
     let header = decode_leaf_header_v3(input.leaf_bytes)?;
     let dir = decode_leaf_dir_v3_with_base(input.leaf_bytes, &header)?;
 
-    // Slice novelty to leaflets.
+    // Slice novelty to leaflets; superseded route identically.
     let novelty_slices =
         slice_novelty_to_leaflets(input.novelty, input.novelty_ops, &dir, input.order);
+    let superseded_slices =
+        slice_novelty_to_leaflets(input.superseded, input.superseded_ops, &dir, input.order);
 
     // Process each leaflet.
     let mut processed: Vec<ProcessedLeafletV3> = Vec::with_capacity(
@@ -148,8 +156,8 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
                 input,
                 entry,
                 dir.payload_base,
-                nov_slice,
-                ops_slice,
+                (nov_slice, ops_slice),
+                superseded_slices[i],
                 &mut matched,
             )?;
             processed.append(&mut merged);
@@ -301,8 +309,8 @@ fn merge_and_encode_leaflet(
     input: &LeafUpdateInput<'_>,
     entry: &LeafletDirEntryV3,
     payload_base: usize,
-    novelty: &[RunRecordV2],
-    novelty_ops: &[u8],
+    (novelty, novelty_ops): (&[RunRecordV2], &[u8]),
+    (superseded, superseded_ops): (&[RunRecordV2], &[u8]),
     matched: &mut Vec<RunRecordV2>,
 ) -> io::Result<Vec<ProcessedLeafletV3>> {
     // 1. Load existing leaflet columns.
@@ -328,6 +336,8 @@ fn merge_and_encode_leaflet(
         existing_history: &existing_history,
         novelty,
         novelty_ops,
+        superseded,
+        superseded_ops,
         order,
     };
     let MergeOutput {
@@ -764,6 +774,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &[],
             novelty_ops: &[],
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -790,6 +802,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -855,6 +869,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -883,6 +899,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -908,6 +926,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -942,6 +962,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -988,6 +1010,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,

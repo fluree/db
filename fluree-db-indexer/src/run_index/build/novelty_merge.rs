@@ -37,6 +37,14 @@ pub struct MergeInput<'a> {
     /// Novelty ops — parallel array, same length as `novelty`.
     /// 1 = assert, 0 = retract.
     pub novelty_ops: &'a [u8],
+    /// Events superseded by lifecycle dedup, sorted by `order`
+    /// (identity-adjacent; arbitrary within an identity). Every superseded
+    /// event's identity has exactly one op in `novelty`. Together with that
+    /// winner they form the identity's full in-window event sequence, from
+    /// which the merge derives history-sidecar transition entries.
+    pub superseded: &'a [RunRecordV2],
+    /// Superseded ops — parallel array, same length as `superseded`.
+    pub superseded_ops: &'a [u8],
     /// Sort order (determines merge comparison).
     pub order: RunSortOrder,
 }
@@ -295,6 +303,11 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
         input.novelty_ops.len(),
         "novelty and novelty_ops must have same length"
     );
+    debug_assert_eq!(
+        input.superseded.len(),
+        input.superseded_ops.len(),
+        "superseded and superseded_ops must have same length"
+    );
 
     let mut out: Vec<RunRecordV2> = Vec::with_capacity(existing_len + novelty_len);
     let mut new_history: Vec<HistEntryV2> = Vec::with_capacity(novelty_len * 2);
@@ -438,7 +451,8 @@ mod tests {
         }
     }
 
-    /// Helper: make a MergeInput from existing records + novelty records + ops.
+    /// Helper: make a MergeInput from existing records + novelty records + ops
+    /// (no transition superseded).
     fn make_input<'a>(
         batch: &'a ColumnBatch,
         novelty: &'a [RunRecordV2],
@@ -451,6 +465,8 @@ mod tests {
             existing_history,
             novelty,
             novelty_ops: ops,
+            superseded: &[],
+            superseded_ops: &[],
             order,
         }
     }

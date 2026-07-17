@@ -107,10 +107,13 @@ pub struct BranchUpdateMeta {
 ///
 /// Leaves are processed sequentially. The caller is responsible for prefetching
 /// touched leaves if parallelism is desired.
+#[allow(clippy::too_many_arguments)]
 pub fn update_branch<F, G>(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
+    superseded: &[RunRecordV2],
+    superseded_ops: &[u8],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -128,6 +131,8 @@ where
         existing_branch_bytes,
         novelty,
         novelty_ops,
+        superseded,
+        superseded_ops,
         config,
         fetch_leaf,
         fetch_sidecar,
@@ -159,6 +164,8 @@ pub fn update_branch_streaming<F, G, S>(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
+    superseded: &[RunRecordV2],
+    superseded_ops: &[u8],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -182,8 +189,10 @@ where
     let manifest = read_branch_from_bytes(existing_branch_bytes)?;
     let cmp = cmp_v2_for_order(order);
 
-    // Slice novelty to leaves.
+    // Slice novelty to leaves; superseded events route identically (every
+    // superseded identity has a winner in the same key range).
     let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp);
+    let superseded_slices = slice_novelty_to_leaves(superseded, superseded_ops, &manifest, cmp);
 
     // Touched leaves: the per-leaf `update_leaf` (decode → merge → zstd re-encode)
     // is the CPU-bound work. On a multi-core box with enough touched leaves we fan
@@ -205,6 +214,7 @@ where
     drain_branch(
         &manifest,
         &novelty_slices,
+        &superseded_slices,
         config,
         fetch_leaf,
         fetch_sidecar,
@@ -228,6 +238,7 @@ enum DrainMode {
 fn drain_branch<F, G, S>(
     manifest: &BranchManifest,
     novelty_slices: &[(&[RunRecordV2], &[u8])],
+    superseded_slices: &[(&[RunRecordV2], &[u8])],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -245,6 +256,7 @@ where
         DrainMode::Serial => update_branch_serial(
             manifest,
             novelty_slices,
+            superseded_slices,
             config,
             fetch_leaf,
             fetch_sidecar,
@@ -254,6 +266,7 @@ where
         DrainMode::Parallel { window } => update_branch_parallel(
             manifest,
             novelty_slices,
+            superseded_slices,
             config,
             fetch_leaf,
             fetch_sidecar,
@@ -337,11 +350,14 @@ const LEAF_SPLIT_CEILING_FACTOR: usize = 2;
 /// (`slice_novelty_to_leaves`), and the leftmost/rightmost leaves keep their
 /// −∞/+∞ coverage (leaf 0 takes everything below `leaves[1].first_key`; the last
 /// leaf takes all remaining).
+#[allow(clippy::too_many_arguments)]
 fn make_leaf_update_input<'a>(
     leaf_bytes: &'a [u8],
     sidecar_bytes: Option<&'a [u8]>,
     nov_slice: &'a [RunRecordV2],
     ops_slice: &'a [u8],
+    superseded_slice: &'a [RunRecordV2],
+    superseded_ops_slice: &'a [u8],
     config: &BranchUpdateConfig,
 ) -> io::Result<LeafUpdateInput<'a>> {
     let existing_header = decode_leaf_header_v3(leaf_bytes)?;
@@ -362,6 +378,8 @@ fn make_leaf_update_input<'a>(
         leaf_bytes,
         novelty: nov_slice,
         novelty_ops: ops_slice,
+        superseded: superseded_slice,
+        superseded_ops: superseded_ops_slice,
         order: config.order,
         g_id: config.g_id,
         zstd_level: config.zstd_level,
@@ -418,6 +436,7 @@ where
 fn update_branch_serial<F, G, S>(
     manifest: &BranchManifest,
     novelty_slices: &[(&[RunRecordV2], &[u8])],
+    superseded_slices: &[(&[RunRecordV2], &[u8])],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -435,6 +454,7 @@ where
             acc.leaf_entries.push(existing.clone());
             continue;
         }
+        let (superseded_slice, superseded_ops_slice) = superseded_slices[i];
 
         let leaf_bytes = fetch_leaf(&existing.leaf_cid)?;
         let sidecar_bytes = match &existing.sidecar_cid {
@@ -446,6 +466,8 @@ where
             sidecar_bytes.as_deref(),
             nov_slice,
             ops_slice,
+            superseded_slice,
+            superseded_ops_slice,
             config,
         )?;
         let output = update_leaf(&input)?;
@@ -463,6 +485,8 @@ struct LeafWorkUnit<'a> {
     sidecar_bytes: Option<Vec<u8>>,
     nov_slice: &'a [RunRecordV2],
     ops_slice: &'a [u8],
+    superseded_slice: &'a [RunRecordV2],
+    superseded_ops_slice: &'a [u8],
 }
 
 /// Windowed parallel per-leaf CoW. Iterates the novelty slices in manifest order
@@ -486,6 +510,7 @@ struct LeafWorkUnit<'a> {
 fn update_branch_parallel<F, G, S>(
     manifest: &BranchManifest,
     novelty_slices: &[(&[RunRecordV2], &[u8])],
+    superseded_slices: &[(&[RunRecordV2], &[u8])],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -519,6 +544,7 @@ where
             if nov_slice.is_empty() {
                 continue;
             }
+            let (superseded_slice, superseded_ops_slice) = superseded_slices[i + offset];
             let leaf_bytes = fetch_leaf(&existing.leaf_cid)?;
             let sidecar_bytes = match &existing.sidecar_cid {
                 Some(cid) => fetch_sidecar(cid)?,
@@ -530,6 +556,8 @@ where
                 sidecar_bytes,
                 nov_slice,
                 ops_slice,
+                superseded_slice,
+                superseded_ops_slice,
             });
         }
 
@@ -545,6 +573,8 @@ where
                     unit.sidecar_bytes.as_deref(),
                     unit.nov_slice,
                     unit.ops_slice,
+                    unit.superseded_slice,
+                    unit.superseded_ops_slice,
                     config,
                 )?;
                 let output = update_leaf(&input)?;
@@ -702,10 +732,12 @@ mod parity_tests {
         let manifest = read_branch_from_bytes(branch_bytes).unwrap();
         let cmp = cmp_v2_for_order(config.order);
         let slices = slice_novelty_to_leaves(novelty, ops, &manifest, cmp);
+        let superseded_slices = slice_novelty_to_leaves(&[], &[], &manifest, cmp);
         let mut blobs: Vec<NewLeafBlob> = Vec::new();
         let meta = drain_branch(
             &manifest,
             &slices,
+            &superseded_slices,
             config,
             &|cid: &ContentId| Ok(leaf_map.get(cid).cloned().unwrap()),
             &|cid: &ContentId| Ok(sidecar_map.get(cid).cloned()),
