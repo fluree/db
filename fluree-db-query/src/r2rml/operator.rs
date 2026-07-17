@@ -637,18 +637,20 @@ impl R2rmlScanOperator {
             &self.pattern.object_constant,
             self.pattern.predicate_filter.as_deref(),
         ) {
-            let mut matching = triples_map
-                .predicate_object_maps
-                .iter()
-                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
-            if let (Some(pom), None) = (matching.next(), matching.next()) {
-                if let Some(col) = value_pushdown_column(&pom.object_map) {
-                    out.push(crate::r2rml::ScanFilter {
-                        column: col.to_string(),
-                        op: crate::r2rml::ScanCmpOp::Eq,
-                        value: value.clone(),
-                    });
-                }
+            push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
+        }
+
+        // W4-1 PRIMARY: a scalar constant-object member of a same-subject star
+        // (`?ol ex:orderLineKey "1"; ?ol ex:order ?ord`) lands in `star_constraints`,
+        // not the base `object_constant`, so without this it was enforced ONLY
+        // residually — the whole FACT was read and filtered post-scan (the round-3b
+        // point-lookup fanned into a full 120 M-row scan). Push each scalar star
+        // constraint as a scan filter under the same soundness gate, so a constant
+        // key equality prunes the scan even alongside other predicates. IRI/decimal/
+        // double constraints stay operator-enforced only (not pushable here).
+        for (pred_iri, constant) in &self.pattern.star_constraints {
+            if let crate::r2rml::ObjectConstant::Scalar(value) = constant {
+                push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
             }
         }
 
@@ -1730,6 +1732,108 @@ fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
             value: ConstantValue::Literal { datatype, .. },
         } => datatype.as_deref(),
         _ => None,
+    }
+}
+
+/// The xsd integer-family datatypes: types whose canonical lexical form of an
+/// integer value carries no decimal point, so a decimal-free integer string is the
+/// column's exact rendering. Only these admit the string→`Int` scan-filter coercion
+/// (`coerce_scalar_for_pushdown`); `xsd:decimal`/`double` render with a fractional
+/// part, so their lexical↔numeric relationship is scale-dependent and not coerced.
+fn is_xsd_integer_datatype(iri: &str) -> bool {
+    use fluree_vocab::xsd;
+    matches!(
+        iri,
+        xsd::INTEGER
+            | xsd::LONG
+            | xsd::INT
+            | xsd::SHORT
+            | xsd::BYTE
+            | xsd::UNSIGNED_LONG
+            | xsd::UNSIGNED_INT
+            | xsd::UNSIGNED_SHORT
+            | xsd::UNSIGNED_BYTE
+            | xsd::NON_NEGATIVE_INTEGER
+            | xsd::POSITIVE_INTEGER
+    )
+}
+
+/// Coerce a scalar constant to the [`ScanValue`] that soundly prunes `om`'s column,
+/// or `None` to DECLINE the push (leaving the operator's residual check the sole
+/// authority — a declined push is never wrong, only unpruned).
+///
+/// SOUNDNESS (the W4-1 hard requirement): the residual
+/// [`rdf_term_eq_object_constant`] compares a `Scalar(Str)` constant LEXICALLY
+/// against the column's materialized rendering, so a pushed file-prune filter is
+/// admissible only when its match-set PROVABLY covers that residual match-set. The
+/// one coercion performed — a string literal against a declared xsd-integer column —
+/// fires ONLY when the string round-trips canonically (`n.to_string() == s`): then
+/// lexical-eq ⟺ integer-eq and an `Int(n)` equality prunes exactly the residual's
+/// rows. Non-canonical forms (`"01"`, `"1.0"`, a non-numeric string) are ambiguous
+/// and DECLINED. A value already carrying a pushable, residual-matched type
+/// (`Int`/`Bool`/`Date`) pushes as-is; a string against any non-integer column
+/// pushes as-is too — a string column prunes lexicographically, and the reader
+/// safely ignores a string filter on a numeric physical column (pre-existing).
+fn coerce_scalar_for_pushdown(
+    value: &crate::r2rml::ScanValue,
+    om: &ObjectMap,
+) -> Option<crate::r2rml::ScanValue> {
+    use crate::r2rml::ScanValue;
+    match value {
+        ScanValue::Str(s) => {
+            if object_map_datatype(om).is_some_and(is_xsd_integer_datatype) {
+                match s.parse::<i64>() {
+                    // Canonical round-trip ⇒ lexical-eq ⟺ integer-eq; otherwise the
+                    // coercion is ambiguous and could over-prune vs the residual.
+                    Ok(n) if n.to_string() == *s => Some(ScanValue::Int(n)),
+                    _ => None,
+                }
+            } else {
+                Some(ScanValue::Str(s.clone()))
+            }
+        }
+        // Already a pushable, type-matched value; the residual uses the same
+        // semantics for these variants.
+        ScanValue::Int(_) | ScanValue::Bool(_) | ScanValue::Date(_) => Some(value.clone()),
+        // Double/Decimal/TemplateKey never wrap a Scalar object constant (a numeric
+        // object routes to ObjectConstant::Double/Decimal, operator-enforced only),
+        // so these are unreachable here; push as-is defensively — never wrong.
+        ScanValue::Double(_) | ScanValue::Decimal { .. } | ScanValue::TemplateKey(_) => {
+            Some(value.clone())
+        }
+    }
+}
+
+/// Push an `Eq` scan filter for a scalar constant-object equality on `pred_iri`,
+/// applying the [`coerce_scalar_for_pushdown`] soundness gate. Shared by the base
+/// `object_constant` (single-predicate `?s pred const`) and the `star_constraints`
+/// (a constant-object member of a same-subject star, e.g. `?ol …key "1"; ?ol ?p ?o`)
+/// so both classes of constant key-equality prune the scan identically. A file-level
+/// prune is only sound when the predicate maps to EXACTLY ONE scalar object map
+/// backed by one column (else a row could match via an unpruned column); otherwise
+/// no filter is pushed and the operator's residual check remains the authority.
+fn push_scalar_eq_filter(
+    out: &mut Vec<crate::r2rml::ScanFilter>,
+    triples_map: &TriplesMap,
+    pred_iri: &str,
+    value: &crate::r2rml::ScanValue,
+) {
+    let mut matching = triples_map
+        .predicate_object_maps
+        .iter()
+        .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+    let (Some(pom), None) = (matching.next(), matching.next()) else {
+        return;
+    };
+    let Some(col) = value_pushdown_column(&pom.object_map) else {
+        return;
+    };
+    if let Some(v) = coerce_scalar_for_pushdown(value, &pom.object_map) {
+        out.push(crate::r2rml::ScanFilter {
+            column: col.to_string(),
+            op: crate::r2rml::ScanCmpOp::Eq,
+            value: v,
+        });
     }
 }
 
@@ -2878,6 +2982,165 @@ mod tests {
             ))),
             None
         );
+    }
+
+    // W4-1 SECONDARY (the hard requirement): a pushed filter's match-set must
+    // PROVABLY cover the residual's. The residual (`rdf_term_eq_object_constant`,
+    // `Scalar(Str)` arm) compares LEXICALLY, so a string literal coerces to `Int`
+    // ONLY when it round-trips canonically (lexical-eq ⟺ integer-eq); every
+    // ambiguous form declines the push so the residual — never wrong — stays sole
+    // authority. These are the refutation cases (residual-matches-but-would-mismatch
+    // and non-numeric-vs-numeric are never over-pruned).
+    #[test]
+    fn w4_1_coerce_string_to_int_only_when_canonical() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::ObjectMap;
+
+        let int_col = ObjectMap::column_typed("K", fluree_vocab::xsd::INTEGER);
+        let long_col = ObjectMap::column_typed("K", fluree_vocab::xsd::LONG);
+        let str_untyped = ObjectMap::column("NAME"); // no rr:datatype → xsd:string
+        let str_typed = ObjectMap::column_typed("NAME", fluree_vocab::xsd::STRING);
+        let dec_col = ObjectMap::column_typed("AMT", fluree_vocab::xsd::DECIMAL);
+
+        // Canonical integer string against an integer column → coerced (prunes).
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &int_col),
+            Some(ScanValue::Int(1))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("-5".into()), &long_col),
+            Some(ScanValue::Int(-5))
+        );
+
+        // REFUTATION — non-canonical / non-integer against an integer column DECLINE
+        // (never over-prune vs the lexical residual): "01" (leading zero), "1.0"
+        // (fraction), "+1" (sign form), " 1" (space), "abc" (non-numeric).
+        for s in ["01", "1.0", "+1", " 1", "abc", ""] {
+            assert_eq!(
+                coerce_scalar_for_pushdown(&ScanValue::Str(s.into()), &int_col),
+                None,
+                "non-canonical {s:?} against an integer column must DECLINE the push"
+            );
+        }
+
+        // A string against a string column pushes AS-IS (lexicographic prune matches
+        // the residual's lexical compare) — no coercion, incl. non-canonical forms.
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &str_untyped),
+            Some(ScanValue::Str("1".into()))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("01".into()), &str_typed),
+            Some(ScanValue::Str("01".into()))
+        );
+        // A string against a DECIMAL column is not coerced (scale-dependent lexical
+        // relationship) → pushed as-is; the reader safely ignores a string filter on
+        // a numeric physical column (no prune, never wrong).
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &dec_col),
+            Some(ScanValue::Str("1".into()))
+        );
+
+        // Already-typed, residual-matched values push as-is.
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Int(7), &int_col),
+            Some(ScanValue::Int(7))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Bool(true), &str_untyped),
+            Some(ScanValue::Bool(true))
+        );
+    }
+
+    // W4-1 PRIMARY dispatch: the shared push helper resolves a scalar key equality
+    // to a single scalar pushdown column and applies the coercion gate, declining
+    // on a duplicate-predicate (unsound file-prune) or a non-column object map.
+    #[test]
+    fn w4_1_push_scalar_eq_filter_resolution_and_gate() {
+        use crate::r2rml::{ScanCmpOp, ScanValue};
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let tm = TriplesMap::new("#OrderLine", "FACT_ORDER_LINE")
+            .with_subject_template("http://ex/ol/{ORDER_LINE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+                object_map: ObjectMap::column_typed("ORDER_LINE_KEY", fluree_vocab::xsd::INTEGER),
+            });
+
+        // Canonical key equality → one coerced Int filter on the mapped column.
+        let mut out = Vec::new();
+        push_scalar_eq_filter(&mut out, &tm, "http://ex/orderLineKey", &ScanValue::Str("1".into()));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].column, "ORDER_LINE_KEY");
+        assert!(matches!(out[0].op, ScanCmpOp::Eq));
+        assert_eq!(out[0].value, ScanValue::Int(1));
+
+        // Non-canonical → declined (coercion gate).
+        let mut out = Vec::new();
+        push_scalar_eq_filter(&mut out, &tm, "http://ex/orderLineKey", &ScanValue::Str("01".into()));
+        assert!(out.is_empty());
+
+        // Duplicate predicate (two POMs) → not a sound single-column prune → declined.
+        let tm_dup = tm.clone().with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+            object_map: ObjectMap::column("ORDER_LINE_KEY_ALT"),
+        });
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm_dup,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("1".into()),
+        );
+        assert!(out.is_empty());
+
+        // A value-transforming (template) object map is not pushable → declined.
+        let tm_tmpl = TriplesMap::new("#X", "T").with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/p"),
+            object_map: ObjectMap::template("PRE-{C}", vec!["C".to_string()]),
+        });
+        let mut out = Vec::new();
+        push_scalar_eq_filter(&mut out, &tm_tmpl, "http://ex/p", &ScanValue::Str("1".into()));
+        assert!(out.is_empty());
+    }
+
+    // W4-1 PRIMARY end-to-end: a scalar constant-object member of a same-subject
+    // star (`?ol …key "1"; ?ol ex:order ?ord`) lands in `star_constraints` and now
+    // produces a scan filter, so the multi-predicate point-lookup prunes the FACT
+    // scan (was residual-only → full read). The residual guard stays intact.
+    #[test]
+    fn w4_1_star_constraint_pushes_scan_filter() {
+        use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
+        use crate::seed::EmptyOperator;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let tm = TriplesMap::new("#OrderLine", "FACT_ORDER_LINE")
+            .with_subject_template("http://ex/ol/{ORDER_LINE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+                object_map: ObjectMap::column_typed("ORDER_LINE_KEY", fluree_vocab::xsd::INTEGER),
+            })
+            .with_predicate_object(pom("http://ex/order", "ORDER_KEY"));
+
+        // ?ol ex:order ?ord (the star base) + ?ol ex:orderLineKey "1" (folded const).
+        let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        pattern.predicate_filter = Some("http://ex/order".to_string());
+        pattern.star_constraints = vec![(
+            "http://ex/orderLineKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Str("1".to_string())),
+        )];
+        // The star constraint is a residual filter regardless of the push (the
+        // operator still enforces it post-scan) — the push is an optimization on top.
+        assert!(topk_residual_filter_present(&pattern));
+
+        let op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        let filters = op.build_scan_filters(&tm);
+        let key = filters
+            .iter()
+            .find(|f| f.column == "ORDER_LINE_KEY")
+            .expect("the folded key equality must now push a scan filter");
+        assert!(matches!(key.op, ScanCmpOp::Eq));
+        assert_eq!(key.value, ScanValue::Int(1));
     }
 
     #[test]
