@@ -3,9 +3,12 @@
 **Status:** audit complete; Phases A (harness completeness) and E (CI
 enforcement) are implemented on branch `test/sparql-testsuite-full-coverage`.
 `cargo test` in `testsuite-sparql/` runs all 36 suites green (~15 s wall,
-parallel): 1,420 tests — 815 passing, 538 registered engine/feature gaps, 67
+parallel): 1,420 tests — 816 passing, 541 registered engine/feature gaps, 63
 registered not-applicable — with the register enforced in both directions in
-CI. Phases B/C/D burn the registers down from here.
+CI. Phases B/C/D burn the registers down from here. (Corrected 2026-07-06 by
+the Stage-2 burn-down cross-check: the original 815/538/67 split was stale —
+pp06 passes and was deregistered, and 4 entries were reclassified from
+not-applicable to gap; see `docs/audit/burn-down/ROADMAP.md`.)
 **Baseline:** commit `15e2a4b95` (origin/main), rdf-tests submodule `efccbc6b8` (`sparql-mixed-rdf-version-tests-228-gefccbc6`).
 
 ## 1. Executive summary
@@ -155,10 +158,13 @@ Ordered roughly by breadth of impact:
 6. **SPARQL parser: `BASE` + relative `PREFIX` IRI resolution**
    (`base-prefix-1`: "expected IRI after prefix namespace") — several 1.0
    `basic` failures.
-7. **Property-path multiplicity semantics** (pp06, pp16, pp34-36): sequence
-   paths must preserve solution multiplicity while `*`/`+` are
-   distinct-node; plus pp36 zero-var projection. Deep operator semantics in a
-   hot operator — needs the §6 pattern (common shapes keep current code path).
+7. **Property-path residuals** (pp16, pp34-36; pp06 passes and is already
+   deregistered): pp16 zero-length-path node-universe completeness and pp36
+   zero-var projection stay path-operator work; the burn-down verification
+   reattributed pp34/pp35 to the graph cluster (constant-GRAPH-IRI base
+   expansion + `?g`-as-literal), not path cardinality. Deep operator
+   semantics in a hot operator — needs the §6 pattern (common shapes keep
+   current code path).
 8. **RDF-star / SPARQL 1.2** — see §4.3.
 9. Misc: `agg-count-rows-distinct` execution error, constructwhere04/
    constructlist execution errors, subquery02/04/12, exists03/
@@ -411,11 +417,16 @@ PRs, each shrinking skip lists in the same change that fixes the engine.
   `sparql10/graph` tests even though named-graph data now loads correctly.
 - `GRAPH` blocks inside `DELETE WHERE` are rejected at lowering
   ("not yet supported").
-- `INSERT` into a not-yet-existing named graph silently loses the triples
-  (basic-update `insert-05a`, `insert-*-same-bnode*`).
+- Multi-operation (`;`) UPDATE requests silently execute only the first
+  operation (#1438) — this, not named-graph INSERT loss or combined
+  DELETE/INSERT skew, is the verified root cause behind basic-update
+  `insert-05a` / `insert-*-same-bnode*` and `dawg-delete-insert-01c`: each
+  individual operation works, everything after the first `;` is discarded.
+  (Corrected 2026-07-06 by the burn-down verification; the two earlier
+  bullets "INSERT into a not-yet-existing named graph silently loses the
+  triples" and "combined DELETE/INSERT WHERE applies inserts without the
+  deletes" are refuted.)
 - `USING` clause semantics incomplete (`dawg-delete-using-*`).
-- Combined `DELETE`/`INSERT` `WHERE` applies inserts without the deletes
-  (`dawg-delete-insert-01c`).
 - CSV output does not use canonical `xsd:double` lexical form (`csv03`).
 
 **Open items:**

@@ -169,9 +169,22 @@ impl crate::BranchLifecycle for MemoryNameService {
         let key = self.normalize_ledger_id(ledger_id);
         let mut records = self.records.write();
 
+        // Refuse a branch that still has children (see the guard in
+        // `StorageNameService::drop_branch`). Peek before removing so
+        // a refused drop leaves the record intact.
+        let child_count = records
+            .get(&key)
+            .ok_or_else(|| crate::NameServiceError::not_found(&key))?
+            .branches;
+        if child_count > 0 {
+            return Err(crate::NameServiceError::storage(format!(
+                "drop_branch refused: {key} still has {child_count} child branch(es)"
+            )));
+        }
+
         let record = records
             .remove(&key)
-            .ok_or_else(|| crate::NameServiceError::not_found(&key))?;
+            .expect("record present — child-count check above loaded it");
 
         // Decrement parent's child count if this branch had a parent
         let parent_new_count = record.source_branch.as_ref().and_then(|source| {
@@ -1591,5 +1604,31 @@ mod tests {
         let branches = ns.list_branches("mydb").await.unwrap();
         assert_eq!(branches.len(), 1);
         assert_eq!(branches[0].branch, "main");
+    }
+
+    #[tokio::test]
+    async fn drop_branch_refuses_parent_with_children() {
+        let ns = MemoryNameService::new();
+        ns.init("mydb:main").await.unwrap();
+        ns.create_branch("mydb", "feature", "main", None)
+            .await
+            .unwrap();
+
+        // `main` has a child now — dropping it must refuse, leaving
+        // both records intact.
+        let err = ns
+            .drop_branch("mydb:main")
+            .await
+            .expect_err("dropping a parent with children must fail");
+        assert!(
+            err.to_string().contains("child branch"),
+            "expected child-branch refusal, got: {err}"
+        );
+        assert!(ns.lookup("mydb:main").await.unwrap().is_some());
+        assert!(ns.lookup("mydb:feature").await.unwrap().is_some());
+
+        // Dropping the leaf first, then the parent, succeeds.
+        ns.drop_branch("mydb:feature").await.unwrap();
+        ns.drop_branch("mydb:main").await.unwrap();
     }
 }

@@ -9197,3 +9197,124 @@ async fn indexed_inline_type_star_aggregate_overlay_undercount_regression() {
         })
         .await;
 }
+
+// =============================================================================
+// PR-1454 review: EncodedSid/EncodedLit graph-variable decode arms (#1443)
+// =============================================================================
+
+/// Regression for the #1443 fix on a **binary-indexed** ledger: an
+/// outer-bound `?g` (scanned from the index) feeding
+/// `FILTER EXISTS { GRAPH ?g { … } }` must seed the row's own graph via
+/// the `GraphVarCorrelated` strategy — the memory-backed suites (including
+/// the W3C harness) never run this plan against `BinaryScanOperator`
+/// output at all. PR-1454's audit found the `EncodedSid`/`EncodedLit`
+/// extraction arms themselves are defense-in-depth no current plan shape
+/// reaches (upstream operators materialize batches first — see the comment
+/// in `graph.rs::extract_graph_iri_from_binding`); what this pins is the
+/// indexed end-to-end behavior, including the string-literal back-compat.
+#[tokio::test]
+async fn indexed_exists_graph_var_decodes_encoded_bindings() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/encoded-graph-var:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            fluree
+                .create_ledger(ledger_id)
+                .await
+                .expect("create ledger");
+
+            // `?g` sources: an IRI object (→ EncodedSid off the index), a
+            // plain-string object naming the same graph (→ EncodedLit,
+            // the documented back-compat arm), and an IRI object naming an
+            // EMPTY graph (EXISTS must filter it out — guards against the
+            // seeding degenerating to constant-true).
+            let result = fluree
+                .graph(ledger_id)
+                .transact()
+                .sparql_update(
+                    r#"PREFIX ex: <http://example.org/ns/>
+                       INSERT DATA {
+                           ex:s1 ex:pointsTo <urn:g:one> .
+                           ex:s2 ex:pointsTo <urn:g:empty> .
+                           ex:s3 ex:pointsToStr "urn:g:one" .
+                           GRAPH <urn:g:one> { ex:x ex:y "z" }
+                       }"#,
+                )
+                .index_config(index_cfg)
+                .commit()
+                .await
+                .expect("seed commit");
+            trigger_index_and_wait_outcome(&handle, ledger_id, result.receipt.t).await;
+
+            // Indexed view: scans produce lazily-encoded bindings.
+            let view = fluree.db(ledger_id).await.expect("load indexed view");
+
+            // EncodedSid arm: only the subject whose ?g names the
+            // populated graph survives EXISTS.
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT ?s
+                WHERE { ?s ex:pointsTo ?g . FILTER EXISTS { GRAPH ?g { ex:x ex:y ?z } } }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("EncodedSid graph-var query");
+            let json = result.to_sparql_json(&view.snapshot).expect("sparql json");
+            let bindings = json["results"]["bindings"]
+                .as_array()
+                .expect("bindings array");
+            assert_eq!(
+                bindings.len(),
+                1,
+                "exactly ex:s1's graph is populated: {json}"
+            );
+            assert_eq!(
+                bindings[0]["s"]["value"], "ex:s1",
+                "EXISTS must seed the row's own ?g, decoded from EncodedSid: {json}"
+            );
+            assert_eq!(
+                bindings[0]["s"]["type"], "uri",
+                "SPARQL results JSON renders IRI bindings as type 'uri': {json}"
+            );
+
+            // EncodedLit arm: the string-literal graph name resolves the
+            // same named graph (documented back-compat).
+            let q = r"
+                PREFIX ex: <http://example.org/ns/>
+                SELECT ?s
+                WHERE { ?s ex:pointsToStr ?g . FILTER EXISTS { GRAPH ?g { ex:x ex:y ?z } } }
+            ";
+            let result = fluree
+                .query(&view, QueryInput::Sparql(q))
+                .await
+                .expect("EncodedLit graph-var query");
+            let json = result.to_sparql_json(&view.snapshot).expect("sparql json");
+            assert_eq!(
+                json["results"]["bindings"]
+                    .as_array()
+                    .expect("bindings array")
+                    .len(),
+                1,
+                "string-literal ?g must decode via the EncodedLit arm: {json}"
+            );
+        })
+        .await;
+}

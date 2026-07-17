@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, TermId};
+use fluree_vocab::iri::is_absolute_iri;
 use fluree_vocab::rdf;
 use rustc_hash::FxHashMap;
 
@@ -53,6 +54,12 @@ pub struct Parser<'a, 'input, S> {
     prefixes: FxHashMap<String, String>,
     /// Base IRI for relative IRI resolution
     base: Option<String>,
+    /// Nesting depth of `{| … |}` annotation bodies currently being parsed.
+    /// Non-zero means we are inside an annotation body, where further star
+    /// constructs (annotation-of-annotation, reified triples) are the
+    /// deferred v1 shapes — mirrors the JSON-LD `@annotation` lowering,
+    /// which rejects the same nesting.
+    annotation_depth: u32,
 }
 
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
@@ -89,6 +96,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             rdf_rest_term: None,
             prefixes: FxHashMap::default(),
             base: None,
+            annotation_depth: 0,
         })
     }
 
@@ -504,6 +512,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.advance()?;
                 Ok(self.rdf_nil())
             }
+            TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
+            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!("expected subject, found {:?}", self.current().kind),
@@ -521,7 +531,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.advance()?;
                 if matches!(
                     self.current().kind,
-                    TokenKind::Dot | TokenKind::RBracket | TokenKind::Eof
+                    TokenKind::Dot
+                        | TokenKind::RBracket
+                        | TokenKind::Eof
+                        | TokenKind::AnnotationClose
                 ) {
                     break;
                 }
@@ -567,18 +580,29 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     ///
     /// Collections in object position are emitted as indexed list items via
     /// `emit_list_item()` instead of rdf:first/rdf:rest linked lists.
+    ///
+    /// Each object may carry an RDF 1.2 annotation tail (`~ reifier` and/or
+    /// `{| … |}` blocks) — see [`Self::parse_annotation_tail`].
     fn parse_object_list(&mut self, subject: TermId, predicate: TermId) -> Result<()> {
         loop {
             match self.current().kind {
                 TokenKind::LParen => {
                     self.parse_collection_as_list(subject, predicate)?;
+                    self.reject_annotation_on_collection()?;
                 }
                 TokenKind::Nil => {
                     self.advance()?;
+                    self.reject_annotation_on_collection()?;
                 }
                 _ => {
                     let object = self.parse_object()?;
                     self.sink_emit_triple(subject, predicate, object);
+                    if matches!(
+                        self.current().kind,
+                        TokenKind::Tilde | TokenKind::AnnotationOpen
+                    ) {
+                        self.parse_annotation_tail(subject, predicate, object)?;
+                    }
                 }
             }
 
@@ -647,6 +671,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             | TokenKind::Decimal
             | TokenKind::Double(_) => self.parse_literal(),
             TokenKind::KwTrue | TokenKind::KwFalse => self.parse_literal(),
+            TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
+            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!("expected object, found {:?}", self.current().kind),
@@ -861,24 +887,276 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         Ok(first_node)
     }
 
-    /// Resolve a potentially relative IRI against the base (RFC 3986 §5).
-    fn resolve_iri(&self, reference: &str) -> Result<String> {
-        // Absolute IRI reference (carries a valid scheme) — returned verbatim,
-        // fragment included; resolution does not apply.
-        if let Some(colon_pos) = reference.find(':') {
-            let potential_scheme = &reference[..colon_pos];
-            if !potential_scheme.is_empty()
-                && potential_scheme
-                    .chars()
-                    .next()
-                    .unwrap()
-                    .is_ascii_alphabetic()
-                && potential_scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-            {
-                return Ok(reference.to_string());
+    // =========================================================================
+    // RDF 1.2 (Turtle-star) — asserting forms only
+    // =========================================================================
+    //
+    // Supported: reified triples `<< s p o >>` / `<< s p o ~ reifier >>`
+    // (subject or object position, nesting via the reifier node) and
+    // annotation blocks `s p o {| … |}` / `s p o ~ reifier {| … |}`.
+    //
+    // Deliberately rejected with specific deferred errors:
+    // - `<<( … )>>` triple terms as values (no Fluree representation yet;
+    //   the triple-term-as-value epic owns this),
+    // - star constructs nested inside an annotation body
+    //   (annotation-of-annotation — mirrors the JSON-LD `@annotation`
+    //   lowering's v1 deferral),
+    // - annotations on RDF collections (`( … ) {| … |}`) — collections are
+    //   emitted as indexed list items with no single object term to reify.
+
+    /// Error for `<<( … )>>` triple terms as values.
+    fn triple_term_deferred_error(&self) -> TurtleError {
+        TurtleError::parse(
+            self.current().start as usize,
+            "RDF 1.2 triple terms as values ('<<( … )>>') are deferred in Turtle \
+             ingest; only the asserting forms are supported (reified triples \
+             '<< s p o >>' with optional '~ reifier', and annotation blocks '{| … |}')",
+        )
+    }
+
+    /// Guard shared by every star construct: the sink must support
+    /// reified-triple events, and star constructs must not appear inside
+    /// an annotation body (the deferred annotation-of-annotation shape).
+    fn check_star_allowed(&self, construct: &str) -> Result<()> {
+        if !self.sink.supports_reified_triples() {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "Turtle-star {construct} is not supported on this ingest path \
+                     (deferred); only direct Turtle insert/import paths accept \
+                     RDF 1.2 asserting forms"
+                ),
+            ));
+        }
+        if self.annotation_depth > 0 {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "Turtle-star {construct} nested inside an annotation body is the \
+                     deferred annotation-of-annotation shape (v1) — mirrors the \
+                     JSON-LD @annotation deferral"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Annotations after collection objects have no single object term to
+    /// reify (collections are emitted as indexed list items); reject with a
+    /// specific deferred error instead of a generic parse failure.
+    fn reject_annotation_on_collection(&mut self) -> Result<()> {
+        if matches!(
+            self.current().kind,
+            TokenKind::Tilde | TokenKind::AnnotationOpen
+        ) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                "RDF 1.2 annotations on collection objects ('( … ) {| … |}') are \
+                 deferred; annotate a single-object triple instead",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Parse a reified triple: `<< rtSubject verb rtObject reifier? >>`.
+    ///
+    /// Emits the base triple, mints/resolves the reifier, signals the
+    /// reifier attachment to the sink, and returns the reifier `TermId`
+    /// (which stands in for the reified triple in the surrounding
+    /// subject/object position).
+    ///
+    /// A FRESH blank-node reifier is minted per anonymous occurrence —
+    /// two textual occurrences of the same `<< s p o >>` never share a
+    /// reifier (mirrors the JSON-LD `_:fluree_ann_N` minting; W3C
+    /// eval-triple-terms `pattern-3-nomatch` depends on this).
+    fn parse_reified_triple(&mut self) -> Result<TermId> {
+        self.check_star_allowed("reified triple ('<< … >>')")?;
+        self.expect(&TokenKind::ReifiedTripleStart)?;
+
+        let subject = self.parse_rt_subject()?;
+        let predicate = self.parse_predicate()?;
+        let object = self.parse_rt_object()?;
+
+        // Optional reifier: `~` (iri | BlankNode)? — bare `~` mints fresh.
+        let reifier = if matches!(self.current().kind, TokenKind::Tilde) {
+            self.advance()?;
+            self.parse_reifier_term()?
+        } else {
+            self.sink_term_blank(None)
+        };
+
+        self.expect(&TokenKind::ReifiedTripleEnd)?;
+
+        // Fluree's edge-annotation model reifies an asserted edge: emit the
+        // base triple, then the reifier attachment (documented divergence
+        // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
+        // inventory).
+        self.sink_emit_triple(subject, predicate, object);
+        self.sink
+            .emit_reified_triple(subject, predicate, object, reifier);
+
+        Ok(reifier)
+    }
+
+    /// rtSubject ::= iri | BlankNode | reifiedTriple
+    fn parse_rt_subject(&mut self) -> Result<TermId> {
+        match self.current().kind.clone() {
+            TokenKind::Iri => {
+                let s = self.current().start;
+                let e = self.current().end;
+                let iri = self.iri_content(s, e);
+                self.advance()?;
+                self.resolve_iri_term(iri)
             }
+            TokenKind::IriEscaped(iri) => {
+                self.advance()?;
+                self.resolve_iri_term(&iri)
+            }
+            TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
+                let s = self.current().start;
+                let e = self.current().end;
+                self.advance()?;
+                self.resolve_prefixed_term(s, e)
+            }
+            TokenKind::BlankNodeLabel => {
+                let label = self.blank_label(self.current().start, self.current().end);
+                self.advance()?;
+                Ok(self.sink_term_blank(Some(label)))
+            }
+            TokenKind::Anon => {
+                self.advance()?;
+                Ok(self.sink_term_blank(None))
+            }
+            TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
+            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
+            _ => Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected reified-triple subject (IRI, blank node, or nested \
+                     '<< … >>'), found {:?}",
+                    self.current().kind
+                ),
+            )),
+        }
+    }
+
+    /// rtObject ::= iri | BlankNode | literal | tripleTerm | reifiedTriple
+    ///
+    /// Note: collections and blank-node property lists are NOT allowed
+    /// inside a reified triple (per the RDF 1.2 Turtle grammar), so this
+    /// does not reuse `parse_object`.
+    fn parse_rt_object(&mut self) -> Result<TermId> {
+        match self.current().kind.clone() {
+            TokenKind::LBracket | TokenKind::LParen | TokenKind::Nil => Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "collections and blank-node property lists are not allowed \
+                     inside a reified triple, found {:?}",
+                    self.current().kind
+                ),
+            )),
+            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
+            TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
+            _ => self.parse_object(),
+        }
+    }
+
+    /// reifier ::= '~' (iri | BlankNode)? — the `~` is already consumed.
+    /// A bare `~` (next token closes the construct or continues the
+    /// statement) mints a fresh anonymous reifier.
+    fn parse_reifier_term(&mut self) -> Result<TermId> {
+        match self.current().kind.clone() {
+            TokenKind::Iri => {
+                let s = self.current().start;
+                let e = self.current().end;
+                let iri = self.iri_content(s, e);
+                self.advance()?;
+                self.resolve_iri_term(iri)
+            }
+            TokenKind::IriEscaped(iri) => {
+                self.advance()?;
+                self.resolve_iri_term(&iri)
+            }
+            TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
+                let s = self.current().start;
+                let e = self.current().end;
+                self.advance()?;
+                self.resolve_prefixed_term(s, e)
+            }
+            TokenKind::BlankNodeLabel => {
+                let label = self.blank_label(self.current().start, self.current().end);
+                self.advance()?;
+                Ok(self.sink_term_blank(Some(label)))
+            }
+            TokenKind::Anon => {
+                self.advance()?;
+                Ok(self.sink_term_blank(None))
+            }
+            // Bare `~`: fresh anonymous reifier.
+            _ => Ok(self.sink_term_blank(None)),
+        }
+    }
+
+    /// Parse the annotation tail after an object:
+    /// `annotation ::= (reifier | annotationBlock)*` where
+    /// `annotationBlock ::= '{|' predicateObjectList '|}'`.
+    ///
+    /// - `~ reifier` attaches `reifier` to the `(subject, predicate,
+    ///   object)` edge (reifier bundle emitted immediately) and stays
+    ///   "pending" so an immediately following `{| … |}` describes that
+    ///   same reifier instead of minting a second one.
+    /// - `{| … |}` without a pending reifier mints a FRESH anonymous
+    ///   reifier (never deduped by edge identity), emits its bundle, then
+    ///   parses the body as ordinary triples about the reifier.
+    fn parse_annotation_tail(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<()> {
+        let mut pending: Option<TermId> = None;
+        loop {
+            match self.current().kind {
+                TokenKind::Tilde => {
+                    self.check_star_allowed("reifier ('~')")?;
+                    self.advance()?;
+                    let reifier = self.parse_reifier_term()?;
+                    self.sink
+                        .emit_reified_triple(subject, predicate, object, reifier);
+                    pending = Some(reifier);
+                }
+                TokenKind::AnnotationOpen => {
+                    self.check_star_allowed("annotation block ('{| … |}')")?;
+                    self.advance()?;
+                    let reifier = match pending.take() {
+                        Some(r) => r,
+                        None => {
+                            let r = self.sink_term_blank(None);
+                            self.sink.emit_reified_triple(subject, predicate, object, r);
+                            r
+                        }
+                    };
+                    if !matches!(self.current().kind, TokenKind::AnnotationClose) {
+                        self.annotation_depth += 1;
+                        let body = self.parse_predicate_object_list(reifier);
+                        self.annotation_depth -= 1;
+                        body?;
+                    }
+                    self.expect(&TokenKind::AnnotationClose)?;
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a potentially relative IRI against the base (RFC 3986 §5).
+    ///
+    /// Delegates to the shared resolver in `fluree_vocab::iri`; this wrapper
+    /// only supplies the Turtle-specific "relative IRI without base" error.
+    fn resolve_iri(&self, reference: &str) -> Result<String> {
+        if is_absolute_iri(reference) {
+            return Ok(reference.to_string());
         }
 
         let base = match &self.base {
@@ -890,89 +1168,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
         };
 
-        // RFC 3986 §5.2.1: split the reference into its fragment and everything
-        // before it. The fragment is the portion after the FIRST `#`. Per
-        // §5.2.2 the resolved fragment is ALWAYS the reference's fragment and is
-        // never inherited from the base, so scheme/authority/path/query are
-        // resolved against the fragment-less portion and the reference fragment
-        // is re-attached during recomposition (§5.3).
-        let (ref_no_fragment, ref_fragment) = match reference.find('#') {
-            Some(pos) => (&reference[..pos], Some(&reference[pos + 1..])),
-            None => (reference, None),
-        };
-
-        let (base_scheme, base_authority, base_path, base_query) = parse_iri_components(base);
-
-        let (scheme, authority, path, query) = if ref_no_fragment.is_empty() {
-            // Same-document reference (`<>` or `<#frag>`): the reference has an
-            // empty path and no query, so the target inherits the base path and
-            // query (RFC 3986 §5.2.2). The base's own fragment is dropped because
-            // `parse_iri_components` never returns it.
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                base_path.to_string(),
-                base_query.map(std::string::ToString::to_string),
-            )
-        } else if let Some(rest) = ref_no_fragment.strip_prefix("//") {
-            let (ref_authority, ref_path, ref_query) = parse_hier_part(rest);
-            (
-                base_scheme.to_string(),
-                Some(ref_authority),
-                remove_dot_segments(&ref_path),
-                ref_query,
-            )
-        } else if ref_no_fragment.starts_with('/') {
-            let (ref_path, ref_query) = split_path_query(ref_no_fragment);
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                remove_dot_segments(ref_path),
-                ref_query.map(std::string::ToString::to_string),
-            )
-        } else if let Some(query_rest) = ref_no_fragment.strip_prefix('?') {
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                base_path.to_string(),
-                Some(query_rest.to_string()),
-            )
-        } else {
-            let (ref_path, ref_query) = split_path_query(ref_no_fragment);
-            let merged = if base_authority.is_some() && base_path.is_empty() {
-                format!("/{ref_path}")
-            } else {
-                let base_dir = match base_path.rfind('/') {
-                    Some(pos) => &base_path[..=pos],
-                    None => "",
-                };
-                format!("{base_dir}{ref_path}")
-            };
-            (
-                base_scheme.to_string(),
-                base_authority.map(std::string::ToString::to_string),
-                remove_dot_segments(&merged),
-                ref_query.map(std::string::ToString::to_string),
-            )
-        };
-
-        let mut result = scheme;
-        result.push(':');
-        if let Some(auth) = authority {
-            result.push_str("//");
-            result.push_str(&auth);
-        }
-        result.push_str(&path);
-        if let Some(q) = query {
-            result.push('?');
-            result.push_str(&q);
-        }
-        if let Some(fragment) = ref_fragment {
-            result.push('#');
-            result.push_str(fragment);
-        }
-
-        Ok(result)
+        Ok(fluree_vocab::iri::resolve_iri(base, reference))
     }
 
     /// Expand a prefixed name to a full IRI.
@@ -1001,96 +1197,6 @@ fn unescape_pn_local(local: &str) -> String {
         }
     }
     result
-}
-
-#[inline]
-fn is_absolute_iri(reference: &str) -> bool {
-    if let Some(colon_pos) = reference.find(':') {
-        let potential_scheme = &reference[..colon_pos];
-        !potential_scheme.is_empty()
-            && potential_scheme
-                .chars()
-                .next()
-                .unwrap()
-                .is_ascii_alphabetic()
-            && potential_scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    } else {
-        false
-    }
-}
-
-// =============================================================================
-// RFC3986 IRI Resolution Helpers
-// =============================================================================
-
-fn parse_iri_components(iri: &str) -> (&str, Option<&str>, &str, Option<&str>) {
-    let (scheme, rest) = match iri.find(':') {
-        Some(pos) => (&iri[..pos], &iri[pos + 1..]),
-        None => return ("", None, iri, None),
-    };
-
-    let (authority, path_query) = if let Some(after_slashes) = rest.strip_prefix("//") {
-        let auth_end = after_slashes
-            .find(['/', '?', '#'])
-            .unwrap_or(after_slashes.len());
-        (Some(&after_slashes[..auth_end]), &after_slashes[auth_end..])
-    } else {
-        (None, rest)
-    };
-
-    let (path, query) = split_path_query(path_query);
-
-    (scheme, authority, path, query)
-}
-
-fn parse_hier_part(s: &str) -> (String, String, Option<String>) {
-    let auth_end = s.find(['/', '?', '#']).unwrap_or(s.len());
-    let authority = s[..auth_end].to_string();
-    let rest = &s[auth_end..];
-
-    let (path, query) = split_path_query(rest);
-    (
-        authority,
-        path.to_string(),
-        query.map(std::string::ToString::to_string),
-    )
-}
-
-fn split_path_query(s: &str) -> (&str, Option<&str>) {
-    let s = match s.find('#') {
-        Some(pos) => &s[..pos],
-        None => s,
-    };
-
-    match s.find('?') {
-        Some(pos) => (&s[..pos], Some(&s[pos + 1..])),
-        None => (s, None),
-    }
-}
-
-fn remove_dot_segments(path: &str) -> String {
-    let mut output: Vec<&str> = Vec::new();
-
-    for segment in path.split('/') {
-        match segment {
-            "." => {}
-            ".." => {
-                output.pop();
-            }
-            s => {
-                output.push(s);
-            }
-        }
-    }
-
-    let result = output.join("/");
-    if path.starts_with('/') && !result.starts_with('/') {
-        format!("/{result}")
-    } else {
-        result
-    }
 }
 
 /// Parse a Turtle document into GraphSink events.
@@ -1553,5 +1659,331 @@ mod tests {
         let mut sink = GraphCollectorSink::new();
         parse(turtle, &mut sink).expect("bare [ ... ] . statement must parse");
         assert_eq!(sink.finish().len(), 2);
+    }
+
+    // =========================================================================
+    // RDF 1.2 (Turtle-star) — asserting forms
+    // =========================================================================
+
+    use fluree_graph_ir::GraphSink;
+
+    /// A term as recorded by [`StarSink`] — enough identity to assert on.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecTerm {
+        Iri(String),
+        Blank(String),
+        Literal(String),
+    }
+
+    /// Recording sink that supports reified-triple events.
+    #[derive(Default)]
+    struct StarSink {
+        terms: Vec<RecTerm>,
+        blank_counter: u32,
+        blank_labels: std::collections::HashMap<String, TermId>,
+        triples: Vec<(RecTerm, RecTerm, RecTerm)>,
+        reified: Vec<(RecTerm, RecTerm, RecTerm, RecTerm)>,
+    }
+
+    impl StarSink {
+        fn t(&self, id: TermId) -> RecTerm {
+            self.terms[id.index() as usize].clone()
+        }
+        fn add(&mut self, term: RecTerm) -> TermId {
+            let id = TermId::new(self.terms.len() as u32);
+            self.terms.push(term);
+            id
+        }
+    }
+
+    impl GraphSink for StarSink {
+        fn on_base(&mut self, _base_iri: &str) {}
+        fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {}
+        fn term_iri(&mut self, iri: &str) -> TermId {
+            self.add(RecTerm::Iri(iri.to_string()))
+        }
+        fn term_blank(&mut self, label: Option<&str>) -> TermId {
+            match label {
+                Some(l) => {
+                    if let Some(&id) = self.blank_labels.get(l) {
+                        return id;
+                    }
+                    let id = self.add(RecTerm::Blank(l.to_string()));
+                    self.blank_labels.insert(l.to_string(), id);
+                    id
+                }
+                None => {
+                    self.blank_counter += 1;
+                    let label = format!("anon{}", self.blank_counter);
+                    self.add(RecTerm::Blank(label))
+                }
+            }
+        }
+        fn term_literal(
+            &mut self,
+            value: &str,
+            _datatype: Datatype,
+            _language: Option<&str>,
+        ) -> TermId {
+            self.add(RecTerm::Literal(value.to_string()))
+        }
+        fn term_literal_value(&mut self, value: LiteralValue, _datatype: Datatype) -> TermId {
+            self.add(RecTerm::Literal(value.lexical()))
+        }
+        fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+            let t = (self.t(subject), self.t(predicate), self.t(object));
+            self.triples.push(t);
+        }
+        fn supports_reified_triples(&self) -> bool {
+            true
+        }
+        fn emit_reified_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+            reifier: TermId,
+        ) {
+            let r = (
+                self.t(subject),
+                self.t(predicate),
+                self.t(object),
+                self.t(reifier),
+            );
+            self.reified.push(r);
+        }
+    }
+
+    fn parse_star(input: &str) -> StarSink {
+        let mut sink = StarSink::default();
+        parse(input, &mut sink).expect("star input must parse");
+        sink
+    }
+
+    fn iri(suffix: &str) -> RecTerm {
+        RecTerm::Iri(format!("http://example/{suffix}"))
+    }
+
+    const P: &str = "PREFIX : <http://example/>\n";
+
+    #[test]
+    fn star_reified_triple_subject_position() {
+        // data-1 shape: assert base, mint anon reifier, reifier gets props.
+        let sink = parse_star(&format!("{P}<<:a :b :c>> :q :z ."));
+        assert_eq!(sink.reified.len(), 1);
+        let (s, p, o, r) = &sink.reified[0];
+        assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
+        assert!(matches!(r, RecTerm::Blank(_)), "anon reifier: {r:?}");
+        // Base triple asserted + reifier property triple.
+        assert!(sink.triples.contains(&(iri("a"), iri("b"), iri("c"))));
+        assert!(sink.triples.contains(&(r.clone(), iri("q"), iri("z"))));
+        assert_eq!(sink.triples.len(), 2);
+    }
+
+    #[test]
+    fn star_reified_triple_object_position_and_named_reifier() {
+        // data-2 pattern-3 shape: named reifier shared across occurrences.
+        let sink = parse_star(&format!(
+            "{P}:a1 :b <<:s :p1 :o ~ :reifier >> .\n<<:s :p1 :o ~ :reifier >> :b :a2 ."
+        ));
+        // Two reified events, both naming :reifier for the same base triple.
+        assert_eq!(sink.reified.len(), 2);
+        for (s, p, o, r) in &sink.reified {
+            assert_eq!((s, p, o), (&iri("s"), &iri("p1"), &iri("o")));
+            assert_eq!(r, &iri("reifier"));
+        }
+        // The reifier is a queryable node on both sides.
+        assert!(sink
+            .triples
+            .contains(&(iri("a1"), iri("b"), iri("reifier"))));
+        assert!(sink
+            .triples
+            .contains(&(iri("reifier"), iri("b"), iri("a2"))));
+    }
+
+    #[test]
+    fn star_fresh_reifier_per_anonymous_occurrence() {
+        // pattern-3-nomatch depends on this: two textual occurrences of the
+        // SAME `<< s p o >>` must mint DISTINCT reifiers (never dedup by
+        // base-triple identity).
+        let sink = parse_star(&format!(
+            "{P}:a1 :b2 <<:s :p1 :o >> .\n<<:s :p1 :o >> :b2 :a2 ."
+        ));
+        assert_eq!(sink.reified.len(), 2);
+        let r1 = &sink.reified[0].3;
+        let r2 = &sink.reified[1].3;
+        assert_ne!(
+            r1, r2,
+            "anonymous reifiers must be fresh per occurrence, never deduped by edge"
+        );
+    }
+
+    #[test]
+    fn star_annotation_block() {
+        // data-3/data-8 shape: `:a :b :c {| :q :z |} .`
+        let sink = parse_star(&format!("{P}:a :b :c {{| :q :z |}} ."));
+        assert_eq!(sink.reified.len(), 1);
+        let (s, p, o, r) = &sink.reified[0];
+        assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
+        assert!(matches!(r, RecTerm::Blank(_)));
+        // Base + annotation-body property about the reifier.
+        assert!(sink.triples.contains(&(iri("a"), iri("b"), iri("c"))));
+        assert!(sink.triples.contains(&(r.clone(), iri("q"), iri("z"))));
+    }
+
+    #[test]
+    fn star_tilde_reifier_then_annotation_block_shares_reifier() {
+        // `:a :b :c ~ :r {| :q :z |}` — the block describes :r; exactly ONE
+        // reified event is emitted.
+        let sink = parse_star(&format!("{P}:a :b :c ~ :r {{| :q :z |}} ."));
+        assert_eq!(sink.reified.len(), 1);
+        assert_eq!(sink.reified[0].3, iri("r"));
+        assert!(sink.triples.contains(&(iri("r"), iri("q"), iri("z"))));
+    }
+
+    #[test]
+    fn star_bare_tilde_mints_fresh_reifier() {
+        let sink = parse_star(&format!("{P}:a :b :c ~ ."));
+        assert_eq!(sink.reified.len(), 1);
+        assert!(matches!(sink.reified[0].3, RecTerm::Blank(_)));
+    }
+
+    #[test]
+    fn star_nested_reified_triple() {
+        // data-2 pattern-6 shape: `<< <<:s :p2 :o>> :p3 :z >> :q :o .`
+        // Inner reifier becomes the subject of the outer base triple.
+        let sink = parse_star(&format!("{P}<< <<:s :p2 :o>> :p3 :z >> :q :o ."));
+        assert_eq!(sink.reified.len(), 2);
+        let (is_, ip, io, ir) = sink.reified[0].clone();
+        assert_eq!((is_, ip, io), (iri("s"), iri("p2"), iri("o")));
+        let (os_, op, oo, or_) = sink.reified[1].clone();
+        assert_eq!(os_, ir, "outer base subject is the inner reifier");
+        assert_eq!((op, oo), (iri("p3"), iri("z")));
+        assert!(sink.triples.contains(&(or_, iri("q"), iri("o"))));
+    }
+
+    #[test]
+    fn star_bnode_reifier_dedups_by_label() {
+        // data-7 shape: `~ _:bnodereifier` twice = same reifier node.
+        let sink = parse_star(&format!(
+            "{P}:x10 :left << :a :b 9 ~ _:bnodereifier >> .\n\
+             :x10 :right << :a :b 9 ~ _:bnodereifier >> ."
+        ));
+        assert_eq!(sink.reified.len(), 2);
+        assert_eq!(sink.reified[0].3, sink.reified[1].3);
+        assert!(matches!(sink.reified[0].3, RecTerm::Blank(_)));
+    }
+
+    #[test]
+    fn star_annotation_trailing_semicolon() {
+        let sink = parse_star(&format!("{P}:a :b :c {{| :q :z ; |}} ."));
+        assert_eq!(sink.reified.len(), 1);
+    }
+
+    #[test]
+    fn star_triple_term_rejected_with_deferred_error() {
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:x1 :left <<( :a :b 123 )>> ."), &mut sink)
+            .expect_err("triple terms as values must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("triple terms as values"), "{msg}");
+        assert!(msg.contains("deferred"), "{msg}");
+    }
+
+    #[test]
+    fn star_triple_term_in_reified_triple_rejected() {
+        let mut sink = StarSink::default();
+        let err = parse(
+            &format!("{P}:f :g << :s :p <<(:x2 :y3 123 )>> >> ."),
+            &mut sink,
+        )
+        .expect_err("nested triple term must be rejected");
+        assert!(err.to_string().contains("triple terms as values"));
+    }
+
+    #[test]
+    fn star_annotation_of_annotation_rejected() {
+        let mut sink = StarSink::default();
+        let err = parse(
+            &format!("{P}:a :b :c {{| :q :z {{| :q2 :z2 |}} |}} ."),
+            &mut sink,
+        )
+        .expect_err("annotation-of-annotation is deferred");
+        let msg = err.to_string();
+        assert!(msg.contains("annotation-of-annotation"), "{msg}");
+    }
+
+    #[test]
+    fn star_annotation_on_collection_rejected() {
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:a :b ( :c :d ) {{| :q :z |}} ."), &mut sink)
+            .expect_err("annotations on collections are deferred");
+        assert!(err.to_string().contains("collection objects"));
+    }
+
+    #[test]
+    fn star_rejected_on_unsupporting_sink() {
+        // GraphCollectorSink does not support reified triples — the parser
+        // must reject with a clear deferred error, never silently drop
+        // reifier semantics.
+        let mut sink = GraphCollectorSink::new();
+        let err = parse(&format!("{P}<<:a :b :c>> :q :z ."), &mut sink)
+            .expect_err("collector sink must reject star input");
+        let msg = err.to_string();
+        assert!(msg.contains("not supported on this ingest path"), "{msg}");
+
+        let mut sink = GraphCollectorSink::new();
+        let err = parse(&format!("{P}:a :b :c {{| :q :z |}} ."), &mut sink)
+            .expect_err("collector sink must reject annotation blocks");
+        assert!(err
+            .to_string()
+            .contains("not supported on this ingest path"));
+    }
+
+    #[test]
+    fn star_full_data2_corpus_parses() {
+        // The complete W3C eval-triple-terms data-2.ttl (all asserting
+        // forms: anon + named reifiers, object position, nesting). The
+        // pattern-3 caveat: these two tests only go green if the WHOLE
+        // file ingests.
+        let data2 = format!(
+            "{P}:s :p1 :o .\n\
+             <<:s :p1 :o>> :q :z .\n\
+             :a1 :b <<:s :p1 :o ~ :reifier >>  .\n\
+             <<:s :p1 :o  ~ :reifier >> :b :a2 .\n\
+             :a1 :b2 <<:s :p1 :o >>  .\n\
+             <<:s :p1 :o >> :b2 :a2 .\n\
+             :s :p2 :o .\n\
+             <<:s :p2 :o>> :sym <<:s :p2 :o>> .\n\
+             <<:s :p2 :o>> :p3 :z .\n\
+             << <<:s :p2 :o>> :p3 :z >> :q :o .\n\
+             <<:s :p2 :o ~ :reifier2 >> :p4 :z .\n\
+             << <<:s :p2 :o  ~ :reifier2 >> :p4 :z >> :q :o .\n"
+        );
+        let sink = parse_star(&data2);
+        // 13 reified occurrences in the file (nested `<< << … >> … >>`
+        // lines contribute two each).
+        assert_eq!(sink.reified.len(), 13);
+        // pattern-3 join exists…
+        assert!(sink
+            .triples
+            .contains(&(iri("a1"), iri("b"), iri("reifier"))));
+        assert!(sink
+            .triples
+            .contains(&(iri("reifier"), iri("b"), iri("a2"))));
+        // …and the pattern-3-nomatch pair uses two distinct anon reifiers.
+        let b2_object = sink
+            .triples
+            .iter()
+            .find(|(s, p, _)| s == &iri("a1") && p == &iri("b2"))
+            .map(|(_, _, o)| o.clone())
+            .expect("a1 :b2 triple");
+        let b2_subject = sink
+            .triples
+            .iter()
+            .find(|(s, p, o)| matches!(s, RecTerm::Blank(_)) && p == &iri("b2") && o == &iri("a2"))
+            .map(|(s, _, _)| s.clone())
+            .expect(":b2 a2 triple");
+        assert_ne!(b2_object, b2_subject, "pattern-3-nomatch must stay empty");
     }
 }

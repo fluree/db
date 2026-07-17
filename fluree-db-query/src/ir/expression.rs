@@ -237,6 +237,61 @@ impl Expression {
             Expression::Resolved(_) => false,
         }
     }
+
+    /// Visit every pattern list embedded in this expression — EXISTS / NOT
+    /// EXISTS sub-patterns (`FILTER(EXISTS { … } && …)`, `BIND(EXISTS { … }
+    /// AS ?x)`) and pattern comprehensions — recursing through
+    /// sub-expressions. The callback receives each embedded list once;
+    /// callers that need to walk *nested* pattern structure recurse
+    /// themselves (mirrors [`Self::contains_function`]'s traversal).
+    pub fn for_each_embedded_patterns(&self, f: &mut dyn FnMut(&[Pattern])) {
+        match self {
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => {}
+            Expression::Call { args, .. } => {
+                for a in args {
+                    a.for_each_embedded_patterns(f);
+                }
+            }
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.for_each_embedded_patterns(f);
+                }
+            }
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.for_each_embedded_patterns(f);
+                if let Some(x) = filter {
+                    x.for_each_embedded_patterns(f);
+                }
+                if let Some(x) = map {
+                    x.for_each_embedded_patterns(f);
+                }
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                init.for_each_embedded_patterns(f);
+                list.for_each_embedded_patterns(f);
+                body.for_each_embedded_patterns(f);
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => {
+                list.for_each_embedded_patterns(f);
+                predicate.for_each_embedded_patterns(f);
+            }
+            Expression::Member { target, .. } => target.for_each_embedded_patterns(f),
+            Expression::Exists { patterns, .. } => f(patterns),
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                f(patterns);
+                projection.for_each_embedded_patterns(f);
+            }
+        }
+    }
 }
 
 // Manual PartialEq: Pattern doesn't implement PartialEq, so we can't derive.
@@ -454,6 +509,43 @@ impl Expression {
     // =========================================================================
     // Query methods
     // =========================================================================
+
+    /// Whether this expression contains a `BNODE(...)` call.
+    ///
+    /// `BNODE` is *solution-scoped* (SPARQL 1.1 §17.4.2.9): its result
+    /// identity depends on which solution it is evaluated against, so a
+    /// BIND containing it is order-sensitive — the planner must not float it
+    /// to the earliest point its variables are bound (evaluating it against a
+    /// partial join prefix collapses per-solution identity; #1439 cluster D9).
+    pub fn contains_bnode(&self) -> bool {
+        match self {
+            Expression::Call { func, args } => {
+                matches!(func, Function::Bnode) || args.iter().any(Expression::contains_bnode)
+            }
+            Expression::Map(entries) => entries.iter().any(|(_, v)| v.contains_bnode()),
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.contains_bnode()
+                    || filter.as_deref().is_some_and(Expression::contains_bnode)
+                    || map.as_deref().is_some_and(Expression::contains_bnode)
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => init.contains_bnode() || list.contains_bnode() || body.contains_bnode(),
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => list.contains_bnode() || predicate.contains_bnode(),
+            Expression::Member { target, .. } => target.contains_bnode(),
+            // BNODE inside an EXISTS/pattern-comprehension subplan cannot leak
+            // a binding into this scope — irrelevant to bind placement.
+            Expression::Var(_)
+            | Expression::Const(_)
+            | Expression::Exists { .. }
+            | Expression::PatternComprehension { .. }
+            | Expression::Resolved(_) => false,
+        }
+    }
 
     /// Variables this expression references when evaluated. Expressions
     /// produce values, never bindings, so there is no `produced_vars`
@@ -845,8 +937,26 @@ pub enum Function {
     // =========================================================================
     // RDF term functions
     // =========================================================================
-    Lang,
-    Datatype,
+    /// `LANG(expr)` — the language tag of a literal (empty string if none).
+    ///
+    /// `strict` selects the SPARQL 1.1 §17.4.2.2 behavior for non-literal
+    /// arguments: a type error (no value). The lenient form — Fluree's
+    /// JSON-LD-surface behavior — returns `""` for IRIs/refs instead. The
+    /// surface lowering picks the mode (SPARQL → strict, JSON-LD → lenient);
+    /// see decision D-12 in `docs/audit/burn-down/ROADMAP.md` §4.
+    Lang {
+        strict: bool,
+    },
+    /// `DATATYPE(expr)` — the datatype IRI of a literal.
+    ///
+    /// `strict` selects the SPARQL 1.1 §17.4.2.3 behavior for non-literal
+    /// arguments: a type error (no value). The lenient form preserves the
+    /// deliberate JSON-LD-surface extension where `DATATYPE(<iri>)` reports
+    /// the `@id` ref type. See decision D-12 in
+    /// `docs/audit/burn-down/ROADMAP.md` §4.
+    Datatype {
+        strict: bool,
+    },
     LangMatches,
     SameTerm,
 
@@ -909,6 +1019,9 @@ pub enum Function {
     XsdDouble,
     XsdDecimal,
     XsdString,
+    XsdDateTime,
+    XsdDate,
+    XsdTime,
 
     // =========================================================================
     // Path functions (Cypher shortestPath result values)

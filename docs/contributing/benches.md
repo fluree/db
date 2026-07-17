@@ -208,7 +208,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
 | `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
 | `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
-| `query_hot` | BSBM-shape SPARQL on warm cache | `fluree-db-api/benches/query_hot_bsbm.rs` (Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break) |
+| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline) |
 | `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
 | `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
@@ -331,12 +331,11 @@ Don't read `FLUREE_BENCH_*` env vars in your bench's hot loop —
 hand-rolled `std::env::var` call inside `b.iter` is a system call per
 iteration. Read once, reuse.
 
-### `iter_batched` setup needs a tokio reactor for file-backed Fluree
+### `iter_batched` setup needs a tokio reactor to build Fluree
 
 `criterion::iter_batched`'s `setup` closure runs **synchronously**, outside
 any `block_on`. If `setup` calls anything that requires a running tokio
-reactor — most notably `FlureeBuilder::file(...).build()` and any path
-that touches the file storage backend during construction — you'll get:
+reactor — including every `FlureeBuilder::build*` method — you'll get:
 
 ```
 thread 'main' panicked: there is no reactor running, must be called from
@@ -365,10 +364,12 @@ b.iter_batched(
 );
 ```
 
-`FlureeBuilder::memory().build_memory()` does **not** have this constraint
-— it constructs synchronously without a reactor. Use the memory builder
-when the bench's hot path doesn't actually need disk I/O; reach for the
-file builder only when you need to exercise persistence/load paths.
+`FlureeBuilder::memory().build_memory()` has the same constraint: even
+though it is synchronous, it spawns the ledger-cache event listener task
+whenever ledger caching is enabled (the default), so it too must run
+inside `rt.block_on`. Use the memory builder when the bench's hot path
+doesn't actually need disk I/O; reach for the file builder only when you
+need to exercise persistence/load paths.
 
 ### Workspace clippy lints apply to bench code
 

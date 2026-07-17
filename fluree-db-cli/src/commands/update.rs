@@ -143,12 +143,11 @@ pub async fn run(
             remote_name,
             ..
         } => {
-            if txn_format == UpdateFormat::Cypher {
+            // Policy enforcement on Cypher writes isn't wired on either transport
+            // (the local arm rejects it too); fail rather than silently ignore it.
+            if txn_format == UpdateFormat::Cypher && policy.is_set() {
                 return Err(CliError::Usage(
-                    "Cypher writes are only supported on local ledgers; the HTTP Cypher \
-                     endpoint is not yet available.\n  \
-                     Retry with --direct to bypass the server route."
-                        .into(),
+                    "policy enforcement is not yet supported for Cypher writes".into(),
                 ));
             }
             let client = client.with_policy(policy.clone());
@@ -158,7 +157,10 @@ pub async fn run(
                     let json: serde_json::Value = serde_json::from_str(&content)?;
                     client.update_jsonld(&remote_alias, &json).await?
                 }
-                UpdateFormat::Cypher => unreachable!("cypher rejected above for remote ledgers"),
+                // Send the body verbatim (raw Cypher or a `{cypher, params}`
+                // envelope); the server extracts the envelope itself, exactly
+                // like the read path and `fluree load --cypher --remote`.
+                UpdateFormat::Cypher => client.update_cypher_body(&remote_alias, &content).await?,
             };
 
             context::persist_refreshed_tokens(&client, &remote_name, dirs).await;

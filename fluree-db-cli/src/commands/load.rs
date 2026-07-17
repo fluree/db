@@ -67,8 +67,17 @@ pub async fn run(
     remote_flag: Option<&str>,
     direct: bool,
 ) -> CliResult<()> {
+    // Each batch becomes literal AST rows inlined into one query/transaction
+    // (see `expand_unwind_match` in fluree-db-cypher), so an unbounded
+    // batch-size is a user-inflicted OOM rather than a throughput knob.
+    const MAX_BATCH_SIZE: usize = 100_000;
     if batch_size == 0 {
         return Err(CliError::Usage("--batch-size must be at least 1".into()));
+    }
+    if batch_size > MAX_BATCH_SIZE {
+        return Err(CliError::Usage(format!(
+            "--batch-size must be at most {MAX_BATCH_SIZE} (each batch is inlined into one transaction)"
+        )));
     }
     let delimiter = single_byte_delimiter(field_terminator)?;
 

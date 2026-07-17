@@ -32,6 +32,7 @@ use fluree_db_cypher::ast::{
     WithClause,
 };
 use fluree_db_novelty::{assemble_fast_stats, Novelty};
+use fluree_db_query::policy::QueryPolicyEnforcer;
 
 use crate::error::ApiError;
 use crate::Result;
@@ -48,21 +49,31 @@ const COMPAT_NEO4J_VERSION: &str = "5.4.0";
 /// the lowering applies to bare identifiers) — label/type/key names are
 /// rendered back through them so `db.labels()` returns the identifiers a
 /// user would actually write in a MATCH.
+///
+/// `policy` is the caller's view-policy enforcer, if any. These procedures
+/// answer from aggregate ledger stats rather than a per-flake scan, so an
+/// explicit unconditional `Deny` targeting a class/predicate excludes it from
+/// the catalog rather than being answered unfiltered (see
+/// [`class_denied`]/[`predicate_denied`]).
 pub(crate) fn procedure_call_query(
     call: &ProcedureCall,
     snapshot: &LedgerSnapshot,
     overlay: Option<&dyn OverlayProvider>,
     vocab: Option<&str>,
     overrides: &HashMap<String, String>,
+    policy: Option<&QueryPolicyEnforcer>,
 ) -> Result<Query> {
     let span = call.span;
     let lit = |s: &str| Expr::Lit(Literal::String(s.to_string(), span));
     let name = call.name.to_ascii_lowercase();
+    // Root (no policy attached, or an explicitly unrestricted policy) sees
+    // the full catalog unfiltered — the same as today's behavior.
+    let policy = policy.filter(|p| !p.is_root());
 
     let (columns, rows): (&[&str], Vec<Vec<Expr>>) = match name.as_str() {
         "db.labels" => {
             require_no_args(call)?;
-            let names = schema_names(snapshot, overlay, vocab, overrides);
+            let names = schema_names(snapshot, overlay, vocab, overrides, policy);
             (
                 &["label"],
                 names.labels.iter().map(|l| vec![lit(l)]).collect(),
@@ -70,7 +81,7 @@ pub(crate) fn procedure_call_query(
         }
         "db.relationshiptypes" => {
             require_no_args(call)?;
-            let names = schema_names(snapshot, overlay, vocab, overrides);
+            let names = schema_names(snapshot, overlay, vocab, overrides, policy);
             (
                 &["relationshipType"],
                 names.rel_types.iter().map(|t| vec![lit(t)]).collect(),
@@ -78,7 +89,7 @@ pub(crate) fn procedure_call_query(
         }
         "db.propertykeys" => {
             require_no_args(call)?;
-            let names = schema_names(snapshot, overlay, vocab, overrides);
+            let names = schema_names(snapshot, overlay, vocab, overrides, policy);
             (
                 &["propertyKey"],
                 names.prop_keys.iter().map(|k| vec![lit(k)]).collect(),
@@ -86,7 +97,7 @@ pub(crate) fn procedure_call_query(
         }
         "db.schema.visualization" => {
             require_no_args(call)?;
-            let names = schema_names(snapshot, overlay, vocab, overrides);
+            let names = schema_names(snapshot, overlay, vocab, overrides, policy);
             let nodes = Expr::List(
                 names
                     .labels
@@ -137,7 +148,7 @@ pub(crate) fn procedure_call_query(
             require_no_args(call)?;
             (
                 META_DATA_COLUMNS,
-                meta_data_rows(call, snapshot, overlay, vocab, overrides),
+                meta_data_rows(call, snapshot, overlay, vocab, overrides, policy),
             )
         }
         _ => {
@@ -199,6 +210,7 @@ fn meta_data_rows(
     overlay: Option<&dyn OverlayProvider>,
     vocab: Option<&str>,
     overrides: &HashMap<String, String>,
+    policy: Option<&QueryPolicyEnforcer>,
 ) -> Vec<Vec<Expr>> {
     let span = call.span;
 
@@ -312,7 +324,14 @@ fn meta_data_rows(
             ]);
         };
 
+    let denied = |class: &Sid, property: &Sid| {
+        policy.is_some_and(|p| class_denied(p, class) || predicate_denied(p, property))
+    };
+
     for ((class, property), by_type) in &props {
+        if denied(class, property) {
+            continue;
+        }
         let (Some(label), Some(prop)) = (display(class), display(property)) else {
             continue;
         };
@@ -323,13 +342,20 @@ fn meta_data_rows(
         }
     }
     for ((class, property), (count, ends)) in &rels {
-        if *count <= 0 {
+        if *count <= 0 || denied(class, property) {
             continue;
         }
         let (Some(label), Some(rel_type)) = (display(class), display(property)) else {
             continue;
         };
-        let other: Vec<Expr> = ends.iter().filter_map(&display).map(|n| lit(&n)).collect();
+        // End-node labels are informational (LangChain uses them for schema
+        // hints, not access), but drop ones an explicit class deny hides too.
+        let other: Vec<Expr> = ends
+            .iter()
+            .filter(|end| !policy.is_some_and(|p| class_denied(p, end)))
+            .filter_map(&display)
+            .map(|n| lit(&n))
+            .collect();
         push_row(&label, &rel_type, *count, "RELATIONSHIP", other);
     }
     rows
@@ -447,6 +473,7 @@ fn schema_names(
     overlay: Option<&dyn OverlayProvider>,
     vocab: Option<&str>,
     overrides: &HashMap<String, String>,
+    policy: Option<&QueryPolicyEnforcer>,
 ) -> SchemaNames {
     let stats = merged_stats(snapshot, overlay);
     let display = |sid: &Sid| display_name(sid, snapshot, vocab, overrides);
@@ -461,6 +488,9 @@ fn schema_names(
         if entry.count == 0 {
             continue;
         }
+        if policy.is_some_and(|p| class_denied(p, &entry.class_sid)) {
+            continue;
+        }
         if let Some(name) = display(&entry.class_sid) {
             names.labels.insert(name);
         }
@@ -473,6 +503,9 @@ fn schema_names(
         }
         let sid = Sid::new(entry.sid.0, &entry.sid.1);
         if is_rdf_type(&sid) {
+            continue;
+        }
+        if policy.is_some_and(|p| predicate_denied(p, &sid)) {
             continue;
         }
         let Some(name) = display(&sid) else { continue };
@@ -495,6 +528,55 @@ fn schema_names(
     }
 
     names
+}
+
+/// True when an unconditional `Deny` restriction targets `class_sid` directly
+/// (an `f:onClass` restriction whose `for_classes` includes it, for a View or
+/// Both action).
+///
+/// This is deliberately narrower than "is this class guaranteed visible":
+/// these procedures answer from aggregate stats with no per-instance
+/// filtered-scan fallback, so precisely reproducing ordinary `MATCH`
+/// enforcement (subject-scoped restrictions, default-bucket policies,
+/// conditional `f:query` restrictions) isn't possible without evaluating
+/// per-subject — which would defeat the point of a stats-only answer. What
+/// *is* tractable, and closes the common "hide this whole class/property
+/// from schema introspection" case, is catching an explicit, unconditional
+/// deny that names the class outright. A blanket `default_allow: true`
+/// fallback (the common shape paired with a handful of specific denies)
+/// leaves everything else listed, matching what an ordinary read would show
+/// for those classes.
+fn class_denied(enforcer: &QueryPolicyEnforcer, class_sid: &Sid) -> bool {
+    let view = enforcer.policy().wrapper().view();
+    view.restrictions.iter().any(|r| {
+        r.class_policy
+            && r.for_classes.contains(class_sid)
+            && matches!(r.value, fluree_db_policy::PolicyValue::Deny)
+            && matches!(
+                r.action,
+                fluree_db_policy::PolicyAction::View | fluree_db_policy::PolicyAction::Both
+            )
+    })
+}
+
+/// True when an unconditional `Deny` restriction targets `p` directly (an
+/// `f:onProperty` restriction, or an `f:onClass` restriction where `p` is
+/// exclusive to that class so no runtime class check is needed — see
+/// [`class_denied`] for why this checks only the unconditional case).
+fn predicate_denied(enforcer: &QueryPolicyEnforcer, p: &Sid) -> bool {
+    let view = enforcer.policy().wrapper().view();
+    view.by_property.get(p).is_some_and(|entries| {
+        entries.iter().any(|e| {
+            !e.class_check_needed && {
+                let r = &view.restrictions[e.idx];
+                matches!(r.value, fluree_db_policy::PolicyValue::Deny)
+                    && matches!(
+                        r.action,
+                        fluree_db_policy::PolicyAction::View | fluree_db_policy::PolicyAction::Both
+                    )
+            }
+        })
+    })
 }
 
 /// HEAD-index stats merged with novelty, so labels/types/keys written since

@@ -23,6 +23,7 @@
 //! outcome. Callers who don't need those guarantees may omit the key.
 
 pub mod caching;
+pub mod http;
 pub mod local;
 #[cfg(feature = "raft")]
 pub mod raft;
@@ -385,6 +386,16 @@ impl QueuedRequest {
     /// request produces the same body CID even when the client recomputes
     /// those fields between attempts. The full envelope still carries
     /// them — only the idempotency comparison is normalized.
+    ///
+    /// The bytes are order-canonical: the payload is projected through
+    /// [`CanonicalValue`](crate::raft::state_machine::CanonicalValue),
+    /// which sorts every object's keys. Plain `serde_json` would emit
+    /// object keys in the payload's insertion order (the crate builds
+    /// `serde_json` with `preserve_order`) and `HashMap` fields in a
+    /// per-process-random order — either of which would give the same
+    /// logical request different CIDs across retries or across nodes,
+    /// silently defeating idempotency dedup.
+    #[cfg(feature = "raft")]
     pub fn canonical_body_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
         match self {
             // Transact: the transaction body is the only semantically
@@ -392,17 +403,29 @@ impl QueuedRequest {
             // governance can drift between retries (timestamps, request
             // IDs, observability toggles) without changing what the
             // commit means.
-            QueuedRequest::Transact(t) => Ok(serde_json::to_vec(&t.body)?),
-            // Push / Revert / Merge / Rebase envelopes already contain
-            // only stable fields (content-addressed commit ids, selection
-            // / strategy descriptors, branch names). Hashing the full
-            // envelope is equivalent to hashing the canonical body.
-            QueuedRequest::Push(p) => Ok(serde_json::to_vec(p)?),
-            QueuedRequest::Revert(r) => Ok(serde_json::to_vec(r)?),
-            QueuedRequest::Merge(m) => Ok(serde_json::to_vec(m)?),
-            QueuedRequest::Rebase(r) => Ok(serde_json::to_vec(r)?),
+            QueuedRequest::Transact(t) => canonical_json_bytes(&t.body),
+            // Push / Revert / Merge / Rebase envelopes carry only stable
+            // fields (content-addressed commit ids, selection / strategy
+            // descriptors, branch names), so hashing the full envelope is
+            // equivalent to hashing the canonical body.
+            QueuedRequest::Push(p) => canonical_json_bytes(p),
+            QueuedRequest::Revert(r) => canonical_json_bytes(r),
+            QueuedRequest::Merge(m) => canonical_json_bytes(m),
+            QueuedRequest::Rebase(r) => canonical_json_bytes(r),
         }
     }
+}
+
+/// Serialize `value` to order-canonical bytes: project it through a
+/// [`CanonicalValue`](crate::raft::state_machine::CanonicalValue) tree
+/// (which holds objects in a `BTreeMap`, so keys sort) and encode
+/// that. The result depends only on the value's logical content, not
+/// on map insertion or `HashMap` iteration order.
+#[cfg(feature = "raft")]
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, QueuedRequestCodecError> {
+    let json = serde_json::to_value(value)?;
+    let canonical = crate::raft::state_machine::CanonicalValue::from(&json);
+    Ok(serde_json::to_vec(&canonical)?)
 }
 
 /// Transact-side envelope payload. Fields mirror the request-side
@@ -728,6 +751,29 @@ pub enum SubmissionError {
     Overloaded,
 }
 
+impl SubmissionError {
+    /// Whether this error is a settled outcome of the submission —
+    /// one that can never change — as opposed to an attempt that
+    /// ended without determining one.
+    ///
+    /// Unsettled errors mean the submission may still commit through
+    /// the replicated log: gateway-class `Execution` statuses
+    /// (not-leader, raft fatal, stranded waiter — all phrased
+    /// "retry"), and the refusal/racing signals that never executed
+    /// the submission at all. Recording an unsettled error as a
+    /// terminal idempotency-cache state would misreport a later
+    /// commit as `Failed` for the cache TTL, inviting the client to
+    /// resubmit under a fresh key — a double-apply.
+    pub fn is_settled(&self) -> bool {
+        match self {
+            // Admission refusals and racing-submission signals —
+            // this submission was never executed.
+            Self::KeyCollision | Self::AlreadyInFlight | Self::Overloaded => false,
+            Self::Execution { status, .. } => !(502..=504).contains(status),
+        }
+    }
+}
+
 /// Submit operations for processing.
 ///
 /// Each method represents an operation kind — transactions, reverts,
@@ -802,6 +848,36 @@ impl<T> SubmittingCommitter for T where T: Committer + SubmissionLookup + ?Sized
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The idempotency body CID must be identical for two logically
+    /// equal payloads regardless of object-key order — otherwise a
+    /// retry that rebuilds the body with different key ordering (or a
+    /// `HashMap` field iterated in a different per-process order) gets
+    /// a different CID and silently misses idempotency dedup.
+    #[cfg(feature = "raft")]
+    #[test]
+    fn canonical_json_bytes_is_key_order_independent() {
+        use serde_json::json;
+        // Same logical content, keys inserted in different order at
+        // every level (top object, nested object, object inside array).
+        let a = json!({ "b": 1, "a": { "y": 2, "x": 3 }, "arr": [{ "n": 1, "m": 2 }] });
+        let b = json!({ "arr": [{ "m": 2, "n": 1 }], "a": { "x": 3, "y": 2 }, "b": 1 });
+
+        // Sanity: the crate builds serde_json with `preserve_order`, so
+        // the naive encoding really does differ — without this the test
+        // would pass vacuously.
+        assert_ne!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "preserve_order must be active for this test to be meaningful"
+        );
+
+        // Canonicalization sorts keys at every level → identical bytes.
+        assert_eq!(
+            canonical_json_bytes(&a).unwrap(),
+            canonical_json_bytes(&b).unwrap(),
+        );
+    }
 
     #[test]
     fn new_accepts_typical_lengths() {

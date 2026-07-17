@@ -369,12 +369,12 @@ async fn build_peer_target(
     let client = build_client_from_auth(&base_url, &auth);
 
     // Persistent, per-remote artifact cache. Everything cached is
-    // content-addressed and immutable, so entries never invalidate; the
-    // nameservice head lookup (verify_freshness_on_cache_hit) is the only
-    // per-query remote state.
+    // content-addressed and immutable, so entries never invalidate. The
+    // ledger head is the only per-query remote state: each CLI invocation
+    // builds a fresh in-process Fluree, so the first load always resolves
+    // the head through the proxy nameservice.
     let cache_config = LedgerManagerConfig {
         cache_dir: peer_cache_dir(&tracked.remote),
-        verify_freshness_on_cache_hit: true,
         ..Default::default()
     };
 

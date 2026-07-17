@@ -64,6 +64,13 @@ pub fn filter_batch(
         return Ok(None);
     }
 
+    // A zero-column batch (e.g. the unit solution from `ASK { FILTER(true) }`)
+    // carries its row count explicitly — `Batch::new` would infer len = 0 from
+    // the absent first column and silently drop the surviving rows (#1439).
+    if schema.is_empty() {
+        return Ok(Some(Batch::empty_schema_with_len(keep_indices.len())));
+    }
+
     let columns: Vec<Vec<Binding>> = (0..schema.len())
         .map(|col_idx| {
             let src_col = batch
@@ -585,6 +592,11 @@ async fn filter_batch_with_exists(
 
     if keep_indices.is_empty() {
         return Ok(None);
+    }
+
+    // See `filter_batch`: a zero-column batch carries its row count explicitly.
+    if schema.is_empty() {
+        return Ok(Some(Batch::empty_schema_with_len(keep_indices.len())));
     }
 
     let columns: Vec<Vec<Binding>> = (0..schema.len())

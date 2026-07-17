@@ -61,6 +61,21 @@ pub struct R2rmlRewriteResult {
 ///   (see [`class_fusion_is_safe`]). `None` disables class fusion — always
 ///   correct, just less optimal — so callers that can cheaply load the mapping
 ///   should pass it.
+/// * `crawl_active` - Whether this rewrite serves a graph-source subgraph "browse"
+///   crawl (sourced from `ExecutionContext::trust_fk_refs`, which only the crawl
+///   sets). When `true`, a lone projected type-var (`?s a ?type`) co-located with
+///   the crawl's wildcard is MERGED into the wildcard so the crawl is a single
+///   LIMIT-budgeted scan (see [`try_fuse_wildcard_class`]). Gated on the crawl so
+///   hand-written SPARQL `{?s a :C . ?s ?p ?o . ?s a ?t}` keeps its known-correct
+///   two-scan plan rather than the fused per-TriplesMap cartesian.
+/// * `reasoning_active` - Whether an RDFS/OWL/datalog entailment mode is active
+///   for this query. When `true`, the wildcard→class fusion
+///   ([`try_fuse_wildcard_class`]) is refused: that fusion prunes TriplesMaps by
+///   an EXACT `rr:class` match, so a subject entailed into a superclass whose
+///   TriplesMap only declares a subclass would be silently dropped. (In
+///   practice RDFS expands `?s a C` into an explicit subclass UNION upstream of
+///   this rewrite and derived-fact overlays are invisible to R2RML scans, so
+///   the fusion is already sound under reasoning; this flag is defense in depth.)
 ///
 /// # Returns
 ///
@@ -70,6 +85,8 @@ pub fn rewrite_patterns_for_r2rml(
     graph_source_id: &str,
     snapshot: &LedgerSnapshot,
     mapping: Option<&CompiledR2rmlMapping>,
+    reasoning_active: bool,
+    crawl_active: bool,
 ) -> R2rmlRewriteResult {
     let mut result_patterns = Vec::with_capacity(patterns.len());
     let mut converted = 0;
@@ -127,7 +144,14 @@ pub fn rewrite_patterns_for_r2rml(
             | Pattern::NotExists(_)
             | Pattern::Service(_) => {
                 let rewritten = pattern.clone().map_subpatterns(&mut |inner| {
-                    let r = rewrite_patterns_for_r2rml(&inner, graph_source_id, snapshot, mapping);
+                    let r = rewrite_patterns_for_r2rml(
+                        &inner,
+                        graph_source_id,
+                        snapshot,
+                        mapping,
+                        reasoning_active,
+                        crawl_active,
+                    );
                     converted += r.converted_count;
                     unconverted += r.unconverted_count;
                     r.patterns
@@ -210,12 +234,33 @@ pub fn rewrite_patterns_for_r2rml(
         result_patterns.push(Pattern::R2rml(base));
     }
 
-    // Class patterns not fused into a star (no same-subject star members, or
-    // multiple classes on one subject) become subject-only scans: the operator
-    // projects only the subject columns and scans no RefObjectMap parents.
-    for (_subject, members) in class_groups {
-        for m in members {
-            result_patterns.push(Pattern::R2rml(m));
+    // Class patterns not fused into a star. First try to fuse a lone class into
+    // a same-subject standalone WILDCARD scan (`?s ?p ?o`, from a subgraph
+    // crawl) by class-constraining it — this prunes the wildcard's TriplesMap
+    // fan-out to the queried class (16→1 for a per-table Iceberg mapping) while
+    // its per-`(predicate, object)`-row semantics still return subjects with
+    // null columns correctly (unlike an inner-joined explicit star). Runs AFTER
+    // the star loop's `fuse_class_if_safe`, which already removed any class it
+    // consumed, so a class is never double-consumed. A class that is neither
+    // star- nor wildcard-fused becomes a subject-only scan (the always-correct
+    // pre-fusion path): the operator projects only the subject columns and scans
+    // no RefObjectMap parents.
+    for (subject, members) in class_groups {
+        let fused = members.len() == 1
+            && members[0].class_filter.as_deref().is_some_and(|class| {
+                try_fuse_wildcard_class(
+                    &mut result_patterns,
+                    subject,
+                    class,
+                    mapping,
+                    reasoning_active,
+                    crawl_active,
+                )
+            });
+        if !fused {
+            for m in members {
+                result_patterns.push(Pattern::R2rml(m));
+            }
         }
     }
 
@@ -578,6 +623,228 @@ fn class_fusion_is_safe(
     saw_predicate_map
 }
 
+/// Whether wildcard→class fusion is enabled. Read once from
+/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (only `0`/`false`/`off`/`no` disable it).
+/// The master crawl kill-switch (`crawl::crawl_expand_enabled`) is COUPLED to
+/// this: expand-on + fusion-off would route a browse through the UNFUSED crawl
+/// (a 16-table fan-out + shared-catalog 429 storm — worse than today's fast
+/// empty result), so disabling fusion also disables crawl expansion there.
+fn wildcard_class_fusion_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_CRAWL_CLASS_FUSION") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// A standalone variable-predicate wildcard scan (`?s ?p ?o`) on `subject`:
+/// binds both predicate and object, carries no predicate/class filter, and is
+/// not a fused star. This is the shape a subgraph crawl injects; class-
+/// constraining it prunes its TriplesMap fan-out to the queried class.
+fn is_standalone_wildcard(rp: &R2rmlPattern, subject: VarId) -> bool {
+    rp.subject_var == Some(subject)
+        && rp.predicate_var.is_some()
+        && rp.object_var.is_some()
+        && rp.predicate_filter.is_none()
+        && rp.class_filter.is_none()
+        && rp.star_bindings.is_empty()
+        && rp.star_constraints.is_empty()
+}
+
+/// A standalone projected-type scan (`?s a ?type`) on `subject` with no class
+/// filter yet. Co-located with a crawl's wildcard; class-constraining it keeps
+/// the scan on the queried class's TriplesMaps while still projecting every
+/// class those maps declare.
+fn is_standalone_type_var(rp: &R2rmlPattern, subject: VarId) -> bool {
+    rp.subject_var == Some(subject)
+        && rp.type_var.is_some()
+        && rp.class_filter.is_none()
+        && rp.predicate_filter.is_none()
+        && rp.object_var.is_none()
+}
+
+/// Try to fuse the lone class `class` into a same-subject standalone wildcard by
+/// setting its `class_filter`. Returns `true` iff a wildcard was constrained (so
+/// the caller drops the now-redundant class scan). Refuses — leaving the wildcard
+/// unconstrained and the class scan standalone — when reasoning is active, the
+/// kill-switch is off, the mapping is unavailable, there is no wildcard to
+/// constrain, or the fusion is not provably safe ([`wildcard_class_fusion_is_safe`]).
+///
+/// Type-var handling has two modes:
+/// - **Browse crawl** (`crawl_active`, exactly one co-located `?s a ?type`): MERGE
+///   the type-var into the wildcard (set `wildcard.type_var`) and REMOVE the
+///   standalone type-var pattern, so the crawl is a SINGLE scan that receives the
+///   downstream LIMIT budget (the standalone type-var is otherwise the topmost
+///   budgeted scan and starves the wildcard). The fused operator then emits the
+///   per-`(predicate,object)` × declared-class cartesian — identical to the
+///   two-scan inner join for the single-TriplesMap-per-subject case, which the
+///   crawl regroup dedups regardless.
+/// - **Otherwise** (hand-written SPARQL, multiple type-vars, or fusion off): leave
+///   the type-var a standalone scan and only class-constrain it, preserving the
+///   known-correct two-scan plan.
+fn try_fuse_wildcard_class(
+    patterns: &mut Vec<Pattern>,
+    subject: VarId,
+    class: &str,
+    mapping: Option<&CompiledR2rmlMapping>,
+    reasoning_active: bool,
+    crawl_active: bool,
+) -> bool {
+    // Reasoning refusal: the class prune is an EXACT `rr:class` match, so a
+    // subject entailed into a superclass whose TriplesMap declares only a
+    // subclass would be dropped. Refuse defensively when any entailment runs.
+    if reasoning_active {
+        return false;
+    }
+    if !wildcard_class_fusion_enabled() {
+        return false;
+    }
+    // Proving safety needs the mapping's subject templates; without it, refuse.
+    let Some(mapping) = mapping else {
+        return false;
+    };
+    let has_wildcard = patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::R2rml(rp) if is_standalone_wildcard(rp, subject)));
+    if !has_wildcard {
+        return false;
+    }
+    if !wildcard_class_fusion_is_safe(mapping, class) {
+        return false;
+    }
+
+    // Decide whether to MERGE the projected type-var into the wildcard. Only for
+    // the browse crawl, and only when EXACTLY ONE standalone type-var exists for
+    // this subject: `R2rmlPattern::type_var` is an `Option<VarId>` (holds one), so
+    // a `?s a ?t1 . ?s a ?t2` shape must keep the two-scan plan rather than drop a
+    // binding. Capture the type-var's VarId now (before the mutation loop).
+    let type_var_count = patterns
+        .iter()
+        .filter(|p| matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)))
+        .count();
+    let do_merge = crawl_active && type_var_count == 1;
+    let merged_type_var: Option<VarId> = if do_merge {
+        patterns.iter().find_map(|p| match p {
+            Pattern::R2rml(rp) if is_standalone_type_var(rp, subject) => rp.type_var,
+            _ => None,
+        })
+    } else {
+        None
+    };
+
+    let mut fused = false;
+    for p in patterns.iter_mut() {
+        if let Pattern::R2rml(rp) = p {
+            if is_standalone_wildcard(rp, subject) {
+                rp.class_filter = Some(class.to_string());
+                // Merge: bind the projected class in the SAME scan.
+                if let Some(tv) = merged_type_var {
+                    rp.type_var = Some(tv);
+                }
+                fused = true;
+            } else if is_standalone_type_var(rp, subject) && !do_merge {
+                // Two-scan path: class-constrain the standalone type-var so its
+                // scan is subject-only over the queried class's TriplesMaps.
+                // On the merge path we deliberately leave it untouched (no
+                // `class_filter`) so `is_standalone_type_var` still matches it
+                // for removal below.
+                rp.class_filter = Some(class.to_string());
+            }
+        }
+    }
+
+    // Remove the now-merged standalone type-var (only on the success path, and
+    // only when merging). It still matches `is_standalone_type_var` because the
+    // merge branch above left its `class_filter` unset. Removal is by predicate
+    // (not index), scoped to this subject, so it cannot disturb another subject's
+    // patterns as the caller iterates its class groups.
+    if fused && do_merge {
+        patterns
+            .retain(|p| !matches!(p, Pattern::R2rml(rp) if is_standalone_type_var(rp, subject)));
+    }
+
+    fused
+}
+
+/// Whether constraining a wildcard to `class_iri` cannot drop any triple.
+///
+/// Unlike [`class_fusion_is_safe`] (which is PREDICATE-keyed — a wildcard has no
+/// base predicate), this is keyed on SUBJECT-TEMPLATE disjointness. Setting
+/// `class_filter` limits the wildcard's scan to TriplesMaps that declare the
+/// class; any OTHER TriplesMap that could produce a subject shared with the
+/// class's subjects would then be skipped, silently dropping its triples (the
+/// vertical-partition hazard: `TM_A person/{id}`+Person+name, `TM_B
+/// person/{id}`+email). So fuse only when every TriplesMap that does NOT declare
+/// the class is provably DISJOINT (by subject template) from every
+/// class-declaring TriplesMap's template.
+///
+/// Conservative and sound: "disjoint" means neither template's constant prefix
+/// is a string-prefix of the other (they diverge inside the constant region, so
+/// no generated IRI can coincide) — NOT mere string inequality. A column/
+/// constant subject (no template) cannot be proven disjoint, so its presence on
+/// a relevant map forces a refusal. For an auto-generated Iceberg mapping (one
+/// TriplesMap per table, one class each, a unique `.../TABLE/{PK}` template)
+/// every non-class map is prefix-disjoint, so this fires and prunes 16→1.
+fn wildcard_class_fusion_is_safe(mapping: &CompiledR2rmlMapping, class_iri: &str) -> bool {
+    // Subject templates of every TriplesMap that declares the class. A class map
+    // with a column/constant subject can't anchor disjointness reasoning.
+    let class_maps = mapping.find_maps_for_class(class_iri);
+    if class_maps.is_empty() {
+        return false;
+    }
+    let mut class_templates: Vec<&str> = Vec::with_capacity(class_maps.len());
+    for tm in &class_maps {
+        match tm.subject_map.template.as_deref() {
+            Some(t) => class_templates.push(t),
+            None => return false,
+        }
+    }
+    // Every non-class TriplesMap must be provably disjoint from ALL class
+    // templates; a non-template (column/constant) subject can't be proven so.
+    for tm in mapping.triples_maps.values() {
+        if tm.classes().iter().any(|c| c == class_iri) {
+            continue;
+        }
+        match tm.subject_map.template.as_deref() {
+            Some(t) => {
+                if !class_templates
+                    .iter()
+                    .all(|ct| templates_provably_disjoint(ct, t))
+                {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The constant prefix of an `rr:template` — everything before the first `{`
+/// placeholder (the whole string when there is no placeholder). Emitted verbatim
+/// by `expand_template`, so every IRI a template can produce starts with it —
+/// which is what makes the operator's bound-subject TriplesMap prune sound.
+pub(crate) fn constant_prefix(template: &str) -> &str {
+    match template.find('{') {
+        Some(i) => &template[..i],
+        None => template,
+    }
+}
+
+/// Whether two subject templates provably generate disjoint IRI sets: neither
+/// constant prefix is a string-prefix of the other, so every generated IRI of
+/// one differs from every generated IRI of the other within the constant region
+/// (before any placeholder value can matter). Equal prefixes are treated as
+/// overlapping (not disjoint) — conservative.
+fn templates_provably_disjoint(a: &str, b: &str) -> bool {
+    let pa = constant_prefix(a);
+    let pb = constant_prefix(b);
+    !pa.starts_with(pb) && !pb.starts_with(pa)
+}
+
 /// Convert a triple pattern to an R2RML pattern.
 ///
 /// Returns `None` if the pattern cannot be converted (e.g., subject is a literal).
@@ -592,10 +859,10 @@ pub fn convert_triple_to_r2rml(
         Ref::Var(v) => (Some(*v), None),
         Ref::Iri(iri) => (None, Some(iri.to_string())),
         // A bound SID subject we cannot decode to an IRI is left unconverted.
-        Ref::Sid(sid) => match snapshot.decode_sid(sid) {
-            Some(iri) => (None, Some(iri)),
-            None => return None,
-        },
+        Ref::Sid(sid) => {
+            let iri = snapshot.decode_sid(sid)?;
+            (None, Some(iri))
+        }
     };
 
     // Build a pattern for `object_var`, carrying either the subject variable or
@@ -613,21 +880,37 @@ pub fn convert_triple_to_r2rml(
     let is_type_pattern = tp.p.is_rdf_type();
 
     if is_type_pattern {
-        // rdf:type pattern: ?s rdf:type ex:Class
-        // Extract the class IRI - handle both Term::Sid (decode) and Term::Iri (use directly)
-        let class_filter = match &tp.o {
-            Term::Sid(sid) => snapshot.decode_sid(sid),
-            Term::Iri(iri) => Some(iri.to_string()),
-            Term::Value(fluree_db_core::FlakeValue::Ref(sid)) => snapshot.decode_sid(sid),
-            Term::Var(_) => None, // Class is a variable - no filter
-            _ => None,
-        };
-
-        // For rdf:type, we create an R2RML pattern with class_filter and no object_var
-        // (the type binding is implicit in the class_filter)
+        // rdf:type pattern. Both forms reduce to the SAME class-driven TriplesMap
+        // scan a SPARQL `a` produces — the class is either a constraint or a
+        // projected variable:
+        //   `?s rdf:type ex:Class` (FQL `@type: ex:Class`) → `class_filter`: the
+        //      scan is limited to TriplesMaps declaring the class; no object var.
+        //   `?s rdf:type ?type`    (FQL `@type: ?type`)    → `type_var`: the scan
+        //      visits every map and the operator binds `?type` to each matched
+        //      subject's declared class IRI (previously the variable was dropped,
+        //      leaving `?type` unbound / `null`).
+        // `object_var` stays `None` in both cases; the class is drawn from the
+        // mapping, never a table column.
         let mut pattern = make_pattern(None);
-        if let Some(class_iri) = class_filter {
-            pattern = pattern.with_class(class_iri);
+        match &tp.o {
+            Term::Sid(sid) => {
+                if let Some(class_iri) = snapshot.decode_sid(sid) {
+                    pattern = pattern.with_class(class_iri);
+                }
+            }
+            Term::Iri(iri) => {
+                pattern = pattern.with_class(iri.to_string());
+            }
+            Term::Value(fluree_db_core::FlakeValue::Ref(sid)) => {
+                if let Some(class_iri) = snapshot.decode_sid(sid) {
+                    pattern = pattern.with_class(class_iri);
+                }
+            }
+            // Variable class: project it instead of filtering on it.
+            Term::Var(v) => {
+                pattern = pattern.with_type_var(*v);
+            }
+            _ => {}
         }
         return Some(pattern);
     }
@@ -638,6 +921,14 @@ pub fn convert_triple_to_r2rml(
         Ref::Sid(sid) => snapshot.decode_sid(sid),
         Ref::Iri(iri) => Some(iri.to_string()),
         Ref::Var(_) => None, // Predicate is variable - no filter
+    };
+
+    // A variable predicate (`?s ?p ?o` / `<iri> ?p ?o`) is projected: the
+    // operator binds `?p` to each materialized triple's predicate IRI, so a
+    // wildcard scan yields the predicate instead of leaving it `null`.
+    let predicate_var = match &tp.p {
+        Ref::Var(v) => Some(*v),
+        _ => None,
     };
 
     // Extract the object: a variable, or a constant equality constraint the
@@ -670,19 +961,19 @@ pub fn convert_triple_to_r2rml(
         _ => return None,
     };
 
-    // A bound subject with a variable predicate (`<store/5> ?p ?o`) has no
-    // `predicate_filter` to resolve the POM and no predicate-var field to bind
-    // `?p`, so materialization would bind `?o` across every predicate with `?p`
-    // left unbound (`?p = NULL`). This PR newly routes bound subjects here, so
-    // leave that shape unconverted for normal evaluation. (The var-subject
-    // wildcard `?s ?p ?o` keeps its existing all-maps scan behavior.)
-    if subject_constant.is_some() && predicate_filter.is_none() && object_var.is_some() {
-        return None;
-    }
-
     let mut pattern = make_pattern(object_var);
     if let Some(pred_iri) = predicate_filter {
         pattern = pattern.with_predicate(pred_iri);
+    }
+    // A variable-predicate wildcard (`?s ?p ?o` or the bound-subject
+    // `<iri> ?p ?o`) carries a `predicate_var` so the operator binds `?p` to each
+    // triple's predicate IRI. This is what makes a bound-subject wildcard (the
+    // UI's subject inspector) resolvable: previously it was left unconverted
+    // because there was no field to bind `?p`.
+    if object_var.is_some() {
+        if let Some(pv) = predicate_var {
+            pattern = pattern.with_predicate_var(pv);
+        }
     }
     pattern.object_constant = object_constant;
 
@@ -705,6 +996,115 @@ mod tests {
 
         let not_type_sid = Sid::new(100, "name");
         assert!(!is_rdf_type(&not_type_sid));
+    }
+
+    /// Extract the single triple pattern lowered from a `where` clause.
+    #[cfg(test)]
+    fn only_triple(q: &crate::ir::Query) -> TriplePattern {
+        q.patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Triple(tp) => Some(tp.clone()),
+                _ => None,
+            })
+            .expect("expected a single triple pattern")
+    }
+
+    /// FQL `@type` must lower to the SAME `rdf:type` scan SPARQL `a` produces.
+    ///
+    /// SPARQL `a` lowers the predicate to `Ref::Iri(rdf::TYPE)` (see
+    /// `fluree-db-sparql` `lower::path`); this test parses the FQL `@type` surface
+    /// and asserts (1) it lowers to the identical `rdf:type` predicate, and (2) it
+    /// converts to the identical R2RML type-scan — a `class_filter` for a bound
+    /// class, and a `type_var` (binding the class IRI, not dropped) for a variable
+    /// class. This is the regression guard for the FQL-vs-SPARQL by-class parity
+    /// bug: FQL `@type` previously produced no type binding for a variable class.
+    #[test]
+    fn fql_type_lowers_to_same_rdf_type_scan_as_sparql_a() {
+        use crate::parse::parse_query;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+
+        // `LedgerSnapshot` is both the IRI encoder (for parse) and the snapshot
+        // (for convert's `decode_sid`, unused here since class objects stay IRIs).
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let class = "http://example.org/Geography";
+
+        // --- Bound class: `@type: <class>` (≡ SPARQL `?s a <class>`) ---
+        let mut vars = VarRegistry::new();
+        let bound = serde_json::json!({
+            "select": ["?s"],
+            "where": {"@id": "?s", "@type": class},
+        });
+        let parsed = parse_query(&bound, &snapshot, &mut vars, None).expect("parse @type");
+        let tp = only_triple(&parsed);
+        assert!(
+            tp.p.is_rdf_type(),
+            "FQL @type must lower to the rdf:type predicate (same as SPARQL `a`)"
+        );
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot).expect("convertible");
+        assert_eq!(
+            pat.class_filter.as_deref(),
+            Some(class),
+            "bound @type ⇒ class_filter (the class-scan)"
+        );
+        assert_eq!(pat.type_var, None);
+        assert_eq!(pat.object_var, None);
+        assert_eq!(pat.predicate_filter, None);
+
+        // --- Variable class: `@type: ?t` (≡ SPARQL `?s a ?t`) ---
+        let mut vars = VarRegistry::new();
+        let vquery = serde_json::json!({
+            "select": ["?s", "?t"],
+            "where": {"@id": "?s", "@type": "?t"},
+        });
+        let parsed = parse_query(&vquery, &snapshot, &mut vars, None).expect("parse @type var");
+        let tp = only_triple(&parsed);
+        assert!(tp.p.is_rdf_type());
+        let want_s = vars.get_or_insert("?s");
+        let want_t = vars.get_or_insert("?t");
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot).expect("convertible");
+        assert_eq!(
+            pat.type_var,
+            Some(want_t),
+            "variable @type ⇒ type_var binds the class IRI (was dropped → null)"
+        );
+        assert_eq!(pat.class_filter, None);
+        assert_eq!(pat.object_var, None);
+        assert_eq!(pat.subject_var, Some(want_s));
+    }
+
+    /// A variable-predicate wildcard binds `?p` (subject inspector / crawl). Both
+    /// the var-subject (`?s ?p ?o`) and bound-subject (`<iri> ?p ?o`) forms — the
+    /// latter previously left unconverted for want of a predicate-var field.
+    #[test]
+    fn wildcard_predicate_binds_predicate_var() {
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+
+        // ?s ?p ?o
+        let tp = TriplePattern::new(Ref::Var(VarId(0)), Ref::Var(VarId(1)), Term::Var(VarId(2)));
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot).expect("convertible");
+        assert_eq!(pat.subject_var, Some(VarId(0)));
+        assert_eq!(pat.predicate_var, Some(VarId(1)));
+        assert_eq!(pat.object_var, Some(VarId(2)));
+        assert!(pat.produced_vars().contains(&VarId(1)));
+
+        // <iri> ?p ?o — bound subject wildcard is now convertible.
+        let tp = TriplePattern::new(
+            Ref::Iri("http://example.org/geography/1".into()),
+            Ref::Var(VarId(1)),
+            Term::Var(VarId(2)),
+        );
+        let pat = convert_triple_to_r2rml(&tp, "gs:main", &snapshot)
+            .expect("bound-subject wildcard is convertible");
+        assert_eq!(pat.subject_var, None);
+        assert_eq!(
+            pat.subject_constant.as_deref(),
+            Some("http://example.org/geography/1")
+        );
+        assert_eq!(pat.predicate_var, Some(VarId(1)));
+        assert_eq!(pat.object_var, Some(VarId(2)));
     }
 
     #[test]
@@ -894,5 +1294,283 @@ mod tests {
             .with_class(CLASS);
         let mapping = CompiledR2rmlMapping::new(vec![tm]);
         assert!(!class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    // ---- Wildcard→class fusion (FIX 2) ---------------------------------------
+
+    const CLASS2: &str = "http://example.org/Order";
+
+    #[test]
+    fn templates_disjoint_only_on_diverging_prefix() {
+        // Prefix-disjoint per-table templates → disjoint.
+        assert!(templates_provably_disjoint(
+            "http://ex/person/{id}",
+            "http://ex/order/{id}"
+        ));
+        // Equal templates → overlap (not disjoint).
+        assert!(!templates_provably_disjoint(
+            "http://ex/person/{id}",
+            "http://ex/person/{id}"
+        ));
+        // One prefix a string-prefix of the other → conservatively not disjoint.
+        assert!(!templates_provably_disjoint(
+            "http://ex/p/{id}",
+            "http://ex/p/{id}/x"
+        ));
+    }
+
+    #[test]
+    fn wildcard_fusion_safe_single_tm() {
+        // Auto-generated Iceberg shape: one TriplesMap, one class, one template.
+        let tm = TriplesMap::new("#TM", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        assert!(wildcard_class_fusion_is_safe(&mapping, CLASS));
+    }
+
+    #[test]
+    fn wildcard_fusion_safe_disjoint_per_table_templates() {
+        // Two tables with unique, prefix-disjoint subject templates: constraining
+        // the wildcard to CLASS's table cannot touch the other table's subjects.
+        let tm_a = TriplesMap::new("#TM_A", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let tm_b = TriplesMap::new("#TM_B", "orders")
+            .with_subject_template("http://example.org/order/{id}")
+            .with_class(CLASS2)
+            .with_predicate_object(pom("http://example.org/total", "total"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_a, tm_b]);
+        assert!(wildcard_class_fusion_is_safe(&mapping, CLASS));
+    }
+
+    #[test]
+    fn wildcard_fusion_unsafe_vertical_partition() {
+        // TM_B shares TM_A's subject template but declares no class. Constraining
+        // the wildcard to CLASS's TriplesMap would silently drop TM_B's triples.
+        let tm_a = TriplesMap::new("#TM_A", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let tm_b = TriplesMap::new("#TM_B", "people_email")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom("http://example.org/email", "email"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_a, tm_b]);
+        assert!(!wildcard_class_fusion_is_safe(&mapping, CLASS));
+    }
+
+    #[test]
+    fn wildcard_fusion_unsafe_column_subject() {
+        // A non-class TriplesMap with a COLUMN subject can't be proven disjoint.
+        let tm_a = TriplesMap::new("#TM_A", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS);
+        let mut tm_b = TriplesMap::new("#TM_B", "other");
+        tm_b.subject_map = fluree_db_r2rml::mapping::SubjectMap::column("uri");
+        tm_b = tm_b.with_predicate_object(pom("http://example.org/x", "x"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_a, tm_b]);
+        assert!(!wildcard_class_fusion_is_safe(&mapping, CLASS));
+    }
+
+    /// Run the crawl-shaped pattern set (`?s ?p ?o` + `?s a ?t` + `?s a CLASS`)
+    /// through the rewriter and return the resulting R2RML patterns.
+    fn rewrite_crawl(
+        mapping: &CompiledR2rmlMapping,
+        reasoning_active: bool,
+        crawl_active: bool,
+    ) -> Vec<R2rmlPattern> {
+        use fluree_db_core::LedgerSnapshot;
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Var(VarId(3)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Iri(CLASS.into()),
+            )),
+        ];
+        rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(mapping),
+            reasoning_active,
+            crawl_active,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect()
+    }
+
+    fn single_class_mapping() -> CompiledR2rmlMapping {
+        let tm = TriplesMap::new("#TM", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        CompiledR2rmlMapping::new(vec![tm])
+    }
+
+    #[test]
+    fn wildcard_fusion_constrains_wildcard_and_type_var_when_safe() {
+        // crawl_active = false → the hand-written / non-crawl two-scan plan: the
+        // type-var is NOT merged, just class-constrained alongside the wildcard.
+        let pats = rewrite_crawl(&single_class_mapping(), false, false);
+        // Fusion consumes the standalone class scan: only the wildcard + type-var
+        // remain, both now class-constrained.
+        assert_eq!(pats.len(), 2, "class scan should be consumed by fusion");
+        let wildcard = pats
+            .iter()
+            .find(|p| p.predicate_var.is_some())
+            .expect("wildcard present");
+        assert_eq!(wildcard.class_filter.as_deref(), Some(CLASS));
+        let type_var = pats
+            .iter()
+            .find(|p| p.type_var.is_some())
+            .expect("type-var present");
+        assert_eq!(type_var.class_filter.as_deref(), Some(CLASS));
+    }
+
+    #[test]
+    fn wildcard_fusion_refused_when_reasoning_active() {
+        let pats = rewrite_crawl(&single_class_mapping(), true, false);
+        // Refused: wildcard stays unconstrained and the class scan is standalone.
+        let wildcard = pats
+            .iter()
+            .find(|p| p.predicate_var.is_some())
+            .expect("wildcard present");
+        assert_eq!(wildcard.class_filter, None);
+        assert!(
+            pats.iter().any(|p| p.class_filter.as_deref() == Some(CLASS)
+                && p.predicate_var.is_none()
+                && p.type_var.is_none()),
+            "a standalone class scan must remain"
+        );
+    }
+
+    #[test]
+    fn wildcard_fusion_refused_for_vertical_partition() {
+        // Same-template classless TM_B: fusion must be refused so the unconstrained
+        // wildcard still returns TM_B's triples.
+        let tm_a = TriplesMap::new("#TM_A", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "name"));
+        let tm_b = TriplesMap::new("#TM_B", "people_email")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom("http://example.org/email", "email"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm_a, tm_b]);
+        let pats = rewrite_crawl(&mapping, false, false);
+        let wildcard = pats
+            .iter()
+            .find(|p| p.predicate_var.is_some())
+            .expect("wildcard present");
+        assert_eq!(
+            wildcard.class_filter, None,
+            "vertical partition must not fuse"
+        );
+        assert!(pats
+            .iter()
+            .any(|p| p.class_filter.as_deref() == Some(CLASS) && p.predicate_var.is_none()));
+    }
+
+    #[test]
+    fn crawl_merge_fuses_type_var_into_single_scan() {
+        // crawl_active = true → the browse merge: the projected type-var is folded
+        // into the wildcard and the standalone type-var scan is removed, leaving
+        // EXACTLY ONE R2RML scan that binds ?p/?o AND ?type and carries the class
+        // filter. This is what makes the single scan receive the LIMIT budget.
+        let pats = rewrite_crawl(&single_class_mapping(), false, true);
+        assert_eq!(
+            pats.len(),
+            1,
+            "browse merge must collapse wildcard + type-var into one scan: {pats:?}"
+        );
+        let fused = &pats[0];
+        assert!(
+            fused.predicate_var.is_some(),
+            "fused scan keeps the wildcard"
+        );
+        assert!(
+            fused.object_var.is_some(),
+            "fused scan keeps the object var"
+        );
+        assert!(
+            fused.type_var.is_some(),
+            "fused scan absorbs the projected type-var"
+        );
+        assert_eq!(
+            fused.class_filter.as_deref(),
+            Some(CLASS),
+            "fused scan is class-constrained"
+        );
+    }
+
+    #[test]
+    fn crawl_merge_refused_for_two_type_vars() {
+        // Two projected type-vars on one subject cannot both fit an Option<VarId>;
+        // the merge is refused (keeps the two-scan plan) so no binding is dropped.
+        use fluree_db_core::LedgerSnapshot;
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let mapping = single_class_mapping();
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Var(VarId(3)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Var(VarId(4)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Iri(CLASS.into()),
+            )),
+        ];
+        let pats: Vec<R2rmlPattern> = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            true,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect();
+        // Two standalone type-vars survive (no merge), plus the wildcard.
+        let type_var_scans = pats.iter().filter(|p| p.type_var.is_some()).count();
+        assert_eq!(
+            type_var_scans, 2,
+            "two type-vars must NOT be merged (would drop a binding): {pats:?}"
+        );
     }
 }

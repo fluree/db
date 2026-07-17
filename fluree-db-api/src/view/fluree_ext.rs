@@ -627,8 +627,18 @@ impl Fluree {
     /// [`db_or_graph_source`](Self::db_or_graph_source) and the dataset path's
     /// `resolve_as_graph_source`.
     pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
-        let gs_id = fluree_db_core::normalize_ledger_id(ledger_id)
-            .unwrap_or_else(|_| ledger_id.to_string());
+        // A graph-source alias may carry a graph fragment (`{ds}#txn-meta`) or an
+        // explicit `:branch`. Split the fragment off BEFORE normalizing/looking up:
+        // the nameservice registers a graph source under its `name:branch` id, and
+        // `normalize_ledger_id` only understands `:` (not `#`), so a `#fragment`
+        // left on the alias would never match — a commit-history
+        // `from:{ds}#txn-meta` query would 500 with NotFound instead of returning
+        // []. Reuse `parse_graph_ref` so `#txn-meta` / `urn:fluree:` handling stays
+        // identical to the native `db()` path (this also fixes the rarer
+        // `{ds}:main#...` NotFound).
+        let (base_id, graph_ref) = Self::parse_graph_ref(ledger_id)?;
+        let gs_id =
+            fluree_db_core::normalize_ledger_id(base_id).unwrap_or_else(|_| base_id.to_string());
 
         if self
             .nameservice()
@@ -644,8 +654,24 @@ impl Fluree {
         let state =
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut db = GraphDb::from_ledger_state(&state);
-        db.graph_source_id = Some(gs_id.into());
-        Ok(Some(db))
+
+        match graph_ref {
+            GraphRef::Default => {
+                // The virtual default graph: tag the view so query execution
+                // auto-wraps patterns in `GRAPH <gs_id> { ... }` and the configured
+                // provider (Iceberg / R2RML / BM25 / vector) resolves them.
+                db.graph_source_id = Some(gs_id.into());
+                Ok(Some(db))
+            }
+            // A graph source has no Fluree commit-metadata (`#txn-meta`) graph —
+            // that system graph is genuinely empty for a virtual dataset. Select
+            // the (empty) txn-meta graph on the genesis snapshot and deliberately
+            // DO NOT tag `graph_source_id`, so `maybe_wrap_for_graph_source` stays
+            // a no-op: the query reads the empty graph and returns [], rather than
+            // routing txn-meta patterns to the data provider (which has no such
+            // graph) or 500-ing on a NotFound alias.
+            other => Self::select_graph(db, other).map(Some),
+        }
     }
 }
 

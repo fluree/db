@@ -413,7 +413,7 @@ pub enum NsLookupResult {
 /// Read-only nameservice lookup surface.
 ///
 /// Implementations provide ledger discovery by ledger ID and the
-/// associated read concerns (refs, graph sources, status, config).
+/// associated per-branch reads (refs, graph sources, status, config).
 /// This is the read-only counterpart to [`NameService`].
 ///
 /// Callers that only need to read should bind this trait — that lets
@@ -840,7 +840,20 @@ pub enum NameServiceEvent {
         index_id: ContentId,
         index_t: i64,
     },
-    /// A ledger was retracted.
+    /// A branch's authoritative state went away: fired for retract
+    /// (soft tombstone), `drop_branch`, and purge alike. The event
+    /// carries only the exact `ledger:branch` id, and consumers use
+    /// it uniformly to evict per-branch state, so the distinction
+    /// between those transitions isn't conveyed.
+    ///
+    /// Known limitation: a query peer reacting to this always
+    /// applies a local retract (tombstone), even when the origin
+    /// hard-dropped or purged the branch. The divergence is benign
+    /// and self-healing — a later re-creation of the alias overwrites
+    /// the peer's tombstone via `init`, and `retracted` reads
+    /// identically to `not-found` for a peer's query path.
+    /// Distinguishing the transitions would need separate event
+    /// variants threaded through the SSE peer-sync protocol.
     LedgerRetracted { ledger_id: String },
     /// A graph source config was published/updated.
     GraphSourceConfigPublished {
@@ -1006,38 +1019,8 @@ pub trait RefPublisher: RefLookup {
 }
 
 // ---------------------------------------------------------------------------
-// V2 Concern Types (Status and Config extensions)
+// V2 Status and Config values
 // ---------------------------------------------------------------------------
-
-/// Which concern is being read or updated (v2 extension).
-///
-/// Extends the concept of `RefKind` to include Status and Config concerns.
-/// Head and Index concerns map directly to `RefKind::CommitHead` and
-/// `RefKind::IndexHead` respectively.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ConcernKind {
-    /// Commit head pointer - equivalent to RefKind::CommitHead
-    Head,
-    /// Index state - equivalent to RefKind::IndexHead
-    Index,
-    /// Status state (queue depth, locks, progress, etc.)
-    Status,
-    /// Config state (default context, settings)
-    Config,
-}
-
-impl ConcernKind {
-    /// Convert to RefKind if applicable (Head/Index only).
-    ///
-    /// Returns `None` for Status and Config since they don't map to RefKind.
-    pub fn as_ref_kind(&self) -> Option<RefKind> {
-        match self {
-            ConcernKind::Head => Some(RefKind::CommitHead),
-            ConcernKind::Index => Some(RefKind::IndexHead),
-            ConcernKind::Status | ConcernKind::Config => None,
-        }
-    }
-}
 
 /// Status payload with extensible metadata.
 ///
@@ -1125,7 +1108,7 @@ impl ConfigPayload {
     }
 }
 
-/// Status concern value (watermark + payload).
+/// Status value (watermark + payload).
 ///
 /// The watermark `v` is a monotonically increasing counter that changes
 /// on every status update. Status always has a payload (never unborn).
@@ -1152,7 +1135,7 @@ impl StatusValue {
     }
 }
 
-/// Config concern value (watermark + optional payload).
+/// Config value (watermark + optional payload).
 ///
 /// The watermark `v` is a monotonically increasing counter. Config can be
 /// "unborn" (v=0, payload=None) if no config has been set yet.
@@ -1231,7 +1214,7 @@ pub trait StatusLookup: Debug + Send + Sync {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>>;
 }
 
-/// Publisher for status concern (v2 extension).
+/// Publisher for the status value (v2 extension).
 ///
 /// Status tracks operational metadata like queue depth, locks, progress,
 /// and error states. It uses a monotonically increasing watermark and
@@ -1274,7 +1257,7 @@ pub trait ConfigLookup: Debug + Send + Sync {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>>;
 }
 
-/// Publisher for config concern (v2 extension).
+/// Publisher for the config value (v2 extension).
 ///
 /// Config tracks settings like default context, index thresholds, and other
 /// configuration options. It uses a monotonically increasing watermark and
@@ -1722,15 +1705,7 @@ mod tests {
         assert!(record.has_index());
     }
 
-    // ========== V2 Concern Type Tests ==========
-
-    #[test]
-    fn test_concern_kind_as_ref_kind() {
-        assert_eq!(ConcernKind::Head.as_ref_kind(), Some(RefKind::CommitHead));
-        assert_eq!(ConcernKind::Index.as_ref_kind(), Some(RefKind::IndexHead));
-        assert_eq!(ConcernKind::Status.as_ref_kind(), None);
-        assert_eq!(ConcernKind::Config.as_ref_kind(), None);
-    }
+    // ========== V2 Status/Config Value Tests ==========
 
     #[test]
     fn test_status_payload_new() {

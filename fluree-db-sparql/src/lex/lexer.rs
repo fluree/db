@@ -39,9 +39,15 @@ impl<'a> Lexer<'a> {
     ///
     /// Comments are identified by the lexer itself, so `#` characters inside
     /// string literals or IRIs are never treated as comments.
+    ///
+    /// Runs the SPARQL 1.2 codepoint-escape pre-pass first (§19.2:
+    /// `\uXXXX`/`\UXXXXXXXX` are unescaped over the whole query string
+    /// before tokenizing), so token spans index into the unescaped string
+    /// when escapes are present.
     pub fn tokenize_collecting(self, comments: &mut Vec<String>) -> Vec<Token> {
+        let unescaped = unescape_codepoints(self.input);
         let mut tokens = Vec::new();
-        let mut input = LocatingSlice::new(self.input);
+        let mut input = LocatingSlice::new(unescaped.as_ref());
 
         loop {
             // Skip whitespace and comments
@@ -75,6 +81,108 @@ impl<'a> Lexer<'a> {
 
         tokens
     }
+}
+
+/// SPARQL 1.2 §19.2 codepoint-escape pre-pass.
+///
+/// `\uXXXX` and `\UXXXXXXXX` sequences are unescaped in a single pass over
+/// the whole query string *before* tokenizing — an escape may therefore
+/// produce a token boundary, a delimiter, or an entire token. Escapes are
+/// processed exactly once, left to right (a decoded character never combines
+/// with the following input to form a new escape), which is what makes
+/// `"\\u0041"` decode to the *invalid* string escape `\A` per the W3C
+/// codepoint-escape tests. Every backslash that does not start a valid
+/// codepoint escape is copied through byte-identically, so the downstream
+/// string/IRI escape handling is unchanged.
+///
+/// Two consequences of the pre-pass being global and delimiter-producing —
+/// both intended, both W3C-consistent, and pinned by unit tests because the
+/// suite covers neither:
+/// - Comment-agnostic: an escape inside a `#` comment is decoded like any
+///   other. The pre-pass must precede tokenizing (codepoint-esc-01 encodes a
+///   whole `ASK {}`; esc-07 escapes the whitespace *between* tokens), and
+///   comment stripping is part of tokenizing, so comments are not exempt.
+/// - Delimiter-producing: an escape that decodes to a delimiter acts as that
+///   delimiter. esc-08 decodes an escaped `"` to open a string literal; by
+///   the same rule an escape that decodes to `>` closes an IRI — an IRI whose
+///   body ends in such an escape, `<http://ex/…>`, decodes to `<http://ex/>>`,
+///   i.e. the IRI `http://ex/` plus a stray `>`, not an IRI whose value
+///   contains `>`.
+///
+/// Fast paths (no allocation): input with no backslash at all, and input
+/// whose backslashes never form a `\u`/`\U` codepoint escape (ordinary
+/// string escapes like `\n`).
+fn unescape_codepoints(input: &str) -> std::borrow::Cow<'_, str> {
+    // Branch-cheap common case: no backslash anywhere (memchr scan).
+    if !input.contains('\\') {
+        return std::borrow::Cow::Borrowed(input);
+    }
+
+    let bytes = input.as_bytes();
+    let Some(first) = find_codepoint_escape(bytes, 0) else {
+        // Backslashes present but none start a codepoint escape.
+        return std::borrow::Cow::Borrowed(input);
+    };
+
+    let mut out = String::with_capacity(input.len());
+    out.push_str(&input[..first]);
+    let mut i = first;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            if let Some((c, len)) = decode_codepoint_escape(bytes, i) {
+                out.push(c);
+                i += len;
+                continue;
+            }
+            // Not a codepoint escape: copy the backslash through; the byte
+            // after it is scanned as a fresh position (so `\\u0041` yields
+            // `\` + decoded `A`).
+            out.push('\\');
+            i += 1;
+            continue;
+        }
+        // Copy one whole UTF-8 character.
+        let ch = input[i..].chars().next().expect("in-bounds char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Find the byte offset of the first valid `\uXXXX`/`\UXXXXXXXX` escape at or
+/// after `from`, or `None` if the input contains no codepoint escape.
+fn find_codepoint_escape(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && decode_codepoint_escape(bytes, i).is_some() {
+            return Some(i);
+        }
+        // Advance one byte per step — a non-escape backslash's follower must
+        // be re-examined as a fresh position (mirrors the copy loop, so
+        // `\\u0041` is found: its *second* backslash starts the escape).
+        i += 1;
+    }
+    None
+}
+
+/// Try to decode a codepoint escape starting at byte `at` (which must be a
+/// backslash). Returns the decoded char and the total byte length of the
+/// escape sequence (`\uXXXX` = 6, `\UXXXXXXXX` = 10).
+fn decode_codepoint_escape(bytes: &[u8], at: usize) -> Option<(char, usize)> {
+    debug_assert_eq!(bytes[at], b'\\');
+    let (hex_len, total) = match bytes.get(at + 1) {
+        Some(b'u') => (4usize, 6usize),
+        Some(b'U') => (8usize, 10usize),
+        _ => return None,
+    };
+    let hex = bytes.get(at + 2..at + 2 + hex_len)?;
+    if !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    // Hex digits are ASCII, so this slice is valid UTF-8.
+    let hex_str = std::str::from_utf8(hex).ok()?;
+    let code = u32::from_str_radix(hex_str, 16).ok()?;
+    char::from_u32(code).map(|c| (c, total))
 }
 
 /// Skip whitespace and comments, collecting comment text (without the
@@ -196,10 +304,8 @@ fn parse_iri_content(input: &mut Input<'_>) -> ModalResult<String> {
         }
     }
 
-    if result.is_empty() {
-        return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
-    }
-
+    // An empty body is valid: `IRIREF ::= '<' ([^…])* '>'` permits zero
+    // characters, so `<>` is the empty relative IRI (resolved against BASE).
     Ok(result)
 }
 
@@ -1296,5 +1402,113 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(t, TokenKind::PrefixedName { prefix, .. } if prefix.as_ref() == "")));
+    }
+
+    #[test]
+    fn test_empty_iriref() {
+        // `<>` is a valid (empty, relative) IRI reference — the IRIREF
+        // character class permits zero characters.
+        assert_eq!(tok("<>"), vec![TokenKind::Iri(Arc::from(""))]);
+        // `< >` is NOT an IRI (space is not an IRI character); it lexes as
+        // comparison-operator punctuation instead.
+        let tokens = tok("< >");
+        assert!(!tokens.iter().any(|t| matches!(t, TokenKind::Iri(_))));
+    }
+
+    #[test]
+    fn test_codepoint_escape_pre_pass_borrows_without_escapes() {
+        use std::borrow::Cow;
+        // No backslash at all: borrowed.
+        assert!(matches!(
+            unescape_codepoints("SELECT * WHERE { ?s ?p ?o }"),
+            Cow::Borrowed(_)
+        ));
+        // Backslashes that are not codepoint escapes: still borrowed.
+        assert!(matches!(
+            unescape_codepoints(r#"SELECT * WHERE { ?s ?p "a\nb" }"#),
+            Cow::Borrowed(_)
+        ));
+        // A `\u` with too few hex digits is not a codepoint escape.
+        assert!(matches!(
+            unescape_codepoints(r"?s ?p '\u00'"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_codepoint_escape_pre_pass_decodes() {
+        // Whole-string decoding (W3C codepoint-esc-01 shape).
+        assert_eq!(
+            unescape_codepoints(r"\u0041\u0053\u004B\u0020\u007B\u007D").as_ref(),
+            "ASK {}"
+        );
+        // `\U` form (8 hex digits); lowercase hex accepted.
+        assert_eq!(unescape_codepoints(r"a\U00000009b").as_ref(), "a\tb");
+        assert_eq!(
+            unescape_codepoints(r"ns:id\u005c=123").as_ref(),
+            r"ns:id\=123"
+        );
+        // Escapes are processed exactly once, left to right: the first `\`
+        // of `\\u0041` is copied through and the second starts the escape,
+        // yielding `\A` (the W3C codepoint-esc-bad-03 requirement) — while a
+        // decoded `\` never combines with following text into a new escape.
+        assert_eq!(unescape_codepoints(r"\\u0041").as_ref(), r"\A");
+        assert_eq!(unescape_codepoints(r"\u0041").as_ref(), r"A");
+    }
+
+    #[test]
+    fn test_codepoint_escape_reaches_tokens() {
+        // The pre-pass runs before tokenizing, so an escape can form a
+        // token boundary or delimiter (SPARQL 1.2 §19.2).
+        assert_eq!(
+            tok(r"\u0041\u0053\u004B"),
+            vec![TokenKind::KwAsk],
+            "escaped keyword should lex as the keyword"
+        );
+        // An escaped quote starts a string literal.
+        assert_eq!(
+            tok("\\u0022value\""),
+            vec![TokenKind::String(Arc::from("value"))]
+        );
+        // `"\\u0041"` decodes to the invalid string escape `\A` and must
+        // be rejected (codepoint-esc-bad-03).
+        let tokens = tok(r#""\\u0041""#);
+        assert!(
+            tokens.iter().any(|t| matches!(t, TokenKind::Error(_))),
+            "invalid post-decode string escape should error: {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn test_codepoint_escape_in_comment_is_decoded() {
+        // The pre-pass is deliberately global and runs before comment
+        // stripping (esc-01 encodes a whole `ASK {}`; esc-07 escapes the
+        // whitespace between tokens), so it does not special-case `#`
+        // comments — an escape inside a comment is decoded like any other.
+        // Intended and W3C-consistent; a known divergence from engines that
+        // treat comments as opaque, pinned so it can't drift silently
+        // (fluree/db#1452 review). `bs` is U+005C (a backslash), built via its
+        // codepoint so this source carries no literal backslash of its own.
+        let bs = char::from_u32(0x5c).unwrap();
+        let input = format!("# a {bs}u0041 b");
+        assert_eq!(unescape_codepoints(&input).as_ref(), "# a A b");
+    }
+
+    #[test]
+    fn test_codepoint_escape_producing_iri_delimiter_closes_iri() {
+        // esc-08 pins that an escape producing a *string* delimiter opens a
+        // string; by the same rule an escape producing `>` closes an IRI. An
+        // IRI whose body ends in a `u003E` escape, `<http://ex/…>`, decodes to
+        // `<http://ex/>>`, so the IRI token is `http://ex/` and the trailing
+        // `>` is separate — not an IRI whose value contains `>`. A corner the
+        // W3C suite omits (fluree/db#1452 review). `bs` is U+005C, built via
+        // its codepoint so this source carries no literal backslash.
+        let bs = char::from_u32(0x5c).unwrap();
+        let input = format!("<http://ex/{bs}u003E>");
+        let tokens = tok(&input);
+        assert_eq!(
+            tokens.first(),
+            Some(&TokenKind::Iri(Arc::from("http://ex/")))
+        );
     }
 }

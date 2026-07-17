@@ -31,8 +31,10 @@ use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
 use fluree_db_nameservice::{
-    BranchLifecycle, IndexPublisher, LedgerEventBus, LedgerLifecycle, NameServiceError,
-    NameServiceEvent, NameServiceLookup, NsRecordSnapshot, SubscriptionScope,
+    BranchLifecycle, ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, IndexPublisher,
+    LedgerEventBus, LedgerLifecycle, NameServiceError, NameServiceEvent, NameServiceLookup,
+    NsRecordSnapshot, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    SubscriptionScope,
 };
 
 struct StubFactory;
@@ -571,6 +573,97 @@ async fn single_node_branch_lifecycle_round_trip() {
         ns.drop_branch("test/db:ghost").await,
         Err(NameServiceError::NotFound(_))
     ));
+
+    raft.shutdown().await.unwrap();
+}
+
+/// Status/config pushes and reads address the same replicated entry
+/// regardless of ledger-id form — `"test/db"` and `"test/db:main"`
+/// name the same branch. Pushes canonicalize before proposing and
+/// reads canonicalize before lookup; without that, mixed-form
+/// callers got two divergent CAS streams for one branch (a status
+/// pushed as `"test/db:main"` was invisible to
+/// `get_status("test/db")`, which returned `initial`).
+///
+/// Writing this test originally exposed that these commands could
+/// not be written to the raft log at all: `StatusPayload` /
+/// `ConfigPayload` are HTTP-shaped (`#[serde(flatten)]`), which
+/// postcard rejects, and the failure surfaced as a raft fatal.
+/// Values now travel and persist as the postcard-safe
+/// `StoredStatus` / `StoredConfig` forms — this round trip pins
+/// that end-to-end alongside the id normalization.
+#[tokio::test]
+async fn single_node_status_config_round_trip_normalizes_ledger_id() {
+    let storage = Arc::new(MemoryRaftStorage::new());
+    let log = LogAdapter::new(Arc::clone(&storage));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage));
+    let shared_state = sm.shared_state();
+
+    let config = Config {
+        cluster_name: "single-node-status-config".into(),
+        election_timeout_min: 150,
+        election_timeout_max: 300,
+        heartbeat_interval: 50,
+        ..Config::default()
+    };
+    let config = Arc::new(config.validate().unwrap());
+    let raft = Arc::new(Raft::new(1, config, StubFactory, log, sm).await.unwrap());
+
+    let mut members = BTreeMap::new();
+    members.insert(1u64, ClusterNode::default());
+    raft.initialize(members).await.unwrap();
+    raft.wait(Some(Duration::from_secs(5)))
+        .state(ServerState::Leader, "leader after self-election")
+        .await
+        .unwrap();
+
+    let ns = RaftNameService::new(shared_state.clone(), Arc::clone(&raft));
+    ns.init("test/db:main").await.expect("init ok");
+
+    // Push under the bare name; read under the full form.
+    let pushed_status = StatusValue::new(2, Default::default());
+    let result = ns
+        .push_status("test/db", Some(&StatusValue::initial()), &pushed_status)
+        .await
+        .expect("push_status ok");
+    assert!(
+        matches!(result, StatusCasResult::Updated),
+        "expected Updated, got {result:?}"
+    );
+    assert_eq!(
+        ns.get_status("test/db:main").await.expect("get_status ok"),
+        Some(pushed_status.clone())
+    );
+
+    // And the reverse: push the full form, read the bare name.
+    let next_status = StatusValue::new(3, Default::default());
+    let result = ns
+        .push_status("test/db:main", Some(&pushed_status), &next_status)
+        .await
+        .expect("push_status ok");
+    assert!(
+        matches!(result, StatusCasResult::Updated),
+        "expected Updated, got {result:?}"
+    );
+    assert_eq!(
+        ns.get_status("test/db").await.expect("get_status ok"),
+        Some(next_status)
+    );
+
+    // Config: bare-name push, full-form read.
+    let pushed_config = ConfigValue::new(1, None);
+    let result = ns
+        .push_config("test/db", Some(&ConfigValue::unborn()), &pushed_config)
+        .await
+        .expect("push_config ok");
+    assert!(
+        matches!(result, ConfigCasResult::Updated),
+        "expected Updated, got {result:?}"
+    );
+    assert_eq!(
+        ns.get_config("test/db:main").await.expect("get_config ok"),
+        Some(pushed_config)
+    );
 
     raft.shutdown().await.unwrap();
 }

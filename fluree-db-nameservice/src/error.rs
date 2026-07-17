@@ -55,6 +55,31 @@ pub enum NameServiceError {
     /// against a state that will never match again.
     #[error("Apply observed stale state: {0}")]
     ApplyStale(String),
+
+    /// The propose arrived behind the current state of affairs —
+    /// it was built on a view lagging the replicated state (its
+    /// value doesn't advance the current head), or another attempt
+    /// at the same work was already in flight. The target work is
+    /// still pending, so callers should refresh their local view
+    /// and rebuild the propose. Distinguished from
+    /// [`Self::ApplyStale`] (the work is gone; drop it) and
+    /// [`Self::Storage`] (transient; retry the same propose).
+    #[error("Apply lagged behind current state: {0}")]
+    ApplyLagged(String),
+
+    /// A propose toward the replicated log ended without a
+    /// determinable outcome — transport failure, lost response, or
+    /// leader step-down between submission and reply. The work may
+    /// have committed: callers must not treat this as "nothing
+    /// happened" (in particular, must not release resources a
+    /// committed outcome would reference) and recover by
+    /// re-checking replicated state or rebuilding the propose.
+    /// Distinguished from [`Self::Storage`] (backend error; nothing
+    /// was submitted) and from the decided apply outcomes
+    /// ([`Self::ApplyStale`], [`Self::ApplyLagged`],
+    /// [`Self::ApplyRejected`]).
+    #[error("Propose outcome unresolved: {0}")]
+    ProposeUnresolved(String),
 }
 
 impl From<LedgerIdParseError> for NameServiceError {
@@ -111,5 +136,21 @@ impl NameServiceError {
     /// retrying.
     pub fn apply_stale(msg: impl Into<String>) -> Self {
         Self::ApplyStale(msg.into())
+    }
+
+    /// Create an [`Self::ApplyLagged`] error signaling that the
+    /// propose was built on a view lagging the replicated state and
+    /// its target is still pending. Callers refresh their local
+    /// view and rebuild the propose rather than dropping the work.
+    pub fn apply_lagged(msg: impl Into<String>) -> Self {
+        Self::ApplyLagged(msg.into())
+    }
+
+    /// Create a [`Self::ProposeUnresolved`] error signaling that a
+    /// propose's outcome could not be determined and may have
+    /// committed. Callers keep any resources the committed outcome
+    /// would reference and re-check replicated state before acting.
+    pub fn propose_unresolved(msg: impl Into<String>) -> Self {
+        Self::ProposeUnresolved(msg.into())
     }
 }

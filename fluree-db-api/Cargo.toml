@@ -90,9 +90,9 @@ xxhash-rust.workspace = true
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
-# Fast integer/float formatting for TSV output (zero-alloc)
+# Fast integer formatting for TSV output (zero-alloc); doubles use the
+# canonical xsd:double writer from fluree-graph-ir
 itoa.workspace = true
-ryu.workspace = true
 # CSV bulk import (neo4j-admin header convention → JSON-LD front-end)
 csv = "1.4"
 # Percent-encode CSV cell values into safe IRI segments
@@ -192,6 +192,10 @@ name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
 [[test]]
+name = "it_multi_graph_property_path"
+path = "tests/it_multi_graph_property_path.rs"
+
+[[test]]
 name = "it_query_cypher"
 path = "tests/it_query_cypher.rs"
 
@@ -231,6 +235,21 @@ required-features = ["credential"]
 [[test]]
 name = "it_graph_source_r2rml"
 path = "tests/it_graph_source_r2rml.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_generate_live"
+path = "tests/it_iceberg_generate_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_sample_live"
+path = "tests/it_iceberg_sample_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_provisional_live"
+path = "tests/it_iceberg_provisional_live.rs"
 required-features = ["iceberg"]
 
 [[test]]
@@ -309,6 +328,14 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm_bi"
+harness = false
+
+[[bench]]
+name = "query_hot_property_path"
+harness = false
+
+[[bench]]
+name = "query_hot_whole_graph_agg"
 harness = false
 
 [lints]

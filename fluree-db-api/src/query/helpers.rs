@@ -111,9 +111,10 @@ pub(crate) fn parse_cypher_to_ir(
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
     overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     let ast = substituted_cypher_ast(cypher, params)?;
-    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay)
+    lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay, policy)
 }
 
 /// Statements longer than this are parsed but never cached: unique bulk
@@ -207,6 +208,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
     snapshot: &LedgerSnapshot,
     default_context: Option<&JsonValue>,
     overlay: Option<(&dyn OverlayProvider, u16)>,
+    policy: Option<&fluree_db_query::policy::QueryPolicyEnforcer>,
 ) -> Result<(VarRegistry, Query)> {
     // Pull `@vocab` and named-term overrides out of the default
     // context, then build a `LoweringContext` and pass it to the
@@ -224,6 +226,7 @@ pub(crate) fn lower_cypher_ast_to_ir(
             overlay.map(|(o, _)| o),
             vocab.as_deref(),
             &overrides,
+            policy,
         )?;
         rewritten = fluree_db_cypher::CypherAst {
             statement: fluree_db_cypher::ast::Statement::Query(query),
@@ -445,10 +448,22 @@ macro_rules! r2rml_provider {
 pub(crate) fn parse_and_validate_sparql(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
     let parse_output = fluree_db_sparql::parse_sparql(sparql);
 
-    // Parse errors: no AST, return ApiError::sparql with structured diagnostics.
+    // Parse errors: return ApiError::sparql with structured diagnostics.
+    //
+    // Error-severity diagnostics are authoritative EVEN WHEN the parser's
+    // error recovery produced an AST. A recovered AST silently drops or
+    // rewrites exactly the parts of the query the parser flagged, so
+    // executing it answers a different question than the user asked
+    // (docs/audit/burn-down/ROADMAP.md §1 addendum: the API previously
+    // swallowed these diagnostics whenever an AST survived recovery).
+    // Recovery itself is unchanged — `parse_sparql` still returns the AST
+    // plus diagnostics for tooling — and warning-severity diagnostics never
+    // reject. The SPARQL UPDATE path (tx_builder::parse_and_lower_sparql_update)
+    // already enforces the same rule.
+    let has_parse_errors = parse_output.has_errors();
     let ast = match parse_output.ast {
-        Some(ast) => ast,
-        None => {
+        Some(ast) if !has_parse_errors => ast,
+        _ => {
             let errors: Vec<_> = parse_output
                 .diagnostics
                 .into_iter()

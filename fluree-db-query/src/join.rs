@@ -87,6 +87,19 @@ impl RowAccess for CombinedRowView<'_> {
             self.right.get(pos - self.left_len)
         }
     }
+
+    fn for_each_binding(&self, f: &mut dyn FnMut(VarId, &Binding)) {
+        for (pos, var) in self.schema.iter().enumerate() {
+            let b = if pos < self.left_len {
+                Some(self.left_batch.get_by_col(self.left_row, pos))
+            } else {
+                self.right.get(pos - self.left_len)
+            };
+            if let Some(b) = b {
+                f(*var, b);
+            }
+        }
+    }
 }
 
 /// Apply inline FILTER operators against a joined row view.

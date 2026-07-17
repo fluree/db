@@ -41,7 +41,7 @@ use fluree_db_consensus::{
 use fluree_db_core::ContentId;
 use fluree_db_nameservice::LedgerEventBus;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex;
@@ -112,6 +112,12 @@ pub struct RaftIntegration {
     /// `Arc<Mutex<Option<_>>>` so `RaftIntegration` can stay `Clone`
     /// without giving up single-consumer semantics on the receiver.
     release_rx: Arc<Mutex<Option<ReleaseReceiver>>>,
+    /// Late-binding slot for the ledger cache the adapter reports
+    /// commit-head advances into. Built after `bootstrap` returns,
+    /// so server assembly fills this via
+    /// [`attach_ledger_manager`](Self::attach_ledger_manager) once
+    /// `Fluree` exists.
+    ledger_manager: Arc<OnceLock<Arc<fluree_db_api::LedgerManager>>>,
 }
 
 /// Shared HTTP transport: a `reqwest::Client` paired with the
@@ -128,6 +134,9 @@ pub struct AdapterChannels {
     pub event_bus: Arc<LedgerEventBus>,
     pub waiter_map: Arc<WaiterMap>,
     pub staged_receipts: Arc<StagedReceiptMap>,
+    /// The adapter's late-binding ledger-cache cell (see
+    /// [`RaftIntegration::attach_ledger_manager`]).
+    pub ledger_manager: Arc<OnceLock<Arc<fluree_db_api::LedgerManager>>>,
 }
 
 impl RaftIntegration {
@@ -147,16 +156,16 @@ impl RaftIntegration {
             event_bus,
             waiter_map,
             staged_receipts,
+            ledger_manager,
         } = channels;
         let HttpTransport {
             client: http_client,
             config: network_config,
         } = transport;
-        let forwarder = Arc::new(LeaderForwarder::new(
-            Arc::clone(&raft),
-            id,
-            http_client.clone(),
-        ));
+        let forwarder = Arc::new(
+            LeaderForwarder::new(Arc::clone(&raft), id, http_client.clone())
+                .with_max_body_bytes(network_config.forward_max_body_bytes),
+        );
         let nameservice = Arc::new(
             RaftNameService::new(shared_state.clone(), Arc::clone(&raft))
                 .with_staged_receipts(Arc::clone(&staged_receipts))
@@ -173,6 +182,18 @@ impl RaftIntegration {
             network_config,
             nameservice,
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
+            ledger_manager,
+        }
+    }
+
+    /// Fill the state-machine adapter's late-binding ledger-cache
+    /// slot. Called by server assembly once `Fluree` exists; every
+    /// apply and snapshot install from then on reports commit-head
+    /// advances into the cache's watermark synchronously. A second
+    /// call is ignored with a warning — the first stays attached.
+    pub fn attach_ledger_manager(&self, manager: Arc<fluree_db_api::LedgerManager>) {
+        if self.ledger_manager.set(manager).is_err() {
+            tracing::warn!("ledger manager already attached; keeping the first");
         }
     }
 
@@ -215,6 +236,7 @@ impl RaftIntegration {
             .with_staged_receipts(Arc::clone(&staged_receipts))
             .with_release_sender(release_tx);
         let shared_state = sm.shared_state();
+        let ledger_manager = sm.ledger_manager_cell();
 
         let raft_cfg = Arc::new(config.raft_config.validate()?);
 
@@ -253,6 +275,7 @@ impl RaftIntegration {
                 event_bus,
                 waiter_map,
                 staged_receipts,
+                ledger_manager,
             },
             HttpTransport {
                 client: http_client,

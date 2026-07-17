@@ -167,6 +167,9 @@ schemars = { workspace = true }
 # Async cancellation token for graceful shutdown
 tokio-util = { version = "0.7", features = ["rt", "io"] }
 
+# Body-length-limit error classification for the request-body cap.
+http-body-util = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }

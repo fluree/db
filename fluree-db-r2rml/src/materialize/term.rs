@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::error::{R2rmlError, R2rmlResult};
-use crate::mapping::{ConstantValue, ObjectMap, SubjectMap, TermType};
+use crate::mapping::{ConstantValue, ObjectMap, PredicateMap, SubjectMap, TermType};
 
 /// Materialized RDF term
 ///
@@ -822,6 +822,30 @@ pub fn materialize_object_from_batch(
     }
 }
 
+/// Materialize a predicate IRI from a [`PredicateMap`] and a `ColumnBatch` row.
+///
+/// Constant predicates (the overwhelmingly common case) return their IRI
+/// verbatim. A templated or column-based predicate (rare, but representable —
+/// `rr:predicateMap [ rr:template/rr:column ... ]`) is expanded from the row's
+/// values; a NULL referenced column yields `Ok(None)` — the triple simply does
+/// not exist for that row, mirroring subject/object template semantics.
+pub fn materialize_predicate_from_batch(
+    predicate_map: &PredicateMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<String>> {
+    match predicate_map {
+        PredicateMap::Constant(iri) => Ok(Some(iri.clone())),
+        PredicateMap::Template { template, .. } => {
+            match expand_template_from_batch(template, batch, row_idx) {
+                Ok(expanded) => Ok(Some(expanded)),
+                Err(_) => Ok(None),
+            }
+        }
+        PredicateMap::Column(column) => Ok(column_value_as_string(batch, column, row_idx)),
+    }
+}
+
 /// Get the join key values for a row (used for RefObjectMap joins)
 ///
 /// Returns the child column values as strings for hash-based join matching.
@@ -832,9 +856,9 @@ pub fn get_join_key_from_batch(
 ) -> Option<Vec<String>> {
     let mut key_values = Vec::with_capacity(child_columns.len());
     for col_name in child_columns {
-        match column_value_as_string(batch, col_name, row_idx) {
-            Some(v) => key_values.push(v),
-            None => return None, // Null in join key means no match
+        {
+            let v = column_value_as_string(batch, col_name, row_idx)?;
+            key_values.push(v);
         }
     }
     Some(key_values)

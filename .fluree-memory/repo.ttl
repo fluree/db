@@ -2706,6 +2706,34 @@ mem:fact-01kpm3sz8pxzakzcj4r8xx687v a mem:Fact ;
     mem:createdAt "2026-04-20T00:14:22.486023+00:00"^^xsd:dateTime ;
     mem:rationale "This is a subtle semi-naive reasoning invariant; future restriction or chain work could easily reintroduce the bug by splitting lookups across delta and derived." .
 
+mem:fact-01kx4zr6ed32yj966mpngvqhcg a mem:Fact ;
+    mem:content "HTTP Cypher READ endpoint already existed server-side: POST /v1/fluree/query/*ledger + Content-Type: application/cypher → execute_cypher_ledger (can_read/policy/Min-T, returns application/vnd.fluree.cypher+json). Gap was CLI-only; wired `fluree query --cypher --remote` via remote_client::query_cypher (body sent verbatim as RequestBody::Text; server calls extract_cypher_envelope itself) + run_remote_cypher_query. Remote emits cypher-json ONLY — --format json/typed-json/csv/tsv and --at rejected before network call, pointing to --direct." ;
+    mem:tag "cli" ;
+    mem:tag "cypher" ;
+    mem:tag "http-endpoint" ;
+    mem:tag "query" ;
+    mem:tag "remote" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cli/src/commands/query.rs" ;
+    mem:artifactRef "fluree-db-cli/src/remote_client.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:branch "perf/property-path-batched-frontier" ;
+    mem:createdAt "2026-07-10T03:04:46.285148+00:00"^^xsd:dateTime .
+
+mem:fact-01kx4zresym4eghmrzn2wcchx5 a mem:Fact ;
+    mem:content "`fluree update --format cypher --remote` write path is now WIRED (previously errored \"HTTP Cypher endpoint not yet available\"). Added remote_client::update_cypher_body (sends body verbatim as RequestBody::Text to ledger-scoped POST /update; server calls extract_cypher_envelope; response = commit receipt, or cypher-json when statement has RETURN). update.rs Tracked arm routes Cypher through it. --policy* is REJECTED for Cypher writes on both transports (no enforcement path yet), matching the local arm. `fluree load --cypher --remote` still uses the older update_cypher (structured {cypher,params} envelope)." ;
+    mem:tag "cli" ;
+    mem:tag "cypher" ;
+    mem:tag "remote" ;
+    mem:tag "update" ;
+    mem:tag "write" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cli/src/commands/load.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/update.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/transact.rs" ;
+    mem:branch "perf/property-path-batched-frontier" ;
+    mem:createdAt "2026-07-10T03:04:54.846310+00:00"^^xsd:dateTime .
+
 mem:fact-01kvg5mrhz4zvhg425038pfj7m a mem:Fact ;
     mem:content "SPARQL UPDATE annotation tails are rejected inside GRAPH{}/WITH<g> (\"default-graph only\") only because the lowering never emits f:reifiesGraph — NOT a storage limit (JSON-LD path + EdgeKey fully support named-graph annotations). Closing it is SMALL/localized: add a graph_iri param to expand_annotated_triples + expand_annotated_triples_in_quad_pattern, emit one f:reifiesGraph TriplePattern when graph is non-default (graph IRI already available: with_graph_iri in lower_modify ~L894; GraphName::Iri at the GRAPH rejection ~L410), delete reject_with_scoped_annotations + the two rejection blocks (~L414, ~L517). Downstream .with_graph_id stamping + EdgeKey decoder validation already correct; no schema/invariant changes." ;
     mem:tag "edge-annotations" ;

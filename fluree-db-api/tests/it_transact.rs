@@ -1066,6 +1066,76 @@ async fn turtle_insert() {
     assert_eq!(row3.get("ex:age").unwrap(), 33);
 }
 
+/// Regression (#1444): a blank-node label immediately followed by the
+/// statement-terminating `.` (`_:o6.`) must lex — the dot is the terminator,
+/// not part of the label. Inserts `_:x.`-shaped Turtle through the public API
+/// and queries it back through the JSON-LD surface (query-surface parity:
+/// the fix is ingest-level, so JSON-LD coverage is authored alongside).
+#[tokio::test]
+async fn turtle_insert_bnode_label_dot() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = fluree
+        .create_ledger("tx/turtle-bnode-dot:main")
+        .await
+        .unwrap();
+
+    // No whitespace between the blank-node labels and the terminating dots;
+    // `_:a..b` keeps its interior consecutive dots (valid label characters).
+    let turtle = r#"@prefix ex: <http://example.org/> .
+ex:s6 ex:p6 _:o6.
+_:o6 ex:name "dotted".
+_:a..b ex:name "interior".
+"#;
+
+    let ledger1 = fluree.insert_turtle(ledger0, turtle).await.unwrap().ledger;
+
+    let ctx = json!({"ex": "http://example.org/"});
+
+    // The `_:o6.`-shaped object loads as a blank node and is reachable
+    // through the JSON-LD query surface.
+    let query = json!({
+        "@context": ctx,
+        "select": ["?o", "?name"],
+        "where": [
+            {"@id": "ex:s6", "ex:p6": "?o"},
+            {"@id": "?o", "ex:name": "?name"}
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger1, &query)
+        .await
+        .unwrap()
+        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .await
+        .unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = rows[0].as_array().unwrap();
+    let bnode_id = row[0].as_str().unwrap();
+    assert!(bnode_id.starts_with("_:"), "expected bnode, got {bnode_id}");
+    assert_eq!(row[1], "dotted");
+
+    // The interior-dot label `_:a..b` also loaded, as a distinct bnode.
+    let query2 = json!({
+        "@context": ctx,
+        "select": ["?s"],
+        "where": {"@id": "?s", "ex:name": "interior"}
+    });
+    let rows2 = support::query_jsonld(&fluree, &ledger1, &query2)
+        .await
+        .unwrap()
+        .to_jsonld_async(ledger1.as_graph_db_ref(0))
+        .await
+        .unwrap();
+    let rows2 = rows2.as_array().unwrap();
+    assert_eq!(rows2.len(), 1);
+    let interior_id = match &rows2[0] {
+        serde_json::Value::Array(cols) => cols[0].as_str().unwrap(),
+        other => other.as_str().unwrap(),
+    };
+    assert!(interior_id.starts_with("_:"));
+    assert_ne!(interior_id, bnode_id);
+}
+
 #[tokio::test]
 async fn turtle_insert_and_commit() {
     let fluree = FlureeBuilder::memory().build_memory();

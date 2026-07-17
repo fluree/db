@@ -361,15 +361,10 @@ fn write_literal(
     Ok(())
 }
 
-/// Write an `xsd:double` lexical value, preserving the special-value spellings.
+/// Write an `xsd:double` lexical value in W3C canonical form (`1.0E6`),
+/// preserving the special-value spellings (`NaN`, `INF`, `-INF`).
 fn write_double(out: &mut String, d: f64) {
-    if d.is_nan() {
-        out.push_str("NaN");
-    } else if d.is_infinite() {
-        out.push_str(if d.is_sign_positive() { "INF" } else { "-INF" });
-    } else {
-        out.push_str(&d.to_string());
-    }
+    fluree_graph_ir::push_canonical_xsd_double(out, d);
 }
 
 /// Cartesian-expand a row containing `Grouped` columns into multiple `<result>`
@@ -636,6 +631,30 @@ mod tests {
             (f64::NAN, "NaN"),
             (f64::INFINITY, "INF"),
             (f64::NEG_INFINITY, "-INF"),
+        ] {
+            let r = make_result(
+                &["?v"],
+                vec![vec![Binding::lit(
+                    FlakeValue::Double(d),
+                    Sid::new(2, "double"),
+                )]],
+            );
+            let xml = fmt(&r, &c);
+            assert!(xml.contains(&format!(">{expected}</literal>")), "{xml}");
+        }
+    }
+
+    /// Finite doubles serialize in the W3C canonical `xsd:double` lexical form
+    /// (issue #1445): `1.0E6`, not Rust-Display `1000000`.
+    #[test]
+    fn double_canonical_form() {
+        let c = make_test_compactor();
+        for (d, expected) in [
+            (1_000_000.0, "1.0E6"),
+            (1e30, "1.0E30"),
+            (0.001, "1.0E-3"),
+            (-3.0, "-3.0E0"),
+            (3.125, "3.125E0"),
         ] {
             let r = make_result(
                 &["?v"],

@@ -282,6 +282,34 @@ independent of `t` — the value of `--at --explain` is in honoring the
 contract and consistency with the query path, not in producing
 materially different plans.
 
+**Remote Cypher queries (`fluree query --cypher --remote`)** POST to the same
+**ledger-scoped** query endpoint with a Cypher content type:
+
+```
+POST {api_base_url}/query/{ledger}
+Content-Type: application/cypher
+
+MATCH (n:Person) RETURN n.name LIMIT 10
+```
+
+- The server detects Cypher by content type (`application/cypher` or
+  `application/opencypher`, `FlureeHeaders::is_cypher_query`) and, for reads,
+  executes via `execute_cypher_ledger`. The body is sent **verbatim** — either
+  raw Cypher text or a `{cypher, params}` envelope — and the server splits it
+  with `fluree_db_api::extract_cypher_envelope`, exactly like the write path.
+- The response is a cypher-json document
+  (`application/vnd.fluree.cypher+json`) — the Neo4j-compatible tabular shape.
+- **Read auth and policy** ride exactly as for the SPARQL/JSON-LD read paths:
+  the URL path drives the bearer's `can_read(ledger)` check, and the
+  [Policy Enforcement Contract](#policy-enforcement-contract) headers apply.
+  `Fluree-Min-T` read-your-writes freshness is honored against the path ledger.
+- **Limitations over remote** (the CLI errors with a pointer to `--direct` for
+  local execution): the server renders cypher-json only — the other `--format`
+  shapes (`json`/`typed-json`/`csv`/`tsv`) are built client-side on the local
+  path and are not negotiated remotely — and the endpoint has no `--at`
+  time-travel handling for Cypher. `--explain`, `--bench`, and `--track*` are
+  not supported for Cypher on any transport.
+
 ### `fluree load` (CSV → batched upserts), `fluree update --format cypher`
 
 `fluree load` streams a local CSV into a ledger as a sequence of batched
@@ -325,6 +353,14 @@ Content-Type: application/cypher
 - The `$batch` parameter and the `UNWIND $batch AS row …` wrapper are
   constructed entirely client-side; the server just substitutes `$param`
   references and runs the statement. Empty CSV cells arrive as JSON `null`.
+- A standalone `fluree update --format cypher --remote <name>` (a single
+  statement, not a CSV load) POSTs to the same `POST /update/{ledger}` route.
+  The CLI sends the body **verbatim** — raw Cypher or a `{cypher, params}`
+  envelope — and the server splits it the same way. The response is the usual
+  commit receipt, or a cypher-json document when the statement carries a
+  `RETURN`. **Policy flags are rejected** for Cypher writes on both transports
+  (`--policy*` has no enforcement path for Cypher writes yet); other write
+  auth rides normally.
 
 **JSON-LD template (`--jsonld`):**
 

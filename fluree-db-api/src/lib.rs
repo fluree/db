@@ -198,13 +198,14 @@ pub use view::{
 
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table, BrowseDepth,
-    CatalogBrowse, CatalogMode, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
-    GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
-    IcebergCreateConfig, IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig,
-    R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo,
-    StatsCompleteness, StatsTier, StructuredR2rmlMapping, TableIdentifier, TableOverride,
-    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
+    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
+    sample_column_values, sample_iceberg_rows, BrowseDepth, CatalogBrowse, CatalogMode, ColumnInfo,
+    ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest,
+    GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult,
+    PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode,
+    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StructuredR2rmlMapping,
+    SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
+    ValidateR2rmlResponse,
 };
 
 pub use bm25_worker::{
@@ -1224,6 +1225,10 @@ fn derive_index_config(config: &ConnectionConfig) -> IndexConfig {
 ///   at compile time.
 /// - **Dynamic build** (`build_client()`) returns `FlureeClient` (type-erased) —
 ///   used when the storage backend is determined at runtime from config.
+///
+/// All `build*` methods (including the synchronous ones) must be called
+/// within a tokio runtime: whenever ledger caching is enabled (the
+/// default), building spawns the local cache event listener task.
 #[derive(Debug, Clone, Default)]
 pub struct FlureeBuilder {
     config: ConnectionConfig,
@@ -1245,6 +1250,11 @@ pub struct FlureeBuilder {
     novelty_thresholds: Option<IndexConfig>,
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
+    /// Externally-supplied event bus. When set, `Fluree` uses this
+    /// instance instead of allocating its own, so external publishers
+    /// and subscribers on `Fluree::event_bus()` share one broadcast
+    /// channel.
+    event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     /// Read-only remote mounts applied at build time (alias-prefixed).
     remote_mounts: Vec<RemoteMountSpec>,
 }
@@ -1327,12 +1337,10 @@ struct RuntimeParts {
 /// `ledger_manager` on every commit / index publish; drops loaded
 /// ledgers on retract.
 ///
-/// `FlureeBuilder::build` calls this with Fluree's internal bus when
-/// indexing is enabled. Deployments that publish commit events on a
-/// separate bus (e.g. raft's `LedgerEventBus`) should call this again
-/// with that bus so cache reconciliation also fires on those events —
-/// otherwise follower nodes only refresh on initial load, and writes
-/// that land between the initial load and the next reload are invisible.
+/// `FlureeBuilder::build` calls this during `finalize_with_backend`
+/// whenever a `LedgerManager` exists. External embedders constructing
+/// `Fluree` via `Fluree::new` bypass the builder and may call this
+/// directly if they want the same cache reconciliation.
 pub fn spawn_local_cache_event_listener(
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     ledger_manager: Arc<LedgerManager>,
@@ -1463,6 +1471,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         }
     }
@@ -1478,6 +1487,7 @@ impl FlureeBuilder {
             indexing_config: None,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         }
     }
@@ -1545,6 +1555,7 @@ impl FlureeBuilder {
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         }
     }
@@ -1738,6 +1749,7 @@ impl FlureeBuilder {
             indexing_config,
             novelty_thresholds: None,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
+            event_bus: None,
             remote_mounts: Vec::new(),
         })
     }
@@ -1875,6 +1887,28 @@ impl FlureeBuilder {
         self
     }
 
+    /// Use a caller-supplied `LedgerEventBus` instead of allocating
+    /// a new one on `build*`.
+    ///
+    /// Every consumer that subscribes via `Fluree::event_bus()`
+    /// (including the cache event listener spawned on build) then
+    /// observes notifications from every publisher wired to the
+    /// supplied bus, with no bridge task between separate instances.
+    pub fn with_event_bus(mut self, bus: Arc<fluree_db_nameservice::LedgerEventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
+    }
+
+    /// Returns the caller-supplied event bus if one was set via
+    /// [`with_event_bus`](Self::with_event_bus), otherwise allocates
+    /// a fresh bus with the historical default capacity. Called from
+    /// every `build_*` path so the override behaviour is uniform.
+    fn resolve_event_bus(&self) -> Arc<fluree_db_nameservice::LedgerEventBus> {
+        self.event_bus
+            .clone()
+            .unwrap_or_else(|| Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)))
+    }
+
     /// Register a remote Fluree connection for SERVICE federation.
     ///
     /// The `name` is used in SPARQL queries as `SERVICE <fluree:remote:name/ledger> { ... }`.
@@ -1923,7 +1957,7 @@ impl FlureeBuilder {
 
         let storage = FileStorage::new(&path);
         let nameservice = FileNameService::new(&path);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let backend = StorageBackend::Managed(Arc::new(storage));
@@ -1960,7 +1994,7 @@ impl FlureeBuilder {
         storage: impl Storage + 'static,
         nameservice: NameServiceMode,
     ) -> Fluree {
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
             self.ledger_cache_config,
@@ -2060,7 +2094,7 @@ impl FlureeBuilder {
         let key_provider = StaticKeyProvider::new(encryption_key);
         let storage = EncryptedStorage::new(file_storage, key_provider);
         let nameservice = FileNameService::new(&path);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let index_config = self.derive_indexing();
@@ -2101,7 +2135,7 @@ impl FlureeBuilder {
     pub fn build_memory(self) -> Fluree {
         let storage = MemoryStorage::new();
         let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
@@ -2135,7 +2169,7 @@ impl FlureeBuilder {
         let key_provider = StaticKeyProvider::new(encryption_key);
         let storage = EncryptedStorage::new(mem_storage, key_provider);
         let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
@@ -2186,7 +2220,7 @@ impl FlureeBuilder {
         });
         let backend = StorageBackend::Permanent(Arc::new(ipfs_store));
         let nameservice = MemoryNameService::new();
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2263,7 +2297,7 @@ impl FlureeBuilder {
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2365,7 +2399,7 @@ impl FlureeBuilder {
             .await
             .map_err(|e| ApiError::config(format!("Failed to ensure DynamoDB table: {e}")))?;
 
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(dynamo_ns, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2451,7 +2485,7 @@ impl FlureeBuilder {
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
@@ -2643,10 +2677,8 @@ impl FlureeBuilder {
             let _ = attachment_provider_cell.set(Arc::clone(mgr));
         }
 
-        if indexing_mode.is_enabled() {
-            if let Some(manager) = &ledger_manager {
-                spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
-            }
+        if let Some(manager) = &ledger_manager {
+            spawn_local_cache_event_listener(Arc::clone(&event_bus), Arc::clone(manager));
         }
 
         Fluree {
@@ -2737,7 +2769,7 @@ impl FlureeBuilder {
         // Wrap with address identifier routing if configured
         let storage = self.wrap_address_identifiers(base_storage)?;
         let backend = StorageBackend::Managed(storage);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         let attachment_provider_cell = Self::new_attachment_provider_cell();
 
@@ -2805,7 +2837,7 @@ impl FlureeBuilder {
             // Wrap with address identifier routing if configured
             let storage = self.wrap_address_identifiers(base_storage)?;
             let backend = StorageBackend::Managed(storage);
-            let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+            let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
             let attachment_provider_cell = Self::new_attachment_provider_cell();
 
@@ -2872,7 +2904,7 @@ impl FlureeBuilder {
             .wrap_address_identifiers_aws(base_storage, aws_handle.config())
             .await?;
         let backend = StorageBackend::Managed(storage);
-        let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
+        let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         let attachment_provider_cell = Self::new_attachment_provider_cell();
 
@@ -3868,6 +3900,7 @@ impl Fluree {
             &probe_view.snapshot,
             probe_view.default_context.as_ref(),
             Some((&*probe_view.overlay, probe_view.graph_id)),
+            probe_view.policy_enforcer().map(|e| &**e),
         )?;
 
         let target_var = vars.get(&target.name).ok_or_else(|| {
@@ -4692,18 +4725,16 @@ pub fn fluree_memory() -> Fluree {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_fluree_builder_memory() {
+    #[tokio::test]
+    async fn test_fluree_builder_memory() {
         let fluree = FlureeBuilder::memory().cache_max_mb(500).build_memory();
 
         assert_eq!(fluree.config.cache.max_mb, 500);
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "native")]
-    fn test_fluree_builder_file() {
-        // `without_indexing()` keeps this a plain `#[test]` — the default
-        // background indexer would require a tokio runtime.
+    async fn test_fluree_builder_file() {
         let result = FlureeBuilder::file("/tmp/test")
             .without_indexing()
             .parallelism(8)
@@ -4722,8 +4753,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_fluree_memory_convenience() {
+    #[tokio::test]
+    async fn test_fluree_memory_convenience() {
         let _fluree = fluree_memory();
     }
 
@@ -4731,8 +4762,8 @@ mod tests {
     // IndexConfig propagation tests (commit e6d0044)
     // ========================================================================
 
-    #[test]
-    fn test_default_index_config_returns_defaults_without_thresholds() {
+    #[tokio::test]
+    async fn test_default_index_config_returns_defaults_without_thresholds() {
         let fluree = FlureeBuilder::memory().build_memory();
         let cfg = fluree.default_index_config();
         let expected = server_defaults::default_index_config();
@@ -4740,8 +4771,8 @@ mod tests {
         assert_eq!(cfg.reindex_max_bytes, expected.reindex_max_bytes);
     }
 
-    #[test]
-    fn test_with_indexing_thresholds_propagates_to_default_index_config() {
+    #[tokio::test]
+    async fn test_with_indexing_thresholds_propagates_to_default_index_config() {
         // This is the exact scenario that was broken before e6d0044:
         // custom thresholds set via the builder were silently dropped.
         let fluree = FlureeBuilder::memory()
@@ -5152,9 +5183,9 @@ mod tests {
             .unwrap());
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "ipfs")]
-    fn test_build_ipfs_constructs_fluree() {
+    async fn test_build_ipfs_constructs_fluree() {
         // No real Kubo node needed — this only verifies the type plumbing.
         let fluree = FlureeBuilder::memory().build_ipfs("http://127.0.0.1:5001");
         // Backend should be Permanent (IPFS), not Managed.

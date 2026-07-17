@@ -45,10 +45,11 @@ use crate::io::send_parquet::predicate_pushdown_enabled;
 use crate::metadata::Schema;
 use crate::scan::predicate::{ComparisonOp, Expression, LiteralValue};
 
-/// Rows per emitted `RecordBatch`. Batch boundaries do not affect query results
-/// (the R2RML operator streams batches), so this only tunes chunk granularity —
-/// smaller batches give finer LIMIT early-termination once the row budget is
-/// wired through, at the cost of more per-batch overhead.
+/// Rows per emitted `RecordBatch` for an unbounded scan. Batch boundaries do not
+/// affect query results (the R2RML operator streams batches), so this only tunes
+/// chunk granularity, at the cost of more per-batch overhead. A bounded read (see
+/// `max_rows` on [`decode_batches_arrow`]) instead sizes the decode batch to the
+/// row budget so the first batch already satisfies it.
 const ARROW_BATCH_ROWS: usize = 8192;
 
 /// Decode a Parquet file to [`ColumnBatch`]es using the Arrow reader.
@@ -59,11 +60,20 @@ const ARROW_BATCH_ROWS: usize = 8192;
 ///
 /// The batch schema and projected column indices are recomputed from the
 /// reader's own footer, so callers only pass the projection request.
+///
+/// `max_rows` bounds the read for a cheap "peek" (row preview / data sampler):
+/// when `Some(n)` the decode is restricted to the **first surviving row group**
+/// and stops after `n` rows, so a small `n` fetches only that group's projected
+/// column chunks (plus the footer) via the range-backed reader — it never scans
+/// the whole file. At most `min(n, rows-in-first-row-group)` rows are returned.
+/// `None` is an unbounded scan and is behavior-identical to before this budget
+/// existed.
 pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
     chunk_reader: R,
     projected_field_ids: &[i32],
     residual_filter: Option<&Expression>,
     iceberg_schema: Option<&Schema>,
+    max_rows: Option<usize>,
 ) -> Result<Vec<ColumnBatch>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(chunk_reader)
         .map_err(|e| IcebergError::Storage(format!("Failed to open Parquet (arrow): {e}")))?;
@@ -135,21 +145,42 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         .filter(|_| predicate_pushdown_enabled())
         .and_then(|r| build_predicate_plan(r, &field_id_to_leaf, &leaf_to_pos));
 
-    let surviving =
+    let mut surviving =
         crate::io::send_parquet::surviving_row_groups(md, residual_filter, &field_id_to_leaf);
+
+    // Bounded "peek": restrict to the first surviving row group so a small
+    // `max_rows` fetches only that group's projected column chunks (+ footer) via
+    // the range-backed reader — the whole point of a cheap sample. Unbounded
+    // reads (`None`) keep every surviving row group.
+    if max_rows.is_some() {
+        surviving.truncate(1);
+    }
+
+    // A bounded peek only needs `max_rows` rows, so size the decode batch to the
+    // budget instead of decoding a full `ARROW_BATCH_ROWS` batch we would
+    // immediately slice back down.
+    let batch_rows = match max_rows {
+        Some(n) => n.clamp(1, ARROW_BATCH_ROWS),
+        None => ARROW_BATCH_ROWS,
+    };
 
     let reader = builder
         .with_projection(mask)
         .with_row_groups(surviving)
-        .with_batch_size(ARROW_BATCH_ROWS)
+        .with_batch_size(batch_rows)
         .build()
         .map_err(|e| {
             IcebergError::Storage(format!("Failed to build Parquet reader (arrow): {e}"))
         })?;
 
     let mut batches = Vec::new();
+    let mut produced = 0usize;
 
     for record_batch in reader {
+        // Stop before decoding another batch once the row budget is met.
+        if max_rows.is_some_and(|budget| produced >= budget) {
+            break;
+        }
         let mut record_batch =
             record_batch.map_err(|e| IcebergError::Storage(format!("Arrow decode error: {e}")))?;
         if let Some(plan) = &predicate_plan {
@@ -157,6 +188,14 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
                 .map_err(|e| IcebergError::Storage(format!("Row filter eval error: {e}")))?;
             record_batch = filter_record_batch(&record_batch, &mask)
                 .map_err(|e| IcebergError::Storage(format!("Row filter apply error: {e}")))?;
+        }
+        // Trim the final batch so we never emit more than the row budget. Safe:
+        // the guard above guarantees `produced < budget` here.
+        if let Some(budget) = max_rows {
+            let remaining = budget - produced;
+            if record_batch.num_rows() > remaining {
+                record_batch = record_batch.slice(0, remaining);
+            }
         }
         let num_rows = record_batch.num_rows();
         if num_rows == 0 {
@@ -183,6 +222,7 @@ pub(crate) fn decode_batches_arrow<R: ChunkReader + 'static>(
         if !batch.is_empty() {
             batches.push(batch);
         }
+        produced += num_rows;
     }
 
     Ok(batches)

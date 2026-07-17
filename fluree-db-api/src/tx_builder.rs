@@ -26,18 +26,31 @@ use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_transact::{
-    lower_sparql_update_ast, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
+    lower_sparql_update_request, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
 
-/// Parse a SPARQL UPDATE string and lower it to the transaction IR against
-/// a snapshot's namespace registry. Errors map to HTTP 400 with the same
-/// shape the two builder paths previously emitted.
+/// Parse, validate, and lower a SPARQL UPDATE request to a sequence of
+/// transaction IRs (one per `;`-separated operation, in request order)
+/// against a snapshot's namespace registry. An empty vector is a valid
+/// no-op request (empty or prologue-only). Parse/lowering errors map to
+/// HTTP 400 with the same shape the two builder paths previously emitted;
+/// validation errors use the query seam's structured [`ApiError::sparql`]
+/// shape (the server maps both to 400).
+///
+/// This is the single production funnel for SPARQL UPDATE (both transact
+/// builders, and through them the HTTP route, consensus appliers, and CLI),
+/// so running `validate()` here means validator-side UPDATE rules apply to
+/// real updates — not only inside the W3C harness's own `validate()` call.
+///
+/// All operations share one namespace registry, so each `Txn`'s
+/// `namespace_delta` is a cumulative superset of its predecessors' — the
+/// last operation's delta carries the whole request's allocations.
 pub(crate) fn parse_and_lower_sparql_update(
     sparql: &str,
     snapshot: &LedgerSnapshot,
     txn_opts: TxnOpts,
-) -> Result<Txn> {
+) -> Result<Vec<Txn>> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
     if parsed.has_errors() {
         let messages: Vec<String> = parsed.errors().map(|d| d.message.clone()).collect();
@@ -49,8 +62,32 @@ pub(crate) fn parse_and_lower_sparql_update(
     let ast = parsed
         .ast
         .ok_or_else(|| ApiError::http(400, "Failed to parse SPARQL UPDATE".to_string()))?;
+
+    // Validation errors: the same `validate()` pass the query seam runs
+    // (helpers::parse_and_validate_sparql), differing only in admitting
+    // Fluree's documented DELETE WHERE extensions (existential blank nodes;
+    // anonymous annotation tails), which the strict W3C default rejects but
+    // the transact surface has always supported. Error-severity diagnostics
+    // reject before lowering — so validator-only rules (e.g. variables in
+    // INSERT/DELETE DATA, which previously lowered to never-bindable
+    // template variables and silently no-op'd) fail loudly; warnings never
+    // reject. The lowering keeps its own mirrors as defense-in-depth for
+    // direct `lower_sparql_update_ast` callers.
+    let capabilities = fluree_db_sparql::Capabilities::with_delete_where_extensions();
+    let errors: Vec<_> = fluree_db_sparql::validate(&ast, &capabilities)
+        .into_iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .collect();
+    if !errors.is_empty() {
+        let message = errors
+            .first()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "SPARQL UPDATE validation error".to_string());
+        return Err(ApiError::sparql(message, errors));
+    }
+
     let mut ns = NamespaceRegistry::from_db(snapshot);
-    lower_sparql_update_ast(&ast, &mut ns, txn_opts)
+    lower_sparql_update_request(&ast, &mut ns, txn_opts)
         .map_err(|e| ApiError::http(400, format!("SPARQL UPDATE lowering error: {e}")))
 }
 
@@ -493,6 +530,18 @@ impl<'a> OwnedTransactBuilder<'a> {
                     .await?
             };
 
+            // A registration-only transaction (CREATE GRAPH: zero staged
+            // flakes, but a graph_delta IRI the registry doesn't know yet)
+            // must still COMMIT so the registration persists — only a no-op
+            // whose delta is already fully registered may skip the commit.
+            let registers_new_graph = graph_delta.values().any(|iri| {
+                view.base()
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .is_none()
+            });
+
             // Add extracted transaction metadata and graph delta to commit opts
             let commit_opts = self
                 .core
@@ -501,26 +550,28 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .with_graph_delta(graph_delta.into_iter().collect());
 
             // No-op updates: return success without committing.
-            let (receipt, ledger) =
-                if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-                    let (base, flakes) = view.into_parts();
-                    debug_assert!(
-                        flakes.is_empty(),
-                        "no-op transaction path requires zero staged flakes"
-                    );
-                    (
-                        fluree_db_transact::CommitReceipt {
-                            commit_id: ContentId::new(ContentKind::Commit, &[]),
-                            t: base.t(),
-                            flake_count: 0,
-                        },
-                        base,
-                    )
-                } else {
-                    self.fluree
-                        .commit_staged(view, ns_registry, &index_config, commit_opts)
-                        .await?
-                };
+            let (receipt, ledger) = if !view.has_staged()
+                && !registers_new_graph
+                && matches!(txn_type, TxnType::Update | TxnType::Upsert)
+            {
+                let (base, flakes) = view.into_parts();
+                debug_assert!(
+                    flakes.is_empty(),
+                    "no-op transaction path requires zero staged flakes"
+                );
+                (
+                    fluree_db_transact::CommitReceipt {
+                        commit_id: ContentId::new(ContentKind::Commit, &[]),
+                        t: base.t(),
+                        flake_count: 0,
+                    },
+                    base,
+                )
+            } else {
+                self.fluree
+                    .commit_staged(view, ns_registry, &index_config, commit_opts)
+                    .await?
+            };
 
             return Ok(self
                 .fluree
@@ -1055,12 +1106,18 @@ impl Fluree {
         }
 
         if let Some(sparql) = core.pending_sparql {
-            let txn = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
-            let txn_type = txn.txn_type;
+            let txns =
+                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, core.txn_opts)?;
+            // A single-op request reports its own type; a multi-op (or
+            // empty no-op) request is reported as a generic update.
+            let txn_type = match txns.as_slice() {
+                [only] => only.txn_type,
+                _ => TxnType::Update,
+            };
             let stage_result = self
-                .stage_transaction_from_txn(
+                .stage_transaction_from_txns(
                     ledger_state,
-                    txn,
+                    txns,
                     Some(index_config),
                     core.policy.as_ref(),
                     Some(tracker),
@@ -1205,11 +1262,23 @@ impl Fluree {
             txn_meta,
             graph_delta,
         } = stage_result;
+        // See the pre_built_txn path: a registration-only commit (new graph
+        // IRI in the delta, zero flakes) must not take the no-op shortcut.
+        let registers_new_graph = graph_delta.values().any(|iri| {
+            view.base()
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(iri)
+                .is_none()
+        });
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
 
-        if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
+        if !view.has_staged()
+            && !registers_new_graph
+            && matches!(txn_type, TxnType::Update | TxnType::Upsert)
+        {
             let (base, _) = view.into_parts();
             return Ok(TransactResultRef {
                 receipt: fluree_db_transact::CommitReceipt {

@@ -1,8 +1,14 @@
 [package]
 name = "testsuite-sparql"
-version = "4.1.1"
+version = "4.1.2"
 edition = "2021"
 publish = false
+
+# Standalone package: never part of the repo workspace (the root Cargo.toml
+# also excludes it by path, but that exclusion doesn't apply when the repo is
+# checked out as a nested git worktree — this marker keeps cargo from walking
+# up to an enclosing workspace root).
+[workspace]
 
 [dependencies]
 # Fluree crates (for testing)

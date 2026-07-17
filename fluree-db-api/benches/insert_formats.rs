@@ -277,7 +277,9 @@ fn bench_insert_formats(c: &mut Criterion) {
     init_tracing_for_bench();
 
     let rt = bench_runtime();
-    let fluree = FlureeBuilder::memory().build_memory();
+    // `build_memory()` spawns the ledger-cache event listener, so it must
+    // run inside the runtime even though it is synchronous.
+    let fluree = rt.block_on(async { FlureeBuilder::memory().build_memory() });
 
     let index_config = IndexConfig {
         reindex_min_bytes: 500_000_000,

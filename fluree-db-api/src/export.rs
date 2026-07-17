@@ -13,6 +13,7 @@ use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
 use fluree_db_query::binary_scan::{
     translate_overlay_flakes_with_untranslated, EphemeralPredicateMap,
 };
+use fluree_graph_ir::canonical_xsd_double;
 use fluree_vocab::xsd;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -1234,19 +1235,8 @@ fn write_object<W: Write>(
             &resolve_datatype_iri(store, o_type).unwrap_or_else(|| xsd::LONG.to_string()),
         ),
         FlakeValue::Double(f) => {
-            // N-Triples canonical form for double
-            let lexical = if f.is_infinite() {
-                if f.is_sign_positive() {
-                    "INF".to_string()
-                } else {
-                    "-INF".to_string()
-                }
-            } else if f.is_nan() {
-                "NaN".to_string()
-            } else {
-                format!("{f:E}")
-            };
-            write_typed_literal(w, &lexical, xsd::DOUBLE)
+            // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved)
+            write_typed_literal(w, &canonical_xsd_double(*f), xsd::DOUBLE)
         }
         FlakeValue::BigInt(n) => write_typed_literal(
             w,
@@ -1463,18 +1453,8 @@ fn write_raw_object<W: Write>(
             Ok(true)
         }
         FlakeValue::Double(f) => {
-            let lexical = if f.is_infinite() {
-                if f.is_sign_positive() {
-                    "INF".to_string()
-                } else {
-                    "-INF".to_string()
-                }
-            } else if f.is_nan() {
-                "NaN".to_string()
-            } else {
-                format!("{f:E}")
-            };
-            write_typed_literal(w, &lexical, xsd::DOUBLE)?;
+            // W3C canonical xsd:double form (1.0E6; NaN/INF/-INF preserved)
+            write_typed_literal(w, &canonical_xsd_double(*f), xsd::DOUBLE)?;
             Ok(true)
         }
         FlakeValue::Vector(v) => {

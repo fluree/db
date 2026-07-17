@@ -1155,7 +1155,7 @@ fn detect_predicate_count_rows_lang_filter(query: &Query) -> Option<(Ref, String
 
     let is_lang_o = |e: &crate::ir::Expression| match e {
         crate::ir::Expression::Call { func, args } => {
-            *func == crate::ir::Function::Lang
+            matches!(func, crate::ir::Function::Lang { .. })
                 && args.len() == 1
                 && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
         }
@@ -1296,7 +1296,7 @@ fn detect_count_rows_with_encoded_filters(
         |e: &crate::ir::Expression| matches!(e, crate::ir::Expression::Var(v) if *v == o_var);
     let is_lang_call = |e: &crate::ir::Expression| match e {
         crate::ir::Expression::Call { func, args } => {
-            *func == crate::ir::Function::Lang
+            matches!(func, crate::ir::Function::Lang { .. })
                 && args.len() == 1
                 && matches!(&args[0], crate::ir::Expression::Var(v) if *v == o_var)
         }
@@ -1581,10 +1581,9 @@ fn detect_predicate_sum_string_fn(query: &Query) -> Option<(Ref, StringFoldAgg, 
             Expression::Call { .. } => {
                 if let Some(needle) = var_const_args(Function::StrBefore, args) {
                     StringFoldAgg::SumStrlenBefore { needle }
-                } else if let Some(needle) = var_const_args(Function::StrAfter, args) {
-                    StringFoldAgg::SumStrlenAfter { needle }
                 } else {
-                    return None;
+                    let needle = var_const_args(Function::StrAfter, args)?;
+                    StringFoldAgg::SumStrlenAfter { needle }
                 }
             }
             _ => return None,

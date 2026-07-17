@@ -404,12 +404,81 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
             language: Option<String>,
         },
     }
+
+    /// Complete a finished element — on a real `Event::End`, or immediately
+    /// for a self-closing `Event::Empty` (which emits NO matching End event,
+    /// so its completion must never wait for one). Returns `Some` when the
+    /// element terminates parsing (`<boolean>`).
+    fn complete_element(
+        local_name: &[u8],
+        text_buf: &str,
+        solutions: &mut Vec<HashMap<String, RdfTerm>>,
+        current_binding_name: &mut Option<String>,
+        current_solution: &mut Option<HashMap<String, RdfTerm>>,
+        current_term: &mut Option<TermKind>,
+    ) -> Option<SparqlResults> {
+        match local_name {
+            b"result" => {
+                if let Some(solution) = current_solution.take() {
+                    solutions.push(solution);
+                }
+            }
+            b"binding" => {
+                *current_binding_name = None;
+            }
+            b"uri" => {
+                if let Some(TermKind::Uri) = current_term {
+                    if let Some(name) = current_binding_name.as_ref() {
+                        if let Some(solution) = current_solution.as_mut() {
+                            solution.insert(name.clone(), RdfTerm::Iri(text_buf.to_string()));
+                        }
+                    }
+                }
+                *current_term = None;
+            }
+            b"bnode" => {
+                if let Some(TermKind::Bnode) = current_term {
+                    if let Some(name) = current_binding_name.as_ref() {
+                        if let Some(solution) = current_solution.as_mut() {
+                            solution.insert(name.clone(), RdfTerm::BlankNode(text_buf.to_string()));
+                        }
+                    }
+                }
+                *current_term = None;
+            }
+            b"literal" => {
+                if let Some(TermKind::Literal { datatype, language }) = current_term.clone() {
+                    if let Some(name) = current_binding_name.as_ref() {
+                        if let Some(solution) = current_solution.as_mut() {
+                            solution.insert(
+                                name.clone(),
+                                RdfTerm::Literal {
+                                    value: text_buf.to_string(),
+                                    datatype,
+                                    language,
+                                },
+                            );
+                        }
+                    }
+                }
+                *current_term = None;
+            }
+            b"boolean" => {
+                let val = text_buf.trim();
+                return Some(SparqlResults::Boolean(val == "true" || val == "1"));
+            }
+            _ => {}
+        }
+        None
+    }
+
     let mut current_term: Option<TermKind> = None;
     let mut text_buf = String::new();
     let mut in_boolean = false;
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
@@ -468,62 +537,32 @@ pub fn parse_srx(xml: &str) -> Result<SparqlResults> {
                     }
                     _ => {}
                 }
+                // A self-closing element (`<result/>`, `<literal/>`, …)
+                // produces no End event; complete it right away so the
+                // element is committed and no stale state leaks forward.
+                if matches!(&event, Ok(Event::Empty(_))) {
+                    if let Some(result) = complete_element(
+                        local_name.as_ref(),
+                        &text_buf,
+                        &mut solutions,
+                        &mut current_binding_name,
+                        &mut current_solution,
+                        &mut current_term,
+                    ) {
+                        return Ok(result);
+                    }
+                }
             }
             Ok(Event::End(ref e)) => {
-                let local_name = e.local_name();
-                match local_name.as_ref() {
-                    b"result" => {
-                        if let Some(solution) = current_solution.take() {
-                            solutions.push(solution);
-                        }
-                    }
-                    b"binding" => {
-                        current_binding_name = None;
-                    }
-                    b"uri" => {
-                        if let Some(TermKind::Uri) = current_term {
-                            if let Some(ref name) = current_binding_name {
-                                if let Some(ref mut solution) = current_solution {
-                                    solution.insert(name.clone(), RdfTerm::Iri(text_buf.clone()));
-                                }
-                            }
-                        }
-                        current_term = None;
-                    }
-                    b"bnode" => {
-                        if let Some(TermKind::Bnode) = current_term {
-                            if let Some(ref name) = current_binding_name {
-                                if let Some(ref mut solution) = current_solution {
-                                    solution
-                                        .insert(name.clone(), RdfTerm::BlankNode(text_buf.clone()));
-                                }
-                            }
-                        }
-                        current_term = None;
-                    }
-                    b"literal" => {
-                        if let Some(TermKind::Literal { datatype, language }) = current_term.clone()
-                        {
-                            if let Some(ref name) = current_binding_name {
-                                if let Some(ref mut solution) = current_solution {
-                                    solution.insert(
-                                        name.clone(),
-                                        RdfTerm::Literal {
-                                            value: text_buf.clone(),
-                                            datatype,
-                                            language,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        current_term = None;
-                    }
-                    b"boolean" => {
-                        let val = text_buf.trim();
-                        return Ok(SparqlResults::Boolean(val == "true" || val == "1"));
-                    }
-                    _ => {}
+                if let Some(result) = complete_element(
+                    e.local_name().as_ref(),
+                    &text_buf,
+                    &mut solutions,
+                    &mut current_binding_name,
+                    &mut current_solution,
+                    &mut current_term,
+                ) {
+                    return Ok(result);
                 }
             }
             Ok(Event::Text(ref e)) if current_term.is_some() || in_boolean => {
@@ -827,11 +866,71 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
         Boolean,
         Ignored,
     }
+
+    /// Complete a finished element state — popped off the stack on a real
+    /// `Event::End`, or applied directly for a self-closing `Event::Empty`
+    /// (which emits NO matching End event and therefore must never be pushed
+    /// onto the state stack: pushing it skews every subsequent pop, which is
+    /// how bound solutions after a `<rs:value rdf:resource=…/>` used to get
+    /// dropped while the unbound-variable solution before it survived).
+    /// Returns `Some` when the element terminates parsing (`<rs:boolean>`).
+    fn complete_state(
+        state: State,
+        text_buf: &str,
+        variables: &mut Vec<String>,
+        solutions: &mut Vec<HashMap<String, RdfTerm>>,
+        current_solution: &mut Option<HashMap<String, RdfTerm>>,
+        current_var_name: &mut Option<String>,
+        current_value: &mut Option<RdfTerm>,
+    ) -> Option<SparqlResults> {
+        match state {
+            State::ResultVariable => {
+                let var = text_buf.trim().to_string();
+                if !var.is_empty() {
+                    variables.push(var);
+                }
+            }
+            State::Boolean => {
+                let val = text_buf.trim();
+                return Some(SparqlResults::Boolean(val == "true" || val == "1"));
+            }
+            State::Solution => {
+                if let Some(sol) = current_solution.take() {
+                    solutions.push(sol);
+                }
+            }
+            State::Binding => {
+                if let (Some(name), Some(term)) = (current_var_name.take(), current_value.take()) {
+                    if let Some(sol) = current_solution.as_mut() {
+                        sol.insert(name, term);
+                    }
+                }
+            }
+            State::BindingVariable => {
+                *current_var_name = Some(text_buf.trim().to_string());
+            }
+            // Only set if not already set by an rdf:resource/rdf:nodeID attribute
+            State::BindingValue { datatype } if current_value.is_none() => {
+                let val = text_buf.trim().to_string();
+                if !val.is_empty() {
+                    *current_value = Some(RdfTerm::Literal {
+                        value: val,
+                        datatype,
+                        language: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     let mut state_stack: Vec<State> = vec![State::Root];
     let mut text_buf = String::new();
 
     loop {
-        match reader.read_event() {
+        let event = reader.read_event();
+        match event {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let local_name = e.local_name();
                 let local = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
@@ -853,12 +952,17 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
                     }
                     (State::Binding, "variable") => State::BindingVariable,
                     (State::Binding, "value") => {
-                        // Check for rdf:resource attribute (IRI value as attribute)
+                        // Term-as-attribute forms: rdf:resource carries an IRI
+                        // value, rdf:nodeID a blank-node label (both typically
+                        // appear on self-closing elements).
                         for attr in e.attributes().flatten() {
                             let key = std::str::from_utf8(attr.key.0).unwrap_or("");
                             if key == "rdf:resource" || key.ends_with(":resource") {
                                 let iri = String::from_utf8_lossy(&attr.value).to_string();
                                 current_value = Some(RdfTerm::Iri(iri));
+                            } else if key == "rdf:nodeID" || key.ends_with(":nodeID") {
+                                let label = String::from_utf8_lossy(&attr.value).to_string();
+                                current_value = Some(RdfTerm::BlankNode(label));
                             }
                         }
                         let datatype = e.attributes().flatten().find_map(|attr| {
@@ -874,50 +978,36 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
                     _ => State::Ignored,
                 };
 
-                state_stack.push(new_state);
+                if matches!(&event, Ok(Event::Empty(_))) {
+                    // Self-closing element: complete it immediately instead of
+                    // pushing expectation state that no End event will pop.
+                    if let Some(result) = complete_state(
+                        new_state,
+                        &text_buf,
+                        &mut variables,
+                        &mut solutions,
+                        &mut current_solution,
+                        &mut current_var_name,
+                        &mut current_value,
+                    ) {
+                        return Ok(result);
+                    }
+                } else {
+                    state_stack.push(new_state);
+                }
             }
             Ok(Event::End(_)) => {
                 let finished_state = state_stack.pop().unwrap_or(State::Root);
-                match finished_state {
-                    State::ResultVariable => {
-                        let var = text_buf.trim().to_string();
-                        if !var.is_empty() {
-                            variables.push(var);
-                        }
-                    }
-                    State::Boolean => {
-                        let val = text_buf.trim();
-                        return Ok(SparqlResults::Boolean(val == "true" || val == "1"));
-                    }
-                    State::Solution => {
-                        if let Some(sol) = current_solution.take() {
-                            solutions.push(sol);
-                        }
-                    }
-                    State::Binding => {
-                        if let (Some(name), Some(term)) =
-                            (current_var_name.take(), current_value.take())
-                        {
-                            if let Some(ref mut sol) = current_solution {
-                                sol.insert(name, term);
-                            }
-                        }
-                    }
-                    State::BindingVariable => {
-                        current_var_name = Some(text_buf.trim().to_string());
-                    }
-                    // Only set if not already set by rdf:resource attribute
-                    State::BindingValue { datatype } if current_value.is_none() => {
-                        let val = text_buf.trim().to_string();
-                        if !val.is_empty() {
-                            current_value = Some(RdfTerm::Literal {
-                                value: val,
-                                datatype,
-                                language: None,
-                            });
-                        }
-                    }
-                    _ => {}
+                if let Some(result) = complete_state(
+                    finished_state,
+                    &text_buf,
+                    &mut variables,
+                    &mut solutions,
+                    &mut current_solution,
+                    &mut current_var_name,
+                    &mut current_value,
+                ) {
+                    return Ok(result);
                 }
             }
             Ok(Event::Text(ref e)) => {
@@ -1550,6 +1640,219 @@ ex:bob ex:name "Bob" .
                 assert_eq!(
                     solutions[0]["addr"],
                     RdfTerm::Iri("http://example.org/alice".into())
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// Regression for the state-stack skew behind dawg-sort-3/6/8: a
+    /// self-closing `<rs:value rdf:resource=…/>` emits no End event, so
+    /// pushing it onto the state stack desynchronized every later pop —
+    /// the parser kept the solution with the unbound variable and dropped
+    /// every bound solution after the first self-closing value. Modeled on
+    /// `sort/result-sort-3.rdf` (4 solutions, first has unbound ?mbox).
+    #[test]
+    fn test_parse_rdf_dawg_self_closing_value_keeps_later_solutions() {
+        let xml = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rs="http://www.w3.org/2001/sw/DataAccess/tests/result-set#"
+         xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rs:ResultSet>
+    <rs:resultVariable>name</rs:resultVariable>
+    <rs:resultVariable>mbox</rs:resultVariable>
+    <rs:solution rdf:parseType="Resource">
+      <rs:index rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">1</rs:index>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>name</rs:variable>
+        <rs:value>Bob</rs:value>
+      </rs:binding>
+    </rs:solution>
+    <rs:solution rdf:parseType="Resource">
+      <rs:index rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">2</rs:index>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>name</rs:variable>
+        <rs:value>Alice</rs:value>
+      </rs:binding>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>mbox</rs:variable>
+        <rs:value rdf:resource="mailto:alice@work.example"/>
+      </rs:binding>
+    </rs:solution>
+    <rs:solution rdf:parseType="Resource">
+      <rs:index rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">3</rs:index>
+      <rs:binding rdf:parseType="Resource">
+        <rs:value rdf:resource="mailto:eve@work.example"/>
+        <rs:variable>mbox</rs:variable>
+      </rs:binding>
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>name</rs:variable>
+        <rs:value>Eve</rs:value>
+      </rs:binding>
+    </rs:solution>
+  </rs:ResultSet>
+</rdf:RDF>"#;
+        let result = parse_rdf_dawg_result_set(xml).unwrap();
+        match result {
+            SparqlResults::Solutions {
+                variables,
+                solutions,
+            } => {
+                assert_eq!(variables, vec!["name", "mbox"]);
+                assert_eq!(solutions.len(), 3, "all solutions must survive");
+                // Solution 1: ?mbox unbound (OPTIONAL) — kept, without a
+                // phantom mbox binding.
+                assert_eq!(
+                    solutions[0]["name"],
+                    RdfTerm::Literal {
+                        value: "Bob".into(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+                assert!(!solutions[0].contains_key("mbox"));
+                // Solution 2: bound via self-closing rdf:resource value.
+                assert_eq!(
+                    solutions[1]["mbox"],
+                    RdfTerm::Iri("mailto:alice@work.example".into())
+                );
+                // Solution 3: self-closing value listed BEFORE the variable
+                // element inside its binding.
+                assert_eq!(
+                    solutions[2]["mbox"],
+                    RdfTerm::Iri("mailto:eve@work.example".into())
+                );
+                assert_eq!(
+                    solutions[2]["name"],
+                    RdfTerm::Literal {
+                        value: "Eve".into(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// `rdf:nodeID` on a self-closing `<rs:value/>` is a blank-node binding
+    /// (used by `sort/result-sort-8.rdf`).
+    #[test]
+    fn test_parse_rdf_dawg_node_id_blank_node_value() {
+        let xml = r#"<?xml version="1.0"?>
+<rdf:RDF xmlns:rs="http://www.w3.org/2001/sw/DataAccess/tests/result-set#"
+         xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rs:ResultSet>
+    <rs:resultVariable>emp</rs:resultVariable>
+    <rs:solution rdf:parseType="Resource">
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>emp</rs:variable>
+        <rs:value rdf:nodeID="node0"/>
+      </rs:binding>
+    </rs:solution>
+    <rs:solution rdf:parseType="Resource">
+      <rs:binding rdf:parseType="Resource">
+        <rs:variable>emp</rs:variable>
+        <rs:value rdf:datatype="http://www.w3.org/2001/XMLSchema#integer">9</rs:value>
+      </rs:binding>
+    </rs:solution>
+  </rs:ResultSet>
+</rdf:RDF>"#;
+        let result = parse_rdf_dawg_result_set(xml).unwrap();
+        match result {
+            SparqlResults::Solutions { solutions, .. } => {
+                assert_eq!(solutions.len(), 2);
+                assert_eq!(solutions[0]["emp"], RdfTerm::BlankNode("node0".into()));
+                assert_eq!(
+                    solutions[1]["emp"],
+                    RdfTerm::Literal {
+                        value: "9".into(),
+                        datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+                        language: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// The SRX parser had the same Start|Empty conflation: a self-closing
+    /// term element never saw its End event, so the binding was silently
+    /// dropped. `<literal/>` must bind the empty string.
+    #[test]
+    fn test_parse_srx_self_closing_literal() {
+        let xml = r#"<?xml version="1.0"?>
+<sparql xmlns="http://www.w3.org/2005/sparql-results#">
+  <head>
+    <variable name="x"/>
+    <variable name="y"/>
+  </head>
+  <results>
+    <result>
+      <binding name="x"><literal/></binding>
+      <binding name="y"><uri>http://example.org/a</uri></binding>
+    </result>
+    <result>
+      <binding name="x"><literal>later</literal></binding>
+    </result>
+  </results>
+</sparql>"#;
+        let result = parse_srx(xml).unwrap();
+        match result {
+            SparqlResults::Solutions { solutions, .. } => {
+                assert_eq!(solutions.len(), 2);
+                assert_eq!(
+                    solutions[0]["x"],
+                    RdfTerm::Literal {
+                        value: String::new(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+                assert_eq!(
+                    solutions[0]["y"],
+                    RdfTerm::Iri("http://example.org/a".into())
+                );
+                assert_eq!(
+                    solutions[1]["x"],
+                    RdfTerm::Literal {
+                        value: "later".into(),
+                        datatype: None,
+                        language: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Solutions, got {result:?}"),
+        }
+    }
+
+    /// A self-closing `<result/>` is a solution with every variable unbound;
+    /// it must be pushed, and must not swallow the following solutions.
+    #[test]
+    fn test_parse_srx_self_closing_empty_result() {
+        let xml = r#"<?xml version="1.0"?>
+<sparql xmlns="http://www.w3.org/2005/sparql-results#">
+  <head>
+    <variable name="x"/>
+  </head>
+  <results>
+    <result/>
+    <result>
+      <binding name="x"><literal>bound</literal></binding>
+    </result>
+  </results>
+</sparql>"#;
+        let result = parse_srx(xml).unwrap();
+        match result {
+            SparqlResults::Solutions { solutions, .. } => {
+                assert_eq!(solutions.len(), 2);
+                assert!(solutions[0].is_empty());
+                assert_eq!(
+                    solutions[1]["x"],
+                    RdfTerm::Literal {
+                        value: "bound".into(),
+                        datatype: None,
+                        language: None,
+                    }
                 );
             }
             _ => panic!("Expected Solutions, got {result:?}"),

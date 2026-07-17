@@ -33,6 +33,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tracing::warn;
 
 fn io_err(action: &str, err: io::Error) -> StorageError {
     StorageError::io(format!("{action}: {err}"))
@@ -67,17 +68,14 @@ async fn fsync_dir(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Atomic write: stage to `<path>.tmp`, fsync, rename onto `path`,
-/// fsync the parent directory.
-///
-/// On any POSIX-y filesystem the rename is atomic, so readers either
-/// see the previous good file or the new good file — never a torn
-/// write. Fsyncing the parent directory after the rename is what
-/// keeps that guarantee across a power loss: without it the rename
-/// can revert on remount, silently rolling back a write whose `Ok`
-/// callers (Raft vote / log entry / snapshot pointer persistence)
-/// rely on for safety.
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+/// Durably write `bytes` to a temp file and rename it over `path`,
+/// but leave the parent-directory fsync (which makes the rename
+/// itself durable) to the caller. The file *contents* are synced
+/// before the rename, so after the caller fsyncs the directory the
+/// entry is fully durable. A batch writer (`append`) uses this to
+/// pay one directory fsync for the whole batch instead of one per
+/// entry; single writers go through [`atomic_write`].
+async fn write_and_rename(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     let tmp = path.with_extension("tmp");
     {
         let mut file = fs::File::create(&tmp)
@@ -91,6 +89,14 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     fs::rename(&tmp, path)
         .await
         .map_err(|e| io_err("rename tmp", e))?;
+    Ok(())
+}
+
+/// [`write_and_rename`] plus the parent-directory fsync, so the
+/// rename is durable on return. For one-off writes (vote, committed,
+/// snapshot files); batch writers fsync the directory once at the end.
+async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    write_and_rename(path, bytes).await?;
     if let Some(parent) = path.parent() {
         fsync_dir(parent).await?;
     }
@@ -197,9 +203,20 @@ impl FsRaftLogStore {
 #[async_trait]
 impl RaftLogStore for FsRaftLogStore {
     async fn append(&self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        // Each entry's contents are fsync'd before its rename; the
+        // renames are made durable by a single directory fsync at the
+        // end, so a batch of N pays N+1 fsyncs rather than 2N. A crash
+        // before that final fsync can leave the tail renames durable
+        // out of order (a gap), but the append hasn't been acked to
+        // openraft, and `log_state` reports only the contiguous prefix
+        // above the purge cutoff — so the gap and any orphans past it
+        // are dropped and re-appended on recovery.
         for entry in entries {
             let bytes = postcard::to_allocvec(entry).map_err(|e| ser_err("encode entry", e))?;
-            atomic_write(&self.entry_path(entry.log_id.index), &bytes).await?;
+            write_and_rename(&self.entry_path(entry.log_id.index), &bytes).await?;
+        }
+        if !entries.is_empty() {
+            fsync_dir(&self.log_dir()).await?;
         }
         Ok(())
     }
@@ -228,8 +245,19 @@ impl RaftLogStore for FsRaftLogStore {
         // `truncate_from` against the actual conflict point on
         // recovery, so no missing-middle hole ever surfaces.
         let indices = self.list_entry_indices().await?;
+        let mut removed = false;
         for idx in indices.into_iter().filter(|&i| i >= from_index).rev() {
             remove_if_exists(&self.entry_path(idx)).await?;
+            removed = true;
+        }
+        // One directory fsync makes the whole unlink batch durable.
+        // Without it a crash can resurrect deleted entries, and
+        // POSIX doesn't order unlink persistence, so even the
+        // descending delete order above can be defeated — a
+        // resurrected entry above a persisted deletion is a mid-log
+        // hole that `read_range` cannot represent.
+        if removed {
+            fsync_dir(&self.log_dir()).await?;
         }
         Ok(())
     }
@@ -251,8 +279,15 @@ impl RaftLogStore for FsRaftLogStore {
         atomic_write(&self.last_purged_path(), &bytes).await?;
 
         let indices = self.list_entry_indices().await?;
+        let mut removed = false;
         for idx in indices.into_iter().filter(|&i| i <= log_id.index) {
             remove_if_exists(&self.entry_path(idx)).await?;
+            removed = true;
+        }
+        // See `truncate_from`: the batch's unlinks aren't durable
+        // until the directory is synced.
+        if removed {
+            fsync_dir(&self.log_dir()).await?;
         }
         Ok(())
     }
@@ -261,17 +296,34 @@ impl RaftLogStore for FsRaftLogStore {
         let last_purged = self.read_last_purged().await?;
         let purged_cutoff = last_purged.map(|p| p.index);
         let indices = self.list_entry_indices().await?;
-        // `last_log` reflects only entries strictly above
-        // `last_purged`; orphans at indices <= cutoff (left behind by
-        // a crashed `purge_through` between marker write and
-        // deletion) must not bump `last_log` or openraft sees a
-        // last_log inside the purged range.
-        let last_log = match indices
+        // `last_log` is the top of the contiguous run of entries above
+        // `last_purged`. Two orphan sources make this a contiguous
+        // scan rather than a plain max:
+        //   - indices <= cutoff (a `purge_through` that crashed between
+        //     marker write and deletion) — filtered out by the cutoff;
+        //   - a gap anywhere from `cutoff + 1` up (an `append` batch
+        //     that crashed before its final directory fsync, leaving
+        //     renames durable out of order) — the scan is anchored at
+        //     `cutoff + 1` (or index 1 with nothing purged) and stops
+        //     at the first missing index, so openraft never sees a
+        //     `last_log` past a hole. A gap at the very front (the
+        //     first expected index absent) yields `None`. Entries
+        //     beyond the gap are orphans that recovery re-appends over.
+        let first_expected = purged_cutoff.map_or(1, |c| c + 1);
+        let last_index = indices
             .iter()
-            .rev()
-            .find(|&&idx| purged_cutoff.is_none_or(|c| idx > c))
             .copied()
-        {
+            .filter(|&idx| purged_cutoff.is_none_or(|c| idx > c))
+            .scan(first_expected, |expected, idx| {
+                if idx == *expected {
+                    *expected += 1;
+                    Some(idx)
+                } else {
+                    None // gap (at the anchor or in the tail) — stop the run
+                }
+            })
+            .last();
+        let last_log = match last_index {
             Some(idx) => self.read_entry(idx).await?.map(|e| e.log_id),
             None => None,
         };
@@ -303,7 +355,13 @@ impl RaftLogStore for FsRaftLogStore {
                     postcard::to_allocvec(&id).map_err(|e| ser_err("encode committed", e))?;
                 atomic_write(&self.committed_path(), &bytes).await
             }
-            None => remove_if_exists(&self.committed_path()).await,
+            None => {
+                remove_if_exists(&self.committed_path()).await?;
+                // The unlink is a durability point like the write
+                // arm's `atomic_write`: sync its directory so the
+                // stale committed marker can't resurrect on crash.
+                fsync_dir(&self.root).await
+            }
         }
     }
 
@@ -415,6 +473,7 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
         atomic_write(&self.meta_path(safe_id), &meta_bytes).await?;
         atomic_write(&self.data_path(safe_id), &data).await?;
         atomic_write(&self.current_path(), safe_id.as_bytes()).await?;
+        self.reclaim_superseded(safe_id).await;
         Ok(())
     }
 
@@ -433,17 +492,73 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
         let id = SnapshotId::new(id_str);
         let safe_id = validate_path_safe_id(&id)?;
 
+        // A pointer naming missing files is corruption, not a fresh
+        // boot: the log below the snapshot has typically been
+        // purged, so silently reporting "no snapshot" would restart
+        // the node with committed state unrecoverable. Only an
+        // absent pointer means "never snapshotted".
         let Some(meta_bytes) = read_if_exists(&self.meta_path(safe_id)).await? else {
-            return Ok(None);
+            return Err(StorageError::corruption(format!(
+                "current snapshot pointer names {safe_id:?} but its meta file is missing"
+            )));
         };
         let meta =
             postcard::from_bytes(&meta_bytes).map_err(|e| ser_err("decode snapshot meta", e))?;
 
         let Some(data) = read_if_exists(&self.data_path(safe_id)).await? else {
-            return Ok(None);
+            return Err(StorageError::corruption(format!(
+                "current snapshot pointer names {safe_id:?} but its data file is missing"
+            )));
         };
 
         Ok(Some((meta, data)))
+    }
+}
+
+impl FsRaftSnapshotStore {
+    /// Remove every snapshot file except `keep_id`'s pair and the
+    /// `current` pointer, plus any `*.tmp` staged by a crashed
+    /// `atomic_write`. Called after the pointer durably names
+    /// `keep_id`, so nothing removed here is reachable; without the
+    /// sweep every superseded snapshot (a full serialized state
+    /// machine) stays on disk forever. Best-effort — a failed
+    /// removal leaves an orphan for the next write's sweep, never a
+    /// broken snapshot — but completed removals get one directory
+    /// fsync so a crash can't resurrect a half-removed sibling.
+    async fn reclaim_superseded(&self, keep_id: &str) {
+        let dir = self.snapshot_dir();
+        let mut entries = match fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(error = %e, "snapshot reclamation could not list directory");
+                return;
+            }
+        };
+        let mut removed = false;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let superseded = name
+                .strip_suffix(".meta")
+                .or_else(|| name.strip_suffix(".data"))
+                .is_some_and(|stem| stem != keep_id)
+                || name.ends_with(".tmp");
+            if !superseded {
+                continue;
+            }
+            match fs::remove_file(entry.path()).await {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    warn!(file = %name, error = %e, "snapshot reclamation failed to remove file");
+                }
+            }
+        }
+        if removed {
+            if let Err(e) = fsync_dir(&dir).await {
+                warn!(error = %e, "snapshot reclamation directory sync failed");
+            }
+        }
     }
 }
 
@@ -665,6 +780,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn log_state_stops_at_a_tail_gap() {
+        // Simulate an `append` batch that crashed before its final
+        // directory fsync: entries 1..3 durable, 4's rename lost, 5
+        // durable past the gap. `log_state` must report `last_log = 3`
+        // (the contiguous prefix), never 5 — otherwise openraft would
+        // see a `last_log` past the missing entry 4.
+        let (_dir, store) = fresh_log_store().await;
+        store
+            .append(&[
+                entry(1, 1),
+                entry(1, 2),
+                entry(1, 3),
+                entry(1, 4),
+                entry(1, 5),
+            ])
+            .await
+            .unwrap();
+        std::fs::remove_file(store.entry_path(4)).expect("open the gap at index 4");
+
+        let state = store.log_state().await.unwrap();
+        assert_eq!(
+            state.last_log,
+            Some(LogId::new(1, 3)),
+            "last_log must stop at the gap, ignoring the orphan at 5"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_state_reports_none_on_a_front_gap() {
+        // The gap is at the very first expected index. This is the
+        // crash-mid-append case on a log that was empty above the
+        // cutoff (fresh node, or right after a snapshot install +
+        // full purge): the batch's first entry's rename is lost while
+        // later ones survive. With nothing older to anchor the run,
+        // `last_log` must be `None` — reporting the surviving orphans'
+        // top would put `last_log` above the missing anchor.
+
+        // No purge marker → the anchor is index 1; drop entry 1.
+        let (_dir, store) = fresh_log_store().await;
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        std::fs::remove_file(store.entry_path(1)).expect("open the front gap at index 1");
+        let state = store.log_state().await.unwrap();
+        assert!(
+            state.last_log.is_none(),
+            "a gap at the anchor must yield last_log=None, got {:?}",
+            state.last_log
+        );
+
+        // With a purge cutoff at 3, the anchor is index 4; drop entry 4.
+        let (_dir2, store2) = fresh_log_store().await;
+        store2
+            .append(&[entry(1, 4), entry(1, 5), entry(1, 6)])
+            .await
+            .unwrap();
+        let marker = postcard::to_allocvec(&LogId::new(1, 3)).expect("encode marker");
+        atomic_write(&store2.last_purged_path(), &marker)
+            .await
+            .expect("write marker");
+        std::fs::remove_file(store2.entry_path(4)).expect("open the front gap at index 4");
+        let state2 = store2.log_state().await.unwrap();
+        assert!(
+            state2.last_log.is_none(),
+            "a gap at cutoff+1 must yield last_log=None, got {:?}",
+            state2.last_log
+        );
+    }
+
+    #[tokio::test]
     async fn vote_round_trip_and_clear() {
         let (_dir, store) = fresh_log_store().await;
         assert!(store.read_vote().await.unwrap().is_none());
@@ -771,10 +957,70 @@ mod tests {
         let (current_meta, current_data) = store.current().await.unwrap().unwrap();
         assert_eq!(current_meta.id, SnapshotId::new("snap-2"));
         assert_eq!(current_data, vec![2]);
-        assert_eq!(
-            store.read(&SnapshotId::new("snap-1")).await.unwrap(),
-            Some(vec![1])
-        );
+        // The superseded snapshot is reclaimed once `current` names
+        // its successor — `read` reports it gone, and its files no
+        // longer occupy disk.
+        assert_eq!(store.read(&SnapshotId::new("snap-1")).await.unwrap(), None);
+        assert!(!dir.path().join("snapshots").join("snap-1.meta").exists());
+        assert!(!dir.path().join("snapshots").join("snap-1.data").exists());
+    }
+
+    /// A `current` pointer naming missing files must hard-fail as
+    /// corruption: the log below the snapshot is typically purged,
+    /// so booting as if no snapshot exists silently abandons
+    /// committed state.
+    #[tokio::test]
+    async fn dangling_current_pointer_is_corruption() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let meta = SnapshotMeta {
+            id: SnapshotId::new("snap-1"),
+            last_applied: Some(LogId::new(1, 5)),
+            membership: vec![],
+        };
+        store.write(&meta, vec![1]).await.unwrap();
+
+        let data_path = dir.path().join("snapshots").join("snap-1.data");
+        std::fs::remove_file(&data_path).unwrap();
+        let err = store.current().await.expect_err("missing data file");
+        assert!(matches!(err, StorageError::Corruption(_)), "got {err:?}");
+
+        let meta_path = dir.path().join("snapshots").join("snap-1.meta");
+        std::fs::remove_file(&meta_path).unwrap();
+        let err = store.current().await.expect_err("missing meta file");
+        assert!(matches!(err, StorageError::Corruption(_)), "got {err:?}");
+
+        // An absent pointer is still a legitimate fresh boot.
+        std::fs::remove_file(dir.path().join("snapshots").join("current")).unwrap();
+        assert!(store.current().await.unwrap().is_none());
+    }
+
+    /// Reclamation also sweeps `*.tmp` files staged by a crashed
+    /// `atomic_write` — by the time it runs, every completed write's
+    /// staging file has been renamed away, so any survivor is a
+    /// leftover.
+    #[tokio::test]
+    async fn reclamation_sweeps_stale_tmp_files() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let stale_tmp = dir.path().join("snapshots").join("snap-0.tmp");
+        std::fs::write(&stale_tmp, b"crashed mid-write").unwrap();
+
+        let meta = SnapshotMeta {
+            id: SnapshotId::new("snap-1"),
+            last_applied: Some(LogId::new(1, 5)),
+            membership: vec![],
+        };
+        store.write(&meta, vec![1]).await.unwrap();
+
+        assert!(!stale_tmp.exists());
+        // The new snapshot itself is intact.
+        let (current_meta, _) = store.current().await.unwrap().unwrap();
+        assert_eq!(current_meta.id, SnapshotId::new("snap-1"));
     }
 
     #[test]

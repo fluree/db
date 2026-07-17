@@ -712,17 +712,6 @@ pub struct LedgerManagerConfig {
     ///
     /// By default this is injected by `Fluree` from its global cache budget.
     pub leaflet_cache: Option<Arc<LeafletCache>>,
-    /// When `true`, [`LedgerManager::get_or_load`] checks the nameservice's
-    /// current head against the cached handle's `t` on every hit, and
-    /// evicts + reloads if the cache is behind.
-    ///
-    /// Off by default — the single-node path mutates the cache atomically
-    /// with the nameservice publish, so the check is wasted I/O. Turn this
-    /// on when the nameservice can advance independently of in-process
-    /// writers (e.g., when wrapped over a Raft state-machine projection,
-    /// where consensus apply can advance heads on follower nodes without
-    /// the local writer pipeline running).
-    pub verify_freshness_on_cache_hit: bool,
 }
 
 impl std::fmt::Debug for LedgerManagerConfig {
@@ -732,10 +721,6 @@ impl std::fmt::Debug for LedgerManagerConfig {
             .field("sweep_interval", &self.sweep_interval)
             .field("cache_dir", &self.cache_dir)
             .field("has_leaflet_cache", &self.leaflet_cache.is_some())
-            .field(
-                "verify_freshness_on_cache_hit",
-                &self.verify_freshness_on_cache_hit,
-            )
             .finish()
     }
 }
@@ -747,7 +732,6 @@ impl Default for LedgerManagerConfig {
             sweep_interval: Duration::from_secs(60),
             cache_dir: std::env::temp_dir().join("fluree_binary_cache"),
             leaflet_cache: None,
-            verify_freshness_on_cache_hit: false,
         }
     }
 }
@@ -925,6 +909,13 @@ pub struct LedgerManager {
     /// [`LoadingLeaderGuard`]'s detached cleanup distinguish its own orphaned
     /// slot from a fresh slot inserted by a later leader (ABA protection).
     load_generation: AtomicU64,
+    /// Highest commit `t` reported per alias by head-advancing
+    /// components outside this manager's own load/commit pipeline
+    /// (see [`Self::note_head_advance`]). [`Self::get_or_load`]
+    /// treats a cached handle behind its alias's watermark as stale.
+    /// A `std::sync` lock: both sides are sub-microsecond map
+    /// operations with no `.await` inside the critical section.
+    head_watermarks: std::sync::RwLock<HashMap<String, i64>>,
 }
 
 impl LedgerManager {
@@ -946,7 +937,42 @@ impl LedgerManager {
             config,
             shutdown: AtomicBool::new(false),
             load_generation: AtomicU64::new(0),
+            head_watermarks: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Record that `ledger_id`'s authoritative commit head reached
+    /// `commit_t`. Monotonic — a lower `t` than already recorded is
+    /// a no-op.
+    ///
+    /// The single-node write path never needs this: it mutates the
+    /// cache atomically with the nameservice publish. Components
+    /// that advance heads outside that pipeline (a raft state
+    /// machine applying replicated commits) call it synchronously
+    /// at each advance, upholding the invariant that whoever moves
+    /// a head keeps this cache coherent. Cache hits behind the
+    /// watermark reload; the reload cost stays on the read path.
+    pub fn note_head_advance(&self, ledger_id: &str, commit_t: i64) {
+        let mut watermarks = self
+            .head_watermarks
+            .write()
+            .expect("head watermark lock never poisoned: no panics inside critical section");
+        let entry = watermarks.entry(ledger_id.to_string()).or_insert(commit_t);
+        if *entry < commit_t {
+            *entry = commit_t;
+        }
+    }
+
+    /// The highest commit `t` reported for `ledger_id` via
+    /// [`Self::note_head_advance`], or `None` if no head-advancing
+    /// component has reported one (heads that only move through
+    /// this manager's own pipeline never do).
+    pub fn head_watermark(&self, ledger_id: &str) -> Option<i64> {
+        self.head_watermarks
+            .read()
+            .expect("head watermark lock never poisoned: no panics inside critical section")
+            .get(ledger_id)
+            .copied()
     }
 
     /// Get the manager configuration
@@ -954,22 +980,24 @@ impl LedgerManager {
         &self.config
     }
 
-    /// Compare the cached handle's `t` against the nameservice's
-    /// current commit head and report whether the cache is behind.
+    /// Compare the cached handle's `t` against the alias's head
+    /// watermark ([`Self::note_head_advance`]) and report whether
+    /// the cache is behind.
     ///
-    /// Returns `false` (not stale) when the freshness check is
-    /// disabled, when the nameservice lookup errors, or when the
-    /// nameservice reports no record — we don't want a transient
-    /// nameservice failure to invalidate every cache hit.
+    /// A pure in-memory comparison — no nameservice involvement, so
+    /// it costs the same under every nameservice implementation. An
+    /// alias with no watermark is never stale: its heads only move
+    /// through this manager's own pipeline, which keeps the cache
+    /// coherent by construction.
     async fn cached_handle_is_stale(&self, handle: &LedgerHandle) -> bool {
-        if !self.config.verify_freshness_on_cache_hit {
-            return false;
-        }
         let cached_t = handle.t().await;
-        match self.nameservice_mode.reader().lookup(handle.id()).await {
-            Ok(Some(record)) => record.commit_t > cached_t,
-            _ => false,
-        }
+        let watermark = self
+            .head_watermarks
+            .read()
+            .expect("head watermark lock never poisoned: no panics inside critical section")
+            .get(handle.id())
+            .copied();
+        matches!(watermark, Some(w) if w > cached_t)
     }
 
     /// Snapshot the running ledger's attachment-event delta in the
@@ -1309,6 +1337,13 @@ impl LedgerManager {
         let mut entries = self.entries.write().await;
         // Removal will drop any pending oneshot senders, causing waiters to get RecvError
         entries.remove(&canonical_alias);
+        // Drop the alias's head watermark with it — a ledger
+        // re-created under the same alias starts at low `t`, and a
+        // leftover watermark would mark every hit stale forever.
+        self.head_watermarks
+            .write()
+            .expect("head watermark lock never poisoned: no panics inside critical section")
+            .remove(&canonical_alias);
     }
 
     /// Remove all ledgers from cache (for shutdown)
@@ -2473,60 +2508,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_handle_is_stale_respects_config_flag_and_ns_head() {
-        use fluree_db_core::{ContentId, ContentKind, LedgerSnapshot, MemoryStorage};
+    async fn cached_handle_is_stale_follows_head_watermark() {
+        use fluree_db_core::{LedgerSnapshot, MemoryStorage};
         use fluree_db_ledger::LedgerState;
-        use fluree_db_nameservice::{memory::MemoryNameService, CommitPublisher, LedgerLifecycle};
+        use fluree_db_nameservice::memory::MemoryNameService;
         use fluree_db_novelty::Novelty;
 
-        let ns = MemoryNameService::new();
-        ns.init("test:main").await.unwrap();
-        ns.publish_commit("test:main", 5, &ContentId::new(ContentKind::Commit, b"c5"))
-            .await
-            .unwrap();
-
         let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
-        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(ns));
+        let ns_mode = crate::NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new()));
         let snapshot = LedgerSnapshot::genesis("test:main");
         let novelty = Novelty::new(5);
         let state = LedgerState::new(snapshot, novelty);
         let handle = LedgerHandle::new("test:main".to_string(), state, None);
 
-        // With the flag off, the helper always reports fresh — no I/O,
-        // no surprise eviction on the single-node path.
-        let mgr_off = LedgerManager::new(
-            backend.clone(),
-            ns_mode.clone(),
-            LedgerManagerConfig::default(),
-        );
-        assert!(!mgr_off.cached_handle_is_stale(&handle).await);
+        let mgr = LedgerManager::new(backend, ns_mode, LedgerManagerConfig::default());
 
-        // With the flag on and cache at the nameservice's current
-        // commit_t, the helper still reports fresh.
-        let mgr_on = LedgerManager::new(
-            backend,
-            ns_mode.clone(),
-            LedgerManagerConfig {
-                verify_freshness_on_cache_hit: true,
-                ..LedgerManagerConfig::default()
-            },
-        );
-        assert!(!mgr_on.cached_handle_is_stale(&handle).await);
+        // No watermark: never stale. Heads that only move through
+        // this manager's own pipeline keep the cache coherent by
+        // construction, so nothing reports advances and hits serve
+        // as-is — the single-node behavior.
+        assert!(!mgr.cached_handle_is_stale(&handle).await);
 
-        // Advance the nameservice past the cache: the helper now reports stale.
-        let writable = match &ns_mode {
-            crate::NameServiceMode::ReadWrite(arc) => arc,
-            crate::NameServiceMode::ReadOnly(_) => unreachable!(),
-        };
-        writable
-            .publish_commit(
-                "test:main",
-                12,
-                &ContentId::new(ContentKind::Commit, b"c12"),
-            )
-            .await
-            .unwrap();
-        assert!(mgr_on.cached_handle_is_stale(&handle).await);
+        // A watermark at the cached `t` is still fresh.
+        mgr.note_head_advance("test:main", 5);
+        assert!(!mgr.cached_handle_is_stale(&handle).await);
+
+        // A head-advancer reporting past the cached `t` marks it stale.
+        mgr.note_head_advance("test:main", 12);
+        assert!(mgr.cached_handle_is_stale(&handle).await);
+
+        // Monotonic: a late, lower report can't roll the watermark back.
+        mgr.note_head_advance("test:main", 3);
+        assert!(mgr.cached_handle_is_stale(&handle).await);
+
+        // Disconnect clears the watermark with the entry, so a
+        // ledger re-created under the same alias isn't permanently
+        // flagged stale by a leftover high watermark.
+        mgr.disconnect("test:main").await;
+        assert!(!mgr.cached_handle_is_stale(&handle).await);
     }
 
     #[tokio::test]

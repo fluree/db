@@ -216,11 +216,16 @@ fn next_token(input: &mut Input<'_>) -> ModalResult<TokenKind> {
 // IRI Parsing
 // =============================================================================
 
-/// Parse an IRI reference: `<...>`
+/// Parse an IRI reference (`<...>`) or an RDF 1.2 star opener (`<<` / `<<(`).
 ///
 /// Fast path: scans to `>` without allocating. Returns `TokenKind::Iri`.
 /// Slow path (rare): if `\u`/`\U` escapes are found, processes them and
 /// returns `TokenKind::IriEscaped(Arc<str>)`.
+///
+/// Star recognition costs the common IRI path nothing: `<` is not a valid
+/// IRI character, so on `<<` the `is_iri_char` scan consumes zero bytes and
+/// control reaches what used to be the error fallback — the `<` peek below
+/// only runs on inputs that previously failed to lex.
 fn parse_iri_ref(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     '<'.parse_next(input)?;
 
@@ -231,6 +236,18 @@ fn parse_iri_ref(input: &mut Input<'_>) -> ModalResult<TokenKind> {
         // Common case: no escapes, content is in the span
         '>'.parse_next(input)?;
         return Ok(TokenKind::Iri);
+    }
+
+    // RDF 1.2 star openers: `<<` (reified triple) and `<<(` (triple term).
+    // Only reachable when the second `<` is adjacent (`first_chunk` empty),
+    // i.e. on input that was a hard lex error before star support.
+    if first_chunk.is_empty() && input.starts_with('<') {
+        '<'.parse_next(input)?;
+        if input.starts_with('(') {
+            '('.parse_next(input)?;
+            return Ok(TokenKind::TripleTermStart);
+        }
+        return Ok(TokenKind::ReifiedTripleStart);
     }
 
     // Slow path: has unicode escapes
@@ -474,7 +491,15 @@ fn parse_blank_node_label(input: &mut Input<'_>) -> ModalResult<TokenKind> {
 }
 
 /// Parse a blank node name (after `_:`).
+///
+/// Grammar: `BLANK_NODE_LABEL ::= '_:' (PN_CHARS_U | [0-9]) ((PN_CHARS | '.')*
+/// PN_CHARS)?` — interior dots (including consecutive ones, `_:a..b`) are
+/// label characters, but the label must not END in a dot. The scan stays
+/// deliberately greedy over `PN_CHARS | '.'` (one branch-light predicate per
+/// char, no lookahead); any trailing dots are then rewound so they lex as the
+/// statement terminator instead: `_:o6.` is `BlankNodeLabel("o6")` + `Dot`.
 fn parse_blank_node_name<'a>(input: &mut Input<'a>) -> ModalResult<&'a str> {
+    let start = input.checkpoint();
     let result: &str = (
         take_while(1, |c: char| is_pn_chars_u(c) || c.is_ascii_digit()),
         take_while(0.., |c: char| is_pn_chars(c) || c == '.'),
@@ -482,8 +507,14 @@ fn parse_blank_node_name<'a>(input: &mut Input<'a>) -> ModalResult<&'a str> {
         .take()
         .parse_next(input)?;
 
-    if result.ends_with('.') {
-        return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
+    let label = result.trim_end_matches('.');
+    if label.len() < result.len() {
+        // Rewind the trailing dots: reset to the start of the name and
+        // re-consume exactly the label bytes, so the token span ends before
+        // the first trailing dot. `label.len()` is a char boundary ('.' is
+        // ASCII) and non-zero (the first char cannot be '.').
+        input.reset(&start);
+        return Ok(input.next_slice(label.len()));
     }
 
     Ok(result)
@@ -825,19 +856,45 @@ fn parse_double_caret(input: &mut Input<'_>) -> ModalResult<TokenKind> {
 }
 
 fn parse_punctuation(input: &mut Input<'_>) -> ModalResult<TokenKind> {
-    any.verify_map(|c| match c {
-        '.' => Some(TokenKind::Dot),
-        ',' => Some(TokenKind::Comma),
-        ';' => Some(TokenKind::Semicolon),
-        '[' => Some(TokenKind::LBracket),
-        ']' => Some(TokenKind::RBracket),
-        '(' => Some(TokenKind::LParen),
-        ')' => Some(TokenKind::RParen),
-        '{' => Some(TokenKind::LBrace),
-        '}' => Some(TokenKind::RBrace),
-        _ => None,
-    })
-    .parse_next(input)
+    let start = input.checkpoint();
+    let c: char = any.parse_next(input)?;
+    match c {
+        '.' => Ok(TokenKind::Dot),
+        ',' => Ok(TokenKind::Comma),
+        ';' => Ok(TokenKind::Semicolon),
+        '[' => Ok(TokenKind::LBracket),
+        ']' => Ok(TokenKind::RBracket),
+        '(' => Ok(TokenKind::LParen),
+        ')' => Ok(TokenKind::RParen),
+        // `{|` opens an RDF 1.2 annotation block; bare `{` stays a TriG
+        // graph-block brace. One extra byte peek on the `{` branch only.
+        '{' => {
+            if input.starts_with('|') {
+                '|'.parse_next(input)?;
+                Ok(TokenKind::AnnotationOpen)
+            } else {
+                Ok(TokenKind::LBrace)
+            }
+        }
+        '}' => Ok(TokenKind::RBrace),
+        // RDF 1.2 closers/markers. `|`, `>` and `~` were hard lex errors
+        // before star support, so these arms never fire on pre-star input.
+        // Lone `|` / `>` fall to the reset-and-error arm, preserving the
+        // pre-star error position.
+        '|' if input.starts_with('}') => {
+            '}'.parse_next(input)?;
+            Ok(TokenKind::AnnotationClose)
+        }
+        '>' if input.starts_with('>') => {
+            '>'.parse_next(input)?;
+            Ok(TokenKind::ReifiedTripleEnd)
+        }
+        '~' => Ok(TokenKind::Tilde),
+        _ => {
+            input.reset(&start);
+            Err(winnow::error::ErrMode::Backtrack(ContextError::new()))
+        }
+    }
 }
 
 /// Tokenize a Turtle document string.
@@ -930,6 +987,65 @@ mod tests {
 
         let spans = tok_spans("_:b1");
         assert_eq!(spans[0].1, "_:b1");
+    }
+
+    #[test]
+    fn test_blank_node_trailing_dot() {
+        // #1444: a blank-node label must not end in '.', so the dot is the
+        // statement terminator, not a lexical error: `_:o6.` → label + Dot.
+        assert_eq!(
+            tok("_:o6."),
+            vec![TokenKind::BlankNodeLabel, TokenKind::Dot]
+        );
+        let spans = tok_spans("_:o6.");
+        assert_eq!(spans[0].1, "_:o6");
+        assert_eq!(spans[1].1, ".");
+
+        // The space form is unchanged.
+        assert_eq!(
+            tok("_:o6 ."),
+            vec![TokenKind::BlankNodeLabel, TokenKind::Dot]
+        );
+        let spans = tok_spans("_:o6 .");
+        assert_eq!(spans[0].1, "_:o6");
+        assert_eq!(spans[1].1, ".");
+    }
+
+    #[test]
+    fn test_blank_node_interior_dots_unchanged() {
+        // Interior dots — including consecutive ones — are valid label
+        // characters and must keep lexing exactly as before the trailing-dot
+        // rewind (ROADMAP §1.1-9 byte-identity requirement).
+        let spans = tok_spans("_:a.b");
+        assert_eq!(spans, vec![(TokenKind::BlankNodeLabel, "_:a.b")]);
+
+        let spans = tok_spans("_:a..b");
+        assert_eq!(spans, vec![(TokenKind::BlankNodeLabel, "_:a..b")]);
+    }
+
+    #[test]
+    fn test_blank_node_trailing_dot_at_eof() {
+        // `_:a.` with nothing after the dot: label `a`, then Dot, then Eof.
+        assert_eq!(tok("_:a."), vec![TokenKind::BlankNodeLabel, TokenKind::Dot]);
+        let spans = tok_spans("_:a.");
+        assert_eq!(spans[0].1, "_:a");
+        assert_eq!(spans[1].1, ".");
+    }
+
+    #[test]
+    fn test_blank_node_multiple_trailing_dots() {
+        // Every trailing dot is rewound; each lexes as its own Dot token.
+        assert_eq!(
+            tok("_:a..."),
+            vec![
+                TokenKind::BlankNodeLabel,
+                TokenKind::Dot,
+                TokenKind::Dot,
+                TokenKind::Dot
+            ]
+        );
+        let spans = tok_spans("_:a...");
+        assert_eq!(spans[0].1, "_:a");
     }
 
     #[test]
@@ -1034,6 +1150,213 @@ mod tests {
         assert!(matches!(&tokens[1], TokenKind::Iri));
         assert!(matches!(&tokens[2], TokenKind::String));
         assert!(matches!(&tokens[3], TokenKind::Dot));
+    }
+
+    // =========================================================================
+    // RDF 1.2 (Turtle-star) tokens
+    // =========================================================================
+
+    #[test]
+    fn test_star_tokens() {
+        assert_eq!(
+            tok("<< >>"),
+            vec![TokenKind::ReifiedTripleStart, TokenKind::ReifiedTripleEnd]
+        );
+        assert_eq!(tok("<<("), vec![TokenKind::TripleTermStart]);
+        assert_eq!(
+            tok("{| |}"),
+            vec![TokenKind::AnnotationOpen, TokenKind::AnnotationClose]
+        );
+        assert_eq!(tok("~"), vec![TokenKind::Tilde]);
+    }
+
+    #[test]
+    fn test_star_reified_triple_token_stream() {
+        // `<<:a :b :c>> :q :z .` — the eval-triple-terms data-1 shape.
+        assert_eq!(
+            tok("<<:a :b :c>> :q :z ."),
+            vec![
+                TokenKind::ReifiedTripleStart,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::ReifiedTripleEnd,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::Dot,
+            ]
+        );
+        // IRI object adjacent to the closer: `<u>` then `>>`.
+        assert_eq!(
+            tok("<< <s> <p> <u>>> ."),
+            vec![
+                TokenKind::ReifiedTripleStart,
+                TokenKind::Iri,
+                TokenKind::Iri,
+                TokenKind::Iri,
+                TokenKind::ReifiedTripleEnd,
+                TokenKind::Dot,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_star_annotation_and_tilde_stream() {
+        assert_eq!(
+            tok(":a :b :c ~ :r {| :q :z |} ."),
+            vec![
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::Tilde,
+                TokenKind::PrefixedName,
+                TokenKind::AnnotationOpen,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::AnnotationClose,
+                TokenKind::Dot,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_star_lone_closers_still_error() {
+        // `>` and `|` alone were lex errors before star support and must stay so.
+        assert!(tokenize(":a > :b").is_err());
+        assert!(tokenize(":a | :b").is_err());
+        // A space between the angles is NOT a star opener: `< <` keeps the
+        // pre-star "invalid or unterminated IRI" behavior.
+        let err = tokenize("< <a> .").unwrap_err().to_string();
+        assert!(err.contains("invalid or unterminated IRI"), "{err}");
+    }
+
+    /// Non-star corpus pin: lexing star-free Turtle is UNCHANGED.
+    ///
+    /// This corpus exercises every pre-star token kind, including the
+    /// dispatch sites the star tokens share a first byte with (`<` for
+    /// IRIs, `{`/`}` for TriG braces). If a lexer change alters any span
+    /// or kind here, the byte-identical guarantee for existing import
+    /// data is broken.
+    #[test]
+    fn test_non_star_corpus_unchanged() {
+        let corpus = "@prefix ex: <http://example.org/> .\n\
+             @base <http://example.org/base/> .\n\
+             PREFIX foaf: <http://xmlns.com/foaf/0.1/>\n\
+             BASE <http://example.org/b2/>\n\
+             ex:alice a foaf:Person ;\n\
+               foaf:name \"Alice\"@en , 'Alicia' ;\n\
+               ex:bio \"\"\"multi\nline\"\"\" ;\n\
+               ex:age 30 ;\n\
+               ex:height 1.75 ;\n\
+               ex:score 1e10 ;\n\
+               ex:ok true ;\n\
+               ex:no false ;\n\
+               ex:when \"2024-01-01\"^^<http://www.w3.org/2001/XMLSchema#date> ;\n\
+               ex:friends ( ex:bob _:b1 ) ;\n\
+               ex:none () ;\n\
+               ex:knows [ foaf:name \"Bob\" ] .\n\
+             GRAPH <http://example.org/g> { ex:s ex:p ex:o . }\n";
+        let kinds = tok(corpus);
+        use TokenKind as T;
+        let expected = vec![
+            // @prefix ex: <...> .
+            T::KwPrefix,
+            T::PrefixedNameNs,
+            T::Iri,
+            T::Dot,
+            // @base <...> .
+            T::KwBase,
+            T::Iri,
+            T::Dot,
+            // PREFIX foaf: <...>
+            T::KwSparqlPrefix,
+            T::PrefixedNameNs,
+            T::Iri,
+            // BASE <...>
+            T::KwSparqlBase,
+            T::Iri,
+            // ex:alice a foaf:Person ;
+            T::PrefixedName,
+            T::KwA,
+            T::PrefixedName,
+            T::Semicolon,
+            // foaf:name "Alice"@en , 'Alicia' ;
+            T::PrefixedName,
+            T::String,
+            T::LangTag,
+            T::Comma,
+            T::String,
+            T::Semicolon,
+            // ex:bio """multi\nline""" ;
+            T::PrefixedName,
+            T::LongString,
+            T::Semicolon,
+            // ex:age 30 ;
+            T::PrefixedName,
+            T::Integer(30),
+            T::Semicolon,
+            // ex:height 1.75 ;
+            T::PrefixedName,
+            T::Decimal,
+            T::Semicolon,
+            // ex:score 1e10 ;
+            T::PrefixedName,
+            T::Double(1e10),
+            T::Semicolon,
+            // ex:ok true ;
+            T::PrefixedName,
+            T::KwTrue,
+            T::Semicolon,
+            // ex:no false ;
+            T::PrefixedName,
+            T::KwFalse,
+            T::Semicolon,
+            // ex:when "2024-01-01"^^<...> ;
+            T::PrefixedName,
+            T::String,
+            T::DoubleCaret,
+            T::Iri,
+            T::Semicolon,
+            // ex:friends ( ex:bob _:b1 ) ;
+            T::PrefixedName,
+            T::LParen,
+            T::PrefixedName,
+            T::BlankNodeLabel,
+            T::RParen,
+            T::Semicolon,
+            // ex:none () ;
+            T::PrefixedName,
+            T::Nil,
+            T::Semicolon,
+            // ex:knows [ foaf:name "Bob" ] .
+            T::PrefixedName,
+            T::LBracket,
+            T::PrefixedName,
+            T::String,
+            T::RBracket,
+            T::Dot,
+            // GRAPH <...> { ex:s ex:p ex:o . }
+            T::KwGraph,
+            T::Iri,
+            T::LBrace,
+            T::PrefixedName,
+            T::PrefixedName,
+            T::PrefixedName,
+            T::Dot,
+            T::RBrace,
+        ];
+        assert_eq!(kinds, expected);
+
+        // Span sanity on the shared-first-byte token kinds: `<`-opened
+        // tokens are still whole IRIs, and braces are single bytes.
+        for (kind, text) in tok_spans(corpus) {
+            match kind {
+                TokenKind::Iri => assert!(text.starts_with('<') && text.ends_with('>')),
+                TokenKind::LBrace => assert_eq!(text, "{"),
+                TokenKind::RBrace => assert_eq!(text, "}"),
+                _ => {}
+            }
+        }
     }
 
     #[test]

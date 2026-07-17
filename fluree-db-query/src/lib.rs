@@ -56,6 +56,7 @@ pub(crate) mod fast_vector_topk;
 pub(crate) mod fast_whole_graph_agg;
 pub mod filter;
 pub(crate) mod filter_fold;
+pub(crate) mod frontier;
 pub mod geo_rewrite;
 pub mod geo_search;
 pub mod graph;
@@ -342,8 +343,22 @@ pub async fn execute_where_streaming<'a>(
     // object seek (`?a <id> 4112` → 1 row) ties with a class scan
     // (`?a rdf:type User` → N rows) and lowering order wins, turning an
     // update's anchored MATCH into a full label scan.
-    let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
-    let stats = stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false);
+    //
+    // A WHERE that is one plain triple has no join order to choose (index
+    // selection is fixed by the bound terms), so skip the stats view
+    // entirely: its cache key includes the overlay epoch, which advances on
+    // every commit, so under a write-heavy load every update's WHERE misses
+    // the cache and rebuilds the novelty-merged view — measured at +60% on
+    // pattern-form deletes (`DELETE WHERE { <s> ?p ?o }`). A single compound
+    // pattern (UNION/OPTIONAL/subquery) still carries interior join
+    // decisions and keeps the stats-driven planning.
+    let single_triple = patterns.len() == 1 && matches!(patterns[0], Pattern::Triple(_));
+    let stats = if single_triple {
+        None
+    } else {
+        let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
+        stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
+    };
 
     let mut ctx = ExecutionContext::from_graph_db_ref(db, vars).with_strict_bind_errors();
     if let Some(ds) = dataset {

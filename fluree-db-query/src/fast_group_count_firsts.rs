@@ -1535,7 +1535,9 @@ fn compute_group_by_object_star_topk(
     // Build output columns.
     let view = BinaryGraphView::with_novelty(Arc::clone(store), g_id, ctx.dict_novelty.clone())
         .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone());
-    let dt_count = WellKnownDatatypes::new().xsd_long;
+    // SPARQL COUNT yields xsd:integer (§18.5.1.6), matching the materialized /
+    // streaming aggregate paths; xsd:long here re-typed the count (agg02).
+    let dt_count = WellKnownDatatypes::new().xsd_integer;
 
     let mut col_o1: Vec<Binding> = Vec::with_capacity(rows.len());
     let mut col_count: Vec<Binding> = Vec::with_capacity(rows.len());

@@ -24,6 +24,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::frontier::{overlay_dirty_ids, reserved_edge_pids, FrontierView, PathNode};
 use crate::ir::triple::Ref;
 use crate::ir::{PathDirection, ShortestPathMode, ShortestPathPattern};
 use crate::operator::{
@@ -31,10 +32,8 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, OverlayProvider, RangeMatch, RangeOptions,
-    RangeTest, Sid,
+    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
@@ -523,19 +522,7 @@ impl ShortestPathOperator {
 
         // Reserved edge predicates as base p_ids (absent from the base dict
         // means absent from base rows; the Sid fallback re-checks by Sid).
-        let mut reserved_pids: FxHashSet<u32> = FxHashSet::default();
-        for sid in fluree_db_core::reifies_predicate_sids() {
-            if let Some(p_id) = store.sid_to_p_id(&sid) {
-                reserved_pids.insert(p_id);
-            }
-        }
-        let rdf_type_sid = Sid::new(
-            fluree_vocab::namespaces::RDF,
-            fluree_vocab::predicates::RDF_TYPE,
-        );
-        if let Some(p_id) = store.sid_to_p_id(&rdf_type_sid) {
-            reserved_pids.insert(p_id);
-        }
+        let reserved_pids = reserved_edge_pids(&store);
         let typed_pid = match &self.pattern.predicate {
             Some(pred) => match store.sid_to_p_id(pred) {
                 Some(p_id) => Some(p_id),
@@ -549,10 +536,12 @@ impl ShortestPathOperator {
 
         let search = IdSearch {
             op: self,
-            store,
-            g_id,
-            to_t,
-            dirty,
+            view: FrontierView {
+                store,
+                g_id,
+                to_t,
+                dirty,
+            },
             reserved_pids,
             typed_pid,
         };
@@ -951,108 +940,13 @@ impl ShortestPathOperator {
 }
 
 // ============================================================================
-// Raw-id bidirectional lane
+// Raw-id bidirectional lane (shared frontier machinery in `crate::frontier`)
 // ============================================================================
-
-/// A BFS node in the raw-id lane: a persisted subject id, or a subject that
-/// exists only in novelty (no persisted id — always expands via the Sid
-/// fallback). The two never alias: batched base rows only ever produce
-/// persisted ids, and Sid-lane neighbors resolve to `Id` whenever a
-/// persisted id exists.
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum PathNode {
-    Id(u64),
-    Novel(Sid),
-}
-
-/// Persisted subject ids the overlay touches, split by the side they
-/// invalidate: `subjects` (any overlay flake with the node as subject —
-/// out-edges incomplete in base) and `objects` (as ref-object — in-edges
-/// incomplete). Retract flakes stamp both, so batched base reads are only
-/// trusted where they are provably the whole truth.
-struct DirtyIds {
-    subjects: FxHashSet<u64>,
-    objects: FxHashSet<u64>,
-}
-
-/// Build (and LRU-cache, keyed on overlay content version) the overlay's
-/// dirty-id sets for one graph. `None` = the overlay can't be summarized
-/// (no content version) — the caller must decline the raw-id lane.
-fn overlay_dirty_ids(
-    overlay: &dyn OverlayProvider,
-    g_id: fluree_db_core::GraphId,
-    store: &Arc<BinaryIndexStore>,
-) -> Option<Arc<DirtyIds>> {
-    use std::sync::OnceLock;
-    type Cache = parking_lot::Mutex<lru::LruCache<(u64, u16, usize), Arc<DirtyIds>>>;
-    static CACHE: OnceLock<Cache> = OnceLock::new();
-
-    if overlay.is_effectively_empty() {
-        static EMPTY: OnceLock<Arc<DirtyIds>> = OnceLock::new();
-        return Some(Arc::clone(EMPTY.get_or_init(|| {
-            Arc::new(DirtyIds {
-                subjects: FxHashSet::default(),
-                objects: FxHashSet::default(),
-            })
-        })));
-    }
-    let version = overlay.content_version()?;
-    let store_key = Arc::as_ptr(store) as usize;
-    let cache = CACHE.get_or_init(|| {
-        parking_lot::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(8).expect("nonzero"),
-        ))
-    });
-    if let Some(hit) = cache.lock().get(&(version, g_id, store_key)) {
-        return Some(Arc::clone(hit));
-    }
-
-    // Collect with no to_t cap: a superset stays conservative (a node whose
-    // overlay flakes all lie beyond the view's t just takes the fallback).
-    let mut subject_sids: std::collections::HashSet<Sid> = std::collections::HashSet::new();
-    let mut object_sids: std::collections::HashSet<Sid> = std::collections::HashSet::new();
-    overlay.for_each_overlay_flake(
-        g_id,
-        IndexType::Spot,
-        None,
-        None,
-        true,
-        i64::MAX,
-        &mut |f| {
-            subject_sids.insert(f.s.clone());
-            if let FlakeValue::Ref(o) = &f.o {
-                object_sids.insert(o.clone());
-            }
-        },
-    );
-    let resolve = |sids: std::collections::HashSet<Sid>| -> FxHashSet<u64> {
-        let mut out = FxHashSet::default();
-        for sid in sids {
-            if let Ok(Some(s_id)) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
-                out.insert(s_id);
-            }
-            // No persisted id: the node can never appear as a PathNode::Id,
-            // so it needs no dirty marker.
-        }
-        out
-    };
-    let dirty = Arc::new(DirtyIds {
-        subjects: resolve(subject_sids),
-        objects: resolve(object_sids),
-    });
-    cache
-        .lock()
-        .put((version, g_id, store_key), Arc::clone(&dirty));
-    Some(dirty)
-}
 
 /// One anchored raw-id search over a fixed view.
 struct IdSearch<'a> {
     op: &'a ShortestPathOperator,
-    store: Arc<BinaryIndexStore>,
-    g_id: fluree_db_core::GraphId,
-    to_t: i64,
-    dirty: Arc<DirtyIds>,
+    view: FrontierView,
     /// Reserved edge predicates (`rdf:type`, `f:reifies*`) as base p_ids;
     /// wildcard expansion drops their rows, mirroring
     /// [`crate::property_path::is_reserved_edge_predicate`].
@@ -1063,26 +957,11 @@ struct IdSearch<'a> {
 
 impl IdSearch<'_> {
     fn node_for_sid(&self, sid: &Sid) -> PathNode {
-        match self
-            .store
-            .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-        {
-            Ok(Some(s_id)) => PathNode::Id(s_id),
-            _ => PathNode::Novel(sid.clone()),
-        }
+        self.view.node_for_sid(sid)
     }
 
     fn sid_for_node(&self, node: &PathNode) -> Result<Sid> {
-        match node {
-            PathNode::Novel(sid) => Ok(sid.clone()),
-            PathNode::Id(s_id) => {
-                let (ns_code, suffix) = self
-                    .store
-                    .resolve_subject_parts(*s_id)
-                    .map_err(|e| QueryError::Internal(format!("resolve path node {s_id}: {e}")))?;
-                Ok(Sid::new(ns_code, suffix))
-            }
-        }
+        self.view.sid_for_node(node)
     }
 
     /// Which edge orientations this expansion side follows (mirrors
@@ -1098,8 +977,7 @@ impl IdSearch<'_> {
     /// A persisted node's base rows are the whole truth for this side iff
     /// the overlay never touches the orientations being followed.
     fn is_clean(&self, s_id: u64, use_out: bool, use_in: bool) -> bool {
-        (!use_out || !self.dirty.subjects.contains(&s_id))
-            && (!use_in || !self.dirty.objects.contains(&s_id))
+        self.view.is_clean(s_id, use_out, use_in)
     }
 
     /// Expand one frontier level: batched galloping sweeps for clean
@@ -1149,66 +1027,34 @@ impl IdSearch<'_> {
     /// Out-edges of `subjects` from base rows. For `IRI_REF` rows `o_key`
     /// is the target's `s_id` — neighbors come back as raw ids.
     fn batched_out(&self, subjects: &[u64], out: &mut Vec<(PathNode, PathNode)>) -> Result<()> {
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
         match self.typed_pid {
-            Some(p_id) => {
-                let refs = fluree_db_binary_index::batched_lookup_predicate_refs(
-                    &self.store,
-                    self.g_id,
-                    p_id,
-                    subjects,
-                    self.to_t,
-                )
-                .map_err(|e| QueryError::Internal(format!("batched out-edges: {e}")))?;
-                for (s_id, targets) in refs {
-                    for t in targets {
-                        out.push((PathNode::Id(s_id), PathNode::Id(t)));
-                    }
-                }
-            }
-            None => {
-                let rows = fluree_db_binary_index::batched_lookup_subject_properties(
-                    &self.store,
-                    self.g_id,
-                    subjects,
-                    self.to_t,
-                )
-                .map_err(|e| QueryError::Internal(format!("batched out-edges: {e}")))?;
-                for (s_id, props) in rows {
-                    for (p_id, o_type, o_key) in props {
-                        if self.reserved_pids.contains(&p_id) {
-                            continue;
-                        }
-                        if !fluree_db_core::o_type::OType::from_u16(o_type).is_node_ref() {
-                            continue;
-                        }
-                        out.push((PathNode::Id(s_id), PathNode::Id(o_key)));
-                    }
-                }
-            }
+            Some(p_id) => self.view.out_typed(p_id, subjects, &mut pairs)?,
+            None => self
+                .view
+                .out_wildcard(subjects, &self.reserved_pids, &mut pairs)?,
         }
+        out.extend(
+            pairs
+                .into_iter()
+                .map(|(s, t)| (PathNode::Id(s), PathNode::Id(t))),
+        );
         Ok(())
     }
 
     /// In-edges pointing at `objects` from base rows.
     fn batched_in(&self, objects: &[u64], out: &mut Vec<(PathNode, PathNode)>) -> Result<()> {
-        let inbound = fluree_db_binary_index::batched_lookup_inbound_refs(
-            &self.store,
-            self.g_id,
-            objects,
-            self.to_t,
-        )
-        .map_err(|e| QueryError::Internal(format!("batched in-edges: {e}")))?;
-        for (o_key, edges) in inbound {
-            for (p_id, s_id) in edges {
-                let keep = match self.typed_pid {
-                    Some(tp) => p_id == tp,
-                    None => !self.reserved_pids.contains(&p_id),
-                };
-                if keep {
-                    out.push((PathNode::Id(o_key), PathNode::Id(s_id)));
-                }
-            }
-        }
+        let mut pairs: Vec<(u64, u64)> = Vec::new();
+        let keep = |p_id: u32| match self.typed_pid {
+            Some(tp) => p_id == tp,
+            None => !self.reserved_pids.contains(&p_id),
+        };
+        self.view.in_edges(objects, keep, &mut pairs)?;
+        out.extend(
+            pairs
+                .into_iter()
+                .map(|(o, s)| (PathNode::Id(o), PathNode::Id(s))),
+        );
         Ok(())
     }
 

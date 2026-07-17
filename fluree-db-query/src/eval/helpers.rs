@@ -90,7 +90,10 @@ thread_local! {
 
 /// Build a regex with optional flags (cached)
 ///
-/// Supported flags: i (case-insensitive), m (multiline), s (dot-all), x (ignore whitespace)
+/// Supported flags: i (case-insensitive), m (multiline), s (dot-all),
+/// x (ignore whitespace), q (literal pattern — all metacharacters escaped,
+/// XPath `fn:matches`). Per XPath F&O §5.6.2, `q` used together with `m`,
+/// `s`, or `x` renders those flags no-ops; `q` composes with `i`.
 /// Returns an error for unknown flags (not silent ignore).
 ///
 /// Uses a thread-local LRU cache to avoid recompiling the same pattern+flags
@@ -104,27 +107,46 @@ pub fn build_regex_with_flags(pattern: &str, flags: &str) -> Result<Regex> {
         return Ok(re);
     }
 
-    // Not in cache - compile and store
-    let mut builder = RegexBuilder::new(pattern);
+    // Validate flags before compiling; `q` escapes the whole pattern.
+    let literal = flags.contains('q');
     for flag in flags.chars() {
         match flag {
-            'i' => {
-                builder.case_insensitive(true);
-            }
-            'm' => {
-                builder.multi_line(true);
-            }
-            's' => {
-                builder.dot_matches_new_line(true);
-            }
-            'x' => {
-                builder.ignore_whitespace(true);
-            }
+            'i' | 'm' | 's' | 'x' | 'q' => {}
             c => {
                 return Err(QueryError::InvalidFilter(format!(
                     "Unknown regex flag: '{c}'"
                 )));
             }
+        }
+    }
+
+    let escaped;
+    let effective_pattern = if literal {
+        escaped = regex::escape(pattern);
+        &escaped
+    } else {
+        pattern
+    };
+
+    // Not in cache - compile and store
+    let mut builder = RegexBuilder::new(effective_pattern);
+    for flag in flags.chars() {
+        match flag {
+            'i' => {
+                builder.case_insensitive(true);
+            }
+            // `q` neutralizes m/s/x (they'd have no meaning against an
+            // escaped literal anyway — x would strip literal whitespace).
+            'm' if !literal => {
+                builder.multi_line(true);
+            }
+            's' if !literal => {
+                builder.dot_matches_new_line(true);
+            }
+            'x' if !literal => {
+                builder.ignore_whitespace(true);
+            }
+            _ => {}
         }
     }
     let re = builder
@@ -463,7 +485,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::StrEnds
             | Function::Regex
             | Function::Str
-            | Function::Lang
+            | Function::Lang { .. }
             | Function::Lcase
             | Function::Ucase
             | Function::Strlen
@@ -482,7 +504,7 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::EncodeForUri
             | Function::StrDt
             | Function::StrLang
-            | Function::Datatype
+            | Function::Datatype { .. }
             | Function::LangMatches
             | Function::SameTerm
             | Function::Iri
@@ -499,6 +521,9 @@ fn function_may_materialize_encoded_value(func: &Function) -> bool {
             | Function::XsdDouble
             | Function::XsdDecimal
             | Function::XsdString
+            | Function::XsdDateTime
+            | Function::XsdDate
+            | Function::XsdTime
             | Function::Year
             | Function::Month
             | Function::Day

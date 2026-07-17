@@ -1265,6 +1265,50 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Execute a Cypher write via the ledger-scoped `update` endpoint, sending
+    /// `body` verbatim as the `application/cypher` payload — either raw Cypher
+    /// text or a `{cypher, params}` envelope; the server reads it as a string
+    /// and extracts the envelope itself. Unlike [`update_cypher`], the caller
+    /// need not pre-split the envelope. Returns the server's response JSON — a
+    /// commit receipt for a plain write, or a cypher-json document when the
+    /// statement carries a `RETURN`.
+    pub async fn update_cypher_body(
+        &self,
+        ledger: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("update", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    /// Execute a Cypher read query via the ledger-scoped `query` endpoint.
+    ///
+    /// `body` is sent verbatim as the `application/cypher` payload — either raw
+    /// Cypher text or a `{cypher, params}` envelope; the server's handler reads
+    /// it as a string and extracts the envelope itself. The response is a
+    /// cypher-json document (`application/vnd.fluree.cypher+json`), which
+    /// `send_json` parses as JSON.
+    pub async fn query_cypher(
+        &self,
+        ledger: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("query", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
     // =========================================================================
     // Ledger Info / Exists
     // =========================================================================

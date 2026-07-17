@@ -10,6 +10,27 @@ use crate::lex::TokenKind;
 
 use super::expr::parse_expression;
 
+/// Whether `expr` is a bare `Constraint` in the SPARQL grammar sense — a
+/// self-delimiting `BuiltInCall` or `FunctionCall` (plus the bracketed form,
+/// normally taken by the `(` branch first). A bare `OrderCondition` /
+/// `GroupCondition` may only be a `Constraint | Var`, never an arbitrary
+/// expression, so binary/unary operators, `IN`, and bare terms are rejected
+/// here — otherwise `ORDER BY ?x - 1` / `GROUP BY ?x + 1` silently parse as an
+/// extra (wrong) sort/group key instead of the parse error the grammar
+/// requires.
+fn is_bare_constraint(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::FunctionCall { .. }
+            | Expression::If { .. }
+            | Expression::Coalesce { .. }
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::Aggregate { .. }
+            | Expression::Bracketed { .. }
+    )
+}
+
 impl super::Parser<'_> {
     /// Parse solution modifiers (ORDER BY, LIMIT, OFFSET).
     pub(super) fn parse_solution_modifiers(&mut self) -> SolutionModifiers {
@@ -149,7 +170,12 @@ impl super::Parser<'_> {
         let pos = self.stream.position();
         let start = self.stream.current_span();
         match parse_expression(self.stream) {
-            Ok(expr) => {
+            // `GroupCondition ::= BuiltInCall | FunctionCall | '(' … ')' | Var`
+            // — the bare form is a call-shaped Constraint only, same as
+            // ORDER BY. Reject a bare arithmetic (`GROUP BY ?x + 1`) instead of
+            // silently accepting it as a group key; restore so the stray token
+            // surfaces as a syntax error.
+            Ok(expr) if is_bare_constraint(&expr) => {
                 let span = start.union(self.stream.previous_span());
                 Some(GroupCondition::Expr {
                     expr,
@@ -157,7 +183,7 @@ impl super::Parser<'_> {
                     span,
                 })
             }
-            Err(_) => {
+            _ => {
                 self.stream.restore(pos);
                 None
             }
@@ -287,8 +313,25 @@ impl super::Parser<'_> {
                 }
             }
         } else {
-            // Not a valid order condition
-            return None;
+            // Bare Constraint form: `OrderCondition ::= … | ( Constraint | Var )`
+            // where `Constraint ::= BrackettedExpression | BuiltInCall |
+            // FunctionCall` — so `ORDER BY str(?o)` (no parentheses) is valid.
+            // The bracketed case is handled by the `(` branch above; here the
+            // grammar allows ONLY a self-delimiting call, not an arbitrary
+            // expression. Accepting a full expression would silently accept
+            // `ORDER BY ?x - 1` (a `?x` key plus a spurious `-1` key) or
+            // `ORDER BY str(?x) - 1` (a bare arithmetic the grammar forbids),
+            // turning former parse errors into silently-wrong multi-key sorts.
+            // On a non-constraint expression, restore and end the condition
+            // loop so the stray token surfaces as a syntax error.
+            let pos = self.stream.position();
+            match parse_expression(self.stream) {
+                Ok(e) if is_bare_constraint(&e) => OrderExpr::Expr(e),
+                _ => {
+                    self.stream.restore(pos);
+                    return None;
+                }
+            }
         };
 
         let span = start.union(self.stream.previous_span());

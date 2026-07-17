@@ -649,7 +649,8 @@ pub enum Commands {
         #[arg(long, conflicts_with = "sparql")]
         jsonld: bool,
 
-        /// Force openCypher query format (local ledgers only)
+        /// Force openCypher query format. Runs locally or against a remote
+        /// server (`--remote`); remote emits cypher-json only and has no `--at`.
         #[arg(long, conflicts_with_all = ["sparql", "jsonld"])]
         cypher: bool,
 

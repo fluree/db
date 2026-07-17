@@ -99,7 +99,8 @@ pub fn resolve_policy_source_g_ids(
 /// 2. **policy_class**: Query for policies of the given class types
 /// 3. **policy**: Parse inline policy JSON-LD
 ///
-/// Priority: identity > policy_class > policy
+/// Priority: (identity + policy_class: classes select, identity binds) >
+/// identity > policy_class > policy
 ///
 /// # Arguments
 ///
@@ -258,8 +259,9 @@ async fn build_policy_context_from_opts_inner(
     // governs in all three cases.
     //
     // Stored-policy selection priority: cross-ledger restrictions >
-    // identity + policy_class > identity > policy_class. Inline `opts.policy`
-    // is not part of the chain — it merges additively after selection.
+    // identity + policy_class (classes select, identity binds) > identity >
+    // policy_class. Inline `opts.policy` is not part of the chain — it merges
+    // additively after selection.
     // `?$identity` binding priority: identity > policy_values["?$identity"].
     let (identity_sid, mut restrictions) = if let Some(merged) = cross_ledger_restrictions {
         // Cross-ledger short-circuit: the resolver already materialized

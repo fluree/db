@@ -7,7 +7,7 @@
 use super::expr::Expression;
 use super::pattern::{GraphPattern, TriplePattern};
 use super::term::{Iri, Var};
-use super::update::UpdateOperation;
+use super::update::UpdateRequest;
 use crate::span::SourceSpan;
 use std::sync::Arc;
 
@@ -74,8 +74,10 @@ pub enum QueryBody {
     Ask(AskQuery),
     /// DESCRIBE query
     Describe(DescribeQuery),
-    /// SPARQL Update operation (INSERT DATA, DELETE DATA, DELETE WHERE, etc.)
-    Update(UpdateOperation),
+    /// SPARQL Update request: one or more `;`-separated operations
+    /// (INSERT DATA, DELETE DATA, DELETE WHERE, Modify, ...) sharing an
+    /// accumulating prologue. Zero operations = valid no-op request.
+    Update(UpdateRequest),
 }
 
 /// The query prologue containing BASE and PREFIX declarations.

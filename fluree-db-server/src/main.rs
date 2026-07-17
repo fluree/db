@@ -62,17 +62,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap the Raft integration when raft mode is enabled in
     // config. Validation guarantees node_id / storage_path /
     // listen_addr are all set if we get here with raft_enabled.
-    #[allow(unused_mut)]
+    // Only the `raft` path below reassigns `builder` (via
+    // `with_raft`); bind it `mut` only there so a non-raft build
+    // doesn't warn on an unused `mut`.
+    #[cfg(feature = "raft")]
     let mut builder = FlureeServerBuilder::for_config(config.clone());
+    #[cfg(not(feature = "raft"))]
+    let builder = FlureeServerBuilder::for_config(config.clone());
     #[cfg(feature = "raft")]
     if config.raft_enabled {
         use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
         use std::sync::Arc;
 
-        let bootstrap = RaftBootstrapConfig::new(
+        let mut bootstrap = RaftBootstrapConfig::new(
             config.raft_node_id.expect("validated"),
             config.raft_storage_path.clone().expect("validated"),
         );
+        // Followers buffering a body the leader's routes would
+        // refuse is wasted memory; cap the forward relay at the
+        // same limit the public routes enforce.
+        bootstrap.network_config.forward_max_body_bytes = config.body_limit;
         let raft_listen = config.raft_listen_addr.expect("validated");
         tracing::info!(
             node_id = config.raft_node_id.unwrap(),

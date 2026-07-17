@@ -394,3 +394,88 @@ async fn cypher_list_comprehension_member_under_policy_is_filtered() {
         "without policy, [x IN ns | x.secret] must project the secrets: {rooted}"
     );
 }
+
+/// The `db.*`/`apoc.meta.data` procedure shims answer from aggregate ledger
+/// stats rather than a per-flake scan, so they need their own policy gate —
+/// a restricted identity must not see a policy-hidden property key in the
+/// catalog, nor its count via `apoc.meta.data`.
+#[tokio::test]
+async fn cypher_call_procedures_hide_policy_denied_property() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/policy-cypher:procedures";
+    let l = seed(&fluree, ledger_id).await;
+
+    let qc_opts = GovernanceOptions {
+        policy: Some(deny_secret_policy()),
+        default_allow: true,
+        ..Default::default()
+    };
+    let db_policy = fluree
+        .db_with_policy(ledger_id, &qc_opts)
+        .await
+        .expect("db_with_policy");
+
+    let keys = fluree
+        .query_cypher(&db_policy, "CALL db.propertyKeys()")
+        .await
+        .expect("db.propertyKeys under policy")
+        .to_jsonld_async(db_policy.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let keys: Vec<String> = keys
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[0].as_str().expect("string cell").to_string())
+        .collect();
+    assert!(
+        keys.contains(&"name".to_string()),
+        "the visible `name` property key must still be listed: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"secret".to_string()),
+        "the policy-denied `secret` property key must not be listed: {keys:?}"
+    );
+
+    let meta = fluree
+        .query_cypher(
+            &db_policy,
+            "CALL apoc.meta.data() YIELD property RETURN property",
+        )
+        .await
+        .expect("apoc.meta.data under policy")
+        .to_jsonld_async(db_policy.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let meta_props: Vec<String> = meta
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[0].as_str().expect("string cell").to_string())
+        .collect();
+    assert!(
+        !meta_props.contains(&"secret".to_string()),
+        "apoc.meta.data must not surface the policy-denied `secret` property: {meta_props:?}"
+    );
+
+    // Positive control: the same procedures under no policy DO list `secret`,
+    // proving the read works generally and is only filtered, not disabled.
+    let db_root = graphdb_from_ledger(&l);
+    let rooted_keys = fluree
+        .query_cypher(&db_root, "CALL db.propertyKeys()")
+        .await
+        .expect("db.propertyKeys root")
+        .to_jsonld_async(db_root.as_graph_db_ref())
+        .await
+        .expect("jsonld");
+    let rooted_keys: Vec<String> = rooted_keys
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row[0].as_str().expect("string cell").to_string())
+        .collect();
+    assert!(
+        rooted_keys.contains(&"secret".to_string()),
+        "without policy, db.propertyKeys() must list `secret`: {rooted_keys:?}"
+    );
+}

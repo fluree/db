@@ -525,6 +525,23 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
         return Err(unsupported_param(&pname, "UNWIND parameter must be a list"));
     };
 
+    // A per-row node MERGE keyed on `row.<field>` lowers to one NOT EXISTS
+    // guard evaluated per row against the same pre-write snapshot: two rows
+    // in this batch sharing a not-yet-existing key would both pass the guard
+    // and both create, silently duplicating the "unique" key. Neo4j's
+    // sequential LOAD CSV doesn't have this problem (each row's write is
+    // visible to the next row's guard); a vectorized batch is, so dedup by
+    // the MERGE identity key here — last row per key wins — to converge on
+    // the same end state sequential execution would reach.
+    let identity_fields = {
+        let Statement::Update(u) = &ast.statement else {
+            unreachable!("checked above");
+        };
+        merge_identity_fields(u, &alias)
+    };
+    let elems = dedup_rows_by_merge_identity(elems, &identity_fields);
+    let elems = &elems;
+
     // Which fields of `row` are referenced, and is the bare alias used?
     let (fields, bare_used) = {
         let Statement::Update(u) = &ast.statement else {
@@ -608,6 +625,70 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
     rewrite_alias_in_update(u, &alias, unwind_idx, &col_var, bare_ref);
     u.read_clauses[unwind_idx] = ReadClause::InlineRows { vars, rows };
     Ok(())
+}
+
+/// Field names of `row` used in a single-node MERGE's identifying prop map
+/// (e.g. `MERGE (n:Person {id: row.id})` → `["id"]`). Empty when there's no
+/// per-row node MERGE, or its identifying props don't reference `row.field`
+/// directly (a computed key can't be deduped this way, so it's left alone).
+fn merge_identity_fields(u: &Update, alias: &str) -> Vec<String> {
+    for w in &u.write_clauses {
+        let WriteClause::Merge(m) = w else { continue };
+        if m.pattern.parts.len() != 1 {
+            continue;
+        }
+        let part = &m.pattern.parts[0];
+        if !part.tail.is_empty() {
+            continue;
+        }
+        let Some(props) = &part.head.props else {
+            continue;
+        };
+        return props
+            .entries
+            .iter()
+            .filter_map(|(_, expr)| match expr {
+                Expr::Prop(inner, field, _) if matches!(&**inner, Expr::Var(v) if v.name == alias) => {
+                    Some(field.clone())
+                }
+                _ => None,
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Dedup `UNWIND $batch` elements by the MERGE identity key fields (last row
+/// per key wins), so a within-batch duplicate key produces one create/update
+/// instead of two. A no-op when `identity_fields` is empty or an element
+/// isn't a map — the existing per-row type checks raise the real error for
+/// the latter.
+fn dedup_rows_by_merge_identity(elems: &[JsonValue], identity_fields: &[String]) -> Vec<JsonValue> {
+    if identity_fields.is_empty() {
+        return elems.to_vec();
+    }
+    let mut last_idx: std::collections::HashMap<Vec<String>, usize> =
+        std::collections::HashMap::new();
+    for (i, elem) in elems.iter().enumerate() {
+        let JsonValue::Object(map) = elem else {
+            return elems.to_vec();
+        };
+        let key: Vec<String> = identity_fields
+            .iter()
+            .map(|f| map.get(f).cloned().unwrap_or(JsonValue::Null).to_string())
+            .collect();
+        last_idx.insert(key, i);
+    }
+    if last_idx.len() == elems.len() {
+        return elems.to_vec();
+    }
+    let keep: std::collections::HashSet<usize> = last_idx.into_values().collect();
+    elems
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, e)| e.clone())
+        .collect()
 }
 
 // ---- alias collection (which `row.field`s are referenced) -------------------

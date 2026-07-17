@@ -303,7 +303,7 @@ impl crate::Fluree {
 
         let content_store = self.content_store(branch_id);
         let publisher = self.publisher()?;
-        let (receipt, new_state) = staged.apply(&content_store, publisher, false).await?;
+        let (receipt, new_state) = staged.apply(&content_store, publisher).await?;
 
         if let Some(guard) = write_guard {
             let needs_reindex = new_state.should_reindex(&self.index_config);

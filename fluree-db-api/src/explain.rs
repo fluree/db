@@ -708,8 +708,14 @@ pub async fn explain_cypher(
     cypher: &str,
     default_context: Option<&JsonValue>,
 ) -> Result<JsonValue> {
-    let (vars, parsed) =
-        crate::query::helpers::parse_cypher_to_ir(cypher, snapshot, default_context, None, None)?;
+    let (vars, parsed) = crate::query::helpers::parse_cypher_to_ir(
+        cypher,
+        snapshot,
+        default_context,
+        None,
+        None,
+        None,
+    )?;
 
     explain_from_parsed(snapshot, &vars, &parsed, json!(cypher), None)
 }

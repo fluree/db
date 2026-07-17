@@ -14,8 +14,8 @@ use fluree_db_policy::{
     ConditionState, PolicyQuery, PolicyQueryExecutor, PolicyQueryFut, PolicyQueryLanguage,
     Result as PolicyResult, UNBOUND_IDENTITY_PREFIX,
 };
-use fluree_vocab::namespaces::XSD;
-use fluree_vocab::xsd_names;
+use fluree_vocab::namespaces::{EMPTY, RDF, XSD};
+use fluree_vocab::{rdf_names, xsd_names};
 use std::collections::HashMap;
 
 /// Policy query executor that runs queries against a database
@@ -114,15 +114,28 @@ fn is_unbound_marker(value: &FlakeValue) -> bool {
     matches!(value, FlakeValue::Ref(sid) if sid.name.starts_with(UNBOUND_IDENTITY_PREFIX))
 }
 
-/// Convert a binding value to a seeded `Binding`: refs as `Binding::Sid`
-/// (no decode/re-encode round trip), literals with a faithful default
-/// datatype as `Binding::Lit`, everything else — including the
-/// unbound-identity marker — as UNDEF (conditions on it never hold,
-/// failing closed).
+/// Object IRI seeded for `?$value` when the flake's object has no faithful
+/// binding representation (`Vector`, `GeoPoint`, `Null`). Absent from real
+/// data, so a positional `?$value` condition finds no match. See
+/// [`binding_for_value`] for why this must not be UNDEF.
+const NON_REPRESENTABLE_VALUE_IRI: &str = "urn:fluree:policy:non-representable-value";
+
+/// Convert a binding value to a seeded `Binding` for a policy VALUES row.
+///
+/// Every special variable seeds a CONCRETE binding — never `Binding::Unbound`.
+/// A positional VALUES pattern treats an unbound variable as "matches
+/// anything" (VALUES-UNDEF is compatible with every row), so seeding UNDEF for
+/// a never-match marker would make a positional condition such as
+/// `$identity <ex:user> $this` *vanish* and hold for every row — fail-OPEN.
+/// Seeding a concrete never-match value instead fails closed positionally and
+/// keeps `FILTER` equality false.
+///
+/// - Refs — including the never-match unbound-identity marker, whose sentinel
+///   IRI is absent from data — seed as `Binding::Sid`.
+/// - Literals with a faithful default datatype seed as `Binding::Lit`.
+/// - Literals whose kind has no faithful datatype (`Vector`, `GeoPoint`,
+///   `Null`) seed the [`NON_REPRESENTABLE_VALUE_IRI`] ref sentinel (fail-closed).
 fn binding_for_value(value: &FlakeValue) -> Binding {
-    if is_unbound_marker(value) {
-        return Binding::Unbound;
-    }
     match value {
         FlakeValue::Ref(sid) => Binding::Sid {
             sid: sid.clone(),
@@ -137,7 +150,11 @@ fn binding_for_value(value: &FlakeValue) -> Binding {
                 op: None,
                 p_id: None,
             },
-            None => Binding::Unbound,
+            None => Binding::Sid {
+                sid: Sid::new(EMPTY, NON_REPRESENTABLE_VALUE_IRI),
+                t: None,
+                op: None,
+            },
         },
     }
 }
@@ -145,9 +162,15 @@ fn binding_for_value(value: &FlakeValue) -> Binding {
 /// Default XSD datatype Sid for a literal binding value, for seeding
 /// VALUES rows (`Binding::Lit` equality includes the datatype). Mirrors the
 /// datatypes the SPARQL literal lowering assigns, so seeded values compare
-/// like written literals. Returns `None` for kinds with no faithful default
-/// (those seed as UNDEF — conditions on them never hold, failing closed).
+/// like written literals. Returns `None` only for `Vector` / `GeoPoint` /
+/// `Null`, whose object value has no faithful literal datatype for seeding;
+/// [`binding_for_value`] then seeds a never-match ref sentinel (fail-closed).
 fn default_literal_datatype(value: &FlakeValue) -> Option<Sid> {
+    // rdf:JSON lives in the RDF namespace, not XSD — handle before the
+    // XSD-namespaced fallthrough below.
+    if matches!(value, FlakeValue::Json(_)) {
+        return Some(Sid::new(RDF, rdf_names::JSON));
+    }
     let name = match value {
         FlakeValue::String(_) => xsd_names::STRING,
         FlakeValue::Boolean(_) => xsd_names::BOOLEAN,
@@ -157,6 +180,14 @@ fn default_literal_datatype(value: &FlakeValue) -> Option<Sid> {
         FlakeValue::DateTime(_) => xsd_names::DATE_TIME,
         FlakeValue::Date(_) => xsd_names::DATE,
         FlakeValue::Time(_) => xsd_names::TIME,
+        FlakeValue::GYear(_) => xsd_names::G_YEAR,
+        FlakeValue::GYearMonth(_) => xsd_names::G_YEAR_MONTH,
+        FlakeValue::GMonth(_) => xsd_names::G_MONTH,
+        FlakeValue::GDay(_) => xsd_names::G_DAY,
+        FlakeValue::GMonthDay(_) => xsd_names::G_MONTH_DAY,
+        FlakeValue::Duration(_) => xsd_names::DURATION,
+        FlakeValue::DayTimeDuration(_) => xsd_names::DAY_TIME_DURATION,
+        FlakeValue::YearMonthDuration(_) => xsd_names::YEAR_MONTH_DURATION,
         _ => return None,
     };
     Some(Sid::new(XSD, name))
@@ -315,15 +346,18 @@ impl QueryPolicyExecutor<'_> {
             .collect();
         var_names.sort();
 
-        // Build VALUES row with IRIs for each variable
-        // Special case: unbound identity uses null (UNDEF) to ensure it never matches
+        // Build VALUES row with IRIs for each variable.
+        //
+        // The unbound-identity marker is a ref carrying its never-match
+        // sentinel IRI: emit it as an `{"@id": ...}` just like any other ref
+        // (NOT as null/UNDEF — a positional VALUES treats UNDEF as
+        // "matches anything", which would make an `$identity`-positioned
+        // condition hold for every row; see `binding_for_value`). Its sentinel
+        // IRI is absent from data, so the condition finds no match.
         let values_row: Vec<serde_json::Value> = var_names
             .iter()
             .map(|name| {
                 let value = bindings.get(name).expect("binding value exists");
-                if is_unbound_marker(value) {
-                    return serde_json::Value::Null;
-                }
                 match value {
                     FlakeValue::Ref(sid) => {
                         // Decode SID to IRI for JSON representation
@@ -337,7 +371,9 @@ impl QueryPolicyExecutor<'_> {
                     FlakeValue::Long(l) => serde_json::Value::from(*l),
                     FlakeValue::Double(d) => serde_json::Value::from(*d),
                     FlakeValue::Boolean(b) => serde_json::Value::from(*b),
-                    _ => serde_json::Value::Null,
+                    // No faithful JSON representation → seed the never-match
+                    // ref sentinel (fail-closed), never null/UNDEF.
+                    _ => serde_json::json!({"@id": NON_REPRESENTABLE_VALUE_IRI}),
                 }
             })
             .collect();
@@ -529,5 +565,66 @@ impl QueryPolicyExecutor<'_> {
         operator.close();
 
         Ok(has_results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    /// The security invariant behind both PR review findings: a policy VALUES
+    /// row must never seed `Binding::Unbound` for a special variable. A
+    /// positional VALUES treats UNDEF as "matches anything", so an unbound
+    /// `$identity` / `$value` would make a positional condition hold for every
+    /// row (fail-OPEN). Every kind must seed a concrete never-match-or-exact
+    /// binding.
+    #[test]
+    fn binding_for_value_never_unbound() {
+        // Finding 1: the unbound-identity marker seeds a concrete ref, not UNDEF.
+        let marker = FlakeValue::Ref(Sid::new(
+            EMPTY,
+            format!("{UNBOUND_IDENTITY_PREFIX}{}", Uuid::nil()),
+        ));
+        assert!(
+            matches!(binding_for_value(&marker), Binding::Sid { .. }),
+            "unbound-identity marker must seed a never-match Sid, not UNDEF"
+        );
+
+        // Finding 2: kinds with no faithful datatype seed the ref sentinel.
+        for value in [
+            FlakeValue::Vector(Arc::from([1.0_f64, 2.0].as_slice())),
+            FlakeValue::Null,
+        ] {
+            match binding_for_value(&value) {
+                Binding::Sid { sid, .. } => {
+                    assert_eq!(sid.name.as_ref(), NON_REPRESENTABLE_VALUE_IRI);
+                }
+                other => panic!("non-faithful {value:?} must seed the sentinel, got {other:?}"),
+            }
+        }
+
+        // Faithful kinds seed concrete literals with the right datatype.
+        for (value, ns, name) in [
+            (FlakeValue::String("x".into()), XSD, xsd_names::STRING),
+            (FlakeValue::Long(1), XSD, xsd_names::INTEGER),
+            (FlakeValue::Json("{}".into()), RDF, rdf_names::JSON),
+        ] {
+            match binding_for_value(&value) {
+                Binding::Lit { dtc, .. } => {
+                    assert_eq!(
+                        dtc.datatype(),
+                        &Sid::new(ns, name),
+                        "datatype for {value:?}"
+                    );
+                }
+                other => panic!("faithful {value:?} must seed a Lit, got {other:?}"),
+            }
+        }
+
+        // A regular ref seeds itself.
+        let real = FlakeValue::Ref(Sid::new(XSD, "someSubject"));
+        assert!(matches!(binding_for_value(&real), Binding::Sid { .. }));
     }
 }

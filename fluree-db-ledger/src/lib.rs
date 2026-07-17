@@ -731,6 +731,51 @@ impl LedgerState {
         Ok(())
     }
 
+    /// Overlay staged flakes as committed novelty at `t()+1` WITHOUT a
+    /// commit record — the in-memory "virtual commit" used by sequential
+    /// multi-operation SPARQL UPDATE staging (SPARQL 1.1 Update §3.1:
+    /// operation N+1's WHERE must observe operation N's effects, while the
+    /// whole request commits as ONE atomic commit — roadmap D-10).
+    ///
+    /// Applies the namespace/graph envelope deltas first so IRIs and named
+    /// graphs the flakes introduce resolve during the next operation's
+    /// staging, then routes the flakes into novelty exactly like a commit
+    /// apply (minus commit metadata, head identity, and temporal stamping).
+    ///
+    /// The resulting state is a **transient staging view only**: it carries
+    /// uncommitted data in novelty and must never be published, committed
+    /// from, or cached as the ledger's live state.
+    pub fn apply_staged_flakes_for_sequential_staging(
+        &mut self,
+        flakes: Vec<Flake>,
+        ns_delta: &std::collections::HashMap<u16, String>,
+        graph_iris: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<()> {
+        // Envelope deltas first: novelty routing below and the next
+        // operation's WHERE/IRI encoding both need the new namespaces and
+        // graph registrations. Applied even when `flakes` is empty (an op
+        // whose WHERE matched nothing still established its allocations).
+        Arc::make_mut(&mut self.snapshot).apply_envelope_deltas(ns_delta, graph_iris)?;
+
+        if flakes.is_empty() {
+            return Ok(());
+        }
+
+        let next_t = self.t() + 1;
+        let reverse_graph = self.snapshot.build_reverse_graph()?;
+
+        // Validate the batch before mutating: `apply_commit` is atomic, but
+        // dict/small-dict population below is not — keep the all-or-nothing
+        // shape `apply_single_commit` provides.
+        self.novelty.can_apply(&flakes, &reverse_graph)?;
+
+        Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&flakes);
+        Arc::make_mut(&mut self.runtime_small_dicts).populate_from_flakes(&flakes);
+        Arc::make_mut(&mut self.novelty).apply_commit(flakes, next_t, &reverse_graph)?;
+
+        Ok(())
+    }
+
     /// Apply a single commit to the existing ledger state (incremental update).
     ///
     /// This is the fast path for `UpdatePlan::CommitCatchUp` — loads one commit's

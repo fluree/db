@@ -110,6 +110,7 @@ macro_rules! view_context_config {
             // transaction opt-in).
             strict_bind_errors: false,
             include_system_facts: $executable.query.include_system_facts,
+            trust_fk_refs: $options.trust_fk_refs,
             ..Default::default()
         };
     };

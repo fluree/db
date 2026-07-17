@@ -56,7 +56,7 @@ impl Function {
 
             // String functions
             Function::Str => string::eval_str(args, row, ctx),
-            Function::Lang => string::eval_lang(args, row, ctx),
+            Function::Lang { strict } => string::eval_lang(args, row, ctx, *strict),
             Function::Lcase => string::eval_lcase(args, row, ctx),
             Function::Ucase => string::eval_ucase(args, row, ctx),
             Function::Strlen => string::eval_strlen(args, row, ctx),
@@ -110,7 +110,7 @@ impl Function {
             Function::IsBlank => types::eval_is_blank(args, row, ctx),
 
             // RDF term functions
-            Function::Datatype => rdf::eval_datatype(args, row, ctx),
+            Function::Datatype { strict } => rdf::eval_datatype(args, row, ctx, *strict),
             Function::LangMatches => rdf::eval_lang_matches(args, row, ctx),
             Function::SameTerm => rdf::eval_same_term(args, row, ctx),
             Function::Iri => rdf::eval_iri(args, row, ctx),
@@ -189,6 +189,9 @@ impl Function {
             Function::XsdDouble => cast::eval_xsd_double(args, row, ctx),
             Function::XsdDecimal => cast::eval_xsd_decimal(args, row, ctx),
             Function::XsdString => cast::eval_xsd_string(args, row, ctx),
+            Function::XsdDateTime => cast::eval_xsd_datetime(args, row, ctx),
+            Function::XsdDate => cast::eval_xsd_date(args, row, ctx),
+            Function::XsdTime => cast::eval_xsd_time(args, row, ctx),
 
             // Path functions
             Function::PathLength => path::eval_path_length(args, row),
@@ -239,6 +242,25 @@ impl Function {
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<bool> {
         let value = self.eval(args, row, ctx)?;
-        Ok(value.is_some_and(Into::into))
+        match value {
+            // A typed literal gets the strict §17.2.2 EBV (the rules the Var
+            // path applies via `binding_effective_bool`): the lenient
+            // conversion below read EVERY typed literal as truthy, so
+            // `FILTER(xsd:float("0"))` and `FILTER(STRDT("abc", xsd:integer))`
+            // — string-backed cast/computed values — passed where the spec
+            // gives them a numeric (respectively rule-1 false) EBV.
+            Some(v @ ComparableValue::TypedLiteral { .. }) => {
+                crate::eval::comparable_effective_bool(&v)
+            }
+            // Everything else keeps the lenient conversion: the dispatcher is
+            // shared with the Cypher surface, whose structural truthiness
+            // (nodes/Sids, temporals — `_ => true`) is a deliberate D-12
+            // carve-out; SPARQL-strict EBV for IRI/temporal function results
+            // stays with the deferred strict-EBV follow-up.
+            Some(v) => Ok(v.into()),
+            // A type-error-demoted-to-unbound result stays false in boolean
+            // position (the pre-existing convention for `Ok(None)` builtins).
+            None => Ok(false),
+        }
     }
 }

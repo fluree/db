@@ -264,17 +264,63 @@ pub struct CachingCommitter<C: Committer = LocalCommitter> {
     executor: C,
     cache: Cache<IdempotencyCacheKey, CachedSubmission>,
     admission: Arc<Semaphore>,
-    per_ledger_admission: DashMap<String, Arc<Semaphore>>,
+    // `Arc` so an [`AdmissionPermits`] guard can hold a handle and
+    // evict its ledger's semaphore once idle — otherwise this map
+    // grows one never-removed entry per distinct ledger string ever
+    // submitted, which a flood of client-chosen names could exploit
+    // (admission runs before any ledger-existence check).
+    per_ledger_admission: Arc<DashMap<String, Arc<Semaphore>>>,
     per_ledger_limit: usize,
 }
 
-/// RAII guard holding both an admission permits — the per-ledger slot
-/// (acquired first) and the global slot. Dropping it releases both.
-/// Fields are private with `_` prefixes because callers only care about
-/// the lifetime effect, not direct permit access.
+/// RAII guard for a submission's per-ledger admission slot. Dropping
+/// it releases the permit and, when the ledger's semaphore goes idle,
+/// evicts that semaphore from
+/// [`CachingCommitter::per_ledger_admission`] so the map stays bounded
+/// by the count of ledgers with in-flight submissions (itself bounded
+/// by the global permit pool).
+///
+/// The eviction is bound to *this* guard rather than the composite
+/// [`AdmissionPermits`] because the map entry is created the moment
+/// the per-ledger permit is acquired — before the global permit. If
+/// the global acquire then fails, this guard still drops (and evicts
+/// the now-idle entry); tying eviction to the composite guard, which
+/// is only built once *both* permits succeed, would leak one entry
+/// per distinct ledger name whenever the global pool is saturated —
+/// exactly the flood the bound defends against.
+struct PerLedgerPermit {
+    /// `Option` so [`Drop`] can release this permit *before* testing
+    /// whether the semaphore is idle.
+    permit: Option<OwnedSemaphorePermit>,
+    admission_map: Arc<DashMap<String, Arc<Semaphore>>>,
+    ledger_id: String,
+    per_ledger_limit: usize,
+}
+
+impl Drop for PerLedgerPermit {
+    fn drop(&mut self) {
+        // Release this submission's per-ledger permit, then drop the
+        // semaphore entry iff no other submission for the same ledger
+        // still holds one. The idle test runs under DashMap's bucket
+        // lock, so a concurrent acquirer is either observed (a permit
+        // is out → entry kept) or races ahead onto its own clone of
+        // the `Arc`, which stays valid regardless — a bounded,
+        // transient relaxation of the soft per-ledger cap, never a
+        // leaked map entry.
+        drop(self.permit.take());
+        self.admission_map
+            .remove_if(&self.ledger_id, |_, semaphore| {
+                semaphore.available_permits() == self.per_ledger_limit
+            });
+    }
+}
+
+/// RAII guard holding a submission's two admission permits — the
+/// per-ledger slot (acquired first) and the global slot. Dropping it
+/// releases both; the per-ledger slot's [`Drop`] handles map eviction.
 struct AdmissionPermits {
     _global: OwnedSemaphorePermit,
-    _per_ledger: OwnedSemaphorePermit,
+    _per_ledger: PerLedgerPermit,
 }
 
 impl CachingCommitter<LocalCommitter> {
@@ -312,7 +358,7 @@ impl<C: Committer> CachingCommitter<C> {
             executor,
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         }
     }
@@ -395,10 +441,20 @@ impl<C: Committer> CachingCommitter<C> {
     /// so retries that elide the default branch resolve to the same
     /// semaphore.
     fn try_admit(&self, ledger_id: &str) -> Result<AdmissionPermits, SubmissionError> {
-        let per_ledger = self
-            .ledger_semaphore(ledger_id)
-            .try_acquire_owned()
-            .map_err(|_| SubmissionError::Overloaded)?;
+        // Acquiring the per-ledger permit creates the map entry;
+        // wrapping it in its evicting guard *before* the global
+        // acquire ensures a global-tier rejection still tears the
+        // entry back down (see [`PerLedgerPermit`]).
+        let per_ledger = PerLedgerPermit {
+            permit: Some(
+                self.ledger_semaphore(ledger_id)
+                    .try_acquire_owned()
+                    .map_err(|_| SubmissionError::Overloaded)?,
+            ),
+            admission_map: Arc::clone(&self.per_ledger_admission),
+            ledger_id: ledger_id.to_string(),
+            per_ledger_limit: self.per_ledger_limit,
+        };
         let global = Arc::clone(&self.admission)
             .try_acquire_owned()
             .map_err(|_| SubmissionError::Overloaded)?;
@@ -489,8 +545,13 @@ impl<C: Committer> CachingCommitter<C> {
     /// fully-populated [`SubmissionState::Committed`] — the caller
     /// supplies the canonical kit (op kind + commit identity) and
     /// the typed [`OperationReceipt`] together because both come
-    /// from the same per-op response shape. Failures bypass the
-    /// projection and store directly as [`SubmissionState::Failed`].
+    /// from the same per-op response shape. Settled failures bypass
+    /// the projection and store directly as
+    /// [`SubmissionState::Failed`]; unsettled ones
+    /// ([`SubmissionError::is_settled`]) are not recorded at all —
+    /// the submission may still commit, so the slot is left to
+    /// `ClaimGuard::drop`'s `InFlight` cleanup and `status` falls
+    /// through to the replicated map for the truth.
     async fn record_outcome<R, F>(
         &self,
         cache_key: IdempotencyCacheKey,
@@ -502,6 +563,12 @@ impl<C: Committer> CachingCommitter<C> {
     {
         let final_state = match outcome {
             Ok(receipt) => project_committed(receipt),
+            // Not an outcome: the submission may still commit
+            // through the replicated log (stranded waiter, leader
+            // transition). Caching it as terminal would serve an
+            // authoritative-looking `Failed` for the cache TTL
+            // while the replicated map says `Committed`.
+            Err(err) if !err.is_settled() => return,
             Err(err) => SubmissionState::Failed(err.clone()),
         };
         let value = CachedSubmission {
@@ -1184,7 +1251,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1242,7 +1309,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1278,7 +1345,7 @@ mod tests {
             executor: stub.clone(),
             cache,
             admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
-            per_ledger_admission: DashMap::new(),
+            per_ledger_admission: Arc::new(DashMap::new()),
             per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
         };
 
@@ -1429,6 +1496,115 @@ mod tests {
         assert!(matches!(entry.state, SubmissionState::Committed(_)));
     }
 
+    #[test]
+    fn settlement_classification() {
+        let execution = |status: u16| SubmissionError::Execution {
+            status,
+            message: "test".into(),
+        };
+        // Determined outcomes: bad requests, policy denials,
+        // poisons, and local internal failures that never submitted.
+        assert!(execution(400).is_settled());
+        assert!(execution(422).is_settled());
+        assert!(execution(500).is_settled());
+
+        // Gateway-class: the submission may still commit through
+        // the replicated log (not-leader, raft fatal, stranded).
+        assert!(!execution(502).is_settled());
+        assert!(!execution(503).is_settled());
+        assert!(!execution(504).is_settled());
+
+        // Never executed at all.
+        assert!(!SubmissionError::KeyCollision.is_settled());
+        assert!(!SubmissionError::AlreadyInFlight.is_settled());
+        assert!(!SubmissionError::Overloaded.is_settled());
+    }
+
+    #[tokio::test]
+    async fn unsettled_error_is_not_recorded_as_terminal_failure() {
+        // A stranded submission (504: outcome unknown) may commit on
+        // the new leader seconds later. Recording it as `Failed`
+        // would make `status()` serve that answer authoritatively
+        // for the cache TTL while the replicated map says
+        // `Committed` — inviting a resubmit under a fresh key.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k-unsettled").expect("fits cap"),
+        );
+        let body_hash = [7u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let _guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        let stranded: Result<(), SubmissionError> = Err(SubmissionError::Execution {
+            status: 504,
+            message: "submission stranded by leader transition".into(),
+        });
+        committer
+            .record_outcome(cache_key.clone(), body_hash, &stranded, |&()| {
+                unreachable!("no receipt to project")
+            })
+            .await;
+
+        let cached = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("claim marker still present");
+        assert!(
+            matches!(cached.state, SubmissionState::InFlight),
+            "unsettled outcome must not overwrite the InFlight claim, got {:?}",
+            cached.state
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_error_is_recorded_as_terminal_failure() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let cache_key = IdempotencyCacheKey::new(
+            "tenant-a:main",
+            IdempotencyKey::new("k-settled").expect("fits cap"),
+        );
+        let body_hash = [8u8; 32];
+
+        let outcome = committer
+            .try_claim_slot(cache_key.clone(), body_hash)
+            .await
+            .expect("claim");
+        let _guard = match outcome {
+            ClaimOutcome::Claimed(g) => g,
+            _ => panic!("expected fresh claim"),
+        };
+
+        let poisoned: Result<(), SubmissionError> = Err(SubmissionError::Execution {
+            status: 422,
+            message: "submission poisoned".into(),
+        });
+        committer
+            .record_outcome(cache_key.clone(), body_hash, &poisoned, |&()| {
+                unreachable!("no receipt to project")
+            })
+            .await;
+
+        let cached = committer
+            .cache
+            .get(&cache_key)
+            .await
+            .expect("terminal state present");
+        assert!(
+            matches!(cached.state, SubmissionState::Failed(_)),
+            "settled failure must be cached as terminal, got {:?}",
+            cached.state
+        );
+    }
+
     #[tokio::test]
     async fn drop_cleanup_preserves_existing_terminal_state() {
         // Regression for the `get` + `invalidate` TOCTOU in
@@ -1520,6 +1696,84 @@ mod tests {
             committer.try_admit("tenant-d:main"),
             Err(SubmissionError::Overloaded)
         ));
+    }
+
+    #[tokio::test]
+    async fn idle_per_ledger_semaphores_are_evicted_not_accumulated() {
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(100)
+            .with_per_ledger_pending_limit(2);
+
+        // A flood of distinct client-chosen ledger strings, each
+        // admitted and released in turn, must leave no residue — this
+        // is the unbounded-growth DoS the eviction closes (admission
+        // runs before any ledger-existence check).
+        for i in 0..1000 {
+            let permit = committer
+                .try_admit(&format!("flood-{i}:main"))
+                .expect("admit");
+            drop(permit);
+        }
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            0,
+            "idle per-ledger semaphores must be evicted, not accumulated"
+        );
+
+        // An in-flight submission keeps its entry; dropping it removes it.
+        let held = committer.try_admit("held:main").expect("admit held");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+        drop(held);
+        assert_eq!(committer.per_ledger_admission.len(), 0);
+
+        // Two concurrent submissions on one ledger: the entry survives
+        // the first drop (the second still holds a permit) and is
+        // removed only once the last permit is released.
+        let s1 = committer.try_admit("shared:main").expect("s1");
+        let s2 = committer.try_admit("shared:main").expect("s2");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+        drop(s1);
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            1,
+            "entry must survive while another submission holds a permit"
+        );
+        drop(s2);
+        assert_eq!(committer.per_ledger_admission.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn global_tier_rejections_do_not_leak_per_ledger_entries() {
+        // The dangerous path: the per-ledger permit (which creates the
+        // map entry) succeeds but the GLOBAL permit is exhausted, so
+        // `try_admit` returns `Overloaded`. A flood of distinct ledger
+        // names under global saturation hits this every request — the
+        // rejection must still evict the entry it created, or the DoS
+        // reopens.
+        let (_fluree, committer, _ledger_id) = setup().await;
+        let committer = committer
+            .with_pending_limit(2) // global cap = 2
+            .with_per_ledger_pending_limit(5); // per-ledger never the limiter here
+
+        // Saturate the global pool with two submissions on one ledger.
+        let _g1 = committer.try_admit("busy:main").expect("g1");
+        let _g2 = committer.try_admit("busy:main").expect("g2");
+        assert_eq!(committer.per_ledger_admission.len(), 1);
+
+        // Each distinct name now fails at the global tier (per-ledger
+        // acquire succeeds on a fresh semaphore, global is full).
+        for i in 0..1000 {
+            assert!(matches!(
+                committer.try_admit(&format!("flood-{i}:main")),
+                Err(SubmissionError::Overloaded)
+            ));
+        }
+        assert_eq!(
+            committer.per_ledger_admission.len(),
+            1,
+            "global-tier rejections must evict the entry they created; only the busy ledger remains"
+        );
     }
 
     #[test]

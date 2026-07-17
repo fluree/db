@@ -39,7 +39,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use openraft::error::{InstallSnapshotError, NetworkError, RPCError, RaftError, Unreachable};
+use openraft::error::{
+    Fatal, InstallSnapshotError, NetworkError, RPCError, RaftError, RemoteError, Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
@@ -114,6 +116,14 @@ pub struct NetworkConfig {
     /// at most). Tiny compared to the receipt path, but still
     /// pinned to a deliberate cap for parity with the sibling RPCs.
     pub apply_queue_poison_max_body_bytes: usize,
+    /// Maximum request body a follower buffers before relaying a
+    /// client request to the leader ([`crate::raft::forward`]).
+    /// Bodies beyond the cap are refused with 413 before any relay.
+    /// Deployments should align this with the public routes' body
+    /// limit — a larger value has the follower buffering bodies the
+    /// leader will refuse anyway, a smaller one rejects follower-side
+    /// what the leader would accept.
+    pub forward_max_body_bytes: usize,
 }
 
 impl Default for NetworkConfig {
@@ -128,6 +138,7 @@ impl Default for NetworkConfig {
             install_snapshot_max_body_bytes: 1024 * 1024 * 1024,
             apply_staged_commit_max_body_bytes: 16 * 1024 * 1024,
             apply_queue_poison_max_body_bytes: 1024 * 1024,
+            forward_max_body_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -202,19 +213,30 @@ impl HttpRaftNetwork {
         format!("{}{}", self.base_url, path)
     }
 
-    /// Encode the request body, send the POST, decode the response
-    /// body. All transport-level failures map to [`RPCError`] in the
-    /// shape openraft expects.
-    async fn post<Req, Resp, E>(
+    /// Encode the request, send the POST, and decode the response.
+    ///
+    /// A successful HTTP response carries `postcard(Result<Resp, W>)`:
+    /// the peer's *logical* outcome. `Ok` is the response; `Err(w)`
+    /// is a remote error, reconstructed into `RaftError` by
+    /// `into_raft_error` and surfaced as [`RPCError::RemoteError`] so
+    /// openraft's classifier can act on it (retry an `Unreachable`,
+    /// restart snapshot streaming on a `SnapshotMismatch`, stop on a
+    /// `Fatal`) rather than seeing an opaque transport failure.
+    /// Genuine transport problems — connect/timeout, a non-2xx
+    /// status (the peer couldn't decode the request), a truncated or
+    /// undecodable body — stay [`RPCError::Network`]/`Unreachable`.
+    async fn post<Req, Resp, E, W>(
         &self,
         path: &str,
         req: &Req,
         timeout: Duration,
+        into_raft_error: impl FnOnce(W) -> RaftError<NodeId, E>,
     ) -> Result<Resp, RPCError<NodeId, ClusterNode, RaftError<NodeId, E>>>
     where
         Req: Serialize,
         Resp: DeserializeOwned,
         E: std::error::Error + Send + Sync + 'static,
+        W: DeserializeOwned,
     {
         let body = postcard::to_allocvec(req).map_err(|e| {
             RPCError::Network(NetworkError::new(&AnyError::new(&PostcardError(
@@ -249,11 +271,14 @@ impl HttpRaftNetwork {
             ))))
         })?;
 
-        postcard::from_bytes(&bytes).map_err(|e| {
+        let outcome: Result<Resp, W> = postcard::from_bytes(&bytes).map_err(|e| {
             RPCError::Network(NetworkError::new(&AnyError::new(&PostcardError(
                 e.to_string(),
             ))))
-        })
+        })?;
+
+        outcome
+            .map_err(|w| RPCError::RemoteError(RemoteError::new(self.target, into_raft_error(w))))
     }
 }
 
@@ -264,8 +289,16 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>>
     {
-        self.post(PATH_APPEND_ENTRIES, &rpc, self.config.rpc_timeout)
-            .await
+        // append/vote can only fail with `Fatal` (their API-error
+        // slot is `Infallible`), which `serde` can't deserialize, so
+        // the wire error is a bare `Fatal` rebuilt into `RaftError`.
+        self.post(
+            PATH_APPEND_ENTRIES,
+            &rpc,
+            self.config.rpc_timeout,
+            RaftError::Fatal,
+        )
+        .await
     }
 
     async fn vote(
@@ -273,7 +306,8 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, ClusterNode, RaftError<NodeId>>> {
-        self.post(PATH_VOTE, &rpc, self.config.rpc_timeout).await
+        self.post(PATH_VOTE, &rpc, self.config.rpc_timeout, RaftError::Fatal)
+            .await
     }
 
     async fn install_snapshot(
@@ -284,8 +318,16 @@ impl RaftNetwork<TypeConfig> for HttpRaftNetwork {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, ClusterNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        self.post(PATH_INSTALL_SNAPSHOT, &rpc, self.config.snapshot_timeout)
-            .await
+        // install_snapshot's error is inhabited (`SnapshotMismatch`),
+        // so the full `RaftError` rides the wire and passes through
+        // unchanged.
+        self.post(
+            PATH_INSTALL_SNAPSHOT,
+            &rpc,
+            self.config.snapshot_timeout,
+            |e| e,
+        )
+        .await
     }
 }
 
@@ -409,9 +451,19 @@ fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, Box<Response>> {
     })
 }
 
-/// Encode a postcard response body + 200. Encoding failures → 500.
-fn encode<T: Serialize>(value: &T) -> Response {
-    match postcard::to_allocvec(value) {
+/// Encode a logical outcome — `postcard(Result<Resp, E>)` — as a 200
+/// response. The `Err` side carries the peer's typed error so the
+/// caller can reconstruct it (see [`HttpRaftNetwork::post`]);
+/// encoding itself failing is a genuine 500. A non-2xx status is
+/// thus reserved for the request never being understood at all
+/// (decode failure below), which the caller reads as a transport
+/// error rather than a logical one.
+fn respond<T, E>(outcome: Result<T, E>) -> Response
+where
+    T: Serialize,
+    E: Serialize,
+{
+    match postcard::to_allocvec(&outcome) {
         Ok(bytes) => (
             StatusCode::OK,
             [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
@@ -426,6 +478,17 @@ fn encode<T: Serialize>(value: &T) -> Response {
     }
 }
 
+/// Collapse `RaftError<NodeId>` to its only inhabited variant. The
+/// `APIError` slot is `Infallible` for append-entries and vote, so
+/// this never hits the unreachable arm; extracting `Fatal` lets it
+/// ride the wire (`Infallible` isn't `Deserialize`).
+fn into_fatal(err: RaftError<NodeId>) -> Fatal<NodeId> {
+    match err {
+        RaftError::Fatal(fatal) => fatal,
+        RaftError::APIError(infallible) => match infallible {},
+    }
+}
+
 async fn handle_append_entries(
     State(raft): State<Arc<Raft<TypeConfig>>>,
     body: axum::body::Bytes,
@@ -434,14 +497,7 @@ async fn handle_append_entries(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    match raft.append_entries(rpc).await {
-        Ok(resp) => encode(&resp),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("append_entries: {e}"),
-        )
-            .into_response(),
-    }
+    respond(raft.append_entries(rpc).await.map_err(into_fatal))
 }
 
 async fn handle_vote(
@@ -452,10 +508,7 @@ async fn handle_vote(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    match raft.vote(rpc).await {
-        Ok(resp) => encode(&resp),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("vote: {e}")).into_response(),
-    }
+    respond(raft.vote(rpc).await.map_err(into_fatal))
 }
 
 async fn handle_install_snapshot(
@@ -466,14 +519,7 @@ async fn handle_install_snapshot(
         Ok(v) => v,
         Err(resp) => return *resp,
     };
-    match raft.install_snapshot(rpc).await {
-        Ok(resp) => encode(&resp),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("install_snapshot: {e}"),
-        )
-            .into_response(),
-    }
+    respond(raft.install_snapshot(rpc).await)
 }
 
 #[cfg(test)]
@@ -571,6 +617,58 @@ mod tests {
             vote: Vote::new(5, 9),
         };
         round_trip(&resp);
+    }
+
+    /// The response envelope is `Result<Resp, Err>`, not a bare
+    /// `Resp` — the `Ok` side must round-trip in that shape (this is
+    /// what the client decodes on every successful RPC).
+    #[test]
+    fn append_response_envelope_ok_round_trips() {
+        let outcome: Result<AppendEntriesResponse<NodeId>, Fatal<NodeId>> =
+            Ok(AppendEntriesResponse::Success);
+        round_trip(&outcome);
+    }
+
+    /// The typed error side round-trips too, so a peer's `Fatal`
+    /// reaches the caller as a `Fatal` (→ `RPCError::RemoteError`)
+    /// rather than an opaque HTTP status.
+    #[test]
+    fn append_response_envelope_fatal_err_round_trips() {
+        let outcome: Result<AppendEntriesResponse<NodeId>, Fatal<NodeId>> = Err(Fatal::Stopped);
+        round_trip(&outcome);
+        // And the peer's server-side `RaftError<NodeId>` collapses
+        // to exactly this `Fatal` on the way onto the wire.
+        assert!(matches!(
+            into_fatal(RaftError::Fatal(Fatal::Stopped)),
+            Fatal::Stopped
+        ));
+    }
+
+    /// `install_snapshot`'s error is inhabited (`SnapshotMismatch`);
+    /// the full `RaftError` rides the wire so openraft's snapshot
+    /// sender can restart streaming instead of wedging.
+    #[test]
+    fn install_snapshot_envelope_mismatch_err_round_trips() {
+        use openraft::error::{InstallSnapshotError, SnapshotMismatch};
+        use openraft::SnapshotSegmentId;
+
+        let mismatch = SnapshotMismatch {
+            expect: SnapshotSegmentId {
+                id: "snap-1".to_string(),
+                offset: 0,
+            },
+            got: SnapshotSegmentId {
+                id: "snap-1".to_string(),
+                offset: 4096,
+            },
+        };
+        let outcome: Result<
+            InstallSnapshotResponse<NodeId>,
+            RaftError<NodeId, InstallSnapshotError>,
+        > = Err(RaftError::APIError(InstallSnapshotError::SnapshotMismatch(
+            mismatch,
+        )));
+        round_trip(&outcome);
     }
 
     #[test]
