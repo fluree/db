@@ -750,6 +750,51 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// Record `bytes` of retained query memory into the query-scoped counter shared by
+    /// this context and every per-graph context derived from it (the derived contexts
+    /// clone the same cancellation handle). Called where a buffering post-scan operator
+    /// grows a retained structure; [`checkpoint`](Self::checkpoint) enforces the budget.
+    #[inline]
+    pub fn record_alloc(&self, bytes: usize) {
+        self.cancellation.record_alloc(bytes);
+    }
+
+    /// Retained query memory recorded so far via [`record_alloc`](Self::record_alloc).
+    #[inline]
+    pub fn mem_used(&self) -> usize {
+        self.cancellation.allocated_bytes()
+    }
+
+    /// Cooperative checkpoint: the single guard the buffering post-scan operators
+    /// (hash-join build, GROUP BY fold, fused dim-map build) poll at batch granularity.
+    /// Aborts if the query was cancelled/timed out, or if the recorded retained memory
+    /// has crossed the budget.
+    ///
+    /// Cancellation is checked first, so an external timeout or RSS-watchdog signal
+    /// maps to [`QueryError::Cancelled`] (408 at the API boundary) while an
+    /// engine-detected memory overrun maps to the distinct
+    /// [`QueryError::MemoryBudgetExceeded`] (507) — a caller can tell "over memory"
+    /// from "over time". The budget is the handle's pinned ceiling when set, else the
+    /// process default ([`query_memory_budget_bytes`]); 0 disables it.
+    #[inline]
+    pub fn checkpoint(&self) -> Result<(), QueryError> {
+        self.check_cancelled()?;
+        let budget = self
+            .cancellation
+            .memory_limit()
+            .unwrap_or_else(query_memory_budget_bytes);
+        if budget != 0 {
+            let used = self.cancellation.allocated_bytes();
+            if used > budget {
+                return Err(QueryError::MemoryBudgetExceeded {
+                    used_bytes: used,
+                    budget_bytes: budget,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Enable strict bind error handling.
     pub fn with_strict_bind_errors(mut self) -> Self {
         self.strict_bind_errors = true;

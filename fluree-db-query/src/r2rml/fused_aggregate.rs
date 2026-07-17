@@ -1088,10 +1088,13 @@ impl Operator for FusedR2rmlAggregateOperator {
             std::collections::HashMap::new();
         let mut overflowed = false;
         'scan: while let Some(batch) = stream.next().await {
-            // T3.1a: cancellation checkpoint per fused-aggregate scan batch, so a
-            // deadline/abort stops a large fused rollup mid-sweep.
-            ctx.check_cancelled()?;
+            // Checkpoint per fused-aggregate scan batch (deadline + memory budget): a
+            // deadline/abort stops a large fused rollup mid-sweep, and a high-cardinality
+            // GROUP BY whose `groups` map crossed the budget on a prior batch aborts
+            // typed before OOM.
+            ctx.checkpoint()?;
             let batch = batch?;
+            let groups_before = groups.len();
             let fold_cols: Vec<Option<&Column>> = folds
                 .iter()
                 .map(|f| match f {
@@ -1226,6 +1229,12 @@ impl Operator for FusedR2rmlAggregateOperator {
                         break 'scan;
                     }
                 }
+            }
+            // Account this batch's group growth into the query-scoped counter; the next
+            // batch's checkpoint enforces the budget against the running total.
+            let grown = groups.len() - groups_before;
+            if grown > 0 {
+                ctx.record_alloc(grown * crate::context::GROUP_EST_BYTES);
             }
             ctx.tracker.consume_fuel(1)?;
         }
@@ -2057,8 +2066,12 @@ impl FusedR2rmlAggregateOperator {
                 .scan_table(gs, &terminal_table, &terminal_proj, &[], None, as_of_t)
                 .await?;
             while let Some(batch) = s.next().await {
-                ctx.check_cancelled()?; // T3.1a: stop a terminal-dim drain on abort
+                // Checkpoint the terminal-dim drain (deadline + memory budget): the
+                // FK→GKey `map` is fully retained to probe the fact scan, so a large dim
+                // aborts typed before OOM instead of buffering unbounded.
+                ctx.checkpoint()?;
                 let batch = batch?;
+                let map_before = map.len();
                 let attr_cols: Vec<Option<&Column>> = group_cols
                     .iter()
                     .map(|g| batch.column_by_name(&g.column))
@@ -2098,6 +2111,7 @@ impl FusedR2rmlAggregateOperator {
                         return Ok(None);
                     }
                 }
+                ctx.record_alloc((map.len() - map_before) * crate::context::GROUP_EST_BYTES);
             }
         }
         // Interior dims: compose from the hop before the terminal back to the fact.
@@ -2124,8 +2138,13 @@ impl FusedR2rmlAggregateOperator {
                 .scan_table(gs, &inter_table, &proj, &[], None, as_of_t)
                 .await?;
             while let Some(batch) = s.next().await {
-                ctx.check_cancelled()?; // T3.1a: stop an interior-dim drain on abort
+                // Checkpoint the interior-dim drain (deadline + memory budget). This is
+                // the loop that builds the potentially multi-million-row interior FK→GKey
+                // map (`next_map`), so it must be under the same query budget — a large
+                // interior dim aborts typed before OOM.
+                ctx.checkpoint()?;
                 let batch = batch?;
+                let next_before = next_map.len();
                 for row in 0..batch.num_rows {
                     let Some(pk) = get_join_key_from_batch(&key_cols, &batch, row) else {
                         continue;
@@ -2144,6 +2163,9 @@ impl FusedR2rmlAggregateOperator {
                         }
                     }
                 }
+                ctx.record_alloc(
+                    (next_map.len() - next_before) * crate::context::GROUP_EST_BYTES,
+                );
             }
             map = next_map;
         }

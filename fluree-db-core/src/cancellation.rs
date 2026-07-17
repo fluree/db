@@ -4,13 +4,17 @@
 //! cancellation from any HTTP framework, task runtime, or resource monitor.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const NOT_CANCELLED: u8 = 0;
 const CANCELLED: u8 = 1;
 const TIMEOUT: u8 = 2;
 const CLIENT_DISCONNECTED: u8 = 3;
+
+/// Sentinel in [`QueryCancellationInner::memory_limit`] meaning "no ceiling set" —
+/// the embedder has not pinned a per-query budget onto this handle.
+const NO_MEMORY_LIMIT: usize = usize::MAX;
 
 /// Reason a cooperative query cancellation was requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,16 +61,39 @@ impl fmt::Display for QueryCancellationReason {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct QueryCancellationInner {
     reason: AtomicU8,
+    /// Bytes of retained query memory recorded via [`QueryCancellation::record_alloc`].
+    /// A monotonic, deliberately-conservative high-water accumulator: callers record
+    /// where a retained buffer grows, so the total tracks a query's live post-scan
+    /// memory across all its operators.
+    allocated: AtomicUsize,
+    /// Optional per-query memory ceiling in bytes (`NO_MEMORY_LIMIT` = unset). Stored
+    /// as an opaque number — this crate never compares or enforces it; the query
+    /// engine reads it at a checkpoint and decides. Lets an embedder pin a budget onto
+    /// the same handle that carries cancellation.
+    memory_limit: AtomicUsize,
 }
 
-/// Shared cooperative cancellation handle for query execution.
+impl Default for QueryCancellationInner {
+    fn default() -> Self {
+        Self {
+            reason: AtomicU8::new(NOT_CANCELLED),
+            allocated: AtomicUsize::new(0),
+            memory_limit: AtomicUsize::new(NO_MEMORY_LIMIT),
+        }
+    }
+}
+
+/// Shared cooperative resource-governance handle for query execution: cancellation
+/// (timeout / disconnect / caller-initiated) plus query-scoped memory accounting.
 ///
-/// A disabled value is a single `None` pointer, so callers that do not opt in
-/// pay only a cheap branch at checkpoints. Timeout and disconnect detection are
-/// external concerns: callers decide when to signal this handle.
+/// A disabled value is a single `None` pointer, so callers that do not opt in pay
+/// only a cheap branch at checkpoints. Timeout and disconnect detection are external
+/// concerns: callers decide when to signal this handle. The memory counter is pure
+/// mechanism — this crate accumulates and reports bytes but never enforces a budget;
+/// the query engine's checkpoint compares the count against the ceiling.
 #[derive(Debug, Clone, Default)]
 pub struct QueryCancellation {
     inner: Option<Arc<QueryCancellationInner>>,
@@ -121,6 +148,51 @@ impl QueryCancellation {
         }
         None
     }
+
+    /// Record `bytes` of retained query memory into the shared counter. Callers record
+    /// at the points where a retained buffer (a hash-join build table, a GROUP BY map,
+    /// a fused dim-map) grows, so the counter tracks the query's live post-scan memory.
+    /// Monotonic and intentionally conservative — over-counting can only trip the guard
+    /// on a query already near its ceiling. No-op on a disabled handle.
+    #[inline]
+    pub fn record_alloc(&self, bytes: usize) {
+        if let Some(inner) = &self.inner {
+            inner.allocated.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes recorded via [`record_alloc`](Self::record_alloc) so far (0 on a disabled
+    /// handle).
+    #[inline]
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |i| i.allocated.load(Ordering::Relaxed))
+    }
+
+    /// Pin an optional per-query memory ceiling (bytes) onto this handle. The query
+    /// engine reads it at a checkpoint; this crate never enforces it. No-op on a
+    /// disabled handle. Mainly for tests / embedders that want an explicit budget
+    /// rather than the engine's container-derived default.
+    pub fn set_memory_limit(&self, bytes: usize) {
+        if let Some(inner) = &self.inner {
+            inner.memory_limit.store(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// The pinned memory ceiling, or `None` when unset (or on a disabled handle), in
+    /// which case the engine applies its own default budget.
+    #[inline]
+    pub fn memory_limit(&self) -> Option<usize> {
+        match self
+            .inner
+            .as_ref()
+            .map(|i| i.memory_limit.load(Ordering::Relaxed))
+        {
+            Some(v) if v != NO_MEMORY_LIMIT => Some(v),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +246,39 @@ mod tests {
             cancellation.reason(),
             Some(QueryCancellationReason::Timeout)
         );
+    }
+
+    #[test]
+    fn memory_accounting_accumulates_and_is_shared_across_clones() {
+        let cancellation = QueryCancellation::new();
+        let derived = cancellation.clone(); // mirrors a derived per-graph context
+
+        cancellation.record_alloc(100);
+        derived.record_alloc(50);
+
+        // The counter lives on the shared Arc, so both handles observe the total.
+        assert_eq!(cancellation.allocated_bytes(), 150);
+        assert_eq!(derived.allocated_bytes(), 150);
+    }
+
+    #[test]
+    fn memory_limit_defaults_unset_and_round_trips() {
+        let cancellation = QueryCancellation::new();
+        assert_eq!(cancellation.memory_limit(), None);
+
+        cancellation.set_memory_limit(4096);
+        assert_eq!(cancellation.memory_limit(), Some(4096));
+    }
+
+    #[test]
+    fn disabled_handle_has_no_memory_guard() {
+        let cancellation = QueryCancellation::disabled();
+
+        cancellation.record_alloc(1 << 30);
+        cancellation.set_memory_limit(1);
+
+        // Both are no-ops on a disabled handle: no counter, no ceiling.
+        assert_eq!(cancellation.allocated_bytes(), 0);
+        assert_eq!(cancellation.memory_limit(), None);
     }
 }

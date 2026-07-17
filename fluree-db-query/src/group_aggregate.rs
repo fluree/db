@@ -627,11 +627,6 @@ pub struct GroupAggregateOperator {
     agg_specs: Vec<StreamingAggSpec>,
     /// Accumulated groups: composite_key -> group_state
     groups: HashMap<CompositeGroupKey, GroupState>,
-    /// R3-B: query memory budget in bytes (0 = disabled). The `groups` map grows
-    /// with distinct group cardinality; it is checked against this per batch so a
-    /// high-cardinality GROUP BY aborts typed before OOM. (SUM/COUNT rollups have
-    /// few groups, so this never trips for them — their OOM is the join build.)
-    mem_budget: usize,
     /// If true, input is already partitioned by the GROUP BY key(s), so we can
     /// aggregate per-run without hashing each row into a map.
     partitioned: bool,
@@ -696,7 +691,6 @@ impl GroupAggregateOperator {
             group_key_indices,
             agg_specs,
             groups: HashMap::new(),
-            mem_budget: crate::context::query_memory_budget_bytes(),
             partitioned,
             partitioned_groups: Vec::new(),
             emit_iter: None,
@@ -834,8 +828,10 @@ impl Operator for GroupAggregateOperator {
                     let mut current_state: Option<GroupState> = None;
 
                     loop {
-                        // R3-A: per-batch deadline poll (see the general-path loop).
-                        ctx.check_cancelled()?;
+                        // Per-batch checkpoint (deadline + memory budget; see the
+                        // general-path loop). `partitioned_groups` grows with distinct
+                        // group cardinality, accounted per finalized group below.
+                        ctx.checkpoint()?;
                         let batch = match self.child.next_batch(ctx).await? {
                             Some(b) => b,
                             None => break,
@@ -854,6 +850,7 @@ impl Operator for GroupAggregateOperator {
                             if !same_group {
                                 if let Some(state) = current_state.take() {
                                     self.partitioned_groups.push(state);
+                                    ctx.record_alloc(crate::context::GROUP_EST_BYTES);
                                 }
                                 current_key = Some(key);
                                 // First row of new group: capture original key bindings for output.
@@ -891,11 +888,13 @@ impl Operator for GroupAggregateOperator {
 
                     if let Some(state) = current_state.take() {
                         self.partitioned_groups.push(state);
+                        ctx.record_alloc(crate::context::GROUP_EST_BYTES);
                     }
 
                     span.record("input_batches", input_batches);
                     span.record("input_rows", input_rows);
                     span.record("groups", self.partitioned_groups.len() as u64);
+                    span.record("mem_used_bytes", ctx.mem_used() as u64);
                     span.record(
                         "drain_ms",
                         (drain_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -909,12 +908,16 @@ impl Operator for GroupAggregateOperator {
 
                 // General path: hash-based accumulation.
                 loop {
-                    // R3-A: the hash-aggregate fold buffers proportional to input
-                    // and, over a fully-buffered join child, can run minutes without
-                    // pulling a polling scan — so poll the deadline per batch here
-                    // (batch granularity; the per-row fold below is bounded by one
-                    // batch between polls). Closes the uncancelled post-scan gap.
-                    ctx.check_cancelled()?;
+                    // The hash-aggregate fold buffers `groups` proportional to distinct
+                    // group cardinality and, over a fully-buffered join child, can run
+                    // minutes without pulling a polling scan. Checkpoint per batch
+                    // (batch granularity; the per-row fold below is bounded by one batch
+                    // between polls): a deadline abort surfaces `Cancelled`, and a
+                    // high-cardinality GROUP BY that grew `groups` past the budget on a
+                    // prior batch surfaces a typed `MemoryBudgetExceeded` before OOM.
+                    // (SUM/COUNT rollups have few groups so this never trips for them —
+                    // their OOM is the join build, guarded in hash_join.rs.)
+                    ctx.checkpoint()?;
                     let batch = match self.child.next_batch(ctx).await? {
                         Some(b) => b,
                         None => break,
@@ -924,6 +927,8 @@ impl Operator for GroupAggregateOperator {
                     if batch.is_empty() {
                         continue;
                     }
+
+                    let groups_before = self.groups.len();
 
                     // Process each row
                     for row_idx in 0..batch.len() {
@@ -963,16 +968,13 @@ impl Operator for GroupAggregateOperator {
                             }
                         }
                     }
-                    // R3-B: guard the groups map size per batch (an O(1) len read);
-                    // a high-cardinality GROUP BY aborts typed before OOM. SUM/COUNT
-                    // rollups have few groups so this never trips — their OOM is the
-                    // join build, guarded in hash_join.rs.
-                    let used = self.groups.len() * crate::context::GROUP_EST_BYTES;
-                    if self.mem_budget != 0 && used > self.mem_budget {
-                        return Err(crate::error::QueryError::MemoryBudgetExceeded {
-                            used_bytes: used,
-                            budget_bytes: self.mem_budget,
-                        });
+                    // Account this batch's group growth into the query-scoped counter
+                    // (an O(1) len delta); the next iteration's checkpoint enforces the
+                    // budget against the running total, which also folds in any upstream
+                    // hash-join build under the same query budget.
+                    let grown = self.groups.len() - groups_before;
+                    if grown > 0 {
+                        ctx.record_alloc(grown * crate::context::GROUP_EST_BYTES);
                     }
                 }
 
@@ -995,6 +997,9 @@ impl Operator for GroupAggregateOperator {
                 span.record("input_batches", input_batches);
                 span.record("input_rows", input_rows);
                 span.record("groups", self.groups.len() as u64);
+                // Growth-curve telemetry: the query's retained post-scan memory as
+                // observed at the end of the fold (see `ExecutionContext::checkpoint`).
+                span.record("mem_used_bytes", ctx.mem_used() as u64);
                 span.record(
                     "drain_ms",
                     (drain_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -1220,10 +1225,15 @@ mod tests {
     async fn r3b_group_aggregate_budget_aborts_typed() {
         use crate::context::ExecutionContext;
         use crate::var_registry::VarRegistry;
+        use fluree_db_core::QueryCancellation;
 
         let snapshot = make_test_snapshot();
         let vars = VarRegistry::new();
-        let ctx = ExecutionContext::new(&snapshot, &vars);
+        // Pin a 1-byte ceiling → the first group's recorded growth crosses it, so the
+        // next checkpoint aborts typed.
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
 
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
         let batch = Batch::new(
@@ -1263,7 +1273,6 @@ mod tests {
             output_var: VarId(2),
         }];
         let mut op = GroupAggregateOperator::new(child, vec![VarId(0)], agg_specs, None, false);
-        op.mem_budget = 1; // 1 byte → the first group exceeds it
         op.open(&ctx).await.unwrap();
         let err = op.next_batch(&ctx).await.unwrap_err();
         assert!(

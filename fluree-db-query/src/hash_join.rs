@@ -575,12 +575,6 @@ pub struct HashJoinOperator {
     /// must match EVERY probe row (with the join var taking the probe value), not be
     /// dropped. Empty in the common case (join var always bound), so zero overhead.
     wildcard_rows: Vec<Vec<Binding>>,
-    /// R3-B: the query memory budget in bytes (0 = disabled). The build side buffers
-    /// the ENTIRE build input in `open()`; a multi-FACT build was the round-3 OOM
-    /// driver, so the accumulated size is checked against this per build batch.
-    mem_budget: usize,
-    /// R3-B: approximate bytes accumulated in `table` + `wildcard_rows` so far.
-    build_bytes: usize,
     /// Current probe batch being consumed and the next row to process.
     cur_probe: Option<Batch>,
     cur_probe_row: usize,
@@ -646,8 +640,6 @@ impl HashJoinOperator {
             probe_emit_cols,
             table: FxHashMap::default(),
             wildcard_rows: Vec::new(),
-            mem_budget: crate::context::query_memory_budget_bytes(),
-            build_bytes: 0,
             cur_probe: None,
             cur_probe_row: 0,
             state: OperatorState::Created,
@@ -673,11 +665,16 @@ impl HashJoinOperator {
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
         while let Some(batch) = build.next_batch(ctx).await? {
-            // R3-A: the build side is drained FULLY here in open() — for a
-            // multi-million-row FACT build that is minutes of accumulation with no
-            // poll of its own. Poll the deadline per build batch so an over-budget
-            // build gives up cleanly instead of running to an OOM.
-            ctx.check_cancelled()?;
+            // The build side is drained FULLY here in open() — for a multi-million-row
+            // FACT build that is minutes of accumulation into `table`/`wildcard_rows`
+            // with no poll of its own (the round-3 OOM driver). Account this batch's
+            // contribution to the query-scoped memory counter, then checkpoint: a
+            // deadline abort surfaces a clean `Cancelled`, and an over-budget build —
+            // inherently un-LIMIT-able, every build row is needed for correctness —
+            // surfaces a typed `MemoryBudgetExceeded` BEFORE the runtime OOMs.
+            // Batch-granularity, approximate (rows × cols × est/binding).
+            ctx.record_alloc(batch.len() * ncols * crate::context::BINDING_EST_BYTES);
+            ctx.checkpoint()?;
             for row in 0..batch.len() {
                 let row_vals: Vec<Binding> = (0..ncols)
                     .map(|c| batch.get_by_col(row, c).clone())
@@ -693,18 +690,6 @@ impl HashJoinOperator {
                     // Poisoned join var: blocks matching — drop the row (no output).
                     JoinKeyClass::Dead => {}
                 }
-            }
-            // R3-B: account this batch's contribution to the build buffer and abort
-            // typed BEFORE the runtime OOMs. The build side is inherently
-            // un-LIMIT-able (every build row is needed for correctness), so a memory
-            // budget is the only pre-OOM guard for a big-FACT build — the round-3
-            // OOM driver. Batch-granularity, approximate (rows × cols × est/binding).
-            self.build_bytes += batch.len() * ncols * crate::context::BINDING_EST_BYTES;
-            if self.mem_budget != 0 && self.build_bytes > self.mem_budget {
-                return Err(crate::error::QueryError::MemoryBudgetExceeded {
-                    used_bytes: self.build_bytes,
-                    budget_bytes: self.mem_budget,
-                });
             }
         }
         build.close();
@@ -791,9 +776,11 @@ impl Operator for HashJoinOperator {
         let probe = self.probe.as_mut().expect("hash join probe");
 
         loop {
-            // R3-A: poll the deadline per probe-drive iteration (batch granularity;
-            // the inner per-probe-row loop is bounded by one batch between polls).
-            ctx.check_cancelled()?;
+            // Checkpoint per probe-drive iteration (batch granularity; the inner
+            // per-probe-row loop is bounded by one batch between polls). Covers both
+            // the deadline and the memory budget — the build table is fully retained
+            // through the probe, so a build that crossed the budget still aborts here.
+            ctx.checkpoint()?;
             // Ensure we have a probe batch to consume.
             if self.cur_probe.is_none() {
                 match probe.next_batch(ctx).await? {
@@ -1118,14 +1105,18 @@ mod tests {
     async fn r3b_hash_join_build_budget_aborts_typed() {
         use crate::context::ExecutionContext;
         use crate::var_registry::VarRegistry;
-        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+        use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
 
         let snapshot = LedgerSnapshot::genesis("test/main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");
         let s = vars.get_or_insert("?s");
-        let ctx = ExecutionContext::new(&snapshot, &vars);
+        // Pin a 1-byte ceiling on the query handle → the first build batch's recorded
+        // allocation crosses it, so the checkpoint aborts typed.
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
 
         let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
         let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
@@ -1151,7 +1142,6 @@ mod tests {
             None,
             crate::temporal_mode::PlanningContext::current().mode(),
         );
-        hj.mem_budget = 1; // 1 byte → the first build batch exceeds it
         let err = hj.open(&ctx).await.unwrap_err();
         assert!(
             matches!(err, crate::error::QueryError::MemoryBudgetExceeded { .. }),
