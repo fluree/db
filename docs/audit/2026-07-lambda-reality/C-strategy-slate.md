@@ -2,268 +2,292 @@
 
 **Status:** draft by audit-doc → lambda-audit adversarial pass (deployed grounding) → team-lead
 second pass → survivors to AJ. **No remedy is committed here** — each lever is a candidate with its
-predicted effect, cost, and, critically, **what it does NOT fix**. Grounded in
-`A-engine-reality.md` (§1–4 + Appendix A.1–A.6) and `lambda-reality-B-deployed-forensics.md`
-(deployed forensics + measured throughput).
+predicted effect, cost, and, critically, **what it does NOT fix**. Grounded in `A-engine-reality.md`
+(§1–4 + Appendix A.1–A.7) and `lambda-reality-B-deployed-forensics.md` (deployed forensics, measured
+throughput, and the 39 production query shapes).
 
-## The frame: five query families and one measured ceiling
+## The epistemic story: three successive reframes (why the adversarial pass matters)
 
-Everything is scored against the families the two tracks actually found, not a generic "virtual
-query":
+This phase changed its mind about the dominant cost **three times**, each time forced by evidence.
+The slate is honest about that arc because it is the reason to distrust any single number here:
+
+1. **Per-file request floor** (`F/C×L`). The epic optimized `DW_SF01`: 7,670 tiny files, 39 rows/file
+   — the wall was the count of S3 round-trips. Levers: compaction, concurrency, file pruning.
+2. **Cross-region latency.** Track B found the deployed data is cross-region (us-east-1 Lambda →
+   us-east-2 parquet + Snowflake Polaris) — a ~1.2 s/table metadata RTT multiplier on every cold read.
+3. **Row materialization (the current, measured truth).** A COMPLETED deployed scan
+   (`DIM_CUSTOMER`, 1.74 M rows, 1 file, 31 s, `C=1`) gives **≈56,000 rows/s per core** of R2RML
+   materialization, and `files_pruned=0` on every table ⇒ **every row is materialized**. FACT tables
+   (36–200 M rows) → 107–590 s at `C=6`. This single number explains BOTH the nine 55 s cancels AND
+   the 900 s runaway.
+
+**The unifying term:** once the catalog constant (~1.2 s/table) is paid, every shape converges on
+
+```
+  wall ≈ rows_materialized / (56k × cores_used)
+```
+
+so the slate is organized around **rows materialized** (Tier 1: touch fewer; Tier 2: materialize
+less/faster per touched row; Tier 3: the constants + safety around it).
+
+## The headline the slate must state plainly
+
+**The deployed timeout is shape (b), which the epic never optimized.** The three shapes:
+- **(a) tiny-file fact** (`DW_SF01`, the epic's target) — request-floor bound.
+- **(b) single-large-file dim/fact** (`DW_SVL`, the DEPLOYED dataset) — single-thread materialization
+  (`C = min(6, 1) = 1`), the shape the wave never tuned. **This is what times out in production.**
+- **(c) catalog-bound many-table first-touch** (`get_data_model`) — the un-deadlined runaway.
+
+The five families the levers are scored against:
 
 | Family | What it is | Observed | Dominant cost |
 |---|---|---|---|
-| **F-RUNAWAY** | `get_data_model` / info-stats | 900 s, pins query **+** router container 15 min | un-deadlined native full-stats scan of every table |
-| **F-FACT** | any chat query materializing a FACT table (36–200 M rows) | the nine 55–61 s cancels | **row materialization** (CPU) |
-| **F-SINGLE** | a single-large-file table (`DIM_CUSTOMER` 1.74 M rows / 1 file) | 31 s measured, `C=1` | single-threaded materialization |
-| **F-CATALOG** | many-table first-touch (q055 shape; the star-schema breadth) | ~1.2 s/table cold | cross-region catalog RTT × N tables |
-| **F-MANY** | many-tiny-file fact (the DW_SF01 epic shape — **not** this deployed dataset) | epic's tail | per-file request floor `F/C×L` |
+| **F-AGG** (~25/39 shapes) | BI rollups: COUNT/SUM/AVG + GROUP BY, **no row filter** | the bulk of chat | full-table materialization to RDF terms |
+| **F-LIMIT** (~11/39 shapes) | `SELECT … LIMIT 20`, several no ORDER BY | full scans, some cancelled | **budget not forwarded** (bug, A.7) |
+| **F-RUNAWAY** | `get_data_model` / info-stats | 900 s, pins 2 containers | un-deadlined native full-stats scan |
+| **F-SINGLE** | a single-large-file table | 31 s at `C=1` | single-threaded materialization |
+| **F-CATALOG** | many-table first-touch | ~1.2 s/table cold | cross-region catalog RTT × N |
 
-**The measured ceiling that governs the ranking (Track B):** R2RML materialization runs at
-**≈56,000 rows/s per core**, and the box has **≈6 vCPUs**, so the hard throughput ceiling is
-**≈336,000 rows/s** — and `files_pruned=0` on every table means **every row is materialized**. This
-single fact reorders the intuitive slate:
-- The dominant term is **CPU-bound row materialization**, not fetch and not file count.
-- A FACT table already spreads across ≥6 files, so `C = min(6, files) = 6` **already saturates all
-  vCPUs**. Therefore **raising `FLUREE_ICEBERG_SCAN_CONCURRENCY` does almost nothing** for the
-  deployed workload — you cannot exceed 6 concurrent decodes on 6 cores. The three ways past the
-  ceiling are: **(a) materialize fewer rows** (prune/pushdown, or don't materialize at all for
-  stats), **(b) more cores** (bigger Lambda), **(c) use the cores you have** (intra-file
-  parallelism for the single-file case that wastes 5 of 6).
+**The 6-core ceiling that governs the ranking:** materialization is CPU-bound at ~56k rows/s/core on
+~6 vCPUs ⇒ hard ceiling ~336k rows/s. A FACT already spans ≥6 files so `C=6` **already saturates all
+cores** — therefore **raising `FLUREE_ICEBERG_SCAN_CONCURRENCY` does almost nothing** for the deployed
+workload. The only ways past the ceiling: **materialize fewer rows** (Tier 1), **materialize
+less/faster per row or use idle cores** (Tier 2), or **more cores** (Lambda is already maxed).
 
 ---
 
-## Layered slate
+## TIER 1 — Touch fewer rows (attacks the dominant term)
 
-Layers by intervention surface. Within each lever: **mechanism · family covered · predicted effect ·
-cost/risk/owner · dependencies · does NOT fix**.
+### T1.1 — Aggregate pushdown (the MAJORITY lever, ~25/39 shapes). *The "new strategy" tier.*
+- **Mechanism:** the majority of production queries are `COUNT/SUM/AVG … GROUP BY` with **no row
+  filter** — `files_pruned=0` is CORRECT there (nothing to prune). Instead of materializing every
+  row into RDF terms and aggregating on top, compute the rollup at/below the scan: (i) `COUNT` from
+  Iceberg manifest `record_count` sums — **already cheap** where sound (`table_row_count` /
+  `sound_manifest_row_count`, `r2rml.rs:843,2212`; the F22 lineage); (ii) `SUM/AVG/MIN/MAX` per
+  GROUP-BY key from **Parquet column chunks / pushed aggregation** — real column-level compute, not
+  free. Prior art: PR-6 fused-aggregate + F22.
+- **Family:** F-AGG (the bulk of chat).
+- **Predicted effect:** COUNT-class → **sub-second** (manifest, no materialization). SUM/AVG per
+  GROUP-BY key → bounded by column-chunk decode of the aggregated columns only (not all columns ×
+  all rows to terms) — a large fraction of the 336k-rows/s wall removed, but **not** to sub-second for
+  high-cardinality GROUP BY.
+- **Cost/risk/owner:** **engine PR — large** (the COUNT slice is moderate/done-cheap; the SUM/AVG
+  per-key column compute is the real work — size it honestly). Risk: soundness (delete manifests,
+  null handling, GROUP-BY key cardinality), and how far the fused path extends before falling back.
+- **Depends on:** nothing hard; extends existing PR-6/F22 machinery.
+- **Does NOT fix:** queries that need row values (projections, joins on values — F-LIMIT); F-RUNAWAY
+  is a sibling (use T1.2).
 
-### Layer 0 — Stop the bleeding (correctness/safety, not speed)
-
-**L0.1 — Manifest-backed virtual info-stats (routing fix).** *Recommended first — highest severity,
-self-contained.*
+### T1.2 — Manifest-backed virtual info-stats routing (kills the runaway, no deadline needed).
 - **Mechanism:** route a graph-source-federated dataset's `/info` stats to the **existing**
   metadata-only path (`build_graph_source_info` → snapshot-summary row counts, mapping-derived
-  classes/properties, NDV `null`) instead of the native `assemble_full_stats` that materializes the
-  federated tables. The metadata path already exists and is zero-data-read
-  (`ledger_info.rs:1524-1526,1607-1648`); the gap is that `LedgerInfoBuilder::execute` reaches it
-  only on the `is_not_found()` fallback (`:2172-2188`), so a virtual dataset that is *also* a
-  committed ledger takes the scanning native path (`:487,:527`).
+  classes/properties, NDV `null`) instead of native `assemble_full_stats`, which materializes the
+  federated tables. The metadata path exists and is zero-data-read (`ledger_info.rs:1524-1526`); the
+  gap is routing — `LedgerInfoBuilder::execute` reaches it only on the `is_not_found()` fallback
+  (`:2172-2188`), so a virtual dataset that is also a committed ledger takes the scanning native path
+  (`:487,:527`). See A.6.
 - **Family:** F-RUNAWAY (kills it outright).
-- **Predicted effect:** 900 s → **sub-second** for `get_data_model`; removes the container-pin
-  capacity risk. Independent of any deadline fix.
-- **Cost/risk/owner:** **engine PR** (moderate). Risk: correctly detecting "virtual-backed committed
-  ledger" and preserving native output shape; consumers already tolerate `null` NDV/flakes
-  (`Option` fields, "null when unknown, virtual no-scan"). Low blast radius (info path only).
+- **Predicted effect:** 900 s → **sub-second**; removes the container-pin capacity risk.
+- **Cost/risk/owner:** **engine PR — low/moderate** (path exists; routing + skip-scan). Risk: output
+  parity (consumers already tolerate `null` NDV/flakes — `Option` fields "null when unknown, virtual
+  no-scan").
 - **Depends on:** nothing.
-- **Does NOT fix:** F-FACT chat scans (a real query still materializes); this only fixes the *stats*
-  path.
+- **Does NOT fix:** real chat scans (F-AGG/F-LIMIT).
 
-**L0.2 — Deadline everywhere + engine scan-loop cancellation polling.** *Belt-and-suspenders for the
-runaway; makes every cancel actually bite.*
-- **Mechanism:** (solo) attach `x-query-timeout-secs` / `opts.timeout` to **all** engine invokes
-  including `execute_query("info", …)` on the `/data-model` path (currently sends neither —
-  `backend/mod.rs`), so the deadline guard bounds it. (engine) have the Iceberg scan/materialize
-  loop **poll `check_cancelled()` mid-sweep** — today it is checked only between operator pulls /
-  per-POM (`operator.rs:909/1090/1332/2377`), never inside the parquet fan-out or the
-  `decode_large_file` blocking decode (§3d), so a cancel doesn't bite until the current scan yields;
-  and detached `tokio::spawn` reads outlive the query (§3e).
-- **Family:** F-RUNAWAY (bounds it even if L0.1 slips), F-FACT (frees the container promptly on
-  cancel instead of burning to the next checkpoint).
-- **Predicted effect:** 900 s → ≤ deadline; container freed at the deadline instead of at the next
-  operator checkpoint; stops burn-after-abandon.
-- **Cost/risk/owner:** **solo PR** (trivial — add the header) **+ engine PR** (moderate — thread a
-  cancellation check into the scan/decode loop without a per-row cost). Risk: partial-work cleanup
-  of detached reads.
-- **Depends on:** nothing; complements L0.1.
-- **Does NOT fix:** speed — nothing gets faster, the query still fails, just bounded and clean.
+### T1.3 — Family-D fix: forward the LIMIT row-budget through `DatasetOperator` (a confirmed bug).
+- **Mechanism:** `DatasetOperator` (`dataset_operator.rs:339`) inherits the no-op
+  `set_row_budget`/`set_topk`, so a `LIMIT 20` on the dataset path never reaches the R2RML scan and
+  it materializes the full 512 K-row window (A.7, confirmed at the operator level). Mirror
+  `GraphOperator`'s forwarding (`graph.rs:639/647`) onto `DatasetOperator` — thread the budget/topk
+  to each member's inner operator.
+- **Family:** F-LIMIT (~11 shapes).
+- **Predicted effect:** a `LIMIT 20` becomes a ~20-row scan — **full scan → sub-second** for the
+  no-filter LIMIT shapes. Among the highest unlock-per-cost on the board.
+- **Cost/risk/owner:** **engine PR — low** (the pattern is built three times; ~a `set_row_budget`/
+  `set_topk` impl on one operator + a forwarding test). Risk: correctness of per-member budgeting
+  (a shared budget across members vs per-member) — mirror the GraphOperator semantics.
+- **Depends on:** confirming the deployed query uses the dataset path (solo lane; strong indirect
+  evidence — the full-scan-on-`LIMIT` symptom).
+- **Does NOT fix:** F-AGG (no LIMIT to push), aggregate/GROUP-BY shapes, F-RUNAWAY.
 
-### Layer 1 — Engine (plan-level, survive cold, no cache needed)
+### T1.4 — Predicate / row-filter pushdown: investigate `files_pruned=0` first.
+- **Mechanism:** before building new pushdown, **determine why `files_pruned=0` in production** — the
+  ~25/39 F-AGG shapes are genuinely un-prunable (whole-table rollups, our prunes CORRECTLY decline),
+  so this is likely **not** a "fix a bad decline" but a "the queries have no selective predicate."
+  Where filters DO exist, extend PR-7/PR-5 pushdown reach; but the evidence says the majority lever
+  is T1.1 (aggregate pushdown), not row-filter pushdown.
+- **Family:** F-AGG/F-SINGLE **only where a selective predicate exists** (evidence says: rarely).
+- **Predicted effect:** proportional to selectivity; **~0 for whole-table rollups** (the majority).
+- **Cost/risk/owner:** **engine PR — high** (soundness). Owner: engine. **Investigate before
+  scoping** — the answer decides whether this is a real lever or subsumed by T1.1.
+- **Does NOT fix:** unfiltered aggregates (→ T1.1); F-RUNAWAY, F-CATALOG.
 
-**L1.1 — Predicate + row-filter pushdown / file pruning (`files_pruned=0` is the smoking gun).**
-*The only lever that attacks the dominant term across the main chat family.*
-- **Mechanism:** push selective SPARQL FILTERs down to Iceberg row-group pruning + Parquet row
-  filters so fewer rows are materialized. Today `files_pruned=0` on every deployed table — either
-  the BI queries carry no pushable predicate, or the mapping/plan isn't translating it. Extends
-  PR-7 (numeric stats) / PR-5 (top-k) beyond their current trigger shapes.
-- **Family:** F-FACT (the main chat-timeout family), partial F-SINGLE.
-- **Predicted effect:** proportional to selectivity — a query filtered to 1 % of a 200 M FACT drops
-  ~590 s → ~6 s. **Zero** when the query has no selective predicate (a BI "count all orders by
-  region" scans everything by nature).
-- **Cost/risk/owner:** **engine PR** (large, soundness-heavy — the hardest item). Risk: correctness
-  of pushdown/decline; must decline safely (the epic's whole discipline).
-- **Depends on:** knowing the real BI query shapes (do they carry pushable filters? — evidence gap;
-  Track B saw none pushed).
-- **Does NOT fix:** unfiltered aggregate/scan queries; F-RUNAWAY (stats needs no rows at all — use
-  L0.1); F-CATALOG.
+---
 
-**L1.2 — Intra-file (row-group) parallelism.** *The only lever for the single-file regime.*
-- **Mechanism:** decode a single file's row groups across multiple `spawn_blocking` tasks instead of
-  one (`decode_large_file` is one blocking thread, `send_parquet.rs:691`; row groups are independent
-  and already enumerated, `:68`), so a single-file table uses all vCPUs.
-- **Family:** F-SINGLE (and few-file FACTs where files < cores).
-- **Predicted effect:** ~×min(cores, row_groups) for single/few-file tables — `DIM_CUSTOMER` 31 s →
-  ~5–6 s; a 1-file FACT similarly. **No effect** on a table already spread over ≥6 files (it already
-  uses 6 cores).
-- **Cost/risk/owner:** **engine PR** (moderate). Risk: memory (N row groups resident at once);
-  ordering of emitted batches.
-- **Depends on:** nothing; survives cold.
-- **Does NOT fix:** the aggregate CPU ceiling — it redistributes the same 336k rows/s ceiling to use
-  idle cores; a table already at `C=6` gets nothing. F-RUNAWAY, F-CATALOG.
+## TIER 2 — Materialize less / faster per touched row
 
-**L1.3 — Manifest-count fast paths for aggregate queries (extend PR-6).** *Adjacent to L0.1 for
-real queries.*
-- **Mechanism:** answer `COUNT`/simple aggregates from Iceberg `record_count` sums where sound
-  (`table_row_count` / `sound_manifest_row_count` already exist, `r2rml.rs:843,2212`); extend the
-  fused-aggregate to more predicate-less / single-table shapes (the F22 un-fused-COUNT gap).
-- **Family:** F-FACT for the aggregate subset.
-- **Predicted effect:** a `COUNT(*)`-class query over a 200 M FACT → sub-second (no materialization).
-  Bounded to aggregate shapes that don't need row values.
-- **Cost/risk/owner:** **engine PR** (moderate). Risk: soundness of the manifest sum under deletes
-  (guard already exists).
-- **Depends on:** nothing.
-- **Does NOT fix:** queries that materialize rows (projections, joins on values).
+### T2.1 — Projection narrowing (only demanded columns → fewer term materializations).
+- **Mechanism:** materialize RDF terms only for the columns the query actually projects/filters, not
+  the full star. The two-scans finding (a subject scan + a `[PRODUCT_KEY]`-only scan, A.5/iii) shows
+  the machinery reads narrow projections; ensure the R2RML row path doesn't build terms for
+  unreferenced POMs.
+- **Family:** F-AGG (partial), F-SINGLE, F-LIMIT.
+- **Predicted effect:** proportional to (demanded columns / total POMs) — a star with 20 predicates
+  where the query wants 3 could cut materialization ~5–6×. Bounded by how much is already projected.
+- **Cost/risk/owner:** **engine PR — moderate**. Risk: correctness of partial-star materialization.
+- **Does NOT fix:** a query that projects the whole star; the per-row cost floor (→ T2.2).
 
-### Layer 2 — Config / CFN (cheapest, but check the ceiling)
+### T2.2 — R2RML row-path throughput (the ~56k rows/s profile question).
+- **Mechanism:** 56k rows/s/core for a 4-column projection is **slow** — where does it go? Term
+  construction, allocation per binding, IRI encoding, POM iteration? A profile-shaped investigation;
+  the fix is whatever the profile shows (batch term construction, reuse buffers, avoid per-row
+  allocs). Late/lazy materialization (defer term build until a row survives filters/limit) is a
+  candidate.
+- **Family:** ALL materializing families (the shared per-row constant).
+- **Predicted effect:** unknown until profiled — a 2× on the row path is a 2× on the dominant term
+  across every F-AGG/F-SINGLE/F-LIMIT query. Potentially the highest-leverage Tier 2 item, but
+  **unsized** without a profile.
+- **Cost/risk/owner:** **engine — investigate then PR** (profile first). Risk: none to investigate.
+- **Does NOT fix:** the row COUNT (→ Tier 1); it makes each row cheaper, not fewer.
 
-**L2.1 — `FLUREE_ICEBERG_SCAN_CONCURRENCY` in CFN.** *Cheap, but near-moot for THIS workload —
-include only with the caveat.*
-- **Mechanism:** set the env so `C` isn't clamped to `min(available_parallelism, files)`.
-- **Family:** F-MANY (many-tiny-file, I/O-wait-bound), marginally F-FACT.
-- **Predicted effect:** **~0 for the deployed DW_SVL FACTs** — they already have 64–129 files so
-  `C = min(6, files) = 6 =` all vCPUs; you cannot run 8 concurrent decodes on 6 cores for a
-  CPU-bound materialization. Real benefit only when (a) the box has more vCPUs, or (b) the workload
-  is fetch-wait-bound (many tiny files overlapping S3 latency — the DW_SF01 shape, not deployed).
-- **Cost/risk/owner:** **CFN env** (trivial). Risk: memory (more in-flight decodes).
-- **Depends on:** L4.1 (more vCPUs) to matter for F-FACT.
-- **Does NOT fix:** the CPU ceiling on 6 cores; F-SINGLE (1 file → still 1).
+### T2.3 — Intra-file (row-group) parallelism (breaks the `C=1` pin on single-file tables).
+- **Mechanism:** `decode_large_file` runs the whole file on ONE `spawn_blocking` thread
+  (`send_parquet.rs:691`); row groups are independent and enumerated (`:68`). Decode them across
+  cores so a single-file table uses all 6 vCPUs instead of 1.
+- **Family:** F-SINGLE (and few-file tables where files < cores).
+- **Predicted effect:** ~×min(cores, row_groups) — `DIM_CUSTOMER` 31 s → ~5–6 s. **Zero** for a table
+  already spread over ≥6 files (already at `C=6`).
+- **Cost/risk/owner:** **engine PR — moderate**. Plan-level, survives cold. Risk: memory (N row
+  groups resident), emitted-batch ordering.
+- **Does NOT fix:** the aggregate 336k-rows/s ceiling (it redistributes to idle cores; a ≥6-file
+  table gets nothing); F-RUNAWAY, F-CATALOG.
 
-**L2.2 — Raise Lambda memory ⇒ more vCPUs.** *The real "more concurrency" lever.*
-- **Mechanism:** already at 10,240 MB (≈6 vCPU, the max) — so this is **capped**; noted for
-  completeness. The only way to exceed 6 vCPUs is a different compute (Fargate/ECS/EC2), which is
-  L4.
-- **Family:** F-FACT, F-SINGLE (with L1.2).
-- **Predicted effect:** materialization ceiling scales ~linearly with cores — but **Lambda is
-  maxed**, so 0 additional headroom here.
-- **Cost/risk/owner:** **CFN** — but no headroom left; escalates to L4 (non-Lambda compute).
-- **Does NOT fix:** anything within Lambda (already max).
+---
 
-### Layer 3 — Solo request pattern
+## TIER 3 — Constants + hygiene (safety, cold floor, packing)
 
-**L3.1 — Async query pattern (escape the 55 s cap).**
-- **Mechanism:** for known-heavy operations (data-model, big BI scans), return a job id + poll/stream
-  instead of a synchronous 55 s-bounded call; let the Lambda run to a higher bound and deliver when
-  done.
-- **Family:** F-FACT, F-RUNAWAY (bounds the sync router pin).
-- **Predicted effect:** removes the 55 s UX cliff for slow-but-valid queries; the query still takes
-  its wall, but the user gets a result instead of a 504.
-- **Cost/risk/owner:** **solo PR** (large — new async/job surface + UI). Risk: product complexity;
-  still needs a hard ceiling (pair with L0.2).
-- **Depends on:** L0.2 (a real deadline/ceiling so async jobs don't run away).
-- **Does NOT fix:** the wall itself; a 590 s FACT is still 590 s, just not a timeout.
+### T3.1 — Deadline everywhere + engine cancellation-that-bites. *Unconditional — burn protection.*
+- **Mechanism:** (solo) attach `x-query-timeout-secs`/`opts.timeout` to **all** engine invokes incl.
+  `execute_query("info", …)` (currently neither — the runaway). (engine) poll `check_cancelled()`
+  **mid-sweep** in the scan/decode loop — today it's checked only between operator pulls
+  (`operator.rs:909/1090/1332/2377`), never inside the parquet fan-out or `decode_large_file`, and
+  detached `tokio::spawn` reads outlive the query (§3d/3e).
+- **Family:** F-RUNAWAY (bounds it even without T1.2), F-FACT (frees the container promptly).
+- **Predicted effect:** no speedup — bounds the burn and frees containers. Near-mandatory safety.
+- **Cost/risk/owner:** **solo PR — trivial** (header) **+ engine PR — moderate** (mid-loop cancel).
+- **Does NOT fix:** speed — the query still fails, just bounded and clean.
 
-### Layer 4 — Infrastructure / architecture
-
-**L4.1 — Same-region placement (Lambda ↔ parquet ↔ catalog).**
-- **Mechanism:** co-locate the query Lambda with the Iceberg parquet (currently us-east-1 → us-east-2)
-  and the catalog, or replicate parquet into us-east-1.
-- **Family:** F-CATALOG (removes ~1.2 s/table metadata RTT), F-FACT/F-SINGLE (removes cross-region
-  per-byte fetch latency on the cold read).
-- **Predicted effect:** removes a measured ~1.2 s/table cold floor (a multi-second win on a 19-table
-  star) + cross-region fetch latency. **Secondary** — it does not touch the materialization wall, so
-  a FACT query stays >55 s.
-- **Cost/risk/owner:** **infra/CFN + data placement** (moderate; may be a customer-BYO-bucket
-  constraint — the parquet is in a BYO `-use2` bucket, so this may be **not solo's to move**).
-- **Depends on:** where the customer's Iceberg data lives (may be immovable).
+### T3.2 — Same-region placement (Lambda ↔ parquet ↔ catalog).
+- **Mechanism:** co-locate the query Lambda with the BYO parquet (us-east-1 vs us-east-2) + catalog,
+  or replicate parquet into the Lambda region.
+- **Family:** F-CATALOG (removes ~1.2 s/table RTT), cold-read fetch trim.
+- **Predicted effect:** removes a measured ~1.2 s/table cold floor + cross-region fetch latency.
+  **Secondary** — does not touch materialization, so a FACT query stays >55 s.
+- **Cost/risk/owner:** **infra/CFN + data placement — moderate**; **may not be solo's to move** (BYO
+  customer bucket).
 - **Does NOT fix:** materialization (the dominant term).
 
-**L4.2 — Catalog persistence across cold containers (shared/EFS/pre-warm).**
+### T3.3 — Catalog persistence across cold containers (shared/EFS/pre-warm).
 - **Mechanism:** move the per-container `/tmp` catalog cache (cold on all 16 containers) to a shared
-  store (EFS mount or an S3-backed layer), or pre-warm it, so the metadata/pointer/scanfiles survive
-  cold containers.
+  store, or pre-warm it.
 - **Family:** F-CATALOG.
 - **Predicted effect:** removes the cold catalog chain (~1.2 s/table × N) on cold containers.
   Secondary vs materialization.
-- **Cost/risk/owner:** **architecture** (large — EFS mount to Lambda, or a new shared cache). Risk:
-  EFS latency/throughput, concurrency, staleness (the 300 s TTL question, F21).
-- **Depends on:** nothing hard; interacts with the disk cache design.
-- **Does NOT fix:** materialization; the parquet *data* cache still cold unless also shared (bigger).
+- **Cost/risk/owner:** **architecture — large** (EFS to Lambda, or shared cache). Risk: EFS latency,
+  staleness (the 300 s TTL / F21 question).
+- **Does NOT fix:** materialization; the parquet data cache stays cold unless also shared.
 
-**L4.3 — Shared/persistent parquet data cache.**
-- **Mechanism:** back the parquet artifact cache with a shared store so a warmed file survives cold
-  containers (today `/tmp` is per-container; the 8 GiB budget is already engine-wired, §reconciliation
-  — the issue is persistence, not existence).
-- **Family:** F-FACT/F-SINGLE **only on repeated reads of the same file**.
-- **Predicted effect:** helps only when the *same* file is re-read (repeat query on warm shared
-  cache); the first cold read still pays full cost, and cancelled-at-55 s scans never warm it.
-- **Cost/risk/owner:** **architecture** (large). Risk: shared-cache latency can exceed a same-region
-  S3 GET — may not pay off.
-- **Does NOT fix:** the first-ask wall (materialization + cold read); the dominant term.
+### T3.4 — `FLUREE_ICEBERG_SCAN_CONCURRENCY` in CFN. *Near-moot — include with the caveat.*
+- **Mechanism:** set the env so `C` isn't clamped to `min(available_parallelism, files)`.
+- **Family:** F-MANY (fetch-wait-bound, not deployed), marginally.
+- **Predicted effect:** **~0 for the deployed workload** — DW_SVL FACTs already have 64–129 files so
+  `C = min(6, files) = 6 =` all vCPUs; you cannot run 8 CPU-bound decodes on 6 cores. Real benefit
+  only with more vCPUs (Lambda is maxed) or a fetch-wait-bound workload.
+- **Cost/risk/owner:** **CFN env — trivial**. Risk: memory (more in-flight).
+- **Does NOT fix:** the 6-core CPU ceiling; F-SINGLE (1 file → still 1).
 
-### Layer 5 — Data layout (Snowflake / customer side)
+### T3.5 — Compaction (RE-SCOPED: parallelism packing only).
+- **Mechanism:** compact source Iceberg tables to `N × 128 MB` where `N ≥ vCPUs` — enough files to
+  fill all cores, not so few a table drops to `C=1`.
+- **Family:** F-MANY (per-file floor), F-SINGLE (splits a 1-file table so `C>1` without T2.3).
+- **Predicted effect:** **reduces neither rows nor bytes materialized** — it only improves
+  parallelism packing + per-file overhead. So it does NOT touch the dominant term; a 200 M-row FACT
+  is still 200 M rows.
+- **Cost/risk/owner:** **Snowflake-side / customer maintenance — external owner**. Risk: write-side
+  cost + freshness; **compacting to too FEW files re-creates the `C=1` pathology** (the N≥cores
+  target is the guardrail).
+- **Depends on:** customer control of the BYO source layout.
+- **Does NOT fix:** the materialization term; F-RUNAWAY; F-CATALOG.
 
-**L5.1 — Compaction to `N × 128 MB` where `N ≥ vCPUs`.**
-- **Mechanism:** compact the source Iceberg tables so each has ≥ (cores) files of ~128 MB — enough
-  files to fill all cores, not so few that a table drops to `C=1`.
-- **Family:** F-MANY (per-file request-floor collapse), F-SINGLE (splits a 1-file table so `C>1`
-  without L1.2).
-- **Predicted effect:** F-MANY per-file overhead → gone; F-SINGLE gains parallelism. **Moves zero
-  rows**, so the materialization ceiling is unchanged — a 200 M FACT is still 200 M rows to
-  materialize.
-- **Cost/risk/owner:** **Snowflake-side / customer maintenance job** (external owner). Risk:
-  write-side cost + freshness (newly written small files exist until compaction runs); **compacting
-  to too FEW files re-creates the F-SINGLE C=1 pathology** (the two-regime target is the guardrail).
-- **Depends on:** customer control of the source layout (BYO dataset — may not be solo's to run).
-- **Does NOT fix:** the dominant materialization term; F-RUNAWAY; F-CATALOG.
+---
 
-### Layer ∅ — The honest do-nothing per item
+## NON-ENGINE TIER — Product / prompt design (possibly best unlock-per-cost)
 
-For each family, "accept it as-is": F-RUNAWAY do-nothing = keep pinning containers (unacceptable —
-capacity risk, so L0.1/L0.2 are near-mandatory). F-FACT do-nothing = chat returns a clean 504 on
-heavy queries (current state; correctness OK, UX bad). F-CATALOG do-nothing = a multi-second cold
-floor (tolerable). The do-nothing baseline is the yardstick every lever's `(unlock × breadth)/cost`
-is measured against.
+### P.1 — MCP surfaces manifest stats so the LLM needn't issue exploratory rollups.
+- **Mechanism:** the agent issued **~39 whole-table rollups in ONE turn**. If the MCP tool surface
+  hands the LLM the dataset's row counts / column stats / schema up front (from Iceberg manifests —
+  the same zero-read metadata as T1.2/T1.1-COUNT), the model doesn't need to fire exploratory
+  `COUNT/GROUP BY` scans to understand the data.
+- **Family:** F-AGG (removes the *demand*, not just the cost), F-RUNAWAY (get_data_model is this).
+- **Predicted effect:** could remove a large fraction of the 39 rollups outright — the wall you never
+  pay. Plausibly the **best unlock-per-cost** of the whole slate.
+- **Cost/risk/owner:** **solo/product — low/moderate** (tool-surface + prompt design). Risk: the
+  model still issues ad-hoc rollups for genuine questions.
+- **Does NOT fix:** a genuine user question that needs a real rollup (→ T1.1); F-LIMIT, F-SINGLE.
+
+---
+
+## Layer ∅ — The honest do-nothing per item
+
+Per family: **F-RUNAWAY** do-nothing = keep pinning two containers 15 min (unacceptable — T1.2/T3.1
+near-mandatory). **F-AGG** do-nothing = chat 504s on rollups over facts (current state; correctness
+OK, UX bad). **F-LIMIT** do-nothing = a `LIMIT 20` scans the whole table (a *bug* left in place —
+low-cost to fix, so do-nothing is hard to justify). **F-CATALOG** do-nothing = a multi-second cold
+floor (tolerable). Do-nothing is the yardstick each lever's `(unlock × breadth)/cost` is measured on.
 
 ---
 
 ## Ranking — `(predicted unlock × breadth) / cost`
 
-| Rank | Lever | Family | Unlock | Breadth | Cost | Owner | Note |
+| Rank | Lever | Tier | Family | Unlock | Breadth | Cost | Owner |
 |---|---|---|---|---|---|---|---|
-| **1** | **L0.1** manifest-backed info-stats routing | F-RUNAWAY | kills 900 s runaway | narrow (stats) but highest severity | **low-mod** | engine | metadata path already exists — routing fix |
-| **2** | **L0.2** deadline-everywhere + scan-loop cancel | F-RUNAWAY, F-FACT | bounds + frees containers | broad (all invokes) | **low** (solo) + mod (engine) | solo+engine | cheapest safety; make cancels bite |
-| **3** | **L1.1** predicate/row pushdown | F-FACT | attacks the dominant term | broad **iff** queries filter | **high** | engine | ceiling-buster; 0 if no selective predicate |
-| **4** | **L1.2** intra-file row-group parallelism | F-SINGLE | ~×6 single-file | moderate | **mod** | engine | plan-level, survives cold; nothing for ≥6-file tables |
-| **5** | **L1.3** manifest-count aggregate fast paths | F-FACT (agg) | sub-s for COUNT-class | moderate | **mod** | engine | extends PR-6/F22 |
-| **6** | **L3.1** async-query pattern | F-FACT | removes 55 s cliff | broad (UX) | **high** | solo | doesn't speed anything; pair w/ L0.2 |
-| **7** | **L4.1** same-region placement | F-CATALOG, cold floor | ~1.2 s/table | moderate | **mod** | infra | secondary; parquet may be immovable BYO |
-| **8** | **L5.1** compaction (N×128 MB) | F-MANY, F-SINGLE | per-file floor | moderate | **mod** | Snowflake | moves 0 rows; wrong target = C=1 pathology |
-| **9** | **L4.2/4.3** shared catalog/data cache | F-CATALOG | cold-container persistence | narrow | **high** | architecture | secondary vs materialization |
-| **10** | **L2.1** `SCAN_CONCURRENCY` env | F-MANY | ~0 for deployed | narrow | **trivial** | CFN | **near-moot**: FACTs already at C=6=vCPUs |
+| **1** | **T1.3** DatasetOperator budget/topk forwarding | 1 | F-LIMIT | full-scan → sub-s | ~11 shapes | **low** | engine (known pattern) |
+| **2** | **T1.2** manifest-backed info-stats routing | 1 | F-RUNAWAY | 900 s → sub-s | narrow, top severity | **low-mod** | engine (path exists) |
+| **3** | **P.1** MCP surfaces manifest stats | product | F-AGG, F-RUNAWAY | removes the *demand* | broad | **low-mod** | solo/product |
+| **4** | **T1.1** aggregate pushdown | 1 | F-AGG | COUNT→sub-s; SUM/AVG big cut | **majority (~25/39)** | **high** | engine (new strategy) |
+| **5** | **T3.1** deadline + cancel-that-bites | 3 | F-RUNAWAY, F-FACT | bounds burn | broad (safety) | **low**+mod | solo+engine |
+| **6** | **T2.3** intra-file row-group parallelism | 2 | F-SINGLE | ~×6 single-file | moderate | **mod** | engine |
+| **7** | **T2.1** projection narrowing | 2 | F-AGG/SINGLE/LIMIT | ~cols-ratio | broad | **mod** | engine |
+| **8** | **T2.2** R2RML row-path throughput | 2 | all materializing | unknown (profile) | broad | **mod** (profile first) | engine |
+| **9** | **T3.2** same-region placement | 3 | F-CATALOG | ~1.2 s/table | moderate | **mod** | infra (BYO?) |
+| **10** | **T1.4** predicate/row pushdown | 1 | F-AGG (if filtered) | selectivity | narrow (evidence: rare) | **high** | engine (investigate first) |
+| **11** | **T3.3/3.5** catalog persistence / compaction | 3 | F-CATALOG / F-MANY | cold floor / packing | narrow | **high/mod** | arch / Snowflake |
+| **12** | **T3.4** `SCAN_CONCURRENCY` env | 3 | F-MANY | ~0 deployed | narrow | **trivial** | CFN |
 
-**Reading the ranking:** the top of the slate is **not** the intuitive "turn on a cache / raise
-concurrency" — those are near-moot (L2.1) or secondary (L4). The high-value work is **stop the
-runaway (L0.1/L0.2, cheap, near-mandatory)** then **reduce rows materialized (L1.1 pushdown, L1.3
-manifest aggregates) and use idle cores (L1.2)** — because the measured wall is CPU-bound row
-materialization on a fixed 6-core budget, and the only ways past that are to materialize fewer rows
-or use the cores you have.
+**Reading the ranking:** the two cheapest, highest-certainty wins are **T1.3 (a confirmed
+forwarding-bug fix, ~11 shapes)** and **T1.2 (route the runaway to the existing metadata path)** —
+both engine, both low cost, both attack the two clearest failure modes. **P.1 (product)** may beat
+everything on unlock-per-cost by removing the *demand* for rollups. **T1.1 (aggregate pushdown)** is
+the majority lever and the "entirely new strategy" tier — the biggest ceiling, the biggest effort.
+The intuitive infra levers (concurrency env, compaction, shared cache) are **Tier 3 constants** — they
+trim the ~1.2 s/table floor or pack files, but none touch the dominant rows-materialized term.
 
 ---
 
 ## What I most want the adversarial pass to attack
 
-1. **The 56k rows/s ceiling and the "concurrency is moot" claim (L2.1).** One measured point
-   (`DIM_CUSTOMER`, 4 columns). Is materialization really CPU-bound, or is some of that 31 s S3
-   fetch that concurrency *would* overlap? A second measured table (esp. a multi-file FACT's actual
-   rows/s at `C=6`) would confirm or break the ranking. If FACTs are partly fetch-bound, L2.1 and
-   L4.1 rise.
-2. **L1.1's breadth depends on unknown query shapes.** Do the real BI chat queries carry pushable
-   predicates? Track B saw `files_pruned=0` everywhere — is that "no predicate" or "predicate not
-   translated"? The answer moves L1.1 between "ceiling-buster" and "0."
-3. **L0.1 output-parity risk.** Does any consumer of `/data-model` / `/info` depend on exact
-   `flakes`/NDV that the metadata path returns as `null`? If so, routing to the metadata path is a
-   contract change, not a pure win.
-4. **L4.1 feasibility.** Is the customer's BYO parquet bucket (`-use2`) movable/replicable at all, or
-   is cross-region a fixed constraint that makes L4.1 impossible and raises L1's weight?
-5. **Does compaction (L5.1) belong at all** if the customer owns the source layout and the dominant
-   term (materialization) is layout-independent?
+1. **Which path does the deployed query use** — `DatasetOperator` (T1.3 applies, ~11 shapes rescued)
+   or the single-view `GraphOperator` (already forwards, Family D smaller)? An `EXPLAIN` of a
+   `LIMIT 20` on `full-enterprise-byo-1:main` settles it. This directly sizes rank #1.
+2. **The 56k rows/s ceiling is one measured point** (`DIM_CUSTOMER`, 4 columns). Is it truly
+   CPU-bound, or partly fetch that concurrency (T3.4) would overlap? A second measured multi-file-FACT
+   rows/s confirms or breaks the whole tiering.
+3. **T1.1 scope:** how far does the fused/pushed aggregate extend before falling back? COUNT is cheap
+   (manifest); SUM/AVG per high-cardinality GROUP-BY key is real column compute — is the majority of
+   the ~25 shapes COUNT (cheap) or SUM/AVG (expensive)? This sizes rank #4.
+4. **T1.2 output-parity:** does any `/data-model` / `/info` consumer depend on exact `flakes`/NDV that
+   the metadata path returns `null`?
+5. **P.1 realism:** will surfacing stats actually stop the LLM issuing rollups, or does the agent loop
+   issue them regardless? (A prompt/tooling question lambda-audit + AJ are better placed to judge.)
+6. **T2.2 is unsized** — worth a profile before it's ranked; a 2× on the row path is a 2× on
+   everything, but it might be irreducible.

@@ -792,3 +792,48 @@ snapshot summaries give **exact** row counts cheaply; column NDV is optional in 
 (`distinct_counts`) — serve it if present, else `null`. **No full-table scan is required for the
 data-model use case.** This kills the runaway independent of any deadline fix (the deadline fix is
 the orthogonal solo-side belt-and-suspenders).
+
+## A.7 Family D — the LIMIT/row-budget forwarding gap (`DatasetOperator`), a confirmed bug lead
+
+lambda-audit's production shapes include **~11 `SELECT … LIMIT 20` shapes (several with NO ORDER BY)
+that ran FULL scans** over dims AND facts — some among the 55 s cancels. A bare `LIMIT 20` should cap
+the R2RML materialize window to ~20 rows via the row-budget pushdown (PR-4a / PR-5 family). It
+doesn't on the deployed path. **Verified at the operator level — the row budget dies at a
+non-forwarding wrapper:**
+
+- The budget originates when `LimitOperator::open` pushes its limit to its child:
+  `self.child.set_row_budget(budget)` (db `limit.rs:85`), independent of ORDER BY (ORDER BY is only
+  needed for `set_topk`, `operator_tree.rs:3394`). It then propagates **only through operators that
+  override `set_row_budget`**: offset, limit, join, union, project, bind, and **`GraphOperator`**
+  (`graph.rs:639`, which threads it into the inner R2RML subplan — the PR-5 fix). Every other
+  operator inherits the **trait default no-op** (`operator.rs:101`, `set_row_budget` empty; `:111`
+  `set_topk` empty).
+- **`DatasetOperator` (`dataset_operator.rs:177`, `impl Operator` at `:339`) does NOT override
+  `set_row_budget` or `set_topk`** — it inherits the no-op. It is the per-graph scan/wrapper for the
+  DATASET execution path (`DatasetOperator::scan`, `:209`), driving one inner operator per member
+  graph. So a query routed through the dataset path has the shape
+  `Project → Limit → DatasetOperator → [per member: GraphOperator → R2RML scan]`, and
+  `Limit.set_row_budget → DatasetOperator.set_row_budget` **stops** (no-op) — the members never
+  receive the budget → the R2RML scan runs its full 512 K-row materialize window regardless of
+  `LIMIT 20`. filter/distinct/sort also don't forward (correctly for distinct/sort — they need all
+  rows — but they compound the gap when present).
+- **This is the exact PR-5 pattern** ("any directive threaded from a LIMIT down to an R2RML scan must
+  be forwarded by every wrapper in between", [[pr-1495-scan-topk]]), on the **`DatasetOperator`**
+  wrapper instead of the `GraphOperator` wrapper — the team-lead's "forwarding may not exist on the
+  dataset path" hypothesis, confirmed, with the operator identified as `DatasetOperator` (not
+  `DefaultGraphSourceOperator`, which is a specialized edge-annotation operator, `default_graph_source.rs:13`).
+- **Fix:** mirror `GraphOperator`'s forwarding (`graph.rs:639/647`) onto `DatasetOperator` — thread
+  `set_row_budget`/`set_topk` to each member's inner operator. Well-understood, built three times.
+  **Rescues Family D** (~11 shapes) — a `LIMIT 20` becomes a ~20-row scan.
+- **Open confirmation (solo lane):** that the deployed `full-enterprise-byo-1:main` query actually
+  routes through `DatasetOperator` (dataset path) rather than the single-view `GraphOperator` path
+  (which already forwards). The full-scan-on-`LIMIT 20` symptom is strong indirect evidence it does;
+  an `EXPLAIN` of a `LIMIT 20` on the dataset would confirm directly. If some shapes use the
+  single-view path, they are already capped and Family D is smaller than 11.
+
+**Also folded from lambda-audit's cross-answers (F2/F5):** one `Fluree` instance persists per warm
+container (`OnceCell`, solo `handler.rs:36`), so §1c's in-memory caches (R2RML mapping, moka) DO
+survive warm reuse — but that reuse never covers the cold cross-region parquet read, the bottleneck.
+And `available_parallelism()` ≈ 6 at 10,240 MB, so a `files_selected=1` table scans at
+`C = min(6,1) = 1` — the single-file `C=1` pin (A.6) is a deployed-confirmed number, not just a
+prediction.
