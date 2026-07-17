@@ -1262,16 +1262,24 @@ fn fold_over_star_constraints(pats: &[&R2rmlPattern]) -> bool {
     pats.iter().any(|p| !p.star_constraints.is_empty())
 }
 
-/// C5 O2 core predicate: a dataset resolves to a single data source iff its
-/// constituent graphs carry EXACTLY ONE distinct `ledger_id`. The deployed
-/// `FROM <gs>` shape lists the graph source as both a default and a named graph
-/// (both the same ledger), so it collapses to one; a mixed dataset (a native
-/// member, or a second graph source) yields ≥2 and is declined; an empty dataset
-/// yields 0 and is declined (materialize — the safe default). Pure so the guard's
-/// arithmetic is hermetic; the `GraphRef` enumeration wiring is trivial.
-fn ledgers_are_single_source<'s>(ledgers: impl IntoIterator<Item = &'s str>) -> bool {
-    let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    set.extend(ledgers);
+/// C5 O2 core predicate: a dataset resolves to a single data VIEW iff its
+/// constituent graphs collapse to EXACTLY ONE distinct `(ledger_id, to_t, policy)`
+/// tuple. `ledger_id` alone is not enough (Q1): the SAME ledger at two different
+/// `to_t`s, or under two different policy enforcers, is two distinct views the
+/// materialize path would union — so keying on the full tuple declines those too.
+/// The deployed `FROM <gs>` shape lists the graph source as both a default and a
+/// named graph at the same to_t with no policy → one view → admit. A mixed dataset
+/// (a native member, a second graph source, or a second view of the same ledger)
+/// yields ≥2 and is declined; an empty dataset yields 0 and is declined
+/// (materialize — the safe default). Policy identity is by `Arc` pointer (two
+/// distinct enforcer instances read as distinct views — conservative/decline-only,
+/// never falsely admits). Pure so the guard's arithmetic is hermetic.
+fn dataset_views_are_single_source<'s>(
+    views: impl IntoIterator<Item = (&'s str, i64, Option<usize>)>,
+) -> bool {
+    let mut set: std::collections::HashSet<(&str, i64, Option<usize>)> =
+        std::collections::HashSet::new();
+    set.extend(views);
     set.len() == 1
 }
 
@@ -1290,11 +1298,18 @@ impl FusedR2rmlAggregateOperator {
         let Some(ds) = ctx.dataset else {
             return true; // single-graph GRAPH path
         };
-        ledgers_are_single_source(
+        // Key each constituent graph by its full (ledger_id, to_t, policy) view.
+        dataset_views_are_single_source(
             ds.default_graphs()
                 .iter()
-                .map(|g| g.ledger_id.as_ref())
-                .chain(ds.named_graphs_iter().map(|(_, g)| g.ledger_id.as_ref())),
+                .chain(ds.named_graphs_iter().map(|(_, g)| g))
+                .map(|g| {
+                    (
+                        g.ledger_id.as_ref(),
+                        g.to_t,
+                        g.policy_enforcer.as_ref().map(|p| Arc::as_ptr(p) as usize),
+                    )
+                }),
         )
     }
 
@@ -1398,19 +1413,29 @@ impl FusedR2rmlAggregateOperator {
                 return Ok(None);
             };
             // C5 slice-1: default an un-annotated column group key to `xsd:string`
-            // — the R2RML natural mapping for a string column (the DIM string
-            // attributes in this schema, e.g. DimAccount.INDUSTRY / DimStore.CHANNEL,
-            // carry no `rr:datatype`). This mirrors the join path
-            // (`resolve_join_at_open`, the `unwrap_or(xsd::STRING)` there) and admits
-            // the family-A single-table rollups (single-DIM COUNT, and single-table
-            // COUNT+SUM) that the deployed corpus hits. Sound because the generic
-            // materialize path emits the identical `xsd:string` literal for such a
-            // column (hash parity — covered by the family-A parity hermetics). The
-            // `q022`-sentinel OVER-COUNT the old byte-for-byte decline guarded
-            // against is now caught earlier by the `star_constraints` guard above
-            // (`:1304`): any constant-object flag declines before this loop, so the
-            // xsd:string default here can only widen admission for un-flagged,
-            // sound-to-fuse shapes.
+            // — the R2RML natural mapping for an UN-ANNOTATED PLAIN-LITERAL column
+            // (the DIM string attributes in this schema, e.g. DimAccount.INDUSTRY /
+            // DimStore.CHANNEL, carry no `rr:datatype`; the Q2 gate below rejects
+            // lang-/IRI-typed columns for which the "natural string" claim does not
+            // hold). Mirrors the join path (`resolve_join_at_open`, the
+            // `unwrap_or(xsd::STRING)` there) and admits the family-A single-table
+            // rollups (single-DIM COUNT, and single-table COUNT+SUM) the deployed
+            // corpus hits.
+            //
+            // The old byte-for-byte decline this default lifts guarded TWO things,
+            // both now retired by mechanisms that make widening sound:
+            //   1. OVER-COUNT of a flagged shape (the `q022` isCurrent sentinel):
+            //      retired by the `star_constraints` guard above (`:1304`) — any
+            //      constant-object flag declines BEFORE this loop, so the default
+            //      here only ever widens admission for un-flagged shapes.
+            //   2. WRONG group-key TERM vs the materialized answer: retired by
+            //      parity-by-construction — the generic materialize path's
+            //      `LiteralEncoder` registers a datatype Sid only for annotated
+            //      object maps and otherwise falls back to `xsd:string`
+            //      (`operator.rs:1637/1643`), the SAME default applied here, so the
+            //      fold's group key and the materialized key are byte-identical for a
+            //      plain-literal column. (Locked by `default_string_group_key_lexical_parity`
+            //      + `key_at_reads_integer_group_key_from_decimal`; live by q060/q007/q023.)
             //
             // Q2 lang/IRI admission gate: that xsd:string default is a PLAIN-LITERAL
             // assumption. A group-key column whose object map is language-tagged
@@ -2027,22 +2052,74 @@ mod tests {
     /// (materialize, the safe default).
     #[test]
     fn o2_single_source_admits_deployed_shape_declines_mixed() {
-        // Deployed FROM <gs>: default + named graph, both the SAME source.
+        let gs = "enterprise-sf01-v:main";
+        // Deployed FROM <gs>: default + named graph, SAME ledger, same to_t, no policy.
         assert!(
-            ledgers_are_single_source(["enterprise-sf01-v:main", "enterprise-sf01-v:main"]),
+            dataset_views_are_single_source([(gs, 0, None), (gs, 0, None)]),
             "one graph source listed as both default+named must admit"
         );
         // Single member.
-        assert!(ledgers_are_single_source(["gs:main"]));
+        assert!(dataset_views_are_single_source([(gs, 0, None)]));
         // Mixed: graph source unioned with a native ledger → decline.
         assert!(
-            !ledgers_are_single_source(["enterprise-sf01-v:main", "native-orders:main"]),
+            !dataset_views_are_single_source([(gs, 0, None), ("native-orders:main", 0, None)]),
             "a native member alongside the graph source must decline (else under-count)"
         );
         // Two distinct graph sources over the same class → decline.
-        assert!(!ledgers_are_single_source(["gs-a:main", "gs-b:main"]));
+        assert!(!dataset_views_are_single_source([
+            ("gs-a:main", 0, None),
+            ("gs-b:main", 0, None)
+        ]));
+        // Q1 residual: the SAME ledger at two different to_t views → decline
+        // (materialize would union both snapshots).
+        assert!(!dataset_views_are_single_source([(gs, 0, None), (gs, 5, None)]));
+        // Q1 residual: the SAME ledger+to_t under two different policy enforcers →
+        // decline (materialize would union both filtered views).
+        assert!(!dataset_views_are_single_source([
+            (gs, 0, Some(0x1111)),
+            (gs, 0, Some(0x2222))
+        ]));
         // Empty dataset → decline (materialize).
-        assert!(!ledgers_are_single_source(std::iter::empty()));
+        assert!(!dataset_views_are_single_source(std::iter::empty()));
+    }
+
+    /// C5 slice-1/Q2 parity-by-construction: the None→xsd:string default's group
+    /// key encodes to the SAME lexical term the materialize path emits. A String
+    /// column reads its raw value as `GKey::Str` (→ an xsd:string literal via the
+    /// dt_sid resolved from `encode_iri(xsd::STRING)`, the same fallback the
+    /// materialize `LiteralEncoder` uses for an un-annotated column); a NULL value
+    /// reads as `GKey::Null` (→ `Binding::Unbound` → validity-drop == BGP
+    /// exclusion, so a null-keyed row forms no group, matching materialize). The
+    /// int/decimal and null-decimal cases are locked by
+    /// `key_at_reads_integer_group_key_from_decimal`; this locks the string default
+    /// + string-null + the binding forms.
+    #[test]
+    fn default_string_group_key_lexical_parity() {
+        // The default classification: an un-annotated column carries no kind on its
+        // own (`None`), and the applied xsd:string default classifies as String.
+        assert!(group_kind(None).is_none());
+        assert!(matches!(
+            group_kind(Some(fluree_vocab::xsd::STRING)),
+            Some(GKind::String)
+        ));
+
+        let gc = GroupCol {
+            column: "SEGMENT".to_string(),
+            kind: GKind::String,
+            dt_sid: Sid::new(1, "string"),
+        };
+        let col = Column::String(vec![Some("SMB".to_string()), None]);
+        // Present value → the raw string, the xsd:string lexical form materialize emits.
+        assert_eq!(gc.key_at(Some(&col), 0), GKey::Str("SMB".to_string()));
+        // NULL value and a missing column both read as Null (row drops == BGP exclusion).
+        assert_eq!(gc.key_at(Some(&col), 1), GKey::Null);
+        assert_eq!(gc.key_at(None, 0), GKey::Null);
+        // Binding forms: a present key binds a literal; Null binds Unbound (drop).
+        assert!(!matches!(
+            gc.binding(&GKey::Str("SMB".into())),
+            Binding::Unbound
+        ));
+        assert!(matches!(gc.binding(&GKey::Null), Binding::Unbound));
     }
 
     /// Q2 lang/IRI admission gate: a fused single-table group key must be a PLAIN
