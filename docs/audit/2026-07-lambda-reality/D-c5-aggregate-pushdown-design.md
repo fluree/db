@@ -37,6 +37,37 @@ wrapper → `detect` declines at `:338` → materialize)? A dataset composed of 
 leave the primary `graph_source_id` unset (the sources are per-member in `DatasetOperator`), which
 would make the whole family decline — the aggregate-side analogue of the C1 `DatasetOperator` gap.
 
+## CODE-TRACED REFINEMENT (2026-07-17, later): the primary hypothesis is likely WRONG — the wrapper is present and detection runs
+
+Tracing the dataset path from code weakens the "detect:338 declines for lack of a `Pattern::Graph`
+wrapper" hypothesis and re-points the decline:
+- The dataset path **does** call `maybe_wrap_for_graph_source(primary, …)` (`dataset_query.rs:127`),
+  and a `FROM <graph-source>` member resolves via `resolve_as_graph_source` → `resolve_graph_source`,
+  which **sets `db.graph_source_id = Some(gs_id)`** (`fluree_ext.rs:663`). So the primary IS tagged →
+  `maybe_wrap` wraps the WHERE patterns in `Pattern::Graph { Iri(gs_id) }` → **detect's `:338` gate
+  passes.**
+- The dataset execution reaches the **fused-enabled** build: `execute_prepared` → the runner's
+  `build_operator_tree` (`runner.rs:466`) → `build_operator_tree_inner(…, enable_fused=true, …)`
+  (`operator_tree.rs:2224`), which invokes `detect_fused_r2rml_aggregate` (`:2474`). So there is **no
+  build-route bypass** — detection runs on the dataset query.
+- The iceberg dataset path uses a **real** R2RML provider (`execute_dataset_internal_with_r2rml`,
+  `dataset_query.rs:556`), so `resolve_at_open`'s `compiled_mapping` can resolve `graph_iri`.
+
+**So detect very likely FIRES and produces a `FusedR2rmlAggregateOperator`; the materialization
+lambda-audit saw is then most plausibly a SHAPE-specific decline, not a path/wrapper decline:**
+- **The deployed family-A/C shapes carry `SUM`/`AVG`** (e.g. `SUM(?orderTotal)`), whose value-column
+  fold + FK-key resolution is **slice 2** — so those decline (or fold) on the SUM/AVG path, and the
+  deployed majority's cost is **slice-2 territory**, not slice 1.
+- **Family-B COUNT-only single-dim rollups may ALREADY FUSE** — the single-`R2rml` path
+  (`resolve_at_open:1264`) has no SUM/AVG and no join. If they do, slice 1's marginal value is small
+  and the lever is slice 2.
+
+**This re-scopes the gate:** the EXPLAIN below must specifically check a **family-B COUNT-only** shape
+(does it already fuse?) AND a **family-C/SUM** shape (does it decline at the SUM/AVG fold, i.e. is the
+real lever slice 2?). If family B already fuses, C5's headline work is slice-2 SUM/AVG, and slice 1
+shrinks to closing whatever narrow COUNT-only decline remains (if any). I did NOT implement either
+slice pending this — the EXPLAIN decides which slice is the real deployed lever.
+
 ## Verification (name it before designing the fix) — one EXPLAIN
 
 `EXPLAIN` a deployed **family-B** rollup (`SELECT ?segment ?gender (COUNT(?c)) WHERE { ?c a
