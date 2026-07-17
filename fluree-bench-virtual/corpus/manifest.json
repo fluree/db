@@ -1400,6 +1400,54 @@
       "timeout_s": 180,
       "subsets": [],
       "exec_path": "from"
+    },
+    {
+      "id": "q062",
+      "file": "queries/q062_onhand_sum_by_store_dataset.rq",
+      "bi_question": "BI-16: What is total on-hand inventory by store? (C5 dataset-path family-C, fact-dim SUM)",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_INVENTORY_SNAPSHOT",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q063",
+      "file": "queries/q063_accounts_by_industry_ordered_dataset.rq",
+      "bi_question": "BI-05: Accounts by industry, ranked, skipping the top 2. (C5 dataset-path family-A, ORDER BY + OFFSET)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star",
+        "order_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        40
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }
