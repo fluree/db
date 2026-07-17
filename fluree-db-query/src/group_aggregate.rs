@@ -828,6 +828,8 @@ impl Operator for GroupAggregateOperator {
                     let mut current_state: Option<GroupState> = None;
 
                     loop {
+                        // R3-A: per-batch deadline poll (see the general-path loop).
+                        ctx.check_cancelled()?;
                         let batch = match self.child.next_batch(ctx).await? {
                             Some(b) => b,
                             None => break,
@@ -901,6 +903,12 @@ impl Operator for GroupAggregateOperator {
 
                 // General path: hash-based accumulation.
                 loop {
+                    // R3-A: the hash-aggregate fold buffers proportional to input
+                    // and, over a fully-buffered join child, can run minutes without
+                    // pulling a polling scan — so poll the deadline per batch here
+                    // (batch granularity; the per-row fold below is bounded by one
+                    // batch between polls). Closes the uncancelled post-scan gap.
+                    ctx.check_cancelled()?;
                     let batch = match self.child.next_batch(ctx).await? {
                         Some(b) => b,
                         None => break,
@@ -1120,6 +1128,73 @@ mod tests {
 
         // No edges (RDF surface): two same-node paths group together.
         assert_eq!(key(&path(vec![])), key(&path(vec![])));
+    }
+
+    /// R3-A: the hash-aggregate fold runs entirely in the first `next_batch`, over
+    /// a possibly fully-buffered join child, with no poll of its own. With a
+    /// pre-cancelled deadline it must abort typed `Cancelled` at the fold's
+    /// per-batch poll, not run to completion.
+    #[tokio::test]
+    async fn r3a_group_aggregate_polls_cancellation() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{QueryCancellation, QueryCancellationReason};
+
+        let snapshot = make_test_snapshot();
+        let vars = VarRegistry::new();
+        let cancel = QueryCancellation::new();
+        cancel.cancel_with(QueryCancellationReason::Timeout);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                vec![Binding::sid(Sid::new(100, "v"))],
+                vec![Binding::sid(Sid::new(200, "p"))],
+            ],
+        )
+        .unwrap();
+
+        struct BatchOperator {
+            schema: Arc<[VarId]>,
+            batch: Option<Batch>,
+        }
+        #[async_trait]
+        impl Operator for BatchOperator {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(self.batch.take())
+            }
+            fn close(&mut self) {}
+        }
+
+        let child: BoxedOperator = Box::new(BatchOperator {
+            schema: schema.clone(),
+            batch: Some(batch),
+        });
+        let agg_specs = vec![StreamingAggSpec {
+            function: AggregateFn::Count(VarId(1)),
+            input_col: Some(1),
+            output_var: VarId(2),
+        }];
+        let mut op = GroupAggregateOperator::new(child, vec![VarId(0)], agg_specs, None, false);
+
+        // Either open() (if it polls) or the first next_batch (where the fold runs)
+        // must surface the deadline.
+        let result = match op.open(&ctx).await {
+            Err(e) => Err(e),
+            Ok(()) => op.next_batch(&ctx).await.map(|_| ()),
+        };
+        assert!(
+            matches!(result, Err(crate::error::QueryError::Cancelled { .. })),
+            "fold must poll the deadline, got {result:?}"
+        );
     }
 
     #[tokio::test]

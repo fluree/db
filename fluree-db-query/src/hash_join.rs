@@ -665,6 +665,11 @@ impl HashJoinOperator {
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
         while let Some(batch) = build.next_batch(ctx).await? {
+            // R3-A: the build side is drained FULLY here in open() — for a
+            // multi-million-row FACT build that is minutes of accumulation with no
+            // poll of its own. Poll the deadline per build batch so an over-budget
+            // build gives up cleanly instead of running to an OOM.
+            ctx.check_cancelled()?;
             for row in 0..batch.len() {
                 let row_vals: Vec<Binding> = (0..ncols)
                     .map(|c| batch.get_by_col(row, c).clone())
@@ -766,6 +771,9 @@ impl Operator for HashJoinOperator {
         let probe = self.probe.as_mut().expect("hash join probe");
 
         loop {
+            // R3-A: poll the deadline per probe-drive iteration (batch granularity;
+            // the inner per-probe-row loop is bounded by one batch between polls).
+            ctx.check_cancelled()?;
             // Ensure we have a probe batch to consume.
             if self.cur_probe.is_none() {
                 match probe.next_batch(ctx).await? {
@@ -1029,6 +1037,58 @@ mod tests {
         assert_eq!(
             rows, 2,
             "Poisoned build row must not fan out to every probe row"
+        );
+    }
+
+    /// R3-A: HashJoin drains its build side FULLY in `open()` with no poll of its
+    /// own — a multi-million-row FACT build ran minutes to an OOM. With a
+    /// pre-cancelled deadline, `open()` must abort typed `Cancelled` at the build
+    /// loop's per-batch poll, not run the drain to completion.
+    #[tokio::test]
+    async fn r3a_hash_join_build_polls_cancellation() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{
+            FlakeValue, LedgerSnapshot, QueryCancellation, QueryCancellationReason,
+        };
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+        let cancel = QueryCancellation::new();
+        cancel.cancel_with(QueryCancellationReason::Timeout);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let build_batch =
+            Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let probe_batch =
+            Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let right_pattern =
+            TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+        let mut hj = HashJoinOperator::new(
+            Box::new(OnceOp {
+                schema: build_schema,
+                batch: Some(build_batch),
+            }),
+            Box::new(OnceOp {
+                schema: probe_schema,
+                batch: Some(probe_batch),
+            }),
+            x,
+            None,
+            right_pattern,
+            None,
+            crate::temporal_mode::PlanningContext::current().mode(),
+        );
+        let err = hj.open(&ctx).await.unwrap_err();
+        assert!(
+            matches!(err, crate::error::QueryError::Cancelled { .. }),
+            "build drain must poll the deadline, got {err:?}"
         );
     }
 
