@@ -41,7 +41,7 @@ use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::{
-    extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap,
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{get_join_key_from_batch, materialize_object_from_batch};
 use fluree_db_tabular::Column;
@@ -891,6 +891,34 @@ impl FusedR2rmlAggregateOperator {
         }
     }
 
+    /// Q2 admission gate: a group-key column may be fused only when its object map
+    /// produces a PLAIN LITERAL — `TermType::Literal` and no language tag. A
+    /// language-tagged (`rdf:langString`) or IRI-/blank-node-typed column
+    /// materializes a term whose datatype/lang/term-type the fused fold's
+    /// `xsd:string` default would mis-encode, so the grouped key would disagree
+    /// with the generic materialize path. `scalar_column_for_var` discards these
+    /// two fields (the `..`), so this checks them directly. Decline-only.
+    fn group_key_col_is_plain_literal(pattern: &R2rmlPattern, tm: &TriplesMap, var: VarId) -> bool {
+        let Some(pred) = Self::predicate_for_var(pattern, var) else {
+            return false;
+        };
+        let mut poms = tm
+            .predicate_object_maps
+            .iter()
+            .filter(|pom| pom.predicate_map.as_constant() == Some(pred));
+        let (Some(pom), None) = (poms.next(), poms.next()) else {
+            return false;
+        };
+        matches!(
+            &pom.object_map,
+            ObjectMap::Column {
+                language: None,
+                term_type: TermType::Literal,
+                ..
+            }
+        )
+    }
+
     /// Resolve the (single, scalar-column) object map a variable's predicate maps
     /// to, for materializing the variable's value during FILTER evaluation.
     fn object_map_for_var(
@@ -1383,6 +1411,17 @@ impl FusedR2rmlAggregateOperator {
             // (`:1304`): any constant-object flag declines before this loop, so the
             // xsd:string default here can only widen admission for un-flagged,
             // sound-to-fuse shapes.
+            //
+            // Q2 lang/IRI admission gate: that xsd:string default is a PLAIN-LITERAL
+            // assumption. A group-key column whose object map is language-tagged
+            // (rdf:langString) or IRI-/blank-node-typed materializes a term the
+            // fused fold would MIS-ENCODE as an xsd:string literal — a different
+            // datatype/lang/term-type than the generic path emits, so the grouped
+            // key would disagree with the materialized answer. Decline such a key
+            // (decline-only — never over-counts, never widens past the plain case).
+            if !Self::group_key_col_is_plain_literal(&pattern, tm, *gv) {
+                return Ok(None);
+            }
             let dt_iri = datatype.as_deref().unwrap_or(fluree_vocab::xsd::STRING);
             let Some(kind) = group_kind(Some(dt_iri)) else {
                 return Ok(None);
@@ -2004,6 +2043,50 @@ mod tests {
         assert!(!ledgers_are_single_source(["gs-a:main", "gs-b:main"]));
         // Empty dataset → decline (materialize).
         assert!(!ledgers_are_single_source(std::iter::empty()));
+    }
+
+    /// Q2 lang/IRI admission gate: a fused single-table group key must be a PLAIN
+    /// LITERAL. A language-tagged (`rdf:langString`) or IRI-/blank-node-typed
+    /// column declines — the fold's `xsd:string` default would mis-encode the
+    /// materialized term (a different datatype/lang/term-type Sid), so the grouped
+    /// key would disagree with the generic materialize path.
+    #[test]
+    fn q2_group_key_plain_literal_gate() {
+        use fluree_db_r2rml::mapping::{PredicateMap, PredicateObjectMap};
+        let pred = "http://ex/attr";
+        let make = |om: ObjectMap| {
+            let tm = TriplesMap::new("http://ex/TM", "T").with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(pred),
+                object_map: om,
+            });
+            let mut pat = R2rmlPattern::new("gs", VarId(0), None);
+            pat.star_bindings = vec![(pred.to_string(), VarId(1))];
+            (pat, tm)
+        };
+        let col = |datatype: Option<&str>, language: Option<&str>, term_type: TermType| {
+            ObjectMap::Column {
+                column: "C".into(),
+                datatype: datatype.map(str::to_string),
+                language: language.map(str::to_string),
+                term_type,
+            }
+        };
+        let is_plain = |om: ObjectMap| {
+            let (p, t) = make(om);
+            FusedR2rmlAggregateOperator::group_key_col_is_plain_literal(&p, &t, VarId(1))
+        };
+
+        // Plain literal (un-annotated) and a typed literal both admit.
+        assert!(is_plain(col(None, None, TermType::Literal)));
+        assert!(is_plain(col(
+            Some("http://www.w3.org/2001/XMLSchema#integer"),
+            None,
+            TermType::Literal
+        )));
+        // Language-tagged, IRI-typed, and blank-node-typed all decline.
+        assert!(!is_plain(col(None, Some("en"), TermType::Literal)));
+        assert!(!is_plain(col(None, None, TermType::Iri)));
+        assert!(!is_plain(col(None, None, TermType::BlankNode)));
     }
     use crate::ir::triple::{Ref, Term, TriplePattern};
     use crate::ir::{Query, QueryOutput, ReasoningConfig};
