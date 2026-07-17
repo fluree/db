@@ -492,35 +492,6 @@ fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
     }
 }
 
-/// Build a JSON representation of a graph source record for the info endpoint.
-fn graph_source_info_json(gs: &fluree_db_nameservice::GraphSourceRecord) -> JsonValue {
-    let mut obj = serde_json::json!({
-        "name": gs.name,
-        "branch": gs.branch,
-        "type": format_source_type(&gs.source_type),
-        "graph_source_id": gs.graph_source_id,
-        "retracted": gs.retracted,
-        "index_t": gs.index_t,
-    });
-
-    if let Some(ref id) = gs.index_id {
-        obj["index_id"] = serde_json::Value::String(id.to_string());
-    }
-
-    if !gs.dependencies.is_empty() {
-        obj["dependencies"] = serde_json::json!(gs.dependencies);
-    }
-
-    // Include parsed config if non-empty
-    if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<JsonValue>(&gs.config) {
-            obj["config"] = parsed;
-        }
-    }
-
-    obj
-}
-
 // =============================================================================
 // Info
 // =============================================================================
@@ -617,10 +588,16 @@ pub async fn info(
         let ledger_state = match super::query::load_ledger_for_query(&state, alias, &span).await {
             Ok(ls) => ls,
             Err(ServerError::Api(ref e)) if e.is_not_found() => {
-                // Try graph source lookup
+                // Try graph source lookup. A virtual (R2RML/Iceberg) dataset is
+                // routed through the SHARED api builder so its `/info` returns
+                // real classes/properties/counts (metadata-only) with NO secrets.
                 if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
+                    let info =
+                        fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
+                            .await
+                            .map_err(ServerError::Api)?;
                     tracing::info!(status = "success", "graph source info retrieved");
-                    return Ok(Json(graph_source_info_json(&gs)).into_response());
+                    return Ok(Json(info).into_response());
                 }
                 set_span_error_code(&span, "error:NotFound");
                 return Err(ServerError::Api(ApiError::NotFound(alias.to_string())));
@@ -729,10 +706,13 @@ async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) ->
         }
     }
 
-    // Try graph source lookup
+    // Try graph source lookup (shared builder: redacted, virtual-aware).
     if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
+        let info = fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
+            .await
+            .map_err(ServerError::Api)?;
         tracing::info!(status = "success", "graph source info retrieved");
-        return Ok(Json(graph_source_info_json(&gs)).into_response());
+        return Ok(Json(info).into_response());
     }
 
     let server_error = ServerError::Api(ApiError::NotFound(alias.to_string()));

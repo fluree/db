@@ -231,6 +231,26 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+
+        // A subgraph ("crawl") projection over an R2RML graph source cannot use
+        // native binary-index hydration (the source has no flakes); expand it
+        // through the R2RML operator instead. Only a wildcard `["*"]` crawl is
+        // handled here — any other shape returns `None` and falls through to the
+        // normal path unchanged.
+        #[cfg(feature = "iceberg")]
+        if let Some(expanded) = crate::graph_source::crawl::maybe_expand_crawl(
+            self.graph.fluree,
+            &view,
+            input.as_jsonld(),
+            r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+            execution.clone(),
+            &format_config,
+        )
+        .await?
+        {
+            return Ok(expanded);
+        }
+
         let result = match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph
@@ -280,6 +300,35 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         let tracking = self.core.tracking.take();
         let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
+
+        // Intercept a virtual-dataset subgraph crawl BEFORE dispatch, exactly
+        // like `execute_formatted` — otherwise the same crawl issued with
+        // tracking headers falls through to native hydration and returns [].
+        // The crawl has no fuel/policy/time stats, so it returns a 200 with
+        // empty tracking (mirrors `FromQueryBuilder::execute_tracked`).
+        #[cfg(feature = "iceberg")]
+        {
+            let fc = format_config
+                .clone()
+                .unwrap_or_else(|| self.core.default_format());
+            match crate::graph_source::crawl::maybe_expand_crawl(
+                self.graph.fluree,
+                &db,
+                input.as_jsonld(),
+                r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref())),
+                execution.clone(),
+                &fc,
+            )
+            .await
+            {
+                Ok(Some(expanded)) => {
+                    return Ok(TrackedQueryResponse::success(expanded, None));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(TrackedErrorResponse::new(500, e.to_string(), None)),
+            }
+        }
+
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
                 self.graph

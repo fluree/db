@@ -63,7 +63,10 @@ pub use commit_flakes::generate_commit_flakes;
 pub use error::{Result, TransactError};
 pub use flake_sink::FlakeSink;
 pub use generate::{apply_cancellation, FlakeGenerator};
-pub use ir::{InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+pub use ir::{
+    GraphMgmtOp, GraphSel, GraphTarget, InlineValues, TemplateTerm, TripleTemplate, Txn, TxnOpts,
+    TxnType,
+};
 pub use lower_sparql_update::{
     lower_sparql_update, lower_sparql_update_ast, lower_sparql_update_request, LowerError,
 };

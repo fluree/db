@@ -238,6 +238,21 @@ path = "tests/it_graph_source_r2rml.rs"
 required-features = ["iceberg"]
 
 [[test]]
+name = "it_iceberg_generate_live"
+path = "tests/it_iceberg_generate_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_sample_live"
+path = "tests/it_iceberg_sample_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_provisional_live"
+path = "tests/it_iceberg_provisional_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
 name = "it_iceberg_direct"
 path = "tests/it_iceberg_direct.rs"
 required-features = ["iceberg", "aws-testcontainers"]

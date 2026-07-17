@@ -11,6 +11,7 @@ use crate::manifest::{parse_manifest, parse_manifest_list};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
 use crate::scan::planner::{FileScanTask, ScanConfig, ScanPlan};
 use crate::scan::pruning::can_contain_file;
+use tracing::Instrument;
 
 /// Send-safe scan planner for Iceberg tables.
 ///
@@ -44,7 +45,31 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
     }
 
     /// Plan a scan for a specific snapshot.
+    ///
+    /// Wraps the planning work (manifest-list + manifest reads and file pruning)
+    /// in an `iceberg.scan_plan` timing span and records the selected/pruned file
+    /// counts and estimated row count on the span once they are known.
     pub async fn plan_scan_for_snapshot(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
+        let span = tracing::debug_span!(
+            "iceberg.scan_plan",
+            files_selected = tracing::field::Empty,
+            files_pruned = tracing::field::Empty,
+            estimated_row_count = tracing::field::Empty,
+        );
+        async move {
+            let plan = self.plan_scan_for_snapshot_inner(snapshot).await?;
+            let span = tracing::Span::current();
+            span.record("files_selected", plan.files_selected);
+            span.record("files_pruned", plan.files_pruned);
+            span.record("estimated_row_count", plan.estimated_row_count);
+            Ok(plan)
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Inner planning implementation (see [`Self::plan_scan_for_snapshot`]).
+    async fn plan_scan_for_snapshot_inner(&self, snapshot: &Snapshot) -> Result<ScanPlan> {
         let schema = self
             .metadata
             .current_schema()

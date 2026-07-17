@@ -138,6 +138,12 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// Whether any reasoning/entailment mode was enabled for this query.
+    ///
+    /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
+    /// read by the R2RML rewriter to refuse an exact-class wildcard fusion that
+    /// could drop a subclass-entailed subject.
+    pub reasoning_active: bool,
 }
 
 /// Inputs that the preparation phase needs to know up front.
@@ -464,6 +470,7 @@ pub async fn prepare_execution_with_config(
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_active: reasoning.has_any_enabled(),
         })
     }
     .instrument(span)
@@ -672,6 +679,12 @@ pub struct ContextConfig<'a, 'b> {
     /// for Fluree-system predicates. Surfaced via
     /// `opts.includeSystemFacts: true` on JSON-LD queries.
     pub include_system_facts: bool,
+    /// When true, the injected true-wildcard crawl scan renders R2RML
+    /// `RefObjectMap` objects by templating the parent IRI from the child row's
+    /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
+    /// set only by the graph-source browse-crawl path. See
+    /// [`ExecutionContext::trust_fk_refs`].
+    pub trust_fk_refs: bool,
     /// Binary columnar index store for `BinaryScanOperator`.
     ///
     /// This is the explicit path — separate from `LedgerSnapshot.range_provider` which
@@ -802,6 +815,12 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if db.eager || prepared.derived_overlay.is_some() {
         ctx = ctx.with_eager_materialization();
     }
+    // Let the R2RML rewriter see whether entailment is active so it can refuse
+    // an exact-class wildcard fusion that a subclass-entailed subject would
+    // otherwise be dropped by.
+    if prepared.reasoning_active {
+        ctx = ctx.with_reasoning_active(true);
+    }
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
@@ -829,6 +848,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);
+    }
+    if config.trust_fk_refs {
+        ctx = ctx.with_trust_fk_refs(true);
     }
     if let Some(store) = config.binary_store {
         ctx = ctx.with_binary_store(store, config.binary_g_id);

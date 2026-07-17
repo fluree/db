@@ -206,6 +206,22 @@ pub fn parse_group_graph_pattern(
         .ok_or_else(|| "Failed to parse group graph pattern".to_string())
 }
 
+/// Parse a SPARQL 1.2 triple-term value `<<( s p o )>>` from a token
+/// stream, for the expression parser's `BIND(<<( … )>> AS ?v)` /
+/// `FILTER(… <<( … )>> …)` forms. Expects the stream positioned at the
+/// opening `<<(`. Blank nodes are rejected — a triple term used in an
+/// expression is a value, not a pattern (negative `bindbnode-tripleterm`).
+/// The specific diagnostic is recorded on the shared stream; the returned
+/// error string is only the coarse Result-level fallback.
+pub fn parse_triple_term_value(
+    stream: &mut super::stream::TokenStream,
+) -> Result<crate::ast::annotation::TripleTerm, String> {
+    let mut parser = Parser::new(stream);
+    parser
+        .parse_triple_term_value(false)
+        .ok_or_else(|| "Failed to parse triple term".to_string())
+}
+
 /// The SPARQL parser.
 struct Parser<'a> {
     stream: &'a mut super::stream::TokenStream,
@@ -311,7 +327,16 @@ impl<'a> Parser<'a> {
                 break;
             }
             match &self.stream.peek().kind {
-                TokenKind::KwInsert | TokenKind::KwDelete | TokenKind::KwWith => {
+                TokenKind::KwInsert
+                | TokenKind::KwDelete
+                | TokenKind::KwWith
+                | TokenKind::KwLoad
+                | TokenKind::KwClear
+                | TokenKind::KwDrop
+                | TokenKind::KwCreate
+                | TokenKind::KwAdd
+                | TokenKind::KwCopy
+                | TokenKind::KwMove => {
                     let operation = self.parse_update_operation()?;
 
                     // Cross-op bnode-label scope validation.

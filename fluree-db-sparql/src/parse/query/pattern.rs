@@ -320,15 +320,22 @@ impl super::Parser<'_> {
 
         let span = start.union(self.stream.previous_span());
 
-        // Simplify: if there's only one pattern, return it directly.
+        // Simplify: unwrap a single-child group to its child, EXCEPT when the
+        // child is scope-sensitive (FILTER, BIND, or a nested Group). Unwrapping
+        // a scope-sensitive child would erase the `{ }` scope boundary: a nested
+        // `{ FILTER(?v) }` or `{ { ... } }` must stay a Group so the lowerer
+        // routes it through an uncorrelated subquery (an independent scope), where
+        // a FILTER/BIND cannot see an enclosing-scope variable (W3C
+        // filter-nested-2, dawg-optional-filter-005). Triples/OPTIONAL/UNION/paths
+        // carry no such hazard, so they still unwrap — keeping common
+        // single-pattern groups cheap. See GraphPattern::is_scope_sensitive.
         //
-        // INVARIANT (consumed by lower/pattern.rs): nested Group nodes in the AST
-        // always correspond to explicitly braced `{ }` blocks from the source
-        // query — never synthetic wrappers.  This simplification ensures that: a
-        // single-pattern `{ }` block produces the pattern itself (not a Group),
-        // and only multi-pattern blocks produce Group nodes.  The lowering layer
-        // relies on this to decide when to introduce scope-boundary subqueries.
-        if patterns.len() == 1 {
+        // INVARIANT (consumed by lower/pattern.rs): a nested Group node in the AST
+        // always corresponds to an explicitly braced `{ }` block from the source
+        // query — never a synthetic wrapper — and has either ≥2 children or a
+        // single scope-sensitive child. The lowering layer relies on this to
+        // decide when to introduce scope-boundary subqueries.
+        if patterns.len() == 1 && !patterns[0].is_scope_sensitive() {
             Some(patterns.remove(0))
         } else {
             Some(GraphPattern::group(patterns, span))
@@ -753,6 +760,15 @@ impl super::Parser<'_> {
         // Literal
         if let Some(lit) = self.parse_literal() {
             return Some(Some(Term::Literal(lit)));
+        }
+
+        // RDF 1.2 triple term *value* `<<( s p o )>>` as an inline-data
+        // value (`basic-tripleterm-05`). Blank nodes are not values in a
+        // VALUES block, so disallow them inside the term; accept-then-defer
+        // (D-1) — lowering rejects the term with `not_implemented`.
+        if self.stream.check(&TokenKind::TripleTermStart) {
+            let tt = self.parse_triple_term_value(false)?;
+            return Some(Some(Term::TripleTerm(Box::new(tt))));
         }
 
         None

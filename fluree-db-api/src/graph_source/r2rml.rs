@@ -26,7 +26,7 @@ use fluree_db_query::r2rml::{
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 /// How many data files to read concurrently. Defaults to
 /// `min(available_parallelism, files, 8)`; override with
@@ -59,6 +59,15 @@ fn config_fingerprint(config: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     config.hash(&mut h);
     h.finish()
+}
+
+/// Build the process-wide REST-client cache key for a graph source: its id plus a
+/// fingerprint of the raw config JSON. Shared by the query scan path and the
+/// `/info` row-count fetch so both reuse the SAME cached client (one OAuth token
+/// and one HTTPS connection pool), warmed by whichever path runs first. Keeping
+/// this in one place guarantees the two keys never drift.
+pub(crate) fn rest_client_cache_key(graph_source_id: &str, config: &str) -> String {
+    format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
 }
 
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
@@ -654,6 +663,36 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         filters: &[ScanFilter],
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
+        // Time the whole scan SETUP (loadTable + planning) as one span; it closes
+        // when the stream is constructed. Per-file Parquet decode happens later,
+        // while the returned stream is consumed, and is timed separately by the
+        // `iceberg.parquet_read` spans, so a bare wrapper here would not (and must
+        // not) cover decode.
+        let span = tracing::debug_span!(
+            "r2rml.scan_table",
+            graph_source_id,
+            table_name,
+            projection_len = projection.len()
+        );
+        self.scan_table_inner(graph_source_id, table_name, projection, filters, _as_of_t)
+            .instrument(span)
+            .await
+    }
+}
+
+impl FlureeR2rmlProvider<'_> {
+    /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
+    /// trait method can wrap the setup in an `r2rml.scan_table` timing span via
+    /// `.instrument()` (the codebase's established pattern for timing an async body
+    /// without holding a span guard across an `.await`).
+    async fn scan_table_inner(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -720,10 +759,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 // ~hour instead of one per query. The fingerprint hashes the full
                 // source config, so a rotated PAT (or any config change) builds a
                 // fresh client.
-                let client_fp = format!(
-                    "{graph_source_id}\u{1f}{:016x}",
-                    config_fingerprint(&record.config)
-                );
+                let client_fp = rest_client_cache_key(graph_source_id, &record.config);
                 let catalog = match cache.rest_client(&client_fp) {
                     Some(c) => c,
                     None => {
@@ -778,8 +814,16 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                     } else {
                         info!(catalog_uri = %uri, namespace = %table_id.namespace,
                             table = %table_id.table, "Loading table from REST catalog");
+                        // The cold REST/OAuth catalog round-trip (~1-3s) — the
+                        // highest-value span for attributing a slow virtual-dataset
+                        // query to cold-remote-retrieval vs. caching vs. decode.
                         let actual = catalog
                             .load_table(&table_id, iceberg_config.io.vended_credentials)
+                            .instrument(tracing::debug_span!(
+                                "r2rml.load_table",
+                                namespace = %table_id.namespace,
+                                table = %table_id.table,
+                            ))
                             .await
                             .map_err(|e| {
                                 QueryError::Internal(format!(
@@ -1129,6 +1173,18 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                 let footers = Arc::clone(&footers);
                 let disk_cache = Arc::clone(&disk_cache);
                 let cache_dir = cache_dir.clone();
+                // Create the per-file span HERE, before `tokio::spawn`, so it is
+                // parented under the consumer's current span: `tokio::spawn` does
+                // NOT propagate the current span into the spawned task, but a span
+                // records its parent at creation time. Instrumenting the read
+                // future inside the task then times the actual read+decode while
+                // keeping the correct parent (and gives each concurrent read a
+                // distinct span, respecting the `buffer_unordered` fan-out).
+                let read_span = tracing::debug_span!(
+                    "iceberg.parquet_read",
+                    path = %task.data_file.file_path,
+                    file_size = task.data_file.file_size_in_bytes,
+                );
                 async move {
                     tokio::spawn(async move {
                         let reader = SendParquetReader::with_caches(
@@ -1137,12 +1193,16 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
                             &disk_cache,
                             &cache_dir,
                         );
-                        reader.read_task(&task).await.map_err(|e| {
-                            QueryError::Internal(format!(
-                                "Failed to read Parquet file '{}': {e}",
-                                task.data_file.file_path
-                            ))
-                        })
+                        reader
+                            .read_task(&task)
+                            .instrument(read_span)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!(
+                                    "Failed to read Parquet file '{}': {e}",
+                                    task.data_file.file_path
+                                ))
+                            })
                     })
                     .await
                     .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?

@@ -242,6 +242,25 @@ impl Function {
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<bool> {
         let value = self.eval(args, row, ctx)?;
-        Ok(value.is_some_and(Into::into))
+        match value {
+            // A typed literal gets the strict §17.2.2 EBV (the rules the Var
+            // path applies via `binding_effective_bool`): the lenient
+            // conversion below read EVERY typed literal as truthy, so
+            // `FILTER(xsd:float("0"))` and `FILTER(STRDT("abc", xsd:integer))`
+            // — string-backed cast/computed values — passed where the spec
+            // gives them a numeric (respectively rule-1 false) EBV.
+            Some(v @ ComparableValue::TypedLiteral { .. }) => {
+                crate::eval::comparable_effective_bool(&v)
+            }
+            // Everything else keeps the lenient conversion: the dispatcher is
+            // shared with the Cypher surface, whose structural truthiness
+            // (nodes/Sids, temporals — `_ => true`) is a deliberate D-12
+            // carve-out; SPARQL-strict EBV for IRI/temporal function results
+            // stays with the deferred strict-EBV follow-up.
+            Some(v) => Ok(v.into()),
+            // A type-error-demoted-to-unbound result stays false in boolean
+            // position (the pre-existing convention for `Ok(None)` builtins).
+            None => Ok(false),
+        }
     }
 }

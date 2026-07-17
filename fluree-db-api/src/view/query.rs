@@ -8,7 +8,7 @@ use crate::query::helpers::{
     parse_jsonld_query, parse_sparql_to_ir, prepare_for_execution, status_for_query_error,
     tracked_query_tracker, tracker_for_limits,
 };
-use crate::view::{GraphDb, QueryInput};
+use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
     ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
     TrackingOptions,
@@ -67,11 +67,14 @@ impl Fluree {
     /// let result = fluree.query(&db, "SELECT * WHERE { ?s ?p ?o }").await?;
     /// ```
     ///
-    /// # SPARQL Dataset Clause Restriction
+    /// # SPARQL Dataset Clauses (`FROM` / `FROM NAMED`)
     ///
-    /// A `GraphDb` represents a single ledger. SPARQL queries with
-    /// `FROM` or `FROM NAMED` clauses will be rejected. Use
-    /// `query_connection_sparql` for multi-ledger queries.
+    /// A `GraphDb` is one ledger, but a `FROM` / `FROM NAMED` clause whose IRIs
+    /// name graphs *within this ledger* (the ledger alias addresses the default
+    /// graph; registered named-graph IRIs address named graphs) builds a
+    /// within-ledger dataset over the one snapshot and runs through the dataset
+    /// execution path. A clause IRI that is not a graph in this ledger is
+    /// rejected — use `query_connection_sparql` for cross-ledger datasets.
     pub async fn query(&self, db: &GraphDb, q: impl Into<QueryInput<'_>>) -> Result<QueryResult> {
         self.query_with_options(db, q, QueryExecutionOptions::default())
             .await
@@ -85,6 +88,22 @@ impl Fluree {
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let input = q.into();
+
+        // A SPARQL FROM/FROM NAMED clause whose IRIs name graphs within this
+        // ledger builds a within-ledger dataset and routes through the shared
+        // dataset execution path (D-3, Option A). `Err` = a clause IRI is not
+        // in this ledger (cross-ledger → connection path).
+        if let QueryInput::Sparql(sparql) = input {
+            if let Some(dataset) = self.build_within_ledger_dataset(db, sparql)? {
+                // query_dataset_with_options returns a concrete boxed future
+                // (its signature is `-> Pin<Box<dyn Future + Send>>`), which
+                // breaks the mutual-recursion `Send` auto-trait cycle between
+                // these two methods and keeps this crate's type-check fast.
+                return self
+                    .query_dataset_with_options(&dataset, input, options)
+                    .await;
+            }
+        }
 
         // 0. Tracker for fuel limits only (no tracking overhead for non-tracked
         // calls). Charge the floor up front so a sub-floor `max-fuel` is
@@ -102,8 +121,6 @@ impl Fluree {
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
-                // Validate no dataset clauses
-                self.validate_sparql_for_view(sparql)?;
                 parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref())?
             }
         };
@@ -250,6 +267,15 @@ impl Fluree {
     ) -> Result<QueryResult> {
         let input = q.into();
 
+        // R2RML + within-ledger SPARQL FROM/FROM NAMED is a deliberately
+        // unsupported combination: the R2RML dataset execution path is not
+        // `Send`, but this method runs from `Send`-required connection/spawn
+        // contexts. Reject a dataset clause here (rather than silently ignoring
+        // it); plain within-ledger datasets are handled by `query_with_options`.
+        if let QueryInput::Sparql(sparql) = input {
+            self.validate_sparql_for_view(sparql)?;
+        }
+
         // 0. Tracker (fuel limits only). Charge the floor up front so a
         // sub-floor `max-fuel` is rejected before parse/plan; no-op untracked.
         let tracker = match &input {
@@ -264,8 +290,6 @@ impl Fluree {
                 parse_jsonld_query(json, &db.snapshot, db.default_context.as_ref(), None)?
             }
             QueryInput::Sparql(sparql) => {
-                // Validate no dataset clauses
-                self.validate_sparql_for_view(sparql)?;
                 parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref())?
             }
         };
@@ -340,6 +364,35 @@ impl Fluree {
     {
         let input = q.into();
 
+        // Within-ledger SPARQL dataset (see `query_with_options`) on the tracked
+        // path: delegate before charging the floor (the dataset method charges
+        // it) so fuel is accounted exactly once. `Err` = cross-ledger clause IRI.
+        if let QueryInput::Sparql(sparql) = input {
+            match self.build_within_ledger_dataset(db, sparql) {
+                Ok(Some(dataset)) => {
+                    // Boxed (`dyn`-erased) — see `query_with_options`.
+                    return futures::FutureExt::boxed(self.query_dataset_tracked_with_options(
+                        &dataset,
+                        input,
+                        format_config,
+                        tracking_override,
+                        options,
+                    ))
+                    .await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let _ = charge_query_floor(&tracker);
+                    return Err(crate::query::TrackedErrorResponse::new(
+                        400,
+                        e.to_string(),
+                        tracker.tally(),
+                    ));
+                }
+            }
+        }
+
         // Tracker: caller-provided options if given, else per-input defaults.
         let tracker = tracked_query_tracker(&input, &tracking_override);
 
@@ -365,9 +418,6 @@ impl Fluree {
                 )?
             }
             QueryInput::Sparql(sparql) => {
-                self.validate_sparql_for_view(sparql).map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-                })?;
                 parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref()).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
@@ -462,6 +512,36 @@ impl Fluree {
     {
         let input = q.into();
 
+        // Within-ledger SPARQL dataset (see `query_with_options`), tracked +
+        // R2RML. Delegate before charging the floor (the dataset method charges
+        // it) so fuel is accounted exactly once.
+        if let QueryInput::Sparql(sparql) = input {
+            match self.build_within_ledger_dataset(db, sparql) {
+                Ok(Some(_dataset)) => {
+                    // R2RML + within-ledger FROM/FROM NAMED is unsupported (the
+                    // R2RML dataset path is non-`Send`; this runs from `Send`
+                    // contexts). Reject rather than silently ignore the clause.
+                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let _ = charge_query_floor(&tracker);
+                    return Err(crate::query::TrackedErrorResponse::new(
+                        400,
+                        "SPARQL FROM/FROM NAMED with R2RML providers is not supported".to_string(),
+                        tracker.tally(),
+                    ));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let tracker = tracked_query_tracker(&input, &tracking_override);
+                    let _ = charge_query_floor(&tracker);
+                    return Err(crate::query::TrackedErrorResponse::new(
+                        400,
+                        e.to_string(),
+                        tracker.tally(),
+                    ));
+                }
+            }
+        }
+
         let tracker = tracked_query_tracker(&input, &tracking_override);
 
         // Charge the one-time query floor before parsing (see `query_tracked`).
@@ -483,9 +563,6 @@ impl Fluree {
                 )?
             }
             QueryInput::Sparql(sparql) => {
-                self.validate_sparql_for_view(sparql).map_err(|e| {
-                    crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
-                })?;
                 parse_sparql_to_ir(sparql, &db.snapshot, db.default_context.as_ref()).map_err(
                     |e| {
                         crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
@@ -557,10 +634,127 @@ impl Fluree {
     // Internal Helpers
     // ========================================================================
 
+    /// Build a within-ledger SPARQL dataset from a query's `FROM` / `FROM
+    /// NAMED` clause, or `None` when the query carries no dataset clause.
+    ///
+    /// This actions decision D-3 (Option A). A dataset clause on a single
+    /// `GraphDb` names graphs *within this ledger*: each clause IRI resolves
+    /// against the ledger's own graph registry (a registered named graph's
+    /// g_id, or the ledger alias → the default graph, g_id 0), and every graph
+    /// shares the one snapshot. The resulting [`DataSetDb`] runs through the
+    /// existing dataset path (`query_dataset*`), so policy, reasoning, and the
+    /// runtime `DatasetOperator` are reused unchanged; because all graphs share
+    /// one ledger the dataset never `spans_multiple_ledgers`, so no cross-ledger
+    /// provenance stamping engages and the scan hot path stays unchanged.
+    ///
+    /// - `Ok(None)` — no dataset clause; run the plain single-graph path.
+    /// - `Ok(Some(dataset))` — every clause IRI resolved within this ledger.
+    /// - `Err(..)` — a clause IRI is not a graph in this ledger (e.g. it names
+    ///   another ledger); cross-ledger datasets go through
+    ///   `query_connection_sparql`.
+    pub(crate) fn build_within_ledger_dataset(
+        &self,
+        db: &GraphDb,
+        sparql: &str,
+    ) -> Result<Option<DataSetDb>> {
+        let ast = parse_and_validate_sparql(sparql)?;
+        // Prefix-expanded, BASE-resolved FROM / FROM NAMED IRIs (shared
+        // resolution with constant IRIs; shipped by pr-base).
+        let Some(clause) = fluree_db_sparql::resolve_dataset_clause(&ast)
+            .map_err(|e| ApiError::query(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+
+        // `FROM <from> TO <to>` (Fluree history-range extension) is not a plain
+        // within-ledger dataset — leave it to the connection path. Its own error
+        // (not `cross_ledger_dataset_error`) so the message isn't the misleading
+        // "graph not in this ledger" for what is really a history-range clause.
+        if clause.to_graph.is_some() {
+            return Err(history_range_dataset_error());
+        }
+
+        let mut dataset = DataSetDb::new();
+        // §13.2: the dataset default graph is the RDF merge (a SET) of the
+        // FROM graphs — a repeated `FROM <g>` (or two spellings resolving to
+        // one graph) must contribute ONE member, not a bag-duplicating twin.
+        let mut seen_default: std::collections::HashSet<fluree_db_core::GraphId> =
+            std::collections::HashSet::new();
+        for iri in &clause.default_graphs {
+            let graph = self
+                .resolve_within_ledger_graph(db, iri)?
+                .ok_or_else(cross_ledger_dataset_error)?;
+            if seen_default.insert(graph.graph_id) {
+                dataset = dataset.with_default(graph);
+            }
+        }
+        for iri in &clause.named_graphs {
+            let graph = self
+                .resolve_within_ledger_graph(db, iri)?
+                .ok_or_else(cross_ledger_dataset_error)?;
+            dataset = dataset.with_named(std::sync::Arc::clone(iri), graph);
+        }
+        Ok(Some(dataset))
+    }
+
+    /// Resolve one `FROM` / `FROM NAMED` IRI to a graph *within this ledger*,
+    /// or `None` when the IRI does not name a graph in this ledger.
+    ///
+    /// - the ledger alias → the default graph (g_id 0), mirroring
+    ///   `ExecutionContext::single_db_user_graph_id`, which reserves the alias
+    ///   for the default graph;
+    /// - a registered named-graph IRI → that graph's g_id.
+    ///
+    /// Reuses [`apply_graph_selector`](Self::apply_graph_selector) — the same
+    /// within-ledger selection primitive behind `fluree.db("ledger:main#graph")`
+    /// and the JSON-LD `@graph` dataset source — so all three surfaces resolve
+    /// and re-scope a graph identically.
+    fn resolve_within_ledger_graph(&self, db: &GraphDb, iri: &str) -> Result<Option<GraphDb>> {
+        use crate::dataset::GraphSelector;
+
+        if iri == db.snapshot.ledger_id.as_str() || iri == db.ledger_id.as_ref() {
+            return Ok(Some(Self::apply_graph_selector(
+                db.clone(),
+                &GraphSelector::Default,
+            )?));
+        }
+
+        // Registered USER named graph in this ledger (registry, with the same
+        // binary-store fallback `select_graph` uses). The registry also seeds
+        // the reserved system graphs — `#txn-meta` (g_id 1) and `#config`
+        // (g_id 2) — which must NOT be reachable through `FROM`/`FROM NAMED`:
+        // the plain `GRAPH <iri>` path already blocks them via
+        // `single_db_user_graph_id`'s `>= FIRST_USER_GRAPH_ID` filter, so gate
+        // this path identically (a reserved IRI falls through to the
+        // "not in this ledger" rejection below).
+        let is_user_graph =
+            |g: fluree_db_core::GraphId| g >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+        let known = db
+            .snapshot
+            .graph_registry
+            .graph_id_for_iri(iri)
+            .is_some_and(is_user_graph)
+            || db
+                .binary_store
+                .as_ref()
+                .and_then(|s| s.graph_id_for_iri(iri))
+                .is_some_and(is_user_graph);
+        if known {
+            return Ok(Some(Self::apply_graph_selector(
+                db.clone(),
+                &GraphSelector::Iri(iri.to_string()),
+            )?));
+        }
+
+        Ok(None)
+    }
+
     /// Validate that SPARQL doesn't have dataset clauses (FROM/FROM NAMED).
     ///
-    /// A GraphDb is single-ledger; dataset clauses would conflict with
-    /// the db's ledger alias.
+    /// Used by the single-graph *streaming* endpoint (`plan_stream_query`),
+    /// which does not support datasets. The buffered `query*` paths instead
+    /// build a within-ledger dataset via [`build_within_ledger_dataset`] and
+    /// only reject cross-ledger clause IRIs.
     pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
         let ast = parse_and_validate_sparql(sparql)?;
 
@@ -1066,6 +1260,31 @@ fn query_error_to_status(err: &fluree_db_query::QueryError) -> u16 {
     status_for_query_error(err)
 }
 
+/// Rejection for a `FROM` / `FROM NAMED` clause that references a graph outside
+/// this ledger (or the `FROM..TO` history extension). The message mentions
+/// `FROM` so callers and tests can recognize the dataset-clause rejection.
+fn cross_ledger_dataset_error() -> ApiError {
+    ApiError::query(
+        "SPARQL FROM/FROM NAMED references a graph that is not in this ledger. \
+         A within-ledger dataset names this ledger's graphs (its default graph \
+         via the ledger alias, or a registered named graph) — check the IRI \
+         for typos against the ledger's registered graphs; for a graph in \
+         ANOTHER ledger, use query_connection_sparql (cross-ledger datasets).",
+    )
+}
+
+/// Error for a `FROM <from> TO <to>` history-range clause on the within-ledger
+/// path. Distinct from [`cross_ledger_dataset_error`] because the clause names
+/// a time range, not a cross-ledger graph — reusing the graph-membership
+/// message there would misdescribe the rejection.
+fn history_range_dataset_error() -> ApiError {
+    ApiError::query(
+        "SPARQL `FROM <from> TO <to>` is the Fluree history-range extension, not \
+         a within-ledger dataset clause; issue it through the connection/history \
+         query path.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1123,13 +1342,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_query_sparql_with_dataset_clause_rejected() {
+    async fn test_query_sparql_cross_ledger_dataset_rejected() {
         let fluree = FlureeBuilder::memory().build_memory();
         let _ledger = fluree.create_ledger("testdb").await.unwrap();
 
         let db = fluree.db("testdb:main").await.unwrap();
 
-        // SPARQL with FROM clause should be rejected
+        // A FROM clause whose IRI names neither the ledger alias nor a graph in
+        // this ledger is a cross-ledger dataset — still rejected (within-ledger
+        // FROM is exercised in the it_query_dataset integration tests).
         let result = fluree
             .query(
                 &db,

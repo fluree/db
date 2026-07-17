@@ -281,6 +281,8 @@ impl GraphOperator {
                 &graph_iri,
                 ctx.active_snapshot,
                 mapping.as_deref(),
+                ctx.reasoning_active,
+                ctx.trust_fk_refs,
             );
 
             // If there are unconverted patterns in an R2RML graph source, return an error.
@@ -477,6 +479,8 @@ impl GraphOperator {
             &graph_iri,
             ctx.active_snapshot,
             mapping.as_deref(),
+            ctx.reasoning_active,
+            ctx.trust_fk_refs,
         );
         if rewrite_result.unconverted_count > 0 {
             return Err(crate::error::QueryError::InvalidQuery(format!(

@@ -542,10 +542,18 @@ pub struct TableOverrideEntry {
     pub namespace: String,
     /// Table name (e.g. "DIM_STORE").
     pub name: String,
-    /// Replaces identifier_field_ids as the subject key (still gated on
-    /// required / null_fraction==0; always earns a SubjectKeyUnverified diagnostic).
+    /// Replaces identifier_field_ids with a SINGLE-column subject key (kept for
+    /// backward compatibility). Always earns a SubjectKeyUnverified diagnostic.
     #[serde(default)]
     pub primary_key: Option<String>,
+    /// Replaces identifier_field_ids with a COMPOSITE (one-or-more-column) subject
+    /// key. Takes precedence over `primary_key` when both are present.
+    #[serde(default)]
+    pub subject_key: Option<Vec<String>>,
+    /// Per-table subject-key strategy: `auto` (always emit) or `identifier`
+    /// (strict). `null` inherits the request-level `options.subject_strategy`.
+    #[serde(default)]
+    pub subject_strategy: Option<fluree_db_api::SubjectStrategy>,
     /// Overrides the derived class name / subject slug for the table.
     #[serde(default)]
     pub class_name: Option<String>,
@@ -619,11 +627,15 @@ async fn iceberg_r2rml_generate_local(
             .per_table_overrides
             .into_iter()
             .map(|e| {
+                // A composite `subject_key` wins; else the single `primary_key`
+                // is lifted into a one-element column list.
+                let primary_key = e.subject_key.or_else(|| e.primary_key.map(|pk| vec![pk]));
                 (
                     TableIdentifier::new(e.namespace, e.name),
                     TableOverride {
-                        primary_key: e.primary_key,
+                        primary_key,
                         class_name: e.class_name,
+                        subject_strategy: e.subject_strategy,
                     },
                 )
             })

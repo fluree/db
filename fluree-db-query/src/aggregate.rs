@@ -736,8 +736,18 @@ fn agg_count_distinct(values: &[Binding]) -> Binding {
 /// is encountered. Result datatype follows XPath numeric promotion.
 fn agg_sum(values: &[Binding]) -> Binding {
     let mut acc = NumericAcc::new();
-    for v in values.iter().filter_map(binding_to_numeric) {
-        acc.add(v);
+    for v in values {
+        // A bound non-numeric group member (bnode/IRI/string) is a type error:
+        // SUM poisons to unbound rather than summing over the numeric subset
+        // (SPARQL §18.5.1; agg-err-01). Unbound/Poisoned members contribute
+        // nothing and do not poison.
+        if matches!(v, Binding::Unbound | Binding::Poisoned) {
+            continue;
+        }
+        match binding_to_numeric(v) {
+            Some(n) => acc.add(n),
+            None => return Binding::Unbound,
+        }
     }
     acc.finalize_sum()
 }
@@ -749,8 +759,16 @@ fn agg_sum(values: &[Binding]) -> Binding {
 /// xsd:double inputs collapse the accumulator to f64 and yield xsd:double.
 fn agg_avg(values: &[Binding]) -> Binding {
     let mut acc = NumericAcc::new();
-    for v in values.iter().filter_map(binding_to_numeric) {
-        acc.add(v);
+    for v in values {
+        // Same poison rule as SUM: a bound non-numeric member is a type error
+        // (AVG unbinds), not a silently-skipped value (agg-err-01).
+        if matches!(v, Binding::Unbound | Binding::Poisoned) {
+            continue;
+        }
+        match binding_to_numeric(v) {
+            Some(n) => acc.add(n),
+            None => return Binding::Unbound,
+        }
     }
     acc.finalize_avg()
 }

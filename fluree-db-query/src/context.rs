@@ -146,6 +146,17 @@ pub struct ExecutionContext<'a> {
     /// `false`. Surfaced through `opts.includeSystemFacts: true` on
     /// JSON-LD queries.
     pub include_system_facts: bool,
+    /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
+    /// IRI template over the FK join columns is rendered directly from the child
+    /// row's FK columns, skipping the parent-table scan and its referential
+    /// (dangling-FK) existence check. Default `false` (R2RML-faithful: a dangling
+    /// FK yields no triple). Enabled by the graph-source subgraph-crawl ("View
+    /// Instances"/browse) path via `QueryExecutionOptions::trust_fk_refs`, where
+    /// scanning every FK-parent table just to render ref IRIs is the dominant
+    /// cost. A matched row renders a byte-identical IRI either way; only the
+    /// present-but-dangling FK differs (templated vs omitted). Read only for the
+    /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
+    pub trust_fk_refs: bool,
     /// Optional binary columnar index store for fast local-file scans.
     ///
     /// When present, scan operators use the binary cursor path for queries
@@ -214,6 +225,17 @@ pub struct ExecutionContext<'a> {
     /// (config resolution, policy loading) that call `binding.as_sid()` /
     /// `binding.as_lit()` directly.
     pub eager_materialization: bool,
+    /// Whether any reasoning/entailment mode (RDFS, OWL2-QL, OWL2-RL, datalog)
+    /// is active for this query.
+    ///
+    /// Set from `PreparedExecution` in `execute_prepared_into` (the one place
+    /// that both knows the effective reasoning modes and builds the context) and
+    /// propagated across per-graph context derivations. Consumed only by the
+    /// R2RML rewriter (`rewrite_patterns_for_r2rml`): when reasoning is active it
+    /// refuses the wildcard→class fusion, because that fusion prunes TriplesMaps
+    /// by an EXACT `rr:class` match and a subclass-entailed subject would be
+    /// silently dropped. Defaults to `false` (no reasoning).
+    pub reasoning_active: bool,
     /// The snapshot this context was originally constructed from.
     ///
     /// Equal to `active_snapshot` in the common single-graph case. In per-graph
@@ -288,6 +310,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -300,6 +323,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
@@ -340,6 +364,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -352,6 +377,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: db.eager,
+            reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
@@ -396,6 +422,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -408,6 +435,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: db.eager,
+            reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
@@ -441,6 +469,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -453,6 +482,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
@@ -485,6 +515,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -497,6 +528,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
@@ -531,6 +563,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -543,6 +576,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: std::collections::HashSet::new(),
             multi_ledger: false,
             eager_materialization: false,
+            reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
@@ -652,6 +686,15 @@ impl<'a> ExecutionContext<'a> {
     /// [`Self::include_system_facts`].
     pub fn with_include_system_facts(mut self, include: bool) -> Self {
         self.include_system_facts = include;
+        self
+    }
+
+    /// Enable child-templated `RefObjectMap` rendering for the injected
+    /// true-wildcard crawl scan (skip FK-parent scans). See
+    /// [`ExecutionContext::trust_fk_refs`]. Set from
+    /// `QueryExecutionOptions::trust_fk_refs` on the graph-source crawl path.
+    pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
+        self.trust_fk_refs = trust;
         self
     }
 
@@ -1027,6 +1070,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1039,6 +1083,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
             multi_ledger,
             eager_materialization: self.eager_materialization,
+            reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
@@ -1082,6 +1127,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1094,6 +1140,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
+            reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
@@ -1133,6 +1180,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            trust_fk_refs: self.trust_fk_refs,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
             dict_novelty: Self::extract_dict_novelty(graph.snapshot),
@@ -1145,6 +1193,7 @@ impl<'a> ExecutionContext<'a> {
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
+            reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             // This per-graph context switches to `graph`'s own store/snapshot
             // (see `binary_store`/`active_snapshot` above) while clearing
@@ -1229,6 +1278,16 @@ impl<'a> ExecutionContext<'a> {
     /// Force eager materialization of binary-scan bindings.
     pub fn with_eager_materialization(mut self) -> Self {
         self.eager_materialization = true;
+        self
+    }
+
+    /// Mark that a reasoning/entailment mode is active for this query.
+    ///
+    /// See [`reasoning_active`](Self::reasoning_active). Used by the R2RML
+    /// rewriter to refuse an exact-class wildcard fusion that could drop a
+    /// subclass-entailed subject.
+    pub fn with_reasoning_active(mut self, active: bool) -> Self {
+        self.reasoning_active = active;
         self
     }
 

@@ -145,6 +145,7 @@ fn datatype_of_comparable(
     let sid = match v {
         ComparableValue::Long(_) | ComparableValue::BigInt(_) => dts.xsd_integer.clone(),
         ComparableValue::Double(_) => dts.xsd_double.clone(),
+        ComparableValue::Float(_) => dts.xsd_float.clone(),
         ComparableValue::Decimal(_) => dts.xsd_decimal.clone(),
         ComparableValue::Bool(_) => dts.xsd_boolean.clone(),
         ComparableValue::String(_) => dts.xsd_string.clone(),

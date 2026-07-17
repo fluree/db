@@ -7,6 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 /// OAuth2 client credentials configuration.
 #[derive(Clone)]
@@ -106,7 +107,18 @@ impl OAuth2ClientCredentials {
     }
 
     /// Fetch a new access token from the token endpoint.
+    ///
+    /// Wrapped in an `iceberg.oauth_token` timing span so a cold token exchange is
+    /// visible as a discrete child of the `r2rml.load_table` span in a trace
+    /// (isolating OAuth cost from the rest of the catalog round-trip). No fields
+    /// are recorded on the span to avoid capturing the secret/token.
     async fn fetch_token(&self) -> Result<CachedToken> {
+        self.fetch_token_inner()
+            .instrument(tracing::debug_span!("iceberg.oauth_token"))
+            .await
+    }
+
+    async fn fetch_token_inner(&self) -> Result<CachedToken> {
         let mut form = vec![
             ("grant_type", "client_credentials".to_string()),
             ("client_secret", self.config.client_secret.clone()),
@@ -421,6 +433,72 @@ mod tests {
                 .find(|(k, _)| k == "scope")
                 .map(|(_, v)| v.as_str()),
             Some("PRINCIPAL_ROLE:ALL")
+        );
+    }
+
+    /// The token exchange is wrapped in an `iceberg.oauth_token` DEBUG span
+    /// (`fetch_token` -> `.instrument(...)`). A host tracing subscriber filtering
+    /// on `fluree=debug` captures it, giving the trace waterfall a discrete bar for
+    /// the (cold) OAuth round-trip. This asserts the span is actually emitted for a
+    /// token fetch, exercising the exact `.instrument(debug_span!(...))` wiring also
+    /// used for the `r2rml.load_table` / `iceberg.scan_plan` / `iceberg.parquet_read`
+    /// spans (those need a live catalog + S3 to drive, so they cannot be unit-tested
+    /// here without a live backend).
+    #[tokio::test]
+    async fn fetch_token_emits_oauth_token_span() {
+        use std::sync::Mutex;
+
+        // Minimal span-name-capturing subscriber (avoids a `tracing-subscriber`
+        // dev-dependency): records every created span's name. `enabled` restricts
+        // interest to our span so unrelated internal spans are ignored.
+        struct SpanNameCapture(Arc<Mutex<Vec<String>>>);
+        impl tracing::Subscriber for SpanNameCapture {
+            fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+                meta.name() == "iceberg.oauth_token"
+            }
+            fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(attrs.metadata().name().to_string());
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let names = Arc::new(Mutex::new(Vec::<String>::new()));
+        // Install as the PROCESS-GLOBAL default (not a thread-local `set_default`).
+        // `set_global_default` rebuilds the callsite-interest cache against this
+        // subscriber, so the `iceberg.oauth_token` callsite is (re-)evaluated as
+        // enabled even if a sibling unit test in this same binary already hit it
+        // under the no-op default and cached it as "never" (a thread-local default
+        // does NOT rebuild interest and so is order-dependent / flaky here). This
+        // makes the assertion deterministic regardless of test order/parallelism;
+        // `enabled` only admits our span, so other tests are behavior-unaffected.
+        // Safe because this is the crate's only `set_global_default` caller.
+        tracing::subscriber::set_global_default(SpanNameCapture(Arc::clone(&names)))
+            .expect("no other global tracing subscriber should be installed in tests");
+
+        let server = mock_token_server().await;
+        let config = OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: String::new(),
+            client_secret: "pat-secret".to_string(),
+            scope: None,
+            audience: None,
+        };
+        let auth = OAuth2ClientCredentials::new(config).unwrap();
+        auth.fetch_token().await.unwrap();
+
+        let captured = names.lock().unwrap();
+        assert!(
+            captured.iter().any(|n| n == "iceberg.oauth_token"),
+            "expected an `iceberg.oauth_token` span to be created for a token fetch; \
+             captured spans: {captured:?}"
         );
     }
 }

@@ -134,7 +134,7 @@ pub struct CatalogBrowse {
 
 /// Build a REST catalog client from a connection, or a clear typed error for
 /// Direct mode (which has no catalog to browse/list).
-fn rest_catalog_client(
+pub(crate) fn rest_catalog_client(
     conn: &IcebergConnectionConfig,
     op: &str,
 ) -> Result<(RestCatalogClient, String, Option<String>)> {
@@ -520,9 +520,12 @@ pub(crate) fn table_schema_from_metadata(
     table: &TableIdentifier,
     metadata: &TableMetadata,
 ) -> Result<TableSchema> {
-    let schema = metadata
-        .current_schema()
-        .ok_or_else(|| crate::ApiError::config("Table metadata has no current schema"))?;
+    let schema = metadata.current_schema().ok_or_else(|| {
+        crate::ApiError::config(format!(
+            "Table {} metadata has no current schema",
+            table.qualified()
+        ))
+    })?;
 
     let current_snapshot = metadata.current_snapshot();
     let snapshot = match current_snapshot {
@@ -631,7 +634,10 @@ pub async fn preview_iceberg_table(
             {
                 Some(snapshot) => {
                     let iceberg_schema = metadata.current_schema().ok_or_else(|| {
-                        crate::ApiError::config("Table metadata has no current schema")
+                        crate::ApiError::config(format!(
+                            "Table {} metadata has no current schema",
+                            table.qualified()
+                        ))
                     })?;
 
                     // Build S3 storage from vended credentials (if the catalog
@@ -707,7 +713,7 @@ pub async fn preview_iceberg_table(
 /// Build S3 storage for reading manifests during a Tier-B preview, mirroring the
 /// scan path's policy: vended credentials when the catalog delegated them,
 /// otherwise the ambient AWS credential chain.
-async fn build_preview_storage(
+pub(crate) async fn build_preview_storage(
     conn: &IcebergConnectionConfig,
     credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
 ) -> Result<S3IcebergStorage> {
