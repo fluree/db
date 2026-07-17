@@ -1802,11 +1802,23 @@ impl FusedR2rmlAggregateOperator {
             else {
                 return Ok(None);
             };
+            // Q2 lang/IRI admission gate (same as the single-table path): the
+            // `xsd:string` default below is a PLAIN-LITERAL assumption. A dim
+            // group-key column that is language-tagged (rdf:langString) or
+            // IRI-/blank-node-typed would be mis-encoded as an xsd:string literal,
+            // disagreeing with the materialized term. Decline (decline-only). This
+            // guards the pre-existing join fold's identical default symmetrically
+            // with the single-table path — no deployed dim key is lang/IRI, so prod
+            // behavior is unchanged.
+            if !Self::group_key_col_is_plain_literal(terminal_p, terminal_tm, *gv) {
+                return Ok(None);
+            }
             // A column ObjectMap with no `rr:datatype` maps to `xsd:string` — the
-            // R2RML natural mapping for a string column (the un-annotated case in
-            // this schema, e.g. DimStore.STORE_NAME / DimProduct.CATEGORY). The
-            // generic materialize path produces the same string literal, so hash
-            // parity holds.
+            // R2RML natural mapping for an un-annotated PLAIN-LITERAL string column
+            // (this schema's DIM string attrs, e.g. DimStore.STORE_NAME /
+            // DimProduct.CATEGORY). The generic materialize path's `LiteralEncoder`
+            // applies the same None->xsd:string fallback, so the group key is
+            // byte-identical (parity by construction).
             let dt_iri = datatype.as_deref().unwrap_or(fluree_vocab::xsd::STRING);
             let Some(kind) = group_kind(Some(dt_iri)) else {
                 return Ok(None);
@@ -2122,11 +2134,13 @@ mod tests {
         assert!(matches!(gc.binding(&GKey::Null), Binding::Unbound));
     }
 
-    /// Q2 lang/IRI admission gate: a fused single-table group key must be a PLAIN
-    /// LITERAL. A language-tagged (`rdf:langString`) or IRI-/blank-node-typed
-    /// column declines — the fold's `xsd:string` default would mis-encode the
-    /// materialized term (a different datatype/lang/term-type Sid), so the grouped
-    /// key would disagree with the generic materialize path.
+    /// Q2 lang/IRI admission gate: a fused group key — the single-table key OR the
+    /// join path's terminal-dim key, both of which call this SAME shared predicate
+    /// before applying the `xsd:string` default — must be a PLAIN LITERAL. A
+    /// language-tagged (`rdf:langString`) or IRI-/blank-node-typed column declines,
+    /// because the fold's `xsd:string` default would mis-encode the materialized
+    /// term (a different datatype/lang/term-type Sid) and the grouped key would
+    /// disagree with the generic materialize path.
     #[test]
     fn q2_group_key_plain_literal_gate() {
         use fluree_db_r2rml::mapping::{PredicateMap, PredicateObjectMap};
