@@ -1047,6 +1047,9 @@ impl Operator for FusedR2rmlAggregateOperator {
             std::collections::HashMap::new();
         let mut overflowed = false;
         'scan: while let Some(batch) = stream.next().await {
+            // T3.1a: cancellation checkpoint per fused-aggregate scan batch, so a
+            // deadline/abort stops a large fused rollup mid-sweep.
+            ctx.check_cancelled()?;
             let batch = batch?;
             let fold_cols: Vec<Option<&Column>> = folds
                 .iter()
@@ -1772,6 +1775,7 @@ impl FusedR2rmlAggregateOperator {
                 .scan_table(gs, &terminal_table, &terminal_proj, &[], None, as_of_t)
                 .await?;
             while let Some(batch) = s.next().await {
+                ctx.check_cancelled()?; // T3.1a: stop a terminal-dim drain on abort
                 let batch = batch?;
                 let attr_cols: Vec<Option<&Column>> = group_cols
                     .iter()
@@ -1823,6 +1827,7 @@ impl FusedR2rmlAggregateOperator {
                 .scan_table(gs, &inter_table, &proj, &[], None, as_of_t)
                 .await?;
             while let Some(batch) = s.next().await {
+                ctx.check_cancelled()?; // T3.1a: stop an interior-dim drain on abort
                 let batch = batch?;
                 for row in 0..batch.num_rows {
                     let Some(pk) = get_join_key_from_batch(&key_cols, &batch, row) else {

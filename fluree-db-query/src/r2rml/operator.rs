@@ -1023,7 +1023,7 @@ impl R2rmlScanOperator {
                         as_of_t,
                     )
                     .await?;
-                match collect_scan_capped(fresh, materialize_window_rows()).await? {
+                match collect_scan_capped(fresh, materialize_window_rows(), ctx).await? {
                     CollectedScan::Complete(batches) => {
                         let arc = Arc::new(batches);
                         self.scan_cache.insert(cache_key, Arc::clone(&arc));
@@ -1215,7 +1215,7 @@ impl R2rmlScanOperator {
                             as_of_t,
                         )
                         .await?;
-                    let parent_batches = collect_stream(parent_stream).await?;
+                    let parent_batches = collect_stream(parent_stream, ctx).await?;
 
                     let lookup = Arc::new(build_parent_lookup(
                         parent_tm,
@@ -1402,10 +1402,22 @@ impl R2rmlScanOperator {
 
 /// Drain a [`ColumnBatchStream`] fully into a vector. Used for small dimension
 /// (parent) tables whose entire contents become a lookup.
-async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch>> {
+async fn collect_stream(
+    mut stream: ColumnBatchStream,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<ColumnBatch>> {
     let mut out = Vec::new();
-    while let Some(batch) = stream.next().await {
-        out.push(batch?);
+    loop {
+        // T3.1a: cancellation checkpoint before decoding the next batch, so a
+        // deadline/abort stops a parent-dimension drain mid-sweep instead of
+        // materializing the whole table into the lookup first. (The main
+        // streaming scan already polls per-batch in `next_batch`; this closes the
+        // collect-into-lookup helpers that drained a scan without a checkpoint.)
+        ctx.check_cancelled()?;
+        match stream.next().await {
+            Some(batch) => out.push(batch?),
+            None => break,
+        }
     }
     Ok(out)
 }
@@ -1441,10 +1453,17 @@ enum CollectedScan {
 /// reaches `cap` with more remaining (→ `Overflow`, too large to cache). The cap
 /// equals one materialize window, so a cached inner never exceeds the resident
 /// footprint a single scan window already materializes.
-async fn collect_scan_capped(mut stream: ColumnBatchStream, cap: usize) -> Result<CollectedScan> {
+async fn collect_scan_capped(
+    mut stream: ColumnBatchStream,
+    cap: usize,
+    ctx: &ExecutionContext<'_>,
+) -> Result<CollectedScan> {
     let mut collected = Vec::new();
     let mut rows = 0usize;
     while rows < cap {
+        // T3.1a: cancellation checkpoint before decoding the next cached-inner
+        // batch (bounded by the materialize window, but still a large drain).
+        ctx.check_cancelled()?;
         match stream.next().await {
             Some(batch) => {
                 let batch = batch?;
@@ -2487,6 +2506,42 @@ mod tests {
     use crate::r2rml::{ObjectConstant, ScanValue};
     use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
     use fluree_db_r2rml::materialize::RdfTerm;
+
+    /// T3.1a: a cancelled query must stop a parent-dimension drain up front
+    /// (return `Cancelled`) instead of materializing the whole table into the
+    /// lookup. Without the checkpoint the empty stream would drain to `Ok`.
+    #[tokio::test]
+    async fn collect_stream_bails_on_cancelled_query() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        assert!(matches!(
+            collect_stream(stream, &ctx).await,
+            Err(QueryError::Cancelled { .. })
+        ));
+    }
+
+    /// T3.1a: same checkpoint on the capped cached-inner drain.
+    #[tokio::test]
+    async fn collect_scan_capped_bails_on_cancelled_query() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        assert!(matches!(
+            collect_scan_capped(stream, 1000, &ctx).await,
+            Err(QueryError::Cancelled { .. })
+        ));
+    }
 
     /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
     /// carries a residual filter the operator enforces after emitting rows —
