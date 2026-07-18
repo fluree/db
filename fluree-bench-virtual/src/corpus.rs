@@ -34,6 +34,9 @@ pub enum Tag {
     Aggregate,
     Count,
     GroupBy,
+    /// A GROUP BY whose keys span BOTH the fact table and a joined dimension
+    /// (W4-2: fused mixed fact+dim group-key resolution).
+    MixedGroupKeys,
     Having,
     OrderBy,
     Distinct,
@@ -335,12 +338,14 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            65,
+            68,
             "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
              4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
              q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
              1 E1 shared-predicate member (q064 Product-by-category) + \
-             1 E2 join+flag member (q065 orders-by-current-customer-segment)"
+             1 E2 join+flag member (q065 orders-by-current-customer-segment) + \
+             2 W4-2 mixed fact+dim group-key members (q066 COUNT, q067 COUNT+intSUM) + \
+             1 W4-1b folded-crawl sentinel (q068 orderline detail crawl)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));
@@ -359,8 +364,9 @@ mod tests {
             .collect();
         assert_eq!(
             smoke_tags.len(),
-            22,
-            "smoke must exercise all 22 feature tags (20 design + wildcard + exploration)"
+            23,
+            "smoke must exercise all 23 feature tags \
+             (20 design + wildcard + exploration + mixed_group_keys)"
         );
     }
 
@@ -445,6 +451,10 @@ mod tests {
             // rr:predicate + rdf:type) > the LIMIT 100, making the 100-subset
             // nondeterministic — empirically the sole parity failure in the run.
             "q055", "q057",
+            // W4-1b folded-crawl sentinel: `?ol ?p ?o` LIMIT 200 truncates the
+            // unordered (p,o) set of the key-constrained subject's crawl —
+            // rows-only for the same LIMIT-nondeterminism reason.
+            "q068",
         ]
         .into_iter()
         .collect();

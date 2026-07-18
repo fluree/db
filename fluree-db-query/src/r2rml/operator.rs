@@ -535,6 +535,26 @@ impl R2rmlScanOperator {
         !self.pattern.star_bindings.is_empty() || !self.pattern.star_constraints.is_empty()
     }
 
+    /// F-16: whether a pattern is a FOLDED crawl wildcard (W4-1b: `?s ?p ?o`
+    /// plus same-subject const-object constraints) whose every constraint is a
+    /// scalar. Only such a pattern may keep the `trust_fk_refs` FK-template ref
+    /// shortcut: a scalar constraint checks a scalar column and never relaxes a
+    /// ref, while an IRI (or any non-scalar) constraint on a ref predicate would
+    /// be satisfied by the templated render of a DANGLING FK — the shortcut
+    /// skips exactly the parent scan that would have dropped that subject, so
+    /// re-enabling it there would over-match (catch #11). Var star members
+    /// (`star_bindings`) also disqualify: they are fixed-predicate star shapes,
+    /// not the crawl fold.
+    fn folded_wildcard_all_scalar(pattern: &R2rmlPattern) -> bool {
+        pattern.predicate_var.is_some()
+            && pattern.star_bindings.is_empty()
+            && !pattern.star_constraints.is_empty()
+            && pattern
+                .star_constraints
+                .iter()
+                .all(|(_, c)| matches!(c, crate::r2rml::ObjectConstant::Scalar(_)))
+    }
+
     /// True for a pure `rdf:type`/subject-only pattern: no object var, no
     /// predicate filter, no star members. Such a pattern derives only the subject
     /// (its `rr:class` constraint is enforced by TriplesMap selection), so it
@@ -792,7 +812,15 @@ impl R2rmlScanOperator {
         // complete star row, so this is a provably-empty prune, result-preserving).
         // Computed before the resolution closure, which borrows `self.pattern`.
         let star_prune_on = star_tm_prune_enabled();
-        let star_required_preds: Vec<String> = if star_prune_on && self.has_star_members() {
+        // F-16/catch-#10: the all-preds prune argument holds only for FIXED-predicate
+        // stars (a map missing a member yields no complete star row). A folded crawl
+        // WILDCARD emits per-(p,o) across co-subject maps, so a map lacking the
+        // folded constraint predicate can still contribute rows — pruning it would
+        // drop those rows for vertically-partitioned subjects (F10-class mappings).
+        let star_required_preds: Vec<String> = if star_prune_on
+            && self.pattern.predicate_var.is_none()
+            && self.has_star_members()
+        {
             self.pattern_predicates()
                 .iter()
                 .map(|s| (*s).to_string())
@@ -1065,8 +1093,19 @@ impl R2rmlScanOperator {
             // `?s <ref> ?o` join) or a star/predicate-list crawl keeps the scan +
             // dangling-FK semantics and its subject set — a ref used as a subject
             // filter must not be relaxed to a match.
+            //
+            // F-16/catch-#10+#11 carve-out: a FOLDED crawl wildcard (W4-1b — the
+            // same true-wildcard shape plus same-subject const-object constraints)
+            // keeps the shortcut ONLY when every folded constraint is a scalar: a
+            // scalar constraint checks a scalar column and never touches a ref,
+            // while an IRI constraint on a ref predicate would be satisfied by the
+            // templated render of a DANGLING FK (the shortcut skips the parent
+            // scan that would have dropped it) — an over-match. Non-scalar
+            // constraints keep the shortcut off and take the sound parent-scan
+            // path.
             let ref_template_shortcut = ctx.trust_fk_refs
-                && !self.has_star_members()
+                && (!self.has_star_members()
+                    || Self::folded_wildcard_all_scalar(&self.pattern))
                 && self.pattern.predicate_filter.is_none()
                 && self.pattern.object_var.is_some();
             // Scoped so `star_preds` (which borrows `self`) is released before the
@@ -3544,6 +3583,61 @@ mod tests {
             rows.is_empty(),
             "violated → no rows (subject filtered by the star_constraint): {rows:?}"
         );
+    }
+
+    /// F-16/catch-#11: the `trust_fk_refs` shortcut re-enable for a folded crawl
+    /// wildcard is SCALAR-GATED. A scalar-constrained fold qualifies; an IRI
+    /// constraint (which a dangling-FK template render would falsely satisfy),
+    /// a mixed set, a fixed-predicate star (`star_bindings`), a plain wildcard
+    /// (no constraints — governed by `!has_star_members()`, not this helper),
+    /// and a non-wildcard all DISQUALIFY.
+    #[test]
+    fn f16_folded_wildcard_all_scalar_gate() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let scalar = |p: &str| {
+            (
+                p.to_string(),
+                ObjectConstant::Scalar(ScanValue::Int(7)),
+            )
+        };
+        let iri = |p: &str| {
+            (
+                p.to_string(),
+                ObjectConstant::Iri("http://ex/order/5".to_string()),
+            )
+        };
+
+        // Folded wildcard, all-scalar → qualifies.
+        let mut pass =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        pass.star_constraints = vec![scalar("http://ex/lineNumber")];
+        assert!(R2rmlScanOperator::folded_wildcard_all_scalar(&pass));
+
+        // IRI constraint → disqualified (dangling-FK over-match hazard).
+        let mut ref_c = pass.clone();
+        ref_c.star_constraints = vec![iri("http://ex/order")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&ref_c));
+
+        // Mixed scalar + IRI → disqualified (every constraint must be scalar).
+        let mut mixed = pass.clone();
+        mixed.star_constraints =
+            vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&mixed));
+
+        // Fixed-predicate star member present → not the crawl fold.
+        let mut star = pass.clone();
+        star.star_bindings = vec![("http://ex/qty".to_string(), VarId(3))];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&star));
+
+        // Plain wildcard (no constraints) → not this helper's business.
+        let plain =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&plain));
+
+        // Fixed-predicate pattern (no predicate_var) → disqualified.
+        let mut fixed = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
+        fixed.star_constraints = vec![scalar("http://ex/lineNumber")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&fixed));
     }
 
     /// A templated (non-constant) predicate binds `?p` from the row when the

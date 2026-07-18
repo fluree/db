@@ -1500,13 +1500,14 @@
     {
       "id": "q066",
       "file": "queries/q066_shipments_by_year_and_method_dataset.rq",
-      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys — shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
+      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys \u2014 shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
       "tags": [
         "aggregate",
         "count",
         "group_by",
         "join",
-        "fk_chain"
+        "fk_chain",
+        "mixed_group_keys"
       ],
       "tables": [
         "FACT_SHIPMENT",
@@ -1519,19 +1520,22 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": [],
+      "subsets": [
+        "smoke"
+      ],
       "exec_path": "from"
     },
     {
       "id": "q067",
       "file": "queries/q067_tickets_by_year_and_priority_dataset.rq",
-      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM — priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
+      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM \u2014 priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
       "tags": [
         "aggregate",
         "count",
         "group_by",
         "join",
-        "fk_chain"
+        "fk_chain",
+        "mixed_group_keys"
       ],
       "tables": [
         "FACT_SUPPORT_TICKET",
@@ -1550,7 +1554,7 @@
     {
       "id": "q068",
       "file": "queries/q068_orderline_detail_crawl_dataset.rq",
-      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage — the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
+      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage \u2014 the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
       "tags": [
         "wildcard",
         "exploration"
