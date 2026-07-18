@@ -920,7 +920,21 @@ impl R2rmlScanOperator {
             // Determine projection columns. For a same-subject star, project the
             // union of columns needed for every star predicate so the whole star
             // is satisfied by one scan.
-            let projection: Vec<String> = if !self.has_star_members() {
+            let projection: Vec<String> = if self.pattern.predicate_var.is_some() {
+                // Variable-predicate wildcard (`?s ?p ?o`): materialize EVERY POM, so
+                // project ALL columns. A W4-1b-folded crawl wildcard ALSO carries
+                // star_constraints, but those are a subject-level existence filter,
+                // not a projection restriction — `columns_for_predicate(None)` already
+                // covers the constraint predicates' columns too. (Without this branch a
+                // folded wildcard fell into the `has_star_members` else below and
+                // projected ONLY the constraint column, dropping every other POM's
+                // value so `?p`/`?o` never materialized.)
+                triples_map
+                    .columns_for_predicate(None)
+                    .into_iter()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            } else if !self.has_star_members() {
                 if self.is_subject_only_pattern() {
                     // rdf:type / subject-only pattern: only the subject columns are
                     // load-bearing. Projecting every POM column (the
@@ -1063,7 +1077,7 @@ impl R2rmlScanOperator {
                     .predicate_object_maps
                     .iter()
                     .filter(|pom| {
-                        if self.has_star_members() {
+                        if self.pattern.predicate_var.is_none() && self.has_star_members() {
                             pom.predicate_map
                                 .as_constant()
                                 .is_some_and(|p| star_preds.contains(&p))
@@ -2040,6 +2054,49 @@ pub(crate) fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnB
     )
 }
 
+/// Whether the current row's subject satisfies EVERY folded `star_constraint` — each
+/// constraint predicate must yield at least one object equal to its constant. The
+/// E2 / W4-1b constant-object existence filter, shared by the fixed-predicate star
+/// branch and the folded-wildcard subject pre-check. `star_constraint_canon` is the
+/// per-constraint precomputed decimal canonical (parallel to `star_constraints`).
+#[allow(clippy::too_many_arguments)]
+fn row_passes_star_constraints(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    table_row_idx: usize,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+    star_constraint_canon: &[Option<String>],
+) -> Result<bool> {
+    for ((pred, required), canon) in pattern.star_constraints.iter().zip(star_constraint_canon) {
+        let mut matched = false;
+        for pom in triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
+        {
+            if let Some(t) = materialize_pom_object(
+                pom,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+            )? {
+                let numeric = object_column_is_numeric(pom, iceberg_batch);
+                if rdf_term_eq_object_constant_cached(&t, required, numeric, canon.as_deref()) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Materialize one column batch into produced variable assignments (subject +
 /// object vars) — the per-batch unit of the parallel scan. Mirrors the previous
 /// per-row logic (star cross product, subject-only, single-object).
@@ -2084,7 +2141,15 @@ fn materialize_batch(
         }
         let subject_binding = encoder.encode(&subject_term);
 
-        if !pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty() {
+        // A fixed-predicate same-subject star (extra star_bindings and/or folded
+        // const-object star_constraints). A variable-predicate WILDCARD is excluded
+        // here even when it carries folded star_constraints (W4-1b): it must reach
+        // the wildcard POM loop below to bind ?p/?o, so its star_constraints are
+        // applied as a subject-level existence pre-check there — this fixed-predicate
+        // path never binds a predicate var and would emit a subject-only row.
+        if pattern.predicate_var.is_none()
+            && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
+        {
             let mut members: Vec<(VarId, &str)> = Vec::new();
             if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
             {
@@ -2123,40 +2188,18 @@ fn materialize_batch(
             // Fused constant-object constraints: the row survives only when each
             // predicate produces at least one object equal to its constant. This
             // is an existence filter (produces no var), enforced by the operator.
-            if row_ok {
-                for ((pred, required), canon) in
-                    pattern.star_constraints.iter().zip(&star_constraint_canon)
-                {
-                    let mut matched = false;
-                    for pom in triples_map
-                        .predicate_object_maps
-                        .iter()
-                        .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
-                    {
-                        if let Some(t) = materialize_pom_object(
-                            pom,
-                            iceberg_batch,
-                            table_row_idx,
-                            parent_lookups,
-                            ref_shortcuts,
-                        )? {
-                            let numeric = object_column_is_numeric(pom, iceberg_batch);
-                            if rdf_term_eq_object_constant_cached(
-                                &t,
-                                required,
-                                numeric,
-                                canon.as_deref(),
-                            ) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !matched {
-                        row_ok = false;
-                        break;
-                    }
-                }
+            if row_ok
+                && !row_passes_star_constraints(
+                    pattern,
+                    triples_map,
+                    iceberg_batch,
+                    table_row_idx,
+                    parent_lookups,
+                    ref_shortcuts,
+                    &star_constraint_canon,
+                )?
+            {
+                row_ok = false;
             }
             if !row_ok {
                 continue;
@@ -2260,6 +2303,27 @@ fn materialize_batch(
             }
             continue;
         };
+
+        // W4-1b: a folded crawl wildcard carries const-object members as
+        // `star_constraints`. Apply them as a SUBJECT existence pre-check before
+        // emitting any (p,o) row: keep this subject's wildcard rows only when every
+        // constraint predicate yields its constant — the same existence filter the
+        // standalone joined key scan enforced. Empty (a no-op) for a plain wildcard;
+        // a fixed-predicate star with constraints took the star branch above, so only
+        // a folded wildcard reaches here with a non-empty set.
+        if !pattern.star_constraints.is_empty()
+            && !row_passes_star_constraints(
+                pattern,
+                triples_map,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+                &star_constraint_canon,
+            )?
+        {
+            continue;
+        }
 
         for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
             pattern
@@ -3401,6 +3465,84 @@ mod tests {
                     .unwrap_or(false)
             }),
             "the data POM row must survive alongside the type row: {rows:?}"
+        );
+    }
+
+    // W4-1b SHIP-BLOCKER regression (lambda-audit-2): a FOLDED crawl wildcard carries
+    // const-object members as star_constraints. Before the execution fix,
+    // has_star_members()==true routed it into the fixed-predicate star materialize,
+    // which emitted a subject-only row and NEVER bound ?p/?o. It must instead behave
+    // as a wildcard whose SUBJECT is filtered by the constraint: satisfied → all
+    // (p,o) rows; violated → the subject drops entirely.
+    #[test]
+    fn w4_1b_folded_wildcard_emits_po_rows_under_star_constraint() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: fluree_db_r2rml::mapping::PredicateMap::constant(
+                    "http://ex/storeKey",
+                ),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let batch = single_col_batch("STORE_KEY", vec![Some(7)]);
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let encoder = LiteralEncoder::build(&tm, &snapshot);
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        // `?s ?p ?o` with a folded const-object constraint storeKey==7 (SATISFIED):
+        // behaves exactly like the plain wildcard — data POM row + rdf:type row, each
+        // binding ?p AND ?o (this is what the ship-blocker broke).
+        let mut pass =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        pass.star_constraints = vec![(
+            "http://ex/storeKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(7)),
+        )];
+        let rows =
+            materialize_batch(&pass, &tm, &batch, &lookups, &shortcuts, &encoder).expect("mat");
+        assert_eq!(
+            rows.len(),
+            2,
+            "satisfied → wildcard emits (p,o): data POM + type row, NOT a subject-only row: {rows:?}"
+        );
+        // The folded wildcard must emit the SAME (p,o) triples the UNFOLDED wildcard
+        // does when the subject satisfies the constraint (lambda-audit-2: assert the
+        // bindings, not just the count — a count alone could pass on two subject-only
+        // rows from some other path). Mirrors var_subject_wildcard_emits_rdf_type_rows.
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == "http://ex/storeKey"))
+                    .unwrap_or(false)
+                    && find(r, VarId(2)).is_some()
+            }),
+            "data POM row must bind ?p=storeKey AND ?o: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == fluree_vocab::rdf::TYPE))
+                    .unwrap_or(false)
+                    && find(r, VarId(2)).map(iri_of).as_deref() == Some("http://ex/Store")
+            }),
+            "rdf:type row must bind ?p=rdf:type AND ?o=Store: {rows:?}"
+        );
+
+        // Same wildcard, constraint storeKey==8 (VIOLATED) → the subject drops.
+        let mut fail =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        fail.star_constraints = vec![(
+            "http://ex/storeKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(8)),
+        )];
+        let rows =
+            materialize_batch(&fail, &tm, &batch, &lookups, &shortcuts, &encoder).expect("mat");
+        assert!(
+            rows.is_empty(),
+            "violated → no rows (subject filtered by the star_constraint): {rows:?}"
         );
     }
 

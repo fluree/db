@@ -1506,8 +1506,7 @@
         "count",
         "group_by",
         "join",
-        "fk_chain",
-        "mixed_group_keys"
+        "fk_chain"
       ],
       "tables": [
         "FACT_SHIPMENT",
@@ -1530,11 +1529,9 @@
       "tags": [
         "aggregate",
         "count",
-        "sum",
         "group_by",
         "join",
-        "fk_chain",
-        "mixed_group_keys"
+        "fk_chain"
       ],
       "tables": [
         "FACT_SUPPORT_TICKET",
@@ -1544,6 +1541,30 @@
       "expected_rows": [
         1,
         500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q068",
+      "file": "queries/q068_orderline_detail_crawl_dataset.rq",
+      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage — the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
+      "tags": [
+        "wildcard",
+        "exploration"
+      ],
+      "tables": [
+        "FACT_ORDER_LINE",
+        "FACT_ORDER",
+        "DIM_PRODUCT"
+      ],
+      "class": "exploration",
+      "hash_gate": "rows_only",
+      "expected_rows": [
+        1,
+        200
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
