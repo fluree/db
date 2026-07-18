@@ -236,6 +236,34 @@ fn topk_pushdown_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_TOPK_PUSHDOWN"))
 }
 
+/// F-AUD-3 kill switch: whether the non-aggregate scan/crawl path records its
+/// materialized windows and fact-parent lookup builds against the query memory
+/// budget. Default ON (`FLUREE_SCAN_MEM_ACCOUNTING`, family falsy spellings via
+/// [`super::env_switch_enabled`]). ON makes a wide crawl trip a typed
+/// `MemoryBudgetExceeded` (507) instead of OOMing — closing the blind spot the
+/// audit's specimen 071cd59f (a point-lookup crawl that hard-OOM'd at 10 GB) fell
+/// into, which the hash-join / group-aggregate `record_alloc`s never covered.
+/// OFF is a clean revert to the prior behavior (scan path invisible to the budget;
+/// the `checkpoint()` polls degrade to pure cancellation checks because the scan
+/// records nothing). The counter is query-lifetime cumulative and never
+/// decremented, so a genuinely-streaming large scan is accounted as if all its
+/// windows were simultaneously resident — the intended conservative direction
+/// (over-count only ever aborts a query already near the budget), matching the
+/// existing fold/join accounting; a high-water refinement is deferred with the
+/// excluded per-file buffer accounting (V2 site B).
+fn scan_mem_accounting_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_SCAN_MEM_ACCOUNTING"))
+}
+
+/// F-AUD-3: conservative per-entry byte estimate for a `build_parent_lookup`
+/// entry (a join key vec + a materialized subject `RdfTerm`, typically an IRI
+/// string) used to account the fact-as-parent build against the budget. ~200 B is
+/// the V2 estimate; like [`crate::context::BINDING_EST_BYTES`] it is a floor
+/// (ignores per-entry heap beyond the term), safe because over-counting only trips
+/// a build already near OOM.
+const PARENT_ENTRY_EST_BYTES: usize = 200;
+
 /// How a window of produced rows is combined with the buffered child rows.
 ///
 /// The join is *flipped* relative to a naive per-child probe: the (small,
@@ -563,8 +591,7 @@ impl R2rmlScanOperator {
     /// — the production build calls THIS fn, so the test exercises the real
     /// admission, not a copy.
     fn ref_template_shortcut_enabled(trust_fk_refs: bool, pattern: &R2rmlPattern) -> bool {
-        let star_free =
-            pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
+        let star_free = pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
         trust_fk_refs
             && (star_free || Self::folded_wildcard_all_scalar(pattern))
             && pattern.predicate_filter.is_none()
@@ -833,17 +860,15 @@ impl R2rmlScanOperator {
         // WILDCARD emits per-(p,o) across co-subject maps, so a map lacking the
         // folded constraint predicate can still contribute rows — pruning it would
         // drop those rows for vertically-partitioned subjects (F10-class mappings).
-        let star_required_preds: Vec<String> = if star_prune_on
-            && self.pattern.predicate_var.is_none()
-            && self.has_star_members()
-        {
-            self.pattern_predicates()
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let star_required_preds: Vec<String> =
+            if star_prune_on && self.pattern.predicate_var.is_none() && self.has_star_members() {
+                self.pattern_predicates()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // PR-3 fix (b'): resolution-only class prune (template-disjoint; see
         // `R2rmlPattern::class_prune_hint`). Gated by the same switch as fix (a).
         let prune_class: Option<String> = if star_prune_on {
@@ -1286,6 +1311,7 @@ impl R2rmlScanOperator {
                     let parent_batches = collect_stream(parent_stream, ctx).await?;
 
                     let lookup = Arc::new(build_parent_lookup(
+                        ctx,
                         parent_tm,
                         &parent_join_cols,
                         parent_batches,
@@ -1430,6 +1456,23 @@ impl R2rmlScanOperator {
                 &progress.tms[i].ref_shortcuts,
                 ctx,
             )?;
+
+            // F-AUD-3 site A1: account the materialized window against the query
+            // memory budget so a wide non-aggregate crawl (the previously-blind scan
+            // path) trips a typed `MemoryBudgetExceeded` instead of OOMing. The window
+            // is bounded (~`materialize_window_rows`) so one window cannot itself OOM;
+            // `checkpoint()` here aborts once the cumulative recorded bytes (this
+            // window plus every prior one and any upstream fold/join) cross the
+            // budget, before the loop pulls another. Cumulative, never decremented —
+            // see `scan_mem_accounting_enabled`.
+            if scan_mem_accounting_enabled() {
+                let window_est = produced
+                    .len()
+                    .saturating_mul(num_cols)
+                    .saturating_mul(crate::context::BINDING_EST_BYTES);
+                ctx.record_alloc(window_est);
+                ctx.checkpoint()?;
+            }
 
             if !produced.is_empty() {
                 emit_produced_window(
@@ -2496,6 +2539,7 @@ fn materialize_batch(
 ///
 /// HashMap mapping join key (as `Vec<String>`) to parent subject `RdfTerm`.
 fn build_parent_lookup(
+    ctx: &ExecutionContext<'_>,
     parent_tm: &TriplesMap,
     parent_columns: &[String],
     batches: Vec<ColumnBatch>,
@@ -2503,6 +2547,20 @@ fn build_parent_lookup(
     let mut lookup = ParentLookup::new();
 
     for batch in batches {
+        // F-AUD-3 site A2: the fact-as-parent hazard (V2) — a RefObjectMap whose
+        // parent is a FACT table transiently builds a full parent-sized map (tens of
+        // millions of entries) here, unbounded by the memo cap, which only refuses to
+        // RETAIN an over-window lookup AFTER it is fully built. Account each batch's
+        // worst-case contribution and checkpoint inside the build loop so a
+        // budget-exceeding build aborts typed (`MemoryBudgetExceeded`) BEFORE the
+        // whole map is resident, instead of OOMing. `num_rows` over-counts skipped
+        // (null-subject / null-key) rows — deliberately conservative. Cumulative like
+        // site A1; the map is genuinely retained while built, so cumulative == the
+        // resident footprint for this structure.
+        if scan_mem_accounting_enabled() {
+            ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
+            ctx.checkpoint()?;
+        }
         for row_idx in 0..batch.num_rows {
             // Materialize parent subject
             let subject_term =
@@ -2607,13 +2665,16 @@ impl Operator for R2rmlScanOperator {
             .collect();
 
         loop {
-            // Cancellation checkpoint at the top of the internal loop: this loop
-            // can pull many windows / files / child batches before returning a
+            // Cancellation + memory checkpoint at the top of the internal loop: this
+            // loop can pull many windows / files / child batches before returning a
             // full output batch, so the runner's between-`next_batch` check would
             // otherwise never run for a whole-table scan. Covers the loop's
-            // non-advancing branches (overflow drain, child pull) that site 2
-            // does not.
-            ctx.check_cancelled()?;
+            // non-advancing branches (overflow drain, child pull) that site 2 does
+            // not. Upgraded from `check_cancelled()` to `checkpoint()` (F-AUD-3): it
+            // also enforces the query memory budget against the window bytes recorded
+            // by site A1 (a no-op for the budget when scan accounting is off, since
+            // nothing on this path records then).
+            ctx.checkpoint()?;
             // 1. Drain overflow from a prior window before doing more work.
             while !self.pending.is_empty() && columns[0].len() < ctx.batch_size {
                 let row = self.pending.pop_front().unwrap();
@@ -2761,6 +2822,120 @@ mod tests {
             collect_scan_capped(stream, 1000, &ctx).await,
             Err(QueryError::Cancelled { .. })
         ));
+    }
+
+    /// F-AUD-3 site A1 — specimen 071cd59f regression. A wide non-aggregate crawl
+    /// (`?s ?p ?o`) materializes a window of bindings that the pre-fix scan path
+    /// never recorded against the memory budget, so a runaway crawl OOM'd instead of
+    /// aborting typed. With scan accounting on (the default), the materialized
+    /// window is recorded and a tiny 1-byte ceiling makes the window checkpoint
+    /// abort TYPED (`MemoryBudgetExceeded`, a 507) rather than completing/OOMing.
+    #[tokio::test]
+    async fn r3b_scan_window_budget_aborts_typed() {
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::QueryCancellation;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        #[derive(Debug)]
+        struct StoreProvider;
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for StoreProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "STORE_KEY".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                let batch =
+                    ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1), Some(2), Some(3)])])
+                        .unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/storeKey"),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = StoreProvider;
+
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1); // 1-byte ceiling → the first window's record crosses it.
+        let mut ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+        ctx.r2rml_table_provider = Some(&provider);
+
+        // `?s ?p ?o` — the true-wildcard crawl the blind spot lived on.
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        op.mapping = Some(Arc::clone(&mapping));
+
+        let mut progress = op
+            .build_progress(&ctx, Batch::single_empty())
+            .await
+            .expect("build_progress")
+            .expect("wildcard crawl resolves the one TriplesMap");
+        let num_cols = op.schema().len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+        let err = op
+            .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+            .await
+            .expect_err("the materialized window must trip the 1-byte budget");
+        assert!(
+            matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+            "wide crawl window must abort typed, got {err:?}"
+        );
+    }
+
+    /// F-AUD-3 site A2 — the fact-as-parent build. `build_parent_lookup` transiently
+    /// materializes a full parent-sized map; with a RefObjectMap whose parent is a
+    /// FACT table this is tens of millions of entries, unbounded by the memo cap.
+    /// The per-batch accounting + checkpoint makes a budget-exceeding build abort
+    /// TYPED before the whole map is resident (a 1-byte ceiling trips on the first
+    /// batch here) instead of OOMing.
+    #[test]
+    fn r3b_parent_build_budget_aborts_typed() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        use fluree_db_r2rml::mapping::TriplesMap;
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(1); // 1-byte ceiling.
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let parent_tm = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://ex/customer/{ID}");
+        // One batch of rows is enough — the per-batch record_alloc crosses the ceiling
+        // before any row is inserted, so the build aborts on the first batch.
+        let batch = single_col_batch("ID", vec![Some(1), Some(2), Some(3)]);
+        let err = build_parent_lookup(&ctx, &parent_tm, &["ID".to_string()], vec![batch])
+            .expect_err("the fact-parent build must trip the 1-byte budget");
+        assert!(
+            matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+            "fact-parent build must abort typed, got {err:?}"
+        );
     }
 
     /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
@@ -3607,12 +3782,7 @@ mod tests {
     #[test]
     fn f16_folded_wildcard_all_scalar_gate() {
         use crate::r2rml::{ObjectConstant, ScanValue};
-        let scalar = |p: &str| {
-            (
-                p.to_string(),
-                ObjectConstant::Scalar(ScanValue::Int(7)),
-            )
-        };
+        let scalar = |p: &str| (p.to_string(), ObjectConstant::Scalar(ScanValue::Int(7)));
         let iri = |p: &str| {
             (
                 p.to_string(),
@@ -3633,8 +3803,7 @@ mod tests {
 
         // Mixed scalar + IRI → disqualified (every constraint must be scalar).
         let mut mixed = pass.clone();
-        mixed.star_constraints =
-            vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
+        mixed.star_constraints = vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
         assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&mixed));
 
         // Fixed-predicate star member present → not the crawl fold.
@@ -3667,8 +3836,8 @@ mod tests {
         use crate::r2rml::{ObjectConstant, ScanValue};
         // The ref side: single-column templated FK — shortcut-eligible (the
         // deployed `edw:order` → FactOrder shape).
-        let parent =
-            TriplesMap::new("#Order", "FACT_ORDER").with_subject_template("http://ex/order/{ORDER_KEY}");
+        let parent = TriplesMap::new("#Order", "FACT_ORDER")
+            .with_subject_template("http://ex/order/{ORDER_KEY}");
         let rom = RefObjectMap::new("#Order", "ORDER_KEY", "ORDER_KEY");
         assert!(
             build_ref_shortcut(&parent, &rom).is_some(),
@@ -3683,7 +3852,9 @@ mod tests {
             "http://ex/lineNumber".to_string(),
             ObjectConstant::Scalar(ScanValue::Int(1)),
         )];
-        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(true, &folded));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &folded
+        ));
 
         // Iri-folded → admission false (sound parent-scan path; catch #11).
         let mut iri_folded = folded.clone();
@@ -3705,7 +3876,9 @@ mod tests {
         // unchanged by the F-16 amendment).
         let plain =
             R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
-        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(true, &plain));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &plain
+        ));
 
         // Fixed-predicate star + trust ON → admission false (star shapes keep
         // parent-scan + dangling-FK semantics; unchanged).
@@ -3714,7 +3887,9 @@ mod tests {
             "http://ex/lineNumber".to_string(),
             ObjectConstant::Scalar(ScanValue::Int(1)),
         )];
-        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(true, &star));
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &star
+        ));
     }
 
     /// A templated (non-constant) predicate binds `?p` from the row when the
