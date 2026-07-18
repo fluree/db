@@ -54,7 +54,7 @@ fn kb_node(i: usize, nodes: usize, mixed: bool, annotated: bool) -> serde_json::
         // PROBE_ANNOTATED: reify each edge (what the Cypher bulk import and
         // Cypher CREATE do), so `-[p]->` traverses real relationship nodes.
         let object = if annotated {
-            json!({"@id": format!("http://kb.example/node/{target}"), "@annotation": {}})
+            json!({"@id": format!("http://kb.example/node/{target}"), "@annotation": {"w": 1}})
         } else {
             json!({"@id": format!("http://kb.example/node/{target}")})
         };
@@ -83,9 +83,11 @@ async fn main() {
     let annotated = std::env::var("PROBE_ANNOTATED").is_ok();
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let fluree: Fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-        .build()
-        .expect("fluree");
+    let mut builder = FlureeBuilder::file(dir.path().to_string_lossy().to_string());
+    if std::env::var("PROBE_CACHE_CFG").is_ok() {
+        builder = builder.with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default());
+    }
+    let fluree: Fluree = builder.build().expect("fluree");
 
     let build_start = Instant::now();
     match mode.as_str() {
@@ -120,6 +122,9 @@ async fn main() {
                 .await
                 .expect("seed");
             if mode != "novelty" {
+                if std::env::var("PROBE_LOAD_FIRST").is_ok() {
+                    let _ = fluree.ledger("probe:kb").await.expect("preload");
+                }
                 fluree
                     .reindex("probe:kb", ReindexOptions::default())
                     .await
@@ -139,6 +144,18 @@ async fn main() {
         db.snapshot.annotation_index.is_some(),
         db.snapshot.content_store.is_some()
     );
+    if std::env::var("PROBE_REINDEX2").is_ok() {
+        fluree
+            .reindex("probe:kb", ReindexOptions::default())
+            .await
+            .expect("reindex2");
+        let handle = fluree.ledger("probe:kb").await.expect("reload");
+        eprintln!(
+            "after second reindex (fresh ledger load): annotation_index={} has_annotations={}",
+            handle.snapshot.annotation_index.is_some(),
+            handle.snapshot.has_annotations
+        );
+    }
 
     // Baseline: point lookup by known value (customer: single-digit ms).
     let point = format!(

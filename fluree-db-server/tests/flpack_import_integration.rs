@@ -845,3 +845,44 @@ async fn discovery_advertises_source_upload_when_presign_enabled() {
     assert!(formats.iter().any(|f| f == "ttl"), "{formats:?}");
     assert!(formats.iter().any(|f| f == "cypher"), "{formats:?}");
 }
+
+#[tokio::test]
+async fn source_upload_with_relationships_seals_annotation_arena() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-cypher-rel/data:main";
+
+    // Relationship CREATEs reify edges (EdgePolicy::Annotated default), so the
+    // imported ledger carries f:reifies* facts; the post-import reindex must
+    // leave a sealed annotation arena, not scan-fallback.
+    let cypher = br#"CREATE (:Person {name: "Alice"});
+CREATE (:Person {name: "Bob"});
+MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2020}]->(b);
+"#
+    .to_vec();
+
+    let final_status = run_source_upload(&state, dst, "dump.cypher", cypher).await;
+    assert_eq!(
+        final_status["status"], "succeeded",
+        "import should succeed: {final_status:?}"
+    );
+    assert_eq!(final_status["result"]["has_annotations"], true);
+
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    assert!(
+        handle.snapshot.has_annotations,
+        "imported ledger carries annotations"
+    );
+    assert!(
+        handle.snapshot.annotation_index.is_some(),
+        "post-import reindex must seal the annotation arena"
+    );
+
+    // The relationship is queryable through the Cypher surface.
+    let db = GraphDb::from_ledger_state(&handle);
+    let result = state
+        .fluree
+        .query_cypher(&db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN r.since")
+        .await
+        .expect("cypher rel query");
+    assert_eq!(result.row_count(), 1);
+}
