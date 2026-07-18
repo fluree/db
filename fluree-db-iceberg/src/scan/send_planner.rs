@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{IcebergError, Result};
 use crate::io::SendIcebergStorage;
-use crate::manifest::{parse_manifest, parse_manifest_list};
+use crate::manifest::{parse_manifest, parse_manifest_list_with_deletes};
 use crate::metadata::{Schema, Snapshot, TableMetadata};
 use crate::scan::planner::{FileScanTask, ScanConfig, ScanPlan};
 use crate::scan::pruning::can_contain_file;
@@ -81,6 +81,12 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         // Determine projection
         let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
 
+        // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads
+        // only live data files and never applies deletes, so a MoR snapshot
+        // would silently return deleted rows. Cheap zero-I/O check first.
+        let allow_mor = crate::mor_guard::mor_deletes_allowed();
+        crate::mor_guard::ensure_no_summary_deletes(snapshot, &self.metadata.location, allow_mor)?;
+
         // Load manifest list
         let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
             IcebergError::Manifest(
@@ -89,7 +95,15 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         })?;
 
         let manifest_list_data = self.storage.read(manifest_list_path).await?;
-        let manifest_entries = parse_manifest_list(&manifest_list_data)?;
+        // Parse WITH delete manifests so the belt-and-suspenders guard can DETECT
+        // them even when the snapshot summary omits/under-counts the counters.
+        let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
+        let delete_manifests = manifest_entries.iter().filter(|e| e.is_deletes()).count();
+        crate::mor_guard::ensure_no_delete_manifests(
+            delete_manifests,
+            &self.metadata.location,
+            allow_mor,
+        )?;
 
         tracing::debug!(
             manifest_count = manifest_entries.len(),
@@ -103,7 +117,9 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         let mut estimated_row_count = 0i64;
 
         for manifest_entry in &manifest_entries {
-            // Skip delete manifests (already filtered by parse_manifest_list)
+            // Skip delete manifests. Under the guard's default they never reach
+            // here (refused above); under the override they are ignored (the
+            // documented, pre-guard behavior).
             if manifest_entry.is_deletes() {
                 continue;
             }
