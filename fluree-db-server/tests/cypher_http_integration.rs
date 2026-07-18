@@ -496,7 +496,7 @@ async fn cypher_http_multi_clause_merge_chain() {
     let (status, body) = post_cypher(
         &state,
         "/v1/fluree/query/cyseqhttp",
-        r#"MATCH (a:Person)-[r:LIVES_IN]->(b:City) RETURN count(r)"#,
+        "MATCH (a:Person)-[r:LIVES_IN]->(b:City) RETURN count(r)",
     )
     .await;
     assert!(status.is_success(), "read back: {body}");
@@ -506,7 +506,7 @@ async fn cypher_http_multi_clause_merge_chain() {
     let (status, body) = post_cypher(
         &state,
         "/v1/fluree/query/cyseqhttp",
-        r#"MATCH (n:Person) RETURN count(n)"#,
+        "MATCH (n:Person) RETURN count(n)",
     )
     .await;
     assert!(status.is_success());
@@ -579,7 +579,7 @@ async fn cypher_http_unwind_batch_merge_chain() {
     let (status, body) = post_cypher(
         &state,
         "/v1/fluree/query/cyseqbatch",
-        r#"MATCH (n:P) RETURN count(n)"#,
+        "MATCH (n:P) RETURN count(n)",
     )
     .await;
     assert!(status.is_success());
@@ -593,7 +593,7 @@ async fn cypher_http_unwind_batch_merge_chain() {
     let (status, body) = post_cypher(
         &state,
         "/v1/fluree/query/cyseqbatch",
-        r#"MATCH (:P)-[r:KNOWS]->(:P) RETURN count(r)"#,
+        "MATCH (:P)-[r:KNOWS]->(:P) RETURN count(r)",
     )
     .await;
     assert!(status.is_success());

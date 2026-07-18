@@ -534,18 +534,34 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
     // the MERGE identity key here — last row per key wins — to converge on
     // the same end state sequential execution would reach.
     //
-    // Single-write-clause statements only: the key comes from the FIRST node
-    // MERGE, so collapsing rows by it would drop legitimate rows of a
-    // multi-clause chain (`MERGE (a {id: row.src}) MERGE (b {id: row.dst}) …`
-    // — two rows sharing `src` but differing in `dst` are distinct work).
-    // Multi-clause statements run through the sequential write driver, which
-    // owns in-batch duplicate-key semantics (first row per key creates,
-    // later rows match).
+    // Only for statements that stay on the single-`Txn` / conditional
+    // paths: the key comes from the FIRST node MERGE, so collapsing rows by
+    // it would drop legitimate rows of a multi-clause chain
+    // (`MERGE (a {id: row.src}) MERGE (b {id: row.dst}) …` — two rows
+    // sharing `src` but differing in `dst` are distinct work). Statements
+    // the sequential write driver takes own in-batch duplicate-key
+    // semantics themselves (first row per key creates, later rows match),
+    // so this must mirror the driver's routing exactly: it takes (a) any
+    // write list beyond the `[MERGE, SET…]` family, and (b) a node MERGE
+    // whose (post-desugar) reads include a plain clause besides this
+    // UNWIND. The upsert idiom `MERGE (n {id: row.id}) SET …` — a MERGE
+    // with trailing SETs and no other reads — keeps its conditional-path
+    // dedup.
     let identity_fields = {
         let Statement::Update(u) = &ast.statement else {
             unreachable!("checked above");
         };
-        if u.write_clauses.len() == 1 {
+        let merge_set_shape = matches!(
+            u.write_clauses.as_slice(),
+            [WriteClause::Merge(_), rest @ ..]
+                if rest.iter().all(|w| matches!(w, WriteClause::Set(_)))
+        );
+        let other_plain_reads = u
+            .read_clauses
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != unwind_idx && !matches!(c, ReadClause::InlineRows { .. }));
+        if merge_set_shape && !other_plain_reads {
             merge_identity_fields(u, &alias)
         } else {
             Vec::new()
