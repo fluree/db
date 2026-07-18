@@ -49,6 +49,10 @@ pub struct BranchUpdateConfig {
     pub leaflet_target_rows: usize,
     /// Target rows per leaf.
     pub leaf_target_rows: usize,
+    /// Collect novelty ops that matched an existing base row into
+    /// [`BranchUpdateMeta::matched`]. Fact identity is order-independent, so
+    /// callers running all four sort orders enable this for one order only.
+    pub collect_matched: bool,
 }
 
 /// Result of a branch update.
@@ -65,6 +69,9 @@ pub struct BranchUpdateResult {
     pub branch_bytes: Vec<u8>,
     /// CID of the new branch manifest.
     pub branch_cid: ContentId,
+    /// Novelty ops whose identity matched an existing base row (empty unless
+    /// [`BranchUpdateConfig::collect_matched`] is set).
+    pub matched: Vec<RunRecordV2>,
 }
 
 /// Branch-assembly metadata from a streaming update — everything the caller
@@ -84,6 +91,9 @@ pub struct BranchUpdateMeta {
     pub branch_cid: ContentId,
     /// Number of new leaf blobs emitted to the sink.
     pub new_leaf_count: usize,
+    /// Novelty ops whose identity matched an existing base row (empty unless
+    /// [`BranchUpdateConfig::collect_matched`] is set).
+    pub matched: Vec<RunRecordV2>,
 }
 
 // ============================================================================
@@ -133,6 +143,7 @@ where
         replaced_sidecar_cids: meta.replaced_sidecar_cids,
         branch_bytes: meta.branch_bytes,
         branch_cid: meta.branch_cid,
+        matched: meta.matched,
     })
 }
 
@@ -228,7 +239,7 @@ where
     G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
     S: FnMut(NewLeafBlob) -> io::Result<()>,
 {
-    let mut acc = BranchAcc::with_capacity(manifest.leaves.len() + 4);
+    let mut acc = BranchAcc::with_capacity(manifest.leaves.len() + 4, config.collect_matched);
 
     match mode {
         DrainMode::Serial => update_branch_serial(
@@ -257,6 +268,8 @@ where
         replaced_leaf_cids,
         replaced_sidecar_cids,
         new_leaf_count,
+        collect_matched: _,
+        matched,
     } = acc;
 
     let branch_bytes = build_branch_bytes(config.order, config.g_id, &leaf_entries);
@@ -269,6 +282,7 @@ where
         branch_bytes,
         branch_cid,
         new_leaf_count,
+        matched,
     })
 }
 
@@ -284,15 +298,21 @@ struct BranchAcc {
     replaced_leaf_cids: Vec<ContentId>,
     replaced_sidecar_cids: Vec<ContentId>,
     new_leaf_count: usize,
+    /// When set, matched novelty ops from each touched leaf accumulate into
+    /// `matched`; otherwise they are dropped at drain time.
+    collect_matched: bool,
+    matched: Vec<RunRecordV2>,
 }
 
 impl BranchAcc {
-    fn with_capacity(leaves: usize) -> Self {
+    fn with_capacity(leaves: usize, collect_matched: bool) -> Self {
         Self {
             leaf_entries: Vec::with_capacity(leaves),
             replaced_leaf_cids: Vec::new(),
             replaced_sidecar_cids: Vec::new(),
             new_leaf_count: 0,
+            collect_matched,
+            matched: Vec::new(),
         }
     }
 }
@@ -368,6 +388,9 @@ where
     acc.replaced_leaf_cids.push(existing.leaf_cid.clone());
     if let Some(sc_cid) = &existing.sidecar_cid {
         acc.replaced_sidecar_cids.push(sc_cid.clone());
+    }
+    if acc.collect_matched {
+        acc.matched.extend(output.matched);
     }
 
     for new_leaf in output.leaves {
@@ -742,6 +765,7 @@ mod parity_tests {
             zstd_level: 1,
             leaflet_target_rows: 50,
             leaf_target_rows: 200,
+            collect_matched: false,
         };
 
         let (serial_meta, serial_blobs) = run_mode(
@@ -841,6 +865,7 @@ mod parity_tests {
             zstd_level: 1,
             leaflet_target_rows: 50,
             leaf_target_rows: 200,
+            collect_matched: false,
         };
 
         let serial = run_mode(

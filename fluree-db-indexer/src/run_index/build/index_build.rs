@@ -218,6 +218,21 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
             let Some((record, op, history)) = merge.next_deduped_with_history()? else {
                 break;
             };
+            // A retract-winner whose identity was never asserted anywhere in
+            // the commit log (the full log — this is a rebuild) is a retract
+            // of a fact that never existed: not a state transition, and its
+            // entries would make time-travel replay fabricate the fact's
+            // presence before the retraction. Skip the whole lifecycle.
+            if op == 0 && history.iter().all(|&(_, hist_op)| hist_op == 0) {
+                progress_batch += 1;
+                if progress_batch >= PROGRESS_BATCH_SIZE {
+                    if let Some(ref ctr) = config.progress {
+                        ctr.fetch_add(progress_batch, Ordering::Relaxed);
+                    }
+                    progress_batch = 0;
+                }
+                continue;
+            }
             // Push history entries for non-winners (these become sidecar segments).
             for (hist_rec, hist_op) in &history {
                 writer.push_history_entry(
@@ -786,6 +801,99 @@ mod tests {
         // Verify o_type_const is set (single type per predicate).
         assert_eq!(leaf_dir[0].o_type_const, Some(OType::XSD_INTEGER.as_u16()));
         assert_eq!(leaf_dir[1].o_type_const, Some(OType::XSD_STRING.as_u16()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A retract-winner whose identity was never asserted anywhere in the log
+    /// is a retract of a fact that never existed: it contributes no row and
+    /// no history entries (a bare retract entry would make time-travel replay
+    /// fabricate the fact's presence before the retraction). A lifecycle that
+    /// does contain an assert keeps its full history.
+    #[test]
+    fn build_skips_never_asserted_retract_lifecycles() {
+        let dir = std::env::temp_dir().join("fluree_test_build_v2_never_asserted");
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_dir = dir.join("runs");
+        let index_dir = dir.join("index");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        // SPOT-sorted (s ascending, then t):
+        // s=10: asserted@1, retracted@2  -> no row; history keeps both events
+        // s=20: retracted@3, never asserted -> no row, no history
+        // s=30: asserted@4               -> row
+        let records = vec![
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 1),
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 2),
+            make_rec(0, 20, 1, OType::XSD_INTEGER.as_u16(), 200, 3),
+            make_rec(0, 30, 1, OType::XSD_INTEGER.as_u16(), 300, 4),
+        ];
+        let ops = vec![1u8, 0, 0, 1];
+
+        crate::run_index::runs::run_file::write_run_file_with_op(
+            &run_dir.join("run_00000.frn"),
+            &records,
+            &ops,
+            RunSortOrder::Spot,
+            1,
+            4,
+        )
+        .unwrap();
+
+        let config = IndexBuildConfig {
+            run_dir,
+            index_dir: index_dir.clone(),
+            sort_order: RunSortOrder::Spot,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 1000,
+            zstd_level: 1,
+            skip_dedup: false,
+            skip_history: false,
+            g_id: 0,
+            progress: None,
+        };
+
+        let result = build_index(&config).unwrap();
+        assert_eq!(result.total_rows, 1, "only s=30 survives to latest-state");
+
+        let leaf = &result.graphs[0].leaf_infos[0];
+        let leaf_bytes = std::fs::read(&leaf.leaf_path).unwrap();
+        let header = decode_leaf_header_v3(&leaf_bytes).unwrap();
+        let leaf_dir = decode_leaf_dir_v3(&leaf_bytes, &header).unwrap();
+
+        let sidecar_bytes =
+            std::fs::read(leaf.sidecar_path.as_ref().expect("history sidecar written")).unwrap();
+        let mut history: Vec<HistEntryV2> = Vec::new();
+        for entry in &leaf_dir {
+            if entry.history_len == 0 {
+                continue;
+            }
+            let seg = fluree_db_binary_index::format::history_sidecar::HistorySegmentRef {
+                offset: entry.history_offset,
+                len: entry.history_len,
+                min_t: entry.history_min_t,
+                max_t: entry.history_max_t,
+            };
+            history.extend(
+                fluree_db_binary_index::format::history_sidecar::decode_history_segment(
+                    &sidecar_bytes,
+                    &seg,
+                )
+                .unwrap(),
+            );
+        }
+
+        let mut events: Vec<(u64, u32, u8)> = history
+            .iter()
+            .map(|e| (e.s_id.as_u64(), e.t, e.op))
+            .collect();
+        events.sort_unstable();
+        assert_eq!(
+            events,
+            vec![(10, 1, 1), (10, 2, 0)],
+            "asserted-then-retracted lifecycle keeps its history; \
+             never-asserted retract leaves none"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

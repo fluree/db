@@ -390,6 +390,20 @@ struct Phase2Task {
     kind: Phase2TaskKind,
 }
 
+/// Graph-scoped V2 fact identity: `(g_id, s_id, p_id, o_type, o_key, o_i)`.
+type FactIdentityKey = (u16, u64, u32, u16, u64, u32);
+
+fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
+    (
+        rec.g_id,
+        rec.s_id.as_u64(),
+        rec.p_id,
+        rec.o_type,
+        rec.o_key,
+        rec.o_i,
+    )
+}
+
 enum Phase2TaskUpdate {
     Default { leaf_entries: Vec<LeafEntry> },
     Named { branch_cid: ContentId },
@@ -404,6 +418,9 @@ struct Phase2TaskOutput {
     replaced_sidecar_cids: Vec<ContentId>,
     new_leaf_count: usize,
     fetch_stats: Phase2FetchStatsSnapshot,
+    /// Novelty ops whose identity matched an existing base row (SPOT task
+    /// only; fresh-graph tasks have no base rows to match).
+    matched: Vec<RunRecordV2>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -434,6 +451,9 @@ async fn execute_phase2_task(
             .leaflet_rows
             .max(1)
             .saturating_mul(config.leaflets_per_leaf.max(1)),
+        // Fact identity is order-independent; collect base-row matches from
+        // the SPOT task only (they feed the Phase 3b stats deltas).
+        collect_matched: order == RunSortOrder::Spot,
     };
 
     let started = Instant::now();
@@ -472,6 +492,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
+                matched: meta.matched,
             }
         }
         Phase2TaskKind::DefaultFresh => {
@@ -499,6 +520,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: Vec::new(),
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
             }
         }
         Phase2TaskKind::NamedExisting { branch_cid } => {
@@ -537,6 +559,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
+                matched: meta.matched,
             }
         }
         Phase2TaskKind::NamedFresh => {
@@ -573,6 +596,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids,
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
             }
         }
     };
@@ -788,9 +812,16 @@ pub async fn incremental_index(
         phase2_results.into_iter().collect::<Result<Vec<_>>>()?;
     phase2_outputs.sort_unstable_by_key(|output| output.seq);
 
+    // Fact identities the SPOT merges matched against existing base rows.
+    // Phase 3b derives materialized-state stat deltas from this: an assert of
+    // a base-present fact and a retract of a base-absent fact change no rows.
+    let mut base_matched: std::collections::HashSet<FactIdentityKey> =
+        std::collections::HashSet::new();
+
     let mut phase2_fetch_totals = Phase2FetchStatsSnapshot::default();
     for output in phase2_outputs {
         total_new_leaves += output.new_leaf_count;
+        base_matched.extend(output.matched.iter().map(fact_identity_key));
         phase2_fetch_totals.leaf_fetches += output.fetch_stats.leaf_fetches;
         phase2_fetch_totals.leaf_cache_hits += output.fetch_stats.leaf_cache_hits;
         phase2_fetch_totals.leaf_cache_misses += output.fetch_stats.leaf_cache_misses;
@@ -1977,11 +2008,16 @@ pub async fn incremental_index(
             }
         }
 
-        // Feed all novelty records.
+        // Feed all novelty records. Counts are base-seeded, so each record's
+        // signed delta reflects its materialized state transition (derived
+        // from the SPOT merge's base-row matches), not its raw op: a
+        // re-assert of a base-present fact and a retract of a base-absent
+        // fact change no rows and contribute 0.
         for (i, rec) in novelty.records.iter().enumerate() {
             let op = novelty.ops[i];
             let sr = stats::stats_record_from_v2(rec, op);
-            stats_hook.on_record(&sr);
+            let base_present = base_matched.contains(&fact_identity_key(rec));
+            stats_hook.on_record_with_base_presence(&sr, base_present);
         }
 
         // Upload HLL sketches (before finalize consumes the hook).
@@ -4049,6 +4085,7 @@ fn build_fresh_default_graph_v3(
         replaced_sidecar_cids: Vec::new(),
         branch_bytes,
         branch_cid,
+        matched: Vec::new(),
     })
 }
 
