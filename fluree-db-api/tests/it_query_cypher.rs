@@ -8366,6 +8366,78 @@ async fn cypher_vocab_context_resolves_bare_names_to_rdf_iris() {
 }
 
 #[tokio::test]
+async fn cypher_labels_and_type_compact_like_db_labels() {
+    // labels()/type() follow the db.labels() naming rule: strip the
+    // configured `@vocab` prefix, otherwise return the FULL IRI so it
+    // round-trips (no blind last-#/segment stripping — a relationship
+    // typed `http://other.example/kb#order` must not come back "order").
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:label-naming");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/", "kb": "http://other.example/kb#"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": ["ex:Person", "kb:Indexed"],
+                        "ex:name": "Alice",
+                        "kb:order": {"@id": "ex:bob"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let vocab_db = graphdb_from_ledger(&committed.ledger)
+        .with_default_context(Some(json!({"@vocab": "http://example.org/"})));
+
+    // labels(): the vocab class compacts to a bare name; the foreign class
+    // stays a full IRI.
+    let cj = fluree
+        .query_cypher(
+            &vocab_db,
+            r#"MATCH (n:Person {name: "Alice"}) UNWIND labels(n) AS l RETURN l ORDER BY l"#,
+        )
+        .await
+        .expect("labels query")
+        .to_cypher_json_async(vocab_db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let labels: Vec<_> = cj["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"][0].clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![json!("Person"), json!("http://other.example/kb#Indexed")],
+        "vocab label compacts, foreign label keeps the full IRI: {cj}"
+    );
+
+    // type(): the foreign relationship IRI round-trips whole.
+    let cj = fluree
+        .query_cypher(
+            &vocab_db,
+            r#"MATCH (:Person {name: "Alice"})-[p]->(:Person) RETURN type(p) AS t"#,
+        )
+        .await
+        .expect("type query")
+        .to_cypher_json_async(vocab_db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!("http://other.example/kb#order"),
+        "type(p) must return the full foreign IRI: {cj}"
+    );
+}
+
+#[tokio::test]
 async fn cypher_backticked_names_round_trip_without_splitting() {
     // The namespace-0 placement rule is "no colon → whole name": the IRI
     // splitter (`canonical_split`) must never cut a colon-free Cypher name

@@ -265,7 +265,11 @@ ORDER BY / SKIP / LIMIT
   (from live `rdf:type` assertions, overlay-aware); `type(r)` returns the
   relationship type string for a named relationship variable (from
   `f:reifiesPredicate` on the reifier). Unbound or non-node/non-rel
-  arguments yield null.
+  arguments yield null. Naming follows the `db.labels()` rule: a name
+  under the ledger's `@vocab` is returned bare (the vocab prefix
+  stripped); any other IRI is returned **whole**, so it round-trips —
+  the same rule the rendered node/relationship label, type, and property
+  keys use.
 - `pathPairs(p)` — the consecutive node pairs of a path value
   (`[[a,b],[b,c],…]`, each pair a two-element list). With `UNWIND`, this
   drives per-edge aggregation: `UNWIND pathPairs(p) AS pair` then

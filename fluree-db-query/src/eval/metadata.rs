@@ -92,32 +92,33 @@ fn binding_subject_s_id(
     }
 }
 
-/// Extract the Cypher-local name from a full IRI (inverse of `@vocab` concat).
-/// The Cypher-visible name for an IRI: the fragment after the last `#` or
-/// `/`, falling back to the whole IRI. Shared naming rule for labels,
-/// property keys, and relationship types across `labels()`/`keys()`/
-/// `properties()`/`type()` and the result formatters.
-pub fn cypher_name_from_iri(iri: &str) -> String {
-    if let Some((_, local)) = iri.rsplit_once('#') {
-        if !local.is_empty() {
-            return local.to_string();
-        }
-    }
-    if let Some((_, local)) = iri.rsplit_once('/') {
-        if !local.is_empty() {
-            return local.to_string();
+/// The Cypher-visible name for an IRI (inverse of `@vocab` concat). Strips
+/// the ledger's `@vocab` prefix when the IRI sits under it; any other IRI is
+/// returned whole, so it round-trips (parity with `db.labels()` /
+/// `db.relationshipTypes()`). Names that never had a prefix (namespace-0
+/// bare identifiers — the default Cypher mode) pass through unchanged.
+/// Shared naming rule for labels, property keys, and relationship types
+/// across `labels()`/`keys()`/`properties()`/`type()` and the result
+/// formatters.
+pub fn cypher_name_from_iri(iri: &str, vocab: Option<&str>) -> String {
+    if let Some(vocab) = vocab {
+        if let Some(local) = iri.strip_prefix(vocab) {
+            if !local.is_empty() {
+                return local.to_string();
+            }
         }
     }
     iri.to_string()
 }
 
 fn cypher_name_from_sid(sid: &Sid, ctx: &ExecutionContext<'_>) -> Result<Option<String>> {
+    let vocab = ctx.cypher_vocab.as_deref();
     if let Some(iri) = ctx
         .active_snapshot
         .decode_sid(sid)
         .or_else(|| ctx.binary_store.as_ref().and_then(|s| s.sid_to_iri(sid)))
     {
-        return Ok(Some(cypher_name_from_iri(&iri)));
+        return Ok(Some(cypher_name_from_iri(&iri, vocab)));
     }
     if let Some(store) = ctx.binary_store.as_ref() {
         if let Ok(Some(s_id)) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
@@ -125,11 +126,11 @@ fn cypher_name_from_sid(sid: &Sid, ctx: &ExecutionContext<'_>) -> Result<Option<
                 let iri = resolved.map_err(|e| {
                     QueryError::dictionary_lookup(format!("metadata: resolve sid {s_id}: {e}"))
                 })?;
-                return Ok(Some(cypher_name_from_iri(&iri)));
+                return Ok(Some(cypher_name_from_iri(&iri, vocab)));
             }
         }
     }
-    Ok(Some(cypher_name_from_iri(&sid.name)))
+    Ok(Some(cypher_name_from_iri(&sid.name, vocab)))
 }
 
 fn merge_latest_ref_objects(flakes: Vec<Flake>) -> Vec<Sid> {

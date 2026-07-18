@@ -52,6 +52,7 @@ pub fn lower_query<E: IriEncoder>(
         post_values: None,
         // System-fact filter ON — hides f:reifies* from untyped relationship matches.
         include_system_facts: false,
+        cypher_vocab: None,
     })
 }
 
@@ -144,6 +145,7 @@ fn lower_union_query<E: IriEncoder>(
         reasoning: Default::default(),
         post_values: None,
         include_system_facts: false,
+        cypher_vocab: None,
     })
 }
 
