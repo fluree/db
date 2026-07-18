@@ -1420,12 +1420,6 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     }
 }
 
-/// Inner-pattern shapes whose per-row OPTIONAL evaluation is exactly a
-/// restriction by the correlation tuple — safe to evaluate once over all
-/// distinct tuples and hash-partition. Triples, row-local filters, and
-/// property paths from a (possibly seeded) endpoint qualify; subqueries,
-/// nested OPTIONAL/UNION/MINUS, BIND/UNWIND/VALUES, and search patterns do
-/// not (they can carry internal limits or independent correlation).
 /// Batched builder for the value-only Cypher relationship binding:
 /// `OPTIONAL { DefaultGraphSource[base edge + 3 f:reifies* triples] }` with
 /// every base-edge position bound by the required row (or constant).
@@ -1456,6 +1450,19 @@ pub struct AnnotationValueOptionalBuilder {
     o_src: crate::annotation_edge_probe::EdgePos,
     stats: Option<Arc<StatsView>>,
     planning: PlanningContext,
+    /// Sidecar maps, built on the first `build_batch` and reused for every
+    /// later required batch of this operator's execution. The builder lives
+    /// for exactly one query run against one snapshot/overlay/`to_t`, so
+    /// the maps cannot go stale; without this cache a 54k-row result
+    /// re-drained the whole sidecar ~55 times (once per required batch).
+    maps: std::sync::Mutex<Option<Arc<AnnotationSidecarMaps>>>,
+}
+
+/// The three `f:reifies*` lookups, drained once and hash-indexed.
+struct AnnotationSidecarMaps {
+    s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
+    ann_pred: HashMap<fluree_db_core::Sid, fluree_db_core::Sid>,
+    ann_obj: HashMap<fluree_db_core::Sid, fluree_db_core::Sid>,
 }
 
 impl AnnotationValueOptionalBuilder {
@@ -1514,7 +1521,41 @@ impl AnnotationValueOptionalBuilder {
             o_src: shape.o_pos,
             stats,
             planning,
+            maps: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The sidecar maps for this execution, drained on first use.
+    async fn sidecar_maps(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Arc<AnnotationSidecarMaps>> {
+        if let Some(m) = self.maps.lock().expect("sidecar maps lock").clone() {
+            return Ok(m);
+        }
+        let subj_pairs = self.drain_pairs(&self.r_subj, ctx, view).await?;
+        let mut s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
+        for (ann, s) in subj_pairs {
+            s_to_anns.entry(s).or_default().push(ann);
+        }
+        let ann_pred: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
+            .drain_pairs(&self.r_pred, ctx, view)
+            .await?
+            .into_iter()
+            .collect();
+        let ann_obj: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
+            .drain_pairs(&self.r_obj, ctx, view)
+            .await?
+            .into_iter()
+            .collect();
+        let built = Arc::new(AnnotationSidecarMaps {
+            s_to_anns,
+            ann_pred,
+            ann_obj,
+        });
+        *self.maps.lock().expect("sidecar maps lock") = Some(built.clone());
+        Ok(built)
     }
 
     /// Normalize a binding to a raw `Sid` (decoding late-materialized
@@ -1652,22 +1693,14 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
         let view = view.as_ref();
 
         // One pass over each reifies predicate (overlay-merged, policy-
-        // filtered planned scans), then pure hash lookups per row.
-        let subj_pairs = self.drain_pairs(&self.r_subj, ctx, view).await?;
-        let mut s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-        for (ann, s) in subj_pairs {
-            s_to_anns.entry(s).or_default().push(ann);
-        }
-        let ann_pred: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
-            .drain_pairs(&self.r_pred, ctx, view)
-            .await?
-            .into_iter()
-            .collect();
-        let ann_obj: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
-            .drain_pairs(&self.r_obj, ctx, view)
-            .await?
-            .into_iter()
-            .collect();
+        // filtered planned scans) — cached across required batches — then
+        // pure hash lookups per row.
+        let maps = self.sidecar_maps(ctx, view).await?;
+        let AnnotationSidecarMaps {
+            s_to_anns,
+            ann_pred,
+            ann_obj,
+        } = maps.as_ref();
 
         let opt_schema: Arc<[VarId]> = Arc::from(vec![self.ann_var].into_boxed_slice());
         let mut pending = Vec::with_capacity(required_batch.len() - start_row);
