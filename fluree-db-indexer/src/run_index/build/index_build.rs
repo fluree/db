@@ -194,6 +194,9 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
     let mut total_rows: u64 = 0;
     let mut progress_batch: u64 = 0;
 
+    // Scratch: one identity's full event log, reused across identities.
+    let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
+
     loop {
         if config.skip_dedup {
             // Import path: no dedup, no history.
@@ -204,26 +207,39 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
                 continue;
             }
             writer.push_record(record)?;
-        } else if config.skip_history {
-            // Rebuild without history: dedup but discard non-winners.
-            let Some((record, op)) = merge.next_deduped()? else {
-                break;
-            };
-            if op == 0 {
-                continue;
-            }
-            writer.push_record(record)?;
         } else {
-            // Rebuild with history: dedup and capture non-winners as sidecar entries.
+            // Rebuild: resolve each identity's full event log to its state
+            // transitions. The row is the transition into the final asserted
+            // state — the `t` at which the fact most recently became present
+            // — matching the novelty and incremental materializers. Each
+            // transition becomes a sidecar entry (unless history is
+            // skipped); identities whose log nets to nothing, such as
+            // retracts of never-asserted facts, vanish entirely.
             let Some((record, op, history)) = merge.next_deduped_with_history()? else {
                 break;
             };
-            // A retract-winner whose identity was never asserted anywhere in
-            // the commit log (the full log — this is a rebuild) is a retract
-            // of a fact that never existed: not a state transition, and its
-            // entries would make time-travel replay fabricate the fact's
-            // presence before the retraction. Skip the whole lifecycle.
-            if op == 0 && history.iter().all(|&(_, hist_op)| hist_op == 0) {
+            events.clear();
+            events.extend(history);
+            events.push((record, op));
+            let row = resolve_lifecycle(&mut events);
+            if !config.skip_history {
+                for &(rec, rec_op) in &events {
+                    writer.push_history_entry(
+                        fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
+                            s_id: rec.s_id,
+                            p_id: rec.p_id,
+                            o_type: rec.o_type,
+                            o_key: rec.o_key,
+                            o_i: rec.o_i,
+                            t: rec.t,
+                            op: rec_op,
+                        },
+                    );
+                }
+            }
+            let Some(row) = row else {
+                // No materialized row (final state absent, or nothing ever
+                // happened). Only track progress for the UI.
                 progress_batch += 1;
                 if progress_batch >= PROGRESS_BATCH_SIZE {
                     if let Some(ref ctr) = config.progress {
@@ -232,47 +248,8 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
                     progress_batch = 0;
                 }
                 continue;
-            }
-            // Push history entries for non-winners (these become sidecar segments).
-            for (hist_rec, hist_op) in &history {
-                writer.push_history_entry(
-                    fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
-                        s_id: hist_rec.s_id,
-                        p_id: hist_rec.p_id,
-                        o_type: hist_rec.o_type,
-                        o_key: hist_rec.o_key,
-                        o_i: hist_rec.o_i,
-                        t: hist_rec.t,
-                        op: *hist_op,
-                    },
-                );
-            }
-            if op == 0 {
-                // Retract-winner: don't push to latest-state, but history is already recorded.
-                // Also push a history-only entry for the retract-winner itself.
-                writer.push_history_entry(
-                    fluree_db_binary_index::format::history_sidecar::HistEntryV2 {
-                        s_id: record.s_id,
-                        p_id: record.p_id,
-                        o_type: record.o_type,
-                        o_key: record.o_key,
-                        o_i: record.o_i,
-                        t: record.t,
-                        op,
-                    },
-                );
-                // Don't count retract-winners in total_rows (they're not in latest-state).
-                // Only track progress for the UI.
-                progress_batch += 1;
-                if progress_batch >= PROGRESS_BATCH_SIZE {
-                    if let Some(ref ctr) = config.progress {
-                        ctr.fetch_add(progress_batch, Ordering::Relaxed);
-                    }
-                    progress_batch = 0;
-                }
-                continue;
-            }
-            writer.push_record(record)?;
+            };
+            writer.push_record(row)?;
         }
 
         total_rows += 1;
@@ -305,6 +282,40 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Resolve one identity's full event log to its state transitions, in place,
+/// and return its materialized row.
+///
+/// Events walk chronologically from absent — a rebuild sees the complete log
+/// — so each op that changes state is a transition, and ops that repeat the
+/// current state (a re-assert of a present fact, a retract of an absent one)
+/// are no-ops. `events` is left holding exactly the transitions. The row is
+/// the transition into the final asserted state, or `None` when the final
+/// state is absent. Same-`t` ties walk retract-first, matching the same-`t`
+/// retract-wins resolution used everywhere else.
+fn resolve_lifecycle(events: &mut Vec<(RunRecordV2, u8)>) -> Option<RunRecordV2> {
+    events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
+    let mut present = false;
+    let mut row: Option<RunRecordV2> = None;
+    let mut write = 0;
+    for read in 0..events.len() {
+        let (rec, op) = events[read];
+        let asserts = op == 1;
+        if asserts == present {
+            continue;
+        }
+        present = asserts;
+        row = asserts.then_some(rec);
+        events[write] = (rec, op);
+        write += 1;
+    }
+    events.truncate(write);
+    if present {
+        row
+    } else {
+        None
+    }
+}
 
 fn create_graph_dir(index_dir: &Path, g_id: u16, order_name: &str) -> io::Result<PathBuf> {
     let graph_dir = index_dir.join(format!("graph_{g_id}/{order_name}"));
@@ -805,11 +816,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A retract-winner whose identity was never asserted anywhere in the log
-    /// is a retract of a fact that never existed: it contributes no row and
-    /// no history entries (a bare retract entry would make time-travel replay
-    /// fabricate the fact's presence before the retraction). A lifecycle that
-    /// does contain an assert keeps its full history.
+    /// Decode every history entry from a persisted leaf's sidecar.
+    fn read_all_history(leaf: &PersistedLeafInfo) -> Vec<HistEntryV2> {
+        let leaf_bytes = std::fs::read(&leaf.leaf_path).unwrap();
+        let header = decode_leaf_header_v3(&leaf_bytes).unwrap();
+        let leaf_dir = decode_leaf_dir_v3(&leaf_bytes, &header).unwrap();
+        let sidecar_bytes =
+            std::fs::read(leaf.sidecar_path.as_ref().expect("history sidecar written")).unwrap();
+        let mut history: Vec<HistEntryV2> = Vec::new();
+        for entry in &leaf_dir {
+            if entry.history_len == 0 {
+                continue;
+            }
+            let seg = fluree_db_binary_index::format::history_sidecar::HistorySegmentRef {
+                offset: entry.history_offset,
+                len: entry.history_len,
+                min_t: entry.history_min_t,
+                max_t: entry.history_max_t,
+            };
+            history.extend(
+                fluree_db_binary_index::format::history_sidecar::decode_history_segment(
+                    &sidecar_bytes,
+                    &seg,
+                )
+                .unwrap(),
+            );
+        }
+        history
+    }
+
+    /// A retract of a fact that was never asserted anywhere in the log is
+    /// not a transition: it contributes no row and no history entries (a
+    /// bare retract entry would make time-travel replay fabricate the fact's
+    /// presence before the retraction). Real transitions — including the
+    /// surviving row's own assert — are all recorded.
     #[test]
     fn build_skips_never_asserted_retract_lifecycles() {
         let dir = std::env::temp_dir().join("fluree_test_build_v2_never_asserted");
@@ -857,31 +897,7 @@ mod tests {
         assert_eq!(result.total_rows, 1, "only s=30 survives to latest-state");
 
         let leaf = &result.graphs[0].leaf_infos[0];
-        let leaf_bytes = std::fs::read(&leaf.leaf_path).unwrap();
-        let header = decode_leaf_header_v3(&leaf_bytes).unwrap();
-        let leaf_dir = decode_leaf_dir_v3(&leaf_bytes, &header).unwrap();
-
-        let sidecar_bytes =
-            std::fs::read(leaf.sidecar_path.as_ref().expect("history sidecar written")).unwrap();
-        let mut history: Vec<HistEntryV2> = Vec::new();
-        for entry in &leaf_dir {
-            if entry.history_len == 0 {
-                continue;
-            }
-            let seg = fluree_db_binary_index::format::history_sidecar::HistorySegmentRef {
-                offset: entry.history_offset,
-                len: entry.history_len,
-                min_t: entry.history_min_t,
-                max_t: entry.history_max_t,
-            };
-            history.extend(
-                fluree_db_binary_index::format::history_sidecar::decode_history_segment(
-                    &sidecar_bytes,
-                    &seg,
-                )
-                .unwrap(),
-            );
-        }
+        let history = read_all_history(leaf);
 
         let mut events: Vec<(u64, u32, u8)> = history
             .iter()
@@ -890,10 +906,121 @@ mod tests {
         events.sort_unstable();
         assert_eq!(
             events,
-            vec![(10, 1, 1), (10, 2, 0)],
-            "asserted-then-retracted lifecycle keeps its history; \
-             never-asserted retract leaves none"
+            vec![(10, 1, 1), (10, 2, 0), (30, 4, 1)],
+            "every real transition is recorded (including the surviving \
+             row's assert); the never-asserted retract leaves none"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding-4 parity: a fact asserted and later re-asserted (never
+    /// retracted between) materializes with the FIRST assert's `t` — the `t`
+    /// at which it became present — matching the novelty and incremental
+    /// materializers instead of the old highest-`t` rule. The no-op
+    /// re-assert records no history entry.
+    #[test]
+    fn build_reasserted_fact_keeps_first_assert_t() {
+        let dir = std::env::temp_dir().join("fluree_test_build_v2_reassert_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_dir = dir.join("runs");
+        let index_dir = dir.join("index");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let records = vec![
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 1),
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 6),
+        ];
+        let ops = vec![1u8, 1];
+        crate::run_index::runs::run_file::write_run_file_with_op(
+            &run_dir.join("run_00000.frn"),
+            &records,
+            &ops,
+            RunSortOrder::Spot,
+            1,
+            6,
+        )
+        .unwrap();
+
+        let config = IndexBuildConfig {
+            run_dir,
+            index_dir: index_dir.clone(),
+            sort_order: RunSortOrder::Spot,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 1000,
+            zstd_level: 1,
+            skip_dedup: false,
+            skip_history: false,
+            g_id: 0,
+            progress: None,
+        };
+
+        let result = build_index(&config).unwrap();
+        assert_eq!(result.total_rows, 1);
+        let leaf = &result.graphs[0].leaf_infos[0];
+        assert_eq!(leaf.first_key.t, 1, "row carries the first assert's t");
+
+        let history = read_all_history(leaf);
+        let events: Vec<(u64, u32, u8)> = history
+            .iter()
+            .map(|e| (e.s_id.as_u64(), e.t, e.op))
+            .collect();
+        assert_eq!(events, vec![(10, 1, 1)], "the re-assert is a no-op");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full lifecycle (assert, retract, re-assert) materializes the row at
+    /// the re-add `t` with every transition in the sidecar.
+    #[test]
+    fn build_full_lifecycle_row_carries_readd_t() {
+        let dir = std::env::temp_dir().join("fluree_test_build_v2_lifecycle_t");
+        let _ = std::fs::remove_dir_all(&dir);
+        let run_dir = dir.join("runs");
+        let index_dir = dir.join("index");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let records = vec![
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 1),
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 4),
+            make_rec(0, 10, 1, OType::XSD_INTEGER.as_u16(), 100, 6),
+        ];
+        let ops = vec![1u8, 0, 1];
+        crate::run_index::runs::run_file::write_run_file_with_op(
+            &run_dir.join("run_00000.frn"),
+            &records,
+            &ops,
+            RunSortOrder::Spot,
+            1,
+            6,
+        )
+        .unwrap();
+
+        let config = IndexBuildConfig {
+            run_dir,
+            index_dir: index_dir.clone(),
+            sort_order: RunSortOrder::Spot,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 1000,
+            zstd_level: 1,
+            skip_dedup: false,
+            skip_history: false,
+            g_id: 0,
+            progress: None,
+        };
+
+        let result = build_index(&config).unwrap();
+        assert_eq!(result.total_rows, 1);
+        let leaf = &result.graphs[0].leaf_infos[0];
+        assert_eq!(leaf.first_key.t, 6, "row carries the re-add t");
+
+        let history = read_all_history(leaf);
+        let mut events: Vec<(u64, u32, u8)> = history
+            .iter()
+            .map(|e| (e.s_id.as_u64(), e.t, e.op))
+            .collect();
+        events.sort_unstable();
+        assert_eq!(events, vec![(10, 1, 1), (10, 4, 0), (10, 6, 1)]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
