@@ -71,7 +71,7 @@ pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
 pub use error::{IcebergError, Result};
 pub use mor_guard::{
     ensure_no_delete_manifests, ensure_no_summary_deletes, mor_deletes_allowed,
-    ALLOW_MOR_DELETES_ENV,
+    summary_indicates_deletes, ALLOW_MOR_DELETES_ENV,
 };
 
 // Re-export Phase 2 types for convenience

@@ -60,6 +60,18 @@ fn env_truthy(value: Option<&str>) -> bool {
     )
 }
 
+/// Whether the snapshot **summary** counters report any merge-on-read delete
+/// files (`total-delete-files` / `-position-deletes` / `-equality-deletes` > 0).
+/// Zero extra I/O — the summary is already in memory. Used both by
+/// [`ensure_no_summary_deletes`] and by the planner to stamp the resulting
+/// [`crate::scan::ScanPlan::has_delete_manifests`] flag so cached scan-file
+/// selections carry the signal downstream.
+pub fn summary_indicates_deletes(snapshot: &Snapshot) -> bool {
+    snapshot.total_delete_files().unwrap_or(0) > 0
+        || snapshot.total_position_deletes().unwrap_or(0) > 0
+        || snapshot.total_equality_deletes().unwrap_or(0) > 0
+}
+
 /// Fail closed if the snapshot **summary** reports any merge-on-read delete
 /// files. Zero extra I/O: `snapshot.summary` is already loaded. An absent
 /// counter reads as `0` (the manifest-list check in [`ensure_no_delete_manifests`]
@@ -68,12 +80,12 @@ fn env_truthy(value: Option<&str>) -> bool {
 /// `allowed` is the operator opt-out ([`mor_deletes_allowed`]); pass it in so
 /// callers read the env once and this stays pure/testable.
 pub fn ensure_no_summary_deletes(snapshot: &Snapshot, table: &str, allowed: bool) -> Result<()> {
+    if !summary_indicates_deletes(snapshot) {
+        return Ok(());
+    }
     let files = snapshot.total_delete_files().unwrap_or(0).max(0);
     let pos = snapshot.total_position_deletes().unwrap_or(0).max(0);
     let eq = snapshot.total_equality_deletes().unwrap_or(0).max(0);
-    if files == 0 && pos == 0 && eq == 0 {
-        return Ok(());
-    }
     decide(
         table,
         &format!(

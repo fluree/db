@@ -1845,6 +1845,9 @@ impl FlureeR2rmlProvider<'_> {
                 plan.estimated_row_count,
             )
         } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
+            // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
+            // without calling the guarded plan_scan, so re-check the delete flag.
+            guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = cached.data_files.len(),
@@ -1872,6 +1875,13 @@ impl FlureeR2rmlProvider<'_> {
                 cached.estimated_row_count,
             )
         } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&metadata_location) {
+            // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
+            // scan-files entry survives restarts, so a delete-bearing list cached
+            // under the override by an earlier process must be re-checked before it
+            // is served or promoted into the in-memory cache. Pre-guard (v2) entries
+            // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
+            // entry written under the override.
+            guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
             // PR-8 slice 2: in-memory miss, but the persistent disk catalog
             // cache has this snapshot's (unfiltered) file list — a warm-catalog
             // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
@@ -1925,6 +1935,7 @@ impl FlureeR2rmlProvider<'_> {
                 estimated_row_count: plan.estimated_row_count,
                 files_selected: plan.files_selected,
                 files_pruned: plan.files_pruned,
+                has_delete_manifests: plan.has_delete_manifests,
             });
             cache
                 .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
@@ -2199,6 +2210,23 @@ fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
 }
 
+/// Re-apply the fail-closed merge-on-read guard (audit F-AUD-1) to a cached
+/// scan-files selection. A scan-files cache HIT (in-memory or persistent disk)
+/// rebuilds tasks WITHOUT calling the guarded `plan_scan`, so a delete-bearing
+/// file list — which is only ever cacheable when the guard was overridden at plan
+/// time — must be re-checked here in case the override is now off. Cheap: the flag
+/// rides on the cache entry, no manifest re-read. Shared by both hit arms so the
+/// check cannot drift between them.
+fn guard_cached_scan_files(has_delete_manifests: bool, metadata_location: &str) -> QueryResult<()> {
+    let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
+    fluree_db_iceberg::ensure_no_delete_manifests(
+        usize::from(has_delete_manifests),
+        metadata_location,
+        allow_mor,
+    )
+    .map_err(|e| storage_query_error("Refusing cached Iceberg scan", e))
+}
+
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
 /// answer to a bare `COUNT(*)`, and if so return it. Pure over the manifest read
 /// result (no I/O), so the soundness gates are unit-tested directly against
@@ -2394,6 +2422,25 @@ mod tests {
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
+
+    /// F-AUD-1 cache-arm follow-up: the shared guard both scan-files hit arms call
+    /// must refuse a delete-bearing cached entry (guard active by default in the
+    /// test env) and pass a delete-free one — so a cache HIT can never silently
+    /// serve a merge-on-read file list around the plan-time guard.
+    #[test]
+    fn cached_scan_files_guard_refuses_delete_bearing_entry() {
+        assert!(
+            guard_cached_scan_files(false, "s3://b/t/metadata/00001.json").is_ok(),
+            "a delete-free cached entry is served"
+        );
+        let err = guard_cached_scan_files(true, "s3://b/dw.fact_orders/metadata/00007.json")
+            .expect_err("a delete-bearing cached entry must be refused with the guard active");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FLUREE_ICEBERG_ALLOW_MOR_DELETES"),
+            "the refusal names the override switch: {msg}"
+        );
+    }
 
     fn field(id: i32, name: &str, ty: serde_json::Value) -> SchemaField {
         SchemaField {

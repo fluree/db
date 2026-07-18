@@ -104,6 +104,10 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             &self.metadata.location,
             allow_mor,
         )?;
+        // Only ever `true` under the override (else refused above); propagated so
+        // a cached scan-file selection can re-refuse if the override is later off.
+        let has_delete_manifests =
+            crate::mor_guard::summary_indicates_deletes(snapshot) || delete_manifests > 0;
 
         tracing::debug!(
             manifest_count = manifest_entries.len(),
@@ -168,6 +172,7 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
             estimated_row_count,
             files_selected,
             files_pruned,
+            has_delete_manifests,
         })
     }
 

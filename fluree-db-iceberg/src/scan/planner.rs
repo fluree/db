@@ -142,6 +142,13 @@ pub struct ScanPlan {
     pub files_selected: usize,
     /// Number of files pruned by statistics.
     pub files_pruned: usize,
+    /// Whether the source snapshot carried merge-on-read delete files (summary
+    /// counters or a `content=1` delete manifest). Under the fail-closed guard
+    /// this is only ever `true` when [`crate::mor_guard`] was overridden — the
+    /// planner refuses otherwise — but it must be propagated so any cached
+    /// scan-file selection derived from this plan can re-refuse if the override
+    /// is later turned off (audit F-AUD-1, cache-arm follow-up).
+    pub has_delete_manifests: bool,
 }
 
 impl ScanPlan {
@@ -222,6 +229,10 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
             &self.metadata.location,
             allow_mor,
         )?;
+        // Only ever `true` under the override (else refused above); propagated so
+        // a cached scan-file selection can re-refuse if the override is later off.
+        let has_delete_manifests =
+            crate::mor_guard::summary_indicates_deletes(snapshot) || delete_manifests > 0;
 
         tracing::debug!(
             manifest_count = manifest_entries.len(),
@@ -286,6 +297,7 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
             estimated_row_count,
             files_selected,
             files_pruned,
+            has_delete_manifests,
         })
     }
 
