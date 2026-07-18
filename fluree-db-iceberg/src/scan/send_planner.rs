@@ -81,11 +81,12 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         // Determine projection
         let (projected_field_ids, projected_columns) = self.resolve_projection(schema)?;
 
-        // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads
-        // only live data files and never applies deletes, so a MoR snapshot
-        // would silently return deleted rows. Cheap zero-I/O check first.
-        let allow_mor = crate::mor_guard::mor_deletes_allowed();
-        crate::mor_guard::ensure_no_summary_deletes(snapshot, &self.metadata.location, allow_mor)?;
+        // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads only
+        // live data files and never applies deletes, so a MoR snapshot would
+        // silently return deleted rows. Same shared guard as `ScanPlanner`: a
+        // zero-I/O summary check first, then the manifest-list belt-and-suspenders.
+        let allow_mor =
+            crate::mor_guard::ensure_summary_scannable(snapshot, &self.metadata.location)?;
 
         // Load manifest list
         let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
@@ -98,9 +99,8 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
         // Parse WITH delete manifests so the belt-and-suspenders guard can DETECT
         // them even when the snapshot summary omits/under-counts the counters.
         let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
-        let delete_manifests = manifest_entries.iter().filter(|e| e.is_deletes()).count();
-        crate::mor_guard::ensure_no_delete_manifests(
-            delete_manifests,
+        crate::mor_guard::ensure_manifests_scannable(
+            &manifest_entries,
             &self.metadata.location,
             allow_mor,
         )?;
@@ -201,5 +201,103 @@ impl<'a, S: SendIcebergStorage> SendScanPlanner<'a, S> {
                 Ok((field_ids, names))
             }
         }
+    }
+}
+
+/// The production COUNT/scan path routes through `SendScanPlanner` (r2rml
+/// `scan_table` → `SendScanPlanner::plan_scan`), so the fail-closed merge-on-read
+/// guard must fire here too — a COUNT over a delete-bearing snapshot refuses
+/// rather than returning an over-count (audit F-AUD-1, the table_row_count path).
+/// The runtime-agnostic `ScanPlanner` is covered separately; this proves the
+/// Send variant (which shares the guard helpers) inherits it.
+#[cfg(test)]
+mod mor_guard_tests {
+    use super::*;
+    use crate::metadata::SchemaField;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use std::collections::HashMap;
+    use std::ops::Range;
+
+    /// A `SendIcebergStorage` that errors on every read. The zero-I/O summary
+    /// guard must refuse a delete-bearing snapshot BEFORE any manifest-list read,
+    /// so nothing here should ever be called.
+    #[derive(Debug)]
+    struct NoReadStorage;
+
+    #[async_trait]
+    impl SendIcebergStorage for NoReadStorage {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            Err(IcebergError::storage(
+                "planner must not read: the summary guard should refuse first",
+            ))
+        }
+        async fn read_range(&self, _path: &str, _range: Range<u64>) -> Result<Bytes> {
+            Err(IcebergError::storage("planner must not read"))
+        }
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Err(IcebergError::storage("planner must not read"))
+        }
+    }
+
+    fn metadata_with_summary(summary: &[(&str, &str)]) -> TableMetadata {
+        TableMetadata {
+            format_version: 2,
+            table_uuid: None,
+            location: "s3://bucket/dw/fact_orders".to_string(),
+            last_sequence_number: 1,
+            last_updated_ms: 1000,
+            last_column_id: 1,
+            current_schema_id: 0,
+            schemas: vec![Schema {
+                schema_id: 0,
+                identifier_field_ids: vec![1],
+                fields: vec![SchemaField {
+                    id: 1,
+                    name: "ID".to_string(),
+                    required: true,
+                    field_type: serde_json::json!("long"),
+                    doc: None,
+                }],
+            }],
+            current_snapshot_id: Some(100),
+            snapshots: vec![Snapshot {
+                snapshot_id: 100,
+                parent_snapshot_id: None,
+                sequence_number: 1,
+                timestamp_ms: 1000,
+                manifest_list: Some(
+                    "s3://bucket/dw/fact_orders/metadata/never-read.avro".to_string(),
+                ),
+                manifests: None,
+                summary: summary
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect::<HashMap<_, _>>(),
+                schema_id: Some(0),
+            }],
+            snapshot_log: vec![],
+            default_spec_id: 0,
+            partition_specs: vec![],
+            last_partition_id: 0,
+            sort_orders: vec![],
+            default_sort_order_id: 0,
+            properties: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_planner_refuses_delete_bearing_snapshot() {
+        let md = metadata_with_summary(&[("total-position-deletes", "17")]);
+        let storage = NoReadStorage;
+        let planner = SendScanPlanner::new(&storage, &md, ScanConfig::new());
+        let err = planner
+            .plan_scan()
+            .await
+            .expect_err("the Send planner (production COUNT/scan path) must fail closed");
+        assert!(
+            matches!(err, IcebergError::MergeOnReadDeletes(_)),
+            "expected a merge-on-read refusal, got {err:?}"
+        );
     }
 }

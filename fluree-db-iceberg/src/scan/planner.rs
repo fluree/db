@@ -202,8 +202,8 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
         // Fail closed on merge-on-read delete files (F-AUD-1): the scan reads
         // only live data files and never applies deletes, so a MoR snapshot
         // would silently return deleted rows. Cheap zero-I/O check first.
-        let allow_mor = crate::mor_guard::mor_deletes_allowed();
-        crate::mor_guard::ensure_no_summary_deletes(snapshot, &self.metadata.location, allow_mor)?;
+        let allow_mor =
+            crate::mor_guard::ensure_summary_scannable(snapshot, &self.metadata.location)?;
 
         // Load manifest list
         let manifest_list_path = snapshot.manifest_list.as_ref().ok_or_else(|| {
@@ -216,9 +216,8 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
         // Parse WITH delete manifests so the belt-and-suspenders guard can DETECT
         // them even when the snapshot summary omits/under-counts the counters.
         let manifest_entries = parse_manifest_list_with_deletes(&manifest_list_data, true)?;
-        let delete_manifests = manifest_entries.iter().filter(|e| e.is_deletes()).count();
-        crate::mor_guard::ensure_no_delete_manifests(
-            delete_manifests,
+        crate::mor_guard::ensure_manifests_scannable(
+            &manifest_entries,
             &self.metadata.location,
             allow_mor,
         )?;

@@ -32,6 +32,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use crate::error::{IcebergError, Result};
+use crate::manifest::ManifestListEntry;
 use crate::metadata::Snapshot;
 
 /// Environment switch that disables the fail-closed MoR delete guard.
@@ -104,6 +105,29 @@ pub fn ensure_no_delete_manifests(
         &format!("manifest list contains {delete_manifests} merge-on-read delete manifest(s)"),
         allowed,
     )
+}
+
+/// Read the override switch once and apply the zero-I/O summary-counter guard
+/// (before the manifest-list read). Returns the override flag to thread into the
+/// post-read [`ensure_manifests_scannable`] check. Both scan planners call this
+/// pair so the fail-closed guard cannot drift between them (audit F-AUD-1).
+pub fn ensure_summary_scannable(snapshot: &Snapshot, table: &str) -> Result<bool> {
+    let allowed = mor_deletes_allowed();
+    ensure_no_summary_deletes(snapshot, table, allowed)?;
+    Ok(allowed)
+}
+
+/// Belt-and-suspenders guard over an already-parsed manifest list: refuse if any
+/// `content=1` delete manifest is present (covers a snapshot whose summary omits
+/// the counters). `allowed` is the override returned by [`ensure_summary_scannable`].
+/// Shared by both scan planners so the count-and-check cannot drift.
+pub fn ensure_manifests_scannable(
+    entries: &[ManifestListEntry],
+    table: &str,
+    allowed: bool,
+) -> Result<()> {
+    let delete_manifests = entries.iter().filter(|e| e.is_deletes()).count();
+    ensure_no_delete_manifests(delete_manifests, table, allowed)
 }
 
 /// Shared decision: refuse (fail-closed) unless the operator opted out, in which
@@ -209,6 +233,54 @@ mod tests {
         assert!(ensure_no_delete_manifests(0, "t", false).is_ok());
         assert!(ensure_no_delete_manifests(2, "t", false).is_err());
         assert!(ensure_no_delete_manifests(2, "t", true).is_ok());
+    }
+
+    #[test]
+    fn summary_scannable_returns_override_and_refuses_deletes() {
+        // The shared planner helper: a delete-free snapshot proceeds and reports
+        // the override flag (false in the test env); a delete-bearing one refuses.
+        let clean = snapshot_with(&[("total-records", "10")]);
+        assert!(
+            !ensure_summary_scannable(&clean, "t").unwrap(),
+            "override is off in the test env"
+        );
+        let dirty = snapshot_with(&[("total-position-deletes", "1")]);
+        assert!(matches!(
+            ensure_summary_scannable(&dirty, "t"),
+            Err(IcebergError::MergeOnReadDeletes(_))
+        ));
+    }
+
+    #[test]
+    fn manifests_scannable_refuses_a_delete_manifest() {
+        use crate::manifest::ManifestContent;
+        fn entry(content: ManifestContent) -> ManifestListEntry {
+            ManifestListEntry {
+                manifest_path: "m.avro".to_string(),
+                manifest_length: 0,
+                partition_spec_id: 0,
+                content,
+                sequence_number: 0,
+                min_sequence_number: 0,
+                added_snapshot_id: 0,
+                added_data_files_count: 0,
+                existing_data_files_count: 0,
+                deleted_data_files_count: 0,
+                added_rows_count: 0,
+                existing_rows_count: 0,
+                deleted_rows_count: 0,
+                partitions: vec![],
+            }
+        }
+        // Only data manifests → proceeds.
+        assert!(ensure_manifests_scannable(&[entry(ManifestContent::Data)], "t", false).is_ok());
+        // A content=1 delete manifest → refuse (guard active); proceed under override.
+        let with_delete = [
+            entry(ManifestContent::Data),
+            entry(ManifestContent::Deletes),
+        ];
+        assert!(ensure_manifests_scannable(&with_delete, "t", false).is_err());
+        assert!(ensure_manifests_scannable(&with_delete, "t", true).is_ok());
     }
 
     #[test]
