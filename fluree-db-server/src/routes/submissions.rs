@@ -371,6 +371,7 @@ mod tests {
                         flake_count: 3,
                     },
                     tally: None,
+                    cypher_return: None,
                 },
             ))),
         }))

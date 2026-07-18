@@ -216,6 +216,69 @@ impl Fluree {
         self.execute_cypher_ir(db, vars, parsed, 0.0).await
     }
 
+    /// Execute a constructed Cypher read AST whose leading `InlineRows`
+    /// clause is a placeholder for caller-supplied binding rows: after
+    /// lowering, the placeholder `Values` pattern's rows are replaced
+    /// wholesale with `rows` (one cell per `seed_cols` column, in order).
+    ///
+    /// The sequential write driver uses this to join a threaded row table —
+    /// entities as already-resolved `Binding`s — against patterns lowered
+    /// with the full context/vocab machinery.
+    pub(crate) async fn query_cypher_ast_seeded(
+        &self,
+        db: &GraphDb,
+        ast: &fluree_db_cypher::CypherAst,
+        seed_cols: &[String],
+        rows: Vec<Vec<fluree_db_query::Binding>>,
+    ) -> Result<QueryResult> {
+        let (vars, mut parsed) = crate::query::helpers::lower_cypher_ast_to_ir(
+            ast,
+            &db.snapshot,
+            db.default_context.as_ref(),
+            Some((&*db.overlay, db.graph_id)),
+            db.policy_enforcer().map(|e| &**e),
+        )?;
+
+        // The placeholder lowers to the first pattern: a `Values` block over
+        // exactly the seed columns. Anything else means the constructed AST
+        // and this swap fell out of sync — an internal invariant, not user
+        // input.
+        let expected: Vec<fluree_db_query::VarId> = seed_cols
+            .iter()
+            .map(|name| {
+                vars.get(name).ok_or_else(|| {
+                    crate::ApiError::internal(format!(
+                        "seeded Cypher query: column `{name}` was not interned by lowering"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        match parsed.patterns.first_mut() {
+            Some(fluree_db_query::ir::Pattern::Values {
+                vars: seed_vars,
+                rows: seed_rows,
+            }) if *seed_vars == expected => {
+                for row in &rows {
+                    if row.len() != expected.len() {
+                        return Err(crate::ApiError::internal(
+                            "seeded Cypher query: row width does not match seed columns",
+                        ));
+                    }
+                }
+                *seed_rows = rows;
+            }
+            other => {
+                return Err(crate::ApiError::internal(format!(
+                    "seeded Cypher query: lowering did not produce the placeholder VALUES \
+                     pattern first: got {other:?}, expected vars {expected:?}",
+                )));
+            }
+        }
+
+        maybe_wrap_for_graph_source(db, &mut parsed);
+        self.execute_cypher_ir(db, vars, parsed, 0.0).await
+    }
+
     async fn execute_cypher_ir(
         &self,
         db: &GraphDb,

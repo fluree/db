@@ -213,6 +213,9 @@ pub(crate) struct TransactCore<'a> {
     /// Raw SPARQL UPDATE text, lowered to a `Txn` under the write lock during
     /// `execute()` so its namespace allocation shares the staging registry.
     pub(crate) pending_sparql: Option<&'a str>,
+    /// A multi-clause Cypher write staged clause-by-clause under the write
+    /// lock by the sequential driver (see [`crate::cypher_seq`]).
+    pub(crate) pre_built_cypher_seq: Option<crate::cypher_seq::CypherSeqInput>,
     pub(crate) txn_opts: TxnOpts,
     pub(crate) commit_opts: CommitOpts,
     pub(crate) index_config: Option<IndexConfig>,
@@ -228,12 +231,31 @@ impl<'a> TransactCore<'a> {
             pre_built_txn: None,
             pre_built_txn_followup: None,
             pending_sparql: None,
+            pre_built_cypher_seq: None,
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOpts::default(),
             index_config: None,
             tracking: None,
             policy: None,
             errors: Vec::new(),
+        }
+    }
+
+    /// Set a sequential (multi-clause) Cypher write plan, staged
+    /// clause-by-clause under the write lock into one commit.
+    pub(crate) fn set_cypher_sequential(&mut self, input: crate::cypher_seq::CypherSeqInput) {
+        if self.operation.is_some()
+            || self.pre_built_txn.is_some()
+            || self.pending_sparql.is_some()
+            || self.pre_built_cypher_seq.is_some()
+        {
+            self.errors.push(BuilderError::Conflict {
+                field: "operation",
+                message: "Transaction operation already set; cannot set sequential Cypher plan"
+                    .to_string(),
+            });
+        } else {
+            self.pre_built_cypher_seq = Some(input);
         }
     }
 
@@ -289,8 +311,12 @@ impl<'a> TransactCore<'a> {
 
     pub(crate) fn validate(&self) -> std::result::Result<(), BuilderErrors> {
         let mut errors = self.errors.clone();
-        // Exactly one of operation / pre_built_txn / pending_sparql must be set.
-        if self.operation.is_none() && self.pre_built_txn.is_none() && self.pending_sparql.is_none()
+        // Exactly one of operation / pre_built_txn / pending_sparql /
+        // pre_built_cypher_seq must be set.
+        if self.operation.is_none()
+            && self.pre_built_txn.is_none()
+            && self.pending_sparql.is_none()
+            && self.pre_built_cypher_seq.is_none()
         {
             errors.push(BuilderError::Missing {
                 field: "operation",
@@ -869,6 +895,15 @@ impl<'a> RefTransactBuilder<'a> {
         self
     }
 
+    /// Set the operation to a sequential (multi-clause) Cypher write plan.
+    /// The driver stages it clause-by-clause under the write lock into one
+    /// commit; a trailing RETURN surfaces on
+    /// [`TransactResultRef::cypher_return`].
+    pub fn cypher_sequential(mut self, input: crate::cypher_seq::CypherSeqInput) -> Self {
+        self.core.set_cypher_sequential(input);
+        self
+    }
+
     // -- Option setters --
 
     /// Set transaction options (author, context, etc.).
@@ -1076,7 +1111,46 @@ impl Fluree {
         tracker: &Tracker,
         index_config: &IndexConfig,
         store_raw_txn: bool,
-    ) -> Result<(StageResult, TxnType, CommitOpts)> {
+    ) -> Result<(StageResult, TxnType, CommitOpts, Option<JsonValue>)> {
+        if let Some(input) = core.pre_built_cypher_seq {
+            let ledger_id = ledger_state.ledger_id().to_string();
+            let outcome = self
+                .stage_cypher_sequential(
+                    ledger_state,
+                    &input.plan,
+                    &ledger_id,
+                    Some(&input.governance),
+                    Some(index_config),
+                    core.policy.as_ref(),
+                    Some(tracker),
+                    input.skolem_txn_id,
+                )
+                .await?;
+            // Answer the trailing RETURN against the final virtual state
+            // (identical content to the state the commit publishes).
+            let cypher_return = match outcome.return_result {
+                Some(qr) => {
+                    let view = crate::GraphDb::from_ledger_state(&outcome.final_state);
+                    Some(
+                        qr.to_cypher_json_async(view.as_graph_db_ref())
+                            .await
+                            .map_err(|e| {
+                                ApiError::internal(format!(
+                                    "sequential write RETURN formatting: {e}"
+                                ))
+                            })?,
+                    )
+                }
+                None => None,
+            };
+            return Ok((
+                outcome.stage_result,
+                TxnType::Update,
+                core.commit_opts,
+                cypher_return,
+            ));
+        }
+
         if let Some(txn) = core.pre_built_txn {
             let txn_type = txn.txn_type;
             let stage_result = if let Some(followup) = core.pre_built_txn_followup {
@@ -1102,7 +1176,7 @@ impl Fluree {
                 )
                 .await?
             };
-            return Ok((stage_result, txn_type, core.commit_opts));
+            return Ok((stage_result, txn_type, core.commit_opts, None));
         }
 
         if let Some(sparql) = core.pending_sparql {
@@ -1123,7 +1197,7 @@ impl Fluree {
                     Some(tracker),
                 )
                 .await?;
-            return Ok((stage_result, txn_type, core.commit_opts));
+            return Ok((stage_result, txn_type, core.commit_opts, None));
         }
 
         let op = core.operation.unwrap(); // safe: validate checks
@@ -1147,7 +1221,7 @@ impl Fluree {
                 serde_json::Value::String(turtle.to_string()),
                 store_raw_txn,
             );
-            return Ok((stage_result, TxnType::Insert, commit_opts));
+            return Ok((stage_result, TxnType::Insert, commit_opts, None));
         }
 
         // JSON-like operation: parse, extracting TriG metadata + named graphs.
@@ -1177,7 +1251,7 @@ impl Fluree {
             )
             .await?;
 
-        Ok((stage_result, txn_type, commit_opts))
+        Ok((stage_result, txn_type, commit_opts, None))
     }
 
     /// Stage a pre-parsed [`OpPlan`] against a given [`LedgerState`] — one
@@ -1247,6 +1321,7 @@ impl Fluree {
     ///
     /// Short-circuits no-op update/upsert (staged no flakes) without
     /// touching the cache or triggering indexing.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_and_finalize(
         &self,
         write_guard: LedgerWriteGuard,
@@ -1255,6 +1330,7 @@ impl Fluree {
         commit_opts: CommitOpts,
         index_config: &IndexConfig,
         tally: Option<TrackingTally>,
+        cypher_return: Option<JsonValue>,
     ) -> Result<TransactResultRef> {
         let StageResult {
             view,
@@ -1294,6 +1370,7 @@ impl Fluree {
                     commit_t: base.t(),
                 },
                 tally,
+                cypher_return,
             });
         }
 
@@ -1316,6 +1393,7 @@ impl Fluree {
             receipt,
             indexing: indexing_status,
             tally,
+            cypher_return,
         })
     }
 
@@ -1349,7 +1427,10 @@ impl Fluree {
             .unwrap_or_else(Tracker::disabled);
 
         let write_guard = ledger.lock_for_write().await;
-        let (stage_result, _txn_type, commit_opts) = self
+        // The dry-run/consensus path has no response channel for a trailing
+        // Cypher RETURN — callers reject RETURN-carrying sequential
+        // statements before submission.
+        let (stage_result, _txn_type, commit_opts, _cypher_return) = self
             .stage_under_lock(
                 write_guard.clone_state(),
                 core,
@@ -1478,9 +1559,13 @@ impl Fluree {
         // commit. These inputs can't be safely restaged on retry — a
         // pre-built `Txn` carries internal references; SPARQL namespace
         // allocation must share the staging registry.
-        if core.pre_built_txn.is_some() || core.pending_sparql.is_some() || core.policy.is_some() {
+        if core.pre_built_txn.is_some()
+            || core.pending_sparql.is_some()
+            || core.pre_built_cypher_seq.is_some()
+            || core.policy.is_some()
+        {
             let write_guard = ledger.lock_for_write().await;
-            let (stage_result, txn_type, commit_opts) = self
+            let (stage_result, txn_type, commit_opts, cypher_return) = self
                 .stage_under_lock(
                     write_guard.clone_state(),
                     core,
@@ -1497,6 +1582,7 @@ impl Fluree {
                     commit_opts,
                     &index_config,
                     tracker.tally(),
+                    cypher_return,
                 )
                 .await
             {
@@ -1569,6 +1655,7 @@ impl Fluree {
                     commit_opts,
                     &index_config,
                     tracker.tally(),
+                    None,
                 )
                 .await
             {
