@@ -1464,6 +1464,19 @@ async fn upsert_ledger_local(
 /// When tracking headers are present (fluree-track-fuel, fluree-max-fuel, etc.),
 /// tracking options are injected into the transaction body and the response
 /// includes x-fdb-fuel / x-fdb-time headers.
+/// A body shaped like the Cypher HTTP envelope (`{"cypher": "...", "params": {...}}`)
+/// that carries none of the JSON-LD transaction keys was almost certainly meant
+/// for the `application/cypher` path.
+fn is_misrouted_cypher_envelope(body: &JsonValue) -> bool {
+    let Some(obj) = body.as_object() else {
+        return false;
+    };
+    obj.get("cypher").is_some_and(JsonValue::is_string)
+        && ["insert", "delete", "where", "@graph", "@id"]
+            .iter()
+            .all(|k| !obj.contains_key(*k))
+}
+
 async fn execute_transaction(
     state: &AppState,
     ledger_id: &str,
@@ -1473,6 +1486,16 @@ async fn execute_transaction(
     author: Option<&str>,
     headers: &FlureeHeaders,
 ) -> Result<Response> {
+    // A Cypher envelope posted with a JSON Content-Type parses as valid JSON
+    // but contains no JSON-LD transaction clauses; without this check it
+    // reaches the transaction parser and fails with a message that never
+    // mentions the actual mistake (the Content-Type header).
+    if is_misrouted_cypher_envelope(&body) {
+        return Err(ServerError::bad_request(
+            "request body is a Cypher envelope ({\"cypher\": ...}) but was sent with a JSON \
+             Content-Type and interpreted as JSON-LD; resend with Content-Type: application/cypher",
+        ));
+    }
     let idempotency_key = extract_idempotency_key(&credential.headers)?;
     let prepared_transaction =
         prepare_transaction_body(state, ledger_id, body, headers, author).await;
@@ -2082,5 +2105,31 @@ async fn forward_write_request(state: &AppState, request: Request) -> Response {
     match client.forward(request).await {
         Ok(response) => response,
         Err(e) => e.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn misrouted_cypher_envelope_detection() {
+        assert!(is_misrouted_cypher_envelope(&json!({
+            "cypher": "MERGE (n:Person {name: 'Alice'})",
+            "params": {"name": "Alice"}
+        })));
+        // Any JSON-LD transaction key means the body was not a Cypher envelope.
+        assert!(!is_misrouted_cypher_envelope(&json!({
+            "cypher": "not really",
+            "insert": {"@id": "ex:a", "ex:p": 1}
+        })));
+        // A "cypher" property on a data node (non-string or alongside @id) is data.
+        assert!(!is_misrouted_cypher_envelope(&json!({
+            "@id": "ex:doc",
+            "cypher": "MATCH (n) RETURN n"
+        })));
+        assert!(!is_misrouted_cypher_envelope(&json!({"cypher": 42})));
+        assert!(!is_misrouted_cypher_envelope(&json!("MATCH (n) RETURN n")));
     }
 }
