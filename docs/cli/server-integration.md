@@ -1788,6 +1788,17 @@ The Fluree server ships a reference backend (enable with `FLUREE_IMPORT_PRESIGN_
 
 > A production server fronting real object storage persists job state externally (DB / object tags) rather than in process, and mints presigned URLs against its bucket. The contract above is what the CLI depends on; the staging mechanism is the server's choice.
 
+### Source uploads (server-side bulk import)
+
+The same handshake optionally accepts **raw source data** — the formats `fluree create --from` ingests locally — and runs the chunked bulk-import pipeline on `complete` instead of a `.flpack` restore. This backs `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` (single files only; the CLI refuses directories with a pointer to publish/`.flpack`).
+
+- **Discovery:** add `"source-upload"` to `import.modes` and advertise `import.source_formats` (the reference server lists `ttl/nt/nq/trig/jsonld/json/jsonl/ndjson` — each optionally `.gz`/`.zst` — plus `csv/cypher/cyp/cql`). The CLI checks `source-upload` before attempting; absent it, `--remote --from <non-flpack>` errors with a `.flpack` fallback hint.
+- **Mint:** two extra body fields — `"source_kind": "source"` (default `"flpack"`) and `"filename"` (its extension drives format detection; the staged object must keep it). Reject unsupported extensions and missing filenames with `400`.
+- **Complete:** run the bulk-import pipeline over the staged file (converting CSV/Cypher to JSON-LD shards first) in the same async worker slot as a restore. On success, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`.
+- **Raft caveat:** the pipeline publishes nameservice heads directly and repeatedly, outside any replicated write log — do not offer `source-upload` on consensus-replicated deployments (the reference server omits the mode and 400s the mint).
+
+Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::run_remote_source_import`.
+
 ## Storage Proxy Contract
 
 These endpoints exist so a client can fetch bytes by CID without knowing storage layout:

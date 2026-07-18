@@ -64,10 +64,25 @@ pub struct MultipartPlan {
     pub num_parts: u32,
 }
 
+/// What the staged upload contains, deciding what `complete` runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportSourceKind {
+    /// A `.flpack` archive → wholesale restore (`Fluree::restore_ledger`).
+    Flpack,
+    /// Raw source data (TTL / N-Triples / N-Quads / TriG / JSON-LD / JSONL /
+    /// CSV / Cypher, optionally gz/zst-compressed where the pipeline supports
+    /// it) → the chunked bulk-import pipeline (`Fluree::create(..).import(..)`),
+    /// the same path as `fluree create --from`. The staged file keeps the
+    /// source's extension so the pipeline's format sniffing works.
+    Source,
+}
+
 /// One negotiated-upload import job.
 pub struct ImportJob {
     /// Target ledger name (carried in the mint request, not the URL path).
     pub ledger_id: String,
+    /// What the staged upload contains (drives the `complete` action).
+    pub source: ImportSourceKind,
     /// Single-use capability token embedded in the upload URL. Modeled on a
     /// presigned URL's signature: knowing it authorizes the blob `PUT`.
     pub token: String,
@@ -82,6 +97,17 @@ pub struct ImportJob {
     /// Error message once `status == Failed`.
     pub error: Option<String>,
     pub created_at: Instant,
+}
+
+/// Snapshot of one job's fields for the `complete` handler, taken without
+/// holding the map lock across the (async) restore/import.
+pub struct CompletionTarget {
+    pub ledger_id: String,
+    pub staged_path: PathBuf,
+    pub status: ImportStatus,
+    pub multipart: Option<MultipartPlan>,
+    pub created_at: Instant,
+    pub source: ImportSourceKind,
 }
 
 /// Process-local registry of import jobs, keyed by opaque `import_id`.
@@ -120,26 +146,15 @@ impl ImportJobs {
         })
     }
 
-    /// Snapshot `(ledger_id, staged_path, status, multipart)` for the
-    /// `complete` handler.
-    pub fn completion_target(
-        &self,
-        import_id: &str,
-    ) -> Option<(
-        String,
-        PathBuf,
-        ImportStatus,
-        Option<MultipartPlan>,
-        Instant,
-    )> {
-        self.jobs.get(import_id).map(|j| {
-            (
-                j.ledger_id.clone(),
-                j.staged_path.clone(),
-                j.status,
-                j.multipart.clone(),
-                j.created_at,
-            )
+    /// Snapshot the fields the `complete` handler needs.
+    pub fn completion_target(&self, import_id: &str) -> Option<CompletionTarget> {
+        self.jobs.get(import_id).map(|j| CompletionTarget {
+            ledger_id: j.ledger_id.clone(),
+            staged_path: j.staged_path.clone(),
+            status: j.status,
+            multipart: j.multipart.clone(),
+            created_at: j.created_at,
+            source: j.source,
         })
     }
 
@@ -202,6 +217,7 @@ mod tests {
     fn job(status: ImportStatus) -> ImportJob {
         ImportJob {
             ledger_id: "books:main".into(),
+            source: ImportSourceKind::Flpack,
             token: "tok".into(),
             staged_path: PathBuf::from("/tmp/x.flpack"),
             multipart: None,

@@ -757,6 +757,23 @@ Mint / complete / status are **admin-protected**; the blob/part `PUT`s are token
 
 This is the transport behind `fluree create … --remote … --from big.flpack` when the server is size-capped — the CLI negotiates automatically.
 
+#### Source uploads (server-side bulk import)
+
+The same handshake also accepts **raw source data** — the formats `fluree create --from` takes locally — and runs the chunked bulk-import pipeline server-side instead of a `.flpack` restore. Servers that support it advertise `"source-upload"` in `import.modes` plus an `import.source_formats` list (`ttl`, `nt`, `nq`, `trig`, `jsonld`, `json`, `jsonl`, `ndjson` — optionally `.gz`/`.zst` — and `csv`, `cypher`/`cyp`/`cql`, which are converted to JSON-LD shards on the server before import).
+
+Mint with two extra fields:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",       // default "flpack"
+  "filename": "dump.cypher" }    // extension drives format detection
+```
+
+Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
+
+This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
 ## Storage Proxy Endpoints
 
 These endpoints are intended for peer mode and `fluree clone`/`pull` workflows. They require the storage proxy to be enabled on the server and use replication-grade Bearer tokens (`fluree.storage.*` claims).

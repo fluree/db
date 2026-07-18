@@ -87,14 +87,20 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         )
                         .await
                     }
-                    // Other formats can't be bulk-imported server-side yet.
-                    Some(_) => Err(error::CliError::Usage(
-                        "--remote --from supports only .flpack archives; \
-                         for other formats, export to .flpack first \
-                         (`fluree export <ledger> --format ledger -o out.flpack`), \
-                         or create locally then `fluree publish <remote> <ledger>`."
-                            .to_string(),
-                    )),
+                    // Raw source data (TTL/JSON-LD/JSONL/CSV/Cypher …) uploads
+                    // to servers that advertise `source-upload` and runs the
+                    // bulk-import pipeline server-side; the handler falls back
+                    // to a clear error (export to .flpack / create locally)
+                    // when the server doesn't offer it.
+                    Some(path) => {
+                        commands::create::run_remote_source_import(
+                            &ledger,
+                            &remote_name,
+                            path,
+                            &fluree_dir,
+                        )
+                        .await
+                    }
                     None => commands::create::run_remote(&ledger, &remote_name, &fluree_dir).await,
                 };
             }

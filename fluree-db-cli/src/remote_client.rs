@@ -225,6 +225,13 @@ impl ImportCapability {
             .any(|m| m == "presigned-put" || m == "multipart-put")
     }
 
+    /// Whether the server accepts raw source-data uploads (`source-upload`):
+    /// the mint endpoint runs the bulk-import pipeline server-side over the
+    /// same formats `fluree create --from` takes locally.
+    pub fn supports_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload")
+    }
+
     /// Whether an archive of `size` bytes should take the negotiated upload
     /// path: a negotiated mode must be offered, and either direct isn't offered
     /// at all or the archive exceeds the advertised direct cap.
@@ -1543,10 +1550,28 @@ impl RemoteLedgerClient {
         ledger: &str,
         size: Option<u64>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
+        self.mint_import_upload_with_source(ledger, size, None)
+            .await
+    }
+
+    /// Mint an upload slot. `source_filename` switches the slot to a raw
+    /// source-data upload (`source_kind: "source"`): the server keeps the
+    /// filename's extension on the staged file and runs the bulk-import
+    /// pipeline on `complete` instead of a `.flpack` restore.
+    pub async fn mint_import_upload_with_source(
+        &self,
+        ledger: &str,
+        size: Option<u64>,
+        source_filename: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("import-upload");
         let mut body = serde_json::json!({ "ledger": ledger });
         if let Some(size) = size {
             body["size"] = serde_json::Value::from(size);
+        }
+        if let Some(filename) = source_filename {
+            body["source_kind"] = serde_json::Value::from("source");
+            body["filename"] = serde_json::Value::from(filename);
         }
         self.send_json(
             reqwest::Method::POST,
