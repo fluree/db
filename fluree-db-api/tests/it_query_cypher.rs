@@ -9504,3 +9504,87 @@ async fn transact_cypher_unwind_batch_node_merge_on_create_on_match() {
         "existing id 1 took ON MATCH; new id 2 took ON CREATE: {rows}"
     );
 }
+
+#[tokio::test]
+async fn cypher_regex_match_is_full_string() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:regex");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "a", "@type": "Person", "name": "Alice"},
+                    {"@id": "b", "@type": "Person", "name": "Alina"},
+                    {"@id": "c", "@type": "Person", "name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let names = |cj: serde_json::Value| -> Vec<serde_json::Value> {
+        cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"][0].clone())
+            .collect()
+    };
+
+    // Prefix wildcard: both Ali* names, nothing else.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "Ali.*" RETURN n.name AS name ORDER BY name"#,
+        )
+        .await
+        .expect("regex query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), vec![json!("Alice"), json!("Alina")]);
+
+    // Neo4j semantics: `=~` matches the WHOLE string, so a substring
+    // pattern without wildcards matches nothing.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "li" RETURN n.name AS name"#,
+        )
+        .await
+        .expect("substring regex")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), Vec::<serde_json::Value>::new());
+
+    // Anchoring must wrap the alternation as a group: `Alice|Bob` means
+    // full-string Alice or full-string Bob — not `Alice|^Bob$`-style leakage.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "Alice|Bob" RETURN n.name AS name ORDER BY name"#,
+        )
+        .await
+        .expect("alternation regex")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), vec![json!("Alice"), json!("Bob")]);
+
+    // Case-insensitive inline flag rides through to the engine.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "(?i)alice" RETURN n.name AS name"#,
+        )
+        .await
+        .expect("inline-flag regex")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), vec![json!("Alice")]);
+}

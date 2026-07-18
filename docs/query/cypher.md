@@ -193,7 +193,9 @@ ORDER BY / SKIP / LIMIT
     mode; see [names](#names-and-opting-into-iris)). Fluree has no integer
     element id (differs from Neo4j's integer `id`).
 - `WHERE` expressions: comparison, AND/OR/XOR/NOT, arithmetic `+ - * / %`, `^`,
-  STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
+  STARTS WITH / ENDS WITH / CONTAINS, `=~` (regular-expression match —
+  whole-string, Neo4j semantics; inline flags like `(?i)` work), IS NULL /
+  IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
   subject forms), `EXISTS { pattern }` and the subquery form
   `EXISTS { MATCH pattern WHERE expr }` (the inner `WHERE` is ANDed into
