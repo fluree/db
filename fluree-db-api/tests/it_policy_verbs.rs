@@ -742,7 +742,11 @@ async fn scaffolder_write_profile_grants_class_ownership_only() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed(&fluree, "verbs_scaffolder_write").await;
 
-    // Byte-for-byte the shape `fluree model access enable` emits.
+    // Byte-for-byte the shape `fluree model access enable` emits, hand-copied
+    // because importing the CLI compiler here would invert the crate
+    // dependency. SYNC with fluree-db-cli
+    // access::tests::write_profile_emits_class_view_and_verb_policy — if
+    // `access::compile()` changes, update both.
     let class = "http://example.org/ns/Lead/access/write";
     let stored = json!({
         "@context": {"f": "https://ns.flur.ee/db#"},

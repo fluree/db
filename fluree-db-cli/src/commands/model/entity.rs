@@ -11,9 +11,11 @@
 //! heuristic; a config graph can override per graph). Defining an entity is
 //! therefore not just documentation: it activates validation for its class.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Value};
 
-use super::{query, replace_nodes, resolve_mode};
+use super::{iri_rows, query, replace_nodes, require_absolute_iri, resolve_mode};
 use crate::cli::ModelEntityAction;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
@@ -43,11 +45,7 @@ fn parse_property_spec(spec: &str) -> CliResult<PropertySpec> {
         .next()
         .ok_or_else(|| CliError::Usage("empty --property spec".into()))?
         .to_string();
-    if !(path.starts_with("http://") || path.starts_with("https://") || path.starts_with("urn:")) {
-        return Err(CliError::Usage(format!(
-            "--property must start with an absolute IRI (got '{path}')"
-        )));
-    }
+    require_absolute_iri("--property", &path)?;
 
     let mut out = PropertySpec {
         path,
@@ -58,25 +56,49 @@ fn parse_property_spec(spec: &str) -> CliResult<PropertySpec> {
     };
     for token in tokens {
         match token {
-            "string" => out.datatype = Some(format!("{XSD}string")),
-            "integer" => out.datatype = Some(format!("{XSD}integer")),
-            "decimal" => out.datatype = Some(format!("{XSD}decimal")),
-            "boolean" => out.datatype = Some(format!("{XSD}boolean")),
-            "date" => out.datatype = Some(format!("{XSD}date")),
-            "datetime" => out.datatype = Some(format!("{XSD}dateTime")),
-            "iri" => out.iri_kind = true,
-            "required" => out.required = true,
-            t if t.starts_with("in[") && t.ends_with(']') => {
-                out.values_in = t[3..t.len() - 1]
-                    .split(',')
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty())
-                    .collect();
-                if out.values_in.is_empty() {
+            "string" | "integer" | "decimal" | "boolean" | "date" | "datetime" => {
+                if out.iri_kind {
                     return Err(CliError::Usage(format!(
-                        "in[...] must list at least one value (in '{spec}')"
+                        "'iri' cannot be combined with datatype '{token}' \
+                         (in '{spec}') — a value is either an IRI or a literal"
                     )));
                 }
+                if out.datatype.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "more than one datatype in --property spec '{spec}'"
+                    )));
+                }
+                let xsd_name = if token == "datetime" {
+                    "dateTime"
+                } else {
+                    token
+                };
+                out.datatype = Some(format!("{XSD}{xsd_name}"));
+            }
+            "iri" => {
+                if out.datatype.is_some() {
+                    return Err(CliError::Usage(format!(
+                        "'iri' cannot be combined with a datatype (in '{spec}') \
+                         — a value is either an IRI or a literal"
+                    )));
+                }
+                out.iri_kind = true;
+            }
+            "required" => out.required = true,
+            t if t.starts_with("in[") && t.ends_with(']') => {
+                out.values_in = t[3..t.len() - 1].split(',').map(str::to_string).collect();
+                if out.values_in.iter().any(String::is_empty) {
+                    return Err(CliError::Usage(format!(
+                        "in[...] must list at least one value and none may be \
+                         empty (in '{spec}')"
+                    )));
+                }
+            }
+            t if t.starts_with("in[") => {
+                return Err(CliError::Usage(format!(
+                    "in[...] must not contain spaces — write in[a,b] not \
+                     in[a, b] (in '{spec}')"
+                )));
             }
             other => {
                 return Err(CliError::Usage(format!(
@@ -86,12 +108,59 @@ fn parse_property_spec(spec: &str) -> CliResult<PropertySpec> {
             }
         }
     }
+    if out.iri_kind && !out.values_in.is_empty() {
+        // sh:in values are serialized as string literals; combined with
+        // sh:nodeKind sh:IRI nothing could ever validate.
+        return Err(CliError::Usage(format!(
+            "'iri' cannot be combined with in[...] (in '{spec}') — in-values \
+             are literals"
+        )));
+    }
     Ok(out)
 }
 
 /// Last path segment of an IRI, for stable child-node ids.
 fn local_name(iri: &str) -> &str {
     iri.rsplit(['/', '#', ':']).next().unwrap_or(iri)
+}
+
+/// Child property-shape ids are minted from the path's local name; two
+/// property IRIs sharing a final segment would collapse into ONE JSON-LD
+/// node, silently merging their constraints (one path dropped from
+/// validation, the survivor over-constrained). Reject up front.
+fn check_child_id_collisions(shape_iri: &str, specs: &[PropertySpec]) -> CliResult<()> {
+    let mut seen: HashMap<&str, &str> = HashMap::new();
+    for p in specs {
+        let name = local_name(&p.path);
+        if let Some(prev) = seen.insert(name, p.path.as_str()) {
+            return Err(CliError::Usage(format!(
+                "--property IRIs '{prev}' and '{}' share the local name \
+                 '{name}' — both would compile to the property shape \
+                 '{shape_iri}/{name}', silently merging their constraints. \
+                 Use property IRIs with distinct final segments.",
+                p.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Node ids the entity compiler owns for full replace: the shape, every
+/// child compiled from the current specs, and any child currently recorded
+/// on the shape — so a dropped property's shape is deleted, not orphaned.
+fn owned_ids(shape_iri: &str, specs: &[PropertySpec], existing_children: &[String]) -> Vec<String> {
+    let mut owned = vec![shape_iri.to_string()];
+    owned.extend(
+        specs
+            .iter()
+            .map(|p| format!("{shape_iri}/{}", local_name(&p.path))),
+    );
+    for child in existing_children {
+        if !owned.iter().any(|o| o == child) {
+            owned.push(child.clone());
+        }
+    }
+    owned
 }
 
 /// Compile the entity definition into its JSON-LD artifacts.
@@ -191,23 +260,18 @@ async fn run_define(
     dirs: &FlureeDir,
     direct: bool,
 ) -> CliResult<()> {
-    if !(entity.starts_with("http://")
-        || entity.starts_with("https://")
-        || entity.starts_with("urn:"))
-    {
-        return Err(CliError::Usage(format!(
-            "--entity must be an absolute IRI (got '{entity}')"
-        )));
-    }
+    require_absolute_iri("--entity", entity)?;
     let specs: Vec<PropertySpec> = property_specs
         .iter()
         .map(|s| parse_property_spec(s))
         .collect::<CliResult<_>>()?;
+    let shape_iri = format!("{}/shape", entity.trim_end_matches('/'));
+    check_child_id_collisions(&shape_iri, &specs)?;
 
     let graph = compile(entity, label, &specs, closed);
 
     println!("Entity:     {entity}");
-    println!("Shape:      {}/shape", entity.trim_end_matches('/'));
+    println!("Shape:      {shape_iri}");
     println!("Properties: {}", specs.len());
     for p in &specs {
         let mut notes: Vec<String> = vec![];
@@ -244,17 +308,27 @@ async fn run_define(
     // and replaced atomically — a constraint from a previous definition
     // (sh:closed, sh:minCount, sh:in, …) must not survive a re-run that
     // dropped it, or validation keeps enforcing what the author removed.
-    // The entity class node is NOT owned: it's shared authorship with
-    // `model class define` (hierarchy, label), so it stays additive.
+    // Children currently recorded on the shape are unioned into the owned
+    // set so a dropped property's child shape is deleted too (RDF-list
+    // blank nodes behind sh:in / sh:ignoredProperties are the one residue a
+    // wildcard delete-by-subject cannot cascade to). The entity class node
+    // is NOT owned: it's shared authorship with `model class define`
+    // (hierarchy, label), so it stays additive — except rdfs:label, which
+    // is replaced when --label is given so re-labeling stays idempotent.
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
-    let shape_iri = format!("{}/shape", entity.trim_end_matches('/'));
-    let mut owned: Vec<String> = specs
-        .iter()
-        .map(|p| format!("{shape_iri}/{}", local_name(&p.path)))
-        .collect();
-    owned.insert(0, shape_iri);
+    let children_q = json!({
+        "select": ["?child"],
+        "where": [{"@id": &shape_iri, format!("{SH}property"): "?child"}]
+    });
+    let existing_children = iri_rows(&query(&mode, &children_q).await?);
+    let owned = owned_ids(&shape_iri, &specs, &existing_children);
     let owned_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
-    replace_nodes(&mode, &graph, &owned_refs).await?;
+    let replaced_props: Vec<(&str, &str)> = if label.is_some() {
+        vec![(entity, RDFS_LABEL)]
+    } else {
+        vec![]
+    };
+    replace_nodes(&mode, &graph, &owned_refs, &replaced_props).await?;
 
     println!("\nDefined. Shape written to '{dataset}'.");
     println!(
@@ -381,6 +455,71 @@ mod tests {
         assert!(parse_property_spec("https://example.org/x strng").is_err());
         assert!(parse_property_spec("ex:name string").is_err());
         assert!(parse_property_spec("https://example.org/x in[]").is_err());
+    }
+
+    #[test]
+    fn rejects_contradictory_tokens() {
+        // iri + datatype (both orders): a value can't be both.
+        assert!(parse_property_spec("https://example.org/x iri string").is_err());
+        assert!(parse_property_spec("https://example.org/x string iri").is_err());
+        // Two datatypes: previously last-wins, now rejected.
+        assert!(parse_property_spec("https://example.org/x string integer").is_err());
+        // iri + in[...]: in-values are literals, nothing could validate.
+        assert!(parse_property_spec("https://example.org/x iri in[a,b]").is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_in_lists() {
+        // Empty values were silently dropped before; now rejected.
+        assert!(parse_property_spec("https://example.org/x in[a,,b]").is_err());
+        // Whitespace splits the token; the error must say why.
+        let err = parse_property_spec("https://example.org/x in[a, b]").unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain spaces"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_child_shape_id_collision() {
+        // schema.org/name and example.org/name share the local name 'name'
+        // and would merge into one property-shape node.
+        let specs = vec![
+            parse_property_spec("https://schema.org/name string required").unwrap(),
+            parse_property_spec("https://example.org/name integer").unwrap(),
+        ];
+        let err = check_child_id_collisions("https://example.org/Lead/shape", &specs).unwrap_err();
+        assert!(
+            err.to_string().contains("share the local name 'name'"),
+            "unexpected error: {err}"
+        );
+
+        let distinct = vec![
+            parse_property_spec("https://schema.org/name string").unwrap(),
+            parse_property_spec("https://example.org/email string").unwrap(),
+        ];
+        assert!(check_child_id_collisions("https://example.org/Lead/shape", &distinct).is_ok());
+    }
+
+    #[test]
+    fn owned_ids_include_existing_children_dropped_from_specs() {
+        // Re-running define without 'score' must still own (and so delete)
+        // the previously written score child shape.
+        let specs = vec![parse_property_spec("https://example.org/name string").unwrap()];
+        let existing = vec![
+            "https://example.org/Lead/shape/name".to_string(),
+            "https://example.org/Lead/shape/score".to_string(),
+        ];
+        let owned = owned_ids("https://example.org/Lead/shape", &specs, &existing);
+        assert_eq!(
+            owned,
+            vec![
+                "https://example.org/Lead/shape",
+                "https://example.org/Lead/shape/name",
+                "https://example.org/Lead/shape/score",
+            ],
+            "existing children union in without duplicating current specs"
+        );
     }
 
     #[test]

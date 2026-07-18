@@ -37,7 +37,7 @@
 
 use serde_json::{json, Value};
 
-use super::{query, replace_nodes, resolve_mode};
+use super::{query, replace_nodes, require_absolute_iri, resolve_mode};
 use crate::cli::ModelAccessAction;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
@@ -218,7 +218,7 @@ async fn run_enable(
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
     let view_id = format!("{policy_class}/view");
     let write_id = format!("{policy_class}/write");
-    replace_nodes(&mode, &graph, &[&view_id, &write_id]).await?;
+    replace_nodes(&mode, &graph, &[&view_id, &write_id], &[]).await?;
     println!("\nPolicies transacted to '{dataset}'.");
 
     if let (Some(space_id), Some(remote_name)) = (space, remote) {
@@ -441,16 +441,6 @@ fn list_values(v: Option<&Value>) -> Vec<String> {
         }
     }
     out
-}
-
-fn require_absolute_iri(flag: &str, v: &str) -> CliResult<()> {
-    if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("urn:") {
-        Ok(())
-    } else {
-        Err(CliError::Usage(format!(
-            "{flag} must be an absolute IRI (got '{v}') — e.g. https://example.org/Lead"
-        )))
-    }
 }
 
 /// Merge `policy_class` into the space's grant on the dataset via the stack's

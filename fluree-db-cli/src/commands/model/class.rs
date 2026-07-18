@@ -8,9 +8,9 @@
 
 use serde_json::{json, Value};
 
-use super::{query, resolve_mode, upsert};
+use super::{iri_rows, query, require_absolute_iri, resolve_mode, update, upsert};
 use crate::cli::ModelClassAction;
-use crate::error::{CliError, CliResult};
+use crate::error::CliResult;
 use fluree_db_api::server_defaults::FlureeDir;
 
 const F: &str = "https://ns.flur.ee/db#";
@@ -24,6 +24,7 @@ pub async fn run(action: &ModelClassAction, dirs: &FlureeDir, direct: bool) -> C
             dataset,
             class,
             subclass_of,
+            clear_subclass_of,
             label,
             dry_run,
             remote,
@@ -32,6 +33,7 @@ pub async fn run(action: &ModelClassAction, dirs: &FlureeDir, direct: bool) -> C
                 dataset,
                 class,
                 subclass_of,
+                *clear_subclass_of,
                 label.as_deref(),
                 *dry_run,
                 remote.as_deref(),
@@ -51,6 +53,7 @@ async fn run_define(
     dataset: &str,
     class: &str,
     subclass_of: &[String],
+    clear_subclass_of: bool,
     label: Option<&str>,
     dry_run: bool,
     remote: Option<&str>,
@@ -65,7 +68,9 @@ async fn run_define(
     let node = compile(class, subclass_of, label);
 
     println!("Class:      {class}");
-    if !subclass_of.is_empty() {
+    if clear_subclass_of {
+        println!("Subclass of: (clearing all parents)");
+    } else if !subclass_of.is_empty() {
         println!("Subclass of: {}", subclass_of.join(", "));
         println!(
             "  note: with RDFS entailment enabled, queries and policies targeting a\n\
@@ -76,17 +81,47 @@ async fn run_define(
 
     if dry_run {
         println!("\n-- dry run; compiled JSON-LD --");
-        println!("{}", serde_json::to_string_pretty(&node)?);
+        if clear_subclass_of {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&clear_parents_txn(class, label, &node))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&node)?);
+        }
         return Ok(());
     }
 
     let mode = resolve_mode(dataset, remote, dirs, direct).await?;
-    upsert(&mode, &node).await?;
+    if clear_subclass_of {
+        update(&mode, &clear_parents_txn(class, label, &node)).await?;
+    } else {
+        upsert(&mode, &node).await?;
+    }
     println!(
         "Defined on '{dataset}'. Re-running with --subclass-of replaces the \
-         parent set (list every parent each time)."
+         parent set (list every parent each time); --clear-subclass-of \
+         removes all parents."
     );
     Ok(())
+}
+
+/// Transaction for `--clear-subclass-of`: `upsert` can only replace listed
+/// properties, so removing the last parent needs an explicit delete of
+/// every `rdfs:subClassOf` edge (and the old label when re-labeling, since
+/// the insert side is additive), atomically with writing the node. This
+/// matters under RDFS entailment: a stale parent widens every grant on it.
+fn clear_parents_txn(class: &str, label: Option<&str>, node: &Value) -> Value {
+    let mut where_clause = vec![json!([
+        "optional",
+        {"@id": class, RDFS_SUBCLASS_OF: "?parent"}
+    ])];
+    let mut delete = vec![json!({"@id": class, RDFS_SUBCLASS_OF: "?parent"})];
+    if label.is_some() {
+        where_clause.push(json!(["optional", {"@id": class, RDFS_LABEL: "?oldLabel"}]));
+        delete.push(json!({"@id": class, RDFS_LABEL: "?oldLabel"}));
+    }
+    json!({"where": where_clause, "delete": delete, "insert": node})
 }
 
 /// Compile the class node. `upsert` replaces the listed properties, so
@@ -141,14 +176,7 @@ async fn run_show(
     });
     let result = query(&mode, &q).await?;
     let rows = result.as_array().cloned().unwrap_or_default();
-    let domain: Vec<&Value> = rows
-        .iter()
-        .filter(|row| {
-            row["@id"]
-                .as_str()
-                .is_some_and(|id| !policy_classes.iter().any(|pc| pc == id))
-        })
-        .collect();
+    let domain = domain_classes(&rows, &policy_classes);
 
     if domain.is_empty() {
         println!("No classes defined on '{dataset}'.");
@@ -170,14 +198,16 @@ async fn run_show(
     Ok(())
 }
 
-fn require_absolute_iri(flag: &str, v: &str) -> CliResult<()> {
-    if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("urn:") {
-        Ok(())
-    } else {
-        Err(CliError::Usage(format!(
-            "{flag} must be an absolute IRI (got '{v}') — e.g. https://example.org/Lead"
-        )))
-    }
+/// Domain vocabulary only: drop rows whose id is a policy class the access
+/// compiler minted (governance plumbing, not user classes).
+fn domain_classes<'a>(rows: &'a [Value], policy_classes: &[String]) -> Vec<&'a Value> {
+    rows.iter()
+        .filter(|row| {
+            row["@id"]
+                .as_str()
+                .is_some_and(|id| !policy_classes.iter().any(|pc| pc == id))
+        })
+        .collect()
 }
 
 fn render_value(v: &Value) -> String {
@@ -218,21 +248,6 @@ fn ids_of(v: Option<&Value>) -> Vec<String> {
     out
 }
 
-fn iri_rows(result: &Value) -> Vec<String> {
-    let rows = match result {
-        Value::Array(rows) => rows.as_slice(),
-        _ => return vec![],
-    };
-    rows.iter()
-        .filter_map(|row| match row {
-            Value::String(s) => Some(s.clone()),
-            Value::Array(inner) => inner.first().and_then(|v| v.as_str()).map(String::from),
-            Value::Object(o) => o.get("@id").and_then(|v| v.as_str()).map(String::from),
-            _ => None,
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +269,52 @@ mod tests {
             node[RDFS_SUBCLASS_OF][0]["@id"],
             "https://example.org/Contact"
         );
+    }
+
+    #[test]
+    fn clear_parents_txn_deletes_all_subclass_edges() {
+        // `upsert` cannot remove the last parent (compile omits
+        // rdfs:subClassOf when empty) — the clear txn must delete
+        // explicitly, or a stale parent keeps widening grants under RDFS
+        // entailment.
+        let node = compile("https://example.org/Lead", &[], None);
+        let txn = clear_parents_txn("https://example.org/Lead", None, &node);
+
+        let where_clause = txn["where"].as_array().unwrap();
+        assert_eq!(where_clause.len(), 1);
+        assert_eq!(where_clause[0][0], "optional");
+        assert_eq!(where_clause[0][1][RDFS_SUBCLASS_OF], "?parent");
+
+        let delete = txn["delete"].as_array().unwrap();
+        assert_eq!(delete.len(), 1);
+        assert_eq!(delete[0]["@id"], "https://example.org/Lead");
+        assert_eq!(delete[0][RDFS_SUBCLASS_OF], "?parent");
+
+        assert_eq!(txn["insert"]["@id"], "https://example.org/Lead");
+        assert!(txn["insert"].get(RDFS_SUBCLASS_OF).is_none());
+    }
+
+    #[test]
+    fn clear_parents_txn_replaces_label_when_given() {
+        // The insert side is a plain (additive) insert, so re-labeling in
+        // the same run must delete the old label too.
+        let node = compile("https://example.org/Lead", &[], Some("Lead v2"));
+        let txn = clear_parents_txn("https://example.org/Lead", Some("Lead v2"), &node);
+        let delete = txn["delete"].as_array().unwrap();
+        assert_eq!(delete.len(), 2);
+        assert_eq!(delete[1][RDFS_LABEL], "?oldLabel");
+    }
+
+    #[test]
+    fn show_excludes_policy_classes() {
+        let rows = vec![
+            serde_json::json!({"@id": "https://example.org/Lead"}),
+            serde_json::json!({"@id": "https://example.org/Lead/access/write"}),
+        ];
+        let policy = vec!["https://example.org/Lead/access/write".to_string()];
+        let domain = domain_classes(&rows, &policy);
+        assert_eq!(domain.len(), 1);
+        assert_eq!(domain[0]["@id"], "https://example.org/Lead");
     }
 
     #[test]

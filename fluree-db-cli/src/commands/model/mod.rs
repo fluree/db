@@ -17,7 +17,7 @@ pub mod entity;
 
 use crate::cli::ModelAction;
 use crate::context::{self, LedgerMode};
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
 use serde_json::Value;
 
@@ -108,23 +108,36 @@ pub(crate) async fn update(mode: &LedgerMode, body: &Value) -> CliResult<()> {
 /// compiled — a property from a previous compilation cannot linger (the
 /// policy loader gives `f:allow` precedence over `f:query`, so a stale
 /// `f:allow: true` would silently disable a newly compiled gate). Nodes in
-/// the graph that are NOT listed as owned are inserted additively.
+/// the graph that are NOT listed as owned are inserted additively, except
+/// the `(node, property)` pairs in `replaced_props`, whose existing values
+/// are deleted first (property-level replace on shared-authorship nodes).
 pub(crate) async fn replace_nodes(
     mode: &LedgerMode,
     graph: &Value,
     owned_ids: &[&str],
+    replaced_props: &[(&str, &str)],
 ) -> CliResult<()> {
-    update(mode, &replace_txn(graph, owned_ids)).await
+    update(mode, &replace_txn(graph, owned_ids, replaced_props)).await
 }
 
 /// Pure builder for [`replace_nodes`]'s transaction: optional wildcard
 /// match + delete per owned id (delete-if-exists — unbound rows skip their
-/// delete template), then insert the compiled nodes.
-pub(crate) fn replace_txn(graph: &Value, owned_ids: &[&str]) -> Value {
+/// delete template), optional match + delete per replaced property, then
+/// insert the compiled nodes.
+pub(crate) fn replace_txn(
+    graph: &Value,
+    owned_ids: &[&str],
+    replaced_props: &[(&str, &str)],
+) -> Value {
     let mut where_clause: Vec<Value> = Vec::new();
     let mut delete: Vec<Value> = Vec::new();
     for (i, id) in owned_ids.iter().enumerate() {
         let pattern = serde_json::json!({"@id": id, format!("?p{i}"): format!("?o{i}")});
+        where_clause.push(serde_json::json!(["optional", pattern]));
+        delete.push(pattern);
+    }
+    for (i, (id, prop)) in replaced_props.iter().enumerate() {
+        let pattern = serde_json::json!({"@id": id, *prop: format!("?rv{i}")});
         where_clause.push(serde_json::json!(["optional", pattern]));
         delete.push(pattern);
     }
@@ -139,6 +152,34 @@ pub(crate) fn replace_txn(graph: &Value, owned_ids: &[&str]) -> Value {
     })
 }
 
+/// Absolute-IRI guard shared by every facet's flag validation.
+pub(crate) fn require_absolute_iri(flag: &str, v: &str) -> CliResult<()> {
+    if v.starts_with("http://") || v.starts_with("https://") || v.starts_with("urn:") {
+        Ok(())
+    } else {
+        Err(CliError::Usage(format!(
+            "{flag} must be an absolute IRI (got '{v}') — e.g. https://example.org/Lead"
+        )))
+    }
+}
+
+/// Extract IRI strings from a single-variable query result (rows may be
+/// strings, one-element arrays, or `{"@id": …}` objects).
+pub(crate) fn iri_rows(result: &Value) -> Vec<String> {
+    let rows = match result {
+        Value::Array(rows) => rows.as_slice(),
+        _ => return vec![],
+    };
+    rows.iter()
+        .filter_map(|row| match row {
+            Value::String(s) => Some(s.clone()),
+            Value::Array(inner) => inner.first().and_then(|v| v.as_str()).map(String::from),
+            Value::Object(o) => o.get("@id").and_then(|v| v.as_str()).map(String::from),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::replace_txn;
@@ -150,7 +191,7 @@ mod tests {
             {"@id": "https://x/A", "https://x/p": 1},
             {"@id": "https://x/B", "https://x/p": 2},
         ]});
-        let txn = replace_txn(&graph, &["https://x/A", "https://x/B"]);
+        let txn = replace_txn(&graph, &["https://x/A", "https://x/B"], &[]);
 
         let where_clause = txn["where"].as_array().unwrap();
         assert_eq!(where_clause.len(), 2);
@@ -176,9 +217,29 @@ mod tests {
         // emits (e.g. write → read drops {class}/write): owned ids are
         // deleted even when nothing in the graph reinserts them.
         let graph = json!({"@graph": [{"@id": "https://x/view", "https://x/p": 1}]});
-        let txn = replace_txn(&graph, &["https://x/view", "https://x/write"]);
+        let txn = replace_txn(&graph, &["https://x/view", "https://x/write"], &[]);
         assert_eq!(txn["delete"].as_array().unwrap().len(), 2);
         assert_eq!(txn["delete"][1]["@id"], "https://x/write");
         assert_eq!(txn["insert"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn replace_txn_deletes_replaced_props_on_unowned_nodes() {
+        // A shared-authorship node stays additive except the listed
+        // property, whose old value is deleted (label re-run idempotency).
+        let graph = json!({"@graph": [
+            {"@id": "https://x/Lead", "https://x/label": "New"},
+        ]});
+        let txn = replace_txn(&graph, &[], &[("https://x/Lead", "https://x/label")]);
+
+        let where_clause = txn["where"].as_array().unwrap();
+        assert_eq!(where_clause.len(), 1);
+        assert_eq!(where_clause[0][0], "optional");
+        assert_eq!(where_clause[0][1]["@id"], "https://x/Lead");
+        assert_eq!(where_clause[0][1]["https://x/label"], "?rv0");
+
+        let delete = txn["delete"].as_array().unwrap();
+        assert_eq!(delete.len(), 1);
+        assert_eq!(delete[0]["https://x/label"], "?rv0");
     }
 }

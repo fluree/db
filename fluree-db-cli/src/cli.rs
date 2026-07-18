@@ -1529,6 +1529,12 @@ pub enum ModelClassAction {
         #[arg(long = "subclass-of")]
         subclass_of: Vec<String>,
 
+        /// Remove ALL parents (deletes every rdfs:subClassOf edge). With
+        /// RDFS entailment, a stale parent widens every grant on it — use
+        /// this to sever the hierarchy; --subclass-of cannot express empty.
+        #[arg(long = "clear-subclass-of", conflicts_with = "subclass_of")]
+        clear_subclass_of: bool,
+
         /// Human label for the class
         #[arg(long)]
         label: Option<String>,
