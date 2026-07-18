@@ -555,6 +555,22 @@ impl R2rmlScanOperator {
                 .all(|(_, c)| matches!(c, crate::r2rml::ObjectConstant::Scalar(_)))
     }
 
+    /// The `trust_fk_refs` FK-template ref-shortcut admission (the seam the
+    /// parent-lookup build consults; see the comment at the call site). A
+    /// pattern qualifies when trust is on, it is a plain OR scalar-folded true
+    /// wildcard, and no predicate filter narrows it. Extracted so the composed
+    /// predicate is pinned by `f16_ref_template_shortcut_fires_for_scalar_folded`
+    /// — the production build calls THIS fn, so the test exercises the real
+    /// admission, not a copy.
+    fn ref_template_shortcut_enabled(trust_fk_refs: bool, pattern: &R2rmlPattern) -> bool {
+        let star_free =
+            pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
+        trust_fk_refs
+            && (star_free || Self::folded_wildcard_all_scalar(pattern))
+            && pattern.predicate_filter.is_none()
+            && pattern.object_var.is_some()
+    }
+
     /// True for a pure `rdf:type`/subject-only pattern: no object var, no
     /// predicate filter, no star members. Such a pattern derives only the subject
     /// (its `rr:class` constraint is enforced by TriplesMap selection), so it
@@ -1103,11 +1119,8 @@ impl R2rmlScanOperator {
             // scan that would have dropped it) — an over-match. Non-scalar
             // constraints keep the shortcut off and take the sound parent-scan
             // path.
-            let ref_template_shortcut = ctx.trust_fk_refs
-                && (!self.has_star_members()
-                    || Self::folded_wildcard_all_scalar(&self.pattern))
-                && self.pattern.predicate_filter.is_none()
-                && self.pattern.object_var.is_some();
+            let ref_template_shortcut =
+                Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
             // Scoped so `star_preds` (which borrows `self`) is released before the
             // parent-lookup loop mutates `self.parent_lookup_cache` (PR-4).
             let filtered_poms: Vec<_> = {
@@ -3638,6 +3651,70 @@ mod tests {
         let mut fixed = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
         fixed.star_constraints = vec![scalar("http://ex/lineNumber")];
         assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&fixed));
+    }
+
+    /// Task #17 — the F-16 closure evidence: the SHORTCUT FIRES (not merely the
+    /// flag) for a scalar-folded crawl wildcard under `trust_fk_refs`. The
+    /// production parent-lookup build consults `ref_template_shortcut_enabled`
+    /// (this exact fn) and, when true, inserts the `build_ref_shortcut` result
+    /// instead of scanning the parent — so admission==true AND
+    /// build_ref_shortcut==Some together pin the fire condition for the folded
+    /// shape. The corpus cannot exercise this seam: SPARQL queries run via
+    /// `query_from` where `trust_fk_refs` is always false (the shortcut is a
+    /// browse-crawl-API feature), so a regression here is perf-silent to q068.
+    #[test]
+    fn f16_ref_template_shortcut_fires_for_scalar_folded() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        // The ref side: single-column templated FK — shortcut-eligible (the
+        // deployed `edw:order` → FactOrder shape).
+        let parent =
+            TriplesMap::new("#Order", "FACT_ORDER").with_subject_template("http://ex/order/{ORDER_KEY}");
+        let rom = RefObjectMap::new("#Order", "ORDER_KEY", "ORDER_KEY");
+        assert!(
+            build_ref_shortcut(&parent, &rom).is_some(),
+            "single-col templated FK must be shortcut-eligible"
+        );
+
+        // Scalar-folded crawl wildcard + trust ON → admission true ⇒ with the
+        // eligible ref above, the build inserts the shortcut (no parent scan).
+        let mut folded =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        folded.star_constraints = vec![(
+            "http://ex/lineNumber".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(1)),
+        )];
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(true, &folded));
+
+        // Iri-folded → admission false (sound parent-scan path; catch #11).
+        let mut iri_folded = folded.clone();
+        iri_folded.star_constraints = vec![(
+            "http://ex/order".to_string(),
+            ObjectConstant::Iri("http://ex/order/5".to_string()),
+        )];
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true,
+            &iri_folded
+        ));
+
+        // Trust OFF (the chat/`query_from` path) → admission false regardless.
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            false, &folded
+        ));
+
+        // Plain wildcard + trust ON → admission true (pre-existing behavior,
+        // unchanged by the F-16 amendment).
+        let plain =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(true, &plain));
+
+        // Fixed-predicate star + trust ON → admission false (star shapes keep
+        // parent-scan + dangling-FK semantics; unchanged).
+        let mut star = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
+        star.star_constraints = vec![(
+            "http://ex/lineNumber".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(1)),
+        )];
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(true, &star));
     }
 
     /// A templated (non-constant) predicate binds `?p` from the row when the
