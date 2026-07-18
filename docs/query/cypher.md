@@ -429,14 +429,14 @@ error listing the supported set.
   variables or the relationship variable (`ON CREATE SET r.checks = 1`).
   `ON MATCH SET` is supported on single-node `MERGE`, on **standalone**
   relationship `MERGE` (resolved by probing the current writer state, then
-  staging either branch), and on the **per-row** relationship form (leading
-  `MATCH`). The per-row form decomposes into two branches over the same
-  leading `MATCH` — an `ON MATCH SET` over the rows whose edge already exists,
-  then a create (`ON CREATE SET`) over the rows whose edge is absent — staged
-  into a **single atomic commit** (either both branches publish, or an error
-  returns with nothing committed). `ON MATCH SET` on a per-row *node* MERGE
-  (leading `MATCH` before a node `MERGE`) stays deferred — there is no
-  relationship to partition the rows on.
+  staging either branch), on the **per-row** relationship form (leading
+  `MATCH`), and on a per-row *node* `MERGE` (leading `MATCH` before a node
+  `MERGE` — executed by the sequential driver below). The per-row
+  relationship form decomposes into two branches over the same leading
+  `MATCH` — an `ON MATCH SET` over the rows whose edge already exists, then a
+  create (`ON CREATE SET`) over the rows whose edge is absent — staged into a
+  **single atomic commit** (either both branches publish, or an error returns
+  with nothing committed).
 
   A single-node or standalone relationship `MERGE` also takes trailing `SET`
   clauses, which apply on *both* branches — the standard upsert idiom:
@@ -452,6 +452,36 @@ error listing the supported set.
   (`MATCH (a:Person) MERGE (a)-[:T]->(b)`). Repeating a label on a bound
   endpoint (`MERGE (a:Person)-[:T]->(b)`) re-asserts its `rdf:type` triple when
   the edge is inserted — idempotent in RDF, but redundant.
+- **Multi-clause write composition** — a statement may chain multiple write
+  clauses (`MERGE` chains, `CREATE`+`MERGE` mixes, interleaved `SET` /
+  `REMOVE`), with each clause observing the writes of the clauses before it
+  and rows piping downstream — the standard Cypher loading idioms:
+
+  ```cypher
+  UNWIND $rows AS row
+  MERGE (a:Person {id: row.src})
+  MERGE (b:Person {id: row.dst})
+  MERGE (a)-[:KNOWS]->(b)
+  ```
+
+  ```cypher
+  MATCH (p:Player)
+  MERGE (t:Team {name: p.team})
+  MERGE (p)-[:PLAYS_FOR]->(t)
+  ```
+
+  The statement stages clause-by-clause against a virtual state (the same
+  machinery behind SPARQL `;`-separated updates) and publishes as **one
+  atomic commit** — either every clause lands or nothing does. Per-row
+  semantics match sequential Cypher exactly: within a batch, the first row of
+  a not-yet-existing `MERGE` key creates (running `ON CREATE SET`) and every
+  later row — including duplicates *within the same batch* — matches (running
+  `ON MATCH SET`). Property accessors are valid `MERGE`-key and `SET` values
+  (`MERGE (t:Team {name: p.team})`).
+
+  Deferred in a multi-clause statement (clear errors): `DELETE` / `FOREACH`
+  members, `OPTIONAL MATCH` / `CALL { … }` in the read prefix. See
+  `docs/design/cypher-sequential-writes.md` for the execution model.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
   property filters (on nodes and relationships — `-[r:T {w: 3}]->` filters on
@@ -474,10 +504,15 @@ error listing the supported set.
   `CREATE (n:Person {name: "Alice"}) RETURN n`,
   `MATCH (a), (b) CREATE (a)-[e:KNOWS]->(b) RETURN e` (one row per matched
   pair). Answered as the read path's Cypher-JSON tabular envelope; each entity
-  serializes as its identifier string. v1 surface: bare variables (optionally
-  aliased) naming a fresh `CREATE` node or relationship variable. Deferred:
-  expressions, `RETURN` modifiers, `MATCH`-bound variables, and `RETURN` with
-  `MERGE` (the matched branch's node isn't a created entity).
+  serializes as its identifier string. Single-clause v1 surface: bare
+  variables (optionally aliased) naming a fresh `CREATE` node or relationship
+  variable; expressions, `RETURN` modifiers, `MATCH`-bound variables, and
+  `RETURN` with a single-clause `MERGE` stay deferred there. A **multi-clause
+  write's** `RETURN` has the full read expression surface (projections,
+  aliases, `DISTINCT`, `ORDER BY`, `SKIP`/`LIMIT`, matched *and* created
+  bindings) — it is answered from the statement's final row table against the
+  post-write state. (Exception: under Raft consensus, a multi-clause write's
+  `RETURN` is rejected over HTTP — drop the `RETURN` or use a Bolt session.)
 
 ```rust
 let committed = fluree.transact_cypher(ledger, cypher).await?;

@@ -196,6 +196,10 @@ name = "it_multi_graph_property_path"
 path = "tests/it_multi_graph_property_path.rs"
 
 [[test]]
+name = "it_cypher_seq_writes"
+path = "tests/it_cypher_seq_writes.rs"
+
+[[test]]
 name = "it_query_cypher"
 path = "tests/it_query_cypher.rs"
 
