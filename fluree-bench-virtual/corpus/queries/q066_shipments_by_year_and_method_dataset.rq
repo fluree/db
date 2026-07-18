@@ -1,0 +1,25 @@
+# q066 shipments_by_year_and_method_dataset
+# Intent: W4-2 MIXED fact+dim GROUP BY keys via the FROM <gs> (deployed) path.
+#         ?yearNum is a DimDate attribute (FactShipment -> dateDim -> DimDate),
+#         ?shipMethod is a FactShipment column. Before W4-2 the join fold resolved
+#         ALL group keys on the TERMINAL dim, so a fact-column key declined at
+#         scalar_column_for_var(terminal_dim, shipMethod) -> None -> materialize
+#         (round-3b #7's 156s post-scan fold -> deadline). W4-2 routes each key to
+#         its source (shipMethod -> fact inline; yearNum -> dim FK->GKey map).
+# BI lineage: round-3b #7 "COUNT + SUM(shipCost) GROUP BY yearNum, shipMethod".
+#         COUNT-only here: SHIP_COST is xsd:double and the SUM fold accumulates as
+#         f64 (summation-order dependent -> not hash-deterministic vs the native
+#         oracle). The SUM/AVG fold is UNCHANGED shared code (resolve_agg_folds),
+#         already corpus-covered by q062's integer SUM; W4-2 only changed group-KEY
+#         resolution, which COUNT exercises fully. Keys are deliberately different
+#         types: ?yearNum = xsd:integer (dim), ?shipMethod = xsd:string (fact).
+# Predicates verified against enterprise-sf01-mapping.ttl — FactShipment: shipMethod
+#         (SHIP_METHOD), dateDim -> DimDate (SHIP_DATE_KEY -> DATE_KEY); DimDate:
+#         year (YEAR_NUM xsd:integer).
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?yearNum ?shipMethod (COUNT(?s) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?s a edw:Shipment ; edw:shipMethod ?shipMethod ; edw:dateDim ?d .
+        ?d edw:year ?yearNum . }
+GROUP BY ?yearNum ?shipMethod

@@ -1496,6 +1496,59 @@
       "timeout_s": 180,
       "subsets": [],
       "exec_path": "from"
+    },
+    {
+      "id": "q066",
+      "file": "queries/q066_shipments_by_year_and_method_dataset.rq",
+      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys — shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "join",
+        "fk_chain",
+        "mixed_group_keys"
+      ],
+      "tables": [
+        "FACT_SHIPMENT",
+        "DIM_DATE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q067",
+      "file": "queries/q067_tickets_by_year_and_priority_dataset.rq",
+      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM — priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
+      "tags": [
+        "aggregate",
+        "count",
+        "sum",
+        "group_by",
+        "join",
+        "fk_chain",
+        "mixed_group_keys"
+      ],
+      "tables": [
+        "FACT_SUPPORT_TICKET",
+        "DIM_DATE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }

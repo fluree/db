@@ -3014,8 +3014,19 @@ mod tests {
 
         // REFUTATION — non-canonical / non-integer against an integer column DECLINE
         // (never over-prune vs the lexical residual): "01" (leading zero), "1.0"
-        // (fraction), "+1" (sign form), " 1" (space), "abc" (non-numeric).
-        for s in ["01", "1.0", "+1", " 1", "abc", ""] {
+        // (fraction), "+1" (sign form), " 1" (space), "abc" (non-numeric), "-0"
+        // (parses to 0 whose canonical render "0" ≠ "-0", so the pushed Int would
+        // prune rows the lexical residual keeps), and a >i64 value (parse overflow).
+        for s in [
+            "01",
+            "1.0",
+            "+1",
+            " 1",
+            "abc",
+            "",
+            "-0",
+            "99999999999999999999",
+        ] {
             assert_eq!(
                 coerce_scalar_for_pushdown(&ScanValue::Str(s.into()), &int_col),
                 None,
@@ -3069,7 +3080,12 @@ mod tests {
 
         // Canonical key equality → one coerced Int filter on the mapped column.
         let mut out = Vec::new();
-        push_scalar_eq_filter(&mut out, &tm, "http://ex/orderLineKey", &ScanValue::Str("1".into()));
+        push_scalar_eq_filter(
+            &mut out,
+            &tm,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("1".into()),
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].column, "ORDER_LINE_KEY");
         assert!(matches!(out[0].op, ScanCmpOp::Eq));
@@ -3077,7 +3093,12 @@ mod tests {
 
         // Non-canonical → declined (coercion gate).
         let mut out = Vec::new();
-        push_scalar_eq_filter(&mut out, &tm, "http://ex/orderLineKey", &ScanValue::Str("01".into()));
+        push_scalar_eq_filter(
+            &mut out,
+            &tm,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("01".into()),
+        );
         assert!(out.is_empty());
 
         // Duplicate predicate (two POMs) → not a sound single-column prune → declined.
@@ -3100,7 +3121,12 @@ mod tests {
             object_map: ObjectMap::template("PRE-{C}", vec!["C".to_string()]),
         });
         let mut out = Vec::new();
-        push_scalar_eq_filter(&mut out, &tm_tmpl, "http://ex/p", &ScanValue::Str("1".into()));
+        push_scalar_eq_filter(
+            &mut out,
+            &tm_tmpl,
+            "http://ex/p",
+            &ScanValue::Str("1".into()),
+        );
         assert!(out.is_empty());
     }
 

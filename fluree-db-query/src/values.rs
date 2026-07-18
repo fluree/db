@@ -197,7 +197,14 @@ impl Operator for ValuesOperator {
             return Ok(Some(Batch::empty(self.schema.clone())?));
         }
 
-        // Build output: for each input row × each value row, check compatibility
+        // Build output: for each input row × each value row, check compatibility.
+        // The nested match is O(input_rows × value_rows); when a VALUES set is joined
+        // against a large (e.g. un-lowered graph-source) child, that product can burn
+        // a long uncancelled stretch. Poll cancellation per batch so a deadline /
+        // RSS-watchdog signal stops it (W4-3: the round-3b #9 VALUES-over-GlJournal
+        // shape). Plain `check_cancelled` — this operator streams and retains no
+        // buffer beyond the current batch, so it needs no memory-budget checkpoint.
+        ctx.check_cancelled()?;
         let num_cols = self.schema.len();
         let child_num_cols = self.child.schema().len();
         let max_rows = input_batch.len() * self.value_rows.len();

@@ -641,6 +641,7 @@ fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u6
 
 /// A GROUP BY key column: which table column, how to read it, and the encoded
 /// datatype Sid for the output key binding.
+#[derive(Clone)]
 struct GroupCol {
     column: String,
     kind: GKind,
@@ -673,6 +674,19 @@ enum GKey {
     Str(String),
     Int(i128),
     Null,
+}
+
+/// W4-2: the source of one GROUP BY key position in a fused fold, in SPARQL order.
+/// A single-table fold is all `Fact`; a pure fact⋈dim fold is all `Dim`; a MIXED
+/// rollup interleaves the two (a fact-column key alongside a dim-attribute key,
+/// e.g. #7's `shipMethod` and `yearNum`). `Dim(slot)` indexes the dim-subset `GKey`
+/// tuple the `GroupKeyResolver.map` stores for a fact FK.
+#[derive(Clone, Copy)]
+enum KeySource {
+    /// Read inline from the scanned fact batch via `group_cols[pos].key_at`.
+    Fact,
+    /// Read from the FK→GKey map's value at this dim-subset slot.
+    Dim(usize),
 }
 
 /// Insert a dim join-key → group-keys mapping for the fused-aggregate FK chain,
@@ -775,6 +789,13 @@ struct Resolved {
     /// fact row — mirroring the R2RML/inner-join row-drop. `group_cols` still
     /// describes the key kinds/datatypes for materializing the output binding.
     group_resolver: Option<GroupKeyResolver>,
+    /// W4-2: per GROUP BY position (SPARQL order), whether that key is read inline
+    /// from the fact batch (`Fact`) or from the dim FK→GKey map (`Dim(slot)`). All
+    /// `Fact` for the single-table fold; all `Dim` for a pure fact⋈dim fold; mixed
+    /// for #7-shaped rollups. `group_cols[pos]` still carries the kind/dt_sid for
+    /// BOTH the fact `key_at` read and the output `binding`, so the emit path is
+    /// position-indexed and source-agnostic.
+    group_key_plan: Vec<KeySource>,
     /// E2: fact-side folded constant-object constraints (`star_constraints`)
     /// applied per fact row in `next_batch` — a fact row failing any is dropped
     /// (existence-filter parity with the normal scan). Empty on the single-table
@@ -877,6 +898,72 @@ impl FusedR2rmlAggregateOperator {
                 .find(|(_, v)| *v == var)
                 .map(|(p, _)| p.as_str())
         }
+    }
+
+    /// W4-2 gate Q1: route each GROUP BY var to its SINGLE source pattern in the
+    /// `fact → dim1 → … → dimk` chain, preserving SPARQL order. For each var,
+    /// `predicate_for_var` must match in EXACTLY ONE participating pattern:
+    /// - 0 matches → the var is not bound as a scalar object anywhere on the chain
+    ///   → decline (`None`);
+    /// - ≥2 matches → the var is an object in two patterns, i.e. a cross-source
+    ///   value-equality the single-scan fold cannot enforce (it would produce
+    ///   different groups than the materialized inner join) → decline;
+    /// - exactly one → that pattern is the source.
+    ///
+    /// v1 admits a source that is the FACT (chain index 0) or the TERMINAL dim
+    /// (last index) only. An INTERIOR-dim source declines: the interior FK→GKey
+    /// composition relays only the terminal dim's group attrs, so an interior
+    /// group attr is not carried (a sound, decline-only follow-on). Returns the
+    /// per-var source chain-index, or `None` to decline the whole fuse.
+    fn route_group_key_sources(chain: &[&R2rmlPattern], group_by: &[VarId]) -> Option<Vec<usize>> {
+        let last = chain.len().checked_sub(1)?;
+        let mut out = Vec::with_capacity(group_by.len());
+        for gv in group_by {
+            let mut src: Option<usize> = None;
+            for (i, p) in chain.iter().enumerate() {
+                if Self::predicate_for_var(p, *gv).is_some() {
+                    if src.is_some() {
+                        return None; // ≥2 sources: cross-source equality
+                    }
+                    src = Some(i);
+                }
+            }
+            let src = src?; // 0 sources: not a scalar object on the chain
+            if src != 0 && src != last {
+                return None; // interior-dim group key: v1 declines
+            }
+            out.push(src);
+        }
+        Some(out)
+    }
+
+    /// W4-2: assemble the composite group key for one fact row, interleaving
+    /// fact-inline positions (`key_at` on the scanned fact batch) with dim-resolved
+    /// positions (the probed FK→GKey slice) in SPARQL order per `plan`. A NULL in
+    /// ANY position — a null fact key column OR a null dim gkey — drops the row
+    /// (`None`), the BGP unbound-object semantics, symmetric across both sources and
+    /// matching the materialize path's row-drop. `dim_gkeys` is the resolver's
+    /// probed value (already existence-checked by the caller); a `Dim` slot with no
+    /// resolver value drops defensively.
+    fn assemble_group_key(
+        plan: &[KeySource],
+        group_cols: &[GroupCol],
+        key_cols: &[Option<&Column>],
+        dim_gkeys: Option<&[GKey]>,
+        row: usize,
+    ) -> Option<Vec<GKey>> {
+        let mut key = Vec::with_capacity(plan.len());
+        for (pos, slot) in plan.iter().enumerate() {
+            let k = match slot {
+                KeySource::Fact => group_cols[pos].key_at(key_cols[pos], row),
+                KeySource::Dim(slot) => dim_gkeys?.get(*slot)?.clone(),
+            };
+            if matches!(k, GKey::Null) {
+                return None;
+            }
+            key.push(k);
+        }
+        Some(key)
     }
 
     /// Resolve the single scalar column (and its declared datatype) a variable's
@@ -1161,25 +1248,37 @@ impl Operator for FusedR2rmlAggregateOperator {
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
                 } else {
-                    let key: Vec<GKey> = if let Some(resolver) = &resolved.group_resolver {
-                        // PR-6: the GROUP BY key lives on the dim — resolve it from
-                        // the fact's FK columns. A null/missing FK, or a dim row
-                        // with a null group attribute (never inserted), drops the
-                        // fact row, mirroring the R2RML/inner-join row-drop.
+                    // W4-2: probe the FK→GKey map once (join existence + the
+                    // dim-subset group keys) when this is a join fold, then assemble
+                    // the composite key by interleaving fact-inline and dim-resolved
+                    // positions in SPARQL order. A null/missing FK or a
+                    // dim-constraint/existence miss drops the fact row here; a null in
+                    // ANY key position drops it in `assemble_group_key` — both the
+                    // R2RML/inner-join row-drop. For an all-fact plan over a join
+                    // (empty dim subset) the map stores `[]` per FK, so this probe is
+                    // a pure existence filter and the key comes wholly from the fact.
+                    let dim_gkeys: Option<&[GKey]> = if let Some(resolver) =
+                        &resolved.group_resolver
+                    {
                         let Some(fk) = get_join_key_from_batch(&resolver.fact_fk_cols, &batch, row)
                         else {
                             continue;
                         };
                         match resolver.map.get(&fk) {
-                            Some(gk) => gk.clone(),
+                            Some(gk) => Some(gk.as_slice()),
                             None => continue,
                         }
                     } else {
-                        gcols
-                            .iter()
-                            .zip(&key_cols)
-                            .map(|(g, c)| g.key_at(*c, row))
-                            .collect()
+                        None
+                    };
+                    let Some(key) = Self::assemble_group_key(
+                        &resolved.group_key_plan,
+                        gcols,
+                        &key_cols,
+                        dim_gkeys,
+                        row,
+                    ) else {
+                        continue;
                     };
                     groups
                         .entry(key)
@@ -1601,6 +1700,8 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             count_non_null_cols,
             group_resolver: None,
+            // Single-table fold: every key reads inline from the fact batch.
+            group_key_plan: (0..self.group_by.len()).map(|_| KeySource::Fact).collect(),
             fact_constraints: Vec::new(),
         }))
     }
@@ -1922,31 +2023,48 @@ impl FusedR2rmlAggregateOperator {
             dim_checks.push(checks);
         }
 
-        // GROUP BY keys resolve to scalar attribute columns on the TERMINAL dim.
+        // W4-2: GROUP BY keys may resolve on FACT columns AND/OR the terminal dim's
+        // attribute columns (a MIXED rollup like #7's `shipMethod` (fact) + `yearNum`
+        // (dim)). Route each key to its single source (gate Q1: exactly one
+        // participating pattern, else decline — `route_group_key_sources`), then
+        // resolve its column on that pattern's TriplesMap. `group_cols` holds one
+        // GroupCol per GROUP BY position (used for BOTH the output binding and a
+        // fact-inline `key_at`); `group_key_plan` tags each position Fact/Dim; the
+        // dim-subset (`dim_group_cols`/`dim_attr_cols`) feeds the FK→GKey map, and
+        // the fact-subset columns (`fact_key_cols`) join the fact scan projection.
+        let Some(sources) = Self::route_group_key_sources(&chain, &self.group_by) else {
+            return Ok(None);
+        };
+        let last_idx = chain.len() - 1;
         let mut group_cols = Vec::with_capacity(self.group_by.len());
-        let mut dim_attr_cols = Vec::with_capacity(self.group_by.len());
-        for gv in &self.group_by {
-            let Some((col, datatype)) = Self::scalar_column_for_var(terminal_p, terminal_tm, *gv)
-            else {
+        let mut group_key_plan = Vec::with_capacity(self.group_by.len());
+        let mut dim_group_cols: Vec<GroupCol> = Vec::new();
+        let mut dim_attr_cols: Vec<String> = Vec::new();
+        let mut fact_key_cols: Vec<String> = Vec::new();
+        for (gv, &src) in self.group_by.iter().zip(&sources) {
+            // v1: the source is the FACT (chain index 0) or the TERMINAL dim (last).
+            let is_fact = src == 0;
+            let (src_p, src_tm): (&R2rmlPattern, &TriplesMap) = if is_fact {
+                (fact_p, fact_tm)
+            } else {
+                debug_assert_eq!(src, last_idx, "route admits only fact or terminal");
+                (terminal_p, terminal_tm)
+            };
+            let Some((col, datatype)) = Self::scalar_column_for_var(src_p, src_tm, *gv) else {
                 return Ok(None);
             };
-            // Q2 lang/IRI admission gate (same as the single-table path): the
-            // `xsd:string` default below is a PLAIN-LITERAL assumption. A dim
-            // group-key column that is language-tagged (rdf:langString) or
-            // IRI-/blank-node-typed would be mis-encoded as an xsd:string literal,
-            // disagreeing with the materialized term. Decline (decline-only). This
-            // guards the pre-existing join fold's identical default symmetrically
-            // with the single-table path — no deployed dim key is lang/IRI, so prod
-            // behavior is unchanged.
-            if !Self::group_key_col_is_plain_literal(terminal_p, terminal_tm, *gv) {
+            // Q2 lang/IRI admission gate, applied on the KEY'S OWN source pattern
+            // (fact OR dim): the `xsd:string` default below is a PLAIN-LITERAL
+            // assumption; a language-tagged (rdf:langString) or IRI-/blank-node-typed
+            // key would be mis-encoded as an xsd:string literal, disagreeing with the
+            // materialized term. Decline (decline-only) — symmetric across sources.
+            if !Self::group_key_col_is_plain_literal(src_p, src_tm, *gv) {
                 return Ok(None);
             }
-            // A column ObjectMap with no `rr:datatype` maps to `xsd:string` — the
-            // R2RML natural mapping for an un-annotated PLAIN-LITERAL string column
-            // (this schema's DIM string attrs, e.g. DimStore.STORE_NAME /
-            // DimProduct.CATEGORY). The generic materialize path's `LiteralEncoder`
-            // applies the same None->xsd:string fallback, so the group key is
-            // byte-identical (parity by construction).
+            // A column ObjectMap with no `rr:datatype` maps to `xsd:string` (the
+            // R2RML natural mapping for an un-annotated plain-literal column); the
+            // generic materialize path's `LiteralEncoder` applies the same default,
+            // so the group key is byte-identical (parity by construction).
             let dt_iri = datatype.as_deref().unwrap_or(fluree_vocab::xsd::STRING);
             let Some(kind) = group_kind(Some(dt_iri)) else {
                 return Ok(None);
@@ -1954,12 +2072,20 @@ impl FusedR2rmlAggregateOperator {
             let Some(dt_sid) = ctx.active_snapshot.encode_iri(dt_iri) else {
                 return Ok(None);
             };
-            dim_attr_cols.push(col.clone());
-            group_cols.push(GroupCol {
-                column: col,
+            let gcol = GroupCol {
+                column: col.clone(),
                 kind,
                 dt_sid,
-            });
+            };
+            if is_fact {
+                group_key_plan.push(KeySource::Fact);
+                fact_key_cols.push(col);
+            } else {
+                group_key_plan.push(KeySource::Dim(dim_group_cols.len()));
+                dim_attr_cols.push(col);
+                dim_group_cols.push(gcol.clone());
+            }
+            group_cols.push(gcol);
         }
         // A join fold must actually group (an implicit aggregate over a join is
         // not this shape).
@@ -2004,6 +2130,13 @@ impl FusedR2rmlAggregateOperator {
         // E2: scan the fact-side constraint columns so the fold can enforce them.
         for c in &fact_checks {
             projection.push(c.column().to_string());
+        }
+        // W4-2: scan the fact-side group-key columns so `key_at` reads them inline.
+        // (A fact group key is a fact object var, hence already in validity_cols +
+        // projection above; pushed explicitly so the fold's key read never relies on
+        // that coincidence, and a null fact key still drops via validity_cols.)
+        for c in &fact_key_cols {
+            projection.push(c.clone());
         }
         projection.sort();
         projection.dedup();
@@ -2072,7 +2205,11 @@ impl FusedR2rmlAggregateOperator {
                 ctx.checkpoint()?;
                 let batch = batch?;
                 let map_before = map.len();
-                let attr_cols: Vec<Option<&Column>> = group_cols
+                // W4-2: read only the DIM-subset group keys (`dim_group_cols`) here;
+                // fact-subset keys are read inline from the fact batch at fold time.
+                // An all-fact plan leaves this empty, so the map stores `[]` per FK
+                // and degenerates to a join-existence set (invariant #1).
+                let attr_cols: Vec<Option<&Column>> = dim_group_cols
                     .iter()
                     .map(|g| batch.column_by_name(&g.column))
                     .collect();
@@ -2092,9 +2229,9 @@ impl FusedR2rmlAggregateOperator {
                     )? {
                         continue;
                     }
-                    let mut gkeys = Vec::with_capacity(group_cols.len());
+                    let mut gkeys = Vec::with_capacity(dim_group_cols.len());
                     let mut any_null = false;
-                    for (g, c) in group_cols.iter().zip(&attr_cols) {
+                    for (g, c) in dim_group_cols.iter().zip(&attr_cols) {
                         let k = g.key_at(*c, row);
                         if matches!(k, GKey::Null) {
                             any_null = true;
@@ -2163,9 +2300,7 @@ impl FusedR2rmlAggregateOperator {
                         }
                     }
                 }
-                ctx.record_alloc(
-                    (next_map.len() - next_before) * crate::context::GROUP_EST_BYTES,
-                );
+                ctx.record_alloc((next_map.len() - next_before) * crate::context::GROUP_EST_BYTES);
             }
             map = next_map;
         }
@@ -2182,6 +2317,7 @@ impl FusedR2rmlAggregateOperator {
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
             group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
+            group_key_plan,
             fact_constraints: fact_checks,
         }))
     }
@@ -2716,6 +2852,168 @@ mod tests {
         let d1 = R2rmlPattern::new("gs", VarId(1), None);
         let d2 = R2rmlPattern::new("gs", VarId(2), None);
         assert!(FusedR2rmlAggregateOperator::order_chain(&[&branch_fact, &d1, &d2]).is_none());
+    }
+
+    // W4-2 gate Q1: route each GROUP BY var to its single source pattern (fact or
+    // terminal dim); decline on 0, ≥2, or interior-dim sources. `predicate_for_var`
+    // drives routing off the R2rmlPattern star_bindings, so this is pure.
+    #[test]
+    fn route_group_key_sources_mixed_and_declines() {
+        // fact(0): fact attr `shipMethod`=?10, FK-to-date `dateDim`=?1.
+        let mut fact = R2rmlPattern::new("gs", VarId(0), None);
+        fact.star_bindings = vec![
+            ("shipMethod".into(), VarId(10)),
+            ("dateDim".into(), VarId(1)),
+        ];
+        // terminal dim(1): dim attr `year`=?11.
+        let mut dim = R2rmlPattern::new("gs", VarId(1), None);
+        dim.star_bindings = vec![("year".into(), VarId(11))];
+        let chain = [&fact, &dim];
+
+        // MIXED, both key orders: fact key ?10 → idx 0, dim key ?11 → idx 1.
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_group_key_sources(&chain, &[VarId(11), VarId(10)]),
+            Some(vec![1, 0])
+        );
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_group_key_sources(&chain, &[VarId(10), VarId(11)]),
+            Some(vec![0, 1])
+        );
+        // All-fact (invariant #1: dim present for the join but grouping only on fact).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_group_key_sources(&chain, &[VarId(10)]),
+            Some(vec![0])
+        );
+        // Unbound var (0 sources) → decline.
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_group_key_sources(&chain, &[VarId(99)]),
+            None
+        );
+        // Cross-source: the same var is an object in BOTH fact and dim (≥2) → decline.
+        let mut fact2 = R2rmlPattern::new("gs", VarId(0), None);
+        fact2.star_bindings = vec![("x".into(), VarId(7)), ("dateDim".into(), VarId(1))];
+        let mut dim2 = R2rmlPattern::new("gs", VarId(1), None);
+        dim2.star_bindings = vec![("x".into(), VarId(7))];
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_group_key_sources(&[&fact2, &dim2], &[VarId(7)]),
+            None
+        );
+        // Interior-dim source (chain fact→interior→terminal), key on the interior → decline (v1).
+        let mut f3 = R2rmlPattern::new("gs", VarId(0), None);
+        f3.star_bindings = vec![("h1".into(), VarId(1))];
+        let mut mid = R2rmlPattern::new("gs", VarId(1), None);
+        mid.star_bindings = vec![("attr".into(), VarId(20)), ("h2".into(), VarId(2))];
+        let term = R2rmlPattern::new("gs", VarId(2), None);
+        assert_eq!(
+            FusedR2rmlAggregateOperator::route_group_key_sources(&[&f3, &mid, &term], &[VarId(20)]),
+            None,
+            "an interior-dim group key declines in v1"
+        );
+    }
+
+    // W4-2: assemble the composite key by interleaving fact-inline + dim-resolved
+    // positions in SPARQL order; a null in ANY position drops the row.
+    #[test]
+    fn assemble_group_key_interleaves_and_drops_nulls() {
+        let s_col = GroupCol {
+            column: "SHIP_METHOD".into(),
+            kind: GKind::String,
+            dt_sid: Sid::new(1, "string"),
+        };
+        let i_col = GroupCol {
+            column: "YEAR_NUM".into(),
+            kind: GKind::Integer,
+            dt_sid: Sid::new(2, "integer"),
+        };
+        let ground = Column::String(vec![Some("Ground".into())]);
+        let null_str = Column::String(vec![None]);
+
+        // plan [Fact(shipMethod), Dim(0)=year] → [Str, Int] in order.
+        let gc = vec![s_col.clone(), i_col.clone()];
+        let kc = vec![Some(&ground), None];
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Fact, KeySource::Dim(0)],
+                &gc,
+                &kc,
+                Some(&[GKey::Int(2024)]),
+                0
+            ),
+            Some(vec![GKey::Str("Ground".into()), GKey::Int(2024)])
+        );
+        // Swapped order [Dim(0)=year, Fact(shipMethod)] → [Int, Str].
+        let gc2 = vec![i_col.clone(), s_col.clone()];
+        let kc2 = vec![None, Some(&ground)];
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Dim(0), KeySource::Fact],
+                &gc2,
+                &kc2,
+                Some(&[GKey::Int(2024)]),
+                0
+            ),
+            Some(vec![GKey::Int(2024), GKey::Str("Ground".into())])
+        );
+        // Null FACT key position → drop.
+        let kc_null = vec![Some(&null_str), None];
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Fact, KeySource::Dim(0)],
+                &gc,
+                &kc_null,
+                Some(&[GKey::Int(2024)]),
+                0
+            ),
+            None
+        );
+        // Null DIM key position → drop.
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Fact, KeySource::Dim(0)],
+                &gc,
+                &kc,
+                Some(&[GKey::Null]),
+                0
+            ),
+            None
+        );
+        // Dim slot present but no resolver value → drop (defensive).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Dim(0)],
+                std::slice::from_ref(&i_col),
+                &[None],
+                None,
+                0
+            ),
+            None
+        );
+        // All-fact plan, no resolver: key wholly inline (invariant #1 fold side).
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Fact],
+                std::slice::from_ref(&s_col),
+                &[Some(&ground)],
+                None,
+                0
+            ),
+            Some(vec![GKey::Str("Ground".into())])
+        );
+        // W4-2 invariant #1, the DEGENERATE join branch: an all-fact plan over a
+        // join yields `Some(&[])` from the FK→GKey map (existence passed, no dim
+        // keys). assemble must take the key wholly from the fact and NOT index the
+        // empty dim slice — the empty-dim-subset join reduces to an FK-existence
+        // filter + inline fact grouping.
+        assert_eq!(
+            FusedR2rmlAggregateOperator::assemble_group_key(
+                &[KeySource::Fact],
+                std::slice::from_ref(&s_col),
+                &[Some(&ground)],
+                Some(&[]),
+                0
+            ),
+            Some(vec![GKey::Str("Ground".into())])
+        );
     }
 
     // PR-6: an `xsd:integer` group key stored as a Snowflake `NUMBER` arrives as
