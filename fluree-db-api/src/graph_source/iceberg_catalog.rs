@@ -677,6 +677,18 @@ pub async fn preview_iceberg_table(
                     schema.total_bytes = schema.total_bytes.or(Some(agg.total_bytes));
 
                     if has_delete_files {
+                        // Fail closed (F-AUD-1): the aggregated row/value/null
+                        // counts sum live data-file records and do NOT subtract
+                        // merge-on-read deletes, so they over-count. Refuse unless
+                        // the operator opted out via FLUREE_ICEBERG_ALLOW_MOR_DELETES.
+                        let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
+                        fluree_db_iceberg::ensure_no_delete_manifests(
+                            usize::from(has_delete_files),
+                            &table.qualified(),
+                            allow_mor,
+                        )
+                        .map_err(|e| crate::ApiError::config(e.to_string()))?;
+                        // Only reached under the override: surface the caveat.
                         warnings.push(
                             "Table has merge-on-read delete files; aggregated row/value/null \
                                  counts are upper bounds (position/equality deletes are not \

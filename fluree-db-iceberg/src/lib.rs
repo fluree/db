@@ -60,6 +60,7 @@ pub mod error;
 pub mod io;
 pub mod manifest;
 pub mod metadata;
+pub mod mor_guard;
 pub mod net;
 pub mod scan;
 pub mod stats;
@@ -68,6 +69,10 @@ pub mod stats;
 pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
 pub use config_value::ConfigValue;
 pub use error::{IcebergError, Result};
+pub use mor_guard::{
+    ensure_no_delete_manifests, ensure_no_summary_deletes, mor_deletes_allowed,
+    ALLOW_MOR_DELETES_ENV,
+};
 
 // Re-export Phase 2 types for convenience
 pub use io::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType, IcebergStorage};
