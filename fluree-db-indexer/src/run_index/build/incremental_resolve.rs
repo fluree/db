@@ -806,7 +806,7 @@ type ResolvedIdentity = (u16, u32);
 /// index-served time travel can see states a fact held only within this
 /// window. No-op re-asserts and same-`t` losers are discarded outright: they
 /// transition nothing anywhere.
-fn dedup_fact_lifecycles(
+pub(crate) fn dedup_fact_lifecycles(
     mut records: Vec<RunRecord>,
     o_types: &OTypeRegistry,
 ) -> (Vec<RunRecord>, Vec<RunRecord>) {
