@@ -647,6 +647,11 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             "server support not compiled. Rebuild with `--features server`.".into(),
         )),
 
+        Commands::Model { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            commands::model::run(&action, &fluree_dir, direct).await
+        }
+
         Commands::Memory { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::memory::run(action, &fluree_dir).await
