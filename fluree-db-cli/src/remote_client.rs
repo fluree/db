@@ -1103,6 +1103,24 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Explain a Cypher query plan against a ledger. The body may be raw
+    /// Cypher or a `{"cypher": ..., "params": ...}` envelope; the server
+    /// extracts it.
+    pub async fn explain_cypher(
+        &self,
+        ledger: &str,
+        cypher: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("explain", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(cypher)),
+        )
+        .await
+    }
+
     /// Explain a JSON-LD connection query plan (ledger specified via `from` in body).
     pub async fn explain_connection_jsonld(
         &self,

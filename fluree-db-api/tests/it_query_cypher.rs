@@ -7800,6 +7800,7 @@ async fn cypher_explain_reports_sid_encoded_plan() {
         &db.snapshot,
         "MATCH (n:Person {id: 7}) RETURN n",
         db.default_context.as_ref(),
+        None,
     )
     .await
     .expect("explain");
@@ -7818,6 +7819,49 @@ async fn cypher_explain_reports_sid_encoded_plan() {
         physical.contains("0:id"),
         "bare `id` not SID-encoded under namespace 0: {explain}"
     );
+}
+
+#[tokio::test]
+async fn cypher_explain_substitutes_params_like_execution() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:explain-params");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "alice",
+                "@type": "Person",
+                "id": 7,
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // UNWIND $param is rejected without substitution, so a successful explain
+    // proves the params rode through the same pre-lowering as execution.
+    let params: fluree_db_cypher::ParamMap =
+        serde_json::from_value(json!({"ids": [7, 8]})).expect("params");
+    let explain = fluree
+        .explain_cypher(
+            &db,
+            "UNWIND $ids AS i MATCH (n:Person {id: i}) RETURN n",
+            Some(&params),
+        )
+        .await
+        .expect("explain with params");
+    assert!(explain.get("plan").is_some(), "{explain}");
+
+    let err = fluree
+        .explain_cypher(
+            &db,
+            "UNWIND $ids AS i MATCH (n:Person {id: i}) RETURN n",
+            None,
+        )
+        .await
+        .expect_err("param without substitution must fail lowering");
+    assert!(err.to_string().contains("param"), "unexpected error: {err}");
 }
 
 #[tokio::test]

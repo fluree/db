@@ -1457,7 +1457,7 @@ Content-Type: application/json
 
 ### GET/POST /explain
 
-Return a query plan without executing the query. Accepts the same body formats and authentication as `/query` (JSON-LD, SPARQL via `application/sparql-query` or `?query=`, and JWS/VC signed requests).
+Return a query plan without executing the query. Accepts the same body formats and authentication as `/query` (JSON-LD, SPARQL via `application/sparql-query` or `?query=`, Cypher via `application/cypher`, and JWS/VC signed requests).
 
 **URL:**
 ```
@@ -1468,6 +1468,7 @@ POST /explain[/{ledger...}]
 **Behavior:**
 - JSON-LD body: returns the logical plan for the parsed query.
 - SPARQL body: returns the plan for the parsed SPARQL query. The ledger-scoped endpoint (`/explain/{ledger}`) rejects queries containing `FROM` / `FROM NAMED` — strip dataset clauses to explain the core plan.
+- Cypher body (`Content-Type: application/cypher`): returns the plan for the lowered Cypher query. Accepts raw Cypher or the `{"cypher": "...", "params": {...}}` envelope — `$param` references are substituted before lowering, exactly like `/query`. Ledger-scoped endpoint only (the connection-scoped `/explain` returns 400 for Cypher).
 - SPARQL UPDATE is rejected (HTTP 400) — use `/update` for updates.
 - Same ledger-scope enforcement for Bearer tokens as `/query`.
 
@@ -1493,6 +1494,11 @@ curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
 curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   -H "Content-Type: application/json" \
   -d '{"select":["?s"],"where":{"@id":"?s"}}'
+
+# Explain a Cypher query (raw text or {"cypher": ..., "params": ...} envelope)
+curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
+  -H "Content-Type: application/cypher" \
+  --data 'MATCH (n:Person {id: 7}) RETURN n'
 ```
 
 ### GET/POST /validate/{ledger...}

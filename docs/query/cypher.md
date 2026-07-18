@@ -70,6 +70,19 @@ The body may be raw Cypher, or a JSON envelope `{"cypher": "...", "params": {...
 (the Neo4j-HTTP shape). Responses are cypher-json; request RDF JSON-LD with
 `Accept: application/ld+json`.
 
+**Explain** — get the query plan without executing. The CLI takes `--explain`
+(local or remote); over HTTP, POST the statement (raw or envelope form — `$param`
+references are substituted before planning) to the ledger-scoped `/explain`
+endpoint:
+
+```bash
+fluree query my/ledger -e 'MATCH (n:Person {id: 7}) RETURN n' --cypher --explain
+
+curl -X POST http://localhost:8090/v1/fluree/explain/my/ledger \
+  -H 'Content-Type: application/cypher' \
+  --data 'MATCH (n:Person {id: 7}) RETURN n'
+```
+
 **Bulk loading** — a `.cypher` dump of `CREATE` / `MATCH … CREATE` statements
 (the Neo4j/Memgraph export idiom) should not be replayed statement-by-statement.
 `fluree create <ledger> --from dump.cypher` converts it on the fly and loads it
