@@ -169,101 +169,23 @@ fn cmp_batch_row_vs_record(
 // History assembly
 // ============================================================================
 
-/// Fact identity key for history dedup (V3).
-#[derive(PartialEq, Eq)]
-struct FactKeyV3 {
-    s_id: u64,
-    p_id: u32,
-    o_type: u16,
-    o_key: u64,
-    o_i: u32,
-}
-
-impl FactKeyV3 {
-    #[inline]
-    fn from_hist(e: &HistEntryV2) -> Self {
-        Self {
-            s_id: e.s_id.as_u64(),
-            p_id: e.p_id,
-            o_type: e.o_type,
-            o_key: e.o_key,
-            o_i: e.o_i,
-        }
-    }
-}
-
-/// Assemble the final history list from new merge entries + existing history.
+/// Assemble the final history list: new merge entries sorted newest-first
+/// (same-`t` ties retracts-first), followed by the carried-forward existing
+/// history.
 ///
-/// - `new_history` is sorted by `t` descending, then deduplicated for adjacent
-///   duplicate asserts (same FactKey).
-/// - Concatenated as `new_history ++ existing_history` with boundary dedup.
+/// No entry is deduplicated or dropped: the merge writes only state
+/// transitions (at most one entry per identity and `t`), and every carried
+/// entry is a transition replay still depends on — in particular a fact's
+/// original assert, which replay's older-assert swap needs when a newer
+/// same-identity entry lands above it. Dropping it would make replay
+/// fabricate the fact's presence before it ever existed.
 fn assemble_history(
     mut new_history: Vec<HistEntryV2>,
     existing: &[HistEntryV2],
 ) -> Vec<HistEntryV2> {
-    // Sort new entries by t descending (newest first).
-    new_history.sort_unstable_by(|a, b| {
-        b.t.cmp(&a.t).then_with(|| {
-            // Tie-break: retracts before asserts (op=0 < op=1)
-            a.op.cmp(&b.op)
-        })
-    });
-
-    // Adjacent dedup within new_history.
-    dedup_adjacent_asserts(&mut new_history);
-
-    // Boundary dedup: at the new ++ existing seam, if both sides have an
-    // assert for the same fact key, keep the newer one (higher t).
-    // In the concat, new_history entries are generally newer than existing.
-    let skip_first_old = match (new_history.last(), existing.first()) {
-        (Some(last_new), Some(first_old))
-            if FactKeyV3::from_hist(last_new) == FactKeyV3::from_hist(first_old)
-                && last_new.op == 1
-                && first_old.op == 1 =>
-        {
-            if last_new.t >= first_old.t {
-                // last_new is newer or equal — keep last_new, skip first_old
-                true
-            } else {
-                // first_old is newer — keep first_old, drop last_new
-                new_history.pop();
-                false
-            }
-        }
-        _ => false,
-    };
-
-    if skip_first_old {
-        new_history.extend_from_slice(&existing[1..]);
-    } else {
-        new_history.extend_from_slice(existing);
-    }
+    new_history.sort_unstable_by(|a, b| b.t.cmp(&a.t).then(a.op.cmp(&b.op)));
+    new_history.extend_from_slice(existing);
     new_history
-}
-
-/// Remove adjacent duplicate asserts within a reverse-chronological history list.
-///
-/// For adjacent entries with the same FactKey and both asserts, the older one
-/// (later index = lower t) is dropped; the newest one is kept. This preserves
-/// the most recent event in the log.
-fn dedup_adjacent_asserts(entries: &mut Vec<HistEntryV2>) {
-    if entries.len() < 2 {
-        return;
-    }
-    let mut write = 0;
-    for read in 1..entries.len() {
-        let is_dup = FactKeyV3::from_hist(&entries[write]) == FactKeyV3::from_hist(&entries[read])
-            && entries[write].op == 1
-            && entries[read].op == 1;
-        if is_dup {
-            // Keep newer (at write position, higher t), drop older (at read).
-            // Don't advance write — next iteration compares against the kept entry.
-        } else {
-            write += 1;
-            entries[write] = entries[read];
-        }
-    }
-    entries.truncate(write + 1);
 }
 
 // ============================================================================
@@ -983,68 +905,13 @@ mod tests {
         assert_eq!(out.records[3].p_id, 2);
     }
 
+    /// A cross-boundary re-assert must NOT displace the fact's carried
+    /// history: the original assert is the birth transition replay's
+    /// older-assert swap depends on. History ends up with the replacement
+    /// pair at t=10 AND the carried assert at t=3.
     #[test]
-    fn test_dedup_adjacent_asserts() {
-        let o_type = OType::XSD_INTEGER.as_u16();
-        let o_key = ObjKey::encode_i64(10).as_u64();
-
-        let mut entries = vec![
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 5,
-                op: 1,
-            },
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 3,
-                op: 1,
-            },
-        ];
-        dedup_adjacent_asserts(&mut entries);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].t, 5); // newer survives
-    }
-
-    #[test]
-    fn test_dedup_keeps_retract_assert_pair() {
-        let o_type = OType::XSD_INTEGER.as_u16();
-        let o_key = ObjKey::encode_i64(10).as_u64();
-
-        let mut entries = vec![
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 5,
-                op: 0, // retract
-            },
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 3,
-                op: 1, // assert
-            },
-        ];
-        dedup_adjacent_asserts(&mut entries);
-        assert_eq!(entries.len(), 2); // both kept
-    }
-
-    #[test]
-    fn test_boundary_dedup_new_is_newer() {
-        let existing = vec![rec2(1, 1, 10, 1)];
+    fn test_carried_assert_survives_reassert() {
+        let existing = vec![rec2(1, 1, 10, 3)];
         let batch = batch_from_records(&existing);
 
         let old_history = vec![HistEntryV2 {
@@ -1054,24 +921,20 @@ mod tests {
             o_key: ObjKey::encode_i64(10).as_u64(),
             o_i: OI_NONE,
             t: 3,
-            op: 1, // assert
+            op: 1, // the fact's original assert
         }];
 
-        // Update same fact at t=10 → produces assert in new_history
+        // Plain re-assert at t=10 → replacement pair in new_history.
         let novelty = vec![rec2(1, 1, 10, 10)];
         let ops = vec![1u8];
         let input = make_input(&batch, &novelty, &ops, &old_history, RunSortOrder::Spot);
 
         let out = merge_novelty(&input);
-        // The newest assert (t=10) should survive boundary dedup
-        let assert_entries: Vec<_> = out
-            .history
-            .iter()
-            .filter(|e| e.op == 1 && e.s_id.as_u64() == 1)
-            .collect();
-        assert!(
-            assert_entries.iter().any(|e| e.t == 10),
-            "newest assert (t=10) should survive boundary dedup"
+        let events: Vec<(u32, u8)> = out.history.iter().map(|e| (e.t, e.op)).collect();
+        assert_eq!(
+            events,
+            vec![(10, 0), (10, 1), (3, 1)],
+            "replacement pair at t=10, carried birth assert at t=3"
         );
     }
 
@@ -1096,46 +959,6 @@ mod tests {
         );
         let assert_entry = out.history.iter().find(|h| h.op == 1).unwrap();
         assert_eq!(assert_entry.t, 5);
-    }
-
-    /// Regression: dedup_adjacent_asserts keeps newest (higher t), drops older.
-    #[test]
-    fn test_dedup_keeps_newest_assert() {
-        let o_type = OType::XSD_INTEGER.as_u16();
-        let o_key = ObjKey::encode_i64(10).as_u64();
-
-        let mut entries = vec![
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 7,
-                op: 1,
-            },
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 5,
-                op: 1,
-            },
-            HistEntryV2 {
-                s_id: SubjectId(1),
-                p_id: 1,
-                o_type,
-                o_key,
-                o_i: OI_NONE,
-                t: 3,
-                op: 1,
-            },
-        ];
-        dedup_adjacent_asserts(&mut entries);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].t, 7, "newest assert (t=7) must survive");
     }
 
     #[test]
