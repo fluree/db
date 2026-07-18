@@ -533,11 +533,23 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
     // visible to the next row's guard); a vectorized batch is, so dedup by
     // the MERGE identity key here — last row per key wins — to converge on
     // the same end state sequential execution would reach.
+    //
+    // Single-write-clause statements only: the key comes from the FIRST node
+    // MERGE, so collapsing rows by it would drop legitimate rows of a
+    // multi-clause chain (`MERGE (a {id: row.src}) MERGE (b {id: row.dst}) …`
+    // — two rows sharing `src` but differing in `dst` are distinct work).
+    // Multi-clause statements run through the sequential write driver, which
+    // owns in-batch duplicate-key semantics (first row per key creates,
+    // later rows match).
     let identity_fields = {
         let Statement::Update(u) = &ast.statement else {
             unreachable!("checked above");
         };
-        merge_identity_fields(u, &alias)
+        if u.write_clauses.len() == 1 {
+            merge_identity_fields(u, &alias)
+        } else {
+            Vec::new()
+        }
     };
     let elems = dedup_rows_by_merge_identity(elems, &identity_fields);
     let elems = &elems;

@@ -489,6 +489,7 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
     let dts = WellKnownDatatypes::new();
     match cell {
         UnresolvedValue::Unbound => Ok(Binding::Unbound),
+        UnresolvedValue::PreBound(binding) => Ok(binding.clone()),
         UnresolvedValue::Iri(iri) => {
             let sid = encoder
                 .encode_iri(iri)
