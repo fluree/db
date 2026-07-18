@@ -65,6 +65,13 @@ fn kb_node(i: usize, nodes: usize, mixed: bool, annotated: bool) -> serde_json::
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
+    // `RUST_LOG=fluree_db_query=debug` surfaces planner/operator lane
+    // decisions (which OPTIONAL builder fired, batched-vs-per-row, etc.).
+    if std::env::var("RUST_LOG").is_ok() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .init();
+    }
     let nodes = env_usize("PROBE_NODES", 72_000);
     let uris = env_usize("PROBE_URIS", 1_000);
     // reindex: insert + reindex (indexer-built root)
@@ -127,6 +134,11 @@ async fn main() {
     );
 
     let db = fluree.db("probe:kb").await.expect("db");
+    eprintln!(
+        "annotation_index={} content_store={}",
+        db.snapshot.annotation_index.is_some(),
+        db.snapshot.content_store.is_some()
+    );
 
     // Baseline: point lookup by known value (customer: single-digit ms).
     let point = format!(
@@ -156,8 +168,30 @@ async fn main() {
     let reindex_query = "UNWIND $uris AS uri \
          MATCH (s:INDEXED {value: uri})-[p]->(o:INDEXED) \
          RETURN uri, s.value AS subject, type(p) AS rel, o.value AS object";
+    // Variant without the relationship variable in RETURN — separates the
+    // per-row cost of binding/using `p` from the rest of the plan.
+    let no_p_query = "UNWIND $uris AS uri \
+         MATCH (s:INDEXED {value: uri})-[p]->(o:INDEXED) \
+         RETURN uri, s.value AS subject, o.value AS object";
+    // Anonymous edge — no relationship variable at all (plain-triple shape).
+    let anon_query = "UNWIND $uris AS uri \
+         MATCH (s:INDEXED {value: uri})-->(o:INDEXED) \
+         RETURN uri, s.value AS subject, o.value AS object";
+
+    if std::env::var("PROBE_EXPLAIN").is_ok() {
+        let plan = fluree
+            .explain_cypher(&db, no_p_query, Some(&params))
+            .await
+            .expect("explain");
+        eprintln!(
+            "PLAN: {}",
+            serde_json::to_string_pretty(&plan["plan"]["physical"]).unwrap_or_default()
+        );
+    }
 
     for (label, query) in [
+        ("unwind anon-edge", anon_query.to_string()),
+        ("unwind no-p", no_p_query.to_string()),
         ("unwind+limit20", format!("{reindex_query} LIMIT 20")),
         ("unwind full", reindex_query.to_string()),
     ] {

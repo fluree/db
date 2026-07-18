@@ -2263,6 +2263,27 @@ pub fn build_where_operators_seeded_with_needed(
                         }
                     }
 
+                    // Value-only edge-annotation probe (a Cypher relationship
+                    // binding): answer the whole batch with three set-wise
+                    // reifies scans + hash lookups instead of per-row chains.
+                    if let Some(builder) = crate::optional::AnnotationValueOptionalBuilder::try_new(
+                        required_schema.clone(),
+                        inner_patterns.clone(),
+                        stats.clone(),
+                        *planning,
+                    ) {
+                        operator = Some(Box::new(
+                            OptionalOperator::with_builder(
+                                child,
+                                required_schema,
+                                Box::new(builder),
+                            )
+                            .with_out_schema(augmented_ref),
+                        ));
+                        i += 1;
+                        continue;
+                    }
+
                     // General path: use PlanTreeOptionalBuilder for multi-pattern or
                     // non-triple single patterns (VALUES, BIND, subquery, etc.)
                     let builder = PlanTreeOptionalBuilder::new(

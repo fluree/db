@@ -9660,3 +9660,59 @@ async fn cypher_regex_match_is_full_string() {
         .expect("cypher json");
     assert_eq!(names(cj), vec![json!("Alice")]);
 }
+
+#[tokio::test]
+async fn cypher_untyped_rel_var_on_reified_edges_batched_probe() {
+    // Value-only relationship binding over a ledger that mixes reified
+    // (annotated) and plain edges. Exercises the batched annotation
+    // optional probe: per row the reifier must bind when one exists
+    // (parallel annotations fan out) and the synthesized relationship
+    // value must fill in when none does — same rows as the per-row path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:reified-relvar");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {
+                        "@id": "a",
+                        "@type": "Node",
+                        "knows": {"@id": "b", "@annotation": {"w": 1}}
+                    },
+                    {
+                        "@id": "b",
+                        "@type": "Node",
+                        "likes": {"@id": "c"}
+                    },
+                    {"@id": "c", "@type": "Node"}
+                ],
+                "opts": {"lpgEdgeLifecycle": true}
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (s:Node)-[p]->(o:Node) RETURN type(p) AS t ORDER BY t"#,
+        )
+        .await
+        .expect("rel var over mixed edges")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let types: Vec<_> = cj["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"][0].clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec![json!("knows"), json!("likes")],
+        "one row per edge, reified and plain alike: {cj}"
+    );
+}

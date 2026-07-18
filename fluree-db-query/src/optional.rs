@@ -1204,6 +1204,17 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         {
             return Ok(None);
         }
+        // `DefaultGraphSource` is only hash-join safe in single-source mode,
+        // where the wrapper is a build-once no-op. With a dataset attached its
+        // per-source iteration runs per parent row — keep the per-row path.
+        if ctx.dataset.is_some()
+            && self
+                .inner_patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::DefaultGraphSource { .. }))
+        {
+            return Ok(None);
+        }
 
         // Correlation columns = required columns whose var is referenced anywhere
         // inside the inner patterns (join keys, filter operands, path endpoints).
@@ -1415,11 +1426,318 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
 /// property paths from a (possibly seeded) endpoint qualify; subqueries,
 /// nested OPTIONAL/UNION/MINUS, BIND/UNWIND/VALUES, and search patterns do
 /// not (they can carry internal limits or independent correlation).
+/// Batched builder for the value-only Cypher relationship binding:
+/// `OPTIONAL { DefaultGraphSource[base edge + 3 f:reifies* triples] }` with
+/// every base-edge position bound by the required row (or constant).
+///
+/// The generic path evaluates that chain per required row (or per seeded
+/// tuple), and with no stats for the system `f:reifies*` predicates the
+/// join can drive from `f:reifiesPredicate` — per row it enumerates
+/// ~(sidecar / #relationship-types) candidate reifiers and
+/// existence-checks each with its own scan. On a reified ledger that
+/// turned a 21k-row UNWIND into minutes of CPU and an OOM.
+///
+/// This builder instead drains the three `f:reifies*` predicates ONCE per
+/// required batch through ordinary planned scans (overlay-merged and
+/// policy-filtered like any scan), builds `subject → reifiers` /
+/// `reifier → (predicate, object)` maps, and answers every row by hash
+/// lookup. Falls back to the generic per-row path (held as `fallback`)
+/// for history queries, attached datasets, and multi-ledger contexts.
+pub struct AnnotationValueOptionalBuilder {
+    fallback: PlanTreeOptionalBuilder,
+    /// The three reifies triples, with their original vars — executed
+    /// unseeded so each drains its whole (overlay-merged) predicate.
+    r_subj: TriplePattern,
+    r_pred: TriplePattern,
+    r_obj: TriplePattern,
+    ann_var: VarId,
+    s_src: crate::annotation_edge_probe::EdgePos,
+    p_src: crate::annotation_edge_probe::EdgePos,
+    o_src: crate::annotation_edge_probe::EdgePos,
+    stats: Option<Arc<StatsView>>,
+    planning: PlanningContext,
+}
+
+impl AnnotationValueOptionalBuilder {
+    /// Recognize and construct; `None` defers to the general builder.
+    pub(crate) fn try_new(
+        required_schema: Arc<[VarId]>,
+        inner_patterns: Vec<Pattern>,
+        stats: Option<Arc<StatsView>>,
+        planning: PlanningContext,
+    ) -> Option<Self> {
+        use crate::annotation_edge_probe::{recognize_annotation_edge, EdgePos};
+
+        let [Pattern::DefaultGraphSource { patterns: chain }] = inner_patterns.as_slice() else {
+            return None;
+        };
+        let shape = recognize_annotation_edge(chain)?;
+        if !shape.body.is_empty() {
+            return None;
+        }
+        let p_src = match &shape.p_pred {
+            Ref::Var(v) => EdgePos::Var(*v),
+            Ref::Sid(sid) => EdgePos::Const(sid.clone()),
+            Ref::Iri(_) => return None,
+        };
+        // Every variable edge position must be bound by the required row —
+        // that's what makes the per-row evaluation a pure (s, p, o) lookup.
+        for pos in [&shape.s_pos, &p_src, &shape.o_pos] {
+            if let EdgePos::Var(v) = pos {
+                if !required_schema.contains(v) {
+                    return None;
+                }
+            }
+        }
+        let (Pattern::Triple(r_subj), Pattern::Triple(r_pred), Pattern::Triple(r_obj)) =
+            (&chain[1], &chain[2], &chain[3])
+        else {
+            return None;
+        };
+        let (r_subj, r_pred, r_obj) = (r_subj.clone(), r_pred.clone(), r_obj.clone());
+
+        let fallback =
+            PlanTreeOptionalBuilder::new(required_schema, inner_patterns, stats.clone(), planning);
+        // The reifier must be the only optional-only variable; anything else
+        // means the shape produces bindings this lane doesn't reconstruct.
+        if fallback.optional_only_vars() != [shape.ann_var] {
+            return None;
+        }
+        Some(Self {
+            fallback,
+            r_subj,
+            r_pred,
+            r_obj,
+            ann_var: shape.ann_var,
+            s_src: shape.s_pos,
+            p_src,
+            o_src: shape.o_pos,
+            stats,
+            planning,
+        })
+    }
+
+    /// Normalize a binding to a raw `Sid` (decoding late-materialized
+    /// subjects through the graph view). `None` for unbound/poisoned or
+    /// non-ref bindings — such a position matches no `f:reifies*` row.
+    fn binding_sid(
+        b: &Binding,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Option<fluree_db_core::Sid>> {
+        match b {
+            Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
+            Binding::EncodedSid { s_id, .. } => {
+                let view = view.ok_or_else(|| {
+                    QueryError::execution(
+                        "annotation optional probe: encoded subject with no binary graph view",
+                    )
+                })?;
+                view.resolve_subject_sid(*s_id).map(Some).map_err(|e| {
+                    QueryError::execution(format!(
+                        "annotation optional probe: resolve encoded subject {s_id}: {e}"
+                    ))
+                })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn row_sid(
+        &self,
+        pos: &crate::annotation_edge_probe::EdgePos,
+        batch: &Batch,
+        row: usize,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Option<fluree_db_core::Sid>> {
+        use crate::annotation_edge_probe::EdgePos;
+        match pos {
+            EdgePos::Const(sid) => Ok(Some(sid.clone())),
+            EdgePos::Var(v) => match batch.get(row, *v) {
+                Some(b) => Self::binding_sid(b, view),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Drain one reifies triple's whole predicate through a planned scan,
+    /// yielding `(reifier Sid, object Sid)` pairs. Non-ref objects (a
+    /// literal-valued reified edge) are skipped — the probe only matches
+    /// ref positions, mirroring `EdgePos::from_term`.
+    async fn drain_pairs(
+        &self,
+        triple: &TriplePattern,
+        ctx: &ExecutionContext<'_>,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Vec<(fluree_db_core::Sid, fluree_db_core::Sid)>> {
+        let ann_v = match &triple.s {
+            Ref::Var(v) => *v,
+            _ => {
+                return Err(QueryError::execution(
+                    "annotation optional probe: reifies subject must be the reifier var",
+                ))
+            }
+        };
+        let o_v = match &triple.o {
+            Term::Var(v) => Some(*v),
+            _ => None,
+        };
+        let mut op = crate::execute::build_where_operators_seeded(
+            None,
+            std::slice::from_ref(&Pattern::Triple(triple.clone())),
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )?;
+        op.open(ctx).await?;
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
+            for r in 0..batch.len() {
+                let Some(ann) = batch
+                    .get(r, ann_v)
+                    .map(|b| Self::binding_sid(b, view))
+                    .transpose()?
+                    .flatten()
+                else {
+                    continue;
+                };
+                let obj = match o_v {
+                    Some(v) => batch
+                        .get(r, v)
+                        .map(|b| Self::binding_sid(b, view))
+                        .transpose()?
+                        .flatten(),
+                    // Constant object (typed relationship / fixed endpoint):
+                    // the scan already filtered to it; record the constant.
+                    None => match &triple.o {
+                        Term::Sid(sid) => Some(sid.clone()),
+                        _ => None,
+                    },
+                };
+                if let Some(obj) = obj {
+                    out.push((ann, obj));
+                }
+            }
+        }
+        op.close();
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl OptionalBuilder for AnnotationValueOptionalBuilder {
+    fn build(
+        &self,
+        required_batch: &Batch,
+        row: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<BoxedOperator>> {
+        self.fallback.build(required_batch, row, ctx)
+    }
+
+    async fn build_batch(
+        &self,
+        required_batch: &Batch,
+        start_row: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Vec<OptionalBatchRow>>> {
+        if start_row >= required_batch.len()
+            || self.planning.is_history()
+            || ctx.dataset.is_some()
+            || ctx.is_multi_ledger()
+        {
+            return Ok(None);
+        }
+        let view = ctx.graph_view();
+        let view = view.as_ref();
+
+        // One pass over each reifies predicate (overlay-merged, policy-
+        // filtered planned scans), then pure hash lookups per row.
+        let subj_pairs = self.drain_pairs(&self.r_subj, ctx, view).await?;
+        let mut s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
+        for (ann, s) in subj_pairs {
+            s_to_anns.entry(s).or_default().push(ann);
+        }
+        let ann_pred: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
+            .drain_pairs(&self.r_pred, ctx, view)
+            .await?
+            .into_iter()
+            .collect();
+        let ann_obj: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
+            .drain_pairs(&self.r_obj, ctx, view)
+            .await?
+            .into_iter()
+            .collect();
+
+        let opt_schema: Arc<[VarId]> = Arc::from(vec![self.ann_var].into_boxed_slice());
+        let mut pending = Vec::with_capacity(required_batch.len() - start_row);
+        for row in start_row..required_batch.len() {
+            let key = (
+                self.row_sid(&self.s_src, required_batch, row, view)?,
+                self.row_sid(&self.p_src, required_batch, row, view)?,
+                self.row_sid(&self.o_src, required_batch, row, view)?,
+            );
+            let (Some(s), Some(p), Some(o)) = key else {
+                pending.push((row, Vec::new()));
+                continue;
+            };
+            let anns: Vec<Binding> = s_to_anns
+                .get(&s)
+                .map(|cands| {
+                    cands
+                        .iter()
+                        .filter(|ann| {
+                            ann_pred.get(*ann) == Some(&p) && ann_obj.get(*ann) == Some(&o)
+                        })
+                        .map(|ann| Binding::sid(ann.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if anns.is_empty() {
+                pending.push((row, Vec::new()));
+            } else {
+                let batch = Batch::new(opt_schema.clone(), vec![anns])?;
+                pending.push((row, vec![batch]));
+            }
+        }
+        tracing::debug!(
+            rows = pending.len(),
+            "annotation value-only optional batched probe complete"
+        );
+        Ok(Some(pending))
+    }
+
+    fn schema(&self) -> &[VarId] {
+        self.fallback.schema()
+    }
+
+    fn optional_only_vars(&self) -> &[VarId] {
+        self.fallback.optional_only_vars()
+    }
+
+    fn unify_instructions(&self) -> &[UnifyInstruction] {
+        self.fallback.unify_instructions()
+    }
+}
+
 fn inner_pattern_is_hash_join_safe(p: &Pattern) -> bool {
-    matches!(
-        p,
-        Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_)
-    )
+    match p {
+        Pattern::Triple(_) | Pattern::Filter(_) | Pattern::PropertyPath(_) => true,
+        // The edge-annotation expansion wraps its `[base + f:reifies*]`
+        // chain in `DefaultGraphSource` (per-source correlation). In
+        // single-source mode the wrapper is a build-once no-op, and its
+        // per-seed evaluation is a pure restriction by the correlation
+        // tuple — the same property the bare-triple chain has. Without
+        // this arm a value-only Cypher relationship binding
+        // (`OPTIONAL { EdgeAnnotation }`) fell to the per-row rebuild
+        // path: ~25ms/row of replanning that turned a 21k-row UNWIND
+        // reindex query into minutes of CPU. Multi-source datasets are
+        // excluded at the `build_batch` gate (dataset presence check).
+        Pattern::DefaultGraphSource { patterns } => {
+            patterns.iter().all(inner_pattern_is_hash_join_safe)
+        }
+        _ => false,
+    }
 }
 
 /// True iff `v` occurs in the inner patterns ONLY as the object of one or more
