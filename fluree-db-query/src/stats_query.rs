@@ -69,7 +69,10 @@ impl StatsCountByPredicateOperator {
     }
 
     fn build_rows(&self, ctx: &ExecutionContext<'_>) -> Result<Vec<(Binding, Binding)>> {
-        let dt = WellKnownDatatypes::new().xsd_long;
+        // SPARQL COUNT yields xsd:integer (§18.5.1.6); the materialized and
+        // streaming aggregate paths already tag it so — this per-predicate
+        // fast-path must match or a COUNT re-typed as xsd:long leaks (agg02).
+        let dt = WellKnownDatatypes::new().xsd_integer;
         let store = ctx.binary_store.as_deref();
 
         // Prefer graph-scoped stats if present (and we can resolve p_id → Sid).

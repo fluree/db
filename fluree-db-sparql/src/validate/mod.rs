@@ -214,6 +214,16 @@ impl<'a> Validator<'a> {
             UpdateOperation::Modify(modify) => {
                 self.validate_modify(modify);
             }
+            // Graph-management verbs reference only graph IRIs (and a source
+            // IRI for LOAD) — there are no templates, variables, or blank
+            // nodes to validate. Grammar acceptance is the whole check.
+            UpdateOperation::Load(_)
+            | UpdateOperation::Clear(_)
+            | UpdateOperation::Drop(_)
+            | UpdateOperation::Create(_)
+            | UpdateOperation::Add(_)
+            | UpdateOperation::Copy(_)
+            | UpdateOperation::Move(_) => {}
         }
     }
 
@@ -531,6 +541,7 @@ impl<'a> Validator<'a> {
         match subject {
             SubjectTerm::Var(var) => self.push_ground_violation(&var.name, var.span, context),
             SubjectTerm::QuotedTriple(qt) => self.validate_ground_quoted_triple(qt, context),
+            SubjectTerm::TripleTerm(tt) => self.validate_ground_triple_term(tt, context),
             SubjectTerm::Iri(_) | SubjectTerm::BlankNode(_) => {}
         }
     }
@@ -545,8 +556,23 @@ impl<'a> Validator<'a> {
         match object {
             Term::Var(var) => self.push_ground_violation(&var.name, var.span, context),
             Term::QuotedTriple(qt) => self.validate_ground_quoted_triple(qt, context),
+            Term::TripleTerm(tt) => self.validate_ground_triple_term(tt, context),
             Term::Iri(_) | Term::Literal(_) | Term::BlankNode(_) => {}
         }
+    }
+
+    /// Recurse into a SPARQL 1.2 triple-term value's positions so that a
+    /// variable inside `<<( s p o )>>` used in ground DATA is flagged (e.g.
+    /// `INSERT DATA { :s :p <<( ?x :b :c )>> }`). An all-ground triple term
+    /// (`update-tripleterm-01`) passes.
+    fn validate_ground_triple_term(
+        &mut self,
+        tt: &crate::ast::annotation::TripleTerm,
+        context: &str,
+    ) {
+        self.validate_ground_subject(&tt.subject, context);
+        self.validate_ground_predicate(&tt.predicate, context);
+        self.validate_ground_object(&tt.object, context);
     }
 
     fn validate_ground_quoted_triple(&mut self, qt: &crate::ast::QuotedTriple, context: &str) {

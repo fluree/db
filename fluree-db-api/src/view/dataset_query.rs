@@ -39,24 +39,37 @@ impl Fluree {
     ///
     /// let result = fluree.query_dataset(&dataset, &query).await?;
     /// ```
-    pub async fn query_dataset(
-        &self,
-        dataset: &DataSetDb,
-        q: impl Into<QueryInput<'_>>,
+    pub async fn query_dataset<'a>(
+        &'a self,
+        dataset: &'a DataSetDb,
+        q: impl Into<QueryInput<'a>>,
     ) -> Result<QueryResult> {
         self.query_dataset_with_options(dataset, q, QueryExecutionOptions::default())
             .await
     }
 
     /// Execute a query against a dataset view with explicit execution controls.
-    pub async fn query_dataset_with_options(
+    pub fn query_dataset_with_options<'a>(
+        &'a self,
+        dataset: &'a DataSetDb,
+        q: impl Into<QueryInput<'a>>,
+        options: QueryExecutionOptions,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<QueryResult>> + Send + 'a>> {
+        // Concrete boxed return (not an opaque `async fn`) so that
+        // `query_with_options` — which delegates here for within-ledger datasets
+        // and which this method's single-ledger fast path delegates back to —
+        // does not form an opaque-recursive-async `Send` auto-trait cycle. It
+        // also keeps this crate's type-check fast (the recursion otherwise makes
+        // it pathologically slow, 30+ min).
+        Box::pin(self.query_dataset_with_options_impl(dataset, q.into(), options))
+    }
+
+    async fn query_dataset_with_options_impl(
         &self,
         dataset: &DataSetDb,
-        q: impl Into<QueryInput<'_>>,
+        input: QueryInput<'_>,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let input = q.into();
-
         // Single-ledger fast path (only safe for JSON-LD or SPARQL without dataset clauses).
         if dataset.is_single_ledger() {
             if let Some(view) = dataset.primary() {

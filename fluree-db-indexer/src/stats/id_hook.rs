@@ -345,10 +345,38 @@ impl IdStatsHook {
 
     /// Process a single record with resolved IDs.
     ///
-    /// Called per-op after the resolver maps Sids to numeric IDs.
+    /// Called per-op after the resolver maps Sids to numeric IDs. The signed
+    /// count delta is derived from the op alone (assert +1, retract -1),
+    /// which is correct when counts accumulate from scratch over an ordered
+    /// event replay (rebuild/import). For base-seeded counts use
+    /// [`Self::on_record_with_base_presence`].
     pub fn on_record(&mut self, rec: &StatsRecord) {
-        self.flake_count += 1;
         let delta: i64 = if rec.op { 1 } else { -1 };
+        self.apply_record(rec, delta);
+    }
+
+    /// Process a single record whose fact identity's presence in the base
+    /// index is known, deriving the signed count delta from the materialized
+    /// state transition instead of the raw op: an assert creates a row only
+    /// when the fact is base-absent, and a retract removes one only when it
+    /// is base-present; otherwise the record changes no rows and counts by 0.
+    /// Monotone accumulators (HLL sketches, touched-property sets,
+    /// `last_modified_t`) still observe every record.
+    ///
+    /// Use for base-seeded counts (the incremental path); commit event logs
+    /// legitimately contain re-asserts of present facts, and deriving ±1
+    /// from the op double-counts them against the seed.
+    pub fn on_record_with_base_presence(&mut self, rec: &StatsRecord, base_present: bool) {
+        let delta: i64 = match (rec.op, base_present) {
+            (true, false) => 1,
+            (false, true) => -1,
+            (true, true) | (false, false) => 0,
+        };
+        self.apply_record(rec, delta);
+    }
+
+    fn apply_record(&mut self, rec: &StatsRecord, delta: i64) {
+        self.flake_count += 1;
 
         // Track per-graph flake count
         *self.graph_flakes.entry(rec.g_id).or_insert(0) += delta;
@@ -858,5 +886,77 @@ mod tests {
         let key = GraphPropertyKey { g_id: 0, p_id: 1 };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
+    }
+
+    fn record(op: bool, t: i64) -> StatsRecord {
+        StatsRecord {
+            g_id: 0,
+            p_id: 1,
+            s_id: 10,
+            dt: fluree_db_core::value_id::ValueTypeTag::INTEGER,
+            o_hash: 42,
+            o_kind: 0,
+            o_key: 7,
+            t,
+            op,
+            lang_id: 0,
+        }
+    }
+
+    fn seeded_hook(count: i64) -> IdStatsHook {
+        let mut prior = HashMap::new();
+        let mut hll = IdPropertyHll::new();
+        hll.count = count;
+        prior.insert(GraphPropertyKey { g_id: 0, p_id: 1 }, hll);
+        IdStatsHook::with_prior_properties(prior)
+    }
+
+    fn property_count(hook: &IdStatsHook) -> i64 {
+        hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }].count
+    }
+
+    /// Base-seeded counts change only on real state transitions: assert of an
+    /// absent fact (+1) and retract of a present fact (-1).
+    #[test]
+    fn base_presence_delta_counts_transitions_only() {
+        let mut hook = seeded_hook(5);
+        hook.on_record_with_base_presence(&record(true, 1), false); // created
+        assert_eq!(property_count(&hook), 6);
+        hook.on_record_with_base_presence(&record(false, 2), true); // removed
+        assert_eq!(property_count(&hook), 5);
+    }
+
+    /// A re-assert of a base-present fact and a retract of a base-absent
+    /// fact are no-ops for counts; commit event logs legitimately contain
+    /// both (facts are re-asserted across commits, and a window's
+    /// assert+retract of a new fact dedups to a lone retract).
+    #[test]
+    fn base_presence_delta_ignores_noop_events() {
+        let mut hook = seeded_hook(5);
+        hook.on_record_with_base_presence(&record(true, 1), true); // re-assert
+        assert_eq!(property_count(&hook), 5);
+        hook.on_record_with_base_presence(&record(false, 2), false); // retract of absent
+        assert_eq!(property_count(&hook), 5);
+    }
+
+    /// Zero-delta records still feed the monotone accumulators: NDV sketches
+    /// and last-modified tracking observe every record.
+    #[test]
+    fn noop_events_still_feed_monotone_accumulators() {
+        let mut hook = seeded_hook(5);
+        hook.on_record_with_base_presence(&record(true, 9), true);
+        let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
+        assert_eq!(hll.last_modified_t, 9);
+        assert!(hll.values_hll.estimate() > 0, "value sketch observed");
+    }
+
+    /// The op-derived path is unchanged: ±1 regardless of any base.
+    #[test]
+    fn event_delta_path_counts_every_op() {
+        let mut hook = seeded_hook(0);
+        hook.on_record(&record(true, 1));
+        hook.on_record(&record(true, 2));
+        hook.on_record(&record(false, 3));
+        assert_eq!(property_count(&hook), 1);
     }
 }

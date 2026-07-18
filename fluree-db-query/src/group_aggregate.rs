@@ -79,10 +79,17 @@ enum AggState {
     /// COUNT(DISTINCT) - HashSet of seen values
     CountDistinct { seen: HashSet<GroupKeyOwned> },
     /// SUM - exact-when-possible numeric accumulator with type promotion
-    /// (xsd:integer → xsd:decimal → xsd:double).
-    Sum { acc: crate::aggregate::NumericAcc },
+    /// (xsd:integer → xsd:decimal → xsd:double). `poisoned` records a bound
+    /// non-numeric member, which makes the whole aggregate a type error.
+    Sum {
+        acc: crate::aggregate::NumericAcc,
+        poisoned: bool,
+    },
     /// AVG - same accumulator as SUM, divided by count at finalize.
-    Avg { acc: crate::aggregate::NumericAcc },
+    Avg {
+        acc: crate::aggregate::NumericAcc,
+        poisoned: bool,
+    },
     /// MIN - current minimum (stores materialized binding for correct comparison)
     Min { min: Option<Binding> },
     /// MAX - current maximum (stores materialized binding for correct comparison)
@@ -219,9 +226,11 @@ impl AggState {
             },
             AggregateFn::Sum { .. } => AggState::Sum {
                 acc: crate::aggregate::NumericAcc::new(),
+                poisoned: false,
             },
             AggregateFn::Avg { .. } => AggState::Avg {
                 acc: crate::aggregate::NumericAcc::new(),
+                poisoned: false,
             },
             AggregateFn::Min(_) => AggState::Min { min: None },
             AggregateFn::Max(_) => AggState::Max { max: None },
@@ -264,14 +273,21 @@ impl AggState {
                     seen.insert(key);
                 }
             }
-            AggState::Sum { acc } => {
+            AggState::Sum { acc, poisoned } => {
+                // Numeric hot path first (unchanged); a bound non-numeric member
+                // poisons the aggregate to a type error (agg-err-01), while
+                // Unbound/Poisoned contribute nothing and do not poison.
                 if let Some(num) = extract_numeric_with_gv(binding, gv) {
                     acc.add(num);
+                } else if !matches!(binding, Binding::Unbound | Binding::Poisoned) {
+                    *poisoned = true;
                 }
             }
-            AggState::Avg { acc } => {
+            AggState::Avg { acc, poisoned } => {
                 if let Some(num) = extract_numeric_with_gv(binding, gv) {
                     acc.add(num);
+                } else if !matches!(binding, Binding::Unbound | Binding::Poisoned) {
+                    *poisoned = true;
                 }
             }
             AggState::Min { min } => {
@@ -341,8 +357,20 @@ impl AggState {
             AggState::CountDistinct { seen } => {
                 Binding::lit(FlakeValue::Long(seen.len() as i64), Sid::xsd_integer())
             }
-            AggState::Sum { acc } => acc.finalize_sum(),
-            AggState::Avg { acc } => acc.finalize_avg(),
+            AggState::Sum { acc, poisoned } => {
+                if poisoned {
+                    Binding::Unbound
+                } else {
+                    acc.finalize_sum()
+                }
+            }
+            AggState::Avg { acc, poisoned } => {
+                if poisoned {
+                    Binding::Unbound
+                } else {
+                    acc.finalize_avg()
+                }
+            }
             AggState::Min { min } => min.unwrap_or(Binding::Unbound),
             AggState::Max { max } => max.unwrap_or(Binding::Unbound),
             AggState::Sample { sample } => sample.unwrap_or(Binding::Unbound),
