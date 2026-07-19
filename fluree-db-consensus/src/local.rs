@@ -455,9 +455,9 @@ pub(crate) async fn resolve_cypher_under_lock(
         )
         .await?;
     match plan {
-        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(
-            CypherWriteUnderLock::Resolved(Box::new(ResolvedConditional::single(*txn))),
-        ),
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(CypherWriteUnderLock::Resolved(
+            Box::new(ResolvedConditional::single(*txn)),
+        )),
         fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
             // Fresh owned state for the branch-choosing probe (cheap — the
             // snapshot is Arc-shared); `snap` stays borrowed for the resolve.
