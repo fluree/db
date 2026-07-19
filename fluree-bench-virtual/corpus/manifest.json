@@ -1,5 +1,5 @@
 {
-  "corpus_version": 2,
+  "corpus_version": 3,
   "description": "vbench corpus: 54 SPARQL queries (design Q01-Q54) derived from 26 BI questions over the ENTERPRISE_DEMO.DW star schema. Every query runs identically against the native materialized ledger (enterprise-sf01) and, once registered, an R2RML/Iceberg virtual target. See docs/audit/2026-07-virtual-dataset-perf/03-corpus-design.md for the feature x hypothesis coverage matrices and expected-rows derivation.",
   "queries": [
     {
@@ -1500,7 +1500,7 @@
     {
       "id": "q066",
       "file": "queries/q066_shipments_by_year_and_method_dataset.rq",
-      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys \u2014 shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
+      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys — shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
       "tags": [
         "aggregate",
         "count",
@@ -1528,7 +1528,7 @@
     {
       "id": "q067",
       "file": "queries/q067_tickets_by_year_and_priority_dataset.rq",
-      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM \u2014 priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
+      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM — priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
       "tags": [
         "aggregate",
         "count",
@@ -1554,7 +1554,7 @@
     {
       "id": "q068",
       "file": "queries/q068_orderline_detail_crawl_dataset.rq",
-      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage \u2014 the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
+      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage — the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
       "tags": [
         "wildcard",
         "exploration"
@@ -1572,6 +1572,142 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q069",
+      "file": "queries/q069_filter_in_fkref_dataset.rq",
+      "bi_question": "Coverage (item 7 / F-AUD-5): FILTER(?fk IN (...)) over an FK-ref var — parity member; FK-IRI IN-prune is a documented follow-on (scalar prune shown by q070).",
+      "tags": [
+        "filter_iri",
+        "join",
+        "fk_chain",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q070",
+      "file": "queries/q070_scalar_values_glaccount_dataset.rq",
+      "bi_question": "Coverage (item 7 / F-AUD-5): single-var VALUES over a scalar column (glAccountName) lowers to Iceberg Expression::In → files_pruned>0. Literals match no value → 0 rows (clean prune-to-zero + parity).",
+      "tags": [
+        "values",
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q071",
+      "file": "queries/q071_asc_topk_order_total_dataset.rq",
+      "bi_question": "Coverage (item 8 / F-AUD-6): ASC ORDER BY … LIMIT over a required scalar column admits scan-side ASC top-k (unique tiebreaker → deterministic, Full-hash).",
+      "tags": [
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q072",
+      "file": "queries/q072_timestamp_range_webevent_dataset.rq",
+      "bi_question": "Coverage (item 10 / F-AUD-11): xsd:dateTime range FILTER over EVENT_TS pushes to MANIFEST-level pruning under frame-match (UTC literal ↔ timestamptz column).",
+      "tags": [
+        "filter_date",
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT"
+      ],
+      "class": "fact-touching",
+      "hash_gate": "rows_only",
+      "expected_rows": [
+        0,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q073",
+      "file": "queries/q073_optional_budget_order_customer_dataset.rq",
+      "bi_question": "Coverage (item 11 / F-AUD-7): a LIMIT above an OPTIONAL forwards the row budget to the required side (closes probe-04’s 68,828× read amplification). Control: q074.",
+      "tags": [
+        "optional",
+        "join",
+        "fk_chain",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_CUSTOMER"
+      ],
+      "class": "fact-touching",
+      "hash_gate": "rows_only",
+      "expected_rows": [
+        0,
+        50
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q074",
+      "file": "queries/q074_limit_budget_control_dataset.rq",
+      "bi_question": "Coverage (item 11 control): the same LIMIT shape WITHOUT the OPTIONAL — the budget already forwards into the scan; the q073-vs-q074 delta is the OPTIONAL cliff item 11 closes.",
+      "tags": [
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "hash_gate": "rows_only",
+      "expected_rows": [
+        0,
+        50
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
       "subsets": [],
       "exec_path": "from"
     }

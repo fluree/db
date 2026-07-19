@@ -31,6 +31,13 @@ pub enum ScanCmpOp {
     LtEq,
     Gt,
     GtEq,
+    /// Set membership (`?x IN (c1..cN)`), lowered from a `FILTER … IN` or a
+    /// single-var `VALUES` block. The filter's `value` is a [`ScanValue::Set`];
+    /// the provider builds an Iceberg `Expression::In`, which keeps a file iff
+    /// ANY member could lie within the file's column bounds (a superset — the
+    /// in-engine FILTER / VALUES join still enforces exact membership). Never
+    /// paired with a scalar `value`; never mapped to a scalar `ComparisonOp`.
+    In,
 }
 
 /// A literal value for a pushed-down scan filter.

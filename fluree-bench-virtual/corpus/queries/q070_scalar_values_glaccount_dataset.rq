@@ -1,0 +1,14 @@
+# q070 scalar_values_glaccount_dataset — promoted from A3 probe-03 (audit item 7, F-AUD-5)
+# Coverage: a single-var VALUES over a SCALAR-attribute column (edw:glAccountName →
+#   the GL_ACCOUNT_NAME string column). Item 7 lowers the VALUES set to an Iceberg
+#   Expression::In, pruning the FACT_GL_JOURNAL scan (files_pruned>0 where C2b
+#   measured 0). The literals below intentionally match no glAccountName value, so
+#   the IN-prune prunes ALL files → 0 rows on both engines (a clean prune signal +
+#   byte-identical parity), mirroring the ASK/FILTER-decimal prune-to-zero controls.
+# Exec path: query_from() FROM <enterprise-sf01-v:main> (the deployed solo/chat shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?acct (SUM(?deb) AS ?tot)
+FROM <enterprise-sf01-v:main>
+WHERE { VALUES ?acct { "4000 - Revenue" "5000 - COGS" "6000 - Opex" }
+        ?j a edw:GlJournalEntry ; edw:glAccountName ?acct ; edw:debitAmount ?deb . }
+GROUP BY ?acct

@@ -389,6 +389,14 @@ fn collect_and_comparisons(
             true
         }
         Expression::And(children) => children.iter().all(|c| collect_and_comparisons(c, out)),
+        // An `In`/`NotIn` set filter has no row-level Arrow representation here.
+        // Treat it as transparent (don't push, don't abort) so a sibling
+        // comparison in the same `And` still builds its row filter. Sound: the row
+        // filter may only ever keep MORE rows than the true predicate — file /
+        // row-group pruning (which DO evaluate `In`) and the in-engine FILTER stay
+        // the authority. A lone `In` yields an empty plan ⇒ no row filter, exactly
+        // as before this arm existed.
+        Expression::In { .. } | Expression::NotIn { .. } => true,
         _ => false,
     }
 }

@@ -622,7 +622,7 @@ impl R2rmlScanOperator {
     /// column; the `SortOperator` above still applies the exact compound order +
     /// LIMIT, so a `None` here is only a missed optimization, never wrong.
     fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
-        let (sort_var, k) = self.topk?;
+        let (sort_var, k, ascending) = self.topk?;
         // SOUNDNESS (heap feed): decline when a residual filter the operator
         // enforces after the scan is present — the heap would see pre-filter rows.
         if topk_residual_filter_present(&self.pattern) {
@@ -655,6 +655,7 @@ impl R2rmlScanOperator {
         Some(crate::r2rml::ScanTopK {
             sort_column: col.to_string(),
             k,
+            ascending,
         })
     }
 
@@ -1921,12 +1922,16 @@ fn coerce_scalar_for_pushdown(
         // Already a pushable, type-matched value; the residual uses the same
         // semantics for these variants.
         ScanValue::Int(_) | ScanValue::Bool(_) | ScanValue::Date(_) => Some(value.clone()),
-        // Double/Decimal/TemplateKey never wrap a Scalar object constant (a numeric
-        // object routes to ObjectConstant::Double/Decimal, operator-enforced only),
-        // so these are unreachable here; push as-is defensively — never wrong.
-        ScanValue::Double(_) | ScanValue::Decimal { .. } | ScanValue::TemplateKey(_) => {
-            Some(value.clone())
-        }
+        // Double/Decimal/TemplateKey/Timestamp never wrap a Scalar object constant
+        // (a numeric/temporal object routes elsewhere, operator-enforced only), so
+        // these are unreachable here; push as-is defensively — never wrong.
+        ScanValue::Double(_)
+        | ScanValue::Decimal { .. }
+        | ScanValue::TemplateKey(_)
+        | ScanValue::Timestamp { .. } => Some(value.clone()),
+        // A `Set` only ever arrives via the FILTER-IN / VALUES set-pushdown path,
+        // never wrapped in a `Scalar` object constant — decline to coerce it.
+        ScanValue::Set(_) => None,
     }
 }
 
@@ -2111,6 +2116,12 @@ pub(crate) fn rdf_term_eq_object_constant_cached(
                 // A TemplateKey is only ever a reversed subject-key filter, never
                 // an object constant, so it never matches an object term.
                 ScanValue::TemplateKey(_) => false,
+                // A Set is only ever a FILTER-IN / VALUES scan filter, never an
+                // object constant, so it never matches an object term.
+                ScanValue::Set(_) => false,
+                // A Timestamp is only ever a FILTER pushdown value (dateTime object
+                // constants are not lowered), never an object constant here.
+                ScanValue::Timestamp { .. } => false,
             }
         }
     }
@@ -2634,13 +2645,15 @@ impl Operator for R2rmlScanOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize) {
-        // Record the DESC top-k directive; it is resolved to a scan column against
-        // the mapping at scan time and honored only for the main table scan. Like
+    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+        // Record the top-k directive; it is resolved to a scan column against the
+        // mapping at scan time and honored only for the main table scan. Like
         // `row_budget`, do NOT forward to the child — an inner correlated scan must
         // still produce every row the join needs; only a topmost scan is eligible.
+        // An ASC directive is admitted only when the sort column is REQUIRED (the
+        // provider re-checks nullability at scan time).
         if topk_pushdown_enabled() {
-            self.topk = Some((sort_var, k));
+            self.topk = Some((sort_var, k, ascending));
         }
     }
 
@@ -4434,7 +4447,7 @@ mod tests {
                     let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
                     op.mapping = Some(Arc::clone(mapping));
                     if topk {
-                        op.topk = Some((VarId(1), 10));
+                        op.topk = Some((VarId(1), 10, false));
                     }
                     for _ in 0..3 {
                         futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))

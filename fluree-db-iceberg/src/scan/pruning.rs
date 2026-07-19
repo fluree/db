@@ -507,11 +507,13 @@ fn evaluate_comparison(
                 .get(i)
                 .and_then(|v| *v)
                 .is_some_and(|v| compare_op(v, *lit, op)),
-            (Column::Timestamp(vals) | Column::TimestampTz(vals), LiteralValue::Timestamp(lit)) => {
-                vals.get(i)
-                    .and_then(|v| *v)
-                    .is_some_and(|v| compare_op(v, *lit, op))
-            }
+            (
+                Column::Timestamp(vals) | Column::TimestampTz(vals),
+                LiteralValue::Timestamp(lit) | LiteralValue::TimestampTz(lit),
+            ) => vals
+                .get(i)
+                .and_then(|v| *v)
+                .is_some_and(|v| compare_op(v, *lit, op)),
             _ => false, // Type mismatch
         };
 
@@ -798,6 +800,38 @@ mod tests {
         // A field the query does not map is conservative — keep the row group.
         let unmapped = HashMap::from([(2i32, 0usize)]);
         assert!(row_group_can_contain(&ge, meta.row_group(0), &unmapped));
+    }
+
+    #[test]
+    fn row_group_pruning_in_set_keeps_iff_any_member_in_bounds() {
+        // Item 7 (F-AUD-5): `Expression::In` keeps a row group iff ANY member could
+        // lie within its column bounds — the same superset guarantee the file-level
+        // prune gives. rg0 = [0..4], rg1 = [100..104].
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(two_row_group_parquet()).unwrap();
+        let meta = reader.metadata();
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let in_set = |vs: &[i64]| Expression::In {
+            field_id: 1,
+            column: "v".to_string(),
+            values: vs.iter().map(|v| LiteralValue::Int64(*v)).collect(),
+        };
+
+        // {2, 200}: 2 ∈ rg0 → keep rg0; neither ∈ [100,104] → prune rg1.
+        let a = in_set(&[2, 200]);
+        assert!(row_group_can_contain(&a, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(&a, meta.row_group(1), &field_to_col));
+
+        // {2, 102}: a member lands in each row group → keep both.
+        let b = in_set(&[2, 102]);
+        assert!(row_group_can_contain(&b, meta.row_group(0), &field_to_col));
+        assert!(row_group_can_contain(&b, meta.row_group(1), &field_to_col));
+
+        // {500, 600}: no member in either range → prune both.
+        let c = in_set(&[500, 600]);
+        assert!(!row_group_can_contain(&c, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(&c, meta.row_group(1), &field_to_col));
     }
 
     /// Two row groups with disjoint UTF-8 string ranges, for `ByteArray`-stats
