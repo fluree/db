@@ -236,9 +236,32 @@ pub fn write_expected(
     Ok(summary)
 }
 
+/// Whether a record's wall must **not** be blessed as a perf baseline because it
+/// is a did-not-finish. A DNF's wall is the deadline cap the harness records at
+/// timeout (`exec.rs`: `wall = timeout`, e.g. 180000ms), not a real measurement;
+/// blessing it pins a *timeout* as the query's "budget" — the F-AUD-18 / C2 §1
+/// pathology, where 28 members sat at 180000ms and a now-fast query could regress
+/// ~1740× (to 216s under the 20%-over gate) before anything tripped. A DNF must
+/// instead bless as *no baseline* (a must-fix). Returns true for a terminal
+/// [`Status::Dnf`] and, defensively, for any record whose wall reached the query's
+/// deadline — a mis-statused or imported record (belt and suspenders); a
+/// `timeout_ms == 0` (unknown deadline) is checked by status only.
+fn is_dnf_wall(status: Status, wall_ms: u64, timeout_ms: u64) -> bool {
+    status == Status::Dnf || (timeout_ms > 0 && wall_ms >= timeout_ms)
+}
+
 /// Bless per-target perf references. Merges into any existing `perf/<target>.json`
-/// so a hot run and a later cold run can both populate a query's entry.
-pub fn write_perf(meta: &RunMeta, records: &[RunRecord], baselines: &Path) -> Result<Vec<String>> {
+/// so a hot run and a later cold run can both populate a query's entry. A
+/// did-not-finish record is **never** blessed as a wall (see [`is_dnf_wall`]): the
+/// matching wall field is cleared to `None` (no baseline / must-fix) so a timeout
+/// cap can never masquerade as a budget, while its counters are still recorded as
+/// DNF telemetry. The corpus supplies each query's deadline for that check.
+pub fn write_perf(
+    meta: &RunMeta,
+    records: &[RunRecord],
+    corpus: &Corpus,
+    baselines: &Path,
+) -> Result<Vec<String>> {
     let dir = perf_dir(baselines);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -262,11 +285,19 @@ pub fn write_perf(meta: &RunMeta, records: &[RunRecord], baselines: &Path) -> Re
         baseline.blessed_from.run_id = meta.run_id.clone();
         baseline.blessed_from.commit = meta.git_commit.clone();
         for r in recs {
+            let timeout_ms = corpus
+                .get(&r.query_id)
+                .map(|q| q.timeout_s.saturating_mul(1000))
+                .unwrap_or(0);
+            let dnf = is_dnf_wall(r.status, r.wall_ms, timeout_ms);
             let entry = baseline.entries.entry(r.query_id.clone()).or_default();
+            // A DNF blesses as no-baseline (`None`), never as the timeout cap; the
+            // `None` also clears any stale fast wall a prior bless left, so a query
+            // that regressed to a DNF cannot keep an unearned budget.
             if r.cache_state == "cold" {
-                entry.cold_wall_ms = Some(r.wall_ms);
+                entry.cold_wall_ms = if dnf { None } else { Some(r.wall_ms) };
             } else {
-                entry.hot_wall_ms_median = Some(r.wall_ms);
+                entry.hot_wall_ms_median = if dnf { None } else { Some(r.wall_ms) };
             }
             // Prefer the hot record's counters; fall back to whatever we have.
             if r.cache_state != "cold" || entry.counters == Counters::default() {
@@ -757,5 +788,76 @@ mod tests {
             over_budget(100, 180, pct20()),
             "a real 80% regression stays red"
         );
+    }
+
+    // --- never-bless-a-timeout guard (F-AUD-18) --------------------------
+
+    #[test]
+    fn is_dnf_wall_flags_timeouts_and_deadline_walls() {
+        // A terminal DNF is a DNF regardless of wall/timeout.
+        assert!(is_dnf_wall(Status::Dnf, 180_000, 180_000));
+        assert!(is_dnf_wall(Status::Dnf, 5, 0));
+        // Belt-and-suspenders: an Ok wall at/over the deadline (a mis-statused or
+        // imported record — the exact 28@180000 pathology) is a DNF-equivalent.
+        assert!(is_dnf_wall(Status::Ok, 180_000, 180_000));
+        assert!(is_dnf_wall(Status::Ok, 181_000, 180_000));
+        // A normal Ok wall under the deadline is a real, blessable measurement.
+        assert!(!is_dnf_wall(Status::Ok, 432, 180_000));
+        // An unknown deadline (0) falls back to the status only.
+        assert!(!is_dnf_wall(Status::Ok, 999_999, 0));
+        assert!(is_dnf_wall(Status::Dnf, 999_999, 0));
+    }
+
+    /// The bless path must never pin a timeout as a perf budget: a DNF blesses as
+    /// *no baseline* (a must-fix), and a query that regressed to a DNF loses any
+    /// stale fast wall a prior bless left.
+    #[test]
+    fn write_perf_blesses_dnf_as_no_baseline_not_the_timeout_cap() {
+        let baselines = bless_dir("dnf-noperf");
+        // bless_corpus pins timeout_s = 120 for every query, so a DNF wall is 120000.
+        let corpus = bless_corpus(&[("q008", HashGate::Full), ("q016", HashGate::RowsOnly)]);
+
+        // q008 finishes at 550ms; q016 DNFs at its 120s deadline.
+        let mut r_ok = rec("q008", "native-sf01", "hot", "H8", 550);
+        r_ok.rows = 9;
+        let mut r_dnf = rec("q016", "native-sf01", "hot", "", 120_000);
+        r_dnf.status = Status::Dnf;
+        r_dnf.rows = 0;
+        let written = write_perf(&bless_meta("R1"), &[r_ok, r_dnf], &corpus, &baselines).unwrap();
+        assert_eq!(written.len(), 1, "one target → one perf file");
+
+        let pb = load_perf(&baselines, "native-sf01").unwrap().unwrap();
+        assert_eq!(
+            pb.entries["q008"].hot_wall_ms_median,
+            Some(550),
+            "a finishing query blesses its real wall"
+        );
+        assert_eq!(
+            pb.entries["q016"].hot_wall_ms_median, None,
+            "a DNF blesses as no-baseline, NOT the 120000ms timeout cap"
+        );
+        assert!(
+            pb.entries.contains_key("q016"),
+            "the must-fix entry still exists (DNF counters recorded), it just carries no wall"
+        );
+
+        // A re-bless where q008 regresses to a DNF must CLEAR its stale 550ms wall,
+        // and q016 now finishing must gain a real baseline.
+        let mut r_ok2 = rec("q016", "native-sf01", "hot", "H16", 400);
+        r_ok2.rows = 5;
+        let mut r_dnf2 = rec("q008", "native-sf01", "hot", "", 120_000);
+        r_dnf2.status = Status::Dnf;
+        write_perf(&bless_meta("R2"), &[r_ok2, r_dnf2], &corpus, &baselines).unwrap();
+        let pb2 = load_perf(&baselines, "native-sf01").unwrap().unwrap();
+        assert_eq!(
+            pb2.entries["q008"].hot_wall_ms_median, None,
+            "a query that regressed to a DNF loses its stale fast wall"
+        );
+        assert_eq!(
+            pb2.entries["q016"].hot_wall_ms_median,
+            Some(400),
+            "and a now-finishing query gains a real baseline"
+        );
+        let _ = std::fs::remove_dir_all(&baselines);
     }
 }
