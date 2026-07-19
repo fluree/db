@@ -1710,6 +1710,62 @@
       "timeout_s": 120,
       "subsets": [],
       "exec_path": "from"
+    },
+    {
+      "id": "q075",
+      "file": "queries/q075_minmax_order_total_dataset.rq",
+      "bi_question": "Coverage (item 9 / F-AUD-8): ungrouped MIN/MAX over a numeric fact column (orderTotal) — folded from the scanned column with byte-parity to agg_min/agg_max, previously a full FACT_ORDER materialize.",
+      "tags": [
+        "aggregate",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q076",
+      "file": "queries/q076_minmax_order_total_by_channel_dataset.rq",
+      "bi_question": "Coverage (item 9 / F-AUD-8): GROUPED MIN/MAX over a numeric fact column keyed by a fact-inline column (orderChannel) — one MinMax accumulator per group in the fused single-table fold.",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 4,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q077",
+      "file": "queries/q077_count_current_enterprise_customers_dataset.rq",
+      "bi_question": "Coverage (item 9b / the q038 class, multi-constraint): COUNT with TWO folded constant-object constraints (isCurrent true AND segment=Enterprise) — the fused fold applies both (oracle 50038 = q022's Enterprise row); dropping either over-counts.",
+      "tags": [
+        "count",
+        "aggregate",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 300,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }

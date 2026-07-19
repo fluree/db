@@ -338,7 +338,7 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            74,
+            77,
             "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
              4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
              q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
@@ -348,7 +348,9 @@ mod tests {
              1 W4-1b folded-crawl sentinel (q068 orderline detail crawl) + \
              6 PR-COVERAGE scan-side members promoted from the A3 probe battery \
              (q069 FILTER-IN/F-AUD-5, q070 scalar-VALUES/F-AUD-5, q071 ASC-top-k/F-AUD-6, \
-             q072 timestamp-prune/F-AUD-11, q073 OPTIONAL-budget/F-AUD-7, q074 its control)"
+             q072 timestamp-prune/F-AUD-11, q073 OPTIONAL-budget/F-AUD-7, q074 its control) + \
+             3 PR-COVERAGE fold-side members (q075 ungrouped MIN/MAX + q076 grouped MIN/MAX \
+             for item 9/F-AUD-8, q077 multi-constraint COUNT for item 9b/the q038 class)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));

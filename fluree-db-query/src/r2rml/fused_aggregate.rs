@@ -79,6 +79,29 @@ fn numeric_kind(datatype: Option<&str>) -> Option<NumKind> {
     }
 }
 
+/// Whether a declared object-map datatype is admissible for a fused MIN/MAX fold:
+/// a numeric (`xsd:integer`/`long`/`int`/`decimal`/`double`/`float`) or temporal
+/// (`xsd:date`/`dateTime`) type. Everything else — string, boolean, IRI-/langtag-
+/// typed, or an **un-annotated** column (which the R2RML natural mapping treats as
+/// `xsd:string`, so its MIN/MAX would be lexical) — declines, keeping the generic
+/// pipeline's collation/term-type semantics. Fold parity itself comes from
+/// materializing the same term + `compare_bindings`; this gate only scopes the
+/// mechanism to the types the audit item covers (F-AUD-8).
+fn minmax_admissible_datatype(datatype: Option<&str>) -> bool {
+    use fluree_vocab::xsd;
+    matches!(
+        datatype,
+        Some(dt) if dt == xsd::INTEGER
+            || dt == xsd::LONG
+            || dt == xsd::INT
+            || dt == xsd::DECIMAL
+            || dt == xsd::DOUBLE
+            || dt == xsd::FLOAT
+            || dt == xsd::DATE
+            || dt == xsd::DATE_TIME
+    )
+}
+
 /// How to read a numeric column value as an exact decimal during native
 /// expression evaluation.
 #[derive(Clone, Copy)]
@@ -379,14 +402,19 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // Every aggregate must be a column fold this operator supports.
     let mut aggregates = Vec::with_capacity(aggregation.aggregates.len());
     for spec in aggregation.aggregates.iter() {
-        // Only multiset (non-DISTINCT) COUNT/SUM/AVG fold from columns; the fused
-        // path has no dedup, so DISTINCT (Set) must fall back to the normal
-        // pipeline. `CountDistinct` is already a separate, unmatched variant.
+        // Only multiset (non-DISTINCT) COUNT/SUM/AVG and MIN/MAX fold from columns;
+        // the fused path has no dedup, so DISTINCT (Set) must fall back to the
+        // normal pipeline. `CountDistinct` is already a separate, unmatched variant.
+        // MIN/MAX carry no DISTINCT flag (dedup is a no-op for them). Whether a
+        // MIN/MAX aggregate variable actually resolves to a foldable numeric/temporal
+        // column is decided at `open` (`resolve_agg_folds`), which declines string /
+        // language- / IRI-typed / un-annotated columns.
         let foldable = match &spec.function {
             AggregateFn::CountAll | AggregateFn::Count(_) => true,
             AggregateFn::Sum(_, sem) | AggregateFn::Avg(_, sem) => {
                 matches!(sem, InputSemantics::List)
             }
+            AggregateFn::Min(_) | AggregateFn::Max(_) => true,
             _ => false,
         };
         if !foldable {
@@ -437,6 +465,14 @@ enum Fold {
     /// `SUM(expr)` / `AVG(expr)` over a native decimal arithmetic expression;
     /// `index` points into `Resolved::expr_folds`.
     NumericExpr { index: usize, is_avg: bool },
+    /// `MIN(?col)` / `MAX(?col)` over a numeric or date/timestamp scalar column;
+    /// `index` points into `Resolved::minmax_folds`. Unlike the COUNT/SUM/AVG
+    /// folds this one materializes the candidate object term (via the same
+    /// `materialize_object_from_batch` + `LiteralEncoder` path the FILTER fold
+    /// uses) and keeps the running extreme by `compare_bindings` — byte-parity
+    /// with the generic `agg_min`/`agg_max`, but streaming (O(1) memory) instead
+    /// of buffering every value and skipping the subject/BindingRow build.
+    MinMax { index: usize },
 }
 
 /// Running accumulator for one [`Fold`], mutated per batch in `next_batch`.
@@ -465,12 +501,22 @@ enum Acc {
         count: u64,
         is_avg: bool,
     },
+    /// Running MIN/MAX extreme, held as the materialized winning `Binding`
+    /// (`Unbound` until the first non-null row). The extreme is updated by
+    /// `compare_bindings` in the fold loop (the `Fold::MinMax` arm), so this is the
+    /// exact `Binding` the generic `agg_min`/`agg_max` would return.
+    MinMax {
+        best: Binding,
+    },
 }
 
 impl Acc {
     fn for_fold(fold: &Fold) -> Self {
         match fold {
             Fold::CountRows | Fold::CountColumn(_) => Acc::Count(0),
+            Fold::MinMax { .. } => Acc::MinMax {
+                best: Binding::Unbound,
+            },
             Fold::NumericExpr { is_avg, .. } => Acc::Expr {
                 sum: 0,
                 scale: 0,
@@ -533,6 +579,9 @@ impl Acc {
     /// Materialize the final result binding for this accumulator.
     fn finalize(self) -> Binding {
         match self {
+            // The extreme is already the materialized winning term (or `Unbound`
+            // for an empty group), byte-identical to `agg_min`/`agg_max`.
+            Acc::MinMax { best } => best,
             Acc::Count(n) => Binding::lit(FlakeValue::Long(n as i64), Sid::xsd_integer()),
             Acc::Exact {
                 sum,
@@ -803,6 +852,14 @@ struct Resolved {
     /// for a join with no fact-side flag. Dim-side constraints are applied earlier,
     /// during the FK→GKey map build, so they are not carried here.
     fact_constraints: Vec<ResolvedConstraint>,
+    /// MIN/MAX fold plans, indexed by `Fold::MinMax.index`. Empty unless the query
+    /// carries a MIN/MAX aggregate. The aggregates always fold from the FACT scan
+    /// (single-table or join), so these read the fact batch.
+    minmax_folds: Vec<MinMaxFold>,
+    /// Shared literal encoder for materializing MIN/MAX candidate terms into
+    /// `Binding`s (datatype Sids pre-resolved from the fact TriplesMap). `None`
+    /// when there are no MIN/MAX folds.
+    minmax_encoder: Option<LiteralEncoder>,
 }
 
 /// PR-6 fact⋈dim group-key resolver, built once at `open` by scanning the small
@@ -824,6 +881,19 @@ struct GroupKeyResolver {
 struct ExprFold {
     expr: Expression,
     var_cols: Vec<(VarId, String, DecKind)>,
+}
+
+/// A `MIN(?col)` / `MAX(?col)` fold plan. The object map materializes the
+/// candidate term per non-null row via the same `materialize_object_from_batch`
+/// path the FILTER fold uses (so the term — value + datatype/lang/term-type — is
+/// byte-identical to the generic scan's), and the running extreme is kept by
+/// `compare_bindings`. The scan column is projected at resolve time; the fold
+/// materializes through `object_map`, which carries the column reference
+/// internally. Admitted only for numeric/temporal plain-literal columns
+/// (`minmax_admissible_datatype` + a `TermType::Literal`, no-lang gate).
+struct MinMaxFold {
+    object_map: ObjectMap,
+    is_max: bool,
 }
 
 /// Per-row FILTER evaluation plan. The filter expression is evaluated through the
@@ -1185,7 +1255,9 @@ impl Operator for FusedR2rmlAggregateOperator {
             let fold_cols: Vec<Option<&Column>> = folds
                 .iter()
                 .map(|f| match f {
-                    Fold::CountRows | Fold::NumericExpr { .. } => None,
+                    // MinMax materializes via its object map (handled inline below),
+                    // not a bare column read.
+                    Fold::CountRows | Fold::NumericExpr { .. } | Fold::MinMax { .. } => None,
                     Fold::CountColumn(c) | Fold::Numeric { column: c, .. } => {
                         batch.column_by_name(c)
                     }
@@ -1321,6 +1393,38 @@ impl Operator for FusedR2rmlAggregateOperator {
                                 _ => true,
                             }
                         }
+                        Fold::MinMax { index } => {
+                            let mmf = &resolved.minmax_folds[*index];
+                            // Materialize just the candidate object term (no subject,
+                            // no BindingRow) exactly as the generic scan would, then
+                            // keep the running extreme by `compare_bindings` — so the
+                            // final `Binding` is byte-identical to `agg_min`/`agg_max`.
+                            // A null/absent value materializes `None` and contributes
+                            // nothing, matching those aggregates dropping `Unbound`.
+                            if let (Some(encoder), Ok(Some(term))) = (
+                                resolved.minmax_encoder.as_ref(),
+                                materialize_object_from_batch(&mmf.object_map, &batch, row),
+                            ) {
+                                let cand = encoder.encode(&term);
+                                if let Acc::MinMax { best } = &mut accs[i] {
+                                    let replace = match &*best {
+                                        Binding::Unbound => true,
+                                        cur => {
+                                            let ord = crate::sort::compare_bindings(&cand, cur);
+                                            if mmf.is_max {
+                                                ord == std::cmp::Ordering::Greater
+                                            } else {
+                                                ord == std::cmp::Ordering::Less
+                                            }
+                                        }
+                                    };
+                                    if replace {
+                                        *best = cand;
+                                    }
+                                }
+                            }
+                            true
+                        }
                         _ => accs[i].update_row(fold, fold_cols[i], row),
                     };
                     if !ok {
@@ -1374,22 +1478,6 @@ impl Operator for FusedR2rmlAggregateOperator {
         self.resolved = None;
         self.state = OperatorState::Closed;
     }
-}
-
-/// C5 slice-1 MANDATORY soundness guard: whether ANY participating R2RML pattern
-/// (the aggregated fact AND every joined dim) carries a `star_constraints` entry —
-/// a constant-object member the rewrite folded into the pattern (e.g.
-/// `?c ex:isCurrent true` → `star_constraints=[(IS_CURRENT, true)]`, `rewrite.rs:344`).
-/// The fused fold reads only the GROUP-BY/aggregate/validity columns + the SPARQL
-/// FILTER; it has NO star_constraints handling (`grep star_constraints
-/// fused_aggregate.rs` = 0), while the normal scan DOES apply them
-/// (`operator.rs:524/1719/…`). So a fused plan over a constrained pattern would
-/// silently IGNORE the constraint and OVER-COUNT. Declining here keeps the fold
-/// sound; slice 1.5 teaches the fold to apply the constraint and lifts this for
-/// that shape. This is also a *current* correctness fix: any COUNT-over-a-flagged-
-/// star that reaches the fused path today over-counts.
-fn fold_over_star_constraints(pats: &[&R2rmlPattern]) -> bool {
-    pats.iter().any(|p| !p.star_constraints.is_empty())
 }
 
 /// E2: a folded constant-object constraint (`star_constraints`) resolved to a
@@ -1535,12 +1623,19 @@ impl FusedR2rmlAggregateOperator {
             _ => return Ok(None), // join sub-switch off, or non-R2rml pattern
         };
 
-        // C5 slice-1 MANDATORY guard: a folded constant-object constraint
-        // (star_constraints, e.g. `?c ex:isCurrent true`) on the single-table
-        // pattern is NOT applied by the fold and would OVER-COUNT. Decline.
-        if fold_over_star_constraints(&[&pattern]) {
-            return Ok(None);
-        }
+        // C5 slice-1.5 (item 9b, the q038 filtered-COUNT class): a folded
+        // constant-object constraint (`star_constraints`, e.g. `?s edw:isCurrent
+        // true`) on the single-table pattern is NO LONGER a blanket decline — the
+        // fold now APPLIES it (resolved below, once the TriplesMap is known). Slice-1
+        // declined here because the fold ignored the constraint and would OVER-COUNT;
+        // that hazard is retired by resolving the constraint to a per-row scalar-column
+        // check via the SAME `resolve_star_constraint_checks` / `row_satisfies_constraints`
+        // machinery the join path (E2) already uses, so a constrained COUNT excludes
+        // the non-matching rows exactly as the materialized answer does. A constraint
+        // that does not resolve to a scalar column still declines (below), and the
+        // COUNT(*) manifest shortcut stays declined for a constraint-bearing plan (it
+        // checks `fact_constraints.is_empty()`), because `record_count` cannot see
+        // per-row constraint matches.
 
         // The graph is genuinely R2RML-backed here; without the mapping fall back
         // to the normal path (which surfaces any real load error).
@@ -1555,7 +1650,19 @@ impl FusedR2rmlAggregateOperator {
             return Ok(None);
         };
 
+        // Resolve the fact-side folded constant-object constraints to per-row
+        // scalar-column checks. Declines (`None`) if any constraint's predicate is a
+        // RefObjectMap object or is absent — those keep the materialize path (no
+        // silent over-count). Empty for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
+        let Some(fact_constraints) = Self::resolve_star_constraint_checks(&pattern, tm) else {
+            return Ok(None);
+        };
+
         let mut projection: Vec<String> = Vec::new();
+        // Scan the constraint columns so the fold can enforce them per row.
+        for c in &fact_constraints {
+            projection.push(c.column().to_string());
+        }
 
         // Resolve GROUP BY key columns (string / integer in slice 3). The output
         // key binding's datatype Sid is encoded from the snapshot so it matches
@@ -1616,10 +1723,17 @@ impl FusedR2rmlAggregateOperator {
         }
 
         // Resolve the aggregate output folds against the (single) scanned TM.
-        let (folds, expr_folds) = match self.resolve_agg_folds(&pattern, tm, &mut projection) {
-            Some(x) => x,
-            None => return Ok(None),
-        };
+        let mut minmax_folds: Vec<MinMaxFold> = Vec::new();
+        let (folds, expr_folds) =
+            match self.resolve_agg_folds(&pattern, tm, &mut projection, &mut minmax_folds) {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+        // MIN/MAX materializes candidate terms via this encoder (built once, from
+        // the scanned TriplesMap's datatype annotations — the same datatype Sids the
+        // generic scan uses).
+        let minmax_encoder =
+            (!minmax_folds.is_empty()).then(|| LiteralEncoder::build(tm, ctx.active_snapshot));
 
         // Row-validity columns. A row participates only if the subject template
         // columns and every predicate's object column are non-null — mirroring
@@ -1702,7 +1816,9 @@ impl FusedR2rmlAggregateOperator {
             group_resolver: None,
             // Single-table fold: every key reads inline from the fact batch.
             group_key_plan: (0..self.group_by.len()).map(|_| KeySource::Fact).collect(),
-            fact_constraints: Vec::new(),
+            fact_constraints,
+            minmax_folds,
+            minmax_encoder,
         }))
     }
 
@@ -1717,6 +1833,7 @@ impl FusedR2rmlAggregateOperator {
         pattern: &R2rmlPattern,
         tm: &TriplesMap,
         projection: &mut Vec<String>,
+        minmax_folds: &mut Vec<MinMaxFold>,
     ) -> Option<(Vec<Fold>, Vec<ExprFold>)> {
         let bind_lookup: std::collections::HashMap<VarId, &Expression> =
             self.agg_binds.iter().map(|(v, e)| (*v, e)).collect();
@@ -1781,6 +1898,40 @@ impl FusedR2rmlAggregateOperator {
                             is_avg,
                         });
                     }
+                }
+                AggregateFn::Min(v) | AggregateFn::Max(v) => {
+                    // MIN/MAX over a bare scalar column only. A desugared expression
+                    // MIN/MAX (an agg_bind) is not folded — decline to the generic
+                    // path (the exact term of an arithmetic result is out of scope).
+                    if bind_lookup.contains_key(v) {
+                        return None;
+                    }
+                    let is_max = matches!(func, AggregateFn::Max(_));
+                    let (col, datatype) = Self::scalar_column_for_var(pattern, tm, *v)?;
+                    // Scope gate: numeric / date / timestamp only. String (collation),
+                    // boolean, and un-annotated (→ xsd:string) columns decline.
+                    if !minmax_admissible_datatype(datatype.as_deref()) {
+                        return None;
+                    }
+                    // Plain-literal term only: a language-tagged or IRI-/blank-typed
+                    // object map materializes a term whose lang/term-type the fold's
+                    // compare would order differently than the generic path intends —
+                    // decline (decline-only, never wrong).
+                    let object_map = Self::object_map_for_var(pattern, tm, *v)?;
+                    if !matches!(
+                        &object_map,
+                        ObjectMap::Column {
+                            language: None,
+                            term_type: TermType::Literal,
+                            ..
+                        }
+                    ) {
+                        return None;
+                    }
+                    projection.push(col);
+                    let index = minmax_folds.len();
+                    minmax_folds.push(MinMaxFold { object_map, is_max });
+                    folds.push(Fold::MinMax { index });
                 }
                 _ => return None,
             }
@@ -2095,10 +2246,16 @@ impl FusedR2rmlAggregateOperator {
 
         // Aggregates fold from the FACT scan.
         let mut projection: Vec<String> = Vec::new();
-        let Some((folds, expr_folds)) = self.resolve_agg_folds(fact_p, fact_tm, &mut projection)
+        let mut minmax_folds: Vec<MinMaxFold> = Vec::new();
+        let Some((folds, expr_folds)) =
+            self.resolve_agg_folds(fact_p, fact_tm, &mut projection, &mut minmax_folds)
         else {
             return Ok(None);
         };
+        // MIN/MAX candidate terms materialize from the FACT scan, so the encoder is
+        // built from the fact TriplesMap (same datatype Sids the generic path uses).
+        let minmax_encoder =
+            (!minmax_folds.is_empty()).then(|| LiteralEncoder::build(fact_tm, ctx.active_snapshot));
 
         // Fact-side row-validity: the subject template columns, the first hop's FK
         // child columns (a null FK ⇒ no ref triple ⇒ row drops), and every scalar
@@ -2319,6 +2476,8 @@ impl FusedR2rmlAggregateOperator {
             group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
             group_key_plan,
             fact_constraints: fact_checks,
+            minmax_folds,
+            minmax_encoder,
         }))
     }
 }
@@ -2328,35 +2487,51 @@ mod tests {
     use super::*;
     use crate::ir::grouping::AggregateSpec;
 
-    /// C5 slice-1 over-count TRIPWIRE: a participating R2RML pattern carrying a
+    /// C5 slice-1.5 (item 9b, the q038 class): a single-table COUNT carrying a
     /// folded constant-object constraint (`star_constraints`, e.g.
-    /// `?c ex:isCurrent true`) must DECLINE the fuse — the fused fold has no
-    /// star_constraints handling and would over-count. Red under a hypothetical
-    /// unguarded fuse, green with `fold_over_star_constraints`; also the guard
-    /// against slice 1.5 silently lifting it.
+    /// `?s edw:isCurrent true`) is NO LONGER a blanket decline — the fold resolves
+    /// the constraint to a scalar-column check and APPLIES it per row (the same
+    /// `resolve_star_constraint_checks` / `row_satisfies_constraints` machinery the
+    /// join path uses), so the constrained count excludes the non-matching rows
+    /// exactly as the materialized answer does. The over-count hazard the slice-1
+    /// decline guarded is now closed by APPLICATION (this test) + the fused-vs-native
+    /// corpus parity (q022/q038/q061 + a multi-constraint member) rather than by
+    /// declining. A constraint the fold cannot enforce (a RefObjectMap object) still
+    /// declines — see `e2_resolve_star_constraint_checks_scalar_vs_ref`.
     #[test]
-    fn fold_over_star_constraints_declines_a_constrained_pattern() {
+    fn slice_1_5_admits_and_applies_a_single_table_flag_constraint() {
         use crate::r2rml::{ObjectConstant, ScanValue};
-        let plain = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)))
-            .with_predicate("http://ex/gender");
-        assert!(
-            !fold_over_star_constraints(&[&plain]),
-            "no constraint → foldable"
-        );
-
-        let mut constrained = plain.clone();
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        let flag = "http://ex/isCurrent";
+        let tm =
+            TriplesMap::new("#Cust", "DIM_CUSTOMER").with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(flag),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            });
+        // The q038 shape: a scalar-column `isCurrent true` flag folded onto the star.
+        let mut constrained = R2rmlPattern::new("gs:main", VarId(1), None);
         constrained.star_constraints = vec![(
-            "IS_CURRENT".to_string(),
+            flag.to_string(),
             ObjectConstant::Scalar(ScanValue::Bool(true)),
         )];
-        assert!(
-            fold_over_star_constraints(&[&constrained]),
-            "a folded `isCurrent true` constraint must decline the fuse (else over-count)"
+        // Slice-1.5: it now RESOLVES (admits) with exactly one per-row check applied
+        // in the fold — no longer a decline, no longer a silent over-count.
+        let checks = FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&constrained, &tm);
+        assert_eq!(
+            checks.map(|v| v.len()),
+            Some(1),
+            "the q038 `isCurrent true` flag resolves to one applied scalar check"
         );
-        // Fires if ANY participating map is constrained (the aggregated fact OR a
-        // joined dim) — the broadened guard.
-        assert!(fold_over_star_constraints(&[&plain, &constrained]));
-        assert!(!fold_over_star_constraints(&[&plain, &plain]));
+        // A non-empty `fact_constraints` set keeps the COUNT(*) manifest shortcut
+        // declined in `next_batch` (it requires `fact_constraints.is_empty()`), so a
+        // constrained count is never answered from the delete-blind `record_count`.
+        let plain = R2rmlPattern::new("gs:main", VarId(1), None);
+        assert_eq!(
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&plain, &tm)
+                .map(|v| v.len()),
+            Some(0),
+            "an unconstrained star resolves to zero checks (shortcut stays eligible)"
+        );
     }
 
     /// C5 O2 mixed-dataset guard (the `dataset_is_single_source` core): the fused
@@ -2536,6 +2711,108 @@ mod tests {
         assert!(!ok(2), "isCurrent=null row is dropped (existence filter)");
         // No constraints → every row satisfied (a no-op).
         assert!(FusedR2rmlAggregateOperator::row_satisfies_constraints(&[], &batch, 1).unwrap());
+    }
+
+    /// Item 9b MULTI-constraint boundary (the D-c5 lesson): with TWO folded
+    /// constant-object constraints a row is kept iff it satisfies BOTH (AND
+    /// semantics), so a constrained COUNT excludes any row failing EITHER — no
+    /// over-count. This is the shape of corpus member q077 (isCurrent true AND
+    /// segment=Enterprise); the fused single-table path routes through this same
+    /// `row_satisfies_constraints`, so the member's native oracle and this test pin
+    /// the same guarantee at two levels.
+    #[test]
+    fn multi_constraint_requires_all_to_match() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        let flag = ObjectConstant::Scalar(ScanValue::Bool(true));
+        let seg = ObjectConstant::Scalar(ScanValue::Str("Enterprise".to_string()));
+        let checks = [
+            ResolvedConstraint {
+                canon: decimal_canonical_of(&flag),
+                pom: PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                    object_map: ObjectMap::column("IS_CURRENT"),
+                },
+                constant: flag,
+            },
+            ResolvedConstraint {
+                canon: decimal_canonical_of(&seg),
+                pom: PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/segment"),
+                    object_map: ObjectMap::column("SEGMENT"),
+                },
+                constant: seg,
+            },
+        ];
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "IS_CURRENT".to_string(),
+                field_type: FieldType::Boolean,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "SEGMENT".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ]));
+        // rows: (both match), (flag matches, segment wrong), (flag wrong, segment
+        // matches), (segment null).
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Boolean(vec![Some(true), Some(true), Some(false), Some(true)]),
+                Column::String(vec![
+                    Some("Enterprise".to_string()),
+                    Some("Consumer".to_string()),
+                    Some("Enterprise".to_string()),
+                    None,
+                ]),
+            ],
+        )
+        .unwrap();
+        let ok = |row| {
+            FusedR2rmlAggregateOperator::row_satisfies_constraints(&checks, &batch, row).unwrap()
+        };
+        assert!(ok(0), "both constraints satisfied → kept");
+        assert!(!ok(1), "segment mismatch → dropped (no over-count)");
+        assert!(!ok(2), "flag mismatch → dropped (no over-count)");
+        assert!(!ok(3), "null segment → dropped (existence filter)");
+    }
+
+    /// Item 9 MIN/MAX admission scope: only numeric and date/timestamp datatypes
+    /// fold; string (collation), boolean, custom, and un-annotated (→ xsd:string)
+    /// columns decline to the generic pipeline. Parity of the fold itself comes from
+    /// materializing the same term + `compare_bindings`; this gate only scopes the
+    /// mechanism to the audit item's covered types (F-AUD-8).
+    #[test]
+    fn minmax_admissible_datatype_scope() {
+        use fluree_vocab::xsd;
+        for dt in [
+            xsd::INTEGER,
+            xsd::LONG,
+            xsd::INT,
+            xsd::DECIMAL,
+            xsd::DOUBLE,
+            xsd::FLOAT,
+            xsd::DATE,
+            xsd::DATE_TIME,
+        ] {
+            assert!(minmax_admissible_datatype(Some(dt)), "{dt} should fold");
+        }
+        for dt in [xsd::STRING, xsd::BOOLEAN, "http://ex/custom"] {
+            assert!(
+                !minmax_admissible_datatype(Some(dt)),
+                "{dt} should decline (collation / non-orderable / out of scope)"
+            );
+        }
+        assert!(
+            !minmax_admissible_datatype(None),
+            "an un-annotated column (→ xsd:string) declines"
+        );
     }
 
     /// Q2 lang/IRI admission gate: a fused group key — the single-table key OR the
