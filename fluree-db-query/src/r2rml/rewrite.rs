@@ -898,7 +898,8 @@ fn fuse_class_if_safe(
             // single-pattern gate → decline → materialize the fact. Distinct from
             // strong fusion, which needs no disjointness because it already proved
             // every base-predicate map is a class map (nothing to drop).
-            if class_declares_predicate(m, &class, base_pred)
+            if shared_predicate_fusion_enabled()
+                && class_declares_predicate(m, &class, base_pred)
                 && wildcard_class_fusion_is_safe(m, &class)
             {
                 class_groups.remove(idx);
@@ -1110,6 +1111,19 @@ fn compute_ref_prune_targets(
 fn wildcard_class_fusion_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_CRAWL_CLASS_FUSION"))
+}
+
+/// Whether the **E1 shared-predicate class collapse** is enabled (default on).
+/// E1 (`fuse_class_if_safe`) collapses a separate class scan back into the star
+/// for a base predicate SHARED across disjoint-subject classes (the `ex:category`
+/// round-2 fix). It shipped unswitched on the audited line (F-AUD-19 / A2 D2); this
+/// is its dedicated kill switch. OFF does NOT re-materialize — control falls through
+/// to the weaker pre-E1 `class_prune_hint` (star + separate class scan, still safe),
+/// exactly the behavior before E1. Distinct from `FLUREE_R2RML_CRAWL_CLASS_FUSION`
+/// (the browse-crawl wildcard path) — do not conflate.
+fn shared_predicate_fusion_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_SHARED_PREDICATE_FUSION"))
 }
 
 /// A standalone variable-predicate wildcard scan (`?s ?p ?o`) on `subject`:
