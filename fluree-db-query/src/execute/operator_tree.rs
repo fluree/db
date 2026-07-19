@@ -3398,7 +3398,7 @@ pub(crate) fn apply_solution_modifiers(
                         // Gated by FLUREE_R2RML_TOPK_ASC: OFF is byte-identical to
                         // the pre-item-8 DESC-only behavior.
                         SortDirection::Ascending if crate::r2rml::topk_asc_enabled() => {
-                            operator.set_topk(primary.var, k, true)
+                            operator.set_topk(primary.var, k, true);
                         }
                         SortDirection::Ascending => {}
                     }
