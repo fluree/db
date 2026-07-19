@@ -156,16 +156,19 @@ F-AUD-18 (stale perf baseline), F-AUD-19 (kill-switch hygiene / SWITCHES.md), F-
 `vbench compare --run <merged> --gate` → **77 records, 0 hash mismatch(es), 0 perf
 violation(s), exit 0.** Correctness passes end-to-end at the final integrated head
 (#1521 mem-fix + #1522 coverage + this PR). The drift-set 300% overrides absorbed the
-loadTable-GET network variance (0 perf violations).
+loadTable-GET network variance (0 perf violations). Accepted residual: those 4×-baseline
+(300%-over) budgets on the 6 catalog-dominated drift members (q002/q004/q022/q024/q030/q043)
+mean a sub-4× engine regression there won't trip the perf arm (the hash/correctness arm is
+unaffected) — a documented anti-flap trade-off, re-narrowable if the catalog path stabilizes.
 
 ## Re-bless record (F-AUD-18)
 
 - **native-sf01**: 54 → **77** entries, ZERO timeout caps (was N/A — native has no DNFs);
   all 74 oracles reproduced exactly (no native regression).
-- **virtual-sf01**: was 54 entries blessed_from `7d77218e2` with **33 pinned at 180000ms**
-  (DNF caps blessed as budgets) + 14 missing; now **77 entries, ZERO at 180000**. Six are
-  honest no-baseline (`is_unblessable_wall`): q013/q034/q051 (expected-virtual-error) +
-  q056/q057/q059 (see finding). Every other member carries a real wall.
+- **virtual-sf01**: was 54 entries blessed_from `7d77218e2` with **28 pinned at 180000ms
+  (+2 at 120000ms, q044/q050)** (DNF caps blessed as budgets) + 14 missing; now **77 entries,
+  ZERO at 180000/120000**. Six are honest no-baseline (`is_unblessable_wall`): q013/q034/q051
+  (expected-virtual-error) + q056/q057/q059 (see finding). Every other member carries a real wall.
 
 ## Splice methodology (honest, documented)
 
