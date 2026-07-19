@@ -17,6 +17,30 @@
 //! returning the final assert as the row instead of keeping it as an
 //! entry; writers that consume an existing row enforce the "never neither"
 //! half by migrating its assert into the sidecar first.
+//!
+//! ## What the index promises about history
+//!
+//! Index-served history is **transition-grade**: it reports the state
+//! changes a fact went through, not every commit event. A re-assert of an
+//! already-present fact changes no state and leaves no trace here; the
+//! commit log is the authoritative event record, and event-grade audit
+//! ("show every user assertion") is served by replaying commits, not
+//! sidecars.
+//!
+//! ## Visible `t` is window-granular
+//!
+//! A row's `t` is the time the fact most recently became present, as
+//! observed at the granularity of indexing windows. A re-assert that
+//! crosses an indexing boundary replaces the row at the re-assert's `t`
+//! (matching what the live novelty overlay showed before indexing), while
+//! events within one window — and a full rebuild, which sees the entire
+//! log as one window — resolve to the earliest assert of the fact's final
+//! presence run. A reindex may therefore change the reported `t` of a
+//! re-asserted fact from the re-assert time to the birth time; presence at
+//! every `t` is unaffected. This is by design: there is no window-free
+//! answer, and the alternative alignments would either diverge from the
+//! live view on every indexing cycle or re-open the rebuild/novelty
+//! disagreement this module exists to close.
 
 use super::run_record_v2::RunRecordV2;
 

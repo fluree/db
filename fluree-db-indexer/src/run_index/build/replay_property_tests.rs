@@ -355,7 +355,10 @@ fn run_rebuild(case: &Case, case_id: usize) -> LeafView {
 /// Expected row `t` on the incremental path: the reference run-start, except
 /// that an assert winner which was a no-op against a continuously-present
 /// fact (a cross-boundary re-assert) replaces the row, so its own `t` is
-/// visible from that point on.
+/// visible from that point on. This window-granular visible-`t` semantics
+/// is specified in `fluree_db_binary_index::format::transitions` ("Visible
+/// `t` is window-granular"); this helper mirrors it for the exhaustive
+/// check.
 fn expected_incremental_t(case: &Case, target: u32, winner: Option<(u32, u8)>) -> Option<u32> {
     let (present, run_start) = reference(case, target);
     if !present {
