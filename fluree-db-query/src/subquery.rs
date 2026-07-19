@@ -268,6 +268,17 @@ impl SubqueryOperator {
 
 #[async_trait]
 impl Operator for SubqueryOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — a subquery computes its own result
+    /// set independently of the outer `LIMIT` (its cardinality, grouping, and
+    /// ordering are self-contained), so the outer budget cannot bound its input.
+    /// Explicit (was a silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "SUBQUERY row-budget swallowed (unsound to forward: independent inner cardinality)"
+        );
+    }
+
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();
         m.insert("join-mode".into(), self.join_mode.into());

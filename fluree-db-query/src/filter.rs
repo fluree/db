@@ -685,6 +685,16 @@ impl FilterOperator {
 
 #[async_trait]
 impl Operator for FilterOperator {
+    /// Item 11 (F-AUD-7): DECLINE forwarding — a FILTER may reject arbitrarily many
+    /// input rows, so producing `k` output can require unboundedly many input rows.
+    /// Explicit (was a silent trait-default no-op) so the swallow is observable.
+    fn set_row_budget(&mut self, budget: usize) {
+        tracing::debug!(
+            budget,
+            "FILTER row-budget swallowed (unsound to forward: a filter rejects rows)"
+        );
+    }
+
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
         vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
     }
