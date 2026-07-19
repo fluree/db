@@ -102,6 +102,26 @@ fn minmax_admissible_datatype(datatype: Option<&str>) -> bool {
     )
 }
 
+/// Whether a MIN/MAX fold should replace its running extreme with a candidate
+/// whose `compare_bindings(candidate, current)` is `ord`. This mirrors the
+/// generic `agg_min`/`agg_max` (`min_by`/`max_by`) tie-breaking EXACTLY:
+/// - MIN keeps the FIRST minimum (`min_by` returns the first of equal-minimums),
+///   so it replaces only on a strictly-less candidate;
+/// - MAX keeps the LAST maximum (`max_by` returns the last of equal-maximums),
+///   so it replaces on greater-OR-EQUAL — the later of two equal elements wins.
+/// The `Equal` case is load-bearing: two values that compare equal can still
+/// RENDER differently (double `+0.0` vs `-0.0` → "0" vs "-0"; or a decimal at two
+/// scales — `1.50` vs `1.5`), so picking the wrong one breaks byte-parity with the
+/// materialized aggregate even though the values are "equal". Candidates are
+/// materialized before the compare, so replacing on `Equal` costs no extra work.
+fn minmax_should_replace(is_max: bool, ord: std::cmp::Ordering) -> bool {
+    if is_max {
+        ord != std::cmp::Ordering::Less
+    } else {
+        ord == std::cmp::Ordering::Less
+    }
+}
+
 /// How to read a numeric column value as an exact decimal during native
 /// expression evaluation.
 #[derive(Clone, Copy)]
@@ -1409,14 +1429,10 @@ impl Operator for FusedR2rmlAggregateOperator {
                                 if let Acc::MinMax { best } = &mut accs[i] {
                                     let replace = match &*best {
                                         Binding::Unbound => true,
-                                        cur => {
-                                            let ord = crate::sort::compare_bindings(&cand, cur);
-                                            if mmf.is_max {
-                                                ord == std::cmp::Ordering::Greater
-                                            } else {
-                                                ord == std::cmp::Ordering::Less
-                                            }
-                                        }
+                                        cur => minmax_should_replace(
+                                            mmf.is_max,
+                                            crate::sort::compare_bindings(&cand, cur),
+                                        ),
                                     };
                                     if replace {
                                         *best = cand;
@@ -2813,6 +2829,74 @@ mod tests {
             !minmax_admissible_datatype(None),
             "an un-annotated column (→ xsd:string) declines"
         );
+    }
+
+    /// Item 9 MIN/MAX tie-break parity (R-1522): the fold must resolve an
+    /// equal-BUT-differently-rendered extreme the SAME way the generic
+    /// `agg_min`/`agg_max` do — MIN keeps the FIRST of the ties, MAX keeps the LAST
+    /// (`min_by`/`max_by` semantics). The reachable concrete case is a double column
+    /// carrying both `+0.0` and `-0.0`: they compare Equal but render "0" vs "-0",
+    /// so picking the wrong one on a tie breaks byte-parity. (A single decimal column
+    /// has a fixed scale, so it can't hold two renderings of one value — but the same
+    /// `Equal`-by-value rule covers `1.50` vs `1.5` if such a pair ever reached the
+    /// fold; the pure-logic assertions below pin that rule directly.)
+    #[test]
+    fn minmax_tie_break_matches_generic_agg() {
+        use crate::sort::compare_bindings;
+        use std::cmp::Ordering;
+        // The replace predicate == min_by (first) / max_by (last) tie-breaking.
+        assert!(
+            !minmax_should_replace(false, Ordering::Equal),
+            "MIN keeps the FIRST on a tie"
+        );
+        assert!(
+            minmax_should_replace(true, Ordering::Equal),
+            "MAX keeps the LAST on a tie"
+        );
+        assert!(minmax_should_replace(false, Ordering::Less));
+        assert!(!minmax_should_replace(false, Ordering::Greater));
+        assert!(minmax_should_replace(true, Ordering::Greater));
+        assert!(!minmax_should_replace(true, Ordering::Less));
+
+        // Concrete reachable case: ±0.0 compare Equal but render differently.
+        let pos = Binding::lit(FlakeValue::Double(0.0), Sid::xsd_double());
+        let neg = Binding::lit(FlakeValue::Double(-0.0), Sid::xsd_double());
+        assert_eq!(
+            compare_bindings(&pos, &neg),
+            Ordering::Equal,
+            "+0.0 and -0.0 compare Equal"
+        );
+        let bits = |b: &Binding| match b {
+            Binding::Lit {
+                val: FlakeValue::Double(d),
+                ..
+            } => d.to_bits(),
+            _ => panic!("expected a double lit"),
+        };
+        // Fold over [+0.0, -0.0] in scan order: MAX must end on -0.0 (the LAST,
+        // matching agg_max); MIN must end on +0.0 (the FIRST, matching agg_min).
+        // Under the old first-on-ties MAX this would keep +0.0 and diverge.
+        for (is_max, generic) in [
+            (
+                true,
+                AggregateFn::Max(VarId(0)).apply(&Binding::Grouped(vec![pos.clone(), neg.clone()])),
+            ),
+            (
+                false,
+                AggregateFn::Min(VarId(0)).apply(&Binding::Grouped(vec![pos.clone(), neg.clone()])),
+            ),
+        ] {
+            let mut best = pos.clone();
+            if minmax_should_replace(is_max, compare_bindings(&neg, &best)) {
+                best = neg.clone();
+            }
+            assert_eq!(
+                bits(&best),
+                bits(&generic),
+                "fused {} tie-break must match the generic aggregate",
+                if is_max { "MAX" } else { "MIN" }
+            );
+        }
     }
 
     /// Q2 lang/IRI admission gate: a fused group key — the single-table key OR the
