@@ -100,15 +100,17 @@ pub trait Operator: Send + Sync {
     /// never inside fused per-row/per-group loops (hot-loop purity).
     fn set_row_budget(&mut self, _budget: usize) {}
 
-    /// Offer a scan-side top-k directive (PR-5): a single-column DESC `ORDER BY
-    /// <sort_var> LIMIT k` sits directly above a row-preserving operator chain
-    /// down to a single R2RML scan. Default no-op; only the R2RML scan honors it
-    /// (and only when `sort_var` resolves to a scalar scan column). Order-
-    /// preserving pass-through operators forward it to their child so it reaches
-    /// the scan. It is a pure optimization — a scan may then read only the files
-    /// that can hold the top-k — and never changes results (the `Sort` above is
-    /// authoritative). Set **before** `open()`.
-    fn set_topk(&mut self, _sort_var: VarId, _k: usize) {}
+    /// Offer a scan-side top-k directive (PR-5; ASC added in item 8, F-AUD-6): a
+    /// single-column `ORDER BY <sort_var> LIMIT k` sits directly above a
+    /// row-preserving operator chain down to a single R2RML scan. `ascending` is
+    /// the sort direction (`false` = DESC). Default no-op; only the R2RML scan
+    /// honors it (and only when `sort_var` resolves to a scalar scan column — for
+    /// ASC, also a required/non-nullable column). Order-preserving pass-through
+    /// operators forward it to their child so it reaches the scan. It is a pure
+    /// optimization — a scan may then read only the files that can hold the top-k —
+    /// and never changes results (the `Sort` above is authoritative). Set
+    /// **before** `open()`.
+    fn set_topk(&mut self, _sort_var: VarId, _k: usize, _ascending: bool) {}
 
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)

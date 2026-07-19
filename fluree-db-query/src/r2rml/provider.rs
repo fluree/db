@@ -110,22 +110,28 @@ pub struct ScanFilter {
     pub value: ScanValue,
 }
 
-/// A scan-side top-k directive for a single-column **DESCENDING** `ORDER BY …
-/// LIMIT k` directly above a single-table R2RML scan (PR-5). The scan reads files
-/// in `upper_bound(sort_column)`-DESC order, keeps a running k-th bound, and stops
+/// A scan-side top-k directive for a single-column `ORDER BY … LIMIT k` directly
+/// above a single-table R2RML scan (PR-5; ASC added in item 8, F-AUD-6). The scan
+/// reads files best-first (DESC: `upper_bound(sort_column)` descending; ASC:
+/// `lower_bound(sort_column)` ascending), keeps a running k-th bound, and stops
 /// once no unread file can beat it — reading far fewer than the whole table.
 ///
 /// A pure perf optimization: the scan still streams a strict SUPERSET of the true
 /// top-k (it only skips files that provably cannot contribute), and the
 /// authoritative `SortOperator` above applies the exact (compound) order + LIMIT.
 /// Ignored by the provider unless `sort_column` resolves to a pushable scalar
-/// column of the scanned table.
+/// column of the scanned table — and, for `ascending`, unless that column is
+/// REQUIRED (non-nullable) in the Iceberg schema, since SPARQL orders unbound
+/// values FIRST under ASC and a nullable column could hide an unread top-k row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanTopK {
-    /// The primary DESC sort column (an R2RML-mapped table column name).
+    /// The primary sort column (an R2RML-mapped table column name).
     pub sort_column: String,
     /// How many top rows the bound must retain — the query's `LIMIT + OFFSET`.
     pub k: usize,
+    /// `true` for an `ASC` sort (admitted only for a required column; the provider
+    /// re-checks nullability), `false` for `DESC`.
+    pub ascending: bool,
 }
 
 /// Provider for compiled R2RML mappings.

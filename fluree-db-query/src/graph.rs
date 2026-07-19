@@ -109,7 +109,7 @@ pub struct GraphOperator {
     /// top-k row from partition p is among p's k largest, so the global top-k is a
     /// subset of the union of the per-partition results (the authoritative sort
     /// above re-selects the exact k).
-    topk: Option<(VarId, usize)>,
+    topk: Option<(VarId, usize, bool)>,
     /// Plan-time decision: seed the enumerated graph variable into the inner
     /// subplan. True only when the inner patterns bind the graph var in EVERY
     /// solution (required top-level triple / property path / slice-free
@@ -356,8 +356,8 @@ impl GraphOperator {
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
         }
-        if let Some((sort_var, k)) = self.topk {
-            inner.set_topk(sort_var, k);
+        if let Some((sort_var, k, ascending)) = self.topk {
+            inner.set_topk(sort_var, k, ascending);
         }
         inner.open(&graph_ctx).await?;
 
@@ -535,8 +535,8 @@ impl GraphOperator {
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
         }
-        if let Some((sort_var, k)) = self.topk {
-            inner.set_topk(sort_var, k);
+        if let Some((sort_var, k, ascending)) = self.topk {
+            inner.set_topk(sort_var, k, ascending);
         }
         inner.open(&graph_ctx).await?;
 
@@ -644,11 +644,11 @@ impl Operator for GraphOperator {
         self.row_budget = Some(budget);
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
         // Record the top-k directive; threaded into the per-parent inner subplan
         // (like `row_budget`). NOT forwarded to `self.child` (the parent seed is
         // not the scan). Per-partition top-k is sound (see the field doc).
-        self.topk = Some((sort_var, k));
+        self.topk = Some((sort_var, k, ascending));
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {

@@ -1901,10 +1901,11 @@ impl FlureeR2rmlProvider<'_> {
         // incrementally instead of the whole table being collected here.
         let footers = cache.parquet_footers();
 
-        // PR-5 scan-side top-k. When a resolvable single-column DESC directive is
-        // present, read files in `upper_bound(sort_col)`-DESC order with a running
-        // k-th bound and stop once no unread file can beat it — streaming a strict
-        // SUPERSET of the top-k (the `SortOperator` above is authoritative). The
+        // PR-5 / item 8 scan-side top-k. When a resolvable single-column directive
+        // is present, read files best-first (DESC by `upper_bound`, ASC by
+        // `lower_bound`) with a running k-th bound and stop once no unread file can
+        // beat it — streaming a strict SUPERSET of the top-k (the `SortOperator`
+        // above is authoritative). ASC is admitted only for a required column. The
         // pruned subset MUST bypass the operator's scan cache (handled by its
         // `cacheable` guard gaining `&& topk.is_none()`); the disk *artifact* cache
         // is keyed by file path+size with whole-file entries, so a pruned subset
@@ -1914,16 +1915,26 @@ impl FlureeR2rmlProvider<'_> {
         // bound / a heap that can't fill), the remaining files are handed to the
         // normal parallel reader so the topk path can never be slower than it.
         if let Some(tk) = topk {
-            if let Some(field) = schema.field_by_name(&tk.sort_column) {
+            // Item 8 (F-AUD-6): ASC top-k is SOUND ONLY for a REQUIRED (non-nullable)
+            // column — SPARQL orders unbound values FIRST under ASC, so a nullable
+            // column could hold an unread NULL row that belongs ahead of the top-k.
+            // DESC is sound for any column (unbound sorts last). A declined directive
+            // simply falls through to the normal parallel scan below (ignoring a
+            // top-k is always correct — the `SortOperator` above is authoritative).
+            let admitted = schema
+                .field_by_name(&tk.sort_column)
+                .filter(|field| !tk.ascending || field.required);
+            if let Some(field) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
                 let order = plan_topk_read(
                     tasks.iter().map(|t| &t.data_file),
                     sort_field_id,
                     sort_type.as_deref(),
+                    tk.ascending,
                 );
 
-                let mut bound = TopKBound::new(tk.k);
+                let mut bound = TopKBound::new(tk.k, tk.ascending);
                 let mut collected: Vec<ColumnBatch> = Vec::new();
                 let mut tail: Vec<FileScanTask> = Vec::new();
                 let mut reads = 0usize;

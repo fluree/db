@@ -424,13 +424,13 @@ pub struct R2rmlScanOperator {
     row_budget: Option<usize>,
     /// Output rows emitted so far, counted against `row_budget`.
     emitted: usize,
-    /// Scan-side top-k directive (PR-5): `(primary DESC sort var, LIMIT+OFFSET)`,
-    /// set by a `SortOperator` for a `ORDER BY DESC(<scan col>) LIMIT k` directly
-    /// above this scan. Resolved to the sort column against the mapping at scan
-    /// time ([`Self::resolve_topk_directive`]); `None` = no pushdown (full scan +
-    /// the authoritative sort above). Only ever consulted for the main table scan,
-    /// never a parent/dimension lookup.
-    topk: Option<(VarId, usize)>,
+    /// Scan-side top-k directive (PR-5; ASC added in item 8): `(primary sort var,
+    /// LIMIT+OFFSET, ascending)`, set by a `SortOperator` for an `ORDER BY
+    /// <scan col> LIMIT k` directly above this scan. Resolved to the sort column
+    /// against the mapping at scan time ([`Self::resolve_topk_directive`]); `None`
+    /// = no pushdown (full scan + the authoritative sort above). Only ever
+    /// consulted for the main table scan, never a parent/dimension lookup.
+    topk: Option<(VarId, usize, bool)>,
     /// A scan-local FILTER the planner folded into this scan (see
     /// [`R2rmlPattern::consumed_filter`]). Applied to each output batch with the
     /// same evaluator the dropped `FilterOperator` would use, so results are

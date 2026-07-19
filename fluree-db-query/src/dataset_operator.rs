@@ -194,7 +194,7 @@ pub struct DatasetOperator {
     /// T1.3: an `ORDER BY … LIMIT` top-k directive, applied per member like
     /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
     /// partial top-k into the global one.
-    topk: Option<(VarId, usize)>,
+    topk: Option<(VarId, usize, bool)>,
 }
 
 impl DatasetOperator {
@@ -221,8 +221,8 @@ impl DatasetOperator {
         if let Some(budget) = self.row_budget {
             member.set_row_budget(budget);
         }
-        if let Some((sort_var, k)) = self.topk {
-            member.set_topk(sort_var, k);
+        if let Some((sort_var, k, ascending)) = self.topk {
+            member.set_topk(sort_var, k, ascending);
         }
     }
 
@@ -381,13 +381,13 @@ impl Operator for DatasetOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
         // T1.3: record ORDER BY … LIMIT top-k; applied per member like the row
         // budget. Per-member top-k is sound — the outer sort merges the members'
         // partial top-k into the global one (same reasoning as `GraphOperator`'s
         // per-partition top-k). Switch-gated.
         if crate::r2rml::dataset_budget_enabled() {
-            self.topk = Some((sort_var, k));
+            self.topk = Some((sort_var, k, ascending));
         }
     }
 
@@ -626,7 +626,7 @@ mod tests {
     /// freshly built member.
     struct DirectiveRecorder {
         budget: Arc<Mutex<Option<usize>>>,
-        topk: Arc<Mutex<Option<(VarId, usize)>>>,
+        topk: Arc<Mutex<Option<(VarId, usize, bool)>>>,
         schema: Arc<[VarId]>,
         state: OperatorState,
     }
@@ -650,8 +650,8 @@ mod tests {
         fn set_row_budget(&mut self, budget: usize) {
             *self.budget.lock().unwrap() = Some(budget);
         }
-        fn set_topk(&mut self, sort_var: VarId, k: usize) {
-            *self.topk.lock().unwrap() = Some((sort_var, k));
+        fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+            *self.topk.lock().unwrap() = Some((sort_var, k, ascending));
         }
     }
 
@@ -659,7 +659,7 @@ mod tests {
     /// handles, so a test can read what the built member(s) received.
     struct RecorderBuilder {
         budget: Arc<Mutex<Option<usize>>>,
-        topk: Arc<Mutex<Option<(VarId, usize)>>>,
+        topk: Arc<Mutex<Option<(VarId, usize, bool)>>>,
         schema: Arc<[VarId]>,
     }
 
@@ -679,7 +679,7 @@ mod tests {
 
     type RecorderHandles = (
         Arc<Mutex<Option<usize>>>,
-        Arc<Mutex<Option<(VarId, usize)>>>,
+        Arc<Mutex<Option<(VarId, usize, bool)>>>,
     );
 
     fn recorder_dataset() -> (DatasetOperator, RecorderHandles) {
@@ -721,9 +721,9 @@ mod tests {
     #[tokio::test]
     async fn dataset_forwards_topk_to_member() {
         let (mut op, (_budget, topk)) = recorder_dataset();
-        op.set_topk(VarId(3), 5);
+        op.set_topk(VarId(3), 5, false);
         open_and_drain(&mut op).await;
-        assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5)));
+        assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5, false)));
     }
 
     #[tokio::test]
