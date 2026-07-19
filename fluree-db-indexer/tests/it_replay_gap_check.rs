@@ -8,13 +8,10 @@
 use std::collections::HashMap;
 
 use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
-use fluree_db_binary_index::format::history_sidecar::{decode_history_segment, HistorySegmentRef};
-use fluree_db_binary_index::format::leaf::{
-    decode_leaf_dir_v3_with_base, decode_leaf_header_v3, LeafWriter,
-};
+use fluree_db_binary_index::format::leaf::LeafWriter;
 use fluree_db_binary_index::format::run_record::{RunSortOrder, LIST_INDEX_NONE};
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
-use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
+use fluree_db_binary_index::read::leaf_access::{FullBlobLeafHandle, LeafHandle};
 use fluree_db_binary_index::replay_leaflet;
 use fluree_db_binary_index::ColumnProjection;
 use fluree_db_core::o_type::OType;
@@ -99,34 +96,13 @@ fn apply_window(
 /// Reconstruct the leaflet state `AS OF t_target` via the real replay path
 /// and report whether subject `s_id` is present.
 fn present_at(leaf_bytes: &[u8], sidecar_bytes: &[u8], t_target: i64, s_id: u64) -> bool {
-    let header = decode_leaf_header_v3(leaf_bytes).expect("leaf header");
-    let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).expect("leaf dir");
-    assert_eq!(dir.entries.len(), 1, "single leaflet expected");
-    let entry = &dir.entries[0];
-
-    let batch = load_leaflet_columns(
-        leaf_bytes,
-        entry,
-        dir.payload_base,
-        &ColumnProjection::all(),
-        RunSortOrder::Spot,
-    )
-    .expect("load columns");
-
-    let history = if entry.history_len > 0 {
-        decode_history_segment(
-            sidecar_bytes,
-            &HistorySegmentRef {
-                offset: entry.history_offset,
-                len: entry.history_len,
-                min_t: entry.history_min_t,
-                max_t: entry.history_max_t,
-            },
-        )
-        .expect("decode history")
-    } else {
-        Vec::new()
-    };
+    let sidecar = (!sidecar_bytes.is_empty()).then(|| sidecar_bytes.to_vec());
+    let handle = FullBlobLeafHandle::new(leaf_bytes.to_vec(), sidecar, 0).expect("leaf handle");
+    assert_eq!(handle.dir().entries.len(), 1, "single leaflet expected");
+    let batch = handle
+        .load_columns(0, &ColumnProjection::all(), RunSortOrder::Spot)
+        .expect("load columns");
+    let history = handle.load_sidecar_segment(0).expect("decode history");
 
     let replayed = replay_leaflet(&batch, &history, t_target, RunSortOrder::Spot);
     let view = replayed.as_ref().unwrap_or(&batch);

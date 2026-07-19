@@ -24,14 +24,11 @@
 use std::collections::HashMap;
 
 use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
-use fluree_db_binary_index::format::history_sidecar::{
-    decode_history_segment, HistEntryV2, HistorySegmentRef,
-};
-use fluree_db_binary_index::format::leaf::{decode_leaf_dir_v3_with_base, decode_leaf_header_v3};
+use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::{RunRecord, RunSortOrder, LIST_INDEX_NONE};
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
-use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
 use fluree_db_binary_index::read::column_types::{ColumnBatch, ColumnProjection};
+use fluree_db_binary_index::read::leaf_access::{FullBlobLeafHandle, LeafHandle};
 use fluree_db_binary_index::replay_leaflet;
 use fluree_db_core::o_type::OType;
 use fluree_db_core::o_type_registry::OTypeRegistry;
@@ -187,39 +184,15 @@ struct LeafView {
 
 impl LeafView {
     fn decode(leaf_bytes: &[u8], sidecar_bytes: Option<&[u8]>) -> Self {
-        let header = decode_leaf_header_v3(leaf_bytes).expect("leaf header");
-        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).expect("leaf dir");
-        let mut history = Vec::new();
-        let mut batches: Vec<ColumnBatch> = Vec::new();
-        for entry in &dir.entries {
-            batches.push(
-                load_leaflet_columns(
-                    leaf_bytes,
-                    entry,
-                    dir.payload_base,
-                    &ColumnProjection::all(),
-                    RunSortOrder::Spot,
-                )
-                .expect("load columns"),
-            );
-            if entry.history_len > 0 {
-                let seg = HistorySegmentRef {
-                    offset: entry.history_offset,
-                    len: entry.history_len,
-                    min_t: entry.history_min_t,
-                    max_t: entry.history_max_t,
-                };
-                history.extend(
-                    decode_history_segment(sidecar_bytes.expect("sidecar bytes"), &seg)
-                        .expect("decode history"),
-                );
-            }
-        }
-        assert_eq!(batches.len(), 1, "cases fit one leaflet");
-        LeafView {
-            batch: batches.pop().expect("one leaflet"),
-            history,
-        }
+        let handle =
+            FullBlobLeafHandle::new(leaf_bytes.to_vec(), sidecar_bytes.map(<[u8]>::to_vec), 0)
+                .expect("leaf handle");
+        assert_eq!(handle.dir().entries.len(), 1, "cases fit one leaflet");
+        let batch = handle
+            .load_columns(0, &ColumnProjection::all(), RunSortOrder::Spot)
+            .expect("load columns");
+        let history = handle.load_sidecar_segment(0).expect("decode history");
+        LeafView { batch, history }
     }
 
     /// Replay to `target` and report the fact's presence and row `t`.

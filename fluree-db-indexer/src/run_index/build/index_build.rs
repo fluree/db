@@ -780,31 +780,16 @@ mod tests {
 
     /// Decode every history entry from a persisted leaf's sidecar.
     fn read_all_history(leaf: &PersistedLeafInfo) -> Vec<HistEntryV2> {
+        use fluree_db_binary_index::read::leaf_access::{FullBlobLeafHandle, LeafHandle};
         let leaf_bytes = std::fs::read(&leaf.leaf_path).unwrap();
-        let header = decode_leaf_header_v3(&leaf_bytes).unwrap();
-        let leaf_dir = decode_leaf_dir_v3(&leaf_bytes, &header).unwrap();
-        let sidecar_bytes =
-            std::fs::read(leaf.sidecar_path.as_ref().expect("history sidecar written")).unwrap();
-        let mut history: Vec<HistEntryV2> = Vec::new();
-        for entry in &leaf_dir {
-            if entry.history_len == 0 {
-                continue;
-            }
-            let seg = fluree_db_binary_index::format::history_sidecar::HistorySegmentRef {
-                offset: entry.history_offset,
-                len: entry.history_len,
-                min_t: entry.history_min_t,
-                max_t: entry.history_max_t,
-            };
-            history.extend(
-                fluree_db_binary_index::format::history_sidecar::decode_history_segment(
-                    &sidecar_bytes,
-                    &seg,
-                )
-                .unwrap(),
-            );
-        }
-        history
+        let sidecar_bytes = leaf
+            .sidecar_path
+            .as_ref()
+            .map(|p| std::fs::read(p).unwrap());
+        let handle = FullBlobLeafHandle::new(leaf_bytes, sidecar_bytes, 0).unwrap();
+        (0..handle.dir().entries.len())
+            .flat_map(|i| handle.load_sidecar_segment(i).unwrap())
+            .collect()
     }
 
     /// A retract of a fact that was never asserted anywhere in the log is
