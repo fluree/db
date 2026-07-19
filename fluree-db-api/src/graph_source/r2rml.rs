@@ -208,6 +208,142 @@ fn build_iceberg_filter(
     }
 }
 
+/// Map each member of an `IN` set to an Iceberg [`LiteralValue`] against the
+/// column's physical type, or `None` if ANY member cannot be represented — a
+/// partial `IN` could prune a file that a dropped member's rows live in, which
+/// the in-engine FILTER could then never recover. Reuses the exact scalar
+/// conversion the single-value pushdown uses, so member soundness is identical.
+fn set_members_to_literals(
+    field_type: Option<&str>,
+    members: &[ScanValue],
+) -> Option<Vec<LiteralValue>> {
+    let mut out = Vec::with_capacity(members.len());
+    for m in members {
+        out.push(scan_value_to_literal(field_type, m)?);
+    }
+    Some(out)
+}
+
+/// Translate one scalar [`ScanValue`] to an Iceberg pushdown [`LiteralValue`]
+/// against a column of the given physical type, or `None` to skip the push
+/// (leaving the in-engine FILTER as the authority). Shared by the single-value
+/// `Comparison` path and the set-membership `In` path.
+fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<LiteralValue> {
+    Some(match value {
+        ScanValue::Bool(b) => LiteralValue::Boolean(*b),
+        // Push a Date literal only against a physically-`date` column. The
+        // Arrow reader applies it as an exact row filter (casting the column
+        // to text), but the operator enforces with a lenient `Date::parse`
+        // that also accepts `"2024-01-15Z"` / offset forms. On a physically
+        // string column the operator would keep such a row while the row
+        // filter drops it — so gate the pushdown to keep it a strict subset.
+        ScanValue::Date(d) => match field_type {
+            Some("date") => LiteralValue::Date(*d),
+            _ => return None,
+        },
+        // Iceberg `int` is 32-bit, `long` 64-bit; against a `decimal` column an
+        // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
+        // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
+        // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
+        ScanValue::Int(n) => {
+            match int_pushdown_literal(*n, field_type, iceberg_numeric_stats_enabled()) {
+                Some(v) => v,
+                None => return None,
+            }
+        }
+        ScanValue::Str(s) => LiteralValue::String(s.clone()),
+        // xsd:double / xsd:float FILTER value. Push only against a physically
+        // `double` column (exact f64 bounds); a `float` column would need an
+        // f64→f32 narrowing that can round the literal and over-prune a range,
+        // so skip it — the in-engine FILTER still applies.
+        ScanValue::Double(d) => match field_type {
+            Some("double") => LiteralValue::Float64(*d),
+            // A binary float → decimal coercion is not exact in general, so a
+            // double literal is NOT pushed against a decimal column (keep is
+            // correct; the in-engine FILTER enforces). Breadcrumb per the
+            // decline-observably ruling.
+            Some(t) if t.starts_with("decimal") => {
+                debug!(
+                    field_type = ?field_type,
+                    "double literal vs decimal column: pushdown declined (inexact float→decimal); in-engine FILTER enforces"
+                );
+                return None;
+            }
+            _ => return None,
+        },
+        // xsd:decimal FILTER value. Push only against a `decimal(...)` column;
+        // the literal keeps its own scale and the bound compare normalizes it
+        // against the column's scale. Row-group stats prune only when the
+        // column is FLBA-encoded (see `prunable_stats`); file-level manifest
+        // bounds prune regardless.
+        ScanValue::Decimal {
+            unscaled,
+            precision,
+            scale,
+        } => match field_type {
+            Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
+                unscaled: *unscaled,
+                precision: *precision,
+                scale: *scale,
+            },
+            // A decimal literal against an integer column has no exact
+            // cross-type bound compare, so it is NOT pushed (keep is correct).
+            // Breadcrumb per the decline-observably ruling.
+            Some("int" | "long") => {
+                debug!(
+                    field_type = ?field_type,
+                    "decimal literal vs integer column: pushdown declined (no exact cross-type bound compare); in-engine FILTER enforces"
+                );
+                return None;
+            }
+            _ => return None,
+        },
+        // A reversed subject-template key: coerce the raw string to the
+        // column's physical type. A key that parses as an integer pushes as an
+        // integer literal against an `int`/`long`/`decimal` column — including
+        // a `decimal` of any scale (the Arrow reader casts the integer to the
+        // column's decimal type; row-group stats conservatively skip
+        // decimals). A `string` column pushes the raw string. A key that is
+        // not integer-valued, or any other physical type
+        // (float/date/timestamp/boolean), skips the pushdown — the operator
+        // still enforces the subject equality either way.
+        ScanValue::TemplateKey(s) => match field_type {
+            Some("int") => match s.parse::<i32>() {
+                Ok(v) => LiteralValue::Int32(v),
+                Err(_) => return None,
+            },
+            Some(t) if t == "long" || t.starts_with("decimal") => match s.parse::<i64>() {
+                Ok(v) => LiteralValue::Int64(v),
+                Err(_) => return None,
+            },
+            Some("string") => LiteralValue::String(s.clone()),
+            _ => return None,
+        },
+        // Item 10 (F-AUD-11): a dateTime pushes to MANIFEST-level pruning, and only
+        // when the literal's frame matches the column's timestamp type — a tz-aware
+        // (UTC) literal against `timestamptz`, a naive (wall-clock) literal against
+        // `timestamp`. Any other pairing (frame mismatch or non-timestamp column)
+        // declines: the micros would not be comparable to the file's decoded bounds,
+        // and pushing anyway could over-prune. The in-engine FILTER stays authority.
+        ScanValue::Timestamp { micros, tz } => match (field_type, tz) {
+            (Some("timestamptz"), true) => LiteralValue::TimestampTz(*micros),
+            (Some("timestamp"), false) => LiteralValue::Timestamp(*micros),
+            _ => {
+                debug!(
+                    field_type = ?field_type,
+                    tz_aware = tz,
+                    "dateTime pushdown declined: literal frame does not match the column's timestamp type; in-engine FILTER enforces"
+                );
+                return None;
+            }
+        },
+        // A set is never a scalar literal — the `In` path handles it member by
+        // member (each member IS a scalar `ScanValue`, so this is unreachable for
+        // a well-formed filter; declining defensively is never wrong).
+        ScanValue::Set(_) => return None,
+    })
+}
+
 // =============================================================================
 // Iceberg/R2RML Graph Source Creation
 // =============================================================================

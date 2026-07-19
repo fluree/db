@@ -371,6 +371,13 @@ fn stat_bounds(
             };
             (s.min_opt().and_then(to_str), s.max_opt().and_then(to_str))
         }
+        // Item 10 (F-AUD-11): NO `TypedValue::Timestamp`/`TimestampTz` arm — a
+        // timestamp column is a Parquet INT64 whose logical UNIT (milli/micro/nano)
+        // is ambiguous from the row-group `Statistics` alone (A1 §4), so decoding the
+        // raw i64 stat as micros could over-prune. Timestamp pruning is therefore
+        // MANIFEST-LEVEL ONLY (Iceberg `value_codec` decodes the unit unambiguously
+        // from the schema type; see `can_contain_comparison`). Falling through to
+        // `(None, None)` keeps every row group for a timestamp predicate.
         _ => (None, None),
     }
 }
@@ -596,6 +603,69 @@ mod tests {
                 doc: None,
             }],
         }
+    }
+
+    fn create_timestamptz_schema() -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: vec![crate::metadata::SchemaField {
+                id: 1,
+                name: "ts".to_string(),
+                required: true,
+                field_type: serde_json::json!("timestamptz"),
+                doc: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn timestamptz_manifest_pruning_by_micros_bounds() {
+        // Item 10 (F-AUD-11): a `timestamptz` FILTER prunes at the MANIFEST level —
+        // Iceberg decodes the file's micros bounds unambiguously from the schema
+        // type. File holds ts micros in [1000, 2000].
+        let schema = create_timestamptz_schema();
+        let data_file = create_test_data_file(1000, 2000);
+        let cmp = |op, micros| Expression::Comparison {
+            field_id: 1,
+            column: "ts".to_string(),
+            op,
+            value: LiteralValue::TimestampTz(micros),
+        };
+        // ts > 2000 (at/above upper) → prune; ts > 1500 (in range) → keep.
+        assert!(!can_contain_file(
+            &cmp(ComparisonOp::Gt, 2000),
+            &data_file,
+            &schema
+        ));
+        assert!(can_contain_file(
+            &cmp(ComparisonOp::Gt, 1500),
+            &data_file,
+            &schema
+        ));
+        // ts < 1000 (at/below lower) → prune; ts < 1500 (in range) → keep.
+        assert!(!can_contain_file(
+            &cmp(ComparisonOp::Lt, 1000),
+            &data_file,
+            &schema
+        ));
+        assert!(can_contain_file(
+            &cmp(ComparisonOp::Lt, 1500),
+            &data_file,
+            &schema
+        ));
+
+        // Defense in depth: a `Timestamp` (naive-frame) literal against this
+        // `timestamptz` column is a TypedValue mismatch → the compare is
+        // incomparable → the file is KEPT (never over-pruned). The build-time
+        // frame match prevents this pairing from ever being emitted.
+        let ntz_lit = Expression::Comparison {
+            field_id: 1,
+            column: "ts".to_string(),
+            op: ComparisonOp::Gt,
+            value: LiteralValue::Timestamp(9_000),
+        };
+        assert!(can_contain_file(&ntz_lit, &data_file, &schema));
     }
 
     #[test]

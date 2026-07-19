@@ -460,7 +460,12 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
         LiteralValue::String(s) => Arc::new(StringArray::from(vec![s.clone()])),
         LiteralValue::Bytes(b) => Arc::new(BinaryArray::from(vec![b.as_slice()])),
         LiteralValue::Date(d) => Arc::new(Date32Array::from(vec![*d])),
-        LiteralValue::Timestamp(t) => Arc::new(TimestampMicrosecondArray::from(vec![*t])),
+        // Both timestamp flavors carry micros-since-epoch; `cast` adapts to the
+        // column's own (tz-tagged or not) timestamp type. If the cast can't adapt,
+        // `eval_comparison` keeps every row and the in-engine FILTER decides.
+        LiteralValue::Timestamp(t) | LiteralValue::TimestampTz(t) => {
+            Arc::new(TimestampMicrosecondArray::from(vec![*t]))
+        }
         LiteralValue::Decimal {
             unscaled,
             precision,

@@ -338,14 +338,17 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            68,
+            74,
             "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
              4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
              q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
              1 E1 shared-predicate member (q064 Product-by-category) + \
              1 E2 join+flag member (q065 orders-by-current-customer-segment) + \
              2 W4-2 mixed fact+dim group-key members (q066 COUNT, q067 COUNT+intSUM) + \
-             1 W4-1b folded-crawl sentinel (q068 orderline detail crawl)"
+             1 W4-1b folded-crawl sentinel (q068 orderline detail crawl) + \
+             6 PR-COVERAGE scan-side members promoted from the A3 probe battery \
+             (q069 FILTER-IN/F-AUD-5, q070 scalar-VALUES/F-AUD-5, q071 ASC-top-k/F-AUD-6, \
+             q072 timestamp-prune/F-AUD-11, q073 OPTIONAL-budget/F-AUD-7, q074 its control)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));
@@ -455,6 +458,11 @@ mod tests {
             // unordered (p,o) set of the key-constrained subject's crawl —
             // rows-only for the same LIMIT-nondeterminism reason.
             "q068",
+            // PR-COVERAGE scan-side members whose LIMIT truncates an UNORDERED set
+            // (no ORDER BY / no unique tiebreaker): q072 timestamp-range LIMIT 5000,
+            // q073 OPTIONAL-budget LIMIT 50, q074 its plain-LIMIT control. (q071 ASC
+            // top-k stays Full — its `ORDER BY ASC(?tot) ?oid` tiebreaks uniquely.)
+            "q072", "q073", "q074",
         ]
         .into_iter()
         .collect();

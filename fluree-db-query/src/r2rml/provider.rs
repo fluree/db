@@ -74,6 +74,26 @@ pub enum ScanValue {
     /// skipped for field types not yet supported. The R2RML operator still enforces
     /// the subject equality, so a skipped or imperfect push is never wrong.
     TemplateKey(String),
+    /// A bounded set of scalar values for a [`ScanCmpOp::In`] membership filter
+    /// (from a `FILTER … IN` or single-var `VALUES`). Every member is one of the
+    /// scalar variants above — never a nested `Set`, never a `TemplateKey`. Only
+    /// ever produced by the set-lowering emit path; it is never wrapped in an
+    /// [`ObjectConstant`] (a constant object is a single scalar term), so the
+    /// scalar-only match sites treat it defensively as "not a scalar constant".
+    Set(Vec<ScanValue>),
+    /// An `xsd:dateTime` value as microseconds since the Unix epoch, carrying
+    /// whether the source literal was timezone-AWARE (item 10). `tz = true` (an
+    /// explicit offset, e.g. `…Z`/`+05:00`) means the micros are in the UTC frame
+    /// and only push against a physically-`timestamptz` column; `tz = false` (a
+    /// naive literal) means wall-clock micros and only push against a physically
+    /// `timestamp` column. The frame is matched at pushdown-build time so the
+    /// micros are directly comparable to the Iceberg manifest bounds; a mismatch
+    /// declines the push (the in-engine FILTER stays the authority). Pruning is
+    /// MANIFEST-level only — see the row-group note in `fluree-db-iceberg`.
+    Timestamp {
+        micros: i64,
+        tz: bool,
+    },
 }
 
 /// A constant object in a triple pattern (`?s <pred> <const>`), enforced by the

@@ -771,6 +771,16 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
         FlakeValue::Decimal(d) if crate::r2rml::iceberg_numeric_stats_enabled() => {
             scan_value_from_bigdecimal(d)
         }
+        // Item 10 (F-AUD-11): an xsd:dateTime pushes as micros-since-epoch, carrying
+        // whether the source was tz-AWARE (an explicit offset ⇒ UTC frame) so the
+        // provider can frame-match it to a `timestamp` vs `timestamptz` column.
+        // Gated by FLUREE_ICEBERG_TIMESTAMP_STATS.
+        FlakeValue::DateTime(dt) if crate::r2rml::iceberg_timestamp_stats_enabled() => {
+            Some(ScanValue::Timestamp {
+                micros: dt.epoch_micros(),
+                tz: dt.tz_offset().is_some(),
+            })
+        }
         _ => None,
     }
 }
