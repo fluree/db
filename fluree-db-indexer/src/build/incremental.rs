@@ -510,12 +510,19 @@ async fn execute_phase2_task(
         }
         Phase2TaskKind::DefaultFresh => {
             if !sorted_superseded.is_empty() {
-                tracing::debug!(
+                // Permanent gap: these are real in-window transitions (e.g. a
+                // fact born and deleted between two index builds) and the next
+                // window's novelty never re-sees them. Reachable beyond
+                // genesis — the root format permits graphs with fewer than
+                // four materialized orders, so a newly added order takes this
+                // arm for an existing graph, leaving that order's replay
+                // without history its sibling orders have.
+                tracing::warn!(
                     g_id,
                     ?order,
                     dropped = sorted_superseded.len(),
-                    "fresh default graph: in-window transition superseded have no \
-                     sidecar to land in; first-window history is not materialized"
+                    "fresh default-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
                 );
             }
             let BranchUpdateResult {
@@ -588,12 +595,13 @@ async fn execute_phase2_task(
         }
         Phase2TaskKind::NamedFresh => {
             if !sorted_superseded.is_empty() {
-                tracing::debug!(
+                // Permanent gap; see the DefaultFresh arm above.
+                tracing::warn!(
                     g_id,
                     ?order,
                     dropped = sorted_superseded.len(),
-                    "fresh named graph: in-window transition superseded have no \
-                     sidecar to land in; first-window history is not materialized"
+                    "fresh named-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
                 );
             }
             let BranchUpdateResult {
