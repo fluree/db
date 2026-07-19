@@ -245,12 +245,13 @@ fn topk_pushdown_enabled() -> bool {
 /// into, which the hash-join / group-aggregate `record_alloc`s never covered.
 /// OFF is a clean revert to the prior behavior (scan path invisible to the budget;
 /// the `checkpoint()` polls degrade to pure cancellation checks because the scan
-/// records nothing). The counter is query-lifetime cumulative and never
-/// decremented, so a genuinely-streaming large scan is accounted as if all its
-/// windows were simultaneously resident — the intended conservative direction
-/// (over-count only ever aborts a query already near the budget), matching the
-/// existing fold/join accounting; a high-water refinement is deferred with the
-/// excluded per-file buffer accounting (V2 site B).
+/// records nothing). Each materialized window is charged then RELEASED once emitted
+/// (it has a provable drop point), so a long streaming scan accounts only its
+/// resident window rather than the all-time sum of every freed window — that sum
+/// otherwise false-aborts a bounded-memory long scan (q038). The retained parent-map
+/// build (A2) and the per-file buffers (V2 site B, still excluded) are the remaining
+/// non-released allocations; A2 genuinely persists so its cumulative charge is
+/// correct, and site B needs its own release pairing.
 fn scan_mem_accounting_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_SCAN_MEM_ACCOUNTING"))
@@ -1459,20 +1460,26 @@ impl R2rmlScanOperator {
 
             // F-AUD-3 site A1: account the materialized window against the query
             // memory budget so a wide non-aggregate crawl (the previously-blind scan
-            // path) trips a typed `MemoryBudgetExceeded` instead of OOMing. The window
-            // is bounded (~`materialize_window_rows`) so one window cannot itself OOM;
-            // `checkpoint()` here aborts once the cumulative recorded bytes (this
-            // window plus every prior one and any upstream fold/join) cross the
-            // budget, before the loop pulls another. Cumulative, never decremented —
-            // see `scan_mem_accounting_enabled`.
-            if scan_mem_accounting_enabled() {
-                let window_est = produced
+            // path) trips a typed `MemoryBudgetExceeded` instead of OOMing. Charge the
+            // resident window and `checkpoint()` BEFORE doing more work, so an oversized
+            // window (or this window on top of a retained A2 fact-parent build / an
+            // upstream fold) aborts typed. The window is then RELEASED once emitted
+            // (below) — it has a provable drop point, so a streaming scan of N
+            // sequentially-freed windows accounts only the resident one instead of
+            // their all-time sum. Without the release, ~70 freed 512K-row windows of a
+            // long un-fused-COUNT scan (q038) SUM past the budget and false-abort a
+            // query whose per-window resident memory is bounded and fine.
+            let window_est = if scan_mem_accounting_enabled() {
+                let est = produced
                     .len()
                     .saturating_mul(num_cols)
                     .saturating_mul(crate::context::BINDING_EST_BYTES);
-                ctx.record_alloc(window_est);
+                ctx.record_alloc(est);
                 ctx.checkpoint()?;
-            }
+                est
+            } else {
+                0
+            };
 
             if !produced.is_empty() {
                 emit_produced_window(
@@ -1487,6 +1494,16 @@ impl R2rmlScanOperator {
                     &mut self.pending,
                     ctx,
                 )?;
+            }
+
+            // The window has been handed off (its rows copied into `columns` / the
+            // bounded `self.pending` overflow) and `produced` drops at the end of this
+            // iteration — release its charge so only the in-flight window is counted.
+            // The retained overflow is bounded (≤ one window, drained before the next
+            // pull) and intentionally left untracked (minimal per V2 site B). The A2
+            // fact-parent build charge is NOT released — that map genuinely persists.
+            if window_est != 0 {
+                ctx.release(window_est);
             }
             // Geometric window growth. A budgeted (LIMIT) scan starts with a small
             // window (~the remaining budget) so a selective query does not explode
@@ -2554,9 +2571,10 @@ fn build_parent_lookup(
         // worst-case contribution and checkpoint inside the build loop so a
         // budget-exceeding build aborts typed (`MemoryBudgetExceeded`) BEFORE the
         // whole map is resident, instead of OOMing. `num_rows` over-counts skipped
-        // (null-subject / null-key) rows — deliberately conservative. Cumulative like
-        // site A1; the map is genuinely retained while built, so cumulative == the
-        // resident footprint for this structure.
+        // (null-subject / null-key) rows — deliberately conservative. Unlike the A1
+        // scan window (released on hand-off), this charge is NOT released: the lookup
+        // is genuinely retained for the whole join, so the cumulative charge correctly
+        // equals its resident footprint.
         if scan_mem_accounting_enabled() {
             ctx.record_alloc(batch.num_rows.saturating_mul(PARENT_ENTRY_EST_BYTES));
             ctx.checkpoint()?;
@@ -2904,6 +2922,125 @@ mod tests {
         assert!(
             matches!(err, QueryError::MemoryBudgetExceeded { .. }),
             "wide crawl window must abort typed, got {err:?}"
+        );
+    }
+
+    /// F-AUD-3 site A1 — q038 regression (the false-abort the live re-bless caught).
+    /// A long non-aggregate scan streams many windows that are each materialized then
+    /// FREED; the per-window budget charge is released on hand-off, so the windows do
+    /// not SUM to a false over-budget. Here 64 one-row windows (charge ~528 B each)
+    /// run under an 8000 B ceiling: each resident window fits and the scan COMPLETES —
+    /// whereas the pre-fix cumulative counter crossed the ceiling within ~16 windows
+    /// and false-aborted a bounded-memory scan. The single-window abort test above
+    /// (an oversized window on a 1-byte ceiling) still passes: the checkpoint fires
+    /// while the window is charged, before it is released.
+    #[tokio::test]
+    async fn r3b_scan_windows_release_no_false_abort() {
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::QueryCancellation;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        const N_WINDOWS: usize = 64;
+
+        #[derive(Debug)]
+        struct ManyRowsProvider;
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for ManyRowsProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "STORE_KEY".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                // N single-row batches → with window_rows pinned to 1, one window each.
+                let batches: Vec<Result<ColumnBatch>> = (0..N_WINDOWS as i64)
+                    .map(|k| {
+                        Ok(ColumnBatch::new(
+                            Arc::clone(&schema),
+                            vec![Column::Int64(vec![Some(k + 1)])],
+                        )
+                        .unwrap())
+                    })
+                    .collect();
+                Ok(Box::pin(futures::stream::iter(batches)))
+            }
+        }
+
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/storeKey"),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let provider = ManyRowsProvider;
+
+        let cancel = QueryCancellation::new();
+        // Between one window (~528 B) and the naive cumulative (64×528 ≈ 34 KB): the
+        // pre-fix counter crosses this within ~16 windows; released windows never do.
+        cancel.set_memory_limit(8000);
+        let mut ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+        ctx.r2rml_table_provider = Some(&provider);
+
+        let pattern =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        op.mapping = Some(Arc::clone(&mapping));
+
+        let mut progress = op
+            .build_progress(&ctx, Batch::single_empty())
+            .await
+            .expect("build_progress")
+            .expect("wildcard crawl resolves the one TriplesMap");
+        let num_cols = op.schema().len();
+        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+
+        let mut windows = 0usize;
+        loop {
+            progress.window_rows = 1; // pin one row per window (bypass geometric growth) — env-free.
+            let more = op
+                .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+                .await
+                .expect("a bounded-resident streaming scan must NOT false-abort on the budget");
+            // Simulate the consumer draining the emitted batch so nothing accumulates
+            // outside the released window charge.
+            for c in &mut columns {
+                c.clear();
+            }
+            op.pending.clear();
+            // The window charge is released on hand-off, so live accounted memory
+            // never approaches the naive cumulative — it stays within one window.
+            assert!(
+                ctx.mem_used() < 8000,
+                "released window charge must keep live memory under budget, got {}",
+                ctx.mem_used()
+            );
+            if !more {
+                break;
+            }
+            windows += 1;
+            assert!(windows < 1000, "safety bound");
+        }
+        assert!(
+            windows >= N_WINDOWS,
+            "the whole streaming scan must complete; got {windows} windows"
         );
     }
 

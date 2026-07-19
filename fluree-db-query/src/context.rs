@@ -806,6 +806,16 @@ impl<'a> ExecutionContext<'a> {
         self.cancellation.record_alloc(bytes);
     }
 
+    /// Release `bytes` previously recorded via [`record_alloc`](Self::record_alloc)
+    /// for an allocation with a provable drop point (e.g. a materialized scan window
+    /// that has been emitted and is about to drop). Saturating. Only valid for
+    /// non-persistent allocations — persistent join/aggregate/lookup buffers must
+    /// never be released. See [`QueryCancellation::release`].
+    #[inline]
+    pub fn release(&self, bytes: usize) {
+        self.cancellation.release(bytes);
+    }
+
     /// Retained query memory recorded so far via [`record_alloc`](Self::record_alloc).
     #[inline]
     pub fn mem_used(&self) -> usize {
