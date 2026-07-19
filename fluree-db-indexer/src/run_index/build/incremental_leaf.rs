@@ -83,6 +83,21 @@ pub struct LeafUpdateOutput {
     pub matched: Vec<RunRecordV2>,
 }
 
+/// One key range's portion of the winner and superseded streams, sliced
+/// together so the two can never be indexed inconsistently. Constructed
+/// only by the paired slicing functions ([`slice_streams_to_leaflets`],
+/// `slice_streams_to_leaves`), which establish the co-routing invariant at
+/// the single point where slices come into existence: a range without
+/// novelty holds no superseded events, because every superseded identity
+/// routes with its winner.
+#[derive(Clone, Copy)]
+pub struct StreamSlices<'a> {
+    pub novelty: &'a [RunRecordV2],
+    pub novelty_ops: &'a [u8],
+    pub superseded: &'a [RunRecordV2],
+    pub superseded_ops: &'a [u8],
+}
+
 // ============================================================================
 // Processed leaflet (internal)
 // ============================================================================
@@ -121,17 +136,18 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
         // No novelty — return the leaf unchanged.
         // The caller should detect this and skip the update entirely,
         // but we handle it gracefully.
+        debug_assert!(
+            input.superseded.is_empty(),
+            "a leaf without novelty cannot hold superseded events: every \
+             superseded identity routes with its winner"
+        );
         return passthrough_entire_leaf(input);
     }
 
     let header = decode_leaf_header_v3(input.leaf_bytes)?;
     let dir = decode_leaf_dir_v3_with_base(input.leaf_bytes, &header)?;
 
-    // Slice novelty to leaflets; superseded route identically.
-    let novelty_slices =
-        slice_novelty_to_leaflets(input.novelty, input.novelty_ops, &dir, input.order);
-    let superseded_slices =
-        slice_novelty_to_leaflets(input.superseded, input.superseded_ops, &dir, input.order);
+    let leaflet_slices = slice_streams_to_leaflets(input, &dir);
 
     // Process each leaflet.
     let mut processed: Vec<ProcessedLeafletV3> = Vec::with_capacity(
@@ -139,10 +155,10 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
     );
     let mut matched: Vec<RunRecordV2> = Vec::new();
 
-    for (i, (nov_slice, ops_slice)) in novelty_slices.iter().enumerate() {
+    for (i, slices) in leaflet_slices.iter().enumerate() {
         let entry = &dir.entries[i];
 
-        if nov_slice.is_empty() {
+        if slices.novelty.is_empty() {
             // No novelty overlaps this leaflet — passthrough.
             processed.push(passthrough_leaflet(
                 input.leaf_bytes,
@@ -156,8 +172,8 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
                 input,
                 entry,
                 dir.payload_base,
-                (nov_slice, ops_slice),
-                superseded_slices[i],
+                (slices.novelty, slices.novelty_ops),
+                (slices.superseded, slices.superseded_ops),
                 &mut matched,
             )?;
             processed.append(&mut merged);
@@ -173,6 +189,34 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
 // ============================================================================
 // Novelty slicing
 // ============================================================================
+
+/// Slice both streams to leaflets as paired [`StreamSlices`], checking the
+/// co-routing invariant where the slices are created.
+fn slice_streams_to_leaflets<'a>(
+    input: &LeafUpdateInput<'a>,
+    dir: &DecodedLeafDirV3,
+) -> Vec<StreamSlices<'a>> {
+    let novelty = slice_novelty_to_leaflets(input.novelty, input.novelty_ops, dir, input.order);
+    let superseded =
+        slice_novelty_to_leaflets(input.superseded, input.superseded_ops, dir, input.order);
+    novelty
+        .into_iter()
+        .zip(superseded)
+        .map(|((novelty, novelty_ops), (superseded, superseded_ops))| {
+            debug_assert!(
+                !novelty.is_empty() || superseded.is_empty(),
+                "a leaflet without novelty cannot hold superseded events: \
+                     every superseded identity routes with its winner"
+            );
+            StreamSlices {
+                novelty,
+                novelty_ops,
+                superseded,
+                superseded_ops,
+            }
+        })
+        .collect()
+}
 
 /// Slice novelty records and ops to leaflets using half-open boundary intervals.
 ///
