@@ -14,6 +14,7 @@
 use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{same_identity_v2, RunRecordV2};
+use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_binary_index::read::column_types::ColumnBatch;
 use fluree_db_core::subject_id::SubjectId;
 use std::cmp::Ordering;
@@ -363,37 +364,21 @@ fn gather_identity_events(
     events.push((*nov, op));
 }
 
-/// Walk one identity's in-window events chronologically from its base
-/// presence, recording a history entry for each real state transition. Ops
-/// that repeat the current state are no-ops and record nothing.
-///
-/// The transition into the final asserted state is NOT recorded: it is the
-/// materialized row, which carries its own assert — replay synthesizes an
-/// assert event from the base row, and history queries read the row
-/// directly, so a sidecar entry for it would duplicate the event.
+/// Resolve one identity's in-window events to transitions (see
+/// [`resolve_transitions`]) and record them as history entries. The
+/// transition into the final asserted state is the materialized row, which
+/// carries its own assert, and is not recorded.
 ///
 /// Returns whether any transition occurred (recorded or row-carried).
 fn push_transition_entries(
-    events: &mut [(RunRecordV2, u8)],
+    events: &mut Vec<(RunRecordV2, u8)>,
     base_present: bool,
     new_history: &mut Vec<HistEntryV2>,
 ) -> bool {
-    // Same-`t` tie: retract sorts first, matching the same-`t` retract-wins
-    // resolution used by the dedup and the query overlay.
-    events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
-    let mut present = base_present;
-    let mut changed = false;
+    let row = resolve_transitions(events, base_present);
+    let changed = row.is_some() || !events.is_empty();
     for &(rec, op) in events.iter() {
-        let asserts = op == 1;
-        if asserts != present {
-            new_history.push(record_to_hist_entry(&rec, op));
-            present = asserts;
-            changed = true;
-        }
-    }
-    if changed && present {
-        // The last transition is the assert that becomes the row.
-        new_history.pop();
+        new_history.push(record_to_hist_entry(&rec, op));
     }
     changed
 }

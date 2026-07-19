@@ -16,6 +16,7 @@ use fluree_db_binary_index::format::history_sidecar::HistEntryV2;
 use fluree_db_binary_index::format::leaf::{LeafInfo, LeafWriter};
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
+use fluree_db_binary_index::format::transitions::resolve_transitions;
 use fluree_db_core::ContentId;
 use fluree_db_core::GraphId;
 use std::io;
@@ -221,7 +222,9 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
             events.clear();
             events.extend(history);
             events.push((record, op));
-            let row = resolve_lifecycle(&mut events);
+            // A rebuild sees the complete log, so lifecycles walk from
+            // absent; `events` is left holding the sidecar transitions.
+            let row = resolve_transitions(&mut events, false);
             if !config.skip_history {
                 for &(rec, rec_op) in &events {
                     writer.push_history_entry(
@@ -282,42 +285,6 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
 // ============================================================================
 // Helpers
 // ============================================================================
-
-/// Resolve one identity's full event log to its sidecar transitions, in
-/// place, and return its materialized row.
-///
-/// Events walk chronologically from absent — a rebuild sees the complete log
-/// — so each op that changes state is a transition, and ops that repeat the
-/// current state (a re-assert of a present fact, a retract of an absent one)
-/// are no-ops. The transition into the final asserted state is the
-/// materialized row and is returned rather than kept in `events`: the row
-/// carries its own assert (replay synthesizes it from the base row, and
-/// history queries read the row directly), so a sidecar entry for it would
-/// duplicate the event. `events` is left holding exactly the transitions
-/// that precede the row. Same-`t` ties walk retract-first, matching the
-/// same-`t` retract-wins resolution used everywhere else.
-fn resolve_lifecycle(events: &mut Vec<(RunRecordV2, u8)>) -> Option<RunRecordV2> {
-    events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
-    let mut present = false;
-    let mut write = 0;
-    for read in 0..events.len() {
-        let (rec, op) = events[read];
-        let asserts = op == 1;
-        if asserts == present {
-            continue;
-        }
-        present = asserts;
-        events[write] = (rec, op);
-        write += 1;
-    }
-    events.truncate(write);
-    if present {
-        let (row, _) = events.pop().expect("present state implies a final assert");
-        Some(row)
-    } else {
-        None
-    }
-}
 
 fn create_graph_dir(index_dir: &Path, g_id: u16, order_name: &str) -> io::Result<PathBuf> {
     let graph_dir = index_dir.join(format!("graph_{g_id}/{order_name}"));
