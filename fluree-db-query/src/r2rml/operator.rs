@@ -2855,6 +2855,63 @@ mod tests {
         ));
     }
 
+    /// C3 (F-AUD-20): the drain loop must actually STOP MID-SWEEP — not merely bail
+    /// up front on an already-cancelled empty stream (the two tests above). Here a
+    /// 5-batch stream cancels the query *while producing its first batch*; the loop
+    /// must consume exactly that one batch and then return `Cancelled` at the next
+    /// checkpoint, leaving the remaining four unread. Without the per-iteration
+    /// `check_cancelled()` the loop would drain all five (poll count 5).
+    #[tokio::test]
+    async fn collect_stream_stops_a_drain_loop_mid_sweep() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        let polls = Arc::new(AtomicUsize::new(0));
+
+        let cancel_from_stream = cancellation.clone();
+        let polls_in = Arc::clone(&polls);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::unfold(0usize, move |i| {
+            let cancel_from_stream = cancel_from_stream.clone();
+            let polls_in = Arc::clone(&polls_in);
+            async move {
+                if i >= 5 {
+                    return None;
+                }
+                polls_in.fetch_add(1, Ordering::SeqCst);
+                // Cancel as the FIRST batch is produced; the loop's next-iteration
+                // checkpoint must catch it before pulling batch 2.
+                if i == 0 {
+                    cancel_from_stream.cancel();
+                }
+                let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                    name: "K".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                }]));
+                let batch = ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap();
+                Some((Ok(batch), i + 1))
+            }
+        }));
+
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let result = collect_stream(stream, &ctx).await;
+        assert!(
+            matches!(result, Err(QueryError::Cancelled { .. })),
+            "a mid-sweep cancel must stop the drain, got {result:?}"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the loop consumed only the first batch, not the whole 5-batch stream"
+        );
+    }
+
     /// F-AUD-3 site A1 — specimen 071cd59f regression. A wide non-aggregate crawl
     /// (`?s ?p ?o`) materializes a window of bindings that the pre-fix scan path
     /// never recorded against the memory budget, so a runaway crawl OOM'd instead of
