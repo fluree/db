@@ -142,3 +142,117 @@ applied", oracle unchanged).
 - Item **14** adds ONE new default-on switch **`FLUREE_R2RML_INFO_MEMBER_ROUTING`**
   (off = the strict `t == 0` reroute, the prior behavior). Needs a SWITCHES.md row.
 </content>
+
+# PR-HARNESS — gate record (audit Tier-1/hygiene, leaf on perf/audit-coverage)
+
+Branch `perf/audit-harness` (base `perf/audit-coverage` @ `729cd686c`). Closes
+F-AUD-18 (stale perf baseline), F-AUD-19 (kill-switch hygiene / SWITCHES.md), F-AUD-20
+(resilience coverage), + the R-1522 count_shortcut_eligible rider (landed upstream as
+`3ece996fd`; my redundant commit dropped on rebase). CI does not fire on this branch
+(base ≠ main); this is the reproduction of record.
+
+## THE LIVE GATE — verification of record for the whole stack
+
+`vbench compare --run <merged> --gate` → **77 records, 0 hash mismatch(es), 0 perf
+violation(s), exit 0.** Correctness passes end-to-end at the final integrated head
+(#1521 mem-fix + #1522 coverage + this PR). The drift-set 300% overrides absorbed the
+loadTable-GET network variance (0 perf violations).
+
+## Re-bless record (F-AUD-18)
+
+- **native-sf01**: 54 → **77** entries, ZERO timeout caps (was N/A — native has no DNFs);
+  all 74 oracles reproduced exactly (no native regression).
+- **virtual-sf01**: was 54 entries blessed_from `7d77218e2` with **33 pinned at 180000ms**
+  (DNF caps blessed as budgets) + 14 missing; now **77 entries, ZERO at 180000**. Six are
+  honest no-baseline (`is_unblessable_wall`): q013/q034/q051 (expected-virtual-error) +
+  q056/q057/q059 (see finding). Every other member carries a real wall.
+
+## Splice methodology (honest, documented)
+
+The live re-bless is a SPLICE across two heads because the #1521 abort fix cascaded
+after the full run. The blessed baseline = 76 valid records from the full 77-query run at
+the pre-fix head `73a7694bf` + a post-fix single-flight re-run of the accounting-sensitive
+subset {q038, q014, q069, q073, q075, q077} at `cd3779480`. The 71 non-subset records are
+valid at the final head because the #1521 fix changes only the memory ACCOUNTING (it
+affects exactly the members that were false-aborting, not the completing queries). All
+three JSONLs ship in `audit-2026-07/data/`: `virtual-full-73a7694bf-prefix.jsonl`,
+`virtual-splice-cd3779480-postfix.jsonl`, `virtual-rebless-merged.jsonl` (the bless/gate
+input). All PAT-scrubbed (`grep -Ff` + secret-marker scan).
+
+## New / changed member walls (live virtual-sf01, hot median)
+
+| member | item | status | wall | note |
+|--------|------|--------|------|------|
+| q069 filter_in_fkref | 7 | ok | 325 ms | FK-IRI IN declines to prune (files_pruned=0), documented follow-on |
+| q070 scalar_values_glaccount | 7 | ok | 1259 ms | scalar VALUES/IN **prunes 7670 files** |
+| q071 asc_topk_order_total | 8 | ok | 250 ms | ASC scan-side top-k |
+| q072 timestamp_range_webevent | 10 | ok | 127 ms | timestamp manifest pushdown |
+| q073 optional_budget_order_customer | 11 | ok | 1991 ms | OPTIONAL budget forwarded (vs probe-04's 68,828× amplification) |
+| q074 limit_budget_control | 11 | ok | 21 ms | control |
+| q075 minmax_order_total | 9 | ok | 120 ms | ungrouped MIN/MAX fused |
+| q076 minmax_order_total_by_channel | 9 | ok | 141 ms | grouped MIN/MAX fused |
+| q077 count_current_enterprise_customers | 9b | ok | 64122 ms | multi-constraint COUNT fuses (streams 332 files / ~129M rows) |
+| q038 count_current_customers | (9b class) | ok | 58154 ms | ungrouped filtered COUNT — fusion still DECLINES (see finding) |
+| q022 current_customers_by_segment | fused-agg | ok | 87 ms | grouped filtered COUNT **fuses** |
+| q061 …_by_segment_dataset | fused-agg | ok | 93 ms | FROM-path grouped **fuses** |
+
+q077 = 64.1 s virtual vs 65.9 s native — the walls CONVERGE on the doubly-constrained
+COUNT (both planner-bound; supersedes the earlier "virtual is the fast path" phrasing,
+which compared against a 133 s dev-build native).
+
+## FINDING — memory-abort false-positives (F-AUD-3 / #1521), now FIXED
+
+The pre-fix full run aborted 4 members (q038, q056, q057, q059) with
+`MemoryBudgetExceeded` (~8.6–9.4 GB) at the 8 GiB budget (macOS fallback) — false
+positives of #1521's cumulative-no-decrement counter (it summed total-rows-streamed, not
+resident memory, on long bounded-window streams). MEASURED: q038 completes in 52.5 s with
+`FLUREE_SCAN_MEM_ACCOUNTING=off`. impl-mem's window-scoped release fix (`cfd773d75`) lands
+in the cascade; the post-fix subset re-run **confirms q038 completes (58.2 s, no abort)** —
+the fix's live confirmation. q056/q057/q059 (exploration-wildcard family) were NOT in the
+lead's re-run subset, so they remain no-baseline from the pre-fix records (the fix would
+let them complete too; a follow-up re-run would bless them — they are a known heavy
+whole-warehouse-read family regardless).
+
+The bless path guard was broadened this PR (`is_dnf_wall` → `is_unblessable_wall`) so an
+error/abort wall (not just a DNF timeout) blesses as no-baseline — otherwise the abort
+time would have been pinned as a budget.
+
+## q038 fusion — PARTIAL, not CLOSED (F-AUD-8 ladder refinement)
+
+q038 = `SELECT (COUNT(*)) WHERE { ?s a edw:Customer ; edw:isCurrent true }` uses the
+constant-object TRIPLE form (not a SPARQL FILTER), identical to the fusing q077/q022. It
+still materializes (58 s), so 9b did NOT admit its exact shape. Discriminator:
+ungrouped-vs-grouped — q022 (no-FROM, GROUPED, same isCurrent) fuses at 87 ms; q038
+(no-FROM, UNGROUPED COUNT(*)) declines. The matching decline is the empty-GROUP-BY cost
+guard `if filter.is_some() && group_by.is_empty()` (`fused_aggregate.rs:441`), which fires
+only if q038's constraint arrives as a residual FILTER rather than a folded
+`star_constraint`. So the ladder's q038 "886× payoff" is **PARTIAL**: q077-class
+(FROM-path multi-constraint) and grouped (q022) constant-object COUNTs fuse; q038's exact
+ungrouped direct-path single-constraint form does not yet. A #1522 follow-up (one code
+trace).
+
+## Code gates (verbatim, at the final rebased head)
+
+- **fmt:** `cargo fmt --check` exits 1 SOLELY on the pre-existing `hash_join.rs:1070/1120`
+  base drift (inherited, deliberately left per db-verify-gotchas / cov-scan precedent). All
+  changed files are fmt-clean.
+- **clippy:** `cargo clippy -p fluree-bench-virtual -p fluree-db-query --all-targets
+  --no-deps` → exit 0.
+- **test (db-query):** `cargo test -p fluree-db-query` → exit 0
+  (`count_shortcut_declines_constraints_filter_group_and_non_count` upstream,
+  `collect_stream_stops_a_drain_loop_mid_sweep` this PR, E1 ON-path test).
+- **test (bench-virtual):** `cargo test -p fluree-bench-virtual --bins` → exit 0, 35 passed
+  (incl. `is_unblessable_wall_flags_non_completions_and_deadline_walls`,
+  `write_perf_blesses_dnf_as_no_baseline_not_the_timeout_cap` w/ the error-abort case);
+  `shipped_corpus_is_valid` = 77.
+- **test (db-api, iceberg):** `cargo test -p fluree-db-api --features iceberg` → exit 0.
+
+## Resilience coverage assessment (F-AUD-20)
+
+Largely closed by the implementation PRs; PR-HARNESS adds the one genuine gap. Present +
+passing: R3-B `r3b_scan_window_budget_aborts_typed` + `r3b_parent_build_budget_aborts_typed`
++ `shared_ceiling_trips_each_query_at_its_divided_budget` (#1521); PR-8 429
+`retries_on_429_then_succeeds` + `gives_up_after_max_retries` + backoff-bound (wiremock);
+C2 /info `serve_virtual_stats_only_for_empty_shell_graph_source` + `info_member_routing_*`
++ `merge_virtual_into_native_*` + `mor_approximate_tables_*` (#1522). Added: C3
+`collect_stream_stops_a_drain_loop_mid_sweep`.
