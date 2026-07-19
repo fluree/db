@@ -32,16 +32,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 // Group nodes (breaking the invariant below), this assertion
                 // catches it in debug/test builds before silent mis-scoping.
                 debug_assert!(
-                    patterns.iter().filter(|p| matches!(p, SparqlGraphPattern::Group { .. })).all(|p| {
-                        // A nested Group must contain ≥ 2 children — the parser
-                        // returns a single child directly (without Group wrapping)
-                        // when parse_group_graph_pattern encounters only one pattern.
-                        matches!(p, SparqlGraphPattern::Group { patterns: inner, .. } if inner.len() >= 2)
-                    }),
-                    "Nested Group node with a single child detected — \
-                     the parser should return single patterns directly, not \
-                     wrapped in a Group.  This would cause incorrect scope \
-                     boundary lowering.  See parse_group_graph_pattern()."
+                    patterns
+                        .iter()
+                        .filter(|p| matches!(p, SparqlGraphPattern::Group { .. }))
+                        .all(|p| {
+                            // A nested Group is either multi-child, or a single
+                            // scope-sensitive child (FILTER/BIND/Group) that the parser
+                            // deliberately keeps wrapped to preserve the `{ }` scope
+                            // boundary (GraphPattern::is_scope_sensitive). Every other
+                            // single child is unwrapped to bare form by the parser, so a
+                            // single non-scope-sensitive child here would mean a
+                            // synthetic wrapper — a bug that mis-scopes lowering.
+                            matches!(p, SparqlGraphPattern::Group { patterns: inner, .. }
+                            if inner.len() >= 2
+                                || (inner.len() == 1 && inner[0].is_scope_sensitive()))
+                        }),
+                    "Nested Group node with a single non-scope-sensitive child \
+                     detected — the parser unwraps such children to bare form; only \
+                     FILTER/BIND/Group children stay wrapped.  This would cause \
+                     incorrect scope boundary lowering.  See parse_group_graph_pattern()."
                 );
 
                 let mut result = Vec::new();

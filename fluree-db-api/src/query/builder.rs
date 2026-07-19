@@ -789,6 +789,57 @@ impl<'a> FromQueryBuilder<'a> {
         }
     }
 
+    /// Route a subgraph ("crawl") projection over a single-source virtual
+    /// (R2RML) dataset through the R2RML operator instead of native binary-index
+    /// hydration — which has no flakes for a virtual dataset and returns `[]`
+    /// (the deployed "View Instances shows no instances" bug on the ledger-scoped
+    /// / connection query path).
+    ///
+    /// Returns `Ok(None)` — so the caller runs its normal formatting path
+    /// unchanged — for a non-crawl query (cheapest gate first), a query whose
+    /// dataset spec names anything other than exactly one graph (a federated
+    /// multi-source crawl must NOT collapse to a single source), or when the
+    /// resolved view is not graph-source-backed (a genuinely native ledger, which
+    /// `maybe_expand_crawl` filters out).
+    #[cfg(feature = "iceberg")]
+    async fn try_expand_crawl(
+        &self,
+        json: &JsonValue,
+        r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
+        execution: &QueryExecutionOptions,
+        format_config: &FormatterConfig,
+    ) -> Result<Option<JsonValue>> {
+        // Cheapest possible gate: an ordinary (non-crawl) query pays only this.
+        if !crate::graph_source::crawl::is_wildcard_crawl(json) {
+            return Ok(None);
+        }
+        // Resolve the single target ledger from the query's own dataset spec. A
+        // crawl over a federated multi-source dataset must not collapse to one
+        // source, so bail unless exactly one graph is specified.
+        let (spec, _) = parse_dataset_spec(json)?;
+        if spec.default_graphs.len() + spec.named_graphs.len() != 1 {
+            return Ok(None);
+        }
+        let alias = spec
+            .default_graphs
+            .first()
+            .or_else(|| spec.named_graphs.first())
+            .expect("exactly one graph checked above");
+        let view = self
+            .fluree
+            .db_or_graph_source(alias.identifier.as_str())
+            .await?;
+        crate::graph_source::crawl::maybe_expand_crawl(
+            self.fluree,
+            &view,
+            Some(json),
+            r2rml,
+            execution.clone(),
+            format_config,
+        )
+        .await
+    }
+
     // --- Shared setters ---
 
     /// Set the query input as JSON-LD.
@@ -1009,6 +1060,20 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // the main query runs, so it is routed through R2RML rather than native
+        // hydration (which returns `[]`). `as_jsonld()` borrows `input` (Copy),
+        // leaving it intact for the paths below.
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            if let Some(expanded) = self
+                .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
+                .await?
+            {
+                return Ok(expanded);
+            }
+        }
         // SPARQL policy via connection opts (multi-query aliases) — see
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
@@ -1159,6 +1224,19 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // the main query runs; serialize the expanded documents to a string to
+        // match this terminal's return type.
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            if let Some(expanded) = self
+                .try_expand_crawl(json, r2rml_pair, &execution, &format_config)
+                .await?
+            {
+                return serde_json::to_string(&expanded).map_err(ApiError::from);
+            }
+        }
         // SPARQL policy via connection opts (multi-query aliases) — see
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)
@@ -1328,6 +1406,24 @@ impl<'a> FromQueryBuilder<'a> {
         let tracking = self.core.tracking.take();
         let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
+        // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
+        // dispatching the tracked query. The crawl has no fuel/policy/time stats,
+        // so it returns a 200 response with empty tracking. Boxed like the
+        // dispatch futures below to keep this frame small (fluree/db#1408).
+        #[cfg(feature = "iceberg")]
+        if let Some(json) = input.as_jsonld() {
+            let r2rml_pair = r2rml.as_ref().map(|(p, t)| (p.as_ref(), t.as_ref()));
+            let fc = format_config
+                .clone()
+                .unwrap_or_else(|| self.core.default_format());
+            match Box::pin(self.try_expand_crawl(json, r2rml_pair, &execution, &fc)).await {
+                Ok(Some(expanded)) => {
+                    return Ok(TrackedQueryResponse::success(expanded, None));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(TrackedErrorResponse::new(500, e.to_string(), None)),
+            }
+        }
         // SPARQL policy via connection opts (multi-query aliases) — see
         // `connection_opts`. Resolves & applies policy from the merged opts.
         if let (Some(qc_opts), QueryInput::Sparql(sparql)) = (self.connection_opts.as_ref(), input)

@@ -3,6 +3,8 @@
 //! Converts SPARQL CONSTRUCT queries to `Query` with template patterns,
 //! supporting both explicit templates and the `CONSTRUCT WHERE { ... }` shorthand.
 
+use std::collections::HashSet;
+
 use crate::ast::query::ConstructQuery;
 use crate::ast::TriplePattern as SparqlTriplePattern;
 
@@ -11,6 +13,7 @@ use fluree_db_query::ir::{
     ConstructTemplate as QueryConstructTemplate, Pattern, Query, QueryOutput,
 };
 use fluree_db_query::parse::encode::IriEncoder;
+use fluree_db_query::VarId;
 
 use super::select::BaseModifiers;
 use super::{LowerError, LoweringContext, Result};
@@ -34,8 +37,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             }
         };
 
+        // Template blank nodes (`[ ]`, `_:a`, and the desugared cells of an RDF
+        // collection `( ... )`) lower to variables whose registry name keeps the
+        // `_:` prefix the term lowerer assigns. Ordinary query variables are
+        // `?`-prefixed and stable Fluree blank ids (`_:fdb-...`) lower to
+        // constants, so this prefix uniquely marks template blank nodes. The
+        // WHERE clause never binds them, so the output path mints a fresh blank
+        // node per solution for each (see `ConstructTemplate::bnode_vars`).
+        let bnode_vars: HashSet<VarId> = template_patterns
+            .iter()
+            .flat_map(TriplePattern::referenced_vars)
+            .filter(|&v| {
+                self.vars
+                    .try_name(v)
+                    .is_some_and(|name| name.starts_with("_:"))
+            })
+            .collect();
+
         // Build construct template
-        let construct_template = QueryConstructTemplate::new(template_patterns);
+        let construct_template =
+            QueryConstructTemplate::with_bnode_vars(template_patterns, bnode_vars);
 
         // Lower solution modifiers (CONSTRUCT supports ORDER BY, LIMIT, OFFSET but not GROUP BY/HAVING)
         let BaseModifiers {

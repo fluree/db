@@ -248,6 +248,29 @@ impl GraphPattern {
         GraphPattern::Group { patterns, span }
     }
 
+    /// Whether this pattern must keep its enclosing `{ }` scope boundary when it
+    /// is the *only* child of a group, rather than being unwrapped to bare form.
+    ///
+    /// A nested `{ }` block is a SPARQL §18.2.2 group graph pattern, evaluated in
+    /// its own scope. `FILTER` and `BIND` read variables from that scope only, so
+    /// unwrapping `{ FILTER(?v) }` / `{ BIND(expr AS ?v) }` out of its group would
+    /// wrongly expose an enclosing-scope `?v` to them (W3C `filter-nested-2`,
+    /// `dawg-optional-filter-005`). A nested `Group` child is itself a scope
+    /// boundary and must not be flattened into its parent. Every other pattern
+    /// (BGP, OPTIONAL, UNION, MINUS, GRAPH, SERVICE, sub-SELECT, path, VALUES,
+    /// annotation) either introduces no enclosing-scope dependency or manages its
+    /// own scope, so it unwraps safely — keeping common single-pattern groups cheap.
+    ///
+    /// Single source of truth for both the parser's single-child simplification
+    /// (`parse_group_graph_pattern`) and the lowerer's group-scope invariant
+    /// assertion (`lower_graph_pattern`).
+    pub(crate) fn is_scope_sensitive(&self) -> bool {
+        matches!(
+            self,
+            GraphPattern::Filter { .. } | GraphPattern::Bind { .. } | GraphPattern::Group { .. }
+        )
+    }
+
     /// Collect the in-scope variables of this pattern per SPARQL 1.1
     /// §18.2.1 ("Variable Scope"), appending references to `out`.
     /// Duplicates are preserved; callers needing a set should dedupe.

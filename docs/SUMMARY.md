@@ -17,6 +17,7 @@
   - [update](cli/update.md)
   - [query](cli/query.md)
   - [validate](cli/validate.md)
+  - [model](cli/model.md)
   - [multi-query](cli/multi-query.md)
   - [history](cli/history.md)
   - [export](cli/export.md)

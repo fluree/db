@@ -530,6 +530,18 @@ impl<'a> OwnedTransactBuilder<'a> {
                     .await?
             };
 
+            // A registration-only transaction (CREATE GRAPH: zero staged
+            // flakes, but a graph_delta IRI the registry doesn't know yet)
+            // must still COMMIT so the registration persists — only a no-op
+            // whose delta is already fully registered may skip the commit.
+            let registers_new_graph = graph_delta.values().any(|iri| {
+                view.base()
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .is_none()
+            });
+
             // Add extracted transaction metadata and graph delta to commit opts
             let commit_opts = self
                 .core
@@ -538,26 +550,28 @@ impl<'a> OwnedTransactBuilder<'a> {
                 .with_graph_delta(graph_delta.into_iter().collect());
 
             // No-op updates: return success without committing.
-            let (receipt, ledger) =
-                if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
-                    let (base, flakes) = view.into_parts();
-                    debug_assert!(
-                        flakes.is_empty(),
-                        "no-op transaction path requires zero staged flakes"
-                    );
-                    (
-                        fluree_db_transact::CommitReceipt {
-                            commit_id: ContentId::new(ContentKind::Commit, &[]),
-                            t: base.t(),
-                            flake_count: 0,
-                        },
-                        base,
-                    )
-                } else {
-                    self.fluree
-                        .commit_staged(view, ns_registry, &index_config, commit_opts)
-                        .await?
-                };
+            let (receipt, ledger) = if !view.has_staged()
+                && !registers_new_graph
+                && matches!(txn_type, TxnType::Update | TxnType::Upsert)
+            {
+                let (base, flakes) = view.into_parts();
+                debug_assert!(
+                    flakes.is_empty(),
+                    "no-op transaction path requires zero staged flakes"
+                );
+                (
+                    fluree_db_transact::CommitReceipt {
+                        commit_id: ContentId::new(ContentKind::Commit, &[]),
+                        t: base.t(),
+                        flake_count: 0,
+                    },
+                    base,
+                )
+            } else {
+                self.fluree
+                    .commit_staged(view, ns_registry, &index_config, commit_opts)
+                    .await?
+            };
 
             return Ok(self
                 .fluree
@@ -1248,11 +1262,23 @@ impl Fluree {
             txn_meta,
             graph_delta,
         } = stage_result;
+        // See the pre_built_txn path: a registration-only commit (new graph
+        // IRI in the delta, zero flakes) must not take the no-op shortcut.
+        let registers_new_graph = graph_delta.values().any(|iri| {
+            view.base()
+                .snapshot
+                .graph_registry
+                .graph_id_for_iri(iri)
+                .is_none()
+        });
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
 
-        if !view.has_staged() && matches!(txn_type, TxnType::Update | TxnType::Upsert) {
+        if !view.has_staged()
+            && !registers_new_graph
+            && matches!(txn_type, TxnType::Update | TxnType::Upsert)
+        {
             let (base, _) = view.into_parts();
             return Ok(TransactResultRef {
                 receipt: fluree_db_transact::CommitReceipt {

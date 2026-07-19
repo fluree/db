@@ -614,6 +614,26 @@ pub struct R2rmlPattern {
     /// If None, this pattern only materializes subjects (e.g., for rdf:type patterns).
     pub object_var: Option<VarId>,
 
+    /// Variable to bind the predicate IRI (optional).
+    ///
+    /// Set for a variable-predicate pattern (`?s ?p ?o` or `<iri> ?p ?o`). The
+    /// operator binds this variable to each materialized triple's predicate IRI
+    /// (the `rr:predicate` of the POM the object came from), so a wildcard scan
+    /// yields the predicate as well as subject/object rather than leaving `?p`
+    /// unbound. `None` for a constant-predicate or subject-only pattern.
+    pub predicate_var: Option<VarId>,
+
+    /// Variable to bind the subject's class IRI(s) for a variable `rdf:type`
+    /// pattern (`?s rdf:type ?type`, i.e. FQL `@type: ?type` / SPARQL `?s a ?t`).
+    ///
+    /// When set, the operator emits one row per class the row's TriplesMap
+    /// declares (`rr:class`), binding this variable to that class IRI — the same
+    /// scan a bound `class_filter` performs, but projecting the class instead of
+    /// filtering on it. A row whose map declares no class produces no binding
+    /// (the subject has no `rdf:type` triple). `object_var` stays `None`; the
+    /// class is drawn from the mapping, not a table column.
+    pub type_var: Option<VarId>,
+
     /// Specific TriplesMap IRI to use (optional)
     ///
     /// If provided, only this TriplesMap is scanned. Otherwise, the planner
@@ -683,6 +703,8 @@ impl R2rmlPattern {
             subject_var: Some(subject_var),
             subject_constant: None,
             object_var,
+            predicate_var: None,
+            type_var: None,
             triples_map_iri: None,
             predicate_filter: None,
             class_filter: None,
@@ -708,6 +730,8 @@ impl R2rmlPattern {
             subject_var: None,
             subject_constant: Some(subject_constant.into()),
             object_var,
+            predicate_var: None,
+            type_var: None,
             triples_map_iri: None,
             predicate_filter: None,
             class_filter: None,
@@ -731,6 +755,20 @@ impl R2rmlPattern {
         self
     }
 
+    /// Set the predicate variable (`?s ?p ?o` / `<iri> ?p ?o`), bound by the
+    /// operator to each materialized triple's predicate IRI.
+    pub fn with_predicate_var(mut self, var: VarId) -> Self {
+        self.predicate_var = Some(var);
+        self
+    }
+
+    /// Set the type variable (`?s rdf:type ?type`), bound by the operator to the
+    /// subject's declared class IRI(s).
+    pub fn with_type_var(mut self, var: VarId) -> Self {
+        self.type_var = Some(var);
+        self
+    }
+
     /// Set the class filter.
     pub fn with_class(mut self, class: impl Into<String>) -> Self {
         self.class_filter = Some(class.into());
@@ -747,6 +785,12 @@ impl R2rmlPattern {
         }
         if let Some(obj_var) = self.object_var {
             vars.push(obj_var);
+        }
+        if let Some(pv) = self.predicate_var {
+            vars.push(pv);
+        }
+        if let Some(tv) = self.type_var {
+            vars.push(tv);
         }
         for (_, var) in &self.star_bindings {
             vars.push(*var);

@@ -32,12 +32,33 @@ use crate::var_registry::VarId;
 pub struct ConstructTemplate {
     /// Template patterns (resolved TriplePatterns with Sids and VarIds)
     pub patterns: Vec<TriplePattern>,
+    /// Variables that originated as template blank nodes (`[ ]`, `_:a`, or the
+    /// blank cells of a desugared RDF collection `( ... )`).
+    ///
+    /// These are never produced by the WHERE clause, so the CONSTRUCT output
+    /// path must mint a FRESH blank node for each on every solution row —
+    /// shared across a row's template triples, distinct across rows — rather
+    /// than resolving them against the (absent) bindings. Empty for templates
+    /// with no blank nodes, including every JSON-LD/FQL construct and DESCRIBE.
+    pub bnode_vars: HashSet<VarId>,
 }
 
 impl ConstructTemplate {
-    /// Create a new construct template from patterns
+    /// Create a construct template from patterns with no template blank nodes.
     pub fn new(patterns: Vec<TriplePattern>) -> Self {
-        Self { patterns }
+        Self {
+            patterns,
+            bnode_vars: HashSet::new(),
+        }
+    }
+
+    /// Create a construct template carrying its template blank-node variables
+    /// (see [`ConstructTemplate::bnode_vars`]).
+    pub fn with_bnode_vars(patterns: Vec<TriplePattern>, bnode_vars: HashSet<VarId>) -> Self {
+        Self {
+            patterns,
+            bnode_vars,
+        }
     }
 
     /// Collect all variables referenced in the template patterns.

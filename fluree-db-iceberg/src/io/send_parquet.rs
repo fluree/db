@@ -400,6 +400,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             &task.projected_field_ids,
             task.residual_filter.as_ref(),
             task.iceberg_schema.as_deref(),
+            None,
         )
     }
 
@@ -437,6 +438,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     residual_filter,
                     iceberg_schema,
                     runtime,
+                    None,
                 )
                 .await;
             }
@@ -472,6 +474,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         residual_filter,
                         iceberg_schema,
                         runtime,
+                        None,
                     )
                     .await;
                 }
@@ -488,6 +491,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             residual_filter,
             iceberg_schema,
             runtime,
+            None,
         )
         .await
     }
@@ -496,6 +500,14 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// source store or a local cache file) via `RangeBackedChunkReader`,
     /// projecting only the requested columns. Runs the sync decode on a blocking
     /// thread.
+    ///
+    /// `max_rows` bounds the decode to a cheap first-row-group "peek" (see
+    /// [`crate::io::arrow_reader::decode_batches_arrow`]); `None` decodes the
+    /// whole projected file.
+    // Params mirror the `FileScanTask` fields already destructured for the
+    // `spawn_blocking` move plus the storage/runtime/budget; bundling them would
+    // not clarify this internal helper.
+    #[expect(clippy::too_many_arguments)]
     async fn decode_large_file<St: SendIcebergStorage + 'static>(
         storage: Arc<St>,
         path: String,
@@ -504,6 +516,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         residual_filter: Option<Expression>,
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
+        max_rows: Option<usize>,
     ) -> Result<Vec<ColumnBatch>> {
         // Run the sync Arrow decode in a blocking context: native projection +
         // row-group pruning + row filtering over the range-backed reader
@@ -515,12 +528,51 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 &projected_field_ids,
                 residual_filter.as_ref(),
                 iceberg_schema.as_deref(),
+                max_rows,
             )
         })
         .await
         .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?;
 
         result
+    }
+
+    /// Read at most `max_rows` rows from the **first row group** of the task's
+    /// file — a bounded, cheap "peek" for row previews and the LLM data sampler.
+    ///
+    /// Unlike [`Self::read_task`], this never reads the whole file: it drives the
+    /// range-backed chunk reader against the source store, and the row-group-0
+    /// restriction + row budget in
+    /// [`decode_batches_arrow`](crate::io::arrow_reader::decode_batches_arrow)
+    /// mean only the footer plus the first row group's projected column chunks are
+    /// fetched, whatever the file size. It therefore returns at most
+    /// `min(max_rows, rows-in-first-row-group)` rows and does **not** fill the
+    /// disk cache (a peek should not pull a whole file into it).
+    pub async fn read_task_sample(
+        &self,
+        task: &FileScanTask,
+        max_rows: usize,
+    ) -> Result<Vec<ColumnBatch>>
+    where
+        S: Clone + 'static,
+    {
+        if max_rows == 0 {
+            return Ok(Vec::new());
+        }
+        let path = task.data_file.file_path.clone();
+        let file_size = task.data_file.file_size_in_bytes as u64;
+        let storage = Arc::new(self.storage.clone());
+        Self::decode_large_file(
+            storage,
+            path,
+            file_size,
+            task.projected_field_ids.clone(),
+            task.residual_filter.clone(),
+            task.iceberg_schema.clone(),
+            Handle::current(),
+            Some(max_rows),
+        )
+        .await
     }
 
     /// Read file bytes needed for the task using range reads (small files only).
@@ -1204,5 +1256,67 @@ mod tests {
         });
         // year 2020 dropped, year 2024 kept, year null dropped.
         assert_eq!(ids, vec![Some(2)], "decimal-backed integer filter mismatch");
+    }
+
+    /// Bounded first-row-group "peek": `read_task_sample` returns at most `n`
+    /// rows, reads only the FIRST row group, and honors projection — exercising
+    /// the range-backed reader path end to end over the 2-row-group fixture
+    /// (row group 0 = 2 rows, row group 1 = 1 row).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_task_sample_bounds_rows_to_first_row_group() {
+        use crate::io::batch::Column;
+
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let reader = SendParquetReader::new(&source);
+
+        // Whole-file task (empty projection => all columns).
+        let task = whole_file_task(&bytes, None, None);
+
+        // n = 0 => no rows, no read.
+        let none = reader.read_task_sample(&task, 0).await.expect("sample 0");
+        assert_eq!(none.iter().map(|b| b.num_rows).sum::<usize>(), 0);
+
+        // n = 1 => exactly the first row of row group 0.
+        let one = reader.read_task_sample(&task, 1).await.expect("sample 1");
+        let ids = flatten(&one, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        assert_eq!(ids, vec![Some(1)]);
+
+        // n = 2 => all of row group 0.
+        let two = reader.read_task_sample(&task, 2).await.expect("sample 2");
+        assert_eq!(two.iter().map(|b| b.num_rows).sum::<usize>(), 2);
+
+        // n = 10 => still only row group 0's 2 rows (row group 1 is never read),
+        // proving the peek does not scan the whole file.
+        let ten = reader.read_task_sample(&task, 10).await.expect("sample 10");
+        let ids = flatten(&ten, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        });
+        assert_eq!(
+            ids,
+            vec![Some(1), Some(2)],
+            "only the first row group is read"
+        );
+
+        // Projection: sampling a single column yields only that column.
+        let projected = FileScanTask::for_whole_file(task.data_file.clone(), vec![0], None);
+        let sampled = reader
+            .read_task_sample(&projected, 1)
+            .await
+            .expect("sample projected");
+        assert!(
+            sampled[0].column_by_id(0).is_some(),
+            "projected id column present"
+        );
+        assert!(
+            sampled[0].column_by_id(1).is_none(),
+            "name column not projected"
+        );
     }
 }

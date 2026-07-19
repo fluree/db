@@ -729,6 +729,193 @@ async fn e2e_fluree_r2rml_provider_full_flow() {
     }
 }
 
+/// Gated live-Iceberg test for the FQL `@type` by-class regression: a derived
+/// single-table R2RML mapping must return the class's instances for FQL `@type`
+/// (both the flat `?s a <Class>` scan and the `{"?s": ["*"]}` crawl the Solo
+/// "View Instances" screen issues), matching SPARQL `a`.
+///
+/// Skips cleanly (does not fail) unless the live catalog is configured via env:
+///   FLUREE_TEST_ICEBERG_CATALOG_URI   (required — the gate)
+///   FLUREE_TEST_ICEBERG_WAREHOUSE     (required)
+///   FLUREE_TEST_ICEBERG_OAUTH2_SECRET (required; `client_id:client_secret`)
+///   FLUREE_TEST_ICEBERG_OAUTH2_SCOPE  (default `session:role:ICEBERG_READER` —
+///                                      the Snowflake Horizon/Polaris role scope,
+///                                      matching the it_iceberg_*_live suites)
+///   FLUREE_TEST_ICEBERG_TABLE         (default `DW.DIM_GEOGRAPHY`)
+///   FLUREE_TEST_ICEBERG_KEY_COLUMN    (default `GEOGRAPHY_KEY`)
+///
+/// Like the E2E test above it is lenient: a catalog-connection failure warns and
+/// returns rather than failing, so it is safe to leave enabled in CI.
+#[tokio::test]
+async fn live_iceberg_fql_type_returns_instances() {
+    use fluree_db_api::R2rmlCreateConfig;
+
+    // --- Gate: all three connection vars must be present, else skip cleanly. ---
+    let (Ok(catalog_uri), Ok(warehouse), Ok(oauth2_secret)) = (
+        std::env::var("FLUREE_TEST_ICEBERG_CATALOG_URI"),
+        std::env::var("FLUREE_TEST_ICEBERG_WAREHOUSE"),
+        std::env::var("FLUREE_TEST_ICEBERG_OAUTH2_SECRET"),
+    ) else {
+        eprintln!(
+            "Skipping live-Iceberg @type test \
+             (set FLUREE_TEST_ICEBERG_CATALOG_URI / _WAREHOUSE / _OAUTH2_SECRET to run)"
+        );
+        return;
+    };
+    let table = std::env::var("FLUREE_TEST_ICEBERG_TABLE")
+        .unwrap_or_else(|_| "DW.DIM_GEOGRAPHY".to_string());
+    let key_column = std::env::var("FLUREE_TEST_ICEBERG_KEY_COLUMN")
+        .unwrap_or_else(|_| "GEOGRAPHY_KEY".to_string());
+
+    // A derived single-table mapping: subject template + class, no POMs required
+    // for the type-scan (the crawl also exercises predicate/object materialization
+    // via the table's remaining columns).
+    let mapping = format!(
+        r#"@base <http://mapping.fluree.dev/r2rml> .
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix v: <http://example/org/ns> .
+
+<#T> a rr:TriplesMap ;
+  rr:logicalTable [ rr:tableName "{table}" ] ;
+  rr:subjectMap [ rr:template "http://example/org/ns/inst/{{{key_column}}}" ; rr:class v:Thing ] .
+"#
+    );
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ledger = genesis_ledger(&fluree, "live-iceberg-type:main");
+
+    let alias = "fql-type-e2e";
+    let mut config = R2rmlCreateConfig::new(alias, &catalog_uri, &table, mapping)
+        .with_warehouse(&warehouse)
+        .with_mapping_media_type("text/turtle")
+        .with_vended_credentials(true)
+        .with_s3_path_style(true);
+    if let Some((client_id, client_secret)) = oauth2_secret.split_once(':') {
+        let token_url = format!("{catalog_uri}/v1/oauth/tokens");
+        let scope = std::env::var("FLUREE_TEST_ICEBERG_OAUTH2_SCOPE")
+            .unwrap_or_else(|_| "session:role:ICEBERG_READER".to_string());
+        config = config
+            .with_auth_oauth2(&token_url, client_id, client_secret)
+            .with_oauth2_scope(scope);
+    }
+
+    if let Err(e) = fluree.create_r2rml_graph_source(config).await {
+        // Creation reaches the catalog for validation; a connection failure here
+        // is environmental, so warn + skip rather than fail.
+        eprintln!("WARNING: could not create live R2RML graph source: {e}");
+        return;
+    }
+
+    // --- Flat FQL `@type` (bound class) must return the class's instances. ---
+    // Uses the `from`/FromQueryBuilder path with an inline WHERE (the previous
+    // `{"@graph":.., "patterns":[..]}` envelope panicked "Arrays in property
+    // values not yet supported" — it is not a valid FQL WHERE shape).
+    let type_query = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "from": format!("{alias}:main"),
+        "select": ["?s"],
+        "where": {"@id": "?s", "@type": "v:Thing"},
+    });
+    match fluree
+        .query_from()
+        .jsonld(&type_query)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let rows = json.as_array().map_or(0, Vec::len);
+            eprintln!("live-iceberg flat @type returned {rows} rows");
+            assert!(rows > 0, "FQL @type must return the class's instances");
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live @type query failed environmentally: {e}");
+            return;
+        }
+        Err(e) => panic!("FQL @type query failed unexpectedly: {e}"),
+    }
+
+    // --- The `{"?s": ["*"]}` crawl (Solo "View Instances") must return hydrated
+    //     instances, not an empty array. ---
+    let crawl = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "@type": "v:Thing"},
+        "limit": 3,
+    });
+    match fluree
+        .graph(&format!("{alias}:main"))
+        .query()
+        .with_r2rml()
+        .jsonld(&crawl)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let docs = json.as_array().expect("crawl returns a JSON array");
+            eprintln!("live-iceberg crawl returned {} instances", docs.len());
+            assert!(
+                !docs.is_empty(),
+                "the @type crawl must return instances (View Instances regression)"
+            );
+            assert!(
+                docs[0].get("@id").is_some(),
+                "each crawled instance carries an @id"
+            );
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live crawl query failed environmentally: {e}");
+        }
+        Err(e) => panic!("FQL @type crawl failed unexpectedly: {e}"),
+    }
+
+    // --- SAME crawl through the `from`/FromQueryBuilder path (the DEPLOYED
+    //     `POST /v1/fluree/query/<ledger>` route that returned []). Pre-fix this
+    //     native-hydrated the empty index → []; post-fix (FIX 1) it routes
+    //     through R2RML and returns the same hydrated instances as the alias
+    //     path above. ---
+    let crawl_from = serde_json::json!({
+        "@context": {"v": "http://example/org/ns"},
+        "from": format!("{alias}:main"),
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "@type": "v:Thing"},
+        "limit": 3,
+    });
+    match fluree
+        .query_from()
+        .jsonld(&crawl_from)
+        .execute_formatted()
+        .await
+    {
+        Ok(json) => {
+            let docs = json.as_array().expect("crawl returns a JSON array");
+            eprintln!("live-iceberg from-crawl returned {} instances", docs.len());
+            assert!(
+                !docs.is_empty(),
+                "the from/connection-path @type crawl must return instances (deployed \
+                 View Instances regression)"
+            );
+            assert!(
+                docs.iter().all(|d| d.get("@id").is_some()),
+                "each from-crawled instance carries an @id"
+            );
+        }
+        Err(e) if is_environmental(&e.to_string()) => {
+            eprintln!("WARNING: live from-crawl query failed environmentally: {e}");
+        }
+        Err(e) => panic!("FQL from-crawl failed unexpectedly: {e}"),
+    }
+}
+
+/// Whether an error string looks like an environmental (catalog/connection)
+/// failure rather than an engine bug, for the lenient live-test skip path.
+fn is_environmental(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("connection")
+        || m.contains("catalog")
+        || m.contains("oauth")
+        || m.contains("credential")
+}
+
 /// Provider that queries Iceberg directly (without nameservice graph source registration).
 #[derive(Debug)]
 struct IcebergDirectProvider {
@@ -1138,6 +1325,153 @@ async fn engine_e2e_graph_pattern_r2rml_scan() {
         batches.len(),
         total_rows
     );
+}
+
+/// The `rdf:type` IRI, exactly as both SPARQL `a` and FQL `@type` lower it
+/// (predicate `Ref::Iri(rdf::TYPE)`).
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// Build + execute a single-triple `GRAPH <airlines-gs:main> { … }` scan over the
+/// airline mock provider, returning the raw result batches.
+async fn run_airline_graph_scan(
+    ledger: &support::MemoryLedger,
+    provider: &MockR2rmlProvider,
+    vars: &VarRegistry,
+    tp: TriplePattern,
+    output_vars: Vec<VarId>,
+) -> Vec<fluree_db_api::Batch> {
+    let graph_pattern = Pattern::Graph {
+        name: GraphName::Iri("airlines-gs:main".into()),
+        patterns: vec![Pattern::Triple(tp)],
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph_pattern];
+    parsed.output = QueryOutput::select_all(output_vars);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        vars,
+        &executable,
+        r2rml_test_config(&tracker, provider),
+    )
+    .await
+    .expect("R2RML scan should execute")
+}
+
+/// FQL `@type` — both bound (`@type: ex:Airline`) and variable (`@type: ?type`) —
+/// must produce the SAME `rdf:type` R2RML type-scan SPARQL `a` produces: the
+/// bound form returns the class's instances; the variable form binds the class
+/// IRI to `?type` (previously it was dropped, leaving `?type` null). This is the
+/// engine-level counterpart to the `fql_type_lowers_to_same_rdf_type_scan_as_sparql_a`
+/// unit test in `fluree-db-query`.
+#[tokio::test]
+async fn engine_e2e_type_scan_bound_and_variable_parity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-type:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    // --- Bound class: ?s a ex:Airline → the 3 airline instances. ---
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let tp = TriplePattern::new(
+        Ref::Var(s),
+        Ref::Iri(RDF_TYPE_IRI.into()),
+        Term::Iri("http://example.org/Airline".into()),
+    );
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s]).await;
+    let bound_rows: usize = batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert_eq!(
+        bound_rows, 3,
+        "bound @type must return the class's instances (parity with SPARQL `a`)"
+    );
+
+    // --- Variable class: ?s a ?type → 3 rows, each ?type = the class IRI. ---
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let ty = vars.get_or_insert("?type");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Iri(RDF_TYPE_IRI.into()), Term::Var(ty));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, ty]).await;
+    let mut rows = 0;
+    for b in &batches {
+        for r in 0..b.len() {
+            rows += 1;
+            let ty_binding = b.get(r, ty).expect("?type column present");
+            assert_eq!(
+                ty_binding.get_iri().map(std::convert::AsRef::as_ref),
+                Some("http://example.org/Airline"),
+                "variable @type must bind the class IRI, not null"
+            );
+        }
+    }
+    assert_eq!(rows, 3, "one row per instance, each carrying its class IRI");
+}
+
+/// A variable-predicate wildcard (`?s ?p ?o`) must bind `?p` to each triple's
+/// predicate IRI — previously the operator left `?p` unbound, so a wildcard /
+/// crawl scan returned subjects and objects with a null predicate. It must ALSO
+/// emit each subject's `rr:class`-derived `rdf:type` triple (native parity: a
+/// native wildcard returns the type triple alongside the data predicates).
+#[tokio::test]
+async fn engine_e2e_wildcard_binds_predicate_var() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-wild:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, p, o]).await;
+
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    let known_predicates = [
+        "http://example.org/name",
+        "http://example.org/country",
+        "http://example.org/iata",
+        RDF_TYPE,
+    ];
+    let mut rows = 0;
+    let mut type_rows = 0;
+    for b in &batches {
+        for r in 0..b.len() {
+            rows += 1;
+            let p_iri = b
+                .get(r, p)
+                .and_then(fluree_db_query::Binding::get_iri)
+                .map(std::string::ToString::to_string)
+                .expect("?p must be bound to a predicate IRI");
+            assert!(
+                known_predicates.contains(&p_iri.as_str()),
+                "?p bound to a mapping predicate; got {p_iri}"
+            );
+            if p_iri == RDF_TYPE {
+                type_rows += 1;
+                let o_iri = b
+                    .get(r, o)
+                    .and_then(fluree_db_query::Binding::get_iri)
+                    .map(std::string::ToString::to_string)
+                    .expect("type row must bind ?o to an IRI");
+                assert_eq!(
+                    o_iri, "http://example.org/Airline",
+                    "type row object = the declared class"
+                );
+            }
+        }
+    }
+    // 3 airlines × (3 predicate-object maps + 1 rr:class rdf:type) = 12 triples.
+    assert_eq!(
+        rows, 12,
+        "wildcard scan yields one row per (subject, predicate) incl. rdf:type"
+    );
+    assert_eq!(type_rows, 3, "exactly one rdf:type row per subject");
 }
 
 /// Regression (fluree/db#1406 review): a class and a predicate that live in
@@ -3875,13 +4209,16 @@ async fn guard_bound_subject_binds_object_only() {
     );
 }
 
-/// A bound subject with a VARIABLE predicate (`<store/5> ?p ?o`) must NOT convert
-/// to an R2RML pattern: with no `predicate_filter` to resolve the POM and no
-/// predicate-var binding, materialization would bind `?o` across every predicate
-/// with `?p` left NULL. It is left unconverted for normal evaluation. A bound
-/// subject with a CONSTANT predicate still converts.
+/// A bound subject with a VARIABLE predicate (`<store/5> ?p ?o`) now converts to a
+/// bound-subject wildcard scan that binds `?p` via `predicate_var` — this is the
+/// UI's "subject inspector". (Previously it was left unconverted for want of a
+/// predicate-var field.) A bound subject with a CONSTANT predicate still converts.
+///
+/// `#[tokio::test]` (not a plain `#[test]`) because `edw_guard_ledger` builds a
+/// `Fluree`, and the builder spawns the cache event listener — which requires a
+/// live runtime even though this test body never awaits.
 #[tokio::test]
-async fn bound_subject_variable_predicate_not_converted() {
+async fn bound_subject_variable_predicate_binds_predicate_var() {
     let (_fluree, ledger) = edw_guard_ledger();
     let mut vars = VarRegistry::new();
     let p = vars.get_or_insert("?p");
@@ -3892,10 +4229,19 @@ async fn bound_subject_variable_predicate_not_converted() {
         Ref::Var(p),
         Term::Var(o),
     );
-    assert!(
-        convert_triple_to_r2rml(&wildcard, "edw-gs:main", &ledger.snapshot).is_none(),
-        "bound subject + variable predicate must stay unconverted"
+    let pat = convert_triple_to_r2rml(&wildcard, "edw-gs:main", &ledger.snapshot)
+        .expect("bound subject + variable predicate now converts (subject inspector)");
+    assert_eq!(pat.subject_var, None);
+    assert_eq!(
+        pat.subject_constant.as_deref(),
+        Some("http://example.org/store/5")
     );
+    assert_eq!(
+        pat.predicate_var,
+        Some(p),
+        "?p is bound to each triple's predicate"
+    );
+    assert_eq!(pat.object_var, Some(o));
 
     // Control: a constant predicate on the same bound subject still converts.
     let p_id = ledger

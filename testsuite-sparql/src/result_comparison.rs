@@ -149,7 +149,9 @@ fn terms_match(
                 language: al,
             },
         ) => {
-            if el != al {
+            // Language tags compare case-insensitively (RDF 1.1 §3.3 / BCP47),
+            // so a produced `en-US` matches an expected `en-us` (strlang03).
+            if !lang_tags_equal(el, al) {
                 return false;
             }
             let ed_norm = normalize_datatype(ed);
@@ -177,11 +179,27 @@ fn terms_match(
     }
 }
 
-/// Normalize datatype: treat `None` and `Some(xsd:string)` as equivalent.
+/// Normalize datatype: treat `None`, `Some(xsd:string)`, and
+/// `Some(rdf:langString)` as equivalent. A language-tagged literal's datatype
+/// is `rdf:langString` (RDF 1.1), but the SPARQL results format writes only
+/// `xml:lang` (no datatype); the language tag is compared separately, so
+/// folding `rdf:langString` here lets `{lang, no-datatype}` match a fixture
+/// that spells out `rdf:langString` (dawg-langMatches-*).
 fn normalize_datatype(dt: &Option<String>) -> Option<&str> {
     match dt.as_deref() {
-        None | Some("http://www.w3.org/2001/XMLSchema#string") => None,
+        None
+        | Some("http://www.w3.org/2001/XMLSchema#string")
+        | Some("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString") => None,
         Some(s) => Some(s),
+    }
+}
+
+/// Compare two optional language tags case-insensitively (RDF 1.1 §3.3).
+fn lang_tags_equal(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
     }
 }
 

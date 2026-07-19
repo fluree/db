@@ -84,6 +84,10 @@ mod xml_escape;
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
 pub use iri::IriCompactor;
 
+/// Format a single result binding to JSON-LD (used by the graph-source crawl
+/// expansion to render object values identically to the normal formatter).
+pub(crate) use jsonld::format_binding_with_result;
+
 use crate::QueryResult;
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_core::{FuelExceededError, GraphDbRef, Tracker};

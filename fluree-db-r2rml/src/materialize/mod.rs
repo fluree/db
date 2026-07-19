@@ -24,5 +24,5 @@ pub use term::reverse_subject_template;
 // ColumnBatch-based API (for production efficiency)
 pub use term::{
     expand_template_from_batch, get_join_key_from_batch, materialize_object_from_batch,
-    materialize_subject_from_batch,
+    materialize_predicate_from_batch, materialize_subject_from_batch,
 };
