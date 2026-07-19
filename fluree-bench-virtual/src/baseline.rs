@@ -236,26 +236,32 @@ pub fn write_expected(
     Ok(summary)
 }
 
-/// Whether a record's wall must **not** be blessed as a perf baseline because it
-/// is a did-not-finish. A DNF's wall is the deadline cap the harness records at
-/// timeout (`exec.rs`: `wall = timeout`, e.g. 180000ms), not a real measurement;
-/// blessing it pins a *timeout* as the query's "budget" — the F-AUD-18 / C2 §1
-/// pathology, where 28 members sat at 180000ms and a now-fast query could regress
-/// ~1740× (to 216s under the 20%-over gate) before anything tripped. A DNF must
-/// instead bless as *no baseline* (a must-fix). Returns true for a terminal
-/// [`Status::Dnf`] and, defensively, for any record whose wall reached the query's
-/// deadline — a mis-statused or imported record (belt and suspenders); a
-/// `timeout_ms == 0` (unknown deadline) is checked by status only.
-fn is_dnf_wall(status: Status, wall_ms: u64, timeout_ms: u64) -> bool {
-    status == Status::Dnf || (timeout_ms > 0 && wall_ms >= timeout_ms)
+/// Whether a record's wall must **not** be blessed as a perf baseline because the
+/// query did not *successfully complete*. Only a `Status::Ok` run that finished
+/// inside its deadline yields a meaningful "how fast does this answer" wall. Every
+/// other outcome pins a wall that is not a completion time:
+/// - a [`Status::Dnf`] wall is the deadline cap (`exec.rs`: `wall = timeout`, e.g.
+///   180000ms) — the F-AUD-18 / C2 §1 pathology where 28 members sat at 180000ms and
+///   a now-fast query could regress ~1740× (to 216s under the 20%-over gate) before
+///   anything tripped;
+/// - a [`Status::Error`] wall is the time-to-abort (e.g. a `MemoryBudgetExceeded`
+///   507 at ~8.6GB), not a completion — blessing it would pin an abort as a "budget";
+/// - a [`Status::ExpectedError`] never produces a result at all.
+/// Defensively also true for any wall at/over the deadline (a mis-statused or
+/// imported record — belt and suspenders); a `timeout_ms == 0` (unknown deadline) is
+/// checked by status only. A non-blessable record blesses as *no baseline* (a
+/// must-fix), clearing any stale wall a prior bless left.
+fn is_unblessable_wall(status: Status, wall_ms: u64, timeout_ms: u64) -> bool {
+    status != Status::Ok || (timeout_ms > 0 && wall_ms >= timeout_ms)
 }
 
 /// Bless per-target perf references. Merges into any existing `perf/<target>.json`
-/// so a hot run and a later cold run can both populate a query's entry. A
-/// did-not-finish record is **never** blessed as a wall (see [`is_dnf_wall`]): the
-/// matching wall field is cleared to `None` (no baseline / must-fix) so a timeout
-/// cap can never masquerade as a budget, while its counters are still recorded as
-/// DNF telemetry. The corpus supplies each query's deadline for that check.
+/// so a hot run and a later cold run can both populate a query's entry. A record
+/// that did not successfully complete is **never** blessed as a wall (see
+/// [`is_unblessable_wall`]): the matching wall field is cleared to `None` (no
+/// baseline / must-fix) so a timeout cap or an abort time can never masquerade as a
+/// budget, while its counters are still recorded as telemetry. The corpus supplies
+/// each query's deadline for that check.
 pub fn write_perf(
     meta: &RunMeta,
     records: &[RunRecord],
@@ -289,15 +295,16 @@ pub fn write_perf(
                 .get(&r.query_id)
                 .map(|q| q.timeout_s.saturating_mul(1000))
                 .unwrap_or(0);
-            let dnf = is_dnf_wall(r.status, r.wall_ms, timeout_ms);
+            let no_bless = is_unblessable_wall(r.status, r.wall_ms, timeout_ms);
             let entry = baseline.entries.entry(r.query_id.clone()).or_default();
-            // A DNF blesses as no-baseline (`None`), never as the timeout cap; the
-            // `None` also clears any stale fast wall a prior bless left, so a query
-            // that regressed to a DNF cannot keep an unearned budget.
+            // A non-completion (DNF timeout cap, error/abort time, expected-error)
+            // blesses as no-baseline (`None`), never as its wall; the `None` also
+            // clears any stale fast wall a prior bless left, so a query that
+            // regressed to a DNF/abort cannot keep an unearned budget.
             if r.cache_state == "cold" {
-                entry.cold_wall_ms = if dnf { None } else { Some(r.wall_ms) };
+                entry.cold_wall_ms = if no_bless { None } else { Some(r.wall_ms) };
             } else {
-                entry.hot_wall_ms_median = if dnf { None } else { Some(r.wall_ms) };
+                entry.hot_wall_ms_median = if no_bless { None } else { Some(r.wall_ms) };
             }
             // Prefer the hot record's counters; fall back to whatever we have.
             if r.cache_state != "cold" || entry.counters == Counters::default() {
@@ -790,22 +797,27 @@ mod tests {
         );
     }
 
-    // --- never-bless-a-timeout guard (F-AUD-18) --------------------------
+    // --- never-bless-a-non-completion guard (F-AUD-18) -------------------
 
     #[test]
-    fn is_dnf_wall_flags_timeouts_and_deadline_walls() {
-        // A terminal DNF is a DNF regardless of wall/timeout.
-        assert!(is_dnf_wall(Status::Dnf, 180_000, 180_000));
-        assert!(is_dnf_wall(Status::Dnf, 5, 0));
+    fn is_unblessable_wall_flags_non_completions_and_deadline_walls() {
+        // Only a Status::Ok wall inside its deadline is a real, blessable wall.
+        assert!(!is_unblessable_wall(Status::Ok, 432, 180_000));
+        // A terminal DNF is unblessable regardless of wall/timeout.
+        assert!(is_unblessable_wall(Status::Dnf, 180_000, 180_000));
+        assert!(is_unblessable_wall(Status::Dnf, 5, 0));
+        // An engine error (e.g. a MemoryBudgetExceeded 507 abort — the live-run
+        // q038/q056/q057/q059 case) is a time-to-abort, not a completion.
+        assert!(is_unblessable_wall(Status::Error, 38_355, 120_000));
+        // An expected-error query never produced a result.
+        assert!(is_unblessable_wall(Status::ExpectedError, 2, 120_000));
         // Belt-and-suspenders: an Ok wall at/over the deadline (a mis-statused or
-        // imported record — the exact 28@180000 pathology) is a DNF-equivalent.
-        assert!(is_dnf_wall(Status::Ok, 180_000, 180_000));
-        assert!(is_dnf_wall(Status::Ok, 181_000, 180_000));
-        // A normal Ok wall under the deadline is a real, blessable measurement.
-        assert!(!is_dnf_wall(Status::Ok, 432, 180_000));
+        // imported record — the exact 28@180000 pathology) is unblessable.
+        assert!(is_unblessable_wall(Status::Ok, 180_000, 180_000));
+        assert!(is_unblessable_wall(Status::Ok, 181_000, 180_000));
         // An unknown deadline (0) falls back to the status only.
-        assert!(!is_dnf_wall(Status::Ok, 999_999, 0));
-        assert!(is_dnf_wall(Status::Dnf, 999_999, 0));
+        assert!(!is_unblessable_wall(Status::Ok, 999_999, 0));
+        assert!(is_unblessable_wall(Status::Dnf, 999_999, 0));
     }
 
     /// The bless path must never pin a timeout as a perf budget: a DNF blesses as
@@ -857,6 +869,19 @@ mod tests {
             pb2.entries["q016"].hot_wall_ms_median,
             Some(400),
             "and a now-finishing query gains a real baseline"
+        );
+
+        // An engine error (a MemoryBudgetExceeded abort — the live-run q038 case)
+        // also blesses as no-baseline: its wall is the time-to-abort, not a
+        // completion, so it must not pin an abort time as a "budget".
+        let mut r_err = rec("q008", "native-sf01", "hot", "", 38_355);
+        r_err.status = Status::Error;
+        r_err.rows = 0;
+        write_perf(&bless_meta("R3"), &[r_err], &corpus, &baselines).unwrap();
+        let pb3 = load_perf(&baselines, "native-sf01").unwrap().unwrap();
+        assert_eq!(
+            pb3.entries["q008"].hot_wall_ms_median, None,
+            "an errored/aborted query blesses as no-baseline, not its abort wall"
         );
         let _ = std::fs::remove_dir_all(&baselines);
     }

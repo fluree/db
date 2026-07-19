@@ -143,9 +143,10 @@ operator must not misread is the timeout.
   that completes at 168s under a 300s `timeout_s` is *slow*, not failing; exceeding
   `timeout_s` is a **DNF** (a hard stop), reported distinctly from a perf-violation
   ratio against a blessed baseline. **A DNF is NEVER blessed as a perf baseline** — the
-  bless path (`baseline.rs::write_perf`, guarded by `is_dnf_wall`) records a DNF as
-  *no baseline / must-fix*, so a timeout wall (e.g. 180000ms) can never masquerade as a
-  budget (the F-AUD-18 pathology this audit re-blessed away). The north-star bar (≤ low
+  bless path (`baseline.rs::write_perf`, guarded by `is_unblessable_wall`) records any
+  non-completion (a DNF timeout cap, an error/abort time, an expected-error) as
+  *no baseline / must-fix*, so a timeout wall (e.g. 180000ms) or a memory-abort time can
+  never masquerade as a budget (the F-AUD-18 pathology this audit re-blessed away). The north-star bar (≤ low
   single-digit seconds, cache-thrashed / first-ask) is a separate criterion the
   `timeout_s` never encodes.
 - **`FLUREE_QUERY_TIMEOUT_MS` (engine).** The engine-level per-query deadline (query
