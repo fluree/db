@@ -122,6 +122,29 @@ fn minmax_should_replace(is_max: bool, ord: std::cmp::Ordering) -> bool {
     }
 }
 
+/// Whether the bare-COUNT manifest shortcut is eligible for a resolved fused plan:
+/// exactly one `CountRows` fold, no GROUP BY, no FILTER, and no folded
+/// constant-object constraints. The Iceberg manifest `record_count` sum cannot see
+/// per-row FILTER/constraint matches or per-group partitions, so anything else must
+/// fall through to the scan-fold (which applies them). This is the D-c5 soundness
+/// line for item 9b in particular: a constraint-bearing COUNT (e.g. `isCurrent
+/// true`) MUST decline the delete-blind shortcut and count matching rows in the
+/// fold instead. Extracted as a pure predicate so the decline invariant is
+/// DIRECTLY unit-tested, not only verified by inspection (R-1522 verified it that
+/// way). `filter_present` is passed as a bool because a `FilterPlan` needs a live
+/// `LedgerSnapshot` to build — the shortcut only ever cares about its presence.
+fn count_shortcut_eligible(
+    filter_present: bool,
+    group_cols: &[GroupCol],
+    fact_constraints: &[ResolvedConstraint],
+    folds: &[Fold],
+) -> bool {
+    !filter_present
+        && group_cols.is_empty()
+        && fact_constraints.is_empty()
+        && matches!(folds, [Fold::CountRows])
+}
+
 /// How to read a numeric column value as an exact decimal during native
 /// expression evaluation.
 #[derive(Clone, Copy)]
@@ -1219,11 +1242,12 @@ impl Operator for FusedR2rmlAggregateOperator {
         // whole fused path (a disabled switch fails detection, so this is never
         // reached). The emitted binding is byte-identical to the scan+fold result
         // (`Acc::Count(n).finalize()`).
-        if resolved.filter.is_none()
-            && resolved.group_cols.is_empty()
-            && resolved.fact_constraints.is_empty()
-            && matches!(resolved.folds.as_slice(), [Fold::CountRows])
-        {
+        if count_shortcut_eligible(
+            resolved.filter.is_some(),
+            &resolved.group_cols,
+            &resolved.fact_constraints,
+            &resolved.folds,
+        ) {
             let gs = resolved.pattern.graph_source_id.clone();
             let table = resolved.table_name.clone();
             let non_null_cols = resolved.count_non_null_cols.clone();
@@ -2797,6 +2821,62 @@ mod tests {
         assert!(!ok(1), "segment mismatch → dropped (no over-count)");
         assert!(!ok(2), "flag mismatch → dropped (no over-count)");
         assert!(!ok(3), "null segment → dropped (existence filter)");
+    }
+
+    /// Item 9b decline invariant (D-c5): the bare-COUNT manifest shortcut fires ONLY
+    /// for a plain COUNT — it DECLINES for a filtered, grouped, constant-object-
+    /// constrained, or non-`CountRows` plan, because the manifest `record_count` sum
+    /// cannot see per-row matches or per-group partitions. A false positive here is
+    /// exactly the over-count R-1522 named as the unacceptable outcome; this pins the
+    /// predicate directly (it was previously only inspection-verified).
+    #[test]
+    fn count_shortcut_declines_constraints_filter_group_and_non_count() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        // Eligible: a single CountRows fold, no filter / group / constraints.
+        assert!(count_shortcut_eligible(false, &[], &[], &[Fold::CountRows]));
+        // Declines: a FILTER is present.
+        assert!(!count_shortcut_eligible(true, &[], &[], &[Fold::CountRows]));
+        // Declines: a GROUP BY key is present.
+        let gcol = GroupCol {
+            column: "SEG".into(),
+            kind: GKind::String,
+            dt_sid: Sid::new(2, "string"),
+        };
+        assert!(!count_shortcut_eligible(
+            false,
+            &[gcol],
+            &[],
+            &[Fold::CountRows]
+        ));
+        // Declines: a folded constant-object constraint is present (the q038/9b line).
+        let constant = ObjectConstant::Scalar(ScanValue::Bool(true));
+        let constraint = ResolvedConstraint {
+            canon: decimal_canonical_of(&constant),
+            pom: PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/isCurrent"),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            },
+            constant,
+        };
+        assert!(
+            !count_shortcut_eligible(false, &[], &[constraint], &[Fold::CountRows]),
+            "a constraint-bearing COUNT must decline the delete-blind shortcut"
+        );
+        // Declines: not a bare CountRows fold (COUNT(col) / SUM / MIN / two folds / none).
+        assert!(!count_shortcut_eligible(
+            false,
+            &[],
+            &[],
+            &[Fold::CountColumn("C".into())]
+        ));
+        assert!(!count_shortcut_eligible(
+            false,
+            &[],
+            &[],
+            &[Fold::CountRows, Fold::CountRows]
+        ));
+        assert!(!count_shortcut_eligible(false, &[], &[], &[]));
     }
 
     /// Item 9 MIN/MAX admission scope: only numeric and date/timestamp datatypes
