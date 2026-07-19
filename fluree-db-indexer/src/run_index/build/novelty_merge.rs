@@ -204,8 +204,8 @@ fn assemble_history(
 ///
 /// - **Existing < Novelty**: Emit existing row unchanged.
 /// - **Novelty < Existing** (base-absent):
-///   - Assert winner: emit the novelty row; its lifecycle's real
-///     transitions are recorded (a lone assert is one transition).
+///   - Assert winner: emit the novelty row; transitions preceding it are
+///     recorded (a lone assert records nothing — the row carries it).
 ///   - Retract winner: no row. A lone retract of a never-materialized fact
 ///     is not a transition and records nothing — a bare retract entry would
 ///     make replay fabricate the fact's presence at every `t` before the
@@ -215,10 +215,11 @@ fn assemble_history(
 /// - **Same identity** (Equal, base-present):
 ///   - Assert winner: emit novelty row (replacement). With no real
 ///     transitions — a plain re-assert of a continuously-present fact — the
-///     replacement is encoded as a synthesized same-`t` retract+assert pair,
-///     which is how replay reads "row replaced while present". When real
-///     transitions exist (an in-window retract preceded the assert), the
-///     real events are recorded instead and no pair is synthesized.
+///     replacement is encoded as a synthesized same-`t` retract entry paired
+///     with the row's own assert, which is how replay reads "row replaced
+///     while present". When real transitions exist (an in-window retract
+///     preceded the assert), the real events are recorded instead and no
+///     retract is synthesized.
 ///   - Retract winner: omit the row; the transition into absence carries the
 ///     `t` of the first retract of the final retracted run (a superseded
 ///     earlier retract rather than the winner, when both exist).
@@ -281,20 +282,27 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
             Ordering::Equal => {
                 // Same fact identity: base-present.
                 matched.push(*nov);
+                // The consumed row's assert migrates into the sidecar: a
+                // fact's materialized assert lives either as its row or as a
+                // history entry, so replay can still find the fact's birth
+                // (and its exact `t`) after the row is removed or replaced.
+                new_history.push(batch_row_to_hist_entry(input.batch, ei, 1));
                 gather_identity_events(input, &mut si, nov, op, &mut events);
-                let transitions = push_transition_entries(&mut events, true, &mut new_history);
+                let changed = push_transition_entries(&mut events, true, &mut new_history);
                 if op == 1 {
                     out.push(*nov);
-                    if transitions == 0 {
+                    if !changed {
                         // Plain re-assert of a continuously-present fact: the
                         // row is replaced but state never changed. Encode the
-                        // replacement as a retract of the old row + the new
-                        // assert, both at the novelty's `t` — replay's
-                        // representation of "row replaced while present".
+                        // replacement as a synthesized retract of the old row
+                        // at the novelty's `t`; the new assert is carried by
+                        // the replacement row itself. Replay reads the pair
+                        // (row-synthetic assert + this retract) as "row
+                        // replaced while present" and swaps in the migrated
+                        // older assert for earlier targets.
                         let mut retract_entry = batch_row_to_hist_entry(input.batch, ei, 0);
                         retract_entry.t = nov.t;
                         new_history.push(retract_entry);
-                        new_history.push(record_to_hist_entry(nov, op));
                     }
                 }
                 ei += 1;
@@ -357,27 +365,37 @@ fn gather_identity_events(
 
 /// Walk one identity's in-window events chronologically from its base
 /// presence, recording a history entry for each real state transition. Ops
-/// that repeat the current state are no-ops and record nothing. Returns the
-/// number of entries recorded.
+/// that repeat the current state are no-ops and record nothing.
+///
+/// The transition into the final asserted state is NOT recorded: it is the
+/// materialized row, which carries its own assert — replay synthesizes an
+/// assert event from the base row, and history queries read the row
+/// directly, so a sidecar entry for it would duplicate the event.
+///
+/// Returns whether any transition occurred (recorded or row-carried).
 fn push_transition_entries(
     events: &mut [(RunRecordV2, u8)],
     base_present: bool,
     new_history: &mut Vec<HistEntryV2>,
-) -> usize {
+) -> bool {
     // Same-`t` tie: retract sorts first, matching the same-`t` retract-wins
     // resolution used by the dedup and the query overlay.
     events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
     let mut present = base_present;
-    let mut recorded = 0;
+    let mut changed = false;
     for &(rec, op) in events.iter() {
         let asserts = op == 1;
         if asserts != present {
             new_history.push(record_to_hist_entry(&rec, op));
             present = asserts;
-            recorded += 1;
+            changed = true;
         }
     }
-    recorded
+    if changed && present {
+        // The last transition is the assert that becomes the row.
+        new_history.pop();
+    }
+    changed
 }
 
 /// Reconstitute `Vec<RunRecordV2>` from a `ColumnBatch`.
@@ -495,9 +513,10 @@ mod tests {
         assert_eq!(out.records[2].s_id.as_u64(), 3);
         assert_eq!(out.records[1].t, 5);
 
-        assert_eq!(out.history.len(), 1);
-        assert_eq!(out.history[0].op, 1); // assert
-        assert_eq!(out.history[0].s_id.as_u64(), 2);
+        assert!(
+            out.history.is_empty(),
+            "the new row carries its own assert; no sidecar entry"
+        );
     }
 
     #[test]
@@ -513,10 +532,12 @@ mod tests {
         assert_eq!(out.records[0].s_id.as_u64(), 1);
         assert_eq!(out.records[1].s_id.as_u64(), 3);
 
-        // History: retraction entry
-        assert_eq!(out.history.len(), 1);
+        // History: the retraction + the consumed row's migrated assert.
+        assert_eq!(out.history.len(), 2);
         assert_eq!(out.history[0].op, 0);
         assert_eq!(out.history[0].s_id.as_u64(), 2);
+        assert_eq!(out.history[1].op, 1);
+        assert_eq!(out.history[1].s_id.as_u64(), 2);
     }
 
     #[test]
@@ -531,13 +552,14 @@ mod tests {
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].t, 5); // updated
 
-        // History: retract at t=5 + assert at t=5 (both at novelty's t).
-        // Sorted by t desc, then op asc (retracts before asserts at same t).
+        // History: the synthesized retract at the novelty's t + the
+        // replaced row's migrated assert at its original t; the new assert
+        // is carried by the replacement row itself.
         assert_eq!(out.history.len(), 2);
         assert_eq!(out.history[0].t, 5);
-        assert_eq!(out.history[0].op, 0); // retract first (same t, op=0 < op=1)
-        assert_eq!(out.history[1].t, 5);
-        assert_eq!(out.history[1].op, 1); // then assert
+        assert_eq!(out.history[0].op, 0);
+        assert_eq!(out.history[1].t, 1);
+        assert_eq!(out.history[1].op, 1);
     }
 
     fn hist_events(out: &MergeOutput) -> Vec<(u64, u32, u8)> {
@@ -571,8 +593,9 @@ mod tests {
         assert_eq!(out.records[0].t, 6);
         assert_eq!(
             hist_events(&out),
-            vec![(1, 4, 0), (1, 6, 1)],
-            "real transitions only; no synthesized retract at t=6"
+            vec![(1, 1, 1), (1, 4, 0)],
+            "migrated row assert + the real retract; no synthesized retract, \
+             and the re-add assert is carried by the new row"
         );
     }
 
@@ -619,8 +642,8 @@ mod tests {
         assert!(out.records.is_empty());
         assert_eq!(
             hist_events(&out),
-            vec![(1, 5, 0)],
-            "absence began at t=5; the t=6 repeat is a no-op"
+            vec![(1, 1, 1), (1, 5, 0)],
+            "migrated row assert; absence began at t=5; the t=6 repeat is a no-op"
         );
     }
 
@@ -642,8 +665,9 @@ mod tests {
         assert!(out.records.is_empty());
         assert_eq!(
             hist_events(&out),
-            vec![(1, 6, 0)],
-            "the re-assert of a present fact transitions nothing"
+            vec![(1, 1, 1), (1, 6, 0)],
+            "migrated row assert; the re-assert of a present fact \
+             transitions nothing"
         );
     }
 
@@ -773,12 +797,11 @@ mod tests {
         let out = merge_novelty(&input);
         assert_eq!(out.records.len(), 2);
 
-        // History: new assert (t=5) then old retraction (t=2)
-        assert_eq!(out.history.len(), 2);
-        assert_eq!(out.history[0].t, 5);
-        assert_eq!(out.history[0].s_id.as_u64(), 2);
-        assert_eq!(out.history[1].t, 2);
-        assert_eq!(out.history[1].s_id.as_u64(), 1);
+        // History: only the carried-forward old retraction (t=2); the new
+        // row carries its own assert.
+        assert_eq!(out.history.len(), 1);
+        assert_eq!(out.history[0].t, 2);
+        assert_eq!(out.history[0].s_id.as_u64(), 1);
     }
 
     #[test]
@@ -816,7 +839,7 @@ mod tests {
 
         let out = merge_novelty(&input);
         assert_eq!(out.records.len(), 2);
-        assert_eq!(out.history.len(), 2);
+        assert!(out.history.is_empty(), "new rows carry their own asserts");
     }
 
     #[test]
@@ -830,9 +853,10 @@ mod tests {
 
         let out = merge_novelty(&input);
         assert_eq!(out.records.len(), 0);
-        // History: 2 retraction entries
-        assert_eq!(out.history.len(), 2);
-        assert!(out.history.iter().all(|h| h.op == 0));
+        // History: each consumed row's migrated assert + its retraction.
+        assert_eq!(out.history.len(), 4);
+        assert_eq!(out.history.iter().filter(|h| h.op == 0).count(), 2);
+        assert_eq!(out.history.iter().filter(|h| h.op == 1).count(), 2);
     }
 
     #[test]
@@ -858,12 +882,10 @@ mod tests {
 
         let out = merge_novelty(&input);
         assert_eq!(out.records.len(), 0); // empty latest-state
-                                          // History: new retraction (t=5) + old assert (t=1)
-        assert_eq!(out.history.len(), 2);
-        assert_eq!(out.history[0].t, 5);
-        assert_eq!(out.history[0].op, 0); // retract
-        assert_eq!(out.history[1].t, 1);
-        assert_eq!(out.history[1].op, 1); // old assert
+                                          // History: new retraction (t=5), the consumed row's migrated assert
+                                          // (the row's own t=3), and the carried old assert (t=1).
+        let events: Vec<(u32, u8)> = out.history.iter().map(|e| (e.t, e.op)).collect();
+        assert_eq!(events, vec![(5, 0), (3, 1), (1, 1)]);
     }
 
     #[test]
@@ -905,36 +927,29 @@ mod tests {
         assert_eq!(out.records[3].p_id, 2);
     }
 
-    /// A cross-boundary re-assert must NOT displace the fact's carried
-    /// history: the original assert is the birth transition replay's
-    /// older-assert swap depends on. History ends up with the replacement
-    /// pair at t=10 AND the carried assert at t=3.
+    /// A cross-boundary re-assert must NOT lose the fact's birth: the
+    /// replaced row's assert migrates into the sidecar (with the row's own
+    /// t), so replay's older-assert swap still finds it for earlier
+    /// targets, alongside the synthesized replacement retract.
     #[test]
-    fn test_carried_assert_survives_reassert() {
+    fn test_replaced_row_assert_migrates_to_history() {
         let existing = vec![rec2(1, 1, 10, 3)];
         let batch = batch_from_records(&existing);
 
-        let old_history = vec![HistEntryV2 {
-            s_id: SubjectId(1),
-            p_id: 1,
-            o_type: OType::XSD_INTEGER.as_u16(),
-            o_key: ObjKey::encode_i64(10).as_u64(),
-            o_i: OI_NONE,
-            t: 3,
-            op: 1, // the fact's original assert
-        }];
-
-        // Plain re-assert at t=10 → replacement pair in new_history.
+        // Plain re-assert at t=10 → replacement.
         let novelty = vec![rec2(1, 1, 10, 10)];
         let ops = vec![1u8];
-        let input = make_input(&batch, &novelty, &ops, &old_history, RunSortOrder::Spot);
+        let input = make_input(&batch, &novelty, &ops, &[], RunSortOrder::Spot);
 
         let out = merge_novelty(&input);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].t, 10, "replacement row carries the new t");
         let events: Vec<(u32, u8)> = out.history.iter().map(|e| (e.t, e.op)).collect();
         assert_eq!(
             events,
-            vec![(10, 0), (10, 1), (3, 1)],
-            "replacement pair at t=10, carried birth assert at t=3"
+            vec![(10, 0), (3, 1)],
+            "synthesized retract at t=10 (the row carries the new assert), \
+             migrated birth assert at t=3"
         );
     }
 
@@ -951,14 +966,15 @@ mod tests {
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.records[0].t, 5);
 
-        // History: retract at t=5 (NOT t=1), then assert at t=5
+        // History: the synthesized retract at t=5 (NOT the old row's t=1);
+        // the new assert is carried by the replacement row.
         let retract = out.history.iter().find(|h| h.op == 0).unwrap();
         assert_eq!(
             retract.t, 5,
             "retraction event must occur at the novelty's t (5), not the old row's t (1)"
         );
-        let assert_entry = out.history.iter().find(|h| h.op == 1).unwrap();
-        assert_eq!(assert_entry.t, 5);
+        let migrated = out.history.iter().find(|h| h.op == 1).unwrap();
+        assert_eq!(migrated.t, 1, "the replaced row's assert keeps its own t");
     }
 
     #[test]

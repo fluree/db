@@ -883,8 +883,8 @@ mod tests {
         assert_eq!(output.leaves.len(), 1);
         assert_eq!(output.leaves[0].info.total_rows, 3);
 
-        // Verify sidecar was produced (history for the insert).
-        assert!(output.leaves[0].info.sidecar_bytes.is_some());
+        // The inserted row carries its own assert; no history entries exist.
+        assert!(output.leaves[0].info.sidecar_bytes.is_none());
     }
 
     #[test]
@@ -991,20 +991,25 @@ mod tests {
 
     /// Regression: when a leaflet splits into multiple chunks, history entries
     /// must be partitioned to the correct chunk (not all in chunk 0).
+    /// Retracting the lowest and highest existing facts produces entries
+    /// (migrated row assert + retract each) at both ends of the key range,
+    /// while the inserts force the split.
     #[test]
     fn test_leaflet_split_partitions_history() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a leaf with a few existing records.
-        let existing = vec![rec2(1, 1, 10, 1), rec2(2, 1, 20, 1), rec2(3, 1, 30, 1)];
+        // Create a leaf with existing records spread across the key range.
+        let existing = vec![rec2(1, 1, 10, 1), rec2(5, 1, 50, 1), rec2(9, 1, 90, 1)];
         let (leaf_bytes, sidecar) = build_test_leaf(&existing, RunSortOrder::Spot);
 
-        // Add enough novelty to force a split (target_rows=3).
+        // Retract both ends; insert enough rows to force a split (target=3).
         let novelty = vec![
-            rec2(4, 1, 40, 5),
-            rec2(5, 1, 50, 5),
+            rec2(1, 1, 10, 5),
+            rec2(2, 1, 20, 5),
+            rec2(3, 1, 30, 5),
             rec2(6, 1, 60, 5),
             rec2(7, 1, 70, 5),
+            rec2(9, 1, 90, 5),
         ];
-        let ops = vec![1u8, 1, 1, 1];
+        let ops = vec![0u8, 1, 1, 1, 1, 0];
 
         let input = LeafUpdateInput {
             leaf_bytes: &leaf_bytes,

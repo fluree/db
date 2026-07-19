@@ -211,10 +211,10 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
             // Rebuild: resolve each identity's full event log to its state
             // transitions. The row is the transition into the final asserted
             // state — the `t` at which the fact most recently became present
-            // — matching the novelty and incremental materializers. Each
-            // transition becomes a sidecar entry (unless history is
-            // skipped); identities whose log nets to nothing, such as
-            // retracts of never-asserted facts, vanish entirely.
+            // — matching the novelty and incremental materializers. The
+            // transitions preceding the row become sidecar entries (unless
+            // history is skipped); identities whose log nets to nothing,
+            // such as retracts of never-asserted facts, vanish entirely.
             let Some((record, op, history)) = merge.next_deduped_with_history()? else {
                 break;
             };
@@ -283,20 +283,22 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
 // Helpers
 // ============================================================================
 
-/// Resolve one identity's full event log to its state transitions, in place,
-/// and return its materialized row.
+/// Resolve one identity's full event log to its sidecar transitions, in
+/// place, and return its materialized row.
 ///
 /// Events walk chronologically from absent — a rebuild sees the complete log
 /// — so each op that changes state is a transition, and ops that repeat the
 /// current state (a re-assert of a present fact, a retract of an absent one)
-/// are no-ops. `events` is left holding exactly the transitions. The row is
-/// the transition into the final asserted state, or `None` when the final
-/// state is absent. Same-`t` ties walk retract-first, matching the same-`t`
-/// retract-wins resolution used everywhere else.
+/// are no-ops. The transition into the final asserted state is the
+/// materialized row and is returned rather than kept in `events`: the row
+/// carries its own assert (replay synthesizes it from the base row, and
+/// history queries read the row directly), so a sidecar entry for it would
+/// duplicate the event. `events` is left holding exactly the transitions
+/// that precede the row. Same-`t` ties walk retract-first, matching the
+/// same-`t` retract-wins resolution used everywhere else.
 fn resolve_lifecycle(events: &mut Vec<(RunRecordV2, u8)>) -> Option<RunRecordV2> {
     events.sort_unstable_by(|a, b| a.0.t.cmp(&b.0.t).then(a.1.cmp(&b.1)));
     let mut present = false;
-    let mut row: Option<RunRecordV2> = None;
     let mut write = 0;
     for read in 0..events.len() {
         let (rec, op) = events[read];
@@ -305,13 +307,13 @@ fn resolve_lifecycle(events: &mut Vec<(RunRecordV2, u8)>) -> Option<RunRecordV2>
             continue;
         }
         present = asserts;
-        row = asserts.then_some(rec);
         events[write] = (rec, op);
         write += 1;
     }
     events.truncate(write);
     if present {
-        row
+        let (row, _) = events.pop().expect("present state implies a final assert");
+        Some(row)
     } else {
         None
     }
@@ -906,9 +908,9 @@ mod tests {
         events.sort_unstable();
         assert_eq!(
             events,
-            vec![(10, 1, 1), (10, 2, 0), (30, 4, 1)],
-            "every real transition is recorded (including the surviving \
-             row's assert); the never-asserted retract leaves none"
+            vec![(10, 1, 1), (10, 2, 0)],
+            "transitions preceding a row are recorded; the surviving row \
+             carries its own assert and the never-asserted retract leaves none"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -959,13 +961,11 @@ mod tests {
         assert_eq!(result.total_rows, 1);
         let leaf = &result.graphs[0].leaf_infos[0];
         assert_eq!(leaf.first_key.t, 1, "row carries the first assert's t");
-
-        let history = read_all_history(leaf);
-        let events: Vec<(u64, u32, u8)> = history
-            .iter()
-            .map(|e| (e.s_id.as_u64(), e.t, e.op))
-            .collect();
-        assert_eq!(events, vec![(10, 1, 1)], "the re-assert is a no-op");
+        assert!(
+            leaf.sidecar_path.is_none(),
+            "the re-assert is a no-op and the row carries its own assert; \
+             no sidecar entries exist"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1020,7 +1020,11 @@ mod tests {
             .map(|e| (e.s_id.as_u64(), e.t, e.op))
             .collect();
         events.sort_unstable();
-        assert_eq!(events, vec![(10, 1, 1), (10, 4, 0), (10, 6, 1)]);
+        assert_eq!(
+            events,
+            vec![(10, 1, 1), (10, 4, 0)],
+            "the re-add assert is the row, not a sidecar entry"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
