@@ -208,6 +208,7 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
                 continue;
             }
             writer.push_record(record)?;
+            total_rows += 1;
         } else {
             // Rebuild: resolve each identity's full event log to its state
             // transitions. The row is the transition into the final asserted
@@ -240,22 +241,14 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
                     );
                 }
             }
-            let Some(row) = row else {
-                // No materialized row (final state absent, or nothing ever
-                // happened). Only track progress for the UI.
-                progress_batch += 1;
-                if progress_batch >= PROGRESS_BATCH_SIZE {
-                    if let Some(ref ctr) = config.progress {
-                        ctr.fetch_add(progress_batch, Ordering::Relaxed);
-                    }
-                    progress_batch = 0;
-                }
-                continue;
-            };
-            writer.push_record(row)?;
+            // Identities without a materialized row (final state absent)
+            // still count toward progress below.
+            if let Some(row) = row {
+                writer.push_record(row)?;
+                total_rows += 1;
+            }
         }
 
-        total_rows += 1;
         progress_batch += 1;
         if progress_batch >= PROGRESS_BATCH_SIZE {
             if let Some(ref ctr) = config.progress {
