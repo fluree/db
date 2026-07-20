@@ -6,8 +6,19 @@ Code commits (dependency order — D before C1, since C1 uses D's typed error):
 - D  18e82659b — typed refusal envelope (err:r2rml/UnsupportedPattern)
 - C1 959d9838d — loud-refuse a dropped VALUES clause on crawls
 - E2 9ad472b07 — short-circuit a crawl over a class with no TriplesMaps
+- cfg — un-orphan build()'s #[cfg(native)] from with_secret_resolver (DEC-002
+  scope addition, lead-verified; separate commit)
 
 Recorded: 2026-07-20. All gates run LOCALLY (CI does not fire on a non-main base).
+
+## no-native featureset gate (DEC-002 permanent addition)
+`cargo check -p fluree-db-api --no-default-features --features aws,iceberg,shacl`
+(solo's real combination) — FAILED at the base rev (storage_path / FileStorage /
+FileNameService missing: build() had been left cfg-less by the #1505 SecretRef
+insertion, and with_secret_resolver was over-gated behind native+iceberg) → PASSES
+after the cfg fix. Native default + iceberg still builds. --all-features and
+workspace builds structurally MASK this class of bug via feature unification, so
+this exact featureset check is the gate.
 
 ## cargo fmt --check (my files) — CLEAN
 `rustfmt --edition 2021 --check <9 changed .rs>` → exit 0.
