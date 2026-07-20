@@ -142,3 +142,37 @@ Full). Native oracles blessed OFFLINE from native-sf01 (`baseline --expected`, 7
 q038's native leg reproduces UNCHANGED (hash `0af26fd7…`, sanity confirmed). q080's native
 node doc shows FK refs as `{"@id":…}`, `isCurrent: true`, dates as `{"@value","@type"}` —
 the shape Cluster B must reproduce on virtual (verified in the live subset).
+
+## canon key-order fix (found by the live subset)
+The first live pass FAILED-PARITY on q080 only. Root cause: `canon::canonicalize_graph`
+hashed each node without sorting its keys — it sorts the row multiset but not keys WITHIN
+a node. Native hydration emits properties alphabetically; the R2RML crawl emits them in
+table-column order — the SAME content, a different key order (q080 was byte-identical,
+reordered). q080 is the FIRST Full-gated cross-engine node-doc comparison (the only prior
+graph members, q048/q049 CONSTRUCT, are rows_only). Fix: recursively sort object keys
+before serializing each node (array/`@list` order preserved). Test:
+`canon::tests::node_key_order_does_not_affect_hash`. Only q080's oracle changed
+(re-blessed with `--force`; q081/q082 already alphabetical → unchanged; SPARQL-path
+oracles untouched). NOT a Cluster B bug — content was always correct.
+
+## LIVE CONFIRMATION SUBSET (virtual-sf01, single-flight, 1 rep, ~2s paced, RELEASE build)
+`compare --gate`: 11 records, **0 hash mismatches, 0 perf violations** (on the corrected canon).
+Headlines: q038 57.6s→44ms, q077 64s→81ms (F1, counts/hashes UNCHANGED); q083 DNF>90s→10.0s
+(E1 terminates). A-cluster: q079 node docs carry FK refs as `{"@id":…}` (edw:account,
+edw:geography), `isCurrent: true`, typed dates — no bare strings.
+
+| query | status | wall | rows | scan_n | vs oracle |
+|---|---|---|---|---|---|
+| q022 | ok | 85ms | 3 | 1 | hash MATCH (sentinel) |
+| q038 | ok | 44ms | 1 | 1 | hash MATCH (was 57.6s) |
+| q077 | ok | 81ms | 1 | 1 | hash MATCH (was 64s) |
+| q078 | ok | 83ms | 1 | 1 | hash MATCH |
+| q079 | ok | 247ms | 20 | 1 | rows_only — FK={"@id"} |
+| q080 | ok | 1664ms | 1 | 1 | hash MATCH |
+| q081 | ok | 1180ms | 1 | 1 | hash MATCH |
+| q082 | ok | 1065ms | 1 | 1 | hash MATCH |
+| q083 | ok | 10037ms | 10 | 17 | rows_only (was DNF; scan_n=17 = X2 deferred) |
+| q084 | ok | 1439ms | 20 | 1 | rows_only |
+| q085 | ok | 2399ms | 1 | 5 | hash MATCH |
+
+Live infra: virtual-sf01 PAT (ICEBERG_READER) authed cleanly, no 401. PAT held in-memory only.
