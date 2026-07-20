@@ -1818,4 +1818,48 @@ mod e2e {
             "flat-select VALUES must fall through to the normal path (Ok(None))"
         );
     }
+
+    // E2 / D9: a crawl over a class with ZERO matching TriplesMaps
+    // short-circuits to an empty result WITHOUT scanning any table — instead of
+    // fanning out over every TriplesMap (the wildcard fan-out DNF).
+    #[tokio::test]
+    async fn crawl_unmapped_class_returns_empty_without_scans() {
+        let provider = two_table_provider(); // declares only Person + Order
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            // No TriplesMap declares `Commit`.
+            "where": {"@id": "?s", "@type": "v:Commit"}
+        });
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert!(
+            docs.is_empty(),
+            "an unmapped class must return no subjects: {docs:?}"
+        );
+        assert!(
+            provider.scanned_tables().is_empty(),
+            "an unmapped class must scan zero tables (no fan-out): {:?}",
+            provider.scanned_tables()
+        );
+    }
+
+    // Control for E2: a MAPPED class is unaffected — it still scans exactly its
+    // own class table (the short-circuit fires only on a zero-TriplesMap class).
+    #[tokio::test]
+    async fn crawl_mapped_class_still_scans_its_table() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let docs = run_crawl(&provider, &view, &person_crawl(json!(["*"]), None)).await;
+        assert_eq!(
+            docs.len(),
+            2,
+            "the mapped Person class still returns its subjects"
+        );
+        assert_eq!(
+            provider.scanned_tables(),
+            vec!["people".to_string()],
+            "a mapped class scans exactly its class table"
+        );
+    }
 }

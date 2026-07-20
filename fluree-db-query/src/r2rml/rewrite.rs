@@ -1232,7 +1232,16 @@ fn try_fuse_wildcard_class(
     if !has_wildcard {
         return false;
     }
-    if !wildcard_class_fusion_is_safe(mapping, class) {
+    // E2 / D9 (unknown-class short-circuit): a class that matches ZERO
+    // TriplesMaps can never bind a subject, so the crawl's answer is empty. Fuse
+    // the (unsatisfiable) `class_filter` onto the wildcard anyway — the operator
+    // then resolves it to zero TriplesMaps and returns an EMPTY result, instead
+    // of the full TriplesMap fan-out (16-table scan DNF) an UNconstrained
+    // wildcard would trigger. The vertical-partition safety check
+    // (`wildcard_class_fusion_is_safe`) is moot for an unmapped class — there is
+    // no class-declaring map whose sibling could be dropped — so skip it here.
+    let class_unmapped = mapping.find_maps_for_class(class).is_empty();
+    if !class_unmapped && !wildcard_class_fusion_is_safe(mapping, class) {
         return false;
     }
 
