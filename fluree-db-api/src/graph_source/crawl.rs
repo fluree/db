@@ -73,14 +73,18 @@ enum CrawlProjection {
     /// `["@id"]` — subject IRIs only; no property or type scan (the cheapest
     /// shape: it never materializes a predicate-object map).
     IdOnly,
-    /// An explicit forward-predicate list (`["v:p1", "v:p2", ...]`). `@id` is
-    /// always emitted; `want_type` records an explicit `"@type"` in the list.
-    /// Each predicate scans with a DISTINCT object var so the members star-
-    /// collapse into ONE scan (and inherit class fusion when the WHERE binds a
-    /// class).
+    /// An explicit forward-predicate list (`["v:p1", "v:p2", ...]`). `want_type`
+    /// records an explicit `"@type"` in the list; `want_id` records an explicit
+    /// `"@id"`. For a variable-subject crawl `@id` is always emitted (it is the
+    /// node's identity); for a constant-IRI select-map (Cluster B) `@id` is
+    /// emitted ONLY when `want_id` (native omits `@id` from an explicit projection
+    /// that does not request it — the single subject is already known). Each
+    /// predicate scans with a DISTINCT object var so the members star-collapse
+    /// into ONE scan (and inherit class fusion when the WHERE binds a class).
     Predicates {
         predicates: Vec<String>,
         want_type: bool,
+        want_id: bool,
     },
 }
 
@@ -344,6 +348,7 @@ pub(crate) async fn expand_wildcard_crawl(
         CrawlProjection::Predicates {
             predicates,
             want_type,
+            .. // want_id: a variable-subject crawl always emits @id (node identity).
         } => {
             // Columns: [?s, ?__crawl_o0, .., ?__crawl_o{n-1}, (?__crawl_type)?].
             let obj_vars: Vec<Option<VarId>> =
@@ -517,10 +522,20 @@ async fn expand_bound_subject_select_map(
     // accumulated (absent subject) → the `{"@id": <iri>}` stub.
     let normalize = format_config.normalize_arrays;
     let mut doc = Map::new();
-    doc.insert(
-        "@id".to_string(),
-        json!(compactor.compact_id_iri(subject_iri)),
+    // `@id` is emitted for the wildcard and id-only forms, and for a
+    // forward-predicate list ONLY when `@id` was explicitly requested — native
+    // omits `@id` from an explicit projection that does not ask for it (the single
+    // subject is already known), e.g. `["@type"]` → `{"@type": …}` (no `@id`).
+    let include_id = !matches!(
+        projection,
+        CrawlProjection::Predicates { want_id: false, .. }
     );
+    if include_id {
+        doc.insert(
+            "@id".to_string(),
+            json!(compactor.compact_id_iri(subject_iri)),
+        );
+    }
     let keep_types = matches!(
         projection,
         CrawlProjection::Wildcard
@@ -740,11 +755,12 @@ fn classify_projection(spec: &[JsonValue]) -> Option<CrawlProjection> {
     }
     let mut predicates: Vec<String> = Vec::new();
     let mut want_type = false;
+    let mut want_id = false;
     for entry in spec {
         // Only string terms are handled; a nested ref-crawl (object) falls back.
         let key = entry.as_str()?;
         match key {
-            "@id" => {} // `@id` is always emitted; it needs no scan.
+            "@id" => want_id = true, // explicit @id request; needs no scan.
             "@type" => want_type = true,
             // Any other JSON-LD keyword (`@graph`, ...) isn't a forward
             // predicate — fall back rather than mis-scan.
@@ -759,6 +775,7 @@ fn classify_projection(spec: &[JsonValue]) -> Option<CrawlProjection> {
         Some(CrawlProjection::Predicates {
             predicates,
             want_type,
+            want_id,
         })
     }
 }
@@ -808,6 +825,7 @@ fn build_flat_query(
         CrawlProjection::Predicates {
             predicates,
             want_type,
+            .. // want_id: a variable-subject crawl always emits @id (node identity).
         } => {
             let mut select = vec![json!(subject_var)];
             for (i, pred) in predicates.iter().enumerate() {
@@ -943,6 +961,7 @@ mod tests {
             CrawlProjection::Predicates {
                 predicates,
                 want_type,
+                ..
             } => {
                 assert_eq!(predicates, vec!["v:name".to_string(), "v:age".to_string()]);
                 assert!(!want_type);
@@ -1035,6 +1054,7 @@ mod tests {
         let projection = CrawlProjection::Predicates {
             predicates: vec!["v:name".to_string(), "v:age".to_string()],
             want_type: true,
+            want_id: false,
         };
         let flat = build_flat_query("?s", &where_clause, None, None, &projection);
         // Select: subject, one distinct object var per predicate, then type.
@@ -2175,12 +2195,17 @@ mod e2e {
         let docs = run_crawl(&provider, &view, &crawl).await;
         assert_eq!(docs.len(), 1);
         let doc = docs[0].as_object().unwrap();
-        assert_eq!(doc["@id"], json!("http://example.org/customer/1"));
+        // Native omits @id from an explicit ["@type"] projection (the single
+        // subject is already known): {"@type": …}, no @id.
+        assert!(
+            doc.get("@id").is_none(),
+            "no @id for an explicit [\"@type\"] projection: {doc:?}"
+        );
         assert_eq!(
             doc.get("@type"),
             Some(&json!("http://example.org/Customer"))
         );
-        assert_eq!(doc.len(), 2, "only @id and @type: {doc:?}");
+        assert_eq!(doc.len(), 1, "only @type: {doc:?}");
     }
 
     // A forward-predicate list projects ONLY the requested predicates (here:
@@ -2197,10 +2222,22 @@ mod e2e {
             .as_object()
             .unwrap()
             .clone();
-        assert_eq!(doc["@id"], json!("http://example.org/customer/1"));
+        // Native omits @id from an explicit predicate list (not requested here).
+        assert!(
+            doc.get("@id").is_none(),
+            "no @id when not requested: {doc:?}"
+        );
         assert_eq!(doc.get("http://example.org/name"), Some(&json!("Alice")));
         assert!(doc.get("http://example.org/account").is_none());
         assert!(doc.get("@type").is_none());
+        // An explicit "@id" in the list IS emitted (want_id).
+        let with_id = json!({"select": {"http://example.org/customer/1": ["@id", "http://example.org/name"]}});
+        let doc_id = run_crawl(&provider, &view, &with_id).await[0]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(doc_id["@id"], json!("http://example.org/customer/1"));
+        assert_eq!(doc_id.get("http://example.org/name"), Some(&json!("Alice")));
         // Compact-term request (via @context) resolves to the same property.
         let crawl2 = json!({
             "@context": {"v": "http://example.org/"},
