@@ -84,12 +84,28 @@ enum CrawlProjection {
     },
 }
 
+/// The subject root of a recognized crawl.
+enum CrawlRoot<'a> {
+    /// A variable subject (`"?s"`): the crawl's WHERE binds and filters many
+    /// subjects, which the expansion groups into per-subject documents.
+    Var(&'a str),
+    /// A constant-IRI subject (`"<iri>"`): a bound-subject select-map (Cluster B,
+    /// D4). The one subject is already known, so the expansion runs the proven
+    /// bound-subject wildcard scan (pruned to the subject's own table) and shapes
+    /// the single result document, returning the native-parity `{"@id": <iri>}`
+    /// stub when the subject is absent / unreversible.
+    Iri(&'a str),
+}
+
 /// A recognized crawl decomposed into the parts the flat-query builder needs.
 struct DetectedCrawl<'a> {
-    /// The subject variable (e.g. `"?s"`).
-    subject_var: &'a str,
-    /// The original WHERE clause (binds/filters `?s`).
-    where_clause: &'a JsonValue,
+    /// The subject root: a variable, or a constant IRI (a bound-subject
+    /// select-map, Cluster B).
+    root: CrawlRoot<'a>,
+    /// The original WHERE clause (binds/filters a variable subject). Always
+    /// present for a [`CrawlRoot::Var`]; typically `None` for a
+    /// [`CrawlRoot::Iri`] (the subject is already bound by the constant).
+    where_clause: Option<&'a JsonValue>,
     /// The query's `@context`, if any (carried onto the flat query).
     context: Option<&'a JsonValue>,
     /// The crawl's subject LIMIT, if any.
@@ -151,7 +167,7 @@ pub(crate) async fn expand_wildcard_crawl(
     format_config: &FormatterConfig,
 ) -> Result<Option<JsonValue>> {
     let Some(DetectedCrawl {
-        subject_var,
+        root,
         where_clause,
         context,
         limit,
@@ -181,6 +197,32 @@ pub(crate) async fn expand_wildcard_crawl(
             ),
         ));
     }
+
+    // Cluster B (D4): a constant-IRI select-map root routes onto the proven
+    // bound-subject scan machinery (a dedicated single-subject expansion), not the
+    // multi-subject var-crawl grouping below. Absent/unreversible subject →
+    // native-parity `{"@id": <iri>}` stub.
+    let subject_var = match root {
+        CrawlRoot::Var(v) => v,
+        CrawlRoot::Iri(iri) => {
+            return expand_bound_subject_select_map(
+                fluree,
+                view,
+                iri,
+                where_clause,
+                context,
+                &projection,
+                provider,
+                table_provider,
+                execution,
+                format_config,
+            )
+            .await;
+        }
+    };
+    // A variable-subject crawl always carries a WHERE (the `detect` gate requires
+    // it) — it is what binds `?s`.
+    let where_clause = where_clause.expect("a variable-subject crawl always has a WHERE");
 
     if offset > MAX_CRAWL_OFFSET_SUBJECTS {
         return Err(crate::ApiError::query(format!(
@@ -373,6 +415,153 @@ pub(crate) async fn expand_wildcard_crawl(
     Ok(Some(JsonValue::Array(docs)))
 }
 
+/// Cluster B (D4): expand a constant-IRI select-map root (`{"select": {"<iri>":
+/// [...]}}`) over a graph source into the ONE subject's JSON-LD document.
+///
+/// Routes onto the proven bound-subject wildcard scan (`{"@id": <iri>, ?p: ?o}`),
+/// which the R2RML operator prunes to the subject's OWN table via subject-template
+/// reversal (`operator.rs` `subject_constant` prune) — the exact machinery the
+/// where-clause bound-subject inspect uses. It runs that ONE pruned scan for every
+/// projection shape (`["*"]`, `["@type"]`, a forward-predicate list) and applies
+/// the requested projection to the assembled document, because for a single
+/// subject the extra materialized columns are free AND this avoids the inner-join
+/// drop a per-predicate scan would suffer when a requested predicate is absent (a
+/// cross-join of independent bound-subject scans yields ZERO rows if any predicate
+/// has no value). An absent / unreversible subject scans zero rows and returns the
+/// native-parity `[{"@id": <iri>}]` stub — exactly what native hydration returns
+/// for a genuinely-missing subject, so present and absent subjects both match
+/// native. `@id` is always seeded (native's `format_subject` seeds it
+/// unconditionally).
+#[allow(clippy::too_many_arguments)]
+async fn expand_bound_subject_select_map(
+    fluree: &Fluree,
+    view: &GraphDb,
+    subject_iri: &str,
+    where_clause: Option<&JsonValue>,
+    context: Option<&JsonValue>,
+    projection: &CrawlProjection,
+    provider: &dyn fluree_db_query::r2rml::R2rmlProvider,
+    table_provider: &dyn fluree_db_query::r2rml::R2rmlTableProvider,
+    execution: QueryExecutionOptions,
+    format_config: &FormatterConfig,
+) -> Result<Option<JsonValue>> {
+    // The single bound-subject wildcard scan. `@id` is a constant, so this lowers
+    // to `subject_constant = Some` and hits the table + file prune (not a
+    // fan-out). A caller WHERE (rare for a select-map) is preserved as an extra
+    // constraint.
+    let mut where_patterns: Vec<JsonValue> = where_clause.map(where_as_array).unwrap_or_default();
+    where_patterns.push(json!({ "@id": subject_iri, CRAWL_PRED: CRAWL_OBJ }));
+    let mut flat = Map::new();
+    if let Some(ctx) = context {
+        flat.insert("@context".to_string(), ctx.clone());
+    }
+    flat.insert("select".to_string(), json!([CRAWL_PRED, CRAWL_OBJ]));
+    flat.insert("where".to_string(), JsonValue::Array(where_patterns));
+    let flat_query = JsonValue::Object(flat);
+
+    // Browse detail: template RefObjectMap parent IRIs from the child row's own FK
+    // columns instead of scanning every FK-parent table (same as the var crawl).
+    let execution = execution.with_trust_fk_refs(true);
+
+    let result = fluree
+        .query_view_with_r2rml_options(
+            view,
+            QueryInput::JsonLd(&flat_query),
+            provider,
+            table_provider,
+            execution,
+        )
+        .await?;
+
+    let Some(cols) = result.output.columns() else {
+        return Ok(None);
+    };
+    let var_at = |i: usize| -> Option<VarId> {
+        match cols.get(i) {
+            Some(Column::Var(v)) => Some(*v),
+            _ => None,
+        }
+    };
+    // Columns: [?__crawl_p, ?__crawl_o] — NO subject column (the subject is the
+    // constant `subject_iri`; every scanned row belongs to it).
+    let (Some(p_var), Some(o_var)) = (var_at(0), var_at(1)) else {
+        return Ok(None);
+    };
+
+    let compactor = IriCompactor::new(view.snapshot.shared_namespaces(), &result.context);
+
+    // Accumulate the ONE subject's rows. Types are compacted here (emitted as-is);
+    // property keys are kept as their RAW full IRI so a forward-predicate-list
+    // projection can match a requested term against either the full IRI or its
+    // compacted form (below) — the compactor only compacts, so full-IRI keys keep
+    // matching unambiguous.
+    let mut acc = SubjectAcc::empty();
+    for batch in &result.batches {
+        for row in 0..batch.len() {
+            let Some(pred_iri) = batch.get(row, p_var).and_then(Binding::get_iri) else {
+                continue;
+            };
+            if &**pred_iri == fluree_vocab::rdf::TYPE {
+                if let Some(class_iri) = batch.get(row, o_var).and_then(Binding::get_iri) {
+                    acc.add_type(compactor.compact_vocab_iri(class_iri));
+                }
+            } else if let Some(obj_binding) = batch.get(row, o_var) {
+                let value =
+                    format_node_object_binding(&result, obj_binding, &compactor, format_config)?;
+                acc.add_value(pred_iri.to_string(), value);
+            }
+        }
+    }
+
+    // Assemble the single document, applying the requested projection. Nothing
+    // accumulated (absent subject) → the `{"@id": <iri>}` stub.
+    let normalize = format_config.normalize_arrays;
+    let mut doc = Map::new();
+    doc.insert(
+        "@id".to_string(),
+        json!(compactor.compact_id_iri(subject_iri)),
+    );
+    let keep_types = matches!(
+        projection,
+        CrawlProjection::Wildcard
+            | CrawlProjection::Predicates {
+                want_type: true,
+                ..
+            }
+    );
+    if keep_types && !acc.types.is_empty() {
+        let types: Vec<JsonValue> = acc.types.into_iter().map(JsonValue::String).collect();
+        doc.insert("@type".to_string(), collapse(types, normalize));
+    }
+    match projection {
+        // `["*"]`: every property, keyed by its compacted (`@vocab`/context) form.
+        CrawlProjection::Wildcard => {
+            for (full_iri, values) in acc.props {
+                doc.insert(
+                    compactor.compact_vocab_iri(&full_iri),
+                    collapse(values, normalize),
+                );
+            }
+        }
+        // `["@id"]` / `["@type"]`: no forward properties.
+        CrawlProjection::IdOnly => {}
+        // Forward-predicate list: emit ONLY the requested predicates, in requested
+        // order, under the user's own term (native keys the projection this way).
+        // Match a requested term against a property's full IRI OR its compacted
+        // form, so both `["<full-iri>"]` and `["prefix:name"]` requests resolve.
+        CrawlProjection::Predicates { predicates, .. } => {
+            for pred in predicates {
+                if let Some((_, values)) = acc.props.iter().find(|(full_iri, _)| {
+                    full_iri == pred || &compactor.compact_vocab_iri(full_iri) == pred
+                }) {
+                    doc.insert(pred.clone(), collapse(values.clone(), normalize));
+                }
+            }
+        }
+    }
+    Ok(Some(JsonValue::Array(vec![JsonValue::Object(doc)])))
+}
+
 /// Master kill-switch for expanding a subgraph crawl over a graph source through
 /// the R2RML operator. Default **on**. Set `FLUREE_R2RML_CRAWL_EXPAND=0` (or
 /// `false`/`off`) to restore native binary-index hydration — which returns `[]`
@@ -405,6 +594,20 @@ fn env_flag_enabled(name: &str) -> bool {
             )
         })
         .unwrap_or(true)
+}
+
+/// Cluster B (D4): whether a constant-IRI select-map root (`{"select": {"<iri>":
+/// [...]}}`) over a graph source is routed onto the bound-subject crawl machinery
+/// (template-reversal → keyed pruned scan → node-document assembly) instead of
+/// native binary-index hydration — which has no flakes for a virtual dataset and
+/// returns the bare `{"@id": <iri>}` stub for an EXISTING subject (the deployed
+/// "subject detail is empty" bug). Default **on**. Set
+/// `FLUREE_R2RML_SELECT_MAP_ROUTING=0` (or `false`/`off`/`no`) to restore the
+/// pre-fix stub behavior — an insurance switch, since this re-routes an existing
+/// (shipping-but-broken) path rather than adding a new one. Read once, cached.
+fn select_map_routing_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| env_flag_enabled("FLUREE_R2RML_SELECT_MAP_ROUTING"))
 }
 
 /// Cheap check: does `input` look like a subgraph crawl this module expands?
@@ -465,20 +668,23 @@ pub(crate) async fn maybe_expand_crawl(
 /// predicate list). Returns `None` for any other shape (which then falls back to
 /// the normal formatter).
 fn detect_wildcard_crawl(input: &JsonValue) -> Option<DetectedCrawl<'_>> {
+    detect_wildcard_crawl_inner(input, select_map_routing_enabled())
+}
+
+/// Inner detection with the Cluster-B select-map switch passed explicitly, so
+/// tests can exercise both the ON and OFF branch without racing the process-wide
+/// `OnceLock` env cache.
+fn detect_wildcard_crawl_inner(
+    input: &JsonValue,
+    select_map_routing: bool,
+) -> Option<DetectedCrawl<'_>> {
     let obj = input.as_object()?;
     let select = obj.get("select")?.as_object()?;
     if select.len() != 1 {
         return None;
     }
-    let (subject_var, spec) = select.iter().next()?;
-    // Only a variable-subject crawl is handled here; a constant-IRI root
-    // (`{"<iri>": ["*"]}`) flows through the flat var-predicate path (subject
-    // reversal), not this module.
-    if !subject_var.starts_with('?') {
-        return None;
-    }
+    let (root_key, spec) = select.iter().next()?;
     let projection = classify_projection(spec.as_array()?)?;
-    let where_clause = obj.get("where")?;
     let limit = obj
         .get("limit")
         .and_then(JsonValue::as_u64)
@@ -488,14 +694,36 @@ fn detect_wildcard_crawl(input: &JsonValue) -> Option<DetectedCrawl<'_>> {
         .and_then(JsonValue::as_u64)
         .map(|n| n as usize)
         .unwrap_or(0);
-    Some(DetectedCrawl {
-        subject_var: subject_var.as_str(),
-        where_clause,
-        context: obj.get("@context"),
-        limit,
-        offset,
-        projection,
-    })
+    let context = obj.get("@context");
+
+    if root_key.starts_with('?') {
+        // Variable-subject crawl: the WHERE binds and filters `?s` — REQUIRED
+        // (a bare `{"select": {"?s": ["*"]}}` has nothing to bind `?s`).
+        Some(DetectedCrawl {
+            root: CrawlRoot::Var(root_key.as_str()),
+            where_clause: Some(obj.get("where")?),
+            context,
+            limit,
+            offset,
+            projection,
+        })
+    } else if select_map_routing {
+        // Cluster B (D4): a constant-IRI root select-map (`{"<iri>": [...]}`). The
+        // subject is already bound by the constant, so a WHERE is OPTIONAL
+        // (typically absent). Behind `FLUREE_R2RML_SELECT_MAP_ROUTING` (default
+        // on); OFF ⇒ `None` here, so the query falls through to native hydration
+        // (today's `{"@id": <iri>}` stub) unchanged.
+        Some(DetectedCrawl {
+            root: CrawlRoot::Iri(root_key.as_str()),
+            where_clause: obj.get("where"),
+            context,
+            limit,
+            offset,
+            projection,
+        })
+    } else {
+        None
+    }
 }
 
 /// Classify a crawl's selection array into a [`CrawlProjection`]. Returns `None`
@@ -636,20 +864,61 @@ mod tests {
             "offset": 6
         });
         let DetectedCrawl {
-            subject_var,
+            root,
             where_clause,
             context,
             limit,
             offset,
             projection,
         } = detect_wildcard_crawl(&input).expect("wildcard crawl");
-        assert_eq!(subject_var, "?s");
+        assert!(matches!(root, CrawlRoot::Var("?s")));
         assert_eq!(limit, Some(3));
         assert_eq!(offset, 6);
         assert!(context.is_some());
-        assert_eq!(where_clause, &json!({"@id": "?s", "@type": "v:Geography"}));
+        assert_eq!(
+            where_clause,
+            Some(&json!({"@id": "?s", "@type": "v:Geography"}))
+        );
         assert!(matches!(projection, CrawlProjection::Wildcard));
         assert!(is_wildcard_crawl(&input));
+    }
+
+    #[test]
+    fn detects_constant_iri_select_map_root() {
+        // Cluster B (D4): a constant-IRI root (`{"select": {"<iri>": [...]}}`, NO
+        // where) is recognized as a bound-subject select-map when routing is ON.
+        let detail = json!({"select": {"http://example.org/customer/1": ["*"]}});
+        let d = detect_wildcard_crawl_inner(&detail, true).expect("constant-IRI root recognized");
+        assert!(matches!(
+            d.root,
+            CrawlRoot::Iri("http://example.org/customer/1")
+        ));
+        assert!(
+            d.where_clause.is_none(),
+            "a constant-IRI root needs no WHERE"
+        );
+        assert!(matches!(d.projection, CrawlProjection::Wildcard));
+        assert!(is_wildcard_crawl(&detail));
+        // `["@type"]` and a forward-predicate list are also recognized.
+        assert!(matches!(
+            detect_wildcard_crawl_inner(&json!({"select": {"ex:s": ["@type"]}}), true)
+                .map(|d| d.projection),
+            Some(CrawlProjection::Predicates {
+                want_type: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            detect_wildcard_crawl_inner(&json!({"select": {"ex:s": ["ex:name", "ex:age"]}}), true)
+                .map(|d| d.projection),
+            Some(CrawlProjection::Predicates {
+                want_type: false,
+                ..
+            })
+        ));
+        // Switch OFF → NOT recognized: the query falls through to native
+        // hydration (today's `{"@id": <iri>}` stub) unchanged.
+        assert!(detect_wildcard_crawl_inner(&detail, false).is_none());
     }
 
     #[test]
@@ -698,10 +967,12 @@ mod tests {
             detect_wildcard_crawl(&json!({"select": {"?s": ["*"], "?x": ["*"]}, "where": {}}))
                 .is_none()
         );
-        // Missing where.
+        // Missing where on a VARIABLE-subject crawl (nothing binds `?s`).
         assert!(detect_wildcard_crawl(&json!({"select": {"?s": ["*"]}})).is_none());
-        // Constant-IRI root is not handled here (flows through the flat path).
-        assert!(detect_wildcard_crawl(&json!({"select": {"ex:s": ["*"]}, "where": {}})).is_none());
+        // Constant-IRI root falls back when select-map routing is OFF (the query
+        // then hits native hydration and returns the `{"@id": <iri>}` stub). The
+        // ON case is covered by `detects_constant_iri_select_map_root`.
+        assert!(detect_wildcard_crawl_inner(&json!({"select": {"ex:s": ["*"]}}), false).is_none());
         // Empty projection list.
         assert!(detect_wildcard_crawl(&json!({"select": {"?s": []}, "where": {}})).is_none());
         // Unsupported JSON-LD keyword in the list.
@@ -1860,6 +2131,134 @@ mod e2e {
             provider.scanned_tables(),
             vec!["people".to_string()],
             "a mapped class scans exactly its class table"
+        );
+    }
+
+    // ---- Cluster B (D4): constant-IRI select-map routing ----
+
+    // `{"select": {"<iri>": ["*"]}}` (NO where) hydrates the ONE existing subject
+    // into a FULL native-parity node document — FK refs as {"@id":…} node
+    // references, not the empty native-hydration stub the select-map used to
+    // return. Prunes to the subject's own table (bound-subject prune).
+    #[tokio::test]
+    async fn bound_subject_select_map_wildcard_hydrates_node_doc() {
+        let provider = customer_account_provider();
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({"select": {"http://example.org/customer/1": ["*"]}});
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 1, "exactly one subject document");
+        let doc = docs[0].as_object().expect("doc object");
+        assert_eq!(doc["@id"], json!("http://example.org/customer/1"));
+        assert_eq!(
+            doc.get("@type"),
+            Some(&json!("http://example.org/Customer"))
+        );
+        assert_eq!(doc.get("http://example.org/name"), Some(&json!("Alice")));
+        // FK ref → {"@id":…} (the A-cluster node-reference shape), NOT a bare string.
+        assert_eq!(
+            doc.get("http://example.org/account"),
+            Some(&json!({"@id": "http://example.org/account/10"})),
+            "FK ref must be an @id node reference: {doc:?}"
+        );
+        // Bound-subject prune + trust_fk_refs: only the customers table is scanned
+        // (not accounts, and no FK-parent verification scan).
+        assert_eq!(provider.scanned_tables(), vec!["customers".to_string()]);
+    }
+
+    // `{"select": {"<iri>": ["@type"]}}` returns @id + @type ONLY (no forward
+    // properties).
+    #[tokio::test]
+    async fn bound_subject_select_map_type_only() {
+        let provider = customer_account_provider();
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({"select": {"http://example.org/customer/1": ["@type"]}});
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 1);
+        let doc = docs[0].as_object().unwrap();
+        assert_eq!(doc["@id"], json!("http://example.org/customer/1"));
+        assert_eq!(
+            doc.get("@type"),
+            Some(&json!("http://example.org/Customer"))
+        );
+        assert_eq!(doc.len(), 2, "only @id and @type: {doc:?}");
+    }
+
+    // A forward-predicate list projects ONLY the requested predicates (here:
+    // name), omitting the account ref and @type — and matches a requested term
+    // against either the full IRI or its compacted form.
+    #[tokio::test]
+    async fn bound_subject_select_map_predicate_list_projects_requested_only() {
+        let provider = customer_account_provider();
+        let (_ledger, view) = genesis_view();
+        // Full-IRI request.
+        let crawl =
+            json!({"select": {"http://example.org/customer/1": ["http://example.org/name"]}});
+        let doc = run_crawl(&provider, &view, &crawl).await[0]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(doc["@id"], json!("http://example.org/customer/1"));
+        assert_eq!(doc.get("http://example.org/name"), Some(&json!("Alice")));
+        assert!(doc.get("http://example.org/account").is_none());
+        assert!(doc.get("@type").is_none());
+        // Compact-term request (via @context) resolves to the same property.
+        let crawl2 = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"http://example.org/customer/1": ["v:name"]}
+        });
+        let doc2 = run_crawl(&provider, &view, &crawl2).await[0]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            doc2.get("v:name"),
+            Some(&json!("Alice")),
+            "compact-term request projects under the requested term: {doc2:?}"
+        );
+    }
+
+    // An ABSENT / unreversible subject scans zero matching rows and returns the
+    // native-parity `[{"@id": <iri>}]` stub (native returns the same for a
+    // genuinely-missing subject).
+    #[tokio::test]
+    async fn bound_subject_select_map_absent_subject_returns_stub() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({"select": {"http://example.org/person/999": ["*"]}});
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 1, "the stub is a single-element array");
+        let doc = docs[0].as_object().unwrap();
+        assert_eq!(doc["@id"], json!("http://example.org/person/999"));
+        assert_eq!(
+            doc.len(),
+            1,
+            "absent subject → bare @id stub (native parity): {doc:?}"
+        );
+    }
+
+    // Regression guard: a constant-IRI select-map over a NATIVE ledger (no graph
+    // source) is UNCHANGED — `maybe_expand_crawl` returns None at the
+    // native-hydration gate, so it never touches the R2RML routing.
+    #[tokio::test]
+    async fn native_select_map_is_not_rerouted() {
+        let snapshot = LedgerSnapshot::genesis("native:main");
+        let ledger = LedgerState::new(snapshot, Novelty::new(0));
+        let view = GraphDb::from_ledger_state(&ledger); // graph_source_id = None
+        let fluree = FlureeBuilder::memory().build_memory();
+        let crawl = json!({"select": {"http://example.org/customer/1": ["*"]}});
+        let out = maybe_expand_crawl(
+            &fluree,
+            &view,
+            Some(&crawl),
+            None,
+            QueryExecutionOptions::new(),
+            &FormatterConfig::default(),
+        )
+        .await
+        .expect("no error");
+        assert!(
+            out.is_none(),
+            "a native ledger select-map must fall through to native hydration"
         );
     }
 }
