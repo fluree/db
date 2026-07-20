@@ -1357,6 +1357,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 
@@ -1419,6 +1420,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -1448,6 +1450,7 @@ mod tests {
                 offset: None,
                 post_values: None,
                 include_system_facts: false,
+                cypher_vocab: None,
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }

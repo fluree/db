@@ -82,7 +82,7 @@ struct CachedSubmission {
 enum ClaimOutcome {
     /// A previous submission with the same key and body already completed.
     /// The caller returns this receipt without running the executor.
-    AlreadyDone(OperationReceipt),
+    AlreadyDone(Box<OperationReceipt>),
     /// This caller won the claim. The guard owns the `InFlight` slot in
     /// the moka cache; dropping it before [`ClaimGuard::commit`] runs
     /// schedules an asynchronous eviction so a cancelled transact future
@@ -532,7 +532,7 @@ impl<C: Committer> CachingCommitter<C> {
             // `SubmissionLookup` (post-leader-transition reads), which
             // doesn't flow through this map.
             SubmissionState::Committed(committed) => match committed.receipt {
-                Some(r) => Ok(ClaimOutcome::AlreadyDone(*r)),
+                Some(r) => Ok(ClaimOutcome::AlreadyDone(r)),
                 None => Err(SubmissionError::AlreadyInFlight),
             },
             _ => Err(SubmissionError::AlreadyInFlight),
@@ -791,8 +791,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_request_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Transaction(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Transaction(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -831,8 +833,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_revert_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Revert(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Revert(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -868,8 +872,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_merge_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Merge(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Merge(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -904,8 +910,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_rebase_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Rebase(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Rebase(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
@@ -953,8 +961,10 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         let body_hash = Self::hash_push_body(&request);
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
-            ClaimOutcome::AlreadyDone(OperationReceipt::Push(r)) => return Ok(r),
-            ClaimOutcome::AlreadyDone(_) => return Err(SubmissionError::KeyCollision),
+            ClaimOutcome::AlreadyDone(receipt) => match *receipt {
+                OperationReceipt::Push(r) => return Ok(r),
+                _ => return Err(SubmissionError::KeyCollision),
+            },
             ClaimOutcome::Claimed(g) => g,
         };
 
