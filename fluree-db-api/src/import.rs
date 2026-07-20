@@ -895,12 +895,12 @@ impl ChunkSource {
         }
     }
 
-    /// Whether chunk at `index` is a JSON-LD file (`.jsonld`, also compressed).
+    /// Whether chunk at `index` is a JSON-LD file (`.json`/`.jsonld`, also compressed).
     pub fn is_jsonld(&self, index: usize) -> bool {
         match self {
             Self::Files(files) => files
                 .get(index)
-                .is_some_and(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+                .is_some_and(|p| is_jsonld_ext(effective_extension(p).0.as_deref())),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => {
                 matches!(producer.format_at(index), Some(RemoteFormat::JsonLd))
@@ -916,7 +916,7 @@ impl ChunkSource {
         match self {
             Self::Files(files) => files
                 .iter()
-                .any(|p| effective_extension(p).0.as_deref() == Some("jsonld")),
+                .any(|p| is_jsonld_ext(effective_extension(p).0.as_deref())),
             Self::Streaming(_) | Self::LocalRechunk(_) => false,
             Self::Remote(producer) => producer.has_jsonld(),
             Self::JsonLdStream(_) => true,
@@ -973,8 +973,14 @@ pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
     matches!(ext, Some("jsonl" | "ndjson"))
 }
 
+/// Whether an effective extension names a whole-document JSON-LD file.
+/// `.json` is accepted because it is a common JSON-LD filename convention.
+pub(crate) fn is_jsonld_ext(ext: Option<&str>) -> bool {
+    matches!(ext, Some("json" | "jsonld"))
+}
+
 /// Whether `path` names a file the bulk-import pipeline accepts: any supported
-/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.jsonld`/`.jsonl`/
+/// RDF/JSON-LD extension (`.ttl`/`.nt`/`.nq`/`.trig`/`.json`/`.jsonld`/`.jsonl`/
 /// `.ndjson`, case-insensitive), optionally compressed with `.gz`/`.zst`.
 ///
 /// Single source of truth shared with the CLI's import-vs-transact routing —
@@ -982,10 +988,8 @@ pub(crate) fn is_ndjson_ext(ext: Option<&str>) -> bool {
 pub fn is_bulk_import_file(path: &Path) -> bool {
     let inner = effective_extension(path).0;
     is_ndjson_ext(inner.as_deref())
-        || matches!(
-            inner.as_deref(),
-            Some("ttl" | "nt" | "trig" | "nq" | "jsonld")
-        )
+        || is_jsonld_ext(inner.as_deref())
+        || matches!(inner.as_deref(), Some("ttl" | "nt" | "trig" | "nq"))
 }
 
 /// Buffer size for decoded input streams, sized to match the splitter's scan
@@ -1283,7 +1287,7 @@ async fn resolve_remote_objects(
                     accepted.push(obj);
                     extensions.push(RemoteFormat::Nquads);
                 }
-                Some("jsonld") => {
+                Some("json" | "jsonld") => {
                     has_jsonld = true;
                     accepted.push(obj);
                     extensions.push(RemoteFormat::JsonLd);
@@ -1308,7 +1312,8 @@ async fn resolve_remote_objects(
 
     if accepted.is_empty() {
         return Err(ImportError::NoChunks(
-            "remote source contains no .ttl/.nt/.nq/.trig/.jsonld/.jsonl/.ndjson objects".into(),
+            "remote source contains no .ttl/.nt/.nq/.trig/.json/.jsonld/.jsonl/.ndjson objects"
+                .into(),
         ));
     }
 
@@ -2734,7 +2739,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         } else {
             match inner.as_deref() {
                 Some("ttl" | "trig" | "nt" | "nq") => has_turtle = true,
-                Some("jsonld") => has_jsonld = true,
+                Some("json" | "jsonld") => has_jsonld = true,
                 _ => {}
             }
         }
@@ -2754,7 +2759,7 @@ pub fn scan_directory_format(dir: &Path) -> std::result::Result<DirectoryFormat,
         (true, _) => Ok(DirectoryFormat::Turtle),
         (false, true) => Ok(DirectoryFormat::JsonLd),
         (false, false) => Err(ImportError::NoChunks(format!(
-            "no supported data files (.ttl, .nt, .nq, .trig, .jsonld, .jsonl, .ndjson) found in {}",
+            "no supported data files (.ttl, .nt, .nq, .trig, .json, .jsonld, .jsonl, .ndjson) found in {}",
             dir.display()
         ))),
     }

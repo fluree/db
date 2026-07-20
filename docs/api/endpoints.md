@@ -767,7 +767,9 @@ Mint with two extra fields:
 POST /import-upload
 { "ledger": "kb:main", "size": 123456789,
   "source_kind": "source",       // default "flpack"
-  "filename": "dump.cypher" }    // extension drives format detection
+  "filename": "dump.cypher",     // extension drives format detection
+  "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
+  "base_iri": "https://kb.example/" } // CSV/Cypher only; format default if omitted
 ```
 
 Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.

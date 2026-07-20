@@ -635,15 +635,27 @@ async fn run_source_upload(
     filename: &str,
     bytes: Vec<u8>,
 ) -> JsonValue {
+    run_source_upload_with_options(state, dst, filename, bytes, JsonValue::Null).await
+}
+
+async fn run_source_upload_with_options(
+    state: &Arc<AppState>,
+    dst: &str,
+    filename: &str,
+    bytes: Vec<u8>,
+    options: JsonValue,
+) -> JsonValue {
+    let mut mint_body = json!({ "ledger": dst, "source_kind": "source", "filename": filename });
+    if let (Some(body), Some(options)) = (mint_body.as_object_mut(), options.as_object()) {
+        body.extend(options.clone());
+    }
     let (status, mint) = json_request(
         state,
         Request::builder()
             .method("POST")
             .uri("/v1/fluree/import-upload")
             .header("content-type", "application/json")
-            .body(Body::from(
-                json!({ "ledger": dst, "source_kind": "source", "filename": filename }).to_string(),
-            ))
+            .body(Body::from(mint_body.to_string()))
             .unwrap(),
     )
     .await;
@@ -738,6 +750,27 @@ ex:bob a ex:User ; schema:name "Bob" .
 }
 
 #[tokio::test]
+async fn source_upload_json_extension_imports_as_jsonld() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-json/data:main";
+    let source = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:name": "Alice"
+    })
+    .to_string()
+    .into_bytes();
+
+    let final_status = run_source_upload(&state, dst, "data.json", source).await;
+    assert_eq!(
+        final_status["status"], "succeeded",
+        "JSON-LD with a .json extension should import: {final_status:?}"
+    );
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    assert_eq!(handle.snapshot.t, 1);
+}
+
+#[tokio::test]
 async fn source_upload_cypher_converts_then_imports() {
     let (_tmp, state) = presign_test_state().await;
     let dst = "src-cypher/data:main";
@@ -765,6 +798,41 @@ CREATE (:Person {name: "Bob"});
         .await
         .expect("cypher query");
     assert_eq!(result.row_count(), 2);
+}
+
+#[tokio::test]
+async fn source_upload_cypher_preserves_conversion_options() {
+    let (_tmp, state) = presign_test_state().await;
+    let dst = "src-cypher-options/data:main";
+    let cypher = br#"CREATE (:Person {name: "Alice"});
+CREATE (:Person {name: "Bob"});
+MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {since: 2020}]->(b);
+"#
+    .to_vec();
+
+    let final_status = run_source_upload_with_options(
+        &state,
+        dst,
+        "dump.cypher",
+        cypher,
+        json!({
+            "edge_properties": "plain",
+            "base_iri": "http://example.org/kb/"
+        }),
+    )
+    .await;
+    assert_eq!(final_status["status"], "succeeded", "{final_status:?}");
+    assert_eq!(final_status["result"]["has_annotations"], false);
+
+    let handle = state.fluree.ledger(dst).await.expect("load imported");
+    let db = GraphDb::from_ledger_state(&handle)
+        .with_default_context(Some(json!({"@vocab": "http://example.org/kb/"})));
+    let result = state
+        .fluree
+        .query_cypher(&db, "MATCH (:Person)-[r:KNOWS]->(:Person) RETURN type(r)")
+        .await
+        .expect("query imported names");
+    assert_eq!(result.row_count(), 1);
 }
 
 #[tokio::test]
@@ -868,6 +936,15 @@ MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS {s
     assert_eq!(final_status["result"]["has_annotations"], true);
 
     let handle = state.fluree.ledger(dst).await.expect("load imported");
+    let expected_root = handle
+        .head_index_id
+        .as_ref()
+        .map(std::string::ToString::to_string);
+    assert_eq!(
+        final_status["result"]["root_id"].as_str(),
+        expected_root.as_deref(),
+        "job result must return the post-seal nameservice root"
+    );
     assert!(
         handle.snapshot.has_annotations,
         "imported ledger carries annotations"
