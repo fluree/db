@@ -119,6 +119,16 @@ impl ServerError {
                 }),
             ) => errors::CATALOG_CREDENTIALS_NOT_VENDED,
 
+            // Virtual-dataset (R2RML) unsupported-pattern refusal: a distinct
+            // `@type` so Solo's browse UI can gate on the condition instead of
+            // matching prose. Stays HTTP 400 (well-formed request, unsupported on
+            // this source) — unlike the 403/507 distinct-status precedents — via
+            // the generic `Query(_)` arm in `status_code()`. MUST precede the
+            // generic `ApiError::Query(_)` arm below.
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
+            )) => errors::R2RML_UNSUPPORTED_PATTERN,
+
             ServerError::Api(ApiError::Query(_)) => errors::INVALID_QUERY,
             ServerError::Api(ApiError::Batch(_)) => errors::INVALID_QUERY,
             // Optimistic-concurrency conflicts: a distinct, retryable class so
@@ -510,5 +520,38 @@ mod tests {
         let msg = json["error"].as_str().unwrap();
         assert!(msg.contains("https://catalog.example/v1"), "{msg}");
         assert!(msg.contains("vended_credentials=false"), "{msg}");
+    }
+
+    #[test]
+    fn r2rml_unsupported_pattern_is_400_with_distinct_type() {
+        // Well-formed but unsupported ON THIS SOURCE: stays HTTP 400 (not a
+        // distinct status like 403/507), but carries a distinct `@type` machine
+        // code so the Solo browse UI can branch on it instead of matching prose.
+        let se = ServerError::Api(ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(
+                "graph source 'x' has 1 pattern(s) with a variable predicate and a bound term",
+            ),
+        ));
+        assert_eq!(se.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(se.error_type(), errors::R2RML_UNSUPPORTED_PATTERN);
+        let body = ErrorResponse {
+            error: se.to_string(),
+            status: se.status_code().as_u16(),
+            error_type: se.error_type().to_string(),
+            cause: extract_cause(&se),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["status"], 400);
+        assert_eq!(json["@type"], errors::R2RML_UNSUPPORTED_PATTERN);
+        // The human-readable message keeps the migration substring existing
+        // prose-matchers rely on.
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be converted to R2RML scans"),
+            "{}",
+            json["error"]
+        );
     }
 }

@@ -80,6 +80,26 @@ pub fn unsupported_subscope_error(graph_iri: &str, kinds: &[&str]) -> crate::err
     ))
 }
 
+/// The typed refusal for an R2RML graph-source query carrying `unconverted`
+/// patterns — a VARIABLE predicate paired with a BOUND term (`?s ?p <iri>` /
+/// `?s ?p "value"`). The single source of the (corrected, actionable) prose for
+/// both the seeded and batched rewrite sites in `graph.rs`, so the message
+/// cannot drift between them, surfaced with the stable
+/// `err:r2rml/UnsupportedPattern` machine code (HTTP 400).
+///
+/// Corrects the historical message, which falsely blamed "bound subjects … or
+/// bound objects": a bound subject (`<iri> ?p ?o`) and a constant-predicate
+/// bound object (`?s <ex:name> "value"`) both convert and run today; only a
+/// VARIABLE predicate with a bound term is refused.
+pub fn r2rml_unsupported_pattern_error(graph_iri: &str, count: usize) -> crate::error::QueryError {
+    crate::error::QueryError::r2rml_unsupported_pattern(format!(
+        "graph source '{graph_iri}' has {count} pattern(s) with a variable predicate and a \
+         bound term (e.g. `?s ?p <iri>` or `?s ?p \"value\"`); use a concrete predicate \
+         (e.g. `?s <ex:name> ?o`) instead. Bound subjects (`<iri> ?p ?o`) and \
+         constant-predicate bound objects (`?s <ex:name> \"value\"`) already work."
+    ))
+}
+
 /// Rewrite patterns for an R2RML graph source.
 ///
 /// This function takes patterns from a GRAPH block and converts triple patterns
