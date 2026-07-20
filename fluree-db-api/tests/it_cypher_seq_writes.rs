@@ -476,6 +476,166 @@ async fn zero_matching_rows_is_a_clean_no_op() {
 }
 
 #[tokio::test]
+async fn anonymous_read_prefix_preserves_row_multiplicity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:anonymous-prefix");
+    let l = fluree
+        .transact_cypher(l, r#"UNWIND [1, 2, 3] AS id CREATE (:Person {id: id})"#)
+        .await
+        .expect("seed people")
+        .ledger;
+
+    let r = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (:Person) CREATE (:Audit) MERGE (:Sentinel {id: 1})"#,
+        )
+        .await
+        .expect("anonymous-prefix sequential write");
+
+    assert_eq!(
+        count(&fluree, &r.ledger, "MATCH (n:Audit) RETURN count(n)").await,
+        3,
+        "the zero-column read relation still carries one row per match"
+    );
+    assert_eq!(
+        count(&fluree, &r.ledger, "MATCH (n:Sentinel) RETURN count(n)").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn with_star_preserves_visible_scope_before_sequential_write() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:with-star");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"UNWIND ["a", "b"] AS name CREATE (:Person {name: name})"#,
+        )
+        .await
+        .expect("seed people")
+        .ledger;
+
+    let r = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (p:Person) WITH * MERGE (t:Tag {name: p.name}) MERGE (p)-[:TAGGED]->(t)"#,
+        )
+        .await
+        .expect("WITH * sequential write");
+
+    assert_eq!(
+        count(&fluree, &r.ledger, "MATCH (n:Tag) RETURN count(n)").await,
+        2
+    );
+    assert_eq!(
+        count(
+            &fluree,
+            &r.ledger,
+            "MATCH (:Person)-[r:TAGGED]->(:Tag) RETURN count(r)"
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn computed_on_match_values_observe_prior_duplicate_updates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:computed-on-match");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (:Counter {id: "counter", count: 0})"#)
+        .await
+        .expect("seed counter")
+        .ledger;
+
+    let r = fluree
+        .transact_cypher_with_params(
+            l,
+            r#"UNWIND $rows AS row
+               MERGE (n:Counter {id: row.id}) ON MATCH SET n.count = n.count + 1
+               MERGE (s:Sentinel {id: 1})"#,
+            Some(&params(
+                json!({"rows": [{"id": "counter"}, {"id": "counter"}]}),
+            )),
+        )
+        .await
+        .expect("computed ON MATCH");
+
+    let db = graphdb_from_ledger(&r.ledger);
+    let returned = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Counter {id: "counter"}) RETURN n.count AS count"#,
+        )
+        .await
+        .expect("read counter")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("counter JSON");
+    assert_eq!(
+        returned["results"][0]["data"][0]["row"][0],
+        json!(2),
+        "the second duplicate row reads the first row's increment: {returned}"
+    );
+}
+
+#[tokio::test]
+async fn computed_on_create_values_can_read_the_created_binding() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:computed-on-create");
+
+    let r = fluree
+        .transact_cypher(
+            l,
+            r#"MERGE (n:Counter {id: "new"})
+               ON CREATE SET n.copy = n.id
+               MERGE (s:Sentinel {id: 1})"#,
+        )
+        .await
+        .expect("computed ON CREATE");
+
+    assert_eq!(
+        count(
+            &fluree,
+            &r.ledger,
+            r#"MATCH (n:Counter {id: "new", copy: "new"}) RETURN count(n)"#
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn path_bindings_round_trip_through_sequential_rows() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:path-row");
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Person {name: "A"})-[:KNOWS]->(:Person {name: "B"})"#,
+        )
+        .await
+        .expect("seed path")
+        .ledger;
+
+    let (_r, returned) = fluree
+        .transact_cypher_returning(
+            l,
+            r#"MATCH p = (a:Person)-[:KNOWS]->(b:Person)
+               MERGE (x:Seen {name: a.name})
+               MERGE (x)-[:POINTS_TO]->(b)
+               RETURN length(p) AS hops"#,
+            None,
+        )
+        .await
+        .expect("path-threading sequential write");
+    let returned = returned.expect("RETURN envelope");
+    assert_eq!(returned["results"][0]["data"][0]["row"][0], json!(1));
+}
+
+#[tokio::test]
 async fn failing_clause_commits_nothing() {
     // All-or-nothing: the third clause is rejected (multi-hop MERGE), so the
     // first two clauses' staging must not surface anywhere.
