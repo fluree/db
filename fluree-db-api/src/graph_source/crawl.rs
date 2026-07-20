@@ -162,6 +162,26 @@ pub(crate) async fn expand_wildcard_crawl(
         return Ok(None);
     };
 
+    // C1: a top-level `values` clause is NOT consumed by crawl planning
+    // (`detect_wildcard_crawl` / `build_flat_query` never read it), so it would
+    // be silently DROPPED — the crawl would return the ENTIRE class instead of
+    // the VALUES-constrained subjects (a wrong-answer defect, not merely a slow
+    // one). Refuse loudly with the typed R2RML envelope until VALUES is honored
+    // on the crawl path (the loud-or-correct precedent). A flat-select VALUES
+    // query is not a crawl select-map, so it never reaches here (detected `None`
+    // above) and keeps working on the normal path.
+    if input.get("values").is_some_and(|v| !v.is_null()) {
+        return Err(crate::ApiError::Query(
+            fluree_db_query::QueryError::r2rml_unsupported_pattern(
+                "a top-level `values` clause on a virtual-dataset (graph-source) subgraph \
+                 crawl is not yet supported and would be silently dropped, returning the \
+                 entire class. Put the subject constraint in the WHERE clause instead — \
+                 e.g. `{\"select\": [\"?p\", \"?o\"], \"where\": {\"@id\": \"<subject-iri>\", \
+                 \"?p\": \"?o\"}}` for a single subject.",
+            ),
+        ));
+    }
+
     if offset > MAX_CRAWL_OFFSET_SUBJECTS {
         return Err(crate::ApiError::query(format!(
             "crawl offset {offset} exceeds the virtual-dataset paging ceiling \
@@ -1722,5 +1742,80 @@ mod e2e {
                 }
             }
         }
+    }
+
+    // C1: a top-level VALUES clause on a graph-source crawl is DROPPED by the
+    // crawl planner (it would silently return the whole class). Refuse loudly
+    // with the typed R2RML unsupported-pattern envelope instead of over-returning.
+    #[tokio::test]
+    async fn crawl_with_top_level_values_refuses_loudly() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Person"},
+            "values": ["?s", [{"@id": "http://example.org/person/1"}]]
+        });
+        let err = expand_wildcard_crawl(
+            &fluree,
+            &view,
+            &crawl,
+            &provider,
+            &provider,
+            QueryExecutionOptions::new(),
+            &FormatterConfig::default(),
+        )
+        .await
+        .expect_err("a crawl carrying a dropped VALUES clause must refuse, not over-return");
+        assert!(
+            matches!(
+                err,
+                crate::ApiError::Query(fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. })
+            ),
+            "must be the typed R2RML unsupported-pattern refusal, got: {err:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("values"),
+            "refusal must name the VALUES clause: {err}"
+        );
+        // The refusal fires BEFORE any scan (no whole-class over-fetch).
+        assert!(
+            provider.scanned_tables().is_empty(),
+            "the VALUES refusal must not scan the class table: {:?}",
+            provider.scanned_tables()
+        );
+    }
+
+    // Regression guard: a FLAT-select VALUES query is not a crawl select-map, so
+    // the crawl expander declines it (Ok(None)) and it flows to the normal path
+    // where VALUES works — the C1 guard must not touch it.
+    #[tokio::test]
+    async fn flat_select_values_is_not_intercepted_by_crawl() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        let fluree = FlureeBuilder::memory().build_memory();
+        let flat = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": ["?p", "?o"],
+            "where": {"@id": "?s", "?p": "?o"},
+            "values": ["?s", [{"@id": "http://example.org/person/1"}]]
+        });
+        let out = expand_wildcard_crawl(
+            &fluree,
+            &view,
+            &flat,
+            &provider,
+            &provider,
+            QueryExecutionOptions::new(),
+            &FormatterConfig::default(),
+        )
+        .await
+        .expect("a flat-select VALUES query must not error in the crawl expander");
+        assert!(
+            out.is_none(),
+            "flat-select VALUES must fall through to the normal path (Ok(None))"
+        );
     }
 }
