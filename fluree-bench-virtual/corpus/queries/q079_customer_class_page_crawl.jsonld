@@ -1,0 +1,14 @@
+# q079 customer_class_page_crawl — browse-parity Cluster A (D1/D2/D3 node-doc
+#   serialization) end-to-end. A "View Instances" class page: a variable-subject
+#   select-map subgraph crawl over edw:Customer, limit 20. Exercises the un-forked
+#   crawl object formatter — FK refs (edw:geography / edw:account) must serialize
+#   as {"@id":...} node references (not bare strings), booleans as real JSON
+#   bools, and typed-json honored. RowsOnly: the LIMIT truncates the unordered
+#   300k-customer set, so native and virtual pick different-but-valid 20-subject
+#   pages (the FK-ref shape is verified in the live subset instead).
+{
+  "@context": {"edw": "http://ns.fluree.dev/edw#"},
+  "select": {"?s": ["*"]},
+  "where": {"@id": "?s", "@type": "edw:Customer"},
+  "limit": 20
+}

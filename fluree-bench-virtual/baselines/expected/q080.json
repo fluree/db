@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "query_id": "q080",
+  "result_hash": "31d53f18855fd764d6aefc589dd84a9ad659934679a262000973cbf129599aef",
+  "rows": 1,
+  "head_rows": [
+    "{\"@id\":\"http://data.fluree.dev/edw/customer/1\",\"@type\":\"http://ns.fluree.dev/edw#Customer\",\"http://ns.fluree.dev/edw#account\":{\"@id\":\"http://data.fluree.dev/edw/account/1624\"},\"http://ns.fluree.dev/edw#birthYear\":1974,\"http://ns.fluree.dev/edw#customerId\":\"CUST-000000000\",\"http://ns.fluree.dev/edw#email\":\"user1@example.com\",\"http://ns.fluree.dev/edw#gender\":\"M\",\"http://ns.fluree.dev/edw#geography\":{\"@id\":\"http://data.fluree.dev/edw/geography/21801\"},\"http://ns.fluree.dev/edw#isCurrent\":true,\"http://ns.fluree.dev/edw#name\":\"Customer 1\",\"http://ns.fluree.dev/edw#phone\":\"+1-8235270980\",\"http://ns.fluree.dev/edw#scdValidFrom\":{\"@value\":\"2016-07-29\",\"@type\":\"http://www.w3.org/2001/XMLSchema#date\"},\"http://ns.fluree.dev/edw#scdValidTo\":{\"@value\":\"9999-12-31\",\"@type\":\"http://www.w3.org/2001/XMLSchema#date\"},\"http://ns.fluree.dev/edw#segment\":\"Consumer\",\"http://ns.fluree.dev/edw#signupDate\":{\"@value\":\"2009-07-17\",\"@type\":\"http://www.w3.org/2001/XMLSchema#date\"}}"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KY0X3SHR4SYZAMCDDTF33GDT",
+    "commit": "be859fe97"
+  }
+}
