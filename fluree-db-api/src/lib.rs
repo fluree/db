@@ -61,6 +61,7 @@ pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
 pub mod import;
+pub mod import_source;
 mod indexer_attachment_provider;
 mod indexer_fulltext_provider;
 mod inline_ontology;

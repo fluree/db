@@ -348,6 +348,21 @@ impl Fluree {
         .await
     }
 
+    /// Explain a Cypher query plan against a GraphDb.
+    ///
+    /// Lowers through the same `parse_cypher_to_ir` path as execution
+    /// (default context, `$param` substitution) so the reported plan matches
+    /// what [`Self::query_cypher_with_params`] would run.
+    pub async fn explain_cypher(
+        &self,
+        db: &GraphDb,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+    ) -> Result<JsonValue> {
+        crate::explain::explain_cypher(&db.snapshot, cypher, db.default_context.as_ref(), params)
+            .await
+    }
+
     /// Execute a query with tracking.
     ///
     /// Returns a tracked response with fuel, time, and policy statistics.

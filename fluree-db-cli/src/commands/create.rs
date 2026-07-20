@@ -274,6 +274,100 @@ async fn poll_remote_import(
     }
 }
 
+/// `fluree create <ledger> --remote <name> --from <data>` for non-`.flpack`
+/// inputs: upload the raw source file to a server advertising
+/// `source-upload` and let it run the bulk-import pipeline (the same formats
+/// `fluree create --from` takes locally). Single files only — a directory
+/// can't ride one upload slot; pack it or create locally and publish.
+pub async fn run_remote_source_import(
+    ledger: &str,
+    remote_name: &str,
+    path: &Path,
+    dirs: &FlureeDir,
+    edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    base_iri: Option<&str>,
+) -> CliResult<()> {
+    use colored::Colorize;
+
+    if !path.is_file() {
+        return Err(CliError::Usage(format!(
+            "--remote --from requires a single file ({} is a directory); \
+             create locally then `fluree publish {remote_name} {ledger}`, or export \
+             to .flpack (`fluree export <ledger> --format ledger -o out.flpack`).",
+            path.display()
+        )));
+    }
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| CliError::Input(format!("unusable file name: {}", path.display())))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| CliError::Input(format!("failed to stat {}: {e}", path.display())))?;
+    let size = meta.len();
+
+    let client = context::build_remote_client(remote_name, dirs).await?;
+    let ledger_id = context::to_ledger_id(ledger);
+
+    let cap = client.fetch_import_capability().await;
+    if !cap.supports_source_upload() {
+        return Err(CliError::Usage(format!(
+            "remote '{remote_name}' does not offer server-side bulk import (source-upload); \
+             export to .flpack first (`fluree export <ledger> --format ledger -o out.flpack`), \
+             or create locally then `fluree publish {remote_name} {ledger}`."
+        )));
+    }
+
+    eprintln!(
+        "Uploading '{}' to remote '{}' for server-side bulk import ({}, {})...",
+        ledger.cyan(),
+        remote_name,
+        filename,
+        format_human_bytes(size),
+    );
+
+    // Same mint → upload → complete → poll handshake as the negotiated
+    // `.flpack` path; the mint body declares the source kind + filename so the
+    // server stages with the right extension and runs the pipeline on
+    // complete.
+    let mint = client
+        .mint_source_import_upload(&ledger_id, Some(size), filename, edge_policy, base_iri)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
+    let import_id = mint["import_id"]
+        .as_str()
+        .ok_or_else(|| CliError::Remote("mint response missing import_id".to_string()))?
+        .to_string();
+
+    let completed_parts = if mint.get("multipart").is_some() {
+        upload_multipart(&client, &mint, path, size).await?
+    } else {
+        upload_single(&client, &mint, path).await?
+    };
+
+    client
+        .complete_import_upload(&import_id, &completed_parts)
+        .await
+        .map_err(|e| CliError::Remote(format!("failed to start remote import: {e}")))?;
+
+    eprintln!("Upload complete; importing on '{remote_name}'...");
+
+    let result = poll_remote_import(&client, &import_id).await?;
+    context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+
+    let resolved = result["ledger_id"].as_str().unwrap_or(&ledger_id);
+    let t = result["t"].as_i64().unwrap_or(0);
+    let flakes = result["flake_count"].as_u64().unwrap_or(0);
+    println!(
+        "{} Imported '{}' to remote '{}' — t={}, {} flakes",
+        "✓".green(),
+        resolved,
+        remote_name,
+        t,
+        flakes,
+    );
+    Ok(())
+}
+
 /// Print the shared success summary for a remote import (both paths).
 fn print_remote_import_summary(remote_name: &str, ledger_id: &str, result: &serde_json::Value) {
     use colored::Colorize;
@@ -959,9 +1053,7 @@ fn is_csv_input(path: &Path) -> bool {
 }
 
 fn has_csv_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("csv"))
+    fluree_db_api::import_source::has_csv_extension(path)
 }
 
 /// Whether `--from` points at a Cypher script: a single `.cypher`/`.cyp`/`.cql`
@@ -979,11 +1071,7 @@ fn is_cypher_input(path: &Path) -> bool {
 }
 
 fn has_cypher_extension(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        e.eq_ignore_ascii_case("cypher")
-            || e.eq_ignore_ascii_case("cyp")
-            || e.eq_ignore_ascii_case("cql")
-    })
+    fluree_db_api::import_source::has_cypher_extension(path)
 }
 
 /// Convert CSV node/relationship files (neo4j-admin header convention) to
@@ -1000,26 +1088,7 @@ async fn run_csv_import(
     quiet: bool,
     import_opts: &ImportOpts,
 ) -> CliResult<()> {
-    use fluree_db_api::csv_import::{write_csv_ndjson, CsvImportOptions};
-    use std::io::{BufReader, BufWriter};
-
-    let files: Vec<std::path::PathBuf> = if path.is_dir() {
-        let mut v: Vec<_> = std::fs::read_dir(path)
-            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| has_csv_extension(p))
-            .collect();
-        v.sort();
-        v
-    } else {
-        vec![path.to_path_buf()]
-    };
-    if files.is_empty() {
-        return Err(CliError::Input(format!(
-            "no .csv files found in {}",
-            path.display()
-        )));
-    }
+    use fluree_db_api::csv_import::CsvImportOptions;
 
     let opts = CsvImportOptions {
         edge_policy: import_opts.edge_policy,
@@ -1037,33 +1106,12 @@ async fn run_csv_import(
         .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
     if !quiet {
         println!(
-            "Converting {} CSV file(s) → JSON-LD (edge properties: {:?})...",
-            files.len(),
+            "Converting CSV → JSON-LD (edge properties: {:?})...",
             import_opts.edge_policy
         );
     }
-    let mut total_objects = 0usize;
-    for (i, csv_path) in files.iter().enumerate() {
-        let stem = csv_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(sanitize_for_filename)
-            .unwrap_or_else(|| format!("part{i}"));
-        let out_path = tmp.path().join(format!("{i:05}_{stem}.jsonl"));
-        let reader =
-            BufReader::new(std::fs::File::open(csv_path).map_err(|e| {
-                CliError::Input(format!("failed to open {}: {e}", csv_path.display()))
-            })?);
-        let mut writer = BufWriter::new(
-            std::fs::File::create(&out_path)
-                .map_err(|e| CliError::Input(format!("failed to write temp jsonl: {e}")))?,
-        );
-        total_objects += write_csv_ndjson(reader, &opts, &mut writer)
-            .map_err(|e| CliError::Input(format!("CSV import ({}): {e}", csv_path.display())))?;
-        writer
-            .into_inner()
-            .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))?;
-    }
+    let total_objects = fluree_db_api::import_source::csv_to_shards(path, &opts, tmp.path())
+        .map_err(|e| CliError::Input(e.to_string()))?;
     if !quiet {
         println!("Converted {total_objects} object(s); importing...");
     }
@@ -1096,107 +1144,35 @@ async fn run_cypher_import(
     quiet: bool,
     import_opts: &ImportOpts,
 ) -> CliResult<()> {
-    use fluree_db_api::cypher_import::{CypherImportOptions, CypherImporter};
-    use std::io::{BufReader, BufWriter, Write};
-
-    let files: Vec<std::path::PathBuf> = if path.is_dir() {
-        let mut v: Vec<_> = std::fs::read_dir(path)
-            .map_err(|e| CliError::Input(format!("failed to read {}: {e}", path.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| has_cypher_extension(p))
-            .collect();
-        v.sort();
-        v
-    } else {
-        vec![path.to_path_buf()]
-    };
-    if files.is_empty() {
-        return Err(CliError::Input(format!(
-            "no .cypher files found in {}",
-            path.display()
-        )));
-    }
-
-    let mut importer = CypherImporter::new(CypherImportOptions {
-        edge_policy: import_opts.edge_policy,
-        vocab: import_opts.base_iri.clone(),
-    });
-
-    let open = |p: &Path| {
-        std::fs::File::open(p)
-            .map(BufReader::new)
-            .map_err(|e| CliError::Input(format!("failed to open {}: {e}", p.display())))
-    };
-    let convert_err =
-        |p: &Path, e| CliError::Input(format!("Cypher import ({}): {e}", p.display()));
+    use fluree_db_api::cypher_import::CypherImportOptions;
 
     if !quiet {
         println!(
-            "Converting {} Cypher file(s) → JSON-LD (edge properties: {:?})...",
-            files.len(),
+            "Converting Cypher → JSON-LD (edge properties: {:?})...",
             import_opts.edge_policy
         );
     }
 
-    // Pass 1 over all files: learn each label's match-key property set, so
-    // node ids derive identically regardless of which file MATCHes them.
-    for p in &files {
-        importer
-            .learn_keys(open(p)?)
-            .map_err(|e| convert_err(p, e))?;
-    }
-
-    // Passes 2 + 3: one `.jsonl` shard per source file per pass (node shards
-    // first), letting the bulk pipeline parallelize across shards. Temp dir is
-    // cleaned up on drop, after the import completes.
+    // Shards land in a temp dir (cleaned up on drop, after the import
+    // completes); the shared converter runs the three passes (learn keys,
+    // nodes, edges) so node ids derive identically across files.
     let tmp = tempfile::tempdir()
         .map_err(|e| CliError::Input(format!("failed to create temp dir: {e}")))?;
-    let mut total_objects = 0usize;
-    for pass in 0..2 {
-        for (i, src) in files.iter().enumerate() {
-            let stem = src
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(sanitize_for_filename)
-                .unwrap_or_else(|| format!("part{i}"));
-            let (kind, shard) = match pass {
-                0 => ("nodes", i),
-                _ => ("edges", files.len() + i),
-            };
-            let out_path = tmp.path().join(format!("{shard:05}_{stem}_{kind}.jsonl"));
-            let mut writer = BufWriter::new(
-                std::fs::File::create(&out_path)
-                    .map_err(|e| CliError::Input(format!("failed to write temp jsonl: {e}")))?,
-            );
-            let written = match pass {
-                0 => importer.write_nodes_ndjson(open(src)?, &mut writer),
-                _ => importer.write_edges_ndjson(open(src)?, &mut writer),
-            }
-            .map_err(|e| convert_err(src, e))?;
-            writer
-                .into_inner()
-                .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))
-                .and_then(|mut f| {
-                    f.flush()
-                        .map_err(|e| CliError::Input(format!("failed to flush temp jsonl: {e}")))
-                })?;
-            if written == 0 {
-                std::fs::remove_file(&out_path).ok(); // keep the shard set dense
-            }
-            total_objects += written;
-        }
-    }
-    if total_objects == 0 {
-        return Err(CliError::Input(
-            "Cypher input produced no data (no CREATE statements found)".to_string(),
-        ));
-    }
-
-    let stats = importer.stats;
+    let stats = fluree_db_api::import_source::cypher_to_shards(
+        path,
+        CypherImportOptions {
+            edge_policy: import_opts.edge_policy,
+            vocab: import_opts.base_iri.clone(),
+        },
+        tmp.path(),
+    )
+    .map_err(|e| CliError::Input(e.to_string()))?;
     if !quiet {
         println!(
             "Converted {} object(s) ({} nodes, {} edges); importing...",
-            total_objects, stats.nodes, stats.edges
+            stats.nodes + stats.edges,
+            stats.nodes,
+            stats.edges
         );
     }
     if stats.edges_skipped > 0 {

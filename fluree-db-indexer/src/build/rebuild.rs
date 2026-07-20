@@ -119,7 +119,7 @@ where
 
     // Capture values for the blocking task
     let ledger_id = ledger_id.to_string();
-    let _prev_root_id = record.index_head_id.clone();
+    let prev_root_id = record.index_head_id.clone();
     let commit_t = record.commit_t;
     // Drive the rebuild's `block_on` on a dedicated runtime so the future, its
     // timers, and any tasks it spawns are advanced by dedicated workers rather
@@ -1120,6 +1120,7 @@ where
                 db_schema,
                 sketch_ref,
                 attachment_events: config.attachment_events.clone(),
+                prev_index_root_id: prev_root_id.clone(),
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(

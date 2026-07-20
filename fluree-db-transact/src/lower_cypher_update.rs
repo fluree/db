@@ -819,6 +819,21 @@ impl<'a> CypherLowering<'a> {
                 let r = self.lower_filter_expr(r, aux)?;
                 Ok(unresolved_call("contains", vec![l, r]))
             }
+            Expr::RegexMatch(l, r, _) => {
+                // Neo4j `=~` is a whole-string match; REGEX is partial —
+                // anchor with a non-capturing group (same as the read path).
+                let l = self.lower_filter_expr(l, aux)?;
+                let r = self.lower_filter_expr(r, aux)?;
+                let anchored = unresolved_call(
+                    "concat",
+                    vec![
+                        UnresolvedExpression::string("^(?:"),
+                        r,
+                        UnresolvedExpression::string(")$"),
+                    ],
+                );
+                Ok(unresolved_call("regex", vec![l, anchored]))
+            }
             Expr::List(items, _) => {
                 let args = items
                     .iter()

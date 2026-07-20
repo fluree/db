@@ -679,6 +679,9 @@ pub struct ContextConfig<'a, 'b> {
     /// for Fluree-system predicates. Surfaced via
     /// `opts.includeSystemFacts: true` on JSON-LD queries.
     pub include_system_facts: bool,
+    /// `@vocab` prefix a Cypher query was lowered against (from
+    /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
+    pub cypher_vocab: Option<Arc<str>>,
     /// When true, the injected true-wildcard crawl scan renders R2RML
     /// `RefObjectMap` objects by templating the parent IRI from the child row's
     /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
@@ -845,6 +848,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     if config.strict_bind_errors {
         ctx = ctx.with_strict_bind_errors();
+    }
+    if let Some(vocab) = config.cypher_vocab.clone() {
+        ctx.cypher_vocab = Some(vocab);
     }
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);

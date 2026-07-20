@@ -302,6 +302,12 @@ pub struct Query {
     /// rejection is the contract-level boundary; this flag only
     /// relaxes the per-row scan filter for `?p`-shape patterns.
     pub include_system_facts: bool,
+    /// `@vocab` prefix of the ledger context a Cypher query was lowered
+    /// against, if any. Read by `labels()`/`type()`/`keys()`/`properties()`
+    /// evaluation so IRI compaction matches `db.labels()`: strip the vocab
+    /// prefix when it applies, otherwise keep the full IRI (round-trippable).
+    /// `None` for JSON-LD/SPARQL queries and vocab-less Cypher.
+    pub cypher_vocab: Option<std::sync::Arc<str>>,
 }
 
 impl Query {
@@ -320,6 +326,7 @@ impl Query {
             reasoning: ReasoningConfig::default(),
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 
@@ -341,6 +348,7 @@ impl Query {
             reasoning: self.reasoning.clone(),
             post_values: self.post_values.clone(),
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
         }
     }
 }

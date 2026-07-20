@@ -70,6 +70,19 @@ The body may be raw Cypher, or a JSON envelope `{"cypher": "...", "params": {...
 (the Neo4j-HTTP shape). Responses are cypher-json; request RDF JSON-LD with
 `Accept: application/ld+json`.
 
+**Explain** — get the query plan without executing. The CLI takes `--explain`
+(local or remote); over HTTP, POST the statement (raw or envelope form — `$param`
+references are substituted before planning) to the ledger-scoped `/explain`
+endpoint:
+
+```bash
+fluree query my/ledger -e 'MATCH (n:Person {id: 7}) RETURN n' --cypher --explain
+
+curl -X POST http://localhost:8090/v1/fluree/explain/my/ledger \
+  -H 'Content-Type: application/cypher' \
+  --data 'MATCH (n:Person {id: 7}) RETURN n'
+```
+
 **Bulk loading** — a `.cypher` dump of `CREATE` / `MATCH … CREATE` statements
 (the Neo4j/Memgraph export idiom) should not be replayed statement-by-statement.
 `fluree create <ledger> --from dump.cypher` converts it on the fly and loads it
@@ -180,7 +193,9 @@ ORDER BY / SKIP / LIMIT
     mode; see [names](#names-and-opting-into-iris)). Fluree has no integer
     element id (differs from Neo4j's integer `id`).
 - `WHERE` expressions: comparison, AND/OR/XOR/NOT, arithmetic `+ - * / %`, `^`,
-  STARTS WITH / ENDS WITH / CONTAINS, IS NULL / IS NOT NULL,
+  STARTS WITH / ENDS WITH / CONTAINS, `=~` (regular-expression match —
+  whole-string, Neo4j semantics; inline flags like `(?i)` work), IS NULL /
+  IS NOT NULL,
   `expr IN [a, b, ...]`, `CASE WHEN ... THEN ... END` (simple and
   subject forms), `EXISTS { pattern }` and the subquery form
   `EXISTS { MATCH pattern WHERE expr }` (the inner `WHERE` is ANDed into
@@ -250,7 +265,11 @@ ORDER BY / SKIP / LIMIT
   (from live `rdf:type` assertions, overlay-aware); `type(r)` returns the
   relationship type string for a named relationship variable (from
   `f:reifiesPredicate` on the reifier). Unbound or non-node/non-rel
-  arguments yield null.
+  arguments yield null. Naming follows the `db.labels()` rule: a name
+  under the ledger's `@vocab` is returned bare (the vocab prefix
+  stripped); any other IRI is returned **whole**, so it round-trips —
+  the same rule the rendered node/relationship label, type, and property
+  keys use.
 - `pathPairs(p)` — the consecutive node pairs of a path value
   (`[[a,b],[b,c],…]`, each pair a two-element list). With `UNWIND`, this
   drives per-edge aggregation: `UNWIND pathPairs(p) AS pair` then
