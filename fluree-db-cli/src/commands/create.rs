@@ -1012,10 +1012,11 @@ fn format_human_bytes(bytes: u64) -> String {
 
 /// Whether this single-file path should use the import pipeline.
 ///
-/// - `.ttl` files (case-insensitive) → import (auto-splits large files)
-/// - `.jsonld` files (case-insensitive) → import (bypasses novelty)
-/// - `.ttl.gz` → error with helpful message
-/// - Everything else (e.g. `.json`) → detect-based transact path
+/// - RDF/JSON-LD formats (`.ttl`/`.nt`/`.nq`/`.trig`/`.json`/`.jsonld`/
+///   `.jsonl`/`.ndjson`, case-insensitive, optionally `.gz`/`.zst`-compressed)
+///   → import
+/// - `.bz2` → error with helpful message
+/// - Everything else (e.g. `.csv`) → detect-based transact path
 ///
 /// Note: directories are handled separately in `run()` via `fluree_db_api::scan_directory_format()`.
 fn is_import_path(path: &Path) -> CliResult<bool> {
@@ -1566,15 +1567,17 @@ mod is_import_path_tests {
 
     #[test]
     fn rdf_formats_remain_import_paths() {
-        for name in ["x.ttl", "x.nt", "x.nq", "x.trig", "x.jsonld", "x.ttl.gz"] {
+        // `.json` is accepted as a JSON-LD filename convention.
+        for name in [
+            "x.ttl", "x.nt", "x.nq", "x.trig", "x.json", "x.jsonld", "x.ttl.gz",
+        ] {
             assert!(is_import_path(Path::new(name)).unwrap(), "{name}");
         }
     }
 
     #[test]
     fn non_bulk_inputs_are_not_import_paths() {
-        // `.json` deliberately routes to the detect/transact path, not import.
-        assert!(!is_import_path(Path::new("x.json")).unwrap());
         assert!(!is_import_path(Path::new("x.csv")).unwrap());
+        assert!(!is_import_path(Path::new("x.txt")).unwrap());
     }
 }

@@ -262,8 +262,14 @@ first_o_key: u64
 - **Region 2 (metadata columns)**: values needed to reconstruct full flakes (datatype, transaction time, etc.).
   - stored in a layout that supports sparse `lang_id` and `i` without per-row overhead
   - `dt` is stored as `u8` today (`dt_width = 1`) and may widen to `u16`
-- **Region 3 (history journal)**: optional operation log to support time-travel semantics from `base_t` onward.
+- **Region 3 (history journal)**: optional **transition log** to support time-travel semantics from `base_t` onward.
   - stored as a sequence of fixed-size entries in **reverse chronological order** (newest first)
+  - entries record only presence changes: an assert entry means the fact was absent immediately
+    before its `t`, a retract entry means it was present immediately before. No-op events
+    (re-assert of a present fact, retract of an absent one) are never recorded.
+  - a fact's materialized assert lives either as its base row or as a history entry, never both
+    and never neither (**row-assert conservation**)
+  - authoritative semantics: the module doc of `fluree-db-binary-index/src/format/transitions.rs`
 
 #### Region 1 layouts (uncompressed)
 
@@ -302,7 +308,8 @@ i_values:     i32 × popcount(i_bitmap)
 
 #### Region 3 layout (uncompressed)
 
-Region 3 is an operation journal stored newest-first:
+Region 3 is a transition log stored newest-first (semantics: see
+`fluree-db-binary-index/src/format/transitions.rs`):
 
 ```text
 entry_count: u32

@@ -170,6 +170,8 @@ async fn run_update_branch(
     branch_bytes: Vec<u8>,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
+    sorted_superseded: Vec<RunRecordV2>,
+    sorted_superseded_ops: Vec<u8>,
     branch_config: BranchUpdateConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
     tracker: fluree_db_core::tracking::Tracker,
@@ -311,6 +313,8 @@ async fn run_update_branch(
             &branch_bytes,
             &sorted_records,
             &sorted_ops,
+            &sorted_superseded,
+            &sorted_superseded_ops,
             &branch_config,
             &|cid| {
                 leaf_map
@@ -387,6 +391,11 @@ struct Phase2Task {
     order: RunSortOrder,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
+    /// Superseded events for this (graph, order), sorted like
+    /// `sorted_records`. Their real-transition subset becomes history-sidecar
+    /// entries in the leaf merge.
+    sorted_superseded: Vec<RunRecordV2>,
+    sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
 }
 
@@ -439,6 +448,8 @@ async fn execute_phase2_task(
         order,
         sorted_records,
         sorted_ops,
+        sorted_superseded,
+        sorted_superseded_ops,
         kind,
     } = task;
 
@@ -472,6 +483,8 @@ async fn execute_phase2_task(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -496,6 +509,22 @@ async fn execute_phase2_task(
             }
         }
         Phase2TaskKind::DefaultFresh => {
+            if !sorted_superseded.is_empty() {
+                // Permanent gap: these are real in-window transitions (e.g. a
+                // fact born and deleted between two index builds) and the next
+                // window's novelty never re-sees them. Reachable beyond
+                // genesis — the root format permits graphs with fewer than
+                // four materialized orders, so a newly added order takes this
+                // arm for an existing graph, leaving that order's replay
+                // without history its sibling orders have.
+                tracing::warn!(
+                    g_id,
+                    ?order,
+                    dropped = sorted_superseded.len(),
+                    "fresh default-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
+                );
+            }
             let BranchUpdateResult {
                 leaf_entries,
                 new_leaf_blobs,
@@ -535,6 +564,8 @@ async fn execute_phase2_task(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -563,6 +594,16 @@ async fn execute_phase2_task(
             }
         }
         Phase2TaskKind::NamedFresh => {
+            if !sorted_superseded.is_empty() {
+                // Permanent gap; see the DefaultFresh arm above.
+                tracing::warn!(
+                    g_id,
+                    ?order,
+                    dropped = sorted_superseded.len(),
+                    "fresh named-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
+                );
+            }
             let BranchUpdateResult {
                 new_leaf_blobs,
                 replaced_leaf_cids,
@@ -713,6 +754,11 @@ pub async fn incremental_index(
     for (idx, rec) in novelty.records.iter().enumerate() {
         by_graph.entry(rec.g_id).or_default().push(idx);
     }
+    let mut superseded_by_graph: std::collections::BTreeMap<u16, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, rec) in novelty.superseded.iter().enumerate() {
+        superseded_by_graph.entry(rec.g_id).or_default().push(idx);
+    }
 
     let base_root = &novelty.base_root;
     let mut root_builder = IncrementalRootBuilder::from_old_root(novelty.base_root.clone());
@@ -732,6 +778,13 @@ pub async fn incremental_index(
         let indices = &by_graph[&g_id];
         let graph_records: Vec<RunRecordV2> = indices.iter().map(|&i| novelty.records[i]).collect();
         let graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
+        let superseded_indices = superseded_by_graph.get(&g_id);
+        let graph_superseded: Vec<RunRecordV2> = superseded_indices
+            .map(|idxs| idxs.iter().map(|&i| novelty.superseded[i]).collect())
+            .unwrap_or_default();
+        let graph_superseded_ops: Vec<u8> = superseded_indices
+            .map(|idxs| idxs.iter().map(|&i| novelty.superseded_ops[i]).collect())
+            .unwrap_or_default();
 
         for &order in &all_orders {
             let cmp = cmp_v2_for_order(order);
@@ -740,6 +793,17 @@ pub async fn incremental_index(
             let sorted_records: Vec<RunRecordV2> =
                 sorted_indices.iter().map(|&i| graph_records[i]).collect();
             let sorted_ops: Vec<u8> = sorted_indices.iter().map(|&i| graph_ops[i]).collect();
+            let mut sorted_superseded_indices: Vec<usize> = (0..graph_superseded.len()).collect();
+            sorted_superseded_indices
+                .sort_unstable_by(|&a, &b| cmp(&graph_superseded[a], &graph_superseded[b]));
+            let sorted_superseded: Vec<RunRecordV2> = sorted_superseded_indices
+                .iter()
+                .map(|&i| graph_superseded[i])
+                .collect();
+            let sorted_superseded_ops: Vec<u8> = sorted_superseded_indices
+                .iter()
+                .map(|&i| graph_superseded_ops[i])
+                .collect();
 
             let kind = if g_id == 0 {
                 match base_root
@@ -770,6 +834,8 @@ pub async fn incremental_index(
                 order,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 kind,
             });
         }
