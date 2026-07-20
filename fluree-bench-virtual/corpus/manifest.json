@@ -1,5 +1,5 @@
 {
-  "corpus_version": 3,
+  "corpus_version": 4,
   "description": "vbench corpus: 54 SPARQL queries (design Q01-Q54) derived from 26 BI questions over the ENTERPRISE_DEMO.DW star schema. Every query runs identically against the native materialized ledger (enterprise-sf01) and, once registered, an R2RML/Iceberg virtual target. See docs/audit/2026-07-virtual-dataset-perf/03-corpus-design.md for the feature x hypothesis coverage matrices and expected-rows derivation.",
   "queries": [
     {
@@ -1766,6 +1766,24 @@
       "timeout_s": 300,
       "subsets": [],
       "exec_path": "from"
+    },
+    {
+      "id": "q078",
+      "file": "queries/q078_count_current_enterprise_customers_graph.rq",
+      "bi_question": "Coverage (F1 / F-AUD-8, the q038 class, DIRECT/Graph-path multi-constraint): the graph-source-direct (no FROM) twin of q077 — an ungrouped COUNT with TWO folded constant-object constraints (isCurrent true AND segment=Enterprise). Closes the q038 ungrouped/direct-path fusion gap: combine_constrained_class_scan recombines the rewrite's class+const split so the fused fold applies both (oracle 50038 = q022's Enterprise row); dropping either over-counts.",
+      "tags": [
+        "count",
+        "aggregate",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 300,
+      "subsets": []
     }
   ]
 }

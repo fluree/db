@@ -434,10 +434,21 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
         }
     }
 
-    // Cost guard: a FILTER is only fused alongside a GROUP BY. There the fused
-    // path's win (skipping the subject + the many grouped/aggregated columns)
-    // dwarfs the per-row filter eval. For a filtered single aggregate the normal
-    // pipeline's file pruning + vectorized filter is faster, so decline.
+    // Cost guard: an explicit SPARQL `FILTER` is only fused alongside a GROUP BY.
+    // There the fused path's win (skipping the subject + the many grouped/aggregated
+    // columns) dwarfs the per-row filter eval. For a filtered single aggregate the
+    // normal pipeline's file pruning + vectorized filter is faster, so decline.
+    //
+    // F1 NOTE (the q038 class): this guard is NOT what declines the ungrouped
+    // filtered COUNT `SELECT (COUNT(*)) WHERE { ?s a edw:Customer ; edw:isCurrent
+    // true }`. A constant-object triple stays a `Pattern::Triple` (SPARQL lowering
+    // never desugars `edw:isCurrent true` to `?v` + `FILTER(?v = true)`), so `filter`
+    // is `None` here and this guard does not fire — q038 is ADMITTED. Its decline is
+    // downstream, at the single-`[R2rml]` shape gate in `resolve_at_open`, because
+    // the rewrite splits its class + const-object members into separate scans;
+    // `combine_constrained_class_scan` recombines them. This guard remains for a
+    // genuine residual FILTER (`?s edw:score ?v . FILTER(?v > 100)`), where the
+    // cost argument above still holds.
     if filter.is_some() && group_by.is_empty() {
         return None;
     }
@@ -1642,8 +1653,20 @@ impl FusedR2rmlAggregateOperator {
         // against non-lowered sub-scopes (`rr.unsupported`): a surviving
         // PropertyPath/Subquery breaks the shape, so we fall back to the normal
         // GRAPH path, which raises the loud `unsupported_subscope_error`.
+        // F1 (F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class): the
+        // rewrite splits a subject-star with no variable-object member into a
+        // standalone class scan + standalone const-object constraint scans.
+        // Recombine them into one class-scan-with-`star_constraints` pattern so the
+        // single-table fold below applies each constraint per row (see
+        // `combine_constrained_class_scan`). Computed before the match so its arm
+        // can claim this multi-pattern shape BEFORE the join arm — that arm would
+        // otherwise take it and decline (a subject-star is not an FK chain).
+        let combined_constrained_class = Self::combine_constrained_class_scan(&rr.patterns);
         let pattern = match rr.patterns.as_slice() {
             [Pattern::R2rml(p)] => p.clone(),
+            _ if combined_constrained_class.is_some() => {
+                combined_constrained_class.expect("is_some checked in the guard")
+            }
             // PR-6: a fact→dim chain rewrites to multiple R2rml leaf patterns.
             // Admit it as a fused aggregate over one join (gated by the join
             // sub-switch); anything else (non-R2rml pattern present) falls back.
@@ -2092,6 +2115,109 @@ impl FusedR2rmlAggregateOperator {
             });
         }
         Some(checks)
+    }
+
+    /// F1 (audit F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class — the
+    /// 886×-PARTIAL residual): when a subject-star carries NO variable-object
+    /// member, the R2RML rewrite does NOT fold its class + constant-object members
+    /// into one scan — it emits a standalone `?s a Class` class scan plus one
+    /// standalone `?s pred const` scan per constraint (`rewrite.rs`, the
+    /// `var_members.is_empty()` branch, whose only non-standalone route is a
+    /// co-located crawl wildcard). That multi-pattern result misses the
+    /// single-`[R2rml]` fused gate in `resolve_at_open`, so a bare-but-CONSTRAINED
+    /// ungrouped COUNT (`SELECT (COUNT(*)) WHERE { ?s a edw:Customer ; edw:isCurrent
+    /// true }`, q038) materializes at ~7k rows/s, while its GROUPED sibling (q022,
+    /// which has a var-object `?seg` the rewrite folds the class + `isCurrent`
+    /// constraint onto) fuses. This recombines that exact split back into ONE
+    /// class-scan-carrying-`star_constraints` pattern — byte-identical to what the
+    /// rewrite already produces for the var-object case — so the single-table fold
+    /// applies each constraint per row via the SAME 9b machinery
+    /// (`resolve_star_constraint_checks` + `row_satisfies_constraints`).
+    ///
+    /// Soundness (the D-c5 over-count line — the one unacceptable outcome): the
+    /// recombination only re-associates patterns the rewrite split; it introduces
+    /// no new semantics. It admits ONLY the exact shape — one shared subject VAR,
+    /// exactly one pure class scan, every other pattern a scalar const-object
+    /// equality with nothing else attached — and returns `None` for anything else
+    /// (a bound subject, a var-object member, a second class, a cross-subject FK
+    /// join, a RefObjectMap/template object carried on a member, a non-R2RML
+    /// pattern), leaving the existing join/decline arms to handle it. Downstream,
+    /// `resolve_star_constraint_checks` still DECLINES (→ materialize) any folded
+    /// constraint it cannot enforce as a scalar-column check, and the manifest
+    /// COUNT shortcut stays declined for the resulting non-empty `fact_constraints`
+    /// (`count_shortcut_eligible`), so no constraint is ever silently dropped or
+    /// over-counted. This adds NO new constraint source — the const-object members
+    /// route through the same `star_constraints` field the var-object star already
+    /// fills. Rides `FLUREE_FUSED_R2RML_AGG`: with the fold off,
+    /// `detect_fused_r2rml_aggregate` returns `None`, the fused operator is never
+    /// built, and q038 reverts to the materialized path (this widening is off).
+    fn combine_constrained_class_scan(patterns: &[Pattern]) -> Option<R2rmlPattern> {
+        // A lone class scan is already the single-`[R2rml]` arm; a single const
+        // scan has no class to resolve its TriplesMap against. The shape is a class
+        // + at least one constraint, i.e. ≥ 2 patterns.
+        if patterns.len() < 2 {
+            return None;
+        }
+        let mut r2rml: Vec<&R2rmlPattern> = Vec::with_capacity(patterns.len());
+        for p in patterns {
+            match p {
+                Pattern::R2rml(rp) => r2rml.push(rp),
+                _ => return None, // a non-R2RML pattern present → not this shape
+            }
+        }
+        // One shared subject VARIABLE (an absent/bound subject → decline: this is a
+        // subject-star, not a bound-subject crawl or a cross-subject FK join).
+        let subject = r2rml[0].subject_var?;
+        if r2rml
+            .iter()
+            .any(|rp| rp.subject_var != Some(subject) || rp.subject_constant.is_some())
+        {
+            return None;
+        }
+        let mut class_base: Option<R2rmlPattern> = None;
+        let mut constraints: Vec<(String, ObjectConstant)> = Vec::new();
+        for rp in &r2rml {
+            // A pure class scan: a class filter and NOTHING else attached.
+            let is_pure_class = rp.class_filter.is_some()
+                && rp.predicate_filter.is_none()
+                && rp.object_var.is_none()
+                && rp.object_constant.is_none()
+                && rp.predicate_var.is_none()
+                && rp.type_var.is_none()
+                && rp.triples_map_iri.is_none()
+                && rp.class_prune_hint.is_none()
+                && rp.star_bindings.is_empty()
+                && rp.star_constraints.is_empty();
+            // A scalar const-object equality: predicate + object constant only (the
+            // standalone shape the rewrite emits for a const member with no
+            // var-object base to fold onto).
+            let is_const_object = rp.predicate_filter.is_some()
+                && rp.object_constant.is_some()
+                && rp.class_filter.is_none()
+                && rp.object_var.is_none()
+                && rp.predicate_var.is_none()
+                && rp.type_var.is_none()
+                && rp.triples_map_iri.is_none()
+                && rp.class_prune_hint.is_none()
+                && rp.star_bindings.is_empty()
+                && rp.star_constraints.is_empty();
+            if is_pure_class {
+                if class_base.is_some() {
+                    return None; // two class scans → ambiguous base → decline
+                }
+                class_base = Some((*rp).clone());
+            } else if is_const_object {
+                constraints.push((rp.predicate_filter.clone()?, rp.object_constant.clone()?));
+            } else {
+                return None; // a var-object / mixed / RefObjectMap member → not this shape
+            }
+        }
+        let mut base = class_base?; // must be exactly one pure class scan
+        if constraints.is_empty() {
+            return None; // no constraint to fold (a lone class is the single arm)
+        }
+        base.star_constraints = constraints;
+        Some(base)
     }
 
     /// E2: whether a row satisfies EVERY resolved constraint — the existence-filter
@@ -2877,6 +3003,192 @@ mod tests {
             &[Fold::CountRows, Fold::CountRows]
         ));
         assert!(!count_shortcut_eligible(false, &[], &[], &[]));
+    }
+
+    /// F1 (F-AUD-8, the q038 ungrouped/direct-path filtered-COUNT class): the
+    /// recombination admits ONLY a same-subject `class scan + scalar const-object
+    /// constraint scans` split (what the rewrite emits for a subject-star with no
+    /// var-object member) and folds the constraints onto the class scan as
+    /// `star_constraints`. Every other multi-pattern shape declines (`None`), so the
+    /// existing join/decline arms still own it and no over-count is possible.
+    #[test]
+    fn f1_combine_constrained_class_scan_admission() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        const CUST: &str = "http://ns.fluree.dev/edw#Customer";
+        const OTHER: &str = "http://ns.fluree.dev/edw#Order";
+        const IS_CURRENT: &str = "http://ns.fluree.dev/edw#isCurrent";
+        const SEGMENT: &str = "http://ns.fluree.dev/edw#segment";
+        let s = VarId(0);
+        let other_s = VarId(9);
+        let bool_true = || ObjectConstant::Scalar(ScanValue::Bool(true));
+        let seg_ent = || ObjectConstant::Scalar(ScanValue::Str("Enterprise".to_string()));
+        let class_scan = |subj: VarId, class: &str| {
+            let mut p = R2rmlPattern::new("gs:main", subj, None);
+            p.class_filter = Some(class.to_string());
+            Pattern::R2rml(p)
+        };
+        let const_scan = |subj: VarId, pred: &str, c: ObjectConstant| {
+            let mut p = R2rmlPattern::new("gs:main", subj, None);
+            p.predicate_filter = Some(pred.to_string());
+            p.object_constant = Some(c);
+            Pattern::R2rml(p)
+        };
+        let var_member = |subj: VarId, pred: &str, obj: VarId| {
+            let mut p = R2rmlPattern::new("gs:main", subj, Some(obj));
+            p.predicate_filter = Some(pred.to_string());
+            Pattern::R2rml(p)
+        };
+        let combine = FusedR2rmlAggregateOperator::combine_constrained_class_scan;
+
+        // q038 shape: class + one const-object constraint → folds (either order).
+        let folded = combine(&[class_scan(s, CUST), const_scan(s, IS_CURRENT, bool_true())])
+            .expect("class + 1 const folds");
+        assert_eq!(folded.class_filter.as_deref(), Some(CUST));
+        assert_eq!(folded.star_constraints.len(), 1);
+        assert_eq!(folded.star_constraints[0].0, IS_CURRENT);
+        assert!(combine(&[const_scan(s, IS_CURRENT, bool_true()), class_scan(s, CUST)]).is_some());
+
+        // q078/q077 shape: class + TWO const-object constraints (multi-constraint AND).
+        let multi = combine(&[
+            class_scan(s, CUST),
+            const_scan(s, IS_CURRENT, bool_true()),
+            const_scan(s, SEGMENT, seg_ent()),
+        ])
+        .expect("class + 2 const folds");
+        assert_eq!(multi.star_constraints.len(), 2);
+
+        // Declines: a lone class (the single-`[R2rml]` arm owns it).
+        assert!(combine(&[class_scan(s, CUST)]).is_none());
+        // Declines: a single const scan (no class to resolve a TriplesMap against).
+        assert!(combine(&[const_scan(s, IS_CURRENT, bool_true())]).is_none());
+        // Declines: two const scans, no class base.
+        assert!(combine(&[
+            const_scan(s, IS_CURRENT, bool_true()),
+            const_scan(s, SEGMENT, seg_ent()),
+        ])
+        .is_none());
+        // Declines: a var-object member present (a real star, not this shape).
+        assert!(combine(&[class_scan(s, CUST), var_member(s, SEGMENT, VarId(2))]).is_none());
+        // Declines: a cross-subject FK-join shape (the join arm owns it).
+        assert!(combine(&[
+            class_scan(s, CUST),
+            const_scan(other_s, IS_CURRENT, bool_true())
+        ])
+        .is_none());
+        // Declines: two class scans → ambiguous base.
+        assert!(combine(&[
+            class_scan(s, CUST),
+            class_scan(s, OTHER),
+            const_scan(s, IS_CURRENT, bool_true()),
+        ])
+        .is_none());
+        // Declines: a bound-subject member (subject_constant set, no subject var).
+        let mut bound_class = R2rmlPattern::new("gs:main", s, None);
+        bound_class.subject_var = None;
+        bound_class.subject_constant = Some("http://ex/cust/1".to_string());
+        bound_class.class_filter = Some(CUST.to_string());
+        assert!(combine(&[
+            Pattern::R2rml(bound_class),
+            const_scan(s, IS_CURRENT, bool_true()),
+        ])
+        .is_none());
+        // Declines: a non-R2RML pattern present.
+        assert!(combine(&[class_scan(s, CUST), Pattern::Filter(Expression::Var(s))]).is_none());
+    }
+
+    /// F1 diagnosis + fix, end to end through the REAL rewrite: the direct-path
+    /// ungrouped constrained COUNT `?s a Customer ; isCurrent true` (q038) rewrites
+    /// to TWO separate R2rml patterns (a class scan + a standalone `isCurrent=true`
+    /// scan) — the split that misses the single-`[R2rml]` fused gate and forces a
+    /// materialize. Its GROUPED sibling q022 (which adds a var-object `?seg`)
+    /// already rewrites to ONE fused pattern. `combine_constrained_class_scan`
+    /// re-folds the q038 split into one class-scan-with-`star_constraints` pattern
+    /// whose constraint the single-table 9b fold resolves — and the resulting
+    /// non-empty `fact_constraints` keeps the delete-blind manifest COUNT shortcut
+    /// declined. The multi-constraint direct-path variant (the new q078 member)
+    /// folds two.
+    #[test]
+    fn f1_rewrite_splits_then_combine_refolds() {
+        use crate::ir::triple::{Ref, Term, TriplePattern};
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{PredicateMap, PredicateObjectMap};
+        const TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const CUST: &str = "http://ns.fluree.dev/edw#Customer";
+        const IS_CURRENT: &str = "http://ns.fluree.dev/edw#isCurrent";
+        const SEGMENT: &str = "http://ns.fluree.dev/edw#segment";
+
+        let customer = TriplesMap::new("#Customer", "DIM_CUSTOMER")
+            .with_subject_template("http://ns.fluree.dev/edw/customer/{CUSTOMER_KEY}")
+            .with_class(CUST)
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(IS_CURRENT),
+                object_map: ObjectMap::column("IS_CURRENT"),
+            })
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant(SEGMENT),
+                object_map: ObjectMap::column("SEGMENT"),
+            });
+        let mapping = CompiledR2rmlMapping::new(vec![customer]);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let tm = mapping.triples_maps.values().next().unwrap();
+
+        let s = VarId(0);
+        let seg = VarId(1);
+        let triple = |p: Ref, o: Term| Pattern::Triple(TriplePattern::new(Ref::Var(s), p, o));
+        let type_tp = triple(Ref::Iri(Arc::from(TYPE)), Term::Iri(Arc::from(CUST)));
+        let flag_tp = triple(
+            Ref::Iri(Arc::from(IS_CURRENT)),
+            Term::Value(FlakeValue::Boolean(true)),
+        );
+        let seg_var_tp = triple(Ref::Iri(Arc::from(SEGMENT)), Term::Var(seg));
+        let seg_const_tp = triple(
+            Ref::Iri(Arc::from(SEGMENT)),
+            Term::Value(FlakeValue::String("Enterprise".to_string())),
+        );
+        let rewrite = |pats: &[Pattern]| {
+            rewrite_patterns_for_r2rml(pats, "gs:main", &snapshot, Some(&mapping), false, false)
+                .patterns
+        };
+
+        // q038: the direct-path ungrouped constrained COUNT splits into 2 patterns.
+        let q038 = rewrite(&[type_tp.clone(), flag_tp.clone()]);
+        assert_eq!(
+            q038.len(),
+            2,
+            "q038 (no var-object member) rewrites to a split class + const scan — the fusion gap"
+        );
+        let folded = FusedR2rmlAggregateOperator::combine_constrained_class_scan(&q038)
+            .expect("F1 recombines the q038 split");
+        assert_eq!(folded.class_filter.as_deref(), Some(CUST));
+        assert_eq!(folded.star_constraints.len(), 1);
+        // The 9b fold resolves the folded constraint to one scalar-column check ...
+        let checks = FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&folded, tm)
+            .expect("scalar column constraint resolves");
+        assert_eq!(checks.len(), 1);
+        // ... and a non-empty constraint set keeps the manifest COUNT shortcut declined.
+        assert!(
+            !count_shortcut_eligible(false, &[], &checks, &[Fold::CountRows]),
+            "the constrained COUNT must not take the delete-blind manifest shortcut"
+        );
+
+        // q022 (grouped, adds var-object ?seg) already fuses in the rewrite: ONE
+        // pattern carrying the class + the isCurrent star_constraint. combine is a
+        // no-op for it (the single-`[R2rml]` arm owns it).
+        let q022 = rewrite(&[type_tp.clone(), flag_tp.clone(), seg_var_tp.clone()]);
+        assert_eq!(q022.len(), 1, "q022 fuses in the rewrite (var-object base)");
+        assert!(FusedR2rmlAggregateOperator::combine_constrained_class_scan(&q022).is_none());
+
+        // Multi-constraint direct path (the new q078 member): class + 2 const → 3
+        // split patterns → combine refolds to one pattern with 2 constraints.
+        let q078 = rewrite(&[type_tp.clone(), flag_tp.clone(), seg_const_tp.clone()]);
+        assert_eq!(q078.len(), 3, "multi-constraint direct path splits into 3");
+        let folded_multi = FusedR2rmlAggregateOperator::combine_constrained_class_scan(&q078)
+            .expect("F1 recombines the multi-constraint split");
+        assert_eq!(folded_multi.star_constraints.len(), 2);
+        let checks_multi =
+            FusedR2rmlAggregateOperator::resolve_star_constraint_checks(&folded_multi, tm)
+                .expect("both scalar constraints resolve");
+        assert_eq!(checks_multi.len(), 2);
     }
 
     /// Item 9 MIN/MAX admission scope: only numeric and date/timestamp datatypes
