@@ -77,12 +77,22 @@ pub enum ImportSourceKind {
     Source,
 }
 
+/// Conversion options carried from `fluree create --remote --from` for
+/// CSV/Cypher source uploads. Other source formats ignore these fields.
+#[derive(Clone, Debug, Default)]
+pub struct SourceImportOptions {
+    pub edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    pub base_iri: Option<String>,
+}
+
 /// One negotiated-upload import job.
 pub struct ImportJob {
     /// Target ledger name (carried in the mint request, not the URL path).
     pub ledger_id: String,
     /// What the staged upload contains (drives the `complete` action).
     pub source: ImportSourceKind,
+    /// CSV/Cypher conversion semantics requested when the slot was minted.
+    pub source_options: SourceImportOptions,
     /// Single-use capability token embedded in the upload URL. Modeled on a
     /// presigned URL's signature: knowing it authorizes the blob `PUT`.
     pub token: String,
@@ -108,6 +118,7 @@ pub struct CompletionTarget {
     pub multipart: Option<MultipartPlan>,
     pub created_at: Instant,
     pub source: ImportSourceKind,
+    pub source_options: SourceImportOptions,
 }
 
 /// Process-local registry of import jobs, keyed by opaque `import_id`.
@@ -155,6 +166,7 @@ impl ImportJobs {
             multipart: j.multipart.clone(),
             created_at: j.created_at,
             source: j.source,
+            source_options: j.source_options.clone(),
         })
     }
 
@@ -218,6 +230,7 @@ mod tests {
         ImportJob {
             ledger_id: "books:main".into(),
             source: ImportSourceKind::Flpack,
+            source_options: SourceImportOptions::default(),
             token: "tok".into(),
             staged_path: PathBuf::from("/tmp/x.flpack"),
             multipart: None,

@@ -18,8 +18,8 @@
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
 use crate::import_jobs::{
-    CompletionTarget, ImportJob, ImportSourceKind, ImportStatus, MultipartPlan, StagedResidue,
-    IMPORT_JOB_TTL,
+    CompletionTarget, ImportJob, ImportSourceKind, ImportStatus, MultipartPlan,
+    SourceImportOptions, StagedResidue, IMPORT_JOB_TTL,
 };
 use crate::state::AppState;
 use axum::extract::{Path, Query, Request, State};
@@ -137,6 +137,14 @@ struct MintRequest {
     /// `.csv`, `.cypher`, …, with `.gz`/`.zst` on RDF/JSONL formats).
     #[serde(default)]
     filename: Option<String>,
+    /// CSV/Cypher relationship-property encoding (`annotated`, `plain`, or
+    /// `nary`), matching `fluree create --edge-properties`.
+    #[serde(default)]
+    edge_properties: Option<String>,
+    /// CSV/Cypher namespace for minted names, matching
+    /// `fluree create --base-iri`.
+    #[serde(default)]
+    base_iri: Option<String>,
 }
 
 /// Pipeline-native single-file extensions (importable as staged, and the only
@@ -219,6 +227,25 @@ fn ensure_source_import_supported(state: &AppState) -> Result<()> {
              use a .flpack restore instead",
         ))
     }
+}
+
+fn source_import_options(req: &MintRequest) -> Result<SourceImportOptions> {
+    use fluree_db_api::csv_import::EdgePolicy;
+
+    let edge_policy = match req.edge_properties.as_deref() {
+        None | Some("annotated") => EdgePolicy::Annotated,
+        Some("plain") => EdgePolicy::Plain,
+        Some("nary") => EdgePolicy::Nary,
+        Some(other) => {
+            return Err(ServerError::bad_request(format!(
+                "unknown edge_properties '{other}' (expected \"annotated\", \"plain\", or \"nary\")"
+            )))
+        }
+    };
+    Ok(SourceImportOptions {
+        edge_policy,
+        base_iri: req.base_iri.clone(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -321,8 +348,12 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
     // Resolve what the upload contains. Source uploads must carry a filename
     // whose extension the staged file keeps (format sniffing), and are
     // refused up front on deployments that can't run the pipeline.
-    let (source, staged_ext) = match req.source_kind.as_deref() {
-        None | Some("flpack") => (ImportSourceKind::Flpack, "flpack".to_string()),
+    let (source, staged_ext, source_options) = match req.source_kind.as_deref() {
+        None | Some("flpack") => (
+            ImportSourceKind::Flpack,
+            "flpack".to_string(),
+            SourceImportOptions::default(),
+        ),
         Some("source") => {
             ensure_source_import_supported(&state)?;
             let filename = req.filename.as_deref().ok_or_else(|| {
@@ -330,7 +361,11 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
                     "source uploads must include \"filename\" so the format can be detected",
                 )
             })?;
-            (ImportSourceKind::Source, source_staged_extension(filename)?)
+            (
+                ImportSourceKind::Source,
+                source_staged_extension(filename)?,
+                source_import_options(&req)?,
+            )
         }
         Some(other) => {
             return Err(ServerError::bad_request(format!(
@@ -391,6 +426,7 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
             ImportJob {
                 ledger_id: req.ledger.clone(),
                 source,
+                source_options: source_options.clone(),
                 token: token.clone(),
                 staged_path,
                 multipart: Some(MultipartPlan {
@@ -421,6 +457,7 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
             ImportJob {
                 ledger_id: req.ledger.clone(),
                 source,
+                source_options,
                 token: token.clone(),
                 staged_path,
                 multipart: None,
@@ -640,6 +677,7 @@ async fn complete_upload_local(
         multipart,
         created_at,
         source,
+        source_options,
     } = state
         .import_jobs
         .completion_target(&import_id)
@@ -729,7 +767,7 @@ async fn complete_upload_local(
                         .map_err(|e| e.to_string())
                 }
                 ImportSourceKind::Source => {
-                    run_source_import(&bg_state, &ledger_id, &staged_path).await
+                    run_source_import(&bg_state, &ledger_id, &staged_path, &source_options).await
                 }
             }
         }
@@ -761,6 +799,7 @@ async fn run_source_import(
     state: &Arc<AppState>,
     ledger_id: &str,
     staged_path: &FsPath,
+    options: &SourceImportOptions,
 ) -> std::result::Result<serde_json::Value, String> {
     let ext = staged_path
         .extension()
@@ -778,11 +817,18 @@ async fn run_source_import(
         let src = staged_path.to_path_buf();
         let out = shards_dir.clone();
         let is_csv = ext == "csv";
+        let options = options.clone();
         tokio::task::spawn_blocking(move || {
             if is_csv {
                 fluree_db_api::import_source::csv_to_shards(
                     &src,
-                    &fluree_db_api::csv_import::CsvImportOptions::default(),
+                    &fluree_db_api::csv_import::CsvImportOptions {
+                        edge_policy: options.edge_policy,
+                        base_iri: options.base_iri.clone().unwrap_or_else(|| {
+                            fluree_db_api::csv_import::CsvImportOptions::default().base_iri
+                        }),
+                        ..Default::default()
+                    },
                     &out,
                 )
                 .map(|_| ())
@@ -790,7 +836,10 @@ async fn run_source_import(
             } else {
                 fluree_db_api::import_source::cypher_to_shards(
                     &src,
-                    fluree_db_api::cypher_import::CypherImportOptions::default(),
+                    fluree_db_api::cypher_import::CypherImportOptions {
+                        edge_policy: options.edge_policy,
+                        vocab: options.base_iri.clone(),
+                    },
                     &out,
                 )
                 .map(|_| ())
@@ -817,13 +866,18 @@ async fn run_source_import(
     // scan and seals an authoritative annotation arena, so relationship-
     // binding queries take the arena probe instead of scan-fallback —
     // mirroring what `fluree create --from` does after a local import.
-    if result.has_annotations {
-        state
-            .fluree
-            .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
-            .await
-            .map_err(|e| format!("post-import annotation-arena seal (reindex): {e}"))?;
-    }
+    let sealed_root_id = if result.has_annotations {
+        Some(
+            state
+                .fluree
+                .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+                .await
+                .map_err(|e| format!("post-import annotation-arena seal (reindex): {e}"))?
+                .root_id,
+        )
+    } else {
+        None
+    };
 
     Ok(serde_json::json!({
         "kind": "bulk-import",
@@ -831,7 +885,10 @@ async fn run_source_import(
         "t": result.t,
         "flake_count": result.flake_count,
         "commit_head_id": result.commit_head_id.to_string(),
-        "root_id": result.root_id.as_ref().map(std::string::ToString::to_string),
+        "root_id": sealed_root_id
+            .as_ref()
+            .or(result.root_id.as_ref())
+            .map(std::string::ToString::to_string),
         "index_t": result.index_t,
         "has_annotations": result.has_annotations,
     }))

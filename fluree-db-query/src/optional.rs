@@ -1461,8 +1461,22 @@ pub struct AnnotationValueOptionalBuilder {
 /// The three `f:reifies*` lookups, drained once and hash-indexed.
 struct AnnotationSidecarMaps {
     s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
-    ann_pred: HashMap<fluree_db_core::Sid, fluree_db_core::Sid>,
-    ann_obj: HashMap<fluree_db_core::Sid, fluree_db_core::Sid>,
+    ann_preds: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
+    ann_objs: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
+}
+
+impl AnnotationSidecarMaps {
+    fn matches(
+        &self,
+        ann: &fluree_db_core::Sid,
+        p: &fluree_db_core::Sid,
+        o: &fluree_db_core::Sid,
+    ) -> bool {
+        self.ann_preds
+            .get(ann)
+            .is_some_and(|preds| preds.contains(p))
+            && self.ann_objs.get(ann).is_some_and(|objs| objs.contains(o))
+    }
 }
 
 impl AnnotationValueOptionalBuilder {
@@ -1539,20 +1553,18 @@ impl AnnotationValueOptionalBuilder {
         for (ann, s) in subj_pairs {
             s_to_anns.entry(s).or_default().push(ann);
         }
-        let ann_pred: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
-            .drain_pairs(&self.r_pred, ctx, view)
-            .await?
-            .into_iter()
-            .collect();
-        let ann_obj: HashMap<fluree_db_core::Sid, fluree_db_core::Sid> = self
-            .drain_pairs(&self.r_obj, ctx, view)
-            .await?
-            .into_iter()
-            .collect();
+        let mut ann_preds: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
+        for (ann, pred) in self.drain_pairs(&self.r_pred, ctx, view).await? {
+            ann_preds.entry(ann).or_default().push(pred);
+        }
+        let mut ann_objs: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
+        for (ann, obj) in self.drain_pairs(&self.r_obj, ctx, view).await? {
+            ann_objs.entry(ann).or_default().push(obj);
+        }
         let built = Arc::new(AnnotationSidecarMaps {
             s_to_anns,
-            ann_pred,
-            ann_obj,
+            ann_preds,
+            ann_objs,
         });
         *self.maps.lock().expect("sidecar maps lock") = Some(built.clone());
         Ok(built)
@@ -1696,12 +1708,6 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
         // filtered planned scans) — cached across required batches — then
         // pure hash lookups per row.
         let maps = self.sidecar_maps(ctx, view).await?;
-        let AnnotationSidecarMaps {
-            s_to_anns,
-            ann_pred,
-            ann_obj,
-        } = maps.as_ref();
-
         let opt_schema: Arc<[VarId]> = Arc::from(vec![self.ann_var].into_boxed_slice());
         let mut pending = Vec::with_capacity(required_batch.len() - start_row);
         for row in start_row..required_batch.len() {
@@ -1714,14 +1720,13 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
                 pending.push((row, Vec::new()));
                 continue;
             };
-            let anns: Vec<Binding> = s_to_anns
+            let anns: Vec<Binding> = maps
+                .s_to_anns
                 .get(&s)
                 .map(|cands| {
                     cands
                         .iter()
-                        .filter(|ann| {
-                            ann_pred.get(*ann) == Some(&p) && ann_obj.get(*ann) == Some(&o)
-                        })
+                        .filter(|ann| maps.matches(ann, &p, &o))
                         .map(|ann| Binding::sid(ann.clone()))
                         .collect()
                 })
@@ -2678,5 +2683,22 @@ mod tests {
 
         // Should have same schema as new() constructor
         assert_eq!(op.schema().len(), 3);
+    }
+
+    #[test]
+    fn annotation_sidecar_maps_preserve_multi_target_values() {
+        let ann = Sid::new(1, "ann");
+        let p1 = Sid::new(2, "p1");
+        let p2 = Sid::new(2, "p2");
+        let o1 = Sid::new(3, "o1");
+        let o2 = Sid::new(3, "o2");
+        let maps = AnnotationSidecarMaps {
+            s_to_anns: HashMap::new(),
+            ann_preds: HashMap::from([(ann.clone(), vec![p1.clone(), p2.clone()])]),
+            ann_objs: HashMap::from([(ann.clone(), vec![o1.clone(), o2.clone()])]),
+        };
+
+        assert!(maps.matches(&ann, &p1, &o1));
+        assert!(maps.matches(&ann, &p2, &o2));
     }
 }

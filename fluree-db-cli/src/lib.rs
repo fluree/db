@@ -59,6 +59,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                     "--from and --memory are mutually exclusive".into(),
                 ));
             }
+            let edge_policy: fluree_db_api::csv_import::EdgePolicy = edge_properties.into();
 
             // `--remote` doesn't write any local state, so it must work even
             // when the user has no project-local `.fluree/` directory — fall
@@ -98,6 +99,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                             &remote_name,
                             path,
                             &fluree_dir,
+                            edge_policy,
+                            base_iri.as_deref(),
                         )
                         .await
                     }
@@ -135,7 +138,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 chunk_size_mb,
                 leaflet_rows,
                 leaflets_per_leaf,
-                edge_policy: edge_properties.into(),
+                edge_policy,
                 base_iri,
             };
             commands::create::run(

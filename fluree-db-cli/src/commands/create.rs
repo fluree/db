@@ -284,6 +284,8 @@ pub async fn run_remote_source_import(
     remote_name: &str,
     path: &Path,
     dirs: &FlureeDir,
+    edge_policy: fluree_db_api::csv_import::EdgePolicy,
+    base_iri: Option<&str>,
 ) -> CliResult<()> {
     use colored::Colorize;
 
@@ -328,7 +330,7 @@ pub async fn run_remote_source_import(
     // server stages with the right extension and runs the pipeline on
     // complete.
     let mint = client
-        .mint_import_upload_with_source(&ledger_id, Some(size), Some(filename))
+        .mint_source_import_upload(&ledger_id, Some(size), filename, edge_policy, base_iri)
         .await
         .map_err(|e| CliError::Remote(format!("failed to start upload to '{remote_name}': {e}")))?;
     let import_id = mint["import_id"]
