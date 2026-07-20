@@ -964,8 +964,27 @@ pub fn estimate_pattern(
         // subquery, so reorder never hoists it ahead of its inputs.
         Pattern::ShortestPath(_) => PatternEstimate::Deferred,
 
-        Pattern::R2rml(_) => PatternEstimate::Source {
-            row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY,
+        Pattern::R2rml(rp) => PatternEstimate::Source {
+            // D7 (E1): a variable-predicate R2RML scan with NO pruning key (no
+            // bound subject, class, class-prune hint, or pinned TriplesMap)
+            // resolves to EVERY TriplesMap — a full-source scan. Estimating it as
+            // `FULL_SCAN` (not the default property-scan cost, which ties it with a
+            // selective co-subject scan and leaves reorder's emit order) places it
+            // LAST among co-subject R2RML scans, so it becomes the LIMIT-budgeted
+            // correlated OUTER driven by the selective inner scan — the property-
+            // scoped browse crawl that otherwise ran the wildcard unbudgeted and
+            // DNF'd. Gated so OFF is byte-identical to the pre-fix estimate.
+            row_count: if crate::r2rml::property_var_budget_enabled()
+                && rp.predicate_var.is_some()
+                && rp.subject_constant.is_none()
+                && rp.class_filter.is_none()
+                && rp.class_prune_hint.is_none()
+                && rp.triples_map_iri.is_none()
+            {
+                FULL_SCAN
+            } else {
+                DEFAULT_PROPERTY_SCAN_SELECTIVITY
+            },
         },
 
         Pattern::Service(_) => PatternEstimate::Source {
@@ -2070,6 +2089,32 @@ mod tests {
                 assert!(branch.iter().any(&pred), "UNION branch {i}: {msg}");
             }
         }
+    }
+
+    #[test]
+    fn r2rml_full_source_wildcard_reorders_last_for_budget() {
+        // D7 (E1): the property-scoped browse crawl lowers to a selective
+        // const-predicate R2RML scan (`?s <prop> ?v`) plus a variable-predicate
+        // FULL-SOURCE wildcard (`?s ?p ?o`) sharing `?s`, emitted in the order
+        // [wildcard, prop-scan]. Because a pruning-key-less wildcard now estimates
+        // as FULL_SCAN, reorder places it LAST, so the selective scan drives and
+        // the wildcard becomes the LIMIT-budgeted correlated OUTER (not the
+        // unbudgeted inner full-source scan that DNF'd).
+        use crate::ir::R2rmlPattern;
+        let s = VarId(0);
+        let prop_scan = R2rmlPattern::new("gs", s, Some(VarId(1))).with_predicate("http://ex/prop");
+        let wildcard = R2rmlPattern::new("gs", s, Some(VarId(3))).with_predicate_var(VarId(2));
+        let patterns = vec![Pattern::R2rml(wildcard), Pattern::R2rml(prop_scan)];
+        let ordered = reorder_patterns(&patterns, None, &HashSet::new());
+        assert_eq!(ordered.len(), 2);
+        assert!(
+            matches!(&ordered[0], Pattern::R2rml(rp) if rp.predicate_filter.is_some() && rp.predicate_var.is_none()),
+            "the selective const-predicate scan must drive (placed first): {ordered:?}"
+        );
+        assert!(
+            matches!(&ordered[1], Pattern::R2rml(rp) if rp.predicate_var.is_some()),
+            "the full-source wildcard must be placed LAST (budgeted correlated outer): {ordered:?}"
+        );
     }
 
     #[test]

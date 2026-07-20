@@ -144,6 +144,27 @@ pub(crate) fn optional_budget_enabled() -> bool {
     *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_BUDGET_OPTIONAL"))
 }
 
+/// D7 (Cluster E / E1): whether a variable-predicate R2RML "crawl wildcard" scan
+/// with NO pruning key (no bound subject, no `class_filter`, no `class_prune_hint`,
+/// no pinned `triples_map_iri`) — which resolves to EVERY TriplesMap, i.e. a
+/// full-source scan — is cost-estimated as [`crate::planner`]'s `FULL_SCAN` so
+/// `reorder_patterns` places it LAST among the query's co-subject R2RML scans.
+/// That makes the wildcard the LIMIT-budgeted, correlated OUTER scan driven by the
+/// selective INNER scan (the property-scoped browse crawl `{?s <prop> ?v}` +
+/// `{?s ?p ?o}`), instead of the UNBUDGETED inner full-source scan it defaults to
+/// when both scans estimate equal (both `DEFAULT_PROPERTY_SCAN_SELECTIVITY`) and
+/// reorder keeps emit order — the D7 DNF. SOUND: reordering two co-subject scans
+/// preserves the solution set (the top LIMIT truncates the same rows; every
+/// driving subject has ≥1 triple so the budget never under-fills); it only lets
+/// the existing budget reach a scan that then terminates. Default on;
+/// `FLUREE_R2RML_BUDGET_PROPERTY_VAR=0|false|off|no` reverts to the equal estimate
+/// (byte-identical results, the property-var browse then runs unbudgeted). Read
+/// once (process-wide).
+pub(crate) fn property_var_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_BUDGET_PROPERTY_VAR"))
+}
+
 /// Item 8 (F-AUD-6): whether an ASCENDING single-column `ORDER BY … LIMIT k` over
 /// an R2RML scan may offer a scan-side top-k directive. DESC top-k (PR-5) is
 /// always offered; ASC is admitted only for a REQUIRED (non-nullable) column (the
