@@ -61,6 +61,12 @@ const MAX_SEQUENTIAL_ROWS: usize = 100_000;
 /// variable (Cypher identifiers cannot start with `#`).
 const ROW_IDX_VAR: &str = "#__cy_seq_row";
 
+/// Synthetic column used when a read prefix produces rows but binds no user
+/// variables (for example `MATCH (:Person)`). Without a column, that N-row
+/// relation is indistinguishable from the one-row unit table to the seeded
+/// write path. Values are unique row ordinals, preserving multiplicity.
+const ROW_SEED_VAR: &str = "#__cy_seq_seed";
+
 /// A multi-clause Cypher write statement routed to the sequential driver.
 pub struct SequentialCypherWrite {
     pub update: Update,
@@ -240,13 +246,23 @@ impl Fluree {
         let mut table = if update.read_clauses.is_empty() {
             RowTable::unit()
         } else {
-            let cols = visible_vars(&update.read_clauses)?;
+            let mut cols = visible_vars(&update.read_clauses)?;
             let ast = read_prefix_query(update, &cols, span);
             let view = self
                 .seq_probe_view(stager.state(), governance, default_context.as_ref())
                 .await?;
             let result = self.query_cypher_ast(&view, &ast).await?;
-            let rows = extract_rows(result, &cols)?;
+            let mut rows = if cols.is_empty() {
+                extract_rows(result, &[ROW_SEED_VAR.to_string()])?
+            } else {
+                extract_rows(result, &cols)?
+            };
+            if cols.is_empty() {
+                cols.push(ROW_SEED_VAR.to_string());
+                for (i, row) in rows.iter_mut().enumerate() {
+                    row[0] = row_index_binding(i as u64);
+                }
+            }
             check_row_cap(rows.len())?;
             RowTable { cols, rows }
         };
@@ -610,9 +626,17 @@ impl Fluree {
         };
 
         // ---- Create branch (first row per distinct absent key) -----------
+        // Values that need engine evaluation against variables introduced by
+        // this MERGE cannot be hoisted until after re-bind. Keep simple
+        // literals / already-bound row columns in the create Txn; defer only
+        // computed ON CREATE expressions to a post-create seeded SET.
+        let deferred_on_create = set_items_need_hoist(&merge.on_create, &table.cols);
         if !creators.is_empty() {
             let mut create_merge = merge.clone();
             create_merge.on_match.clear();
+            if deferred_on_create {
+                create_merge.on_create.clear();
+            }
             let create_ast_clause = WriteClause::Merge(create_merge);
             if table.is_seeded() {
                 let sub = RowTable {
@@ -725,6 +749,7 @@ impl Fluree {
             let creator_set: std::collections::HashSet<u64> =
                 creators.iter().map(|&i| i as u64).collect();
             let has_on_match = !merge.on_match.is_empty();
+            let mut on_create_rows: Vec<Vec<Binding>> = Vec::new();
             let mut on_match_rows: Vec<Vec<Binding>> = Vec::new();
             let mut new_rows: Vec<Vec<Binding>> = Vec::with_capacity(rebound.len());
             for row in rebound {
@@ -732,7 +757,9 @@ impl Fluree {
                     ApiError::internal("sequential MERGE re-bind lost its row index")
                 })?;
                 let cells: Vec<Binding> = row[1..].to_vec();
-                if has_on_match && !creator_set.contains(&idx) {
+                if deferred_on_create && creator_set.contains(&idx) {
+                    on_create_rows.push(cells.clone());
+                } else if has_on_match && !creator_set.contains(&idx) {
                     on_match_rows.push(cells.clone());
                 }
                 new_rows.push(cells);
@@ -741,20 +768,32 @@ impl Fluree {
             let mut new_cols = table.cols.clone();
             new_cols.extend(new_vars.iter().cloned());
 
-            if has_on_match && !on_match_rows.is_empty() {
-                let sub = RowTable {
-                    cols: new_cols.clone(),
-                    rows: on_match_rows,
-                };
-                self.seq_stage_seeded(
+            if deferred_on_create && !on_create_rows.is_empty() {
+                self.seq_stage_set_items(
                     stager,
-                    &sub,
-                    vec![WriteClause::Set(SetClause {
-                        items: merge.on_match.clone(),
-                        span,
-                    })],
-                    None,
+                    &new_cols,
+                    on_create_rows,
+                    &merge.on_create,
                     ledger_id,
+                    governance,
+                    default_context,
+                    index_config,
+                    policy,
+                    tracker,
+                    span,
+                )
+                .await?;
+            }
+
+            if has_on_match && !on_match_rows.is_empty() {
+                self.seq_stage_set_items(
+                    stager,
+                    &new_cols,
+                    on_match_rows,
+                    &merge.on_match,
+                    ledger_id,
+                    governance,
+                    default_context,
                     index_config,
                     policy,
                     tracker,
@@ -770,6 +809,87 @@ impl Fluree {
             return Err(cypher_err(
                 "MERGE … ON MATCH SET requires a variable in the MERGE pattern",
             ));
+        }
+        Ok(())
+    }
+
+    /// Stage SET items over selected MERGE-branch rows. Simple literal /
+    /// row-column values stay batched. Computed values are evaluated and
+    /// staged one row at a time against the evolving virtual state so a
+    /// duplicate row observes updates made by the preceding row.
+    #[allow(clippy::too_many_arguments)]
+    async fn seq_stage_set_items(
+        &self,
+        stager: &mut SequentialStager,
+        cols: &[String],
+        rows: Vec<Vec<Binding>>,
+        items: &[fluree_db_cypher::ast::SetItem],
+        ledger_id: &str,
+        governance: Option<&GovernanceOptions>,
+        default_context: Option<&serde_json::Value>,
+        index_config: Option<&IndexConfig>,
+        policy: Option<&crate::PolicyContext>,
+        tracker: Option<&Tracker>,
+        span: SourceSpan,
+    ) -> Result<()> {
+        if rows.is_empty() || items.is_empty() {
+            return Ok(());
+        }
+        if !set_items_need_hoist(items, cols) {
+            let table = RowTable {
+                cols: cols.to_vec(),
+                rows,
+            };
+            return self
+                .seq_stage_seeded(
+                    stager,
+                    &table,
+                    vec![WriteClause::Set(SetClause {
+                        items: items.to_vec(),
+                        span,
+                    })],
+                    None,
+                    ledger_id,
+                    index_config,
+                    policy,
+                    tracker,
+                    span,
+                )
+                .await
+                .map(|_| ());
+        }
+
+        for row in rows {
+            let mut table = RowTable {
+                cols: cols.to_vec(),
+                rows: vec![row],
+            };
+            let clause = WriteClause::Set(SetClause {
+                items: items.to_vec(),
+                span,
+            });
+            let clause = self
+                .hoist_clause_value_exprs(
+                    &mut table,
+                    &clause,
+                    governance,
+                    default_context,
+                    stager.state(),
+                    span,
+                )
+                .await?;
+            self.seq_stage_seeded(
+                stager,
+                &table,
+                vec![clause],
+                None,
+                ledger_id,
+                index_config,
+                policy,
+                tracker,
+                span,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -939,12 +1059,13 @@ impl Fluree {
         state: &LedgerState,
         span: SourceSpan,
     ) -> Result<WriteClause> {
+        let include_merge_sets = !matches!(clause, WriteClause::Merge(_));
         let mut clause = clause.clone();
         let mut hoisted: Vec<(String, Expr)> = Vec::new();
         {
             let base = table.cols.len();
             let cols = &table.cols;
-            visit_value_exprs(&mut clause, &mut |e: &mut Expr| {
+            visit_value_exprs(&mut clause, include_merge_sets, &mut |e: &mut Expr| {
                 let bound_var = matches!(e, Expr::Var(v) if cols.iter().any(|c| c == &v.name));
                 if matches!(e, Expr::Lit(_)) || bound_var {
                     return;
@@ -1112,10 +1233,14 @@ impl Fluree {
     }
 }
 
-/// Visit every *value* expression position of a write clause (pattern
-/// property values on nodes and relationships; `SET` / `ON CREATE SET` /
-/// `ON MATCH SET` item values). Targets and labels are not values.
-fn visit_value_exprs(clause: &mut WriteClause, f: &mut impl FnMut(&mut Expr)) {
+/// Visit every *value* expression position of a write clause. MERGE branch
+/// sets may be excluded because their newly-bound variables do not exist
+/// until the driver's post-create re-bind.
+fn visit_value_exprs(
+    clause: &mut WriteClause,
+    include_merge_sets: bool,
+    f: &mut impl FnMut(&mut Expr),
+) {
     use fluree_db_cypher::ast::SetItem;
     fn visit_pattern(p: &mut Pattern, f: &mut impl FnMut(&mut Expr)) {
         for part in &mut p.parts {
@@ -1155,12 +1280,29 @@ fn visit_value_exprs(clause: &mut WriteClause, f: &mut impl FnMut(&mut Expr)) {
         WriteClause::Create(c) => visit_pattern(&mut c.pattern, f),
         WriteClause::Merge(m) => {
             visit_pattern(&mut m.pattern, f);
-            visit_items(&mut m.on_create, f);
-            visit_items(&mut m.on_match, f);
+            if include_merge_sets {
+                visit_items(&mut m.on_create, f);
+                visit_items(&mut m.on_match, f);
+            }
         }
         WriteClause::Set(s) => visit_items(&mut s.items, f),
         WriteClause::Remove(_) | WriteClause::Delete(_) | WriteClause::Foreach(_) => {}
     }
+}
+
+fn set_items_need_hoist(items: &[fluree_db_cypher::ast::SetItem], cols: &[String]) -> bool {
+    use fluree_db_cypher::ast::SetItem;
+    let needs_hoist = |e: &Expr| {
+        !matches!(e, Expr::Lit(_))
+            && !matches!(e, Expr::Var(v) if cols.iter().any(|c| c == &v.name))
+    };
+    items.iter().any(|item| match item {
+        SetItem::Property { value, .. } => needs_hoist(value),
+        SetItem::MapMerge { map, .. } | SetItem::MapReplace { map, .. } => {
+            map.entries.iter().any(|(_, value)| needs_hoist(value))
+        }
+        SetItem::Labels { .. } => false,
+    })
 }
 
 /// Reject members the v1 driver defers, with clear errors.
@@ -1298,6 +1440,14 @@ fn visible_vars(clauses: &[ReadClause]) -> Result<Vec<String>> {
             ReadClause::With(w) => {
                 let mut narrowed: Vec<String> = Vec::new();
                 for item in &w.items {
+                    if matches!((&item.alias, &item.expr), (None, Expr::Var(v)) if v.name == "*") {
+                        for name in &vars {
+                            if !narrowed.contains(name) {
+                                narrowed.push(name.clone());
+                            }
+                        }
+                        continue;
+                    }
                     let name = match (&item.alias, &item.expr) {
                         (Some(a), _) => a.name.clone(),
                         (None, Expr::Var(v)) => v.name.clone(),
@@ -1322,11 +1472,23 @@ fn visible_vars(clauses: &[ReadClause]) -> Result<Vec<String>> {
 
 /// The read prefix as a read query projecting `cols`.
 fn read_prefix_query(update: &Update, cols: &[String], span: SourceSpan) -> CypherAst {
+    let items = if cols.is_empty() {
+        vec![ProjectionItem {
+            expr: Expr::Lit(Literal::Integer(0, span)),
+            alias: Some(Variable {
+                name: ROW_SEED_VAR.to_string(),
+                span,
+            }),
+            span,
+        }]
+    } else {
+        cols.iter().map(|c| var_projection(c, span)).collect()
+    };
     CypherAst {
         statement: Statement::Query(Query {
             clauses: update.read_clauses.clone(),
             return_clause: ReturnClause {
-                items: cols.iter().map(|c| var_projection(c, span)).collect(),
+                items,
                 distinct: false,
                 order_by: Vec::new(),
                 skip: None,
@@ -1541,7 +1703,11 @@ fn normalize_binding(b: Binding) -> Result<Binding> {
             p_id: None,
         },
         Binding::Unbound | Binding::Poisoned => Binding::Unbound,
-        other @ (Binding::Iri(_) | Binding::List(_) | Binding::Map(_)) => other,
+        other @ (Binding::Iri(_)
+        | Binding::Path { .. }
+        | Binding::Rel(_)
+        | Binding::List(_)
+        | Binding::Map(_)) => other,
         other => {
             return Err(ApiError::internal(format!(
                 "sequential write driver: unexpected binding shape in row table: {other:?}"

@@ -62,6 +62,11 @@ decomposition:
      `ON MATCH SET` (a seeded SET Txn). In-batch duplicate keys thus converge
      to sequential semantics: first occurrence creates + `ON CREATE SET`,
      later occurrences match + `ON MATCH SET`.
+     Computed branch values that read graph state (for example
+     `n.count = n.count + 1`) evaluate after re-bind and stage row-by-row
+     against the evolving virtual state; this lets each duplicate observe the
+     preceding row's update. Simple literals and threaded row-column values
+     remain batched.
    - **SET / REMOVE**: one seeded Txn; row table unchanged.
    - **DELETE** in a multi-clause chain: rejected (clear error) in v1 — its
      relationship-existence / parallel-edge probes stay single-statement.
@@ -127,6 +132,8 @@ statements.
 ## Costs
 
 Per MERGE clause: two or three `VALUES`-seeded engine queries (match probe,
-identity-tuple evaluation for dedup, re-bind) plus one or two stagings. All
-row-bulk operations — no per-row query loops. Row tables are capped
+identity-tuple evaluation for dedup, re-bind) plus one or two stagings. The
+common path is row-bulk. A computed `ON CREATE` / `ON MATCH` value that must
+read the current graph uses a correctness-first per-row query/stage loop so
+duplicate rows observe prior updates. Row tables are capped
 (`MAX_SEQUENTIAL_ROWS`) with a clear error.
