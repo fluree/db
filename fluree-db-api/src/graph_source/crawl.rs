@@ -31,7 +31,7 @@ use fluree_db_query::ir::projection::Column;
 use fluree_db_query::var_registry::VarId;
 use fluree_db_query::Binding;
 
-use crate::format::{format_binding_with_result, FormatterConfig, IriCompactor};
+use crate::format::{format_node_object_binding, FormatterConfig, IriCompactor};
 use crate::view::{GraphDb, QueryInput};
 use crate::{Fluree, QueryExecutionOptions, Result};
 
@@ -267,8 +267,12 @@ pub(crate) async fn expand_wildcard_crawl(
                                 acc.add_type(compactor.compact_vocab_iri(class_iri));
                             }
                         } else if let Some(obj_binding) = batch.get(row, o_var) {
-                            let value =
-                                format_binding_with_result(&result, obj_binding, &compactor)?;
+                            let value = format_node_object_binding(
+                                &result,
+                                obj_binding,
+                                &compactor,
+                                format_config,
+                            )?;
                             acc.add_value(compactor.compact_vocab_iri(pred_iri), value);
                         }
                     }
@@ -301,8 +305,12 @@ pub(crate) async fn expand_wildcard_crawl(
                         let Some(ovar) = ovar else { continue };
                         if let Some(obj_binding) = batch.get(row, *ovar) {
                             if !matches!(obj_binding, Binding::Unbound) {
-                                let value =
-                                    format_binding_with_result(&result, obj_binding, &compactor)?;
+                                let value = format_node_object_binding(
+                                    &result,
+                                    obj_binding,
+                                    &compactor,
+                                    format_config,
+                                )?;
                                 acc.add_value(predicates[i].clone(), value);
                             }
                         }
@@ -904,6 +912,17 @@ mod e2e {
         view: &GraphDb,
         crawl: &JsonValue,
     ) -> Vec<JsonValue> {
+        run_crawl_cfg(provider, view, crawl, &FormatterConfig::default()).await
+    }
+
+    /// Like [`run_crawl`] but with an explicit formatter config, so tests can
+    /// exercise the crawl object formatter across output formats (typed-json).
+    async fn run_crawl_cfg(
+        provider: &MockCrawlProvider,
+        view: &GraphDb,
+        crawl: &JsonValue,
+        config: &FormatterConfig,
+    ) -> Vec<JsonValue> {
         let fluree = FlureeBuilder::memory().build_memory();
         expand_wildcard_crawl(
             &fluree,
@@ -912,7 +931,7 @@ mod e2e {
             provider,
             provider,
             QueryExecutionOptions::new(),
-            &FormatterConfig::default(),
+            config,
         )
         .await
         .expect("crawl expansion succeeds")
@@ -1332,17 +1351,44 @@ mod e2e {
         });
         let docs = run_crawl(&provider, &view, &crawl).await;
         assert_eq!(docs.len(), 2, "two Customer instances");
-        let serialized = serde_json::to_string(&docs).unwrap();
-        // Present FK renders the templated parent IRI from the child's account_id.
+        // Each Customer's `account` ref MUST serialize as a JSON-LD node
+        // reference `{"@id": …}`, NOT a bare string (defect D1). Assert the
+        // parsed SHAPE, so a bare-string regression can't slip past a substring
+        // match. The one object-valued forward property is the account ref.
+        let account_ids: std::collections::BTreeSet<String> = docs
+            .iter()
+            .map(|doc| {
+                let obj = doc.as_object().expect("crawl doc is an object");
+                let refs: Vec<&JsonValue> = obj
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with('@'))
+                    .filter(|(_, v)| !v.is_string())
+                    .map(|(_, v)| v)
+                    .collect();
+                assert_eq!(
+                    refs.len(),
+                    1,
+                    "exactly one non-literal forward property (the account ref): {obj:?}"
+                );
+                refs[0]
+                    .as_object()
+                    .and_then(|o| o.get("@id"))
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("account ref must be {{\"@id\": …}}, got {}", refs[0])
+                    })
+                    .to_string()
+            })
+            .collect();
+        // Present FK (account 10) and dangling FK (account 99, the browse
+        // relaxation) both render as templated `@id` node references.
         assert!(
-            serialized.contains("account/10"),
-            "present FK must render the templated parent IRI: {serialized}"
+            account_ids.iter().any(|id| id.ends_with("account/10")),
+            "present FK must be an @id node ref to account/10: {account_ids:?}"
         );
-        // Dangling FK (account 99, no such Account row) still renders a templated
-        // IRI — the intended browse relaxation.
         assert!(
-            serialized.contains("account/99"),
-            "dangling FK must render a templated IRI (browse relaxation): {serialized}"
+            account_ids.iter().any(|id| id.ends_with("account/99")),
+            "dangling FK must be an @id node ref to account/99 (browse relaxation): {account_ids:?}"
         );
         // The parent (Account) table is NEVER scanned; the child IS.
         assert!(
@@ -1453,5 +1499,228 @@ mod e2e {
             vec!["people".to_string()],
             "bound subject person/1 must prune to the People table only (not Orders)"
         );
+    }
+
+    /// One Customer (Alice) with a scalar `name` and a ref to Account (present
+    /// FK), plus the Account parent map. Shared by the typed-json and
+    /// `/info`⇔crawl serialization tests.
+    fn customer_account_provider() -> MockCrawlProvider {
+        let mapping = CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://example.org/customer/{id}")
+                .with_class("http://example.org/Customer")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://example.org/name"),
+                    object_map: ObjectMap::column("name"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://example.org/account"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Account",
+                        "account_id",
+                        "id",
+                    )),
+                }),
+            tm(
+                "#Account",
+                "accounts",
+                "http://example.org/account/{id}",
+                "http://example.org/Account",
+                "http://example.org/label",
+                "label",
+            ),
+        ]);
+        let mut tables = HashMap::new();
+        tables.insert(
+            "customers".to_string(),
+            vec![id_str_fk_batch("name", "account_id", &[(1, "Alice", 10)])],
+        );
+        tables.insert(
+            "accounts".to_string(),
+            vec![id_str_batch("label", &[10], &["Acct-10"])],
+        );
+        MockCrawlProvider::new(mapping, tables)
+    }
+
+    // A typed-json crawl shapes refs as {"@id":…} (format-independent) and
+    // literals as {"@value","@type"} value-objects — the crawl previously
+    // ignored `format` and always emitted default JSON-LD (defect D2).
+    #[tokio::test]
+    async fn crawl_typed_json_shapes_refs_and_literals() {
+        let provider = customer_account_provider();
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Customer"}
+        });
+        let docs = run_crawl_cfg(&provider, &view, &crawl, &FormatterConfig::typed_json()).await;
+        assert_eq!(docs.len(), 1);
+        let doc = docs[0].as_object().expect("doc is an object");
+        let mut saw_typed_literal = false;
+        let mut saw_id_ref = false;
+        for (k, v) in doc {
+            if k.starts_with('@') {
+                continue;
+            }
+            if v.get("@value").is_some() {
+                saw_typed_literal = true;
+                assert!(
+                    v.get("@type").is_some(),
+                    "typed-json literal must carry @type: {v}"
+                );
+            } else if v.get("@id").is_some() {
+                saw_id_ref = true;
+            } else {
+                panic!("typed-json property {k} is neither a value-object nor an @id ref: {v}");
+            }
+        }
+        assert!(
+            saw_typed_literal,
+            "a typed literal value-object must appear: {doc:?}"
+        );
+        assert!(
+            saw_id_ref,
+            "the account ref must be an @id node reference: {doc:?}"
+        );
+    }
+
+    // A boolean object renders as a real JSON boolean (`true`), not the string
+    // "true" the R2RML operator leaves it as (defect D3) — in BOTH the default
+    // and typed-json formats.
+    #[tokio::test]
+    async fn crawl_boolean_literal_renders_as_bool() {
+        let mapping = CompiledR2rmlMapping::new(vec![TriplesMap::new("#Flag", "flags")
+            .with_subject_template("http://example.org/flag/{id}")
+            .with_class("http://example.org/Flag")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://example.org/active"),
+                object_map: ObjectMap::column_typed(
+                    "active",
+                    "http://www.w3.org/2001/XMLSchema#boolean",
+                ),
+            })]);
+        let mut tables = HashMap::new();
+        // The operator reads the column value as the string "true" tagged
+        // xsd:boolean — the exact shape D3 mis-rendered as a JSON string.
+        tables.insert(
+            "flags".to_string(),
+            vec![id_str_batch("active", &[1], &["true"])],
+        );
+        let provider = MockCrawlProvider::new(mapping, tables);
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({
+            "@context": {"v": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "v:Flag"}
+        });
+        // Default format: bare JSON boolean.
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 1);
+        let (_, active) = docs[0]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| !k.starts_with('@'))
+            .expect("the active property");
+        assert!(
+            active.is_boolean() && active == &json!(true),
+            "boolean must be a JSON bool, not the string \"true\": {active}"
+        );
+        // Typed-json: {"@value": true, "@type": …} with a real boolean @value.
+        let typed = run_crawl_cfg(&provider, &view, &crawl, &FormatterConfig::typed_json()).await;
+        let (_, active_t) = typed[0]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| !k.starts_with('@'))
+            .expect("the active property (typed)");
+        assert!(
+            active_t["@value"].is_boolean() && active_t["@value"] == json!(true),
+            "typed-json @value must be a JSON bool: {active_t}"
+        );
+    }
+
+    // Cross-path invariant (P1): every property `/info`
+    // (`build_virtual_ledger_info`) reports with the `@id` datatype MUST
+    // serialize in the crawl as a node reference `{"@id": …}` — the exact
+    // two-path disagreement about `account` that defect D1 fixed. The crawl is
+    // issued with NO @context + full IRIs so its property keys are full IRIs
+    // that match `/info`'s full-IRI property keys.
+    #[tokio::test]
+    async fn crawl_ref_serialization_matches_info_id_datatype() {
+        use crate::ledger_info::{build_virtual_ledger_info, VirtualSourceMeta};
+        use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
+
+        let provider = customer_account_provider();
+
+        // Which forward properties does /info type as `@id`?
+        let record = GraphSourceRecord {
+            graph_source_id: "crawl-e2e:main".to_string(),
+            name: "crawl-e2e".to_string(),
+            branch: "main".to_string(),
+            source_type: GraphSourceType::Iceberg,
+            config: "{}".to_string(),
+            dependencies: vec![],
+            index_id: None,
+            index_t: 0,
+            retracted: false,
+        };
+        let meta = VirtualSourceMeta {
+            source_type: "Iceberg".to_string(),
+            catalog_type: None,
+            catalog_uri: None,
+            table_location: None,
+            warehouse: None,
+            tables: vec!["customers".to_string(), "accounts".to_string()],
+            snapshot_id: Some(1),
+            mor_approximate_tables: Vec::new(),
+        };
+        let mut counts = HashMap::new();
+        counts.insert("customers".to_string(), 1);
+        counts.insert("accounts".to_string(), 1);
+        let info = serde_json::to_value(build_virtual_ledger_info(
+            &record,
+            Some(provider.mapping.as_ref()),
+            &meta,
+            &counts,
+        ))
+        .unwrap();
+        let id_props: std::collections::BTreeSet<String> = info["stats"]["properties"]
+            .as_object()
+            .expect("info carries stats.properties")
+            .iter()
+            .filter(|(_, v)| v["datatypes"].get("@id").is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert!(
+            id_props.contains("http://example.org/account"),
+            "/info must type the account ref as @id: {id_props:?}"
+        );
+
+        let (_ledger, view) = genesis_view();
+        let crawl = json!({
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "http://example.org/Customer"}
+        });
+        let docs = run_crawl(&provider, &view, &crawl).await;
+        assert_eq!(docs.len(), 1);
+        for doc in &docs {
+            for (key, val) in doc.as_object().expect("doc is an object") {
+                if !id_props.contains(key) {
+                    continue;
+                }
+                let values: Vec<&JsonValue> = match val {
+                    JsonValue::Array(a) => a.iter().collect(),
+                    other => vec![other],
+                };
+                for v in values {
+                    assert!(
+                        v.as_object().and_then(|o| o.get("@id")).is_some(),
+                        "property {key} is @id-typed by /info but the crawl serialized it as {v}"
+                    );
+                }
+            }
+        }
     }
 }
