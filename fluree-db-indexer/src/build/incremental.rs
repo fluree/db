@@ -2803,13 +2803,20 @@ pub async fn incremental_index(
                             }
                             // Resolve classes for endpoints not already known from this batch
                             // (stable base entities) via one batched rdf:type lookup; endpoints
-                            // in base_subject_classes (re-typed / novelty) use those maps.
+                            // in either batch map (re-typed / novelty) use those maps. A subject
+                            // typed for the FIRST time this batch has no base entry — only a net
+                            // one — so both maps must be checked or it would be mistaken for a
+                            // stable (still class-less) base entity.
                             let mut external_sids: Vec<u64> = Vec::new();
                             for &(s, _p, o) in &edges {
-                                if !base_subject_classes.contains_key(&(g_id, s)) {
+                                if !base_subject_classes.contains_key(&(g_id, s))
+                                    && !subject_classes.contains_key(&(g_id, s))
+                                {
                                     external_sids.push(s);
                                 }
-                                if !base_subject_classes.contains_key(&(g_id, o)) {
+                                if !base_subject_classes.contains_key(&(g_id, o))
+                                    && !subject_classes.contains_key(&(g_id, o))
+                                {
                                     external_sids.push(o);
                                 }
                             }
@@ -2841,11 +2848,21 @@ pub async fn incremental_index(
                             };
                             // (base_classes, net_classes) for an endpoint. A stable base
                             // entity has base == net (its type did not change this batch).
+                            // Batch-local membership is keyed on EITHER map: a first-time-typed
+                            // subject is absent from base but present in net; keying on base
+                            // alone would resolve it externally as class-less and drop the +1
+                            // side of its edge moves.
                             let resolve = |sid: u64| -> (Vec<u64>, Vec<u64>) {
-                                if let Some(b) = base_subject_classes.get(&(g_id, sid)) {
-                                    let base: Vec<u64> = b.iter().copied().collect();
+                                let key = (g_id, sid);
+                                if base_subject_classes.contains_key(&key)
+                                    || subject_classes.contains_key(&key)
+                                {
+                                    let base: Vec<u64> = base_subject_classes
+                                        .get(&key)
+                                        .map(|b| b.iter().copied().collect())
+                                        .unwrap_or_default();
                                     let net: Vec<u64> = subject_classes
-                                        .get(&(g_id, sid))
+                                        .get(&key)
                                         .map(|s| s.iter().copied().collect())
                                         .unwrap_or_default();
                                     (base, net)
