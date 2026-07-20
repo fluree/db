@@ -331,7 +331,11 @@ pub fn merge_novelty(input: &MergeInput<'_>) -> MergeOutput {
         ni += 1;
     }
 
-    debug_assert_eq!(
+    // Release-mode check: a stranded superseded event stalls the gather
+    // cursor, so every later identity's events would also miss the sidecar —
+    // a silent, durable loss of time-travel history. Failing the merge keeps
+    // the novelty overlay authoritative instead of persisting the gap.
+    assert_eq!(
         si,
         input.superseded.len(),
         "every superseded event's identity must have a winner in this leaflet's novelty"
