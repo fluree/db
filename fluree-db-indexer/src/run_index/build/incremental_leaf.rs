@@ -90,6 +90,14 @@ pub struct LeafUpdateOutput {
 /// the single point where slices come into existence: a range without
 /// novelty holds no superseded events, because every superseded identity
 /// routes with its winner.
+///
+/// Co-routing is sound because slicing compares sort-key identity columns
+/// only ([`fluree_db_binary_index::format::run_record_v2::cmp_v2_for_order`]
+/// carries no `t` or `op`): all events of one identity compare equal to
+/// each other and to any boundary key, so a
+/// partition point can never fall between a winner and its superseded
+/// events — a boundary key taken from an existing row cannot sort between
+/// two same-identity events.
 #[derive(Clone, Copy)]
 pub struct StreamSlices<'a> {
     pub novelty: &'a [RunRecordV2],
