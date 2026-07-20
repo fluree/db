@@ -90,6 +90,7 @@
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
   - [Edge annotations (storage internals)](design/edge-annotations.md)
+  - [Cypher sequential writes (multi-clause MERGE composition)](design/cypher-sequential-writes.md)
   - [Spatial index (GeoPoint + S2)](design/spatial-index.md)
   - [Namespace allocation and fallback modes](design/namespace-allocation.md)
   - [Ontology imports (`f:schemaSource` + `owl:imports`)](design/ontology-imports.md)

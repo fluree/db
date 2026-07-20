@@ -640,11 +640,23 @@ impl Worker {
             }
             TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
             TransactionBody::Cypher { .. } => {
-                let resolved = cypher_txn.expect("cypher_txn is Some for a Cypher body");
-                let staged = staged.txn(resolved.primary);
-                match resolved.followup {
-                    Some(followup) => staged.txn_followup(followup),
-                    None => staged,
+                match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
+                    crate::local::CypherWriteUnderLock::Resolved(resolved) => {
+                        let staged = staged.txn(resolved.primary);
+                        match resolved.followup {
+                            Some(followup) => staged.txn_followup(followup),
+                            None => staged,
+                        }
+                    }
+                    // Multi-clause plan: the sequential driver stages it
+                    // clause-by-clause inside the builder against the locked
+                    // state (the worker is the single serialized writer, so
+                    // the under-lock contract holds). A trailing RETURN was
+                    // rejected at submission — the Raft receipt path has no
+                    // channel for it.
+                    crate::local::CypherWriteUnderLock::Sequential(input) => {
+                        staged.cypher_sequential(*input)
+                    }
                 }
             }
         };

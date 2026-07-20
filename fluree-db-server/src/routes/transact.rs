@@ -1880,17 +1880,40 @@ async fn execute_cypher_transact(
     );
     let tracking = tracking_from_headers(headers);
 
-    // A trailing RETURN on the write ships a skolemization id with the
-    // request so the created-entity rows are reconstructible post-commit
-    // (see `fluree_db_api::cypher_write`). Validation errors surface here,
-    // pre-submission; parse errors fall through to the consensus path's
-    // full-diagnostic error.
-    let return_plan =
+    // A multi-clause statement runs through the sequential write driver
+    // inside the consensus layer; its trailing RETURN is answered from the
+    // driver's final row table and travels back on the receipt (local
+    // consensus only — the Raft receipt path has no channel for it, so
+    // reject RETURN there pre-submission rather than after committing).
+    let (is_sequential, sequential_has_return) =
+        fluree_db_api::cypher_seq::classify_sequential_source(&cypher, params.as_ref());
+    if is_sequential
+        && sequential_has_return
+        && !crate::routes::import::source_import_supported(state)
+    {
+        set_span_error_code(span, "error:BadRequest");
+        return Err(ServerError::Api(fluree_db_api::ApiError::cypher(
+            "a trailing RETURN on a multi-clause Cypher write is not supported under Raft \
+             consensus — drop the RETURN or use a Bolt session"
+                .to_string(),
+            Vec::new(),
+        )));
+    }
+
+    // A trailing RETURN on a single-clause write ships a skolemization id
+    // with the request so the created-entity rows are reconstructible
+    // post-commit (see `fluree_db_api::cypher_write`). Validation errors
+    // surface here, pre-submission; parse errors fall through to the
+    // consensus path's full-diagnostic error.
+    let return_plan = if is_sequential {
+        None
+    } else {
         fluree_db_api::cypher_write::plan_write_return_source(&cypher, params.as_ref())
             .map_err(ServerError::Api)
             .inspect_err(|_| {
                 set_span_error_code(span, "error:BadRequest");
-            })?;
+            })?
+    };
     let skolem_txn_id = return_plan
         .as_ref()
         .map(|_| fluree_db_api::cypher_write::fresh_skolem_txn_id());
@@ -1911,6 +1934,29 @@ async fn execute_cypher_transact(
         tracking,
         governance: qc_opts,
     };
+
+    if is_sequential && sequential_has_return {
+        // Sequential write with RETURN: the receipt carries the envelope.
+        let receipt = submit_via_consensus(state, request, &credential.headers).await?;
+        let envelope = receipt
+            .cypher_return
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"results": [{"columns": [], "data": []}]}));
+        let mut response_headers = HeaderMap::new();
+        if let Some(key) = &receipt.idempotency_key {
+            if let Ok(value) = HeaderValue::from_str(key.as_str()) {
+                response_headers.insert("Idempotency-Key", value);
+            }
+        }
+        if let Some(tally) = &receipt.tally {
+            response_headers.extend(tracking_headers(tally));
+        }
+        response_headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.fluree.cypher+json; charset=utf-8"),
+        );
+        return Ok((response_headers, envelope.to_string()).into_response());
+    }
 
     let (Some(plan), Some(skolem_id)) = (return_plan, skolem_txn_id) else {
         return transact_via_consensus(state, ledger_id, request, tx_id, &credential.headers).await;
