@@ -1748,9 +1748,12 @@ impl FusedR2rmlAggregateOperator {
             // The old byte-for-byte decline this default lifts guarded TWO things,
             // both now retired by mechanisms that make widening sound:
             //   1. OVER-COUNT of a flagged shape (the `q022` isCurrent sentinel):
-            //      retired by the `star_constraints` guard above (`:1304`) — any
-            //      constant-object flag declines BEFORE this loop, so the default
-            //      here only ever widens admission for un-flagged shapes.
+            //      post-E2/F1 a constant-object flag is NO LONGER declined —
+            //      `combine_constrained_class_scan` FUSES it onto the class scan as
+            //      a `star_constraints` entry that is APPLIED per row
+            //      (`resolve_star_constraint_checks` / `row_satisfies_constraints`),
+            //      so the fold counts only satisfying rows; the default here widens
+            //      admission soundly for flagged shapes too, not just un-flagged ones.
             //   2. WRONG group-key TERM vs the materialized answer: retired by
             //      parity-by-construction — the generic materialize path's
             //      `LiteralEncoder` registers a datatype Sid only for annotated

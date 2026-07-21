@@ -2273,6 +2273,47 @@ mod e2e {
         );
     }
 
+    // Native parity for an ABSENT subject on the NON-wildcard forms. Native
+    // returns `[{}]` (one empty node) for both `["@type"]` and a forward-predicate
+    // list on a missing subject: an explicit projection does NOT seed `@id`, and
+    // no requested property/type is present, so the node is empty (but a node IS
+    // emitted — the select-map projects a specific requested root). VERIFIED
+    // against native-sf01 (a missing customer): both forms → `[{}]`, so Cluster B
+    // is at parity. (The wildcard form separately returns the `[{"@id"}]` stub
+    // above, because `["*"]` DOES seed `@id`.)
+    #[tokio::test]
+    async fn bound_subject_select_map_absent_non_wildcard_returns_empty_node() {
+        let provider = two_table_provider();
+        let (_ledger, view) = genesis_view();
+        // `["@type"]` on a missing subject → one empty node.
+        let type_docs = run_crawl(
+            &provider,
+            &view,
+            &json!({"select": {"http://example.org/person/999": ["@type"]}}),
+        )
+        .await;
+        assert_eq!(type_docs.len(), 1, "one node (the requested subject)");
+        assert!(
+            type_docs[0].as_object().unwrap().is_empty(),
+            "absent [\"@type\"] → [{{}}] (native parity): {type_docs:?}"
+        );
+        // A forward-predicate list on a missing subject → one empty node.
+        let pred_docs = run_crawl(
+            &provider,
+            &view,
+            &json!({
+                "@context": {"v": "http://example.org/"},
+                "select": {"http://example.org/person/999": ["v:name"]}
+            }),
+        )
+        .await;
+        assert_eq!(pred_docs.len(), 1);
+        assert!(
+            pred_docs[0].as_object().unwrap().is_empty(),
+            "absent predicate-list → [{{}}] (native parity): {pred_docs:?}"
+        );
+    }
+
     // Regression guard: a constant-IRI select-map over a NATIVE ledger (no graph
     // source) is UNCHANGED — `maybe_expand_crawl` returns None at the
     // native-hydration gate, so it never touches the R2RML routing.
