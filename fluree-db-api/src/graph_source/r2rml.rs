@@ -790,6 +790,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
                         metadata_location,
                         config: std::collections::HashMap::default(),
                         credentials: None,
+                        metadata: None,
                     }
                 } else {
                     let direct_catalog =

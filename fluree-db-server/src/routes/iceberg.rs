@@ -1198,6 +1198,8 @@ mod tests {
             branch: None,
             connection: build_iceberg_connection(&req.connection).unwrap(),
             table_identifier: "ns.tbl".to_string(),
+            delete_convention: None,
+            order_by: None,
         };
         assert!(create.is_rest());
         let gs = create.to_iceberg_gs_config();

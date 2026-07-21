@@ -750,6 +750,13 @@ impl IcebergCreateConfig {
         self
     }
 
+    /// Use the GCE/GKE metadata server for refreshable Google catalog auth
+    /// (REST mode only). See [`IcebergConnectionConfig::with_auth_google_metadata`].
+    pub fn with_auth_google_metadata(mut self, scopes: Option<String>) -> Self {
+        self.connection = self.connection.with_auth_google_metadata(scopes);
+        self
+    }
+
     /// Set OAuth2 client credentials authentication (REST mode only).
     pub fn with_auth_oauth2(
         mut self,
