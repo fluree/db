@@ -68,6 +68,7 @@ mod inline_ontology;
 mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
+pub mod materialize;
 mod merge;
 mod merge_preview;
 pub mod nameservice_query;

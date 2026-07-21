@@ -4503,3 +4503,231 @@ async fn f20_prebound_nonproduct_iri_dies_by_conjunction() {
         "a pre-bound non-product ?p must die via the ref-member conjunction, not survive"
     );
 }
+
+// =============================================================================
+// Bulk materializer (DEC-003 Deliverable 1) — driver over the scan path
+// =============================================================================
+
+/// Decode one result binding to an N-Triples term, matching the bulk
+/// materializer's own rendering: a subject `Sid` via `decode_sid`, a raw graph
+/// source `Iri` verbatim, and a plain string literal without an explicit
+/// `xsd:string` datatype (the materializer's convention for `dtc = None`).
+fn binding_to_nt<F>(b: &fluree_db_query::Binding, decode_sid: &F) -> String
+where
+    F: Fn(&fluree_db_core::Sid) -> Option<String>,
+{
+    if let Some(iri) = b.get_iri() {
+        return format!("<{iri}>");
+    }
+    match b {
+        fluree_db_query::Binding::Sid { sid, .. } => {
+            format!("<{}>", decode_sid(sid).expect("decode subject sid to IRI"))
+        }
+        fluree_db_query::Binding::Lit {
+            val: fluree_db_core::FlakeValue::String(s),
+            ..
+        } => format!("\"{s}\""),
+        other => panic!("materializer engine-diff: unexpected binding variant {other:?}"),
+    }
+}
+
+/// ENGINE-EQUIVALENCE (Chunk B checkpoint): the bulk materializer's streaming
+/// driver, run over the SAME airline mock the engine's `?s ?p ?o` wildcard scan
+/// uses, must emit EXACTLY the triple set the engine produces — subjects,
+/// predicates, and objects decoded to N-Triples and compared as sets. This is
+/// the deterministic, hermetic analog of the live native-sf01 full-triple diff:
+/// it proves the new whole-graph enumerator agrees with the proven query engine
+/// over an identical scan, not just with hand-written expectations.
+#[tokio::test]
+async fn materializer_driver_matches_engine_wildcard() {
+    use fluree_db_r2rml::materialize::NTriplesCollector;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "r2rml-mat:main");
+    std::sync::Arc::make_mut(&mut ledger.snapshot)
+        .insert_namespace_code(9_999, "http://example.org/".to_string())
+        .unwrap();
+    let provider = MockR2rmlProvider::new(compile_airline_mapping(), vec![sample_airline_batch()]);
+
+    // Path A — the bulk materializer driver.
+    let mut collector = NTriplesCollector::default();
+    let stats =
+        fluree_db_api::materialize::materialize_graph(&provider, "airlines-gs:main", &mut collector)
+            .await
+            .expect("materialize driver should succeed");
+    let driver_triples = collector.sorted_unique();
+
+    // Path B — the engine `?s ?p ?o` wildcard scan, decoded to N-Triples.
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let tp = TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o));
+    let batches = run_airline_graph_scan(&ledger, &provider, &vars, tp, vec![s, p, o]).await;
+
+    let decode = |sid: &fluree_db_core::Sid| ledger.snapshot.decode_sid(sid);
+    let mut engine_triples: Vec<String> = Vec::new();
+    for b in &batches {
+        for r in 0..b.len() {
+            let subj = binding_to_nt(b.get(r, s).expect("?s bound"), &decode);
+            let pred = b
+                .get(r, p)
+                .and_then(fluree_db_query::Binding::get_iri)
+                .expect("?p is a predicate IRI")
+                .to_string();
+            let obj = binding_to_nt(b.get(r, o).expect("?o bound"), &decode);
+            engine_triples.push(format!("{subj} <{pred}> {obj} ."));
+        }
+    }
+    engine_triples.sort();
+    engine_triples.dedup();
+
+    assert_eq!(
+        driver_triples, engine_triples,
+        "materializer driver triple set must equal the engine wildcard scan's"
+    );
+    // 3 airlines × (name + country + iata + rdf:type) = 12 triples.
+    assert_eq!(stats.total_triples(), 12, "airline mapping yields 12 triples");
+    assert_eq!(driver_triples.len(), 12);
+}
+
+/// Returns different batches per logical table so a dim + fact + foreign-key
+/// mapping can be materialized over the streaming scan path.
+#[derive(Debug)]
+struct MultiTableMock {
+    mapping: Arc<CompiledR2rmlMapping>,
+    tables: HashMap<String, Vec<ColumnBatch>>,
+}
+
+#[async_trait]
+impl R2rmlProvider for MultiTableMock {
+    async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+        true
+    }
+    async fn compiled_mapping(
+        &self,
+        _gs: &str,
+        _t: Option<i64>,
+    ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        Ok(Arc::clone(&self.mapping))
+    }
+}
+
+#[async_trait]
+impl R2rmlTableProvider for MultiTableMock {
+    async fn scan_table(
+        &self,
+        _gs: &str,
+        table: &str,
+        _p: &[String],
+        _f: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
+        _t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        Ok(vec_batch_stream(
+            self.tables.get(table).cloned().unwrap_or_default(),
+        ))
+    }
+}
+
+/// FK INTEGRATION: the streaming driver resolves a foreign-key edge across two
+/// separate tables (dims-first ordering + parent index over streamed scans),
+/// and drops a dangling FK — the async analog of the in-memory golden FK test.
+#[tokio::test]
+async fn materializer_driver_resolves_fk_across_tables() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+    use fluree_db_r2rml::materialize::NTriplesCollector;
+
+    // Customer dim (parent) + Order fact (child, FK placedBy -> Customer).
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map = SubjectMap::template("http://ex.org/customer/{c_key}")
+        .with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/name"),
+        object_map: ObjectMap::column("name"),
+    }];
+
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+    }];
+
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "c_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "name".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    let cust_batch = ColumnBatch::new(
+        Arc::new(cust_schema),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+        ],
+    )
+    .unwrap();
+
+    let order_schema = BatchSchema::new(vec![
+        FieldInfo {
+            name: "o_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        },
+        FieldInfo {
+            name: "cust_key".to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: 2,
+        },
+    ]);
+    // order 1 -> cust 10 (match); order 2 -> cust 99 (dangling, dropped).
+    let order_batch = ColumnBatch::new(
+        Arc::new(order_schema),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::Int64(vec![Some(10), Some(99)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = MultiTableMock { mapping, tables };
+
+    let mut collector = NTriplesCollector::default();
+    let stats = fluree_db_api::materialize::materialize_graph(&provider, "gs:main", &mut collector)
+        .await
+        .expect("materialize driver should succeed");
+    let triples = collector.sorted_unique();
+
+    assert!(
+        triples.contains(
+            &"<http://ex.org/order/1> <http://ex.org/placedBy> <http://ex.org/customer/10> ."
+                .to_string()
+        ),
+        "matched FK edge must be present: {triples:?}"
+    );
+    assert!(
+        !triples.iter().any(|t| t.contains("order/2") && t.contains("placedBy")),
+        "dangling FK (cust 99) must be dropped: {triples:?}"
+    );
+    assert_eq!(stats.ref_triples, 1, "exactly one FK edge resolves");
+    assert_eq!(stats.ref_dangling, 1, "order 2's FK is dangling");
+}

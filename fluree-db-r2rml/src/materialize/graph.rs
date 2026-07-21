@@ -285,6 +285,20 @@ impl ParentIndexSet {
     fn lookup(&self, parent_iri: &str, cols: &[String], key: &[String]) -> Option<&RdfTerm> {
         self.index.get(parent_iri)?.get(cols)?.get(key)
     }
+
+    /// The union of parent-column names `tm_iri` must be indexed on — the extra
+    /// columns a scan of this parent must project (beyond the TriplesMap's own
+    /// referenced columns) so the foreign-key join keys can be read. Empty when
+    /// `tm_iri` is not a foreign-key parent.
+    pub fn needed_parent_columns(&self, tm_iri: &str) -> Vec<String> {
+        let mut cols: Vec<String> = match self.needed.get(tm_iri) {
+            Some(sets) => sets.iter().flatten().cloned().collect(),
+            None => return Vec::new(),
+        };
+        cols.sort();
+        cols.dedup();
+        cols
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +465,32 @@ fn self_referential(mapping: &CompiledR2rmlMapping) -> HashSet<String> {
         .collect()
 }
 
+/// The execution plan for enumerating a mapping: the dims-first emission order
+/// (every parent before its children, with any cyclic remainder appended) and
+/// the set of parents that must be FULLY pre-indexed before the emit pass
+/// (cyclic tables and self-referential ones, which cannot be indexed lazily in
+/// a single forward pass). Shared by the in-memory driver here and the
+/// streaming (provider-backed) driver so both order and pre-index identically.
+#[derive(Debug, Clone)]
+pub struct MaterializationPlan {
+    /// TriplesMap IRIs in emission order.
+    pub emit_order: Vec<String>,
+    /// TriplesMap IRIs to pre-index before emission.
+    pub preindex: HashSet<String>,
+}
+
+/// Compute the [`MaterializationPlan`] for a mapping.
+pub fn plan(mapping: &CompiledR2rmlMapping) -> MaterializationPlan {
+    let (order, cyclic) = dependency_order(mapping);
+    let mut preindex: HashSet<String> = cyclic.iter().cloned().collect();
+    preindex.extend(self_referential(mapping));
+    let emit_order = order.into_iter().chain(cyclic).collect();
+    MaterializationPlan {
+        emit_order,
+        preindex,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // In-memory driver (tests + reference for the streaming driver)
 // ---------------------------------------------------------------------------
@@ -469,13 +509,10 @@ pub fn enumerate_from_batches(
     observer: &mut dyn TripleObserver,
 ) -> R2rmlResult<MaterializeStats> {
     let mut parents = ParentIndexSet::new(mapping)?;
-    let (order, cyclic) = dependency_order(mapping);
+    let materialization = plan(mapping);
 
-    // Pre-index the parents that cannot be indexed lazily: cyclic tables and
-    // self-referential ones.
-    let mut preindex: HashSet<String> = cyclic.iter().cloned().collect();
-    preindex.extend(self_referential(mapping));
-    for tm_iri in &preindex {
+    // Pre-index the parents that cannot be indexed lazily (cyclic / self-ref).
+    for tm_iri in &materialization.preindex {
         if let (Some(tm), Some(tm_batches)) =
             (mapping.triples_maps.get(tm_iri), batches.get(tm_iri))
         {
@@ -485,17 +522,17 @@ pub fn enumerate_from_batches(
         }
     }
 
-    // Emit in dims-first order, then the cyclic remainder. Lazily index a parent
-    // during its own emit pass unless it was pre-indexed above.
+    // Emit in dims-first order. Lazily index a parent during its own emit pass
+    // unless it was pre-indexed above.
     let mut stats = MaterializeStats::default();
-    for tm_iri in order.iter().chain(cyclic.iter()) {
+    for tm_iri in &materialization.emit_order {
         let tm = match mapping.triples_maps.get(tm_iri) {
             Some(tm) => tm,
             None => continue,
         };
         if let Some(tm_batches) = batches.get(tm_iri) {
             for batch in tm_batches {
-                if !preindex.contains(tm_iri) && parents.is_parent(tm_iri) {
+                if !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri) {
                     parents.index_batch(tm, batch)?;
                 }
                 emit_batch(tm, batch, &parents, observer, &mut stats)?;
