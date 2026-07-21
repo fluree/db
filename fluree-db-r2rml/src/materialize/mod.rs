@@ -12,7 +12,14 @@
 //!   `expand_template_from_batch`, `get_join_key_from_batch`
 //!   For efficient production use with Iceberg tabular data.
 
+mod graph;
 mod term;
+
+// Whole-graph triple enumeration (bulk materialization / twin builder).
+pub use graph::{
+    dependency_order, emit_batch, enumerate_from_batches, render_term, MaterializeStats,
+    NTriplesCollector, ParentIndexSet, TripleObserver,
+};
 
 // HashMap-based API (for testing and simple use)
 pub use term::{expand_template, materialize_object, materialize_subject, RdfTerm};
