@@ -269,6 +269,12 @@ first_o_key: u64
     (re-assert of a present fact, retract of an absent one) are never recorded.
   - a fact's materialized assert lives either as its base row or as a history entry, never both
     and never neither (**row-assert conservation**)
+  - a fact's transition entries live in the **same leaflet/segment as its materialized row**
+    (**history co-location**). Replay is per-leaflet, so entries stranded in a neighbouring
+    leaflet would silently drop the fact from time-travel results. The writer buffers pushed
+    history until the row's leaflet is known so entries follow their row across a
+    predicate/`o_type` segment boundary — see `LeafWriter::commit_all_pending` in
+    `fluree-db-binary-index/src/format/leaf.rs`.
   - authoritative semantics: the module doc of `fluree-db-binary-index/src/format/transitions.rs`
 
 #### Region 1 layouts (uncompressed)
