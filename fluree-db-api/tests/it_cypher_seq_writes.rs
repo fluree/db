@@ -795,7 +795,10 @@ async fn commit_result_carries_fuel_and_indexing_signals() {
         .as_ref()
         .and_then(|t| t.fuel)
         .expect("fuel tally present when tracking is enabled");
-    assert!(fuel > 0.0, "fuel accumulated across both statements: {fuel}");
+    assert!(
+        fuel > 0.0,
+        "fuel accumulated across both statements: {fuel}"
+    );
     assert!(committed.receipt.flake_count > 0);
     // Indexing signals are populated (novelty reflects the staged flakes).
     assert!(committed.indexing.novelty_size > 0);
