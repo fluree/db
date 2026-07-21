@@ -13,17 +13,18 @@
 //! parity diff, or (later chunks) an ingest-sink adapter that streams the
 //! triples into the native import pipeline.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 
-use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
+use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, TableWatermark};
 use fluree_db_r2rml::materialize::{
     emit_batch, plan, MaterializeStats, ParentIndexSet, TripleObserver,
 };
-use fluree_db_r2rml::mapping::TriplesMap;
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
 use fluree_db_r2rml::{R2rmlError, RdfTerm};
 use fluree_db_transact::import::ParsedChunk;
 use fluree_db_transact::import_sink::{ImportSink, SpoolConfig, SpoolContext};
@@ -45,6 +46,14 @@ pub enum MaterializeError {
     /// for Iceberg sources, so this should not occur in practice).
     #[error("TriplesMap '{0}' has no logical table name")]
     NoTable(String),
+    /// The provider reported an empty build watermark for a non-empty table set
+    /// (DEC-003 §17(b)). No table snapshots were captured, so the twin cannot be
+    /// stamped — a fail-loud guard against publishing an unverifiable twin.
+    #[error(
+        "materialize watermark is empty for a non-empty table set; the twin cannot be stamped \
+         (no table snapshots were captured — did the provider scan the tables?)"
+    )]
+    EmptyWatermark,
 }
 
 /// Columns a scan of `tm` must project: the TriplesMap's own referenced columns
@@ -352,6 +361,112 @@ impl TripleObserver for ChunkingObserver {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Completion stamp: pin-all pre-pass + watermark + mapping hash + builder version
+// ---------------------------------------------------------------------------
+
+/// Builder identity stamped into every twin, so a reader can tell which builder
+/// produced it (and an incompatible builder's twin can be refused or annotated).
+const BUILDER_VERSION: &str = concat!("fluree-materialize/", env!("CARGO_PKG_VERSION"));
+
+/// The completion stamp written to a twin's FINAL commit (DEC-003 §17). A twin is
+/// valid iff a head-walk finds this stamp; a build that dies mid-way leaves the
+/// head commit unstamped, so a partial twin is detectable. Carries the per-table
+/// snapshot watermark vector (delta-sync reads it), the R2RML mapping hash (a
+/// mapping change invalidates the twin), and the builder version.
+#[derive(Debug, Clone)]
+pub struct WatermarkStamp {
+    /// The builder that produced the twin ([`BUILDER_VERSION`]).
+    pub builder_version: String,
+    /// SHA-256 of the R2RML mapping ([`mapping_hash`]).
+    pub mapping_hash: String,
+    /// Per-table pinned Iceberg snapshot at build time.
+    pub tables: HashMap<String, TableWatermark>,
+}
+
+/// SHA-256 (hex) of a canonical serialization of the mapping's TriplesMaps —
+/// sorted by IRI, each serialized to JSON with a length prefix. Deterministic
+/// because the R2RML mapping types carry no `HashMap` (only the compiled
+/// mapping's derived indexes do, and those are excluded): an unchanged mapping
+/// hashes identically across builds/platforms, and any edit to a subject /
+/// predicate / object map changes the hash, invalidating the twin.
+pub fn mapping_hash(mapping: &CompiledR2rmlMapping) -> String {
+    let mut sorted: Vec<(&String, &TriplesMap)> = mapping.triples_maps.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = Sha256::new();
+    for (iri, tm) in sorted {
+        hasher.update(iri.as_bytes());
+        hasher.update([0u8]);
+        // Canonical: TriplesMap has no HashMap field, so JSON field/element order
+        // is stable. Serialization of these plain-data types is infallible.
+        let json = serde_json::to_vec(tm).unwrap_or_default();
+        hasher.update((json.len() as u64).to_le_bytes());
+        hasher.update(&json);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Fail-loud guard (DEC-003 §17(b)): a mapping with at least one table must
+/// yield a non-empty watermark, or the twin cannot be stamped. An empty mapping
+/// (no tables) legitimately has an empty watermark.
+fn require_nonempty_watermark(
+    tables: &HashMap<String, TableWatermark>,
+    mapping: &CompiledR2rmlMapping,
+) -> Result<(), MaterializeError> {
+    let has_tables = mapping
+        .triples_maps
+        .values()
+        .any(|tm| tm.table_name().is_some());
+    if has_tables && tables.is_empty() {
+        return Err(MaterializeError::EmptyWatermark);
+    }
+    Ok(())
+}
+
+/// Assemble the twin's completion stamp from the provider's captured watermark,
+/// the mapping hash, and the builder version. Fails loud on an empty watermark
+/// for a non-empty table set.
+fn build_watermark_stamp(
+    provider: &dyn R2rmlBuildProvider,
+    graph_source_id: &str,
+    mapping: &CompiledR2rmlMapping,
+) -> Result<WatermarkStamp, MaterializeError> {
+    let tables = provider.build_watermark(graph_source_id);
+    require_nonempty_watermark(&tables, mapping)?;
+    Ok(WatermarkStamp {
+        builder_version: BUILDER_VERSION.to_string(),
+        mapping_hash: mapping_hash(mapping),
+        tables,
+    })
+}
+
+/// Pin every table's Iceberg snapshot up front, before emission (DEC-003 §17(a)).
+/// Awaiting `scan_table` runs the `loadTable` + snapshot capture as the table
+/// context resolves; the returned stream is dropped unpolled, so no Parquet data
+/// is read. This pins all snapshots within seconds — narrowing cross-table
+/// snapshot skew from the whole build duration to this window — and the emit-pass
+/// scans reuse the pins (session first-writer-wins), so it adds no duplicate
+/// `loadTable` GETs.
+async fn pin_all_tables(
+    provider: &dyn R2rmlBuildProvider,
+    graph_source_id: &str,
+    mapping: &CompiledR2rmlMapping,
+) -> Result<(), MaterializeError> {
+    let mut tables: Vec<&str> = mapping
+        .triples_maps
+        .values()
+        .filter_map(|tm| tm.table_name())
+        .collect();
+    tables.sort_unstable();
+    tables.dedup();
+    for table in tables {
+        let _ = provider
+            .scan_table(graph_source_id, table, &[], &[], None, None)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Stream a virtual R2RML source through the whole-graph enumerator, encoding
 /// byte-budgeted [`ParsedChunk`]s and handing each to `emit_chunk(idx, chunk)`
 /// in contiguous `idx` order (`t = idx + 1`). `emit_chunk` returns `false` when
@@ -371,6 +486,10 @@ where
     let mapping = provider.compiled_mapping(graph_source_id, None).await?;
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
+
+    // Pin-all pre-pass — pin every table's snapshot before emission so the
+    // watermark is complete and cross-table skew is bounded to seconds (§17(a)).
+    pin_all_tables(provider, graph_source_id, &mapping).await?;
 
     // Pass 1 — pre-index cyclic / self-referential parents (no triples emitted).
     for tm_iri in &materialization.preindex {
@@ -426,6 +545,17 @@ where
         }
     }
 
+    // Assemble the twin's completion stamp now that every table is pinned and
+    // scanned (fail-loud on an empty watermark for a non-empty table set). Chunk D
+    // persists it into the FINAL commit's txn_meta.
+    let stamp = build_watermark_stamp(provider, graph_source_id, &mapping)?;
+    tracing::info!(
+        builder_version = %stamp.builder_version,
+        mapping_hash = %stamp.mapping_hash,
+        watermark_tables = stamp.tables.len(),
+        "materialize completion stamp assembled"
+    );
+
     // Final partial chunk.
     if let Some(triples) = chunker.take_final() {
         let t = (next_idx + 1) as i64;
@@ -440,6 +570,74 @@ where
 mod tests {
     use super::literal_sink_args;
     use fluree_vocab::UnresolvedDatatypeConstraint as Dtc;
+
+    #[test]
+    fn mapping_hash_is_deterministic_and_change_sensitive() {
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
+        let m1 = CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("http://tm/a", "dw.a"),
+            TriplesMap::new("http://tm/b", "dw.b"),
+        ]);
+        // Same content, reversed insertion order — hashes identically (the hash
+        // sorts by IRI, so it is insertion-order-independent).
+        let m2 = CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("http://tm/b", "dw.b"),
+            TriplesMap::new("http://tm/a", "dw.a"),
+        ]);
+        assert_eq!(
+            super::mapping_hash(&m1),
+            super::mapping_hash(&m2),
+            "the mapping hash must be canonical (order-independent)"
+        );
+        // A changed subject template must change the hash (twin invalidation).
+        let m3 = CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("http://tm/a", "dw.a").with_subject_template("http://ex/{k}"),
+            TriplesMap::new("http://tm/b", "dw.b"),
+        ]);
+        assert_ne!(
+            super::mapping_hash(&m1),
+            super::mapping_hash(&m3),
+            "any mapping edit must change the hash"
+        );
+    }
+
+    #[test]
+    fn watermark_guard_rejects_empty_for_nonempty_tables() {
+        use fluree_db_query::r2rml::TableWatermark;
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
+        use std::collections::HashMap;
+
+        let mapping = CompiledR2rmlMapping::new(vec![TriplesMap::new("http://tm/a", "dw.a")]);
+        let empty: HashMap<String, TableWatermark> = HashMap::new();
+        assert!(
+            matches!(
+                super::require_nonempty_watermark(&empty, &mapping),
+                Err(super::MaterializeError::EmptyWatermark)
+            ),
+            "a table-bearing mapping with no captured snapshots must fail loud"
+        );
+
+        let mut nonempty = HashMap::new();
+        nonempty.insert(
+            "dw.a".to_string(),
+            TableWatermark {
+                metadata_location: "s3://m.json".into(),
+                snapshot_id: Some(1),
+                sequence_number: Some(1),
+            },
+        );
+        assert!(
+            super::require_nonempty_watermark(&nonempty, &mapping).is_ok(),
+            "a captured watermark passes the guard"
+        );
+
+        // An empty mapping (no tables) legitimately has an empty watermark.
+        let empty_mapping = CompiledR2rmlMapping::default();
+        assert!(
+            super::require_nonempty_watermark(&empty, &empty_mapping).is_ok(),
+            "no tables → an empty watermark is fine"
+        );
+    }
 
     #[test]
     fn plain_literal_is_xsd_string_no_lang() {

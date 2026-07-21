@@ -4611,6 +4611,28 @@ impl R2rmlProvider for MultiTableMock {
     ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
         Ok(Arc::clone(&self.mapping))
     }
+
+    // Fake per-table watermarks so the builder's fail-loud stamp guard passes
+    // (DEC-003 §17(b): mocks override with fakes). Keyed by the logical table
+    // name the driver scans, matching the real provider's capture.
+    fn build_watermark(
+        &self,
+        _gs: &str,
+    ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
+        self.tables
+            .keys()
+            .map(|t| {
+                (
+                    t.clone(),
+                    fluree_db_query::r2rml::TableWatermark {
+                        metadata_location: format!("mock://{t}/metadata.json"),
+                        snapshot_id: Some(1),
+                        sequence_number: Some(1),
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
