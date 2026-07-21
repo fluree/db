@@ -120,6 +120,13 @@ impl<S: SendIcebergStorage> SendIcebergStorage for LazyStorage<'_, S> {
     async fn file_size(&self, path: &str) -> IcebergResult<u64> {
         self.resolve().await?.file_size(path).await
     }
+
+    async fn list_dir(&self, prefix: &str) -> IcebergResult<Vec<String>> {
+        // Warehouse-root resolution genuinely needs the object store, so this
+        // forces the deferred build (the one case the lazy optimization does not
+        // apply — a build-time LIST, not a per-file read).
+        self.resolve().await?.list_dir(prefix).await
+    }
 }
 
 #[cfg(test)]

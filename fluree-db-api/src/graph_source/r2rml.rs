@@ -1351,6 +1351,67 @@ impl FlureeR2rmlProvider<'_> {
         None
     }
 
+    /// Resolve the effective table location for a Direct-mode scan. When
+    /// `table_location` is a warehouse ROOT (a catalog-less multi-table copy) —
+    /// detected because its leaf directory does not name the requested table —
+    /// LIST the root once (session-cached, one LIST per build) and match THIS
+    /// table's own `<name>.<suffix>/` (or bare `<name>/`) directory beneath it,
+    /// case-insensitively on the name part. Ambiguity or a miss fails loud, naming
+    /// the candidates. Otherwise (a single-table direct location) returns
+    /// `table_location` unchanged, so the caller's resolution is byte-identical.
+    ///
+    /// Detection is pure string logic; a table literally named after its parent
+    /// directory reads as single-table (documented in `iceberg map --help`).
+    async fn resolve_direct_table_location(
+        &self,
+        table_location: &str,
+        table_id: &TableIdentifier,
+        lt_key: &str,
+        iceberg_config: &IcebergGsConfig,
+    ) -> QueryResult<String> {
+        let trimmed = table_location.trim_end_matches('/');
+        let leaf = trimmed.rsplit('/').next().unwrap_or("");
+        let leaf_name = leaf.split('.').next().unwrap_or("");
+        let requested = table_id.table.trim();
+        let is_warehouse = !requested.is_empty() && !leaf_name.eq_ignore_ascii_case(requested);
+        if !is_warehouse {
+            return Ok(table_location.to_string());
+        }
+
+        let root = trimmed.to_string();
+        let listing = match self.session.cached_warehouse_listing(&root) {
+            Some(l) => l,
+            None => {
+                let storage = direct_session_storage(
+                    &self.session,
+                    lt_key,
+                    iceberg_config.io.s3_region.as_deref(),
+                    iceberg_config.io.s3_endpoint.as_deref(),
+                    iceberg_config.io.s3_path_style,
+                )
+                .await?;
+                let dirs = storage.list_dir(&root).await.map_err(|e| {
+                    storage_query_error(&format!("Failed to LIST warehouse root {root}"), e)
+                })?;
+                info!(
+                    warehouse_root = %root,
+                    tables_found = dirs.len(),
+                    "Listed catalog-less warehouse root (direct mode)"
+                );
+                self.session.store_warehouse_listing(root.clone(), dirs)
+            }
+        };
+
+        let matched = fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing)
+            .map_err(|e| {
+                QueryError::InvalidQuery(format!(
+                    "warehouse-root resolution for table '{}': {e}",
+                    table_id.table
+                ))
+            })?;
+        Ok(format!("{root}/{matched}"))
+    }
+
     async fn load_table_context(
         &self,
         graph_source_id: &str,
@@ -1687,11 +1748,6 @@ impl FlureeR2rmlProvider<'_> {
                 (load_response, storage)
             }
             CatalogConfig::Direct { table_location } => {
-                info!(
-                    table_location = %table_location,
-                    "Loading table via direct S3 access"
-                );
-
                 // Session cache key for this table's storage client — the same
                 // key the REST branch uses (source id + fully-qualified table),
                 // so repeated scans of one Direct table in a query reuse a single
@@ -1701,6 +1757,26 @@ impl FlureeR2rmlProvider<'_> {
                     graph_source_id,
                     &table_id.namespace,
                     &table_id.table,
+                );
+
+                // Warehouse-root resolution: when `table_location` is a warehouse
+                // ROOT (a catalog-less multi-table copy) rather than a single
+                // table dir, resolve THIS table's own directory beneath it via one
+                // session-cached LIST. Single-table direct returns `table_location`
+                // unchanged, so its behavior below is byte-identical.
+                let effective_location = self
+                    .resolve_direct_table_location(
+                        table_location,
+                        &table_id,
+                        &lt_key,
+                        &iceberg_config,
+                    )
+                    .await?;
+                let table_location = &effective_location;
+
+                info!(
+                    table_location = %table_location,
+                    "Loading table via direct S3 access"
                 );
 
                 let cache = self.fluree.r2rml_cache();

@@ -116,6 +116,11 @@ pub(crate) struct IcebergCatalogSession {
     /// build. Recorded unconditionally (independent of the loadTable cache toggle):
     /// even with caching off, the build must record the snapshot each scan read.
     snapshots: Mutex<HashMap<String, TableWatermark>>,
+    /// Warehouse-root child-directory listings, keyed by warehouse root, so a
+    /// catalog-less multi-table Direct source LISTs each root exactly ONCE per
+    /// build (not once per table). Always cached (independent of the loadTable
+    /// cache toggle) — the listing is stable for the build.
+    warehouse_listings: Mutex<HashMap<String, Arc<Vec<String>>>>,
 }
 
 impl IcebergCatalogSession {
@@ -263,6 +268,29 @@ impl IcebergCatalogSession {
             .unwrap()
             .entry(key)
             .or_insert(watermark);
+    }
+
+    /// The cached child-directory listing for a warehouse `root`, if this build
+    /// already LISTed it.
+    pub(crate) fn cached_warehouse_listing(&self, root: &str) -> Option<Arc<Vec<String>>> {
+        self.warehouse_listings.lock().unwrap().get(root).cloned()
+    }
+
+    /// Cache a warehouse root's child-directory listing (first-writer-wins, so a
+    /// concurrent double-LIST still keeps one listing), returning the effective
+    /// entry.
+    pub(crate) fn store_warehouse_listing(
+        &self,
+        root: String,
+        dirs: Vec<String>,
+    ) -> Arc<Vec<String>> {
+        Arc::clone(
+            self.warehouse_listings
+                .lock()
+                .unwrap()
+                .entry(root)
+                .or_insert_with(|| Arc::new(dirs)),
+        )
     }
 
     /// All snapshot watermarks captured this build for `graph_source_id`, as

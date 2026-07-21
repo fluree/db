@@ -2411,7 +2411,19 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table: Option<String>,
 
-    /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table")
+    /// S3 table location for direct mode (e.g., "s3://bucket/warehouse/ns/table").
+    ///
+    /// WAREHOUSE ROOT (multi-table): point this at the DATABASE/namespace root
+    /// (e.g. "s3://bucket/warehouse/dw") of a catalog-less copy — such as a
+    /// Snowflake-managed Iceberg database whose table dirs carry random suffixes
+    /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
+    /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
+    /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
+    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// location's leaf directory does not name the requested table; a bare
+    /// single-table location resolves as before. (A table named exactly after its
+    /// parent directory would read as single-table.) No catalog/OAuth flags are
+    /// needed — direct mode reads with ambient IAM credentials.
     #[arg(long)]
     pub table_location: Option<String>,
 
