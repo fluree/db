@@ -582,6 +582,10 @@ pub enum ImportError {
     MixedFormats(String),
     /// Tracker max-fuel limit exceeded mid-import.
     FuelExceeded(FuelExceededError),
+    /// A virtual (R2RML materialize) import was attempted on a single-threaded
+    /// tokio runtime. Its producer drives an async scan via `Handle::block_on`
+    /// off a dedicated thread, which deadlocks on a current-thread runtime.
+    UnsupportedRuntime(String),
 }
 
 impl std::fmt::Display for ImportError {
@@ -603,6 +607,7 @@ impl std::fmt::Display for ImportError {
                 e.used_fuel(),
                 e.limit_fuel()
             ),
+            Self::UnsupportedRuntime(msg) => write!(f, "unsupported runtime: {msg}"),
         }
     }
 }
@@ -3999,6 +4004,22 @@ where
         let spool_dir = spool_dir.clone();
         let ledger = alias.to_string();
         let runtime = tokio::runtime::Handle::current();
+        // Fail loud, not deadlock: the producer drives its async scan via
+        // `runtime.block_on` off a dedicated thread, which hangs on a
+        // single-threaded runtime. Production servers and the CLI both run
+        // multi-thread. FUTURE: a remote-style two-stage producer (async tokio
+        // task → bridge thread → sync ParsedChunk channel) would be
+        // runtime-flavor-agnostic; deferred until a customer needs it.
+        if matches!(
+            runtime.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        ) {
+            return Err(ImportError::UnsupportedRuntime(
+                "materialize (virtual R2RML import) requires a multi-thread tokio runtime; \
+                 the current runtime is single-threaded"
+                    .to_string(),
+            ));
+        }
 
         let producer = std::thread::Builder::new()
             .name("virtual-materializer".into())

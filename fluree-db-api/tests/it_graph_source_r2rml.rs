@@ -4874,3 +4874,47 @@ async fn materialize_builds_queryable_native_twin() {
     assert_eq!(lbl_b["value"], "hola", "lang literal value must round-trip");
     assert_eq!(lbl_b["xml:lang"], "en", "language tag must round-trip");
 }
+
+/// RUNTIME GUARD: attempting a virtual materialize on a single-threaded tokio
+/// runtime must fail loud with a typed error, NOT deadlock in the producer's
+/// block_on. Production servers and the CLI run multi-thread; this guards a
+/// mis-wired caller.
+#[cfg(feature = "native")]
+#[tokio::test] // default flavor = current_thread
+async fn materialize_on_current_thread_runtime_fails_loud() {
+    use fluree_db_r2rml::mapping::{SubjectMap, TriplesMap};
+
+    let mut tm = TriplesMap::new("<#T>", "dw.t");
+    tm.subject_map = SubjectMap::template("http://ex.org/t/{id}").with_class("http://ex.org/T");
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+    let batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "id".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }])),
+        vec![Column::Int64(vec![Some(1)])],
+    )
+    .unwrap();
+    let mut tables = HashMap::new();
+    tables.insert("dw.t".to_string(), vec![batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let err = fluree
+        .create("test/rt:main")
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect_err("virtual import on a current-thread runtime must fail");
+    assert!(
+        format!("{err}").contains("multi-thread"),
+        "expected a typed multi-thread-runtime error, got: {err}"
+    );
+}
