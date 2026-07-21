@@ -174,6 +174,9 @@ impl LeafWriter {
             // flush — commit it before the flush closes that leaflet's segment.
             self.commit_pending_for_current_segment();
             self.flush_leaflet()?;
+            // Close a full leaf before assigning the incoming record or its
+            // history to it. The segment flush may have crossed this threshold.
+            self.flush_leaf_if_target_reached()?;
         }
 
         // Track first record of the leaf.
@@ -206,9 +209,7 @@ impl LeafWriter {
         }
 
         // Leaf-level threshold.
-        if self.leaf_accumulated_rows >= self.leaf_target_rows as u64 {
-            self.flush_leaf()?;
-        }
+        self.flush_leaf_if_target_reached()?;
 
         Ok(())
     }
@@ -319,6 +320,13 @@ impl LeafWriter {
         }
     }
 
+    fn flush_leaf_if_target_reached(&mut self) -> io::Result<()> {
+        if self.leaf_accumulated_rows >= self.leaf_target_rows as u64 {
+            self.flush_leaf()?;
+        }
+        Ok(())
+    }
+
     // ── Flush leaflet ──────────────────────────────────────────────────
 
     fn flush_leaflet(&mut self) -> io::Result<()> {
@@ -356,11 +364,20 @@ impl LeafWriter {
             return Ok(());
         }
 
+        debug_assert!(
+            self.record_buf.is_empty(),
+            "cannot flush a leaf while its next leaflet has buffered records"
+        );
+
         let first_record = self.leaf_first_record.take().unwrap();
         let last_record = self.last_record.unwrap();
 
         // 1. Build history sidecar (must come first — CAS ordering).
         let sidecar_builder = std::mem::take(&mut self.sidecar_builder);
+        // The replacement builder has no current segment. This is normally
+        // already false after flush_leaflet(), but keep the state coupled to
+        // the builder so future flush paths cannot drop history.
+        self.current_segment_started = false;
         let (sidecar_cid, sidecar_bytes, seg_refs) =
             if !self.skip_history && sidecar_builder.has_history() {
                 let (bytes, refs) = sidecar_builder.build();

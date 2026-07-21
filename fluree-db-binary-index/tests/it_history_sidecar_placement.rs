@@ -85,3 +85,41 @@ fn history_entries_straddle_psot_segment_boundary() {
         "fact X (asserted t=1, retracted t=4) must be present at t=2"
     );
 }
+
+#[test]
+fn history_survives_leaf_split_at_psot_segment_boundary() {
+    // The p=1 segment reaches the leaf target only when pushing the first p=2
+    // row forces it to flush. The incoming row and its history must start leaf 2.
+    let mut writer = LeafWriter::new(RunSortOrder::Psot, 100, 2, 1);
+    writer.push_record(rec(1, 1, 10, 1)).unwrap();
+    writer.push_record(rec(1, 2, 11, 1)).unwrap();
+
+    writer.push_history_entry(hist(2, 3, 20, 1, 1));
+    writer.push_history_entry(hist(2, 3, 20, 4, 0));
+    writer.push_record(rec(2, 3, 20, 6)).unwrap();
+
+    let infos = writer.finish().unwrap();
+    assert_eq!(infos.len(), 2);
+    assert_eq!(infos[0].total_rows, 2);
+    assert_eq!(infos[0].first_key.p_id, 1);
+    assert_eq!(infos[0].last_key.p_id, 1);
+    assert_eq!(infos[1].total_rows, 1);
+    assert_eq!(infos[1].first_key.p_id, 2);
+    assert_eq!(infos[1].last_key.p_id, 2);
+
+    let info = &infos[1];
+    let handle =
+        FullBlobLeafHandle::new(info.leaf_bytes.clone(), info.sidecar_bytes.clone(), 0).unwrap();
+    assert_eq!(handle.dir().entries.len(), 1);
+
+    let batch = handle
+        .load_columns(0, &ColumnProjection::all(), RunSortOrder::Psot)
+        .unwrap();
+    let history = handle.load_sidecar_segment(0).unwrap();
+    let replayed = replay_leaflet(&batch, &history, 2, RunSortOrder::Psot);
+    let view = replayed.as_ref().unwrap_or(&batch);
+    assert!(
+        (0..view.row_count).any(|i| view.s_id.get(i) == 3),
+        "fact X must remain present AS OF t=2 after crossing the leaf boundary"
+    );
+}
