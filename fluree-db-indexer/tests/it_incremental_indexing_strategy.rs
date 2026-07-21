@@ -79,6 +79,7 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
         zstd_level: 1,
         leaflet_target_rows: 50, // avoid splits in this test
         leaf_target_rows: 200,   // irrelevant unless split
+        collect_matched: false,
     };
 
     let fetched: std::cell::RefCell<Vec<ContentId>> = std::cell::RefCell::new(Vec::new());
@@ -92,6 +93,8 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
         &branch_bytes,
         &novelty,
         &novelty_ops,
+        &[],
+        &[],
         &config,
         &fetch_leaf,
         &fetch_sidecar,

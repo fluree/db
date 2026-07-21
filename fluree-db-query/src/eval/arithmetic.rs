@@ -53,9 +53,18 @@ pub fn eval_negate<R: RowAccess>(
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "Negate")?;
 
-    match args[0].eval_to_comparable(row, ctx)? {
+    // Coerce string-backed numeric TypedLiterals first, matching
+    // `ArithmeticOp::apply` and `cmp_values_inner`: a cast result like
+    // `xsd:float("1.5")` is a `TypedLiteral{String, Explicit(xsd:float)}` and
+    // would otherwise hit the non-numeric arm, leaving `-xsd:float("1.5")`
+    // unbound while `xsd:float("1.5") - 0` works.
+    match args[0]
+        .eval_to_comparable(row, ctx)?
+        .map(ComparableValue::coerce_numeric_operand)
+    {
         Some(ComparableValue::Long(n)) => Ok(Some(ComparableValue::Long(-n))),
         Some(ComparableValue::Double(d)) => Ok(Some(ComparableValue::Double(-d))),
+        Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(-f))),
         Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(Box::new(-(*n))))),
         Some(ComparableValue::Decimal(d)) => Ok(Some(ComparableValue::Decimal(Box::new(-(*d))))),
         None => Ok(None),

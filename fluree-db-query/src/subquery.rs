@@ -75,6 +75,17 @@ pub struct SubqueryOperator {
     /// semantics (the subquery's unbound value joins with the parent's bound
     /// value). Empty when there is no correlation (broadcast).
     join_keys: Vec<VarId>,
+    /// Correlation vars the subquery binds only via `OPTIONAL`/`UNION`/`BIND`
+    /// (`correlation_vars \ join_keys`) — not self-produced, so NOT safe hash
+    /// keys, yet present in the subquery's output. They are evaluated UNSEEDED
+    /// (per-row mode seeds only `join_keys`; join-mode seeds nothing), so one of
+    /// these can take a value that conflicts with the parent's binding; the merge
+    /// must then drop the row (SPARQL §18.4 keeps only compatible mappings). The
+    /// merge check is therefore LOAD-BEARING in BOTH modes — it is NOT a per-row
+    /// no-op, so do not gate it on join-mode. Fixes W3C `var-scope-join-1`
+    /// (join-scope-1), where `?X` is bound only by an inner `OPTIONAL` and must
+    /// reconcile against the parent `?X`. See the merge in `process_parent_batch`.
+    reconcile_vars: Vec<VarId>,
     /// Whether the subquery is evaluated ONCE and hash-joined (on `join_keys`)
     /// rather than re-executed per parent row. Requires no inner `LIMIT`/`OFFSET`
     /// and that every non-key correlation variable is an unreferenced
@@ -148,10 +159,26 @@ impl SubqueryOperator {
         // every solution itself (a top-level required triple / property path);
         // seeding it only filters the output, so it can be a hash key.
         let produced = self_produced_vars(&subquery.patterns);
+        // An explicitly-pinned import (Cypher `CALL (p)` — `pinned_vars`) is
+        // seeded like a self-produced key even when the body binds it only via
+        // OPTIONAL: the import IS a per-row binding by the surface's contract,
+        // not an inferred correlation for Family-B reconciliation.
+        let pinned: std::collections::HashSet<VarId> =
+            subquery.pinned_vars.iter().copied().collect();
         let join_keys: Vec<VarId> = correlation_vars
             .iter()
             .copied()
-            .filter(|v| produced.contains(v))
+            .filter(|v| produced.contains(v) || pinned.contains(v))
+            .collect();
+
+        // The complementary set: correlation vars the subquery binds only
+        // conditionally (OPTIONAL/UNION/BIND), so they are not hash keys but must
+        // still be reconciled against the parent at merge time (Family B). Every
+        // correlation var is either self-produced (a join key) or here.
+        let reconcile_vars: Vec<VarId> = correlation_vars
+            .iter()
+            .copied()
+            .filter(|v| !produced.contains(v) && !pinned.contains(v))
             .collect();
 
         // Every NON-key correlation var must be either produced by the inner
@@ -191,7 +218,19 @@ impl SubqueryOperator {
             // seeding for a small parent (its pruning seed can be cheaper); an
             // uncorrelated (no shared key) subquery is always evaluated once
             // (per-row recomputes identically).
-            let eligible = subquery.limit.is_none() && subquery.offset.is_none() && pass_through_ok;
+            // A pinned import the body does not itself produce requires
+            // true per-row (LATERAL) evaluation: evaluate-once + hash-join on
+            // the import would drop zero-match parents (e.g. Cypher
+            // `CALL (p) { OPTIONAL MATCH … RETURN count(…) }` retaining a
+            // friendless `p` as 0).
+            let pinned_requires_per_row = subquery
+                .pinned_vars
+                .iter()
+                .any(|v| correlation_vars.contains(v) && !produced.contains(v));
+            let eligible = subquery.limit.is_none()
+                && subquery.offset.is_none()
+                && pass_through_ok
+                && !pinned_requires_per_row;
             eligible
                 && (correlation_vars.is_empty()
                     || child
@@ -213,6 +252,7 @@ impl SubqueryOperator {
             planning,
             out_schema: None,
             join_keys,
+            reconcile_vars,
             join_mode,
             materialized: None,
             norm: None,
@@ -418,6 +458,38 @@ impl SubqueryOperator {
 
             // Merge results with parent row
             for subquery_row in subquery_results {
+                // Family B — reconcile OPTIONAL/UNION-produced correlation vars.
+                // These are correlation vars the subquery does not self-produce,
+                // so they are not hash join keys; the subquery binds them
+                // independently (they are never seeded — per-row mode seeds only
+                // `join_keys`) and can bind one to a term that conflicts with the
+                // parent's. SPARQL's natural join keeps a solution only when every
+                // shared variable is compatible (equal, or unbound on either
+                // side), so drop a row whose reconcile var is bound on BOTH sides
+                // to different terms (normalized like the hash key). This check is
+                // load-bearing in BOTH per-row and join mode — it is not a per-row
+                // no-op.
+                if !self.reconcile_vars.is_empty() {
+                    let (store, gv) = EqualityNorm::parts(&self.norm);
+                    let incompatible = self.reconcile_vars.iter().any(|v| {
+                        let parent = parent_batch.get(row_idx, *v);
+                        let sub = self.select_index.get(v).and_then(|&i| subquery_row.get(i));
+                        match (parent, sub) {
+                            (Some(p), Some(s))
+                                if !matches!(p, Binding::Unbound | Binding::Poisoned)
+                                    && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
+                            {
+                                binding_to_group_key_normalized(p, store, gv)
+                                    != binding_to_group_key_normalized(s, store, gv)
+                            }
+                            _ => false,
+                        }
+                    });
+                    if incompatible {
+                        continue;
+                    }
+                }
+
                 let mut merged_row = Vec::with_capacity(self.in_schema.len());
 
                 // Copy parent bindings
@@ -509,11 +581,18 @@ impl SubqueryOperator {
         parent_batch: &Batch,
         row_idx: usize,
     ) -> Result<Vec<Vec<Binding>>> {
-        // Build seed from parent row (for correlated execution)
-        // Include correlation vars (present in both parent schema and subquery patterns).
-        let seed_schema: Vec<VarId> = self.correlation_vars.clone();
+        // Build seed from parent row (for correlated execution). Seed ONLY the
+        // `join_keys` (self-produced correlation vars): seeding such a var merely
+        // filters the subquery's own output to that value, which is join-equivalent
+        // (SPARQL §18.2 evaluate-independently-then-join). A `reconcile_vars` member
+        // is bound only conditionally inside the subquery (OPTIONAL/UNION), so
+        // seeding it would PIN it to the parent value and defeat the natural join —
+        // it must instead be produced independently and reconciled at merge time
+        // (Family B / W3C join-scope-1). When every correlation var is a join key
+        // (the common case, incl. BSBM), this is byte-identical to seeding them all.
+        let seed_schema: Vec<VarId> = self.join_keys.clone();
         let seed_row: Vec<Binding> = self
-            .correlation_vars
+            .join_keys
             .iter()
             .map(|var| {
                 parent_batch
@@ -569,15 +648,15 @@ impl SubqueryOperator {
     /// is the inner `reorder_patterns`' initial bound set AND the child every nested
     /// subquery sees (a `SeedOperator`'s 1-row estimate flips their cardinality-guard
     /// `join_mode` to per-row). `join_mode` evaluates the body ONCE with an empty
-    /// seed (`materialize`); per-row seeds the correlation vars
-    /// (`execute_subquery_for_row`). An uncorrelated subquery has no seed either way.
+    /// seed (`materialize`); per-row seeds the `join_keys` — NOT the reconcile vars,
+    /// which are produced independently and reconciled at merge (see
+    /// `execute_subquery_for_row`). An uncorrelated subquery has no seed either way.
     fn build_inner_plan_for_explain(&self) -> Result<BoxedOperator> {
-        let seed: BoxedOperator = if self.join_mode || self.correlation_vars.is_empty() {
+        let seed: BoxedOperator = if self.join_mode || self.join_keys.is_empty() {
             Box::new(EmptyOperator::new())
         } else {
-            let seed_schema: Arc<[VarId]> =
-                Arc::from(self.correlation_vars.clone().into_boxed_slice());
-            let seed_row = vec![Binding::Unbound; self.correlation_vars.len()];
+            let seed_schema: Arc<[VarId]> = Arc::from(self.join_keys.clone().into_boxed_slice());
+            let seed_row = vec![Binding::Unbound; self.join_keys.len()];
             Box::new(SeedOperator::from_row(seed_schema, seed_row))
         };
 

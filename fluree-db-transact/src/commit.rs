@@ -608,7 +608,14 @@ pub async fn build_commit(
     // 2. Check for empty transaction — merge commits with no data flakes are
     //    valid (e.g., TakeBranch strategy drops all source flakes) because
     //    the commit still records the merge-parent relationship in the DAG.
-    if flakes.is_empty() && merge_parents.is_empty() {
+    //    A REGISTRATION-ONLY commit is likewise valid: `CREATE GRAPH <g>`
+    //    stages no flakes (D-6: an empty graph has no representation) but
+    //    must persist its graph_delta so the registry learns the IRI — O3's
+    //    transfer source-existence check consults exactly that registration.
+    let registers_new_graph = graph_delta
+        .values()
+        .any(|iri| base.snapshot.graph_registry.graph_id_for_iri(iri).is_none());
+    if flakes.is_empty() && merge_parents.is_empty() && !registers_new_graph {
         return Err(TransactError::EmptyTransaction);
     }
 

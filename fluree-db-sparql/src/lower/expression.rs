@@ -5,6 +5,7 @@
 
 use crate::ast::expr::{BinaryOp, Expression as AstExpression, FunctionName, UnaryOp};
 use crate::ast::term::{Literal, LiteralValue};
+use crate::span::SourceSpan;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::ir::{Expression, Function};
 use fluree_db_query::parse::encode::IriEncoder;
@@ -90,7 +91,9 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 }
             },
 
-            AstExpression::FunctionCall { name, args, .. } => self.lower_function_call(name, args),
+            AstExpression::FunctionCall {
+                name, args, span, ..
+            } => self.lower_function_call(name, args, *span),
 
             agg @ AstExpression::Aggregate { function, span, .. } => {
                 if let Some(aliases) = &self.aggregate_aliases {
@@ -224,7 +227,26 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         &mut self,
         name: &FunctionName,
         args: &[AstExpression],
+        span: SourceSpan,
     ) -> Result<Expression> {
+        // SPARQL 1.2 triple-term functions are accepted and arity-validated at
+        // parse time, but have no evaluable implementation yet: defer per
+        // burn-down decision D-1 (accept-then-defer). A query that reaches here
+        // fails at lower time with a clean `not_implemented`, not a parse error.
+        if matches!(
+            name,
+            FunctionName::Triple
+                | FunctionName::Subject
+                | FunctionName::Predicate
+                | FunctionName::Object
+                | FunctionName::IsTriple
+        ) {
+            return Err(LowerError::not_implemented(
+                "SPARQL 1.2 triple-term functions (TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE)",
+                span,
+            ));
+        }
+
         let func = match name {
             // Type checking functions
             FunctionName::Bound => Function::Bound,
@@ -304,6 +326,15 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             FunctionName::DotProduct => Function::DotProduct,
             FunctionName::CosineSimilarity => Function::CosineSimilarity,
             FunctionName::EuclideanDistance => Function::EuclideanDistance,
+
+            // Handled by the `not_implemented` early return above.
+            FunctionName::Triple
+            | FunctionName::Subject
+            | FunctionName::Predicate
+            | FunctionName::Object
+            | FunctionName::IsTriple => {
+                unreachable!("triple-term functions defer via the early return")
+            }
 
             // Extension functions
             FunctionName::Extension(iri) => {

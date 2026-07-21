@@ -250,6 +250,23 @@ impl TokenStream {
         }
     }
 
+    /// Consume and return a SPARQL 1.2 triple-term builtin function name
+    /// (`TRIPLE`/`SUBJECT`/`PREDICATE`/`OBJECT`/`isTRIPLE`) if the current
+    /// token is one. The returned string is the uppercased canonical name.
+    pub fn consume_triple_term_fn(&mut self) -> Option<(Arc<str>, SourceSpan)> {
+        match &self.peek().kind {
+            TokenKind::TripleTermFn(_) => {
+                let token = self.consume();
+                if let TokenKind::TripleTermFn(name) = token.kind {
+                    Some((name, token.span))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Consume and return an IRI if the current token is an IRI.
     pub fn consume_iri(&mut self) -> Option<(Arc<str>, SourceSpan)> {
         match &self.peek().kind {
@@ -417,6 +434,7 @@ impl TokenStream {
                 | TokenKind::LParen    // Collection syntax (non-empty)
                 | TokenKind::Nil       // Collection syntax (empty list)
                 | TokenKind::TripleStart // RDF-star quoted triple
+                | TokenKind::TripleTermStart // RDF 1.2 triple-term value (subject position)
         )
     }
 }

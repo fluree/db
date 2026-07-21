@@ -70,6 +70,7 @@ pub fn eval_is_numeric<R: RowAccess>(
             v,
             ComparableValue::Long(_)
                 | ComparableValue::Double(_)
+                | ComparableValue::Float(_)
                 | ComparableValue::Decimal(_)
                 | ComparableValue::BigInt(_)
         )

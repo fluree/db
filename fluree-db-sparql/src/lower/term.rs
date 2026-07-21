@@ -113,6 +113,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     term.span(),
                 ))
             }
+            // SPARQL 1.2 triple-term value in subject position: accepted at
+            // parse time, deferred at lower time (burn-down D-1). No
+            // first-class triple-term value exists yet.
+            SubjectTerm::TripleTerm(tt) => Err(LowerError::not_implemented(
+                "SPARQL 1.2 triple-term values (`<<( s p o )>>`)",
+                tt.span,
+            )),
         }
     }
 
@@ -158,6 +165,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     qt.span,
                 ))
             }
+            // SPARQL 1.2 triple-term value in object position: accepted at
+            // parse time, deferred at lower time (burn-down D-1).
+            SparqlTerm::TripleTerm(tt) => Err(LowerError::not_implemented(
+                "SPARQL 1.2 triple-term values (`<<( s p o )>>`)",
+                tt.span,
+            )),
         }
     }
 
@@ -188,6 +201,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::Literal(lit) => self.lower_literal_with_constraint(lit),
             SparqlTerm::BlankNode(_) => Ok((self.lower_object(term)?, None)),
             SparqlTerm::QuotedTriple(_) => Ok((self.lower_object(term)?, None)),
+            // Defers via `lower_object` (D-1); no datatype constraint applies.
+            SparqlTerm::TripleTerm(_) => Ok((self.lower_object(term)?, None)),
         }
     }
 
@@ -482,6 +497,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::QuotedTriple(qt) => Err(LowerError::not_implemented(
                 "RDF 1.2 reified triples (`<< s p o >>`) as VALUES data",
                 qt.span,
+            )),
+            // SPARQL 1.2 triple-term value as VALUES data: parse-accepted,
+            // lower-deferred (burn-down D-1).
+            SparqlTerm::TripleTerm(tt) => Err(LowerError::not_implemented(
+                "SPARQL 1.2 triple-term values (`<<( s p o )>>`) as VALUES data",
+                tt.span,
             )),
         }
     }

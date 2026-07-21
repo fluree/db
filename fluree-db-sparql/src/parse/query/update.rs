@@ -2,27 +2,38 @@
 
 use crate::ast::pattern::GraphName;
 use crate::ast::update::{
-    DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
-    UpdateOperation, UsingClause,
+    Create, DeleteData, DeleteWhere, GraphMgmtRef, GraphOrDefault, GraphRefAll, GraphTransfer,
+    InsertData, Load, Modify, QuadData, QuadPattern, QuadPatternElement, UpdateOperation,
+    UsingClause,
 };
 use crate::ast::{GraphPattern, Iri};
 use crate::lex::TokenKind;
 use crate::span::SourceSpan;
 
+/// Which of the three `GraphOrDefault TO GraphOrDefault` transfer verbs is
+/// being parsed. They share one grammar production.
+enum TransferKind {
+    Add,
+    Copy,
+    Move,
+}
+
 /// Collect the labeled blank nodes appearing in an update operation's
-/// blank-node-MINTING template positions: INSERT DATA quad data and Modify
-/// INSERT templates.
+/// **ground-data** positions — the quads of `INSERT DATA` / `DELETE DATA` only.
 ///
 /// Used by the request-level parser to enforce SPARQL 1.1 Update §19.6's
-/// blank-node label scoping: a label may not be reused across operations of
-/// one request. WHERE-clause and DELETE-side blank nodes are excluded — in
-/// WHERE clauses (including DELETE WHERE, per Fluree's documented
-/// extension) they act as non-distinguished matching variables governed by
-/// the query-side BGP scoping rules, and strict-mode DELETE templates/data
-/// reject blank nodes outright downstream (validator + lowering) — in
-/// neither case is there a minted node the label-scope rule could protect,
-/// and walking them over-rejected `DELETE WHERE { _:b1 … } ; DELETE WHERE
-/// { _:b1 … }`, whose two labels are independently-scoped matches.
+/// blank-node label scoping: a label may not be reused across the ground-data
+/// operations of one request (negative test `syntax-update-54`:
+/// `INSERT DATA {_:b} ; INSERT DATA {_:b}`).
+///
+/// The scope rule applies to `DATA` forms only. Blank nodes in a `Modify`
+/// (`INSERT`/`DELETE ... WHERE`) template and in `DELETE WHERE` are
+/// **template/query-scoped**: like CONSTRUCT, each operation instantiates its
+/// own fresh blank nodes per solution, so reusing a label across operations is
+/// legitimate and yields *distinct* nodes — the approved positive tests
+/// `insert-where-same-bnode`/`-2` reuse `_:b` across two `INSERT ... WHERE`
+/// operations and MUST succeed. Collecting from those forms would wrongly
+/// reject them, so they are excluded here.
 ///
 /// Parser-synthesized labels (`#bnpl<N>` from blank-node property lists) are
 /// minted from a counter that is monotonic across the whole request, so they
@@ -47,6 +58,17 @@ pub(super) fn collect_template_bnode_labels(
                 SubjectTerm::QuotedTriple(qt) => {
                     from_subject(&qt.subject, out);
                     if let Term::BlankNode(bn) = qt.object.as_ref() {
+                        if let BlankNodeValue::Labeled(label) = &bn.value {
+                            out.push((label.clone(), bn.span));
+                        }
+                    }
+                }
+                // A triple-term value subject (deferred, D-1) — mirror the
+                // reified-triple recursion so any labeled blank node inside
+                // is still collected.
+                SubjectTerm::TripleTerm(tt) => {
+                    from_subject(&tt.subject, out);
+                    if let Term::BlankNode(bn) = &tt.object {
                         if let BlankNodeValue::Labeled(label) = &bn.value {
                             out.push((label.clone(), bn.span));
                         }
@@ -99,15 +121,24 @@ pub(super) fn collect_template_bnode_labels(
     }
 
     match op {
+        // Ground-data forms — the only ones subject to cross-operation
+        // blank-node label scoping (SPARQL 1.1 Update §19.6).
         UpdateOperation::InsertData(insert) => from_elements(&insert.data.quads, out),
-        UpdateOperation::Modify(modify) => {
-            if let Some(insert_clause) = &modify.insert_clause {
-                from_elements(&insert_clause.patterns, out);
-            }
-        }
-        // DELETE-side blank nodes never mint nodes (see the doc comment),
-        // so they carry no cross-operation label identity to protect.
-        UpdateOperation::DeleteData(_) | UpdateOperation::DeleteWhere(_) => {}
+        UpdateOperation::DeleteData(delete) => from_elements(&delete.data.quads, out),
+        // Template/query-scoped forms — blank nodes are per-operation, per
+        // solution (CONSTRUCT-style). Reusing a label across operations is
+        // legitimate (distinct nodes), so they contribute nothing here.
+        UpdateOperation::DeleteWhere(_) | UpdateOperation::Modify(_) => {}
+        // Graph-management verbs (LOAD/CLEAR/DROP/CREATE/ADD/COPY/MOVE) carry
+        // no template/data triples, so they contribute no blank-node labels
+        // to the cross-operation scope check.
+        UpdateOperation::Load(_)
+        | UpdateOperation::Clear(_)
+        | UpdateOperation::Drop(_)
+        | UpdateOperation::Create(_)
+        | UpdateOperation::Add(_)
+        | UpdateOperation::Copy(_)
+        | UpdateOperation::Move(_) => {}
     }
 }
 
@@ -122,6 +153,20 @@ impl super::Parser<'_> {
     /// - [WITH iri] INSERT QuadPattern [UsingClause*] WHERE GroupGraphPattern
     pub(super) fn parse_update_operation(&mut self) -> Option<UpdateOperation> {
         let start = self.stream.current_span();
+
+        // Graph-management verbs (SPARQL 1.1 Update §3.1.4-3.2.5). These have no
+        // WITH clause; each consumes an optional SILENT then its target grammar.
+        // The keywords are already lexed (token.rs); this is grammar + AST only.
+        match &self.stream.peek().kind {
+            TokenKind::KwLoad => return self.parse_load(start),
+            TokenKind::KwClear => return self.parse_clear_or_drop(start, false),
+            TokenKind::KwDrop => return self.parse_clear_or_drop(start, true),
+            TokenKind::KwCreate => return self.parse_create(start),
+            TokenKind::KwAdd => return self.parse_transfer(start, TransferKind::Add),
+            TokenKind::KwCopy => return self.parse_transfer(start, TransferKind::Copy),
+            TokenKind::KwMove => return self.parse_transfer(start, TransferKind::Move),
+            _ => {}
+        }
 
         // Check for WITH clause first
         let with_iri = if self.stream.check_keyword(TokenKind::KwWith) {
@@ -180,6 +225,143 @@ impl super::Parser<'_> {
         self.stream
             .error_at_current("expected INSERT or DELETE after WITH");
         None
+    }
+
+    /// Consume an optional `SILENT` keyword, returning whether it was present.
+    fn parse_optional_silent(&mut self) -> bool {
+        self.stream.match_keyword(TokenKind::KwSilent)
+    }
+
+    /// Parse an IRI that the grammar requires here, emitting an error-severity
+    /// diagnostic (not just returning `None`) when one is absent — `parse_sparql`
+    /// reports rejection via error diagnostics, so a silent `None` would let a
+    /// malformed request like `LOAD ;` pass as valid (negative test test_41).
+    fn parse_required_iri(&mut self, context: &str) -> Option<Iri> {
+        match self.parse_iri_term() {
+            Some(iri) => Some(iri),
+            None => {
+                self.stream.error_at_current(context);
+                None
+            }
+        }
+    }
+
+    /// Parse `LOAD [SILENT] iri [INTO GRAPH iri]`.
+    fn parse_load(&mut self, start: SourceSpan) -> Option<UpdateOperation> {
+        self.stream.advance(); // consume LOAD
+        let silent = self.parse_optional_silent();
+        let source =
+            self.parse_required_iri("expected an IRI (the document to load) after LOAD")?;
+        let into = if self.stream.match_keyword(TokenKind::KwInto) {
+            // `INTO GraphRef` where `GraphRef ::= GRAPH iri`.
+            if !self.stream.match_keyword(TokenKind::KwGraph) {
+                self.stream
+                    .error_at_current("expected GRAPH after INTO in LOAD");
+                return None;
+            }
+            Some(self.parse_required_iri("expected an IRI after INTO GRAPH")?)
+        } else {
+            None
+        };
+        let span = start.union(self.stream.previous_span());
+        Some(UpdateOperation::Load(Load {
+            silent,
+            source,
+            into,
+            span,
+        }))
+    }
+
+    /// Parse `CLEAR [SILENT] GraphRefAll` or `DROP [SILENT] GraphRefAll`.
+    fn parse_clear_or_drop(&mut self, start: SourceSpan, is_drop: bool) -> Option<UpdateOperation> {
+        self.stream.advance(); // consume CLEAR / DROP
+        let silent = self.parse_optional_silent();
+        let target = self.parse_graph_ref_all()?;
+        let span = start.union(self.stream.previous_span());
+        let mgmt = GraphMgmtRef {
+            silent,
+            target,
+            span,
+        };
+        Some(if is_drop {
+            UpdateOperation::Drop(mgmt)
+        } else {
+            UpdateOperation::Clear(mgmt)
+        })
+    }
+
+    /// Parse `CREATE [SILENT] GRAPH iri`.
+    fn parse_create(&mut self, start: SourceSpan) -> Option<UpdateOperation> {
+        self.stream.advance(); // consume CREATE
+        let silent = self.parse_optional_silent();
+        if !self.stream.match_keyword(TokenKind::KwGraph) {
+            self.stream
+                .error_at_current("expected GRAPH after CREATE [SILENT]");
+            return None;
+        }
+        let graph = self.parse_required_iri("expected an IRI after CREATE GRAPH")?;
+        let span = start.union(self.stream.previous_span());
+        Some(UpdateOperation::Create(Create {
+            silent,
+            graph,
+            span,
+        }))
+    }
+
+    /// Parse `ADD|COPY|MOVE [SILENT] GraphOrDefault TO GraphOrDefault`.
+    fn parse_transfer(&mut self, start: SourceSpan, kind: TransferKind) -> Option<UpdateOperation> {
+        self.stream.advance(); // consume ADD / COPY / MOVE
+        let silent = self.parse_optional_silent();
+        let from = self.parse_graph_or_default()?;
+        if !self.stream.match_keyword(TokenKind::KwTo) {
+            self.stream
+                .error_at_current("expected TO between the source and destination graphs");
+            return None;
+        }
+        let to = self.parse_graph_or_default()?;
+        let span = start.union(self.stream.previous_span());
+        let transfer = GraphTransfer {
+            silent,
+            from,
+            to,
+            span,
+        };
+        Some(match kind {
+            TransferKind::Add => UpdateOperation::Add(transfer),
+            TransferKind::Copy => UpdateOperation::Copy(transfer),
+            TransferKind::Move => UpdateOperation::Move(transfer),
+        })
+    }
+
+    /// Parse a `GraphRefAll ::= GRAPH iri | DEFAULT | NAMED | ALL`.
+    fn parse_graph_ref_all(&mut self) -> Option<GraphRefAll> {
+        if self.stream.match_keyword(TokenKind::KwDefault) {
+            Some(GraphRefAll::Default)
+        } else if self.stream.match_keyword(TokenKind::KwNamed) {
+            Some(GraphRefAll::Named)
+        } else if self.stream.match_keyword(TokenKind::KwAll) {
+            Some(GraphRefAll::All)
+        } else if self.stream.match_keyword(TokenKind::KwGraph) {
+            let iri = self.parse_required_iri("expected an IRI after GRAPH")?;
+            Some(GraphRefAll::Graph(iri))
+        } else {
+            self.stream
+                .error_at_current("expected GRAPH <iri>, DEFAULT, NAMED, or ALL");
+            None
+        }
+    }
+
+    /// Parse a `GraphOrDefault ::= DEFAULT | GRAPH? iri` (the GRAPH keyword is
+    /// optional before the IRI).
+    fn parse_graph_or_default(&mut self) -> Option<GraphOrDefault> {
+        if self.stream.match_keyword(TokenKind::KwDefault) {
+            Some(GraphOrDefault::Default)
+        } else {
+            // Optional GRAPH keyword before the IRI.
+            self.stream.match_keyword(TokenKind::KwGraph);
+            let iri = self.parse_required_iri("expected DEFAULT or a graph IRI")?;
+            Some(GraphOrDefault::Graph(iri))
+        }
     }
 
     /// Parse INSERT DATA { ... }

@@ -285,6 +285,16 @@ fn parse_update(json: &Value, opts: TxnOpts, ns_registry: &mut NamespaceRegistry
         .as_object()
         .ok_or_else(|| TransactError::Parse("Update transaction must be an object".to_string()))?;
 
+    // An update with neither clause can never change data. Rejecting it here
+    // (mirroring the empty-insert/upsert guards) prevents a mistargeted body —
+    // e.g. a Cypher envelope posted as JSON-LD — from committing an empty
+    // transaction and reporting success.
+    if !obj.contains_key("insert") && !obj.contains_key("delete") {
+        return Err(TransactError::Parse(
+            "update transaction must contain an \"insert\" or \"delete\" clause".to_string(),
+        ));
+    }
+
     let mut vars = VarRegistry::new();
     let mut graph_ids = GraphIdAssigner::new();
 
@@ -2069,6 +2079,44 @@ mod tests {
         assert_eq!(txn.where_patterns.len(), 1);
         assert_eq!(txn.delete_templates.len(), 1);
         assert_eq!(txn.insert_templates.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_update_without_insert_or_delete_rejected() {
+        let mut ns_registry = test_registry();
+
+        // A Cypher envelope mistakenly posted as a JSON-LD update: no
+        // insert/delete clause means the transaction could never change data.
+        let cypher_envelope = json!({
+            "cypher": "MERGE (n:Person {name: 'Alice'})",
+            "params": {}
+        });
+        let err = parse_update(&cypher_envelope, TxnOpts::default(), &mut ns_registry).unwrap_err();
+        assert!(
+            err.to_string().contains("\"insert\" or \"delete\""),
+            "unexpected error: {err}"
+        );
+
+        // where-only updates are equally inert and rejected.
+        let where_only = json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": { "@id": "?s", "ex:name": "?name" }
+        });
+        let err = parse_update(&where_only, TxnOpts::default(), &mut ns_registry).unwrap_err();
+        assert!(
+            err.to_string().contains("\"insert\" or \"delete\""),
+            "unexpected error: {err}"
+        );
+
+        // An explicit empty delete keeps its documented no-op semantics.
+        let explicit_empty_delete = json!({
+            "@context": {"ex": "http://example.org/"},
+            "delete": []
+        });
+        let txn =
+            parse_update(&explicit_empty_delete, TxnOpts::default(), &mut ns_registry).unwrap();
+        assert!(txn.delete_templates.is_empty());
+        assert!(txn.insert_templates.is_empty());
     }
 
     #[test]

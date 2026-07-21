@@ -77,14 +77,14 @@ impl super::Parser<'_> {
             return self.parse_quoted_triple().map(SubjectTerm::QuotedTriple);
         }
 
-        // RDF 1.2 triple term in subject position is a deferred shape
-        // (nested triple terms / arbitrary triple-term values). Reject
-        // here with a targeted message instead of falling through to
-        // generic "expected subject" errors.
+        // RDF 1.2 triple term *value* in subject position:
+        // `<<( s p o )>> :p1 :o1 .` (accept-then-defer, D-1). Blank nodes
+        // are allowed here (triple-pattern context — `bnode-tripleterm-*`);
+        // lowering rejects the term with `not_implemented`.
         if self.stream.check(&TokenKind::TripleTermStart) {
-            self.stream
-                .error_at_current("nested triple terms are not supported in v1");
-            return None;
+            return self
+                .parse_triple_term_value(true)
+                .map(|tt| SubjectTerm::TripleTerm(Box::new(tt)));
         }
 
         // RDF collection (list) syntax: ( item1 item2 ... ) or ()
@@ -304,6 +304,16 @@ impl super::Parser<'_> {
             return self
                 .parse_quoted_triple()
                 .map(|qt| Term::QuotedTriple(Box::new(qt)));
+        }
+
+        // RDF 1.2 triple term *value* in object position (bare, i.e. for a
+        // predicate other than `rdf:reifies`): `:s :p <<( a b c )>>`, and
+        // nested triple-term objects. Accept-then-defer (D-1); lowering
+        // rejects with `not_implemented`.
+        if self.stream.check(&TokenKind::TripleTermStart) {
+            return self
+                .parse_triple_term_value(true)
+                .map(|tt| Term::TripleTerm(Box::new(tt)));
         }
 
         // RDF collection (list) syntax: ( item1 item2 ... ) or ()
@@ -719,6 +729,18 @@ impl super::Parser<'_> {
             return Some(patterns);
         }
 
+        // A bare triple-term subject is NOT a statement: unlike a reified
+        // triple (handled just above), `<<( s p o )>> .` with no
+        // predicate-object list is invalid — a triple term is only a value
+        // (W3C negative `tripleterm-separate-01..06`). Require a verb.
+        if matches!(&subject, SubjectTerm::TripleTerm(_)) && !self.is_verb_start() {
+            self.stream.error_at_current(
+                "a bare triple term is not a statement; a triple term is a value — \
+                 give it a predicate-object list to use it as a subject",
+            );
+            return None;
+        }
+
         // A blank-node property-list or collection subject (`[ :p ?o ] …`,
         // `( ?x ) …`) emitted its inner triples (and, for a path verb inside
         // `[ … ]`, path patterns); fold the triples in before the (optional)
@@ -839,19 +861,10 @@ impl super::Parser<'_> {
         bgp_start: &mut Option<SourceSpan>,
     ) -> Option<()> {
         loop {
-            // A bare `<<(` here means the user wrote a triple-term object
-            // for a predicate other than `rdf:reifies`. v1 only accepts
-            // triple terms as the object of `rdf:reifies`; reject with
-            // the documented deferred-feature error.
-            if self.stream.check(&TokenKind::TripleTermStart) {
-                self.stream.error_at_current(
-                    "triple terms (<<( s p o )>>) are only allowed as the object of \
-                     rdf:reifies in v1; arbitrary triple-term values are deferred",
-                );
-                return None;
-            }
-
-            // Parse object
+            // Parse object. A bare `<<( s p o )>>` for a predicate other
+            // than `rdf:reifies` parses as a deferred triple-term value
+            // (`Term::TripleTerm`, D-1); the `rdf:reifies` object case is
+            // routed to `parse_reifies_object_list` before reaching here.
             let object = self.parse_object()?;
 
             // Track BGP start span
@@ -916,7 +929,15 @@ impl super::Parser<'_> {
 
         self.reject_collection_in_quoted_context()?;
         let subject = self.parse_subject()?;
-        if matches!(subject, SubjectTerm::QuotedTriple(_)) {
+        // The `rdf:reifies` object stays strict per v1 (pr-w2a): its inner
+        // subject may not be a nested triple term or reified triple. Now
+        // that `parse_subject` accepts `<<(` as a value, guard both variants
+        // (bare triple-term values in general BGP positions may nest — that
+        // is the separate `parse_triple_term_value` path).
+        if matches!(
+            subject,
+            SubjectTerm::QuotedTriple(_) | SubjectTerm::TripleTerm(_)
+        ) {
             self.stream
                 .error_at_current("nested triple terms are not supported in v1");
             return None;
@@ -939,6 +960,107 @@ impl super::Parser<'_> {
         }
         self.reject_collection_in_quoted_context()?;
         let object = self.parse_object()?;
+
+        if !self.stream.match_token(&TokenKind::TripleTermEnd) {
+            self.stream
+                .error_at_current("expected ')>>' to close triple term");
+            return None;
+        }
+
+        let span = start.union(self.stream.previous_span());
+        Some(TripleTerm {
+            subject,
+            predicate,
+            object,
+            span,
+        })
+    }
+
+    /// Parse a SPARQL 1.2 triple-term *value* `<<( s p o )>>` (BGP
+    /// subject/object, `VALUES`, `BIND`). The current token must be
+    /// `TripleTermStart`.
+    ///
+    /// Accept-then-defer (burn-down decision D-1): the node is built for
+    /// the syntax surface but lowers to `not_implemented`. The grammar
+    /// guardrails of the RDF 1.2 `TripleTerm` production are enforced here
+    /// so the negative suite stays rejected:
+    /// - **subject**: variable / IRI / blank node, and — in a *pattern*
+    ///   context — a nested triple term (positive `nested-tripleterm-02`,
+    ///   `compound-tripleterm-subject`). Never a reified triple, a literal
+    ///   (rejected by `parse_subject`), a path, or a collection.
+    /// - **predicate**: a plain IRI or variable — never a path
+    ///   (`quoted-path-tripleterm`), blank node (`bnode-predicate-tripleterm`),
+    ///   or collection (`quoted-list-predicate-tripleterm`);
+    /// - **object**: any term including a *nested* triple term
+    ///   (`nested-tripleterm-*`) — never a reified triple or collection
+    ///   (`quoted-list-object-tripleterm`).
+    ///
+    /// `in_pattern` distinguishes the two contexts the W3C suite treats
+    /// differently. In a **value** context (`VALUES` / expression,
+    /// `in_pattern == false`) the subject may be neither a blank node
+    /// (negative `bindbnode-tripleterm`) nor a nested triple term (negative
+    /// `tripleterm-subject-01..03`). In a **pattern** context
+    /// (`in_pattern == true`) both are allowed (positive `bnode-tripleterm-*`,
+    /// `nested-tripleterm-02`, `compound-tripleterm-subject`).
+    ///
+    /// A bare `<<( s p o )>> .` is not accepted as a statement (the enclosing
+    /// triples-block requires a predicate-object list after the subject), so
+    /// `tripleterm-separate-*` stay rejected.
+    pub(super) fn parse_triple_term_value(&mut self, in_pattern: bool) -> Option<TripleTerm> {
+        let start = self.stream.current_span();
+        if !self.stream.match_token(&TokenKind::TripleTermStart) {
+            self.stream
+                .error_at_current("expected '<<(' to begin triple term");
+            return None;
+        }
+
+        self.reject_collection_in_quoted_context()?;
+        let subject = self.parse_subject()?;
+        match &subject {
+            // A reified triple is never a valid triple-term subject
+            // (`ttSubject` has no `ReifiedTriple` production).
+            SubjectTerm::QuotedTriple(_) => {
+                self.stream.error_at_current(
+                    "a reified triple (<< s p o >>) may not be the subject of a triple term",
+                );
+                return None;
+            }
+            // Only the object of a triple term may nest when the term is a
+            // *value*: `<<( <<( … )>> :q :z )>>` is rejected in VALUES/BIND
+            // (`tripleterm-subject-01..03`) but accepted in a triple pattern.
+            SubjectTerm::TripleTerm(_) if !in_pattern => {
+                self.stream.error_at_current(
+                    "a triple term used as a value may not have a triple-term subject",
+                );
+                return None;
+            }
+            SubjectTerm::BlankNode(_) if !in_pattern => {
+                self.stream.error_at_current(
+                    "blank nodes are not allowed in a triple term used as a value",
+                );
+                return None;
+            }
+            _ => {}
+        }
+
+        let predicate = self.parse_simple_predicate()?;
+
+        // A reified triple is not grammatical inside a triple term
+        // (`ttObject` has no `ReifiedTriple` production); a nested triple
+        // term *is* (handled by `parse_object` → `Term::TripleTerm`).
+        if self.stream.check(&TokenKind::TripleStart) {
+            self.stream.error_at_current(
+                "reified triples (<< s p o >>) are not allowed inside a triple term",
+            );
+            return None;
+        }
+        self.reject_collection_in_quoted_context()?;
+        let object = self.parse_object()?;
+        if !in_pattern && matches!(object, Term::BlankNode(_)) {
+            self.stream
+                .error_at_current("blank nodes are not allowed in a triple term used as a value");
+            return None;
+        }
 
         if !self.stream.match_token(&TokenKind::TripleTermEnd) {
             self.stream
@@ -1108,14 +1230,10 @@ impl super::Parser<'_> {
                     Verb::Path(p) => AnnotationVerb::Path(p),
                 };
                 loop {
-                    // Reject nested triple terms here too.
-                    if self.stream.check(&TokenKind::TripleTermStart) {
-                        self.stream.error_at_current(
-                            "triple terms (<<( s p o )>>) are not allowed inside an \
-                             annotation block; reify edges via `rdf:reifies` instead",
-                        );
-                        return None;
-                    }
+                    // A `<<( s p o )>>` object inside an annotation block
+                    // (e.g. `{| ?Y <<(:s1 :p1 ?Z)>> |}`, `update-tripleterm-04`)
+                    // parses as a deferred triple-term value; lowering
+                    // rejects it (D-1).
                     let object = self.parse_object()?;
 
                     // Reject nested annotation tails: the RDF 1.2
@@ -1301,21 +1419,11 @@ impl super::Parser<'_> {
             // Parse predicate (simple only - no paths in CONSTRUCT)
             let predicate = self.parse_simple_predicate()?;
 
-            // Parse object list
+            // Parse object list. A bare `<<( s p o )>>` object parses as a
+            // deferred triple-term value here too (CONSTRUCT / INSERT /
+            // DELETE templates — `basic-tripleterm-06/07`,
+            // `update-tripleterm-*`); lowering rejects it (D-1).
             loop {
-                // Triple-term objects are NOT allowed in DATA / template
-                // contexts in v1 (the `~` annotation-tail form covers
-                // the same content). Reject with the same documented
-                // deferred-feature error used by the WHERE path.
-                if self.stream.check(&TokenKind::TripleTermStart) {
-                    self.stream.error_at_current(
-                        "triple terms (<<( s p o )>>) are only allowed as the object of \
-                         rdf:reifies in v1; use the `~ {| ... |}` annotation-tail form in \
-                         INSERT/DELETE DATA and templates",
-                    );
-                    return None;
-                }
-
                 let object = self.parse_object()?;
                 let annotation = self.parse_annotation_tail()?;
                 let mut span = subject.span().union(predicate.span()).union(object.span());

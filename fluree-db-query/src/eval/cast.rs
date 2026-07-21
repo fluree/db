@@ -65,6 +65,12 @@ fn cast_to_boolean(v: ComparableValue) -> Option<ComparableValue> {
             }
             d != 0.0
         }
+        ComparableValue::Float(f) => {
+            if f.is_nan() {
+                return None;
+            }
+            f != 0.0
+        }
         ComparableValue::BigInt(n) => !num_traits::Zero::is_zero(&*n),
         ComparableValue::Decimal(d) => !num_traits::Zero::is_zero(&*d),
         ComparableValue::String(s) => match s.as_ref() {
@@ -99,6 +105,13 @@ fn cast_to_integer(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::Long(n) => n,
         ComparableValue::Bool(b) => i64::from(b),
         ComparableValue::Double(d) => {
+            if !d.is_finite() || d > i64::MAX as f64 || d < i64::MIN as f64 {
+                return None;
+            }
+            d.trunc() as i64
+        }
+        ComparableValue::Float(f) => {
+            let d = f as f64;
             if !d.is_finite() || d > i64::MAX as f64 || d < i64::MIN as f64 {
                 return None;
             }
@@ -150,6 +163,7 @@ fn cast_to_float(v: ComparableValue) -> Option<ComparableValue> {
         }
         ComparableValue::Long(n) => n as f32,
         ComparableValue::Double(d) => d as f32,
+        ComparableValue::Float(f) => f,
         ComparableValue::BigInt(n) => n.to_f32()?,
         ComparableValue::Decimal(d) => d.to_f64()? as f32,
         ComparableValue::String(s) => s.parse::<f32>().ok()?,
@@ -177,7 +191,7 @@ fn float_typed_literal(f: f32) -> ComparableValue {
 ///
 /// Rust's default f32 Display uses minimal decimal digits. This is acceptable
 /// for the W3C tests which compare float values numerically.
-fn format_f32(f: f32) -> String {
+pub(crate) fn format_f32(f: f32) -> String {
     if f.is_nan() {
         "NaN".to_string()
     } else if f.is_infinite() {
@@ -220,6 +234,7 @@ fn cast_to_double(v: ComparableValue) -> Option<ComparableValue> {
         }
         ComparableValue::Long(n) => n as f64,
         ComparableValue::Double(d) => d,
+        ComparableValue::Float(f) => f as f64,
         ComparableValue::BigInt(n) => n.to_f64()?,
         ComparableValue::Decimal(dec) => dec.to_f64()?,
         ComparableValue::String(s) => s.parse::<f64>().ok()?,
@@ -251,6 +266,13 @@ fn cast_to_decimal(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::Bool(b) => BigDecimal::from(i64::from(b)),
         ComparableValue::Long(n) => BigDecimal::from(n),
         ComparableValue::Double(d) => {
+            if !d.is_finite() {
+                return None;
+            }
+            BigDecimal::try_from(d).ok()?
+        }
+        ComparableValue::Float(f) => {
+            let d = f as f64;
             if !d.is_finite() {
                 return None;
             }
