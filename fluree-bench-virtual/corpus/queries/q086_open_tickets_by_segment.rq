@@ -1,0 +1,15 @@
+# q086 open tickets by segment — the deployed production DNF shape Q1 (FAMILY-C).
+# fact(SupportTicket) -> dim(Customer) FK join, GROUP BY the dim attribute segment,
+# COUNT, with a FACT-SIDE INEQUALITY FILTER (?status != "Closed"). Before FAMILY-C
+# this DECLINED at the join-path blanket filter guard (fused_aggregate.rs) and
+# materialized the whole join (~10.3s virtual at SF0.1, DNF at deployed scale). The
+# widening admits the fact-side residual into the fused fold. Deterministic grouped
+# result → Full hash-gated (native oracle == virtual). A NULL status is excluded by
+# the R2RML star row-validity (BGP parity), not counted as "not Closed".
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?segment (COUNT(?ticket) AS ?openTickets)
+WHERE { ?ticket a edw:SupportTicket ; edw:status ?status ; edw:customer ?cust .
+        ?cust edw:segment ?segment .
+        FILTER(?status != "Closed") }
+GROUP BY ?segment
+ORDER BY DESC(?openTickets)
