@@ -200,6 +200,36 @@ pub trait R2rmlProvider: Debug + Send + Sync {
         graph_source_id: &str,
         as_of_t: Option<i64>,
     ) -> Result<Arc<CompiledR2rmlMapping>>;
+
+    /// Per-table build watermark for a materialize (twin) build: the pinned
+    /// snapshot of every table this provider has loaded for `graph_source_id`
+    /// during the current build. Returns EMPTY by default; a real Iceberg-backed
+    /// provider overrides it to report its catalog session's pins. The bulk
+    /// builder fails loud when this is empty for a non-empty table set, so a
+    /// provider that forgets to override cannot publish an unstamped twin.
+    fn build_watermark(
+        &self,
+        graph_source_id: &str,
+    ) -> std::collections::HashMap<String, TableWatermark> {
+        let _ = graph_source_id;
+        std::collections::HashMap::new()
+    }
+}
+
+/// The pinned snapshot of one Iceberg table at build time — the twin's per-table
+/// watermark entry (DEC-003). `metadata_location` is the authoritative pin (it
+/// uniquely identifies the table state and is always available); `snapshot_id` /
+/// `sequence_number` are the Iceberg snapshot identifiers captured from the
+/// parsed table metadata (typed `Option`, best-effort), which the delta-sync
+/// (Deliverable 3) snapshot diff needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableWatermark {
+    /// Iceberg `metadata.json` location pinned for this table this build.
+    pub metadata_location: String,
+    /// Current snapshot id of the pinned metadata, if parsed.
+    pub snapshot_id: Option<i64>,
+    /// Sequence number of the current snapshot, if parsed.
+    pub sequence_number: Option<i64>,
 }
 
 /// Provider for scanning Iceberg tables underlying R2RML graph sources.
