@@ -692,7 +692,11 @@ async fn bolt_transaction_pipelines_sequential_statements() {
 
     let governance = fluree_db_api::GovernanceOptions::default();
     let mut txn = fluree
-        .begin_cypher_transaction("it/cyseq:bolt", governance)
+        .begin_cypher_transaction(
+            "it/cyseq:bolt",
+            governance,
+            fluree_db_api::TrackingOptions::default(),
+        )
         .await
         .expect("begin");
 
@@ -721,8 +725,12 @@ async fn bolt_transaction_pipelines_sequential_statements() {
         .expect("second sequential statement");
     assert!(out2.flake_count > 0);
 
-    let committed_t = fluree.commit_cypher_transaction(txn).await.expect("commit");
-    assert!(committed_t > l.t());
+    let committed = fluree.commit_cypher_transaction(txn).await.expect("commit");
+    assert!(committed.receipt.t > l.t());
+    assert!(
+        committed.receipt.flake_count > 0,
+        "flake count summed across both statements"
+    );
 
     let handle = fluree
         .ledger_cached("it/cyseq:bolt")
@@ -738,4 +746,87 @@ async fn bolt_transaction_pipelines_sequential_statements() {
         count(&fluree, &state, "MATCH (n:City) RETURN count(n)").await,
         2
     );
+}
+
+#[tokio::test]
+async fn commit_result_carries_fuel_and_indexing_signals() {
+    // The commit result reaches parity with the autocommit `execute()` path:
+    // a fuel tally accumulated across every statement, plus the indexing
+    // signals a transactor needs to trigger background reindexing.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:tracked");
+    let _ = fluree
+        .transact_cypher(l, r#"CREATE (s:Seed {name: "s"})"#)
+        .await
+        .expect("seed commit")
+        .ledger;
+
+    let mut txn = fluree
+        .begin_cypher_transaction(
+            "it/cyseq:tracked",
+            fluree_db_api::GovernanceOptions::default(),
+            fluree_db_api::TrackingOptions::all_enabled(),
+        )
+        .await
+        .expect("begin");
+
+    // Two separate statements: their fuel must sum into one tally.
+    fluree
+        .cypher_transaction_write(
+            &mut txn,
+            r#"MERGE (a:Person {name: "Alice"}) MERGE (b:City {name: "Rome"}) MERGE (a)-[:LIVES_IN]->(b)"#,
+            None,
+        )
+        .await
+        .expect("first statement");
+    fluree
+        .cypher_transaction_write(
+            &mut txn,
+            r#"MERGE (a:Person {name: "Alice"}) MERGE (c:City {name: "Oslo"}) MERGE (a)-[:VISITED]->(c)"#,
+            None,
+        )
+        .await
+        .expect("second statement");
+
+    let committed = fluree.commit_cypher_transaction(txn).await.expect("commit");
+
+    let fuel = committed
+        .tally
+        .as_ref()
+        .and_then(|t| t.fuel)
+        .expect("fuel tally present when tracking is enabled");
+    assert!(fuel > 0.0, "fuel accumulated across both statements: {fuel}");
+    assert!(committed.receipt.flake_count > 0);
+    // Indexing signals are populated (novelty reflects the staged flakes).
+    assert!(committed.indexing.novelty_size > 0);
+    assert_eq!(committed.indexing.commit_t, committed.receipt.t);
+}
+
+#[tokio::test]
+async fn commit_without_tracking_reports_no_tally() {
+    // Opting out of tracking leaves the tally empty — no accidental overhead.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = genesis_ledger(&fluree, "it/cyseq:untracked");
+    let _ = fluree
+        .transact_cypher(l, r#"CREATE (s:Seed {name: "s"})"#)
+        .await
+        .expect("seed commit")
+        .ledger;
+
+    let mut txn = fluree
+        .begin_cypher_transaction(
+            "it/cyseq:untracked",
+            fluree_db_api::GovernanceOptions::default(),
+            fluree_db_api::TrackingOptions::default(),
+        )
+        .await
+        .expect("begin");
+    fluree
+        .cypher_transaction_write(&mut txn, r#"CREATE (a:Person {name: "Bob"})"#, None)
+        .await
+        .expect("write");
+
+    let committed = fluree.commit_cypher_transaction(txn).await.expect("commit");
+    assert!(committed.tally.is_none(), "no tally without tracking");
+    assert!(committed.receipt.flake_count > 0);
 }
