@@ -402,6 +402,17 @@ pub struct WatermarkStamp {
     pub mapping_hash: String,
     /// Per-table pinned Iceberg snapshot at build time.
     pub tables: HashMap<String, TableWatermark>,
+    /// Seed for the parity gate's stratified sample. Recorded so the sampled
+    /// subjects are auditable and reproducible (and so a later verify can widen
+    /// coverage by rotating it). Derived deterministically from `mapping_hash`.
+    pub sample_seed: u64,
+}
+
+/// Derive the stratified-sample seed from a mapping hash (its leading 64 bits).
+/// Deterministic, so the build's own post-build gate and any independent verify
+/// select the SAME sample without reading the stamp back.
+fn sample_seed_from_hash(mapping_hash: &str) -> u64 {
+    u64::from_str_radix(mapping_hash.get(..16).unwrap_or("0"), 16).unwrap_or(0)
 }
 
 /// SHA-256 (hex) of a canonical serialization of the mapping's TriplesMaps —
@@ -453,10 +464,13 @@ fn build_watermark_stamp(
 ) -> Result<WatermarkStamp, MaterializeError> {
     let tables = provider.build_watermark(graph_source_id);
     require_nonempty_watermark(&tables, mapping)?;
+    let hash = mapping_hash(mapping);
+    let sample_seed = sample_seed_from_hash(&hash);
     Ok(WatermarkStamp {
         builder_version: BUILDER_VERSION.to_string(),
-        mapping_hash: mapping_hash(mapping),
+        mapping_hash: hash,
         tables,
+        sample_seed,
     })
 }
 
@@ -466,6 +480,7 @@ const MATERIALIZE_NS: &str = "https://ns.flur.ee/materialize#";
 const STAMP_PRED_BUILDER: &str = "builderVersion";
 const STAMP_PRED_MAPPING_HASH: &str = "mappingHash";
 const STAMP_PRED_WATERMARK: &str = "watermark";
+const STAMP_PRED_SAMPLE_SEED: &str = "sampleSeed";
 
 /// ns-encode the completion stamp into `txn_meta` entries, interning each
 /// predicate through `sink` so its namespace code is published in this chunk's
@@ -489,11 +504,19 @@ fn encode_stamp(
         (STAMP_PRED_MAPPING_HASH, stamp.mapping_hash.clone()),
         (STAMP_PRED_WATERMARK, watermark_json),
     ];
-    let mut entries = Vec::with_capacity(fields.len());
+    let mut entries = Vec::with_capacity(fields.len() + 1);
     for (local, value) in fields {
         let (ns, name) = sink.intern_meta_predicate(&format!("{MATERIALIZE_NS}{local}"));
         entries.push(TxnMetaEntry::new(ns, name, TxnMetaValue::String(value)));
     }
+    // The sample seed as an integer (auditable; a verify reproduces the sample).
+    let (ns, name) =
+        sink.intern_meta_predicate(&format!("{MATERIALIZE_NS}{STAMP_PRED_SAMPLE_SEED}"));
+    entries.push(TxnMetaEntry::new(
+        ns,
+        name,
+        TxnMetaValue::Long(stamp.sample_seed as i64),
+    ));
     Ok(entries)
 }
 
@@ -513,10 +536,18 @@ pub fn read_stamp(txn_meta: &[TxnMetaEntry]) -> Option<WatermarkStamp> {
     let mapping_hash = field(STAMP_PRED_MAPPING_HASH)?.to_string();
     let tables: HashMap<String, TableWatermark> =
         serde_json::from_str(field(STAMP_PRED_WATERMARK)?).ok()?;
+    let sample_seed = txn_meta
+        .iter()
+        .find_map(|e| match &e.value {
+            TxnMetaValue::Long(n) if e.predicate_name == STAMP_PRED_SAMPLE_SEED => Some(*n as u64),
+            _ => None,
+        })
+        .unwrap_or_else(|| sample_seed_from_hash(&mapping_hash));
     Some(WatermarkStamp {
         builder_version,
         mapping_hash,
         tables,
+        sample_seed,
     })
 }
 
@@ -835,7 +866,10 @@ where
             });
         }
         VerifyMode::Quick => {
-            checks.extend(sample_checks(&source, &twin, &classes));
+            // The same deterministic seed the build recorded in the stamp, so the
+            // sampled subjects are reproducible and auditable.
+            let seed = sample_seed_from_hash(&mapping_hash(&mapping));
+            checks.extend(sample_checks(&source, &twin, &classes, seed));
         }
     }
 
@@ -1002,24 +1036,42 @@ fn group_by_subject(triples: &BTreeSet<String>) -> BTreeMap<&str, BTreeSet<&str>
     by_subject
 }
 
-/// Stratified sample: for each class, fully compare the triple set of its first
-/// [`SAMPLE_SUBJECTS_PER_CLASS`] subjects (by sorted subject) between source and
-/// twin. A systematic value/edge bug appears in every sample by construction.
+/// Deterministic per-subject sort key from a seed — spreads the sample across a
+/// class instead of always taking the lexicographic head (a systematic bug in
+/// tail subjects would otherwise never be sampled). Rotating the seed selects a
+/// different subset, so repeated verifies widen coverage.
+fn seeded_subject_key(seed: u64, subject: &str) -> u64 {
+    // FNV-1a mixed with the seed — dependency-free and stable across platforms.
+    let mut h = seed ^ 0x9e37_79b9_7f4a_7c15;
+    for b in subject.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Stratified sample: for each class, fully compare the triple set of
+/// [`SAMPLE_SUBJECTS_PER_CLASS`] subjects — chosen by a `seed`-mixed hash so the
+/// sample is spread across the class and reproducible (the seed is in the stamp)
+/// — between source and twin. A systematic value/edge bug appears in every
+/// sample by construction.
 fn sample_checks(
     source: &BTreeSet<String>,
     twin: &BTreeSet<String>,
     classes: &BTreeSet<String>,
+    seed: u64,
 ) -> Vec<ParityCheck> {
     let source_by_subject = group_by_subject(source);
     let twin_by_subject = group_by_subject(twin);
     let mut checks = Vec::new();
     for class in classes {
         let type_suffix = format!("<{}> <{class}> .", fluree_vocab::rdf::TYPE);
-        let subjects = source_by_subject
+        let mut subjects: Vec<&str> = source_by_subject
             .iter()
             .filter(|(_, triples)| triples.iter().any(|t| t.ends_with(&type_suffix)))
             .map(|(s, _)| *s)
-            .take(SAMPLE_SUBJECTS_PER_CLASS);
+            .collect();
+        subjects.sort_by_key(|s| seeded_subject_key(seed, s));
+        subjects.truncate(SAMPLE_SUBJECTS_PER_CLASS);
         for subject in subjects {
             let src = source_by_subject.get(subject).cloned().unwrap_or_default();
             let tw = twin_by_subject.get(subject).cloned().unwrap_or_default();

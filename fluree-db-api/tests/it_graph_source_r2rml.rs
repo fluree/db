@@ -5346,6 +5346,136 @@ async fn verify_twin_fails_on_corrupted_twin() {
     );
 }
 
+/// PARITY GATE — Quick SAMPLE arm negative: a per-subject value corruption on a
+/// SAMPLED subject (an extra property, no new instance so the class counts stay
+/// equal) must fail the Quick gate on the sample's node compare — the check the
+/// stratified sample adds over the always-on counts.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_quick_catches_sampled_subject_corruption() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-quick-neg:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Corrupt an existing (always-sampled, only 2/class) subject with a spurious
+    // extra property. No new instance → the class counts are unchanged, so ONLY
+    // the sample's per-subject node compare can catch it.
+    let extra = serde_json::json!({
+        "@id": "http://ex.org/customer/10",
+        "http://ex.org/name": "SPURIOUS"
+    });
+    let committed = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("inject spurious property");
+
+    let report = verify_twin(
+        &fluree,
+        &committed.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Quick,
+    )
+    .await
+    .expect("verify");
+    assert!(
+        !report.passed,
+        "Quick must catch a value corruption on a sampled subject"
+    );
+    // The class-count arm stays green (no new instance) — proving it is the
+    // SAMPLE arm that fired.
+    let cust_count = report
+        .checks
+        .iter()
+        .find(|c| c.name == "count:http://ex.org/Customer")
+        .expect("Customer count check present");
+    assert_eq!(
+        cust_count.outcome,
+        CheckOutcome::Match,
+        "class counts are unchanged by a per-subject property corruption"
+    );
+    assert!(
+        report
+            .failures()
+            .iter()
+            .any(|c| c.name == "sample:<http://ex.org/customer/10>"),
+        "the corrupted sampled subject must fail; failures: {:?}",
+        report.failures()
+    );
+}
+
+/// DROP-ON-FAIL mechanism: the CLI hard-drops a twin whose gate fails, so nothing
+/// unverified stays announced. Verify the drop actually UNPUBLISHES — after a
+/// hard drop, the twin is no longer a live, queryable ledger (its nameservice
+/// head is gone / retracted).
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_twin_is_unpublished() {
+    use fluree_db_api::DropMode;
+
+    const LEDGER: &str = "test/twin-drop:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+
+    // Announced before the drop: a published head is present.
+    let before = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup")
+        .expect("built twin is registered");
+    assert!(
+        before.commit_head_id.is_some(),
+        "built twin has a published commit head"
+    );
+
+    // Drop it exactly as the gate-fail path does. drop_ledger drops the WHOLE
+    // ledger and rejects a `:branch` suffix, so strip it (this is the CLI bug the
+    // test surfaced: dropping with `:main` 400s and leaves the twin announced).
+    fluree
+        .drop_ledger("test/twin-drop", DropMode::Hard)
+        .await
+        .expect("hard drop");
+
+    // No live ledger remains — the record is absent or retracted (a drop leaves a
+    // retracted tombstone rather than purging the entry), so nothing unverified
+    // is left announced.
+    let after = fluree
+        .nameservice()
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup");
+    assert!(
+        after.is_none_or(|r| r.retracted),
+        "a hard-dropped twin must leave no live, queryable ledger"
+    );
+}
+
 /// RUNTIME GUARD: attempting a virtual materialize on a single-threaded tokio
 /// runtime must fail loud with a typed error, NOT deadlock in the producer's
 /// block_on. Production servers and the CLI run multi-thread; this guards a

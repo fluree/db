@@ -134,6 +134,18 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
         .await
         .map_err(|e| classify_build_error(&e.to_string(), params.allow_mor_deletes))?;
 
+    // VERIFY-DEFAULT HONESTY: make the quick gate's epistemics operator-visible.
+    // The quick sample compares the twin against the build's OWN enumerator, so
+    // it catches ingest/index corruption but shares the enumerator's blind spot
+    // (a bug in enumerator logic appears identically on both sides).
+    if !params.quiet && params.verify == MaterializeVerify::Quick {
+        println!(
+            "Quick verify: class counts + a seeded per-class sample against the build's own \
+             enumerator — catches ingest/index corruption, NOT enumerator logic (shared oracle). \
+             Run `--verify full` plus the independent native diff before a production cutover."
+        );
+    }
+
     // Verify (publish-then-verify-then-drop): the gate needs a queryable twin, so
     // the build has already published; a failure drops it so nothing unverified
     // stays announced.
@@ -152,9 +164,18 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     .map_err(|e| CliError::Import(format!("parity gate: {e}")))?;
 
     if !report.passed {
-        let _ = fluree.drop_ledger(&twin_ledger, DropMode::Hard).await;
+        // drop_ledger drops the WHOLE ledger and rejects a `:branch` suffix, so
+        // strip it — otherwise the drop 400s and the unverified twin stays
+        // announced (the exact hazard this path guards against).
+        let drop_result = fluree
+            .drop_ledger(ledger_name_no_branch(&twin_ledger), DropMode::Hard)
+            .await;
+        let drop_note = match drop_result {
+            Ok(_) => "dropped, not announced".to_string(),
+            Err(e) => format!("WARNING: automatic drop FAILED ({e}) — drop it manually"),
+        };
         return Err(CliError::Import(format!(
-            "parity gate FAILED — twin '{twin_ledger}' dropped, not announced.\n{}",
+            "parity gate FAILED — twin '{twin_ledger}' {drop_note}.\n{}",
             format_failures(&report),
         )));
     }
@@ -205,6 +226,14 @@ fn default_twin_name(graph_source: &str) -> String {
         Some((name, branch)) => format!("{name}-twin:{branch}"),
         None => format!("{graph_source}-twin"),
     }
+}
+
+/// The whole-ledger id (no `:branch` suffix), as `drop_ledger` requires.
+fn ledger_name_no_branch(ledger: &str) -> &str {
+    ledger
+        .rsplit_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(ledger)
 }
 
 /// A filesystem-safe basename for a default pack path (ledger ids contain `/`
@@ -258,6 +287,15 @@ mod tests {
         assert_eq!(default_twin_name("dw-gs:main"), "dw-gs-twin:main");
         assert_eq!(default_twin_name("catalog:dev"), "catalog-twin:dev");
         assert_eq!(default_twin_name("plain"), "plain-twin");
+    }
+
+    #[test]
+    fn ledger_name_no_branch_strips_suffix_for_drop() {
+        // drop_ledger rejects a `:branch` suffix — the gate-fail drop must pass
+        // the whole-ledger id or it 400s and leaves the twin announced.
+        assert_eq!(ledger_name_no_branch("dw-gs-twin:main"), "dw-gs-twin");
+        assert_eq!(ledger_name_no_branch("a/b/c:dev"), "a/b/c");
+        assert_eq!(ledger_name_no_branch("nobranch"), "nobranch");
     }
 
     #[test]

@@ -1126,6 +1126,13 @@ pub enum Commands {
     /// fixed memory budget + low parallelism, NOT own-the-box auto-sizing).
     /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
     /// `--max-performance` on a cleared machine to auto-size to the host.
+    ///
+    /// BUDGET HONESTY: `--memory-budget-mb` is advisory below ~2GB — the import
+    /// pipeline assumes a ~2GB fixed overhead and floors the chunk size at 128MB,
+    /// so a smaller budget mainly lowers parallelism, not peak RAM. Peak RAM is
+    /// roughly 2GB + parallelism × 128MB × 2.5. The foreign-key parent index the
+    /// enumerator holds during the build sits OUTSIDE this budget and grows with
+    /// the largest parent (dimension) table — size the host accordingly.
     Materialize {
         /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
         graph_source: String,
