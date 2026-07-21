@@ -807,9 +807,20 @@ fn insert_dim_gkeys(
     key: Vec<String>,
     gkeys: Vec<GKey>,
 ) -> bool {
+    // The FK→GKey map assumes the parent JOIN KEY is UNIQUE — true for a proper
+    // star schema (the RefObjectMap's parent columns are the dim's surrogate PK),
+    // but NOT guaranteed for a hand-written mapping whose parent columns are a
+    // non-key subset. A duplicate parent join key means the materialized inner
+    // join FANS OUT (one fact row matches multiple dim rows), which a single-entry
+    // per-key map cannot represent: conflicting group attrs would mis-attribute
+    // (last-wins), and even EQUAL group attrs would UNDER-COUNT the fan-out. So any
+    // duplicate parent key DECLINES the fused plan (caller returns `Ok(None)` →
+    // materialize), the conservative posture the whole operator takes when a shape
+    // is outside what it can fold soundly. Returns `false` on any duplicate (was
+    // previously `true` for an equal-value duplicate — that "harmless" case is a
+    // latent fan-out under-count, so it now declines too).
     match map.get(&key) {
-        Some(prev) if *prev != gkeys => false,
-        Some(_) => true,
+        Some(_) => false,
         None => {
             map.insert(key, gkeys);
             true
@@ -1399,18 +1410,21 @@ impl Operator for FusedR2rmlAggregateOperator {
                     continue;
                 }
                 if let Some(fp) = &resolved.filter {
-                    // Materialize only the referenced object columns into a
-                    // binding row and evaluate through the engine evaluator.
-                    let binds: Vec<Binding> = fp
-                        .eval_objmaps
-                        .iter()
-                        .map(|om| match materialize_object_from_batch(om, &batch, row) {
-                            Ok(Some(term)) => fp.encoder.encode(&term),
-                            _ => Binding::Unbound,
-                        })
-                        .collect();
-                    let rv = BindingRow::new(&fp.eval_vars, &binds);
-                    if !fp.prepared.eval_to_bool_non_strict(&rv, Some(ctx))? {
+                    // The single-table and FACT-side-join filter, evaluated through the
+                    // SAME `row_passes_filter_plan` the dim side uses — one filter-eval
+                    // path for all three, so a fact filter is byte-parity with the dim
+                    // filter and the materialized operator. A NULL/absent filter-member
+                    // column EXCLUDES the row (BGP row-drop). Today `validity_cols`
+                    // already null-drops these member columns before the filter runs, so
+                    // this null-exclusion is unreachable here; routing through the helper
+                    // makes that INVARIANT fail-safe — if a future refactor ever eroded
+                    // the validity coverage, a null filter member would still exclude the
+                    // row (never counted as, e.g., "not Closed") rather than leak via an
+                    // Unbound. (`materialize_object_from_batch` over a scalar-column
+                    // ObjectMap — all `build_filter_plan` produces — never returns Err, so
+                    // this is behavior-identical to the prior inline block on every
+                    // reachable input.)
+                    if !Self::row_passes_filter_plan(fp, &batch, row, ctx)? {
                         continue;
                     }
                 }
@@ -3294,6 +3308,70 @@ mod tests {
         );
     }
 
+    /// FAMILY-C fact-side NULL defense (R-1528 hardening item 1): the FACT filter in
+    /// `next_batch` routes through the SAME `row_passes_filter_plan` as the dim side,
+    /// so a NULL fact filter-member column EXCLUDES the row (Q1's `?status != "Closed"`
+    /// with a NULL status is NOT counted as "not Closed"). In production `validity_cols`
+    /// already null-drops the member before the filter runs, making this unreachable —
+    /// this test bypasses that path (calls the helper directly) to prove the defense is
+    /// fail-safe should a future refactor ever erode the validity coverage. Exercises the
+    /// exact fact filter arm with Q1's production STATUS shape.
+    #[test]
+    fn family_c_fact_filter_null_member_excludes_failsafe() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let status = VarId(1);
+        let tm = TriplesMap::new("#Ticket", "FACT_SUPPORT_TICKET").with_predicate_object(
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/status"),
+                object_map: ObjectMap::column("STATUS"),
+            },
+        );
+        let mut pat = R2rmlPattern::new("gs", VarId(0), None);
+        pat.star_bindings = vec![("http://ex/status".to_string(), status)];
+        let mut proj = Vec::new();
+        let ne_filter = Expression::ne(
+            Expression::Var(status),
+            Expression::Const(FlakeValue::String("Closed".to_string())),
+        );
+        let fp =
+            FusedR2rmlAggregateOperator::build_filter_plan(&pat, &tm, &ne_filter, &ctx, &mut proj)
+                .expect("scalar filter admits");
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "STATUS".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 1,
+        }]));
+        // rows: Open (!= Closed → kept), Closed (== Closed → dropped), NULL (excluded).
+        let batch = ColumnBatch::new(
+            schema,
+            vec![Column::String(vec![
+                Some("Open".to_string()),
+                Some("Closed".to_string()),
+                None,
+            ])],
+        )
+        .unwrap();
+        let pass = |row| {
+            FusedR2rmlAggregateOperator::row_passes_filter_plan(&fp, &batch, row, &ctx).unwrap()
+        };
+        assert!(pass(0), "status=Open → `!=` true → kept");
+        assert!(!pass(1), "status=Closed → `!=` false → dropped");
+        assert!(
+            !pass(2),
+            "status=NULL → unbound BGP member → EXCLUDED fail-safe (NOT counted as 'not Closed')"
+        );
+    }
+
     /// FAMILY-C null/comparison semantics — THE D-c5 correctness crux. Evaluated
     /// through `row_passes_filter_plan`, the exact per-row eval the fused fold
     /// runs (dim-side directly; fact-side via the same `FilterPlan` in
@@ -3963,10 +4041,14 @@ mod tests {
     }
 
     #[test]
-    fn dim_dup_join_key_conflict_declines_equal_dup_kept() {
-        // The dim-scan map's soundness gate (#1490 review): a duplicate join-key
-        // mapping to DIFFERENT group-keys must decline the fused plan (caller returns
-        // Ok(None) → generic pipeline), while an equal-value duplicate is harmless.
+    fn dim_dup_join_key_always_declines() {
+        // The dim-scan map's soundness gate (#1490 review, HARDENED by the R-1528
+        // duplicate-parent-key item): a duplicate parent join key means the
+        // materialized join FANS OUT, which the single-entry-per-key map cannot
+        // represent — so ANY duplicate (conflicting OR equal group-keys) declines
+        // the fused plan (caller returns Ok(None) → generic pipeline). The equal-value
+        // duplicate previously kept is a latent fan-out under-count, so it now declines
+        // too. Proper star schemas have unique parent keys, so this never fires there.
         use std::collections::HashMap;
         let mut m: HashMap<Vec<String>, Vec<GKey>> = HashMap::new();
         let k = vec!["1".to_string()];
@@ -3975,19 +4057,20 @@ mod tests {
             k.clone(),
             vec![GKey::Str("A".into())]
         ));
-        // equal-value duplicate → kept, no decline
-        assert!(insert_dim_gkeys(
+        // equal-value duplicate → now DECLINES (was previously kept): the fan-out
+        // the map can't represent would under-count.
+        assert!(!insert_dim_gkeys(
             &mut m,
             k.clone(),
             vec![GKey::Str("A".into())]
         ));
-        // conflicting duplicate (different attrs) → decline
+        // conflicting duplicate (different attrs) → declines (mis-attribution).
         assert!(!insert_dim_gkeys(
             &mut m,
             k.clone(),
             vec![GKey::Str("B".into())]
         ));
-        // a distinct key still inserts
+        // a distinct key still inserts.
         assert!(insert_dim_gkeys(
             &mut m,
             vec!["2".to_string()],

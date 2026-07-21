@@ -80,3 +80,34 @@ unchanged. `scan_table` span counts were not captured (this run had
 `FLUREE_BENCH_TRACING` off; the warm run elides the scan-plan span — P4 §2), so
 the wall + exact hash are the fire/decline discriminators, and both are decisive.
 PAT held in-memory only (`$(cat ~/.vbench/snowflake-pat.txt)`), never written; no 401.
+
+## R-1528 review — SHIP verdict + two nonblocking hardening items (2026-07-21)
+
+Review verdict: SHIP, zero blocking (null semantics sound on all four attack
+sub-points; no admitted-and-wrong shapes; the shared `build_filter_plan`
+extraction confirmed byte-identical). Two hardening items landed on this branch:
+
+1. **Fact-side NULL defense (fail-safe symmetry).** `next_batch`'s fact filter now
+   routes through the SAME `row_passes_filter_plan` as the dim side — one filter-eval
+   path for single-table + fact-join + dim. A NULL filter-member column excludes the
+   row explicitly (`None → false`) instead of via a demotable Unbound. This is
+   unreachable today (`validity_cols` null-drops the member first) and
+   behavior-identical on every reachable input (`materialize_object_from_batch` over a
+   scalar-column ObjectMap — all `build_filter_plan` emits — never returns Err), so it
+   is a pure fail-safe against future erosion of the validity invariant. Test:
+   `family_c_fact_filter_null_member_excludes_failsafe` (Q1's STATUS shape, bypasses
+   validity by calling the helper directly).
+
+2. **Duplicate-parent-key guard.** `insert_dim_gkeys` now DECLINES on ANY duplicate
+   parent join key (was: kept an equal-value duplicate). A non-unique parent key means
+   the materialized join fans out, which the single-entry-per-key map cannot represent
+   — the previously-"harmless" equal-dup is a latent fan-out under-count. Proper star
+   schemas have unique parent PKs, so this never fires there (no corpus regression).
+   Test: `dim_dup_join_key_always_declines` (deliberately non-unique fixture).
+
+Skipped the reviewer's item (1) (default-ON under the existing join switch) — DEC-002
+policy as documented, no change.
+
+Gates re-run (`-p fluree-db-query`): fmt clean; clippy 0 new lints (5 pre-existing
+doc-list only); `cargo test -p fluree-db-query` → **1320** lib (+1 fact-null test) +
+all integration bins, 0 failed; fused_aggregate module 33 tests pass.
