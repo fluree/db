@@ -389,12 +389,24 @@ The worker runs on write nodes (not peers). Tracked jobs are held in memory, so
 after a restart re-issue `track` — the watermark in the target ledger means it
 resumes incrementally rather than re-reading everything.
 
+### Multiple sources into one target (additive)
+
+By default materialization is **additive**: it inserts and updates triples and
+never removes them. Several sources can safely materialize into the **same**
+target ledger — a shared knowledge graph, or a join table that only adds an edge
+to a parent entity. `rdf:type` is asserted additively (via an idempotent insert),
+so classes **union** across sources instead of the last writer clobbering the
+rest; the remaining predicates are upserted per predicate. For example, one
+source can type a subject `as:Article` while a second source adds `as:Announce`
+to the *same* subject IRI, and both classes remain queryable. (The "dedicated
+target" restriction under *Assumptions and limitations* applies only to
+latest-by-key mode, not to additive mode.)
+
 ### Change data capture: updates and deletes (latest-by-key)
 
-By default materialization is **additive** (it inserts/updates triples; it never
-removes them). For a change-data-capture source — an append-only log where each
-change is a new row and a delete is a **tombstone row** — configure two options
-so Fluree applies *latest-by-key* semantics that match a
+For a change-data-capture source — an append-only log where each change is a new
+row and a delete is a **tombstone row** — configure two options so Fluree applies
+*latest-by-key* semantics that match a
 `ROW_NUMBER() OVER (PARTITION BY id ORDER BY <ts> DESC) = 1` view:
 
 - **`order_by`** — a column that orders a key's revisions (e.g. an event

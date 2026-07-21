@@ -17,6 +17,8 @@ mod it_graph_commit;
 mod it_graph_source_bm25;
 #[path = "it_materialize_retract.rs"]
 mod it_materialize_retract;
+#[path = "it_materialize_type_union.rs"]
+mod it_materialize_type_union;
 #[path = "it_named_graph_isolation.rs"]
 mod it_named_graph_isolation;
 #[path = "it_named_graphs.rs"]

@@ -127,9 +127,13 @@ impl Fluree {
     /// subject materializer (parity with the query path). The two commits are
     /// ordered (retract, then upsert+watermark) so the watermark advances only in
     /// the upsert — a crash between them re-reads the same window on the next run.
-    /// The target ledger is assumed dedicated to this source (whole-subject
-    /// retraction owns the subject). With neither `order_by` nor `delete`
-    /// configured the pass is additive per-predicate (legacy behavior).
+    /// (Latest-by-key mode assumes the target ledger is dedicated to this source —
+    /// whole-subject retraction owns the subject.) With neither `order_by` nor
+    /// `delete` configured the pass is additive: non-type predicates are upserted
+    /// per predicate, and `rdf:type` is asserted via an idempotent `insert` so
+    /// classes UNION across sources — several sources (or a join table adding an
+    /// edge to a parent) can contribute types to the same subject in a shared
+    /// target without clobbering each other.
     pub async fn materialize_r2rml_graph_source(
         &self,
         source_graph_source_id: &str,
@@ -316,11 +320,47 @@ impl Fluree {
                 .ledger;
         }
 
-        let mut nodes: Vec<JsonValue> = live.into_values().map(SubjectNode::into_json).collect();
-        for (table, _from, to) in &table_watermarks {
-            nodes.push(watermark_node(source_graph_source_id, table, *to));
+        if latest_by_key {
+            // Whole-subject replace: the retraction above cleared every seen
+            // subject, so the re-asserted nodes (carrying @type) are the sole
+            // source of truth for the subject — a single upsert is correct.
+            let mut nodes: Vec<JsonValue> =
+                live.into_values().map(SubjectNode::into_json).collect();
+            for (table, _from, to) in &table_watermarks {
+                nodes.push(watermark_node(source_graph_source_id, table, *to));
+            }
+            self.upsert(ledger, &JsonValue::Array(nodes)).await?;
+        } else {
+            // Additive mode: a subject may be contributed to by several sources —
+            // a shared target ledger fed by many graph sources, or a join table
+            // that only adds an edge to a parent entity. Assert `@type` with an
+            // idempotent `insert` so classes UNION across sources, and `upsert`
+            // only the remaining predicates. A single upsert carrying `@type`
+            // would retract-then-insert rdf:type per predicate, so the last source
+            // to touch a shared subject would CLOBBER the classes the others added
+            // (e.g. a `silver_article_tag` join row re-typing its article, or an
+            // `entity_type` row adding `as:Announce`). Two commits: insert the
+            // classes first, then upsert predicates + advance the watermark — the
+            // watermark advances only in the upsert, so a crash between them
+            // re-runs this window (self-healing; insert is idempotent).
+            let mut type_nodes: Vec<JsonValue> = Vec::new();
+            let mut upsert_nodes: Vec<JsonValue> = Vec::new();
+            for node in live.into_values() {
+                let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+                type_nodes.extend(type_node);
+                upsert_nodes.extend(pred_node);
+            }
+            if !type_nodes.is_empty() {
+                ledger = self
+                    .insert(ledger, &JsonValue::Array(type_nodes))
+                    .await?
+                    .ledger;
+            }
+            for (table, _from, to) in &table_watermarks {
+                upsert_nodes.push(watermark_node(source_graph_source_id, table, *to));
+            }
+            self.upsert(ledger, &JsonValue::Array(upsert_nodes)).await?;
         }
-        self.upsert(ledger, &JsonValue::Array(nodes)).await?;
 
         Ok(MaterializeResult {
             to_snapshot_id,
@@ -588,7 +628,53 @@ impl SubjectNode {
         }
         JsonValue::Object(node)
     }
+
+    /// Split the node into `(optional @type-only node, optional predicates-only
+    /// node)` for additive-mode application: `rdf:type` is asserted via an
+    /// idempotent `insert` (classes UNION across sources) while the remaining
+    /// predicates are `upsert`ed (last-writer-wins per predicate). Each side is
+    /// `None` when it would carry no data (a type-less join row, or a class-only
+    /// `entity_type` row) so callers can skip an empty transaction node.
+    fn into_type_and_predicate_nodes(self) -> (Option<JsonValue>, Option<JsonValue>) {
+        let SubjectNode {
+            id,
+            types,
+            predicates,
+        } = self;
+        let type_node = if types.is_empty() {
+            None
+        } else {
+            let mut m = Map::new();
+            m.insert("@id".to_string(), JsonValue::String(id.clone()));
+            m.insert(
+                "@type".to_string(),
+                JsonValue::Array(types.into_iter().map(JsonValue::String).collect()),
+            );
+            Some(JsonValue::Object(m))
+        };
+        let pred_node = if predicates.is_empty() {
+            None
+        } else {
+            let mut m = Map::new();
+            m.insert("@id".to_string(), JsonValue::String(id));
+            for (pred, mut vals) in predicates {
+                let v = if vals.len() == 1 {
+                    vals.pop().expect("len == 1")
+                } else {
+                    JsonValue::Array(vals)
+                };
+                m.insert(pred, v);
+            }
+            Some(JsonValue::Object(m))
+        };
+        (type_node, pred_node)
+    }
 }
+
+/// The `rdf:type` predicate IRI. A predicate-object map asserting it is treated
+/// as a subject class (data-driven typing), not an ordinary predicate — see
+/// [`build_live_node`].
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// Build a live `SubjectNode` from one source row (subject classes + the
 /// constant-predicate objects). RefObjectMap joins are resolved at query time,
@@ -610,7 +696,17 @@ fn build_live_node(
         let obj = materialize_object_from_batch(&pom.object_map, batch, row)
             .map_err(|e| ApiError::Internal(format!("R2RML object materialization failed: {e}")))?;
         if let Some(term) = obj {
-            node.add_object(predicate, rdf_term_to_jsonld(term));
+            // A data-driven `rdf:type` object map is a CLASS, not an ordinary
+            // predicate. `rr:class` is constant-only, so per-row typing (e.g.
+            // `as:Announce` vs `as:Article` from a `type` column) must be a POM
+            // with `rr:predicate rdf:type`. Route it to the subject's @type so it
+            // UNIONS across sources in additive mode — as an ordinary predicate it
+            // would be upserted and clobber other sources' types on a shared
+            // subject. (A non-IRI rdf:type object is malformed; fall through.)
+            match term {
+                RdfTerm::Iri(iri) if predicate == RDF_TYPE_IRI => node.add_type(&iri),
+                other => node.add_object(predicate, rdf_term_to_jsonld(other)),
+            }
         }
     }
     Ok(node)
@@ -815,6 +911,98 @@ mod tests {
         assert_eq!(
             extract_first_i64(&json!(["5648190075564901028"])),
             Some(5_648_190_075_564_901_028)
+        );
+    }
+
+    #[test]
+    fn split_type_and_predicates_both_present() {
+        let mut node = SubjectNode::new("urn:x".into());
+        node.add_type("https://ex/A");
+        node.add_type("https://ex/B");
+        node.add_object("https://ex/p", json!("v"));
+        let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+        // @type is asserted separately (via insert) so classes union across
+        // sources; the predicate goes to the upsert.
+        assert_eq!(
+            type_node.unwrap(),
+            json!({ "@id": "urn:x", "@type": ["https://ex/A", "https://ex/B"] })
+        );
+        assert_eq!(
+            pred_node.unwrap(),
+            json!({ "@id": "urn:x", "https://ex/p": "v" })
+        );
+    }
+
+    #[test]
+    fn split_type_only_row_has_no_predicate_node() {
+        // entity_type shape: a class-only row yields a type node and nothing to upsert.
+        let mut node = SubjectNode::new("urn:x".into());
+        node.add_type("https://ex/Announce");
+        let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+        assert_eq!(
+            type_node.unwrap(),
+            json!({ "@id": "urn:x", "@type": ["https://ex/Announce"] })
+        );
+        assert!(pred_node.is_none());
+    }
+
+    #[test]
+    fn split_edge_only_row_has_no_type_node() {
+        // join-table shape (rr:class removed): an edge-only row yields a predicate
+        // node and NO type node, so it never re-types (clobbers) its parent.
+        let mut node = SubjectNode::new("urn:x".into());
+        node.add_object("https://ex/tag", json!({ "@id": "urn:t" }));
+        let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+        assert!(type_node.is_none());
+        assert_eq!(
+            pred_node.unwrap(),
+            json!({ "@id": "urn:x", "https://ex/tag": { "@id": "urn:t" } })
+        );
+    }
+
+    #[test]
+    fn build_live_node_routes_rdf_type_pom_to_union_type() {
+        use fluree_db_iceberg::io::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap};
+        use std::sync::Arc;
+
+        // A source row whose `type` column holds a full-IRI class (data-driven typing).
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "type".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 1,
+        }]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![Column::String(vec![Some(
+                "https://www.w3.org/ns/activitystreams#Announce".to_string(),
+            )])],
+        )
+        .unwrap();
+
+        // Mapping with NO rr:class; the class comes from a `rr:predicate rdf:type`
+        // object map reading the `type` column (the only way to express per-row
+        // typing, since rr:class is constant-only).
+        let tm = TriplesMap::new("#Article", "silver.article").with_predicate_object(
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant(RDF_TYPE_IRI),
+                object_map: ObjectMap::column_iri("type"),
+            },
+        );
+
+        let node = build_live_node(&tm, &batch, 0, "urn:s".to_string()).unwrap();
+        // The rdf:type POM is routed to @type (the additive union-insert path),
+        // NOT to predicates (which would be upserted and clobber other sources'
+        // classes on a shared subject IRI).
+        assert_eq!(
+            node.types,
+            vec!["https://www.w3.org/ns/activitystreams#Announce".to_string()]
+        );
+        assert!(
+            node.predicates.is_empty(),
+            "rdf:type must be a class, not an ordinary predicate: {:?}",
+            node.predicates
         );
     }
 }
