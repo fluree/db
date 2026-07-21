@@ -258,7 +258,11 @@ impl IcebergCatalogSession {
     /// scan of the same table keeps the first-recorded watermark, matching the
     /// `metadata_location` pin.
     pub(crate) fn record_snapshot(&self, key: String, watermark: TableWatermark) {
-        self.snapshots.lock().unwrap().entry(key).or_insert(watermark);
+        self.snapshots
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert(watermark);
     }
 
     /// All snapshot watermarks captured this build for `graph_source_id`, as
@@ -514,7 +518,10 @@ mod tests {
             "first-recorded snapshot wins over a later touch"
         );
         assert_eq!(pinned.get("DW.DIM_STORE").unwrap().snapshot_id, Some(1));
-        assert_eq!(pinned.get("DW.DIM_STORE").unwrap().sequence_number, Some(10));
+        assert_eq!(
+            pinned.get("DW.DIM_STORE").unwrap().sequence_number,
+            Some(10)
+        );
         assert!(
             pinned.contains_key("DW.DIM_GEOGRAPHY"),
             "the table key is the raw logical table name, not namespace.table split"

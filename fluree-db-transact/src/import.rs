@@ -26,6 +26,7 @@ mod inner {
     use fluree_db_core::CommitId;
     use fluree_db_core::{
         ContentAddressedWrite, ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid,
+        TxnMetaEntry,
     };
 
     /// Returns `Some(mode)` for the genesis commit (no parent), `None` otherwise.
@@ -819,6 +820,13 @@ mod inner {
         /// buffered RunRecords with chunk-local IDs and chunk-local
         /// dictionaries for the post-parse sort + sorted commit write pipeline.
         pub spool_result: Option<crate::import_sink::BufferedSpoolResult>,
+        /// Transaction metadata for this chunk's commit envelope. EMPTY for every
+        /// text-import chunk (Turtle/TriG/JSON-LD) — those set `Vec::new()`, so the
+        /// commit is byte-identical to before this field existed. The materialize
+        /// (twin) builder sets it on ONE chunk — the FINAL commit — to carry the
+        /// completion stamp (watermark + mapping hash + builder version), so a
+        /// twin is valid iff a head-walk finds the stamp (DEC-003 §17).
+        pub txn_meta: Vec<TxnMetaEntry>,
     }
 
     /// Parse a TTL chunk into a `StreamingCommitWriter`. Thread-safe.
@@ -875,6 +883,7 @@ mod inner {
             new_codes,
             prefix_map,
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -942,6 +951,7 @@ mod inner {
             // need to contribute additional prefix mappings.
             prefix_map: HashMap::new(),
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -1086,6 +1096,7 @@ mod inner {
             new_codes,
             prefix_map,
             spool_result,
+            txn_meta: Vec::new(),
         })
     }
 
@@ -1134,7 +1145,11 @@ mod inner {
             time: Some(state.import_time.clone()),
 
             txn_signature: None,
-            txn_meta: Vec::new(),
+            // Empty for every text-import chunk (unchanged behavior); the
+            // materialize builder sets it on the final commit to carry the twin's
+            // completion stamp. The predicate namespace codes were interned through
+            // this chunk's sink, so they are already in `ns_delta` above.
+            txn_meta: parsed.txn_meta,
             graph_delta: HashMap::new(),
             ns_split_mode,
         };

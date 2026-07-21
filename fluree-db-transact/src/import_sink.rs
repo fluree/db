@@ -596,6 +596,17 @@ mod inner {
             self.spool_ctx = Some(ctx);
         }
 
+        /// Intern a predicate IRI, returning its `(namespace_code, local_name)`.
+        /// Like [`GraphSink::term_iri`], this allocates + tracks the namespace code
+        /// so it is published in this chunk's `namespace_delta` — required when the
+        /// code names a `txn_meta` predicate (the materialize completion stamp),
+        /// whose namespace code must resolve when the commit is read back. Emits no
+        /// flake; only the code allocation is a side effect.
+        pub fn intern_meta_predicate(&mut self, iri: &str) -> (u16, String) {
+            let sid = self.ns.sid_for_iri(iri);
+            (sid.namespace_code, sid.name.to_string())
+        }
+
         /// Consume the sink and return the writer for finalization.
         ///
         /// Returns an error if any flake failed to encode during parsing.

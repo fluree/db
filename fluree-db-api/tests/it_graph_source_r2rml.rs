@@ -4551,10 +4551,13 @@ async fn materializer_driver_matches_engine_wildcard() {
 
     // Path A — the bulk materializer driver.
     let mut collector = NTriplesCollector::default();
-    let stats =
-        fluree_db_api::materialize::materialize_graph(&provider, "airlines-gs:main", &mut collector)
-            .await
-            .expect("materialize driver should succeed");
+    let stats = fluree_db_api::materialize::materialize_graph(
+        &provider,
+        "airlines-gs:main",
+        &mut collector,
+    )
+    .await
+    .expect("materialize driver should succeed");
     let driver_triples = collector.sorted_unique();
 
     // Path B — the engine `?s ?p ?o` wildcard scan, decoded to N-Triples.
@@ -4587,7 +4590,11 @@ async fn materializer_driver_matches_engine_wildcard() {
         "materializer driver triple set must equal the engine wildcard scan's"
     );
     // 3 airlines × (name + country + iata + rdf:type) = 12 triples.
-    assert_eq!(stats.total_triples(), 12, "airline mapping yields 12 triples");
+    assert_eq!(
+        stats.total_triples(),
+        12,
+        "airline mapping yields 12 triples"
+    );
     assert_eq!(driver_triples.len(), 12);
 }
 
@@ -4664,8 +4671,8 @@ async fn materializer_driver_resolves_fk_across_tables() {
 
     // Customer dim (parent) + Order fact (child, FK placedBy -> Customer).
     let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
-    customer.subject_map = SubjectMap::template("http://ex.org/customer/{c_key}")
-        .with_class("http://ex.org/Customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
     customer.predicate_object_maps = vec![PredicateObjectMap {
         predicate_map: PredicateMap::constant("http://ex.org/name"),
         object_map: ObjectMap::column("name"),
@@ -4747,7 +4754,9 @@ async fn materializer_driver_resolves_fk_across_tables() {
         "matched FK edge must be present: {triples:?}"
     );
     assert!(
-        !triples.iter().any(|t| t.contains("order/2") && t.contains("placedBy")),
+        !triples
+            .iter()
+            .any(|t| t.contains("order/2") && t.contains("placedBy")),
         "dangling FK (cust 99) must be dropped: {triples:?}"
     );
     assert_eq!(stats.ref_triples, 1, "exactly one FK edge resolves");
@@ -4772,8 +4781,8 @@ async fn materialize_builds_queryable_native_twin() {
 
     // Customer dim: name (plain string) + label (lang-tagged @en).
     let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
-    customer.subject_map = SubjectMap::template("http://ex.org/customer/{c_key}")
-        .with_class("http://ex.org/Customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
     customer.predicate_object_maps = vec![
         PredicateObjectMap {
             predicate_map: PredicateMap::constant("http://ex.org/name"),
@@ -4796,20 +4805,42 @@ async fn materialize_builds_queryable_native_twin() {
     order.predicate_object_maps = vec![
         PredicateObjectMap {
             predicate_map: PredicateMap::constant("http://ex.org/amount"),
-            object_map: ObjectMap::column_typed("amount", "http://www.w3.org/2001/XMLSchema#decimal"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
         },
         PredicateObjectMap {
             predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
-            object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
         },
     ];
     let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
 
     let cust_batch = ColumnBatch::new(
         Arc::new(BatchSchema::new(vec![
-            FieldInfo { name: "c_key".to_string(), field_type: FieldType::Int64, nullable: false, field_id: 1 },
-            FieldInfo { name: "name".to_string(), field_type: FieldType::String, nullable: true, field_id: 2 },
-            FieldInfo { name: "label".to_string(), field_type: FieldType::String, nullable: true, field_id: 3 },
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "label".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
         ])),
         vec![
             Column::Int64(vec![Some(10), Some(20)]),
@@ -4820,9 +4851,24 @@ async fn materialize_builds_queryable_native_twin() {
     .unwrap();
     let order_batch = ColumnBatch::new(
         Arc::new(BatchSchema::new(vec![
-            FieldInfo { name: "o_key".to_string(), field_type: FieldType::Int64, nullable: false, field_id: 1 },
-            FieldInfo { name: "amount".to_string(), field_type: FieldType::String, nullable: true, field_id: 2 },
-            FieldInfo { name: "cust_key".to_string(), field_type: FieldType::Int64, nullable: true, field_id: 3 },
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "amount".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
         ])),
         vec![
             Column::Int64(vec![Some(1), Some(2)]),
@@ -4869,15 +4915,13 @@ async fn materialize_builds_queryable_native_twin() {
     // Class count (parity-gate "counts" shape against the built twin).
     let orders = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Order> }").await;
     assert_eq!(orders["results"]["bindings"][0]["c"]["value"], "2");
-    let customers =
-        json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Customer> }").await;
+    let customers = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Customer> }").await;
     assert_eq!(customers["results"]["bindings"][0]["c"]["value"], "2");
 
     // Foreign-key edge fidelity: order 1 placedBy customer 10.
     let fk = json("SELECT ?c WHERE { <http://ex.org/order/1> <http://ex.org/placedBy> ?c }").await;
     assert_eq!(
-        fk["results"]["bindings"][0]["c"]["value"],
-        "http://ex.org/customer/10",
+        fk["results"]["bindings"][0]["c"]["value"], "http://ex.org/customer/10",
         "FK edge must resolve to the parent subject IRI"
     );
 
@@ -4891,10 +4935,179 @@ async fn materialize_builds_queryable_native_twin() {
     );
 
     // Language-tag fidelity: label@en round-trips value + language.
-    let lbl = json("SELECT ?l WHERE { <http://ex.org/customer/10> <http://ex.org/label> ?l }").await;
+    let lbl =
+        json("SELECT ?l WHERE { <http://ex.org/customer/10> <http://ex.org/label> ?l }").await;
     let lbl_b = &lbl["results"]["bindings"][0]["l"];
     assert_eq!(lbl_b["value"], "hola", "lang literal value must round-trip");
     assert_eq!(lbl_b["xml:lang"], "en", "language tag must round-trip");
+}
+
+/// Read the completion stamp off a ledger's HEAD commit by decoding its envelope
+/// `txn_meta`. Panics if the head commit carries no stamp.
+#[cfg(feature = "native")]
+async fn read_head_stamp(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &str,
+) -> fluree_db_api::materialize::WatermarkStamp {
+    use fluree_db_core::commit::codec::envelope::decode_envelope;
+    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
+    use fluree_db_core::ContentStore;
+
+    let rec = fluree
+        .nameservice()
+        .lookup(ledger)
+        .await
+        .expect("ns lookup")
+        .expect("ledger exists");
+    let head = rec.commit_head_id.expect("ledger has commits");
+    let raw = fluree
+        .content_store(ledger)
+        .get(&head)
+        .await
+        .expect("read head commit blob");
+    let hdr = CommitHeader::read_from(&raw).expect("commit header");
+    let start = HEADER_LEN;
+    let end = start + hdr.envelope_len as usize;
+    let env = decode_envelope(&raw[start..end]).expect("decode envelope");
+    fluree_db_api::materialize::read_stamp(&env.txn_meta)
+        .expect("head commit must carry the completion stamp")
+}
+
+/// D ROUND-TRIP: the twin's completion stamp is written to the FINAL commit's
+/// txn_meta, survives an archive_ledger → restore_ledger round-trip byte-for-byte,
+/// and parses back identically. This is the completion-marker contract — a valid
+/// twin is one whose head commit carries a parseable stamp.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialize_stamp_survives_pack_restore() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TriplesMap,
+    };
+
+    const LEDGER: &str = "test/twin-stamp:main";
+    const RESTORED: &str = "test/twin-stamp-restored:main";
+
+    // Two tables (dim + fact with an FK) → two watermark entries.
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/name"),
+        object_map: ObjectMap::column("name"),
+    }];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![PredicateObjectMap {
+        predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+        object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+    }];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+    let expected_hash = fluree_db_api::materialize::mapping_hash(&mapping);
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    // Build twin A (TIGHT bounds — machine-safety directive).
+    let src_dir = tempfile::tempdir().expect("src tmpdir");
+    let src = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source Fluree");
+    src.create(LEDGER)
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("materialize twin");
+
+    // The head commit carries the stamp; it matches the assembled stamp.
+    let stamp_a = read_head_stamp(&src, LEDGER).await;
+    assert_eq!(
+        stamp_a.mapping_hash, expected_hash,
+        "stamp mapping hash matches"
+    );
+    assert!(
+        stamp_a.builder_version.starts_with("fluree-materialize/"),
+        "builder version stamped"
+    );
+    assert_eq!(
+        stamp_a.tables.len(),
+        2,
+        "both tables in the watermark vector"
+    );
+    assert!(
+        stamp_a.tables.contains_key("dw.customer") && stamp_a.tables.contains_key("dw.orders"),
+        "watermark keyed by logical table name"
+    );
+
+    // Pack + restore into a fresh instance under a different name.
+    let mut archive: Vec<u8> = Vec::new();
+    src.archive_ledger(LEDGER, true, &mut archive)
+        .await
+        .expect("archive twin");
+    let dst_dir = tempfile::tempdir().expect("dst tmpdir");
+    let dst = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination Fluree");
+    let mut reader = std::io::Cursor::new(archive);
+    dst.restore_ledger(RESTORED, &mut reader)
+        .await
+        .expect("restore twin");
+
+    // The stamp survives byte-for-byte and parses identically.
+    let stamp_b = read_head_stamp(&dst, RESTORED).await;
+    assert_eq!(stamp_b.builder_version, stamp_a.builder_version);
+    assert_eq!(stamp_b.mapping_hash, stamp_a.mapping_hash);
+    assert_eq!(
+        stamp_b.tables, stamp_a.tables,
+        "the watermark vector survives pack/restore byte-identical"
+    );
 }
 
 /// RUNTIME GUARD: attempting a virtual materialize on a single-threaded tokio

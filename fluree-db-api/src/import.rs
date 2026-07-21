@@ -3589,8 +3589,7 @@ where
     // source (an empty placeholder). Its own bounded chunk channel provides
     // backpressure, so it counts as channel-fed (skips the permit channel).
     let is_virtual = config.virtual_source.is_some();
-    let is_channel_fed =
-        is_streaming || is_remote_parallel || is_local_rechunk || is_virtual;
+    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk || is_virtual;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.effective_parse_threads();

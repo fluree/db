@@ -13,18 +13,19 @@
 //! parity diff, or (later chunks) an ingest-sink adapter that streams the
 //! triples into the native import pipeline.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
 use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
+use fluree_db_core::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, TableWatermark};
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
 use fluree_db_r2rml::materialize::{
     emit_batch, plan, MaterializeStats, ParentIndexSet, TripleObserver,
 };
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
 use fluree_db_r2rml::{R2rmlError, RdfTerm};
 use fluree_db_transact::import::ParsedChunk;
 use fluree_db_transact::import_sink::{ImportSink, SpoolConfig, SpoolContext};
@@ -130,8 +131,7 @@ where
             .table_name()
             .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
         let projection = scan_projection(tm, &parents);
-        let lazy_index =
-            !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
+        let lazy_index = !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
         let mut stream = provider
             .scan_table(graph_source_id, table, &projection, &[], None, None)
             .await?;
@@ -264,11 +264,18 @@ pub struct VirtualChunkContext<'a> {
 /// triples (via [`ImportSinkObserver`]) instead of parsing Turtle text. `t` is
 /// the caller-assigned transaction number (`chunk_idx + 1`), matching the parse
 /// path's contract.
+///
+/// `stamp` is `Some` for exactly ONE chunk — the twin's FINAL commit — and its
+/// completion stamp is ns-encoded into this chunk's `txn_meta` through the SAME
+/// sink, so the stamp predicates' namespace codes publish in this commit's
+/// namespace_delta. Every other chunk passes `None`, leaving `txn_meta` empty
+/// (byte-identical to a text-import chunk).
 pub fn build_virtual_chunk(
     triples: &[OwnedTriple],
     ctx: &VirtualChunkContext,
     t: i64,
     chunk_idx: usize,
+    stamp: Option<&WatermarkStamp>,
 ) -> Result<ParsedChunk, MaterializeError> {
     let txn_id = format!("{}-{}", ctx.ledger_id, t);
     let mut worker_cache = WorkerCache::new(Arc::clone(ctx.shared_alloc));
@@ -289,6 +296,13 @@ pub fn build_virtual_chunk(
         }
     }
 
+    // Encode the completion stamp into THIS chunk's sink before finishing, so the
+    // stamp predicate namespace codes land in `new_codes` (→ namespace_delta).
+    let txn_meta = match stamp {
+        Some(s) => encode_stamp(&mut sink, s)?,
+        None => Vec::new(),
+    };
+
     let (writer, prefix_map, spool_ctx) = sink
         .finish()
         .map_err(|e| R2rmlError::Materialization(format!("flake encode: {e}")))?;
@@ -302,6 +316,7 @@ pub fn build_virtual_chunk(
         new_codes,
         prefix_map,
         spool_result,
+        txn_meta,
     })
 }
 
@@ -349,7 +364,12 @@ impl ChunkingObserver {
 }
 
 impl TripleObserver for ChunkingObserver {
-    fn observe(&mut self, subject: &RdfTerm, predicate: &str, object: &RdfTerm) -> Result<(), R2rmlError> {
+    fn observe(
+        &mut self,
+        subject: &RdfTerm,
+        predicate: &str,
+        object: &RdfTerm,
+    ) -> Result<(), R2rmlError> {
         self.buffer_bytes += triple_weight(subject, predicate, object);
         self.buffer
             .push((subject.clone(), predicate.to_string(), object.clone()));
@@ -440,6 +460,66 @@ fn build_watermark_stamp(
     })
 }
 
+/// Namespace of the twin's completion-stamp predicates.
+const MATERIALIZE_NS: &str = "https://ns.flur.ee/materialize#";
+/// Local names of the three stamp predicates (namespaced by [`MATERIALIZE_NS`]).
+const STAMP_PRED_BUILDER: &str = "builderVersion";
+const STAMP_PRED_MAPPING_HASH: &str = "mappingHash";
+const STAMP_PRED_WATERMARK: &str = "watermark";
+
+/// ns-encode the completion stamp into `txn_meta` entries, interning each
+/// predicate through `sink` so its namespace code is published in this chunk's
+/// namespace_delta (and thus resolves when the commit is read back). The
+/// watermark vector is stored as one deterministic JSON string (sorted by table)
+/// under `materialize:watermark`. The whole stamp must fit the 64 KiB txn_meta
+/// cap; a schema with a very large table count would need a compacter encoding
+/// (documented residual).
+fn encode_stamp(
+    sink: &mut ImportSink,
+    stamp: &WatermarkStamp,
+) -> Result<Vec<TxnMetaEntry>, MaterializeError> {
+    let watermark_json = {
+        let sorted: BTreeMap<&str, &TableWatermark> =
+            stamp.tables.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        serde_json::to_string(&sorted)
+            .map_err(|e| R2rmlError::Materialization(format!("watermark encode: {e}")))?
+    };
+    let fields = [
+        (STAMP_PRED_BUILDER, stamp.builder_version.clone()),
+        (STAMP_PRED_MAPPING_HASH, stamp.mapping_hash.clone()),
+        (STAMP_PRED_WATERMARK, watermark_json),
+    ];
+    let mut entries = Vec::with_capacity(fields.len());
+    for (local, value) in fields {
+        let (ns, name) = sink.intern_meta_predicate(&format!("{MATERIALIZE_NS}{local}"));
+        entries.push(TxnMetaEntry::new(ns, name, TxnMetaValue::String(value)));
+    }
+    Ok(entries)
+}
+
+/// Reader-side of the completion stamp: extract it from a commit's `txn_meta`, if
+/// present. A twin is valid iff a head-walk finds a commit whose txn_meta yields
+/// `Some` here (all three stamp fields present). Keys on the stable predicate
+/// LOCAL NAMES (the namespace code is per-ledger); the local names are
+/// materialize-specific, so requiring all three together identifies the stamp.
+pub fn read_stamp(txn_meta: &[TxnMetaEntry]) -> Option<WatermarkStamp> {
+    let field = |local: &str| -> Option<&str> {
+        txn_meta.iter().find_map(|e| match &e.value {
+            TxnMetaValue::String(s) if e.predicate_name == local => Some(s.as_str()),
+            _ => None,
+        })
+    };
+    let builder_version = field(STAMP_PRED_BUILDER)?.to_string();
+    let mapping_hash = field(STAMP_PRED_MAPPING_HASH)?.to_string();
+    let tables: HashMap<String, TableWatermark> =
+        serde_json::from_str(field(STAMP_PRED_WATERMARK)?).ok()?;
+    Some(WatermarkStamp {
+        builder_version,
+        mapping_hash,
+        tables,
+    })
+}
+
 /// Pin every table's Iceberg snapshot up front, before emission (DEC-003 §17(a)).
 /// Awaiting `scan_table` runs the `loadTable` + snapshot capture as the table
 /// context resolves; the returned stream is dropped unpolled, so no Parquet data
@@ -510,10 +590,13 @@ where
     }
 
     // Pass 2 — emit into the byte-budgeted chunker; encode + ship completed
-    // chunks as they close.
+    // chunks as they close. A one-chunk lookahead (`pending`) holds the most
+    // recently closed group back, so the LAST group can carry the completion
+    // stamp — the stamp lands on the final commit without an extra 0-op commit.
     let mut stats = MaterializeStats::default();
     let mut chunker = ChunkingObserver::new(chunk_size_bytes);
     let mut next_idx = 0usize;
+    let mut pending: Option<Vec<OwnedTriple>> = None;
 
     for tm_iri in &materialization.emit_order {
         let Some(tm) = mapping.triples_maps.get(tm_iri) else {
@@ -523,8 +606,7 @@ where
             .table_name()
             .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
         let projection = scan_projection(tm, &parents);
-        let lazy_index =
-            !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
+        let lazy_index = !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
         let mut stream = provider
             .scan_table(graph_source_id, table, &projection, &[], None, None)
             .await?;
@@ -535,12 +617,16 @@ where
             }
             emit_batch(tm, &batch, &parents, &mut chunker, &mut stats)?;
             while let Some(triples) = chunker.completed.pop_front() {
-                let t = (next_idx + 1) as i64;
-                let parsed = build_virtual_chunk(&triples, ctx, t, next_idx)?;
-                if !emit_chunk(next_idx, parsed) {
-                    return Ok(stats);
+                // Hold the newest group; flush the previously held group (if any)
+                // as a non-final chunk, keeping the last group for the stamp.
+                if let Some(prev) = pending.replace(triples) {
+                    let t = (next_idx + 1) as i64;
+                    let parsed = build_virtual_chunk(&prev, ctx, t, next_idx, None)?;
+                    if !emit_chunk(next_idx, parsed) {
+                        return Ok(stats);
+                    }
+                    next_idx += 1;
                 }
-                next_idx += 1;
             }
         }
     }
@@ -556,12 +642,26 @@ where
         "materialize completion stamp assembled"
     );
 
-    // Final partial chunk.
+    // Fold the trailing sub-threshold buffer into the lookahead as the final
+    // group (so it, not a held earlier group, carries the stamp).
     if let Some(triples) = chunker.take_final() {
-        let t = (next_idx + 1) as i64;
-        let parsed = build_virtual_chunk(&triples, ctx, t, next_idx)?;
-        emit_chunk(next_idx, parsed);
+        if let Some(prev) = pending.replace(triples) {
+            let t = (next_idx + 1) as i64;
+            let parsed = build_virtual_chunk(&prev, ctx, t, next_idx, None)?;
+            if !emit_chunk(next_idx, parsed) {
+                return Ok(stats);
+            }
+            next_idx += 1;
+        }
     }
+
+    // FINAL commit — carries the completion stamp. Normally the last held group;
+    // an empty stamp-only commit only for a graph that produced no triples. Being
+    // the last commit, a head-walk finds the stamp iff the build completed (§17(a)).
+    let final_triples = pending.unwrap_or_default();
+    let t = (next_idx + 1) as i64;
+    let parsed = build_virtual_chunk(&final_triples, ctx, t, next_idx, Some(&stamp))?;
+    emit_chunk(next_idx, parsed);
 
     Ok(stats)
 }

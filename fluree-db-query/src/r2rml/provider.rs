@@ -222,7 +222,10 @@ pub trait R2rmlProvider: Debug + Send + Sync {
 /// `sequence_number` are the Iceberg snapshot identifiers captured from the
 /// parsed table metadata (typed `Option`, best-effort), which the delta-sync
 /// (Deliverable 3) snapshot diff needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so the twin's completion stamp can carry the watermark vector as
+/// JSON in a commit's `txn_meta`, and delta-sync can read it back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TableWatermark {
     /// Iceberg `metadata.json` location pinned for this table this build.
     pub metadata_location: String,
