@@ -179,6 +179,19 @@ pub struct ImportConfig {
     /// shared `@context` map or already the first node. No effect on other
     /// formats. Default: [`FirstLineContextPolicy::Auto`].
     pub ndjson_first_line_context: FirstLineContextPolicy,
+    /// When set, the import materializes a virtual R2RML graph source into a
+    /// native ledger instead of parsing files (DEC-003 Deliverable 1). Carries
+    /// the provider + graph-source id; `None` for every file/remote import, so
+    /// those paths are unaffected.
+    pub(crate) virtual_source: Option<VirtualSource>,
+}
+
+/// A virtual (R2RML-over-Iceberg) graph source to materialize into a native
+/// twin: the combined provider handle plus the graph-source id to scan.
+#[derive(Clone)]
+pub(crate) struct VirtualSource {
+    pub provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
+    pub graph_source_id: String,
 }
 
 impl std::fmt::Debug for ImportConfig {
@@ -217,6 +230,7 @@ impl Default for ImportConfig {
             progress: None,
             tracker: Tracker::disabled(),
             ndjson_first_line_context: FirstLineContextPolicy::Auto,
+            virtual_source: None,
         }
     }
 }
@@ -643,6 +657,11 @@ pub(crate) enum ImportSource {
         storage: Arc<dyn StorageRead>,
         source: RemoteSource,
     },
+    /// Materialize a virtual R2RML graph source into a native ledger. The
+    /// provider + graph-source id ride on [`ImportConfig::virtual_source`]; this
+    /// marker only routes `run_import_pipeline` past file resolution to the
+    /// virtual producer arm.
+    Virtual,
 }
 
 /// Format of an individual remote object, derived from its extension.
@@ -2456,6 +2475,27 @@ impl<'a> ImportBuilder<'a> {
         }
     }
 
+    pub(crate) fn new_virtual(
+        fluree: &'a super::Fluree,
+        ledger_id: String,
+        provider: Arc<dyn crate::materialize::R2rmlBuildProvider>,
+        graph_source_id: String,
+    ) -> Self {
+        let config = ImportConfig {
+            virtual_source: Some(VirtualSource {
+                provider,
+                graph_source_id,
+            }),
+            ..ImportConfig::default()
+        };
+        Self {
+            fluree,
+            ledger_id,
+            source: ImportSource::Virtual,
+            config,
+        }
+    }
+
     /// Set the number of parallel TTL parse threads. `0` = auto (use the
     /// machine's logical cores, memory-capped). Explicit values are honored
     /// as-is (not capped to core count) with a hard floor of 1.
@@ -2635,6 +2675,27 @@ impl<'a> CreateBuilder<'a> {
     /// (sorted lexicographically), or a single `.ttl`/`.jsonld` file.
     pub fn import(self, path: impl AsRef<Path>) -> ImportBuilder<'a> {
         ImportBuilder::new(self.fluree, self.ledger_id, path.as_ref().to_path_buf())
+    }
+
+    /// Materialize a virtual R2RML graph source into this native ledger
+    /// (DEC-003 Deliverable 1). `provider` scans the source and compiles its
+    /// mapping; `graph_source_id` selects which registered source to read. The
+    /// returned [`ImportBuilder`] accepts the usual tuning.
+    ///
+    /// MACHINE-SAFETY: set explicit `.parallelism(...)` and
+    /// `.memory_budget_mb(...)` — the auto (own-the-box) defaults can OOM a
+    /// co-resident machine, and the memory budget also drives the chunk size.
+    pub fn import_r2rml<P: crate::materialize::R2rmlBuildProvider + 'static>(
+        self,
+        provider: Arc<P>,
+        graph_source_id: impl Into<String>,
+    ) -> ImportBuilder<'a> {
+        ImportBuilder::new_virtual(
+            self.fluree,
+            self.ledger_id,
+            provider,
+            graph_source_id.into(),
+        )
     }
 
     /// Attach a bulk import that streams source bytes from a remote
@@ -2892,6 +2953,11 @@ where
                     ChunkSource::Remote(producer)
                 }
             }
+            // Virtual (R2RML) source: the provider rides on
+            // `config.virtual_source`; the chunk source is an empty placeholder
+            // and `run_import_chunks` routes to the virtual producer arm when
+            // `config.virtual_source` is set.
+            ImportSource::Virtual => ChunkSource::Files(Vec::new()),
         };
 
         // ---- Phase 1: Create ledger (init nameservice) ----
@@ -3514,7 +3580,12 @@ where
     let is_remote_serial = is_remote && !remote_all_ttl;
     let is_local_rechunk = chunk_source.is_local_rechunk();
     let is_jsonld_stream = chunk_source.is_jsonld_stream();
-    let is_channel_fed = is_streaming || is_remote_parallel || is_local_rechunk;
+    // Virtual (R2RML) materialization is signaled on the config, not the chunk
+    // source (an empty placeholder). Its own bounded chunk channel provides
+    // backpressure, so it counts as channel-fed (skips the permit channel).
+    let is_virtual = config.virtual_source.is_some();
+    let is_channel_fed =
+        is_streaming || is_remote_parallel || is_local_rechunk || is_virtual;
     let estimated_total = chunk_source.estimated_len();
     let compress = config.compress_commits;
     let num_threads = config.effective_parse_threads();
@@ -3905,6 +3976,72 @@ where
         tracing::info!(
             committed_chunks = next_expected,
             "streaming import phase complete"
+        );
+    } else if is_virtual {
+        // Virtual (R2RML) source: one materializer thread scans the graph source,
+        // enumerates triples, and encodes byte-budgeted ParsedChunks that feed the
+        // SAME commit_parsed_chunks_in_order consumer + index/publish downstream as
+        // the text paths. Chunk byte-size derives from the memory budget
+        // (machine-safety); the sync-channel capacity bounds in-flight chunks. The
+        // scan is async, so the producer thread drives it via the ambient runtime
+        // handle — Handle::block_on off a DEDICATED thread (never a runtime worker),
+        // so the blocking channel sends inside it are safe.
+        let vs = config
+            .virtual_source
+            .clone()
+            .expect("is_virtual implies virtual_source is set");
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
+            std::result::Result<(usize, ParsedChunk), String>,
+        >(num_threads);
+        let chunk_size_bytes = config.effective_chunk_size_mb() as usize * 1024 * 1024;
+        let shared_alloc = Arc::clone(&shared_alloc);
+        let spool_config = Arc::clone(&spool_config);
+        let spool_dir = spool_dir.clone();
+        let ledger = alias.to_string();
+        let runtime = tokio::runtime::Handle::current();
+
+        let producer = std::thread::Builder::new()
+            .name("virtual-materializer".into())
+            .spawn(move || {
+                let ctx = crate::materialize::VirtualChunkContext {
+                    shared_alloc: &shared_alloc,
+                    ledger_id: &ledger,
+                    compress,
+                    spool_dir: &spool_dir,
+                    spool_config: Some(&spool_config),
+                };
+                let outcome = runtime.block_on(crate::materialize::drive_virtual_import(
+                    &*vs.provider,
+                    &vs.graph_source_id,
+                    chunk_size_bytes,
+                    &ctx,
+                    |idx, parsed| result_tx.send(Ok((idx, parsed))).is_ok(),
+                ));
+                if let Err(e) = outcome {
+                    let _ = result_tx.send(Err(e.to_string()));
+                }
+                // result_tx dropped here → the consumer sees EOF.
+            })
+            .map_err(|e| ImportError::Transact(format!("spawn virtual materializer: {e}")))?;
+
+        let next_expected = commit_parsed_chunks_in_order(
+            result_rx,
+            &commit_env,
+            &mut state,
+            &mut published_codes,
+            compute_ns_delta,
+            &mut sort_write_handles,
+            &mut total_commit_size,
+            &mut commit_metas,
+        )
+        .await?;
+
+        producer
+            .join()
+            .map_err(|_| ImportError::Transact("virtual materializer thread panicked".into()))?;
+        tracing::info!(
+            committed_chunks = next_expected,
+            "virtual import phase complete"
         );
     } else if is_remote_parallel || is_local_rechunk {
         // Channel-fed parallel path. Two sources share this arm:

@@ -4731,3 +4731,146 @@ async fn materializer_driver_resolves_fk_across_tables() {
     assert_eq!(stats.ref_triples, 1, "exactly one FK edge resolves");
     assert_eq!(stats.ref_dangling, 1, "order 2's FK is dangling");
 }
+
+/// END-TO-END (Chunk B complete): materialize a virtual R2RML source into a REAL
+/// native ledger through the bulk import pipeline (ImportSource::Virtual → commit
+/// → index → publish), then query the twin back and confirm term, datatype,
+/// language, and foreign-key fidelity round-trip. Tight EXPLICIT bounds per the
+/// machine-safety directive (parallelism + a small memory budget; never
+/// auto-detection). Multi-thread runtime: the virtual producer drives its async
+/// scan via Handle::block_on off a dedicated thread.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materialize_builds_queryable_native_twin() {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    const LEDGER: &str = "test/twin:main";
+
+    // Customer dim: name (plain string) + label (lang-tagged @en).
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map = SubjectMap::template("http://ex.org/customer/{c_key}")
+        .with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    // Order fact: amount (xsd:decimal) + placedBy (FK → Customer).
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed("amount", "http://www.w3.org/2001/XMLSchema#decimal"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Customer>", "cust_key", "c_key")),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo { name: "c_key".to_string(), field_type: FieldType::Int64, nullable: false, field_id: 1 },
+            FieldInfo { name: "name".to_string(), field_type: FieldType::String, nullable: true, field_id: 2 },
+            FieldInfo { name: "label".to_string(), field_type: FieldType::String, nullable: true, field_id: 3 },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+            Column::String(vec![Some("hola".to_string()), Some("mundo".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo { name: "o_key".to_string(), field_type: FieldType::Int64, nullable: false, field_id: 1 },
+            FieldInfo { name: "amount".to_string(), field_type: FieldType::String, nullable: true, field_id: 2 },
+            FieldInfo { name: "cust_key".to_string(), field_type: FieldType::Int64, nullable: true, field_id: 3 },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("9.99".to_string()), Some("5.00".to_string())]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    let provider = Arc::new(MultiTableMock { mapping, tables });
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    // Materialize the twin with TIGHT EXPLICIT bounds (machine-safety directive).
+    let result = fluree
+        .create(LEDGER)
+        .import_r2rml(provider, "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("materialize virtual twin");
+    assert!(result.root_id.is_some(), "twin index must be built");
+
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+    let json = |q: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            support::query_sparql(fluree, ledger, q)
+                .await
+                .expect("query")
+                .to_sparql_json(&ledger.snapshot)
+                .expect("sparql json")
+        }
+    };
+
+    // Class count (parity-gate "counts" shape against the built twin).
+    let orders = json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Order> }").await;
+    assert_eq!(orders["results"]["bindings"][0]["c"]["value"], "2");
+    let customers =
+        json("SELECT (COUNT(*) AS ?c) WHERE { ?s a <http://ex.org/Customer> }").await;
+    assert_eq!(customers["results"]["bindings"][0]["c"]["value"], "2");
+
+    // Foreign-key edge fidelity: order 1 placedBy customer 10.
+    let fk = json("SELECT ?c WHERE { <http://ex.org/order/1> <http://ex.org/placedBy> ?c }").await;
+    assert_eq!(
+        fk["results"]["bindings"][0]["c"]["value"],
+        "http://ex.org/customer/10",
+        "FK edge must resolve to the parent subject IRI"
+    );
+
+    // Typed-literal fidelity: xsd:decimal round-trips value + datatype.
+    let amt = json("SELECT ?a WHERE { <http://ex.org/order/1> <http://ex.org/amount> ?a }").await;
+    let amt_b = &amt["results"]["bindings"][0]["a"];
+    assert_eq!(amt_b["value"], "9.99", "decimal value must round-trip");
+    assert_eq!(
+        amt_b["datatype"], "http://www.w3.org/2001/XMLSchema#decimal",
+        "decimal datatype must round-trip (not narrowed to string)"
+    );
+
+    // Language-tag fidelity: label@en round-trips value + language.
+    let lbl = json("SELECT ?l WHERE { <http://ex.org/customer/10> <http://ex.org/label> ?l }").await;
+    let lbl_b = &lbl["results"]["bindings"][0]["l"];
+    assert_eq!(lbl_b["value"], "hola", "lang literal value must round-trip");
+    assert_eq!(lbl_b["xml:lang"], "en", "language tag must round-trip");
+}
