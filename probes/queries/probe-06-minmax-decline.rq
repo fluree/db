@@ -1,0 +1,13 @@
+# probe-06 minmax_decline_missed_stats
+# GAP: MIN/MAX are not foldable in the fused aggregate (resolve_agg_folds :1785 returns
+#   None for anything but Count/Sum/Avg) -> generic aggregate pipeline over a FULL scan.
+#   This is a DOUBLE miss: MIN/MAX of a scalar column are answerable directly from Iceberg
+#   column min/max stats (same stats the file-pruner already reads, stat_bounds :317-374),
+#   so a manifest/stats shortcut analogous to PR-1's COUNT(*) is left on the table.
+# MECHANISM that SHOULD (ideally) fire: a MIN/MAX-from-column-stats shortcut. None today.
+# PREDICTED: files_selected>0, full FACT_ORDER decode of ORDER_TOTAL, seconds-class cold —
+#   despite the answer being derivable without reading a single data file.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (MIN(?tot) AS ?lo) (MAX(?tot) AS ?hi)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot . }

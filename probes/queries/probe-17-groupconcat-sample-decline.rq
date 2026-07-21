@@ -1,0 +1,13 @@
+# probe-17 groupconcat_sample_decline
+# GAP: GROUP_CONCAT and SAMPLE are not foldable (resolve_agg_folds :1785 -> None), so a
+#   GROUP BY carrying either declines the fused path -> full materialize of the grouped
+#   columns. GROUP_CONCAT over a fact-sized group is also a memory-growth risk (the generic
+#   pipeline buffers every value per group). No corpus member uses GROUP_CONCAT or SAMPLE.
+# MECHANISM that SHOULD fire: none today; measures the decline cost + memory behavior.
+# PREDICTED: files_selected>0, full FACT_ORDER decode of the store + orderId columns; watch
+#   peak memory vs the fused COUNT sibling (q060/probe-16b).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?st (GROUP_CONCAT(?oid ; SEPARATOR=",") AS ?ids)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:store ?st ; edw:orderId ?oid . }
+GROUP BY ?st

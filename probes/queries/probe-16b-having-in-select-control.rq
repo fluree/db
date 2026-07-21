@@ -1,0 +1,11 @@
+# probe-16b having_in_select  (POSITIVE CONTROL for probe-16)
+# HAVING lifts COUNT(?o), which IS in the SELECT projection, so the outs-membership check
+#   passes and the fused aggregate + wrapping HavingOperator fire (PR-6).
+# PREDICTED: fused path (single grouped scan of FACT_ORDER store column, no full materialize),
+#   faster than probe-16. The delta is the HAVING projection-membership admission line.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?st (COUNT(?o) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:store ?st . }
+GROUP BY ?st
+HAVING (COUNT(?o) > 100)

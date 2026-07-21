@@ -1,0 +1,15 @@
+# probe-04 optional_budget_cliff
+# GAP: the LIMIT row-budget forwards through only offset/join/limit/graph/dataset/project/
+#   union/bind (F17 added UNION+BIND). OptionalOperator has NO set_row_budget impl, so it
+#   inherits the no-op default and SWALLOWS the budget: a LIMIT above an OPTIONAL does not
+#   bound the driving FACT scan.
+# MECHANISM that SHOULD fire: LIMIT budget forwarding into the required (left) child scan.
+# CONTRAST: probe-04b (same, no OPTIONAL) DOES budget-cap the scan to ~50 rows.
+# PREDICTED: full FACT_ORDER materialize (window not capped to 50), wall >> the plain
+#   LIMIT-50 form; scan_table present with large emitted-row count before the LIMIT clips.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot ?cust
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot .
+        OPTIONAL { ?o edw:customer ?cust . } }
+LIMIT 50

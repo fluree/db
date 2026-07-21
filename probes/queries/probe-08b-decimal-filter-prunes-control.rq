@@ -1,0 +1,11 @@
+# probe-08b decimal_filter_prunes  (POSITIVE CONTROL for probe-08)
+# Same selectivity as probe-08 but expressed as a range FILTER on the decimal column, which
+#   DOES lower to a ScanValue::Decimal scan filter (numeric-stats pruning, PR-7/H4, default-on).
+# PREDICTED: files_pruned>0 (only the high-debit files survive), fast. The probe-08 vs 08b
+#   delta IS the constant-object-vs-FILTER pushdown asymmetry.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?acct ?deb ?pd
+FROM <enterprise-sf01-v:main>
+WHERE { ?j a edw:GlJournalEntry ; edw:glAccountName ?acct ; edw:debitAmount ?deb ; edw:postingDate ?pd .
+        FILTER(?deb > 1000000) }
+LIMIT 5000

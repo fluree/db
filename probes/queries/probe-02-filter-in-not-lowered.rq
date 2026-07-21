@@ -1,0 +1,17 @@
+# probe-02 filter_in_not_lowered
+# GAP: there is no set-valued scan filter (ScanCmpOp has only Eq/NotEq/Lt/LtEq/Gt/GtEq,
+#   provider.rs:27-34; no ScanCmpOp::In). A FILTER(?fk IN (...)) on an FK-ref column is
+#   never lowered to an Iceberg IN-prune, even though the file-pruning BACKEND exists
+#   (Expression::In in pruning.rs:124). The FILTER runs in-engine over a FULL scan.
+# MECHANISM that SHOULD fire: an IN-set scan filter -> Expression::In can_contain_file.
+# CONTRAST: this is the FILTER-form sibling of the VALUES q040 (same H8 class). Running
+#   both confirms neither surface lowers a bounded set.
+# PREDICTED: files_pruned=0, scan_table n=1 FULL over FACT_ORDER (~all files), NOT the
+#   3-store-pruned scan an IN-push would give.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot ; edw:store ?st .
+        FILTER(?st IN (<http://data.fluree.dev/edw/store/1>,
+                       <http://data.fluree.dev/edw/store/2>,
+                       <http://data.fluree.dev/edw/store/3>)) }

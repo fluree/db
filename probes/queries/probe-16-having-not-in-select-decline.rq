@@ -1,0 +1,18 @@
+# probe-16 having_not_in_select_decline
+# GAP: PR-6 allows a HAVING in the fused aggregate ONLY when every aggregate it lifts is also
+#   in the SELECT projection (the outs-membership check, fused_aggregate.rs:405-412). A HAVING
+#   that references an aggregate NOT projected (here HAVING(SUM(?tot)>X) while only COUNT is
+#   selected) fails that check and DECLINES the whole query to the generic pipeline -> full
+#   materialize + group. A human sees "grouped count with a spend threshold" and expects the
+#   fused rollup.
+# MECHANISM that SHOULD fire: fused fold of the extra HAVING aggregate even when unprojected.
+# CONTRAST: probe-16b (HAVING(COUNT(?o)>100), the projected agg) stays fused. The 16 vs 16b
+#   delta isolates the projection-membership admission line.
+# PREDICTED: 16 declines (files_selected>0, scan_table present); 16b fuses (files_selected=0
+#   or single grouped scan, faster).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?st (COUNT(?o) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:store ?st ; edw:orderTotal ?tot . }
+GROUP BY ?st
+HAVING (SUM(?tot) > 1000000)

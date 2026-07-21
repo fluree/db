@@ -1,0 +1,519 @@
+{
+  "corpus_version": 2,
+  "description": "Wave-2 probe battery (A3 coverage-gap isolators) as a scratch survey corpus. All exec_path=from (FROM <enterprise-sf01-v:main>), all in smoke. Informational --survey only.",
+  "queries": [
+    {
+      "id": "probe-01",
+      "file": "queries/probe-01-asc-topk-cliff.rq",
+      "bi_question": "ASC top-k unsupported (DESC-only) + no budget -> files_pruned=0 vs q046 DESC",
+      "tags": [
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-02",
+      "file": "queries/probe-02-filter-in-not-lowered.rq",
+      "bi_question": "FILTER(?fk IN (...)) never lowered to Iceberg IN-prune -> full FACT scan",
+      "tags": [
+        "filter_iri",
+        "join",
+        "fk_chain",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-03",
+      "file": "queries/probe-03-scalar-values-not-lowered.rq",
+      "bi_question": "scalar VALUES un-lowered (round3b #9) -> full FACT_GL_JOURNAL scan / maybe DNF",
+      "tags": [
+        "values",
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-04",
+      "file": "queries/probe-04-optional-budget-cliff.rq",
+      "bi_question": "LIMIT budget swallowed by OPTIONAL -> window not capped vs 04b",
+      "tags": [
+        "optional",
+        "join",
+        "fk_chain",
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "FACT_SHIPMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        50
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-04b",
+      "file": "queries/probe-04b-limit-budget-control.rq",
+      "bi_question": "control: plain LIMIT budgets",
+      "tags": [
+        "count",
+        "aggregate",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        50
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-05",
+      "file": "queries/probe-05-count-distinct-decline.rq",
+      "bi_question": "COUNT(DISTINCT) declines fused + no PR-1 shortcut -> full scan vs q036 shortcut",
+      "tags": [
+        "count",
+        "distinct",
+        "aggregate"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-06",
+      "file": "queries/probe-06-minmax-decline.rq",
+      "bi_question": "MIN/MAX decline; missed column-stats shortcut -> full scan for stats-answerable query",
+      "tags": [
+        "aggregate",
+        "count"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-07",
+      "file": "queries/probe-07-timestamp-range-no-prune.rq",
+      "bi_question": "xsd:dateTime not pushable (EVENT_TS) -> files_pruned=0 on 1M fact",
+      "tags": [
+        "filter_date",
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-08",
+      "file": "queries/probe-08-decimal-constant-object-no-prune.rq",
+      "bi_question": "constant-object decimal/double/IRI no prune -> files_pruned=0 vs 08b FILTER",
+      "tags": [
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-08b",
+      "file": "queries/probe-08b-decimal-filter-prunes-control.rq",
+      "bi_question": "control: FILTER decimal prunes",
+      "tags": [
+        "filter_range",
+        "count",
+        "aggregate",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-09",
+      "file": "queries/probe-09-multi-fact-join-aggregate.rq",
+      "bi_question": "fact-fact aggregate join uncovered -> two full FACT scans; candidate DNF",
+      "tags": [
+        "join",
+        "fk_chain",
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "FACT_PAYMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-10",
+      "file": "queries/probe-10-minus-unexercised.rq",
+      "bi_question": "MINUS has zero corpus coverage -> correctness + negated-side exec",
+      "tags": [
+        "negation",
+        "aggregate",
+        "count"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "FACT_SHIPMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-11",
+      "file": "queries/probe-11-distinct-limit-budget-cliff.rq",
+      "bi_question": "DISTINCT swallows LIMIT budget -> full scan for tiny LIMIT",
+      "tags": [
+        "distinct",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        5
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-12",
+      "file": "queries/probe-12-expression-orderby-declines.rq",
+      "bi_question": "expr ORDER BY kills fused AND top-k -> files_pruned=0 vs q046",
+      "tags": [
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-13",
+      "file": "queries/probe-13-ask-existence-budget.rq",
+      "bi_question": "ASK may not forward LIMIT-1 budget -> emitted rows ~1 vs full",
+      "tags": [
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_PAYMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-14",
+      "file": "queries/probe-14-describe-crawl-fanout.rq",
+      "bi_question": "DESCRIBE may skip bound-subject prune -> scan_table n (3 vs 16)",
+      "tags": [
+        "construct",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-15",
+      "file": "queries/probe-15-deep-offset-asc-sort.rq",
+      "bi_question": "deep-OFFSET ASC pagination = full sort/page -> wall independent of OFFSET",
+      "tags": [
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "probe-16",
+      "file": "queries/probe-16-having-not-in-select-decline.rq",
+      "bi_question": "HAVING(unprojected agg) declines fused -> scan vs 16b fused",
+      "tags": [
+        "having",
+        "aggregate",
+        "group_by",
+        "count"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        100000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-16b",
+      "file": "queries/probe-16b-having-in-select-control.rq",
+      "bi_question": "control: projected-HAVING fuses",
+      "tags": [
+        "having",
+        "aggregate",
+        "group_by",
+        "count"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        100000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-17",
+      "file": "queries/probe-17-groupconcat-sample-decline.rq",
+      "bi_question": "GROUP_CONCAT/SAMPLE decline + memory -> full materialize + peak mem",
+      "tags": [
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        100000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "probe-18",
+      "file": "queries/probe-18-notexists-correlate-cost.rq",
+      "bi_question": "NOT EXISTS anti-join not batched like OPTIONAL -> scan_table n / span count on FACT_PAYMENT",
+      "tags": [
+        "negation",
+        "join"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "FACT_PAYMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from",
+      "hash_gate": "rows_only"
+    }
+  ]
+}

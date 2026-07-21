@@ -1,0 +1,12 @@
+# probe-14 describe_crawl_fanout
+# GAP (UNKNOWN): DESCRIBE <iri> must gather every predicate of one subject. The bound-subject
+#   detail path (a5528e880) prunes the crawl to the TriplesMaps whose subject template can
+#   produce the IRI (detail 16->3 tables). It is unclear whether DESCRIBE reaches that same
+#   bound-subject TriplesMap prune or fans out across all 16 per-table maps (a full-catalog
+#   crawl). No corpus member is a DESCRIBE (q002 is the SELECT-form store detail).
+# MECHANISM that SHOULD fire: bound-subject TriplesMap prune (detail path) for DESCRIBE.
+# PREDICTED: if pruned, scan_table n<=3 (only order-key-templated maps); if not, n up to 16.
+#   The scan_table n is the whole signal here.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+DESCRIBE <http://data.fluree.dev/edw/order/1>
+FROM <enterprise-sf01-v:main>

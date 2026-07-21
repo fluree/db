@@ -1,0 +1,16 @@
+# probe-08 decimal_constant_object_no_prune
+# GAP: a constant-object equality whose object is decimal/double/IRI is operator-enforced
+#   ONLY (ObjectConstant::Decimal/Double/Iri carry no scan pushdown, provider.rs:74-91;
+#   build_scan_filters pushes only ObjectConstant::Scalar, operator.rs:669-677). Yet the
+#   FILTER form of the SAME numeric comparison DOES push (ScanValue::Decimal via numeric
+#   stats, default-on). So `?j edw:debitAmount 1000000.0` (constant-object) does not prune,
+#   while `FILTER(?deb = 1000000.0)` would — a pure surface/shape asymmetry.
+# MECHANISM that SHOULD fire: decimal-aware constant-object scan pushdown.
+# CONTRAST: probe-08b (FILTER = form) prunes via numeric stats; this constant-object form
+#   does not. FACT_GL_JOURNAL debitAmount is one of the mapping's two xsd:decimal columns.
+# PREDICTED: constant-object form files_pruned=0 (full scan); FILTER form prunes (few files).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?j ?pd
+FROM <enterprise-sf01-v:main>
+WHERE { ?j a edw:GlJournalEntry ; edw:debitAmount 1000000.0 ; edw:postingDate ?pd . }
+LIMIT 5000

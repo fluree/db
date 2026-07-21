@@ -1,312 +1,106 @@
-# Fluree DB - A graph database for data that matters.
-
-Temporal, verifiable, standards-compliant, git-like branching and merging, and [optimized for AI agents](docs/ai/README.md). Integrated vector, text and geo search, and fine-grained access control with no external dependencies.
-
-RDF 1.1 / 1.2, [SPARQL](docs/guides/cookbook-sparql.md), [JSON-LD](docs/guides/cookbook-query-patterns.md), and [openCypher](docs/guides/cookbook-cypher.md) query (includes history query and other Fluree feature extensions).
-
-Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. [Benchmark leader](https://labs.flur.ee), 10.4x faster than next  database. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean.
-
-> [!NOTE]
-> **Fluree Memory** — is part of the Fluree DB CLI.
-> Persistent, searchable memory for AI coding assistants. Give Claude Code, Cursor, and other AI tools long-term project memory: facts, decisions, and preferences persist across sessions in a Fluree ledger you control — scoped per-repo or per-user, shareable via git.
-> [Fluree Memory docs →](https://labs.flur.ee/docs)
-
-## Install
-
-**Cloud / Serverless** — Run in a dedicated serverless stack at no cost at [flur.ee](https://flur.ee/solo) (usage limited), spin up dedicated servers on demand as needed. Interact seamlessly with local fluree CLI (install instructions below).
-
-**Docker** — pre-configured HTTP server, ready to accept queries on port 8090. Best for trying out the API or running Fluree as a service.
-
-```bash
-docker run -p 8090:8090 fluree/server:latest
-```
-
-**Homebrew, shell installer, or Windows PowerShell** — installs the `fluree` binary that bundles both the CLI and the embedded server (`fluree server run`).
-
-```bash
-# Homebrew (macOS / Linux)
-brew install fluree/tap/fluree
-
-# Shell installer (macOS / Linux)
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
-```
-
-Pre-built binaries and the changelog for every release are on the [GitHub Releases page](https://github.com/fluree/db/releases).
-
-## Zero to graph in 60 seconds
-
-```bash
-fluree init
-fluree create movies
-
-fluree insert '
-@prefix schema: <http://schema.org/> .
-@prefix ex:     <http://example.org/> .
-
-ex:blade-runner  a schema:Movie ;
-  schema:name        "Blade Runner" ;
-  schema:dateCreated "1982-06-25"^^<http://www.w3.org/2001/XMLSchema#date> ;
-  schema:director    ex:ridley-scott .
-
-ex:ridley-scott  a schema:Person ;
-  schema:name "Ridley Scott" .
-
-ex:alien  a schema:Movie ;
-  schema:name        "Alien" ;
-  schema:dateCreated "1979-05-25"^^<http://www.w3.org/2001/XMLSchema#date> ;
-  schema:director    ex:ridley-scott .
-'
-
-fluree query --format table 'SELECT ?title ?date WHERE {
-  ?movie a <http://schema.org/Movie> ;
-         <http://schema.org/name> ?title ;
-         <http://schema.org/dateCreated> ?date .
-} ORDER BY ?date'
-```
-
-```
-┌──────────────┬────────────┐
-│ title        │ date       │
-├──────────────┼────────────┤
-│ Alien        │ 1979-05-25 │
-│ Blade Runner │ 1982-06-25 │
-└──────────────┴────────────┘
-```
-
-That's a SPARQL query. The same query in JSON-LD:
-
-```bash
-fluree query --jsonld '{
-  "@context": { "schema": "http://schema.org/" },
-  "select": ["?title", "?date"],
-  "where": [
-    { "@id": "?movie", "@type": "schema:Movie",
-      "schema:name": "?title", "schema:dateCreated": "?date" }
-  ],
-  "orderBy": "?date"
-}'
-```
-
-And in Cypher — bare labels and properties resolve through the ledger's default `@context`, so point it at schema.org first:
-
-```bash
-fluree context set movies -e '{"@vocab": "http://schema.org/"}'
-
-fluree query --cypher -e 'MATCH (m:Movie)
-  RETURN m.name AS title, m.dateCreated AS date
-  ORDER BY date'
-```
-
-All three compile to the same engine — same features, same performance.
-
-Now update the data and query the past:
-
-```bash
-# Give every Ridley Scott movie a genre
-fluree update '
-PREFIX schema: <http://schema.org/>
-PREFIX ex:     <http://example.org/>
-INSERT { ?movie schema:genre "sci-fi" }
-WHERE  { ?movie schema:director ex:ridley-scott }
-'
-
-# What did the data look like before that update?
-fluree query --at 1 'SELECT ?title ?genre WHERE {
-  ?movie a <http://schema.org/Movie> ;
-         <http://schema.org/name> ?title .
-  OPTIONAL { ?movie <http://schema.org/genre> ?genre }
-}'
-# → Blade Runner (no genre), Alien (no genre)
-
-# And now?
-fluree query 'SELECT ?title ?genre WHERE {
-  ?movie a <http://schema.org/Movie> ;
-         <http://schema.org/name> ?title .
-  OPTIONAL { ?movie <http://schema.org/genre> ?genre }
-}'
-# → Blade Runner "sci-fi", Alien "sci-fi"
-```
-
-Every change is preserved. Query any point in history by transaction number, ISO timestamp, or commit ID.
-
-## What makes Fluree different
-
-### Time travel
-
-Every transaction is immutable. Query data as it existed at any point in time — by transaction number, ISO-8601 timestamp, or content-addressed commit ID. No special tables, no slowly-changing dimensions. It's built into the storage model.
-
-```bash
-fluree query --at 2024-06-15T00:00:00Z 'SELECT * WHERE { ?s ?p ?o }'
-```
-
-Learn more: [Time travel concepts](docs/concepts/time-travel.md), [time-travel cookbook](docs/guides/cookbook-time-travel.md).
-
-### Property graphs & edge annotations
-
-Attach properties to a *relationship*, not just a node — a `role` and `since` date on a `worksFor` edge, a `source` and `confidence` on a claim. Fluree implements the RDF 1.2 / SPARQL 1.2 annotation syntax, so you get labeled-property-graph edges, parallel relationships between the same two nodes, and RDF-star statement-level provenance on a single surface. Plain triple queries are left untouched — annotations only change cardinality when you ask for them.
-
-```sparql
-# Attach metadata to the edge itself, not to Alice or Acme
-INSERT DATA {
-  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since 2024 |} .
-}
-
-# Match the edge and its metadata together
-SELECT ?role ?since WHERE {
-  ex:alice ex:worksFor ex:acme {| ex:role ?role ; ex:since ?since |} .
-}
-```
-
-The same shape is available in JSON-LD via `@annotation`, including on edges inside named graphs.
-
-Learn more: [Edge annotations concept](docs/concepts/edge-annotations.md), [edge-annotations cookbook](docs/guides/cookbook-edge-annotations.md).
-
-### Integrated search
-
-BM25 full-text search and HNSW vector similarity are built into the query engine — not bolted-on external services. Search results participate in joins, filters, and aggregations like any other graph pattern.
-
-```json
-{
-  "@context": { "ex": "http://example.org/" },
-  "from": "mydb:main",
-  "where": [
-    { "@id": "?doc", "ex:title": "?title" },
-    ["bind", "?score", "(fulltext ?title \"knowledge graph\")"]
-  ],
-  "select": ["?doc", "?title", "?score"],
-  "orderBy": [["desc", "?score"]],
-  "limit": 10
-}
-```
-
-For dedicated BM25 / HNSW graph sources, the same query engine drives the `f:graphSource` / `f:searchText` / `f:queryVector` patterns and can be backed by an embedded index or a remote `fluree-search-httpd` service.
-
-Learn more: [BM25 full-text](docs/indexing-and-search/bm25.md), [vector search](docs/indexing-and-search/vector-search.md), [search cookbook](docs/guides/cookbook-search.md).
-
-### Git-like data management
-
-Branch, rebase, merge, push, pull — the same workflow developers already use for code, applied to data. Fork a dataset to experiment without affecting production. Merge when ready. Rebase to catch up with upstream changes. Every branch has its own independent commit history.
-
-```bash
-fluree branch create experiment
-fluree use mydb:experiment
-# ... make changes safely ...
-fluree branch rebase experiment    # catch up with main
-fluree branch merge experiment     # fast-forward merge into main
-fluree branch drop experiment      # clean up
-```
-
-Learn more: [branching cookbook](docs/guides/cookbook-branching.md), [Ledgers and the nameservice](docs/concepts/ledgers-and-nameservice.md).
-
-### Triple-level access control
-
-Policies are data in the ledger, enforced at query and transaction time. Users see only what they're authorized to see — not rows, not tables, individual facts. No application-layer filtering required.
-
-See [Policy enforcement](docs/concepts/policy-enforcement.md) for the model, the [policy cookbook](docs/guides/cookbook-policies.md) for worked examples, and [Policy model and inputs](docs/security/policy-model.md) for the reference.
-
-### Reasoning and inference
-
-RDFS subclass/subproperty reasoning, OWL 2 RL forward-chaining, and user-defined Datalog rules. The database infers facts you didn't explicitly store.
-
-Learn more: [Reasoning and inference](docs/concepts/reasoning.md), [OWL & RDFS support reference](docs/reference/owl-rdfs-support.md), [Datalog rules](docs/query/datalog-rules.md).
-
-### Standards-first
-
-Full SPARQL 1.1 with zero compliance failures against the W3C test suite. Native JSON-LD for idiomatic JSON APIs. Both query languages access the same engine with the same capabilities — time travel, policies, graph sources, and all.
-
-Learn more: [SPARQL reference](docs/query/sparql.md), [JSON-LD Query reference](docs/query/jsonld-query.md), [Standards and feature flags](docs/reference/compatibility.md).
-
-### Also worth knowing
-
-- **[SHACL validation](docs/guides/cookbook-shacl.md)** — declarative shape constraints enforced at transaction time, with violations reported per-target, per-property.
-- **[OWL ontology imports](docs/design/ontology-imports.md)** — pull external vocabularies into a ledger via `f:schemaSource` + `owl:imports`, materialized at commit time.
-- **[Apache Iceberg / R2RML](docs/graph-sources/iceberg.md)** — query Parquet warehouses and relational stores as first-class graph sources alongside native Fluree data.
-
-## Use it your way
-
-**CLI** — Explore data, script pipelines, manage ledgers from the terminal.
-```bash
-fluree query -f report.rq --format csv > output.csv
-```
-
-**HTTP Server** — Run `fluree server` for a production API with OIDC auth, content negotiation, and OpenTelemetry.
-```bash
-fluree server run
-curl -X POST http://localhost:8090/v1/fluree/query?ledger=mydb:main \
-  -H "Content-Type: application/sparql-query" \
-  -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 10'
-```
-
-**Rust library** — Embed Fluree directly in your application. No server process needed.
-```rust
-let fluree = FlureeBuilder::memory().build_memory();
-fluree.create_ledger("mydb").await?;
-
-let result = fluree.graph("mydb:main")
-    .query()
-    .sparql("SELECT ?s WHERE { ?s a <http://schema.org/Person> }")
-    .execute()
-    .await?;
-```
-
-**MCP server** — Expose Fluree to AI assistants over the Model Context Protocol.
-```bash
-fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
-```
-
-## Capabilities
-
-| | |
-|---|---|
-| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md) |
-| **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
-| **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
-| **Time travel** | [Transaction number, ISO timestamp, commit ID](docs/concepts/time-travel.md) |
-| **Full-text search** | [Integrated BM25 with Block-Max WAND](docs/indexing-and-search/bm25.md) |
-| **Vector search** | [Embedded HNSW or remote service](docs/indexing-and-search/vector-search.md) |
-| **Reasoning** | [RDFS, OWL 2 QL, OWL 2 RL, Datalog rules](docs/reference/owl-rdfs-support.md) |
-| **Access control** | [Triple-level policy enforcement](docs/concepts/policy-enforcement.md) |
-| **Geospatial** | [GeoSPARQL, S2 cell indexing](docs/indexing-and-search/geospatial.md) |
-| **Verifiability** | [JWS-signed transactions, Verifiable Credentials](docs/api/signed-requests.md) |
-| **Data sources** | [Apache Iceberg](docs/graph-sources/iceberg.md), [R2RML relational mappings](docs/graph-sources/r2rml.md) |
-| **Storage backends** | [Memory, file, AWS S3 + DynamoDB, IPFS](docs/operations/storage.md) |
-| **Replication** | [Clone, push, pull between instances](docs/operations/query-peers.md) |
-| **Branching** | [Fork ledgers, independent commit histories](docs/guides/cookbook-branching.md) |
-| **Observability** | [OpenTelemetry tracing, structured logging](docs/operations/telemetry.md) |
-| **Validation** | [SHACL shape constraints](docs/guides/cookbook-shacl.md) |
-
-## Documentation
-
-For documentation and more information, visit [labs.flur.ee/docs](https://labs.flur.ee/docs).
-
-Full documentation also lives in [`docs/`](docs/README.md):
-
-- [Getting started](docs/getting-started/README.md) — Install, create a ledger, write and query data
-- [Fluree for SQL developers](docs/getting-started/fluree-for-sql-developers.md) — Coming from relational? Start here
-- [End-to-end tutorial](docs/getting-started/tutorial-end-to-end.md) — Build a knowledge base using search, time travel, branching, and policies
-- [Concepts](docs/concepts/README.md) — Time travel, graph sources, policies, verifiable data
-- [Guides](docs/guides/) — Practical cookbooks for [search](docs/guides/cookbook-search.md), [time travel](docs/guides/cookbook-time-travel.md), [branching](docs/guides/cookbook-branching.md), [policies](docs/guides/cookbook-policies.md), and [SHACL validation](docs/guides/cookbook-shacl.md)
-- [Query languages](docs/query/README.md) — SPARQL and JSON-LD query reference
-- [Transactions](docs/transactions/README.md) — Insert, upsert, update patterns
-- [CLI reference](docs/cli/README.md) — All commands and options
-- [HTTP API](docs/api/README.md) — Server endpoints and authentication
-- [Operations](docs/operations/README.md) — Configuration, deployment, telemetry
-- [Contributing](docs/contributing/README.md) — Build from source, run tests, PR workflow
-- [Benchmarking](BENCHMARKING.md) — Run, understand, and add performance benchmarks
-
-### For AI agents
-
-The published docs are available as LLM-readable text following the [`llms.txt`](https://llmstxt.org) convention:
-
-- Curated index: https://fluree.github.io/db/llms.txt
-- Full corpus: https://fluree.github.io/db/llms-full.txt
-
-## License
-
-Licensed under the [Business Source License 1.1](LICENSE), with a Change Date
-to Apache License 2.0 as specified in that file.
+# Virtual-dataset audit — R2RML / Iceberg / S3-Parquet read path (2026-07)
+
+This directory is the durable, outward-facing record of a technical audit of Fluree
+`db`'s **virtual dataset** read path: SPARQL / JSON-LD queries answered live over
+R2RML-mapped Apache Iceberg tables backed by S3 Parquet, without materializing the
+data into a native ledger. It was produced by a structured audit + implementation
+program that traced the engine, benchmarked it against a native oracle on a live
+Snowflake-managed Iceberg dataset, adversarially verified every headline claim, and
+sequenced a recommendations ladder — Tiers 0-2 of which were implemented as the
+consolidated PRs these documents accompany.
+
+Every claim in these documents carries an inline receipt label:
+
+- `READ(file:line)` — read directly in the source at the audit tip
+- `MEASURED` — measured this session (bench run, `du`, live query)
+- `AWS(api)` — a live AWS CLI/API call
+- `WEB(url)` — an external source
+- `PR(url)` — a GitHub receipt
+- `INFERRED` — reasoning from the above
+- `RELAYED(...)` — verified in a companion document of this set; cited, not re-derived
+- References to `prior` assessments (`deployed-forensics`, `strategy slate`, `A-doc`) are provenance labels for internal working papers that predate this set and are not published here
+
+Audit tip: `feat/lambda-usability = 10e073fe9` (PR #1514). Baseline: `main`
+(virtual path identical to the #1450 merge `a49ac3fc2`). Bench dataset: a synthetic
+enterprise data-warehouse star (`ENTERPRISE_DEMO.DW`, `data.fluree.dev` vocabulary)
+at scale factors sf01 and sf20 (200×). No customer data appears anywhere in this
+corpus.
+
+## Reading order
+
+1. **`00-MASTER-AUDIT.md`** — the flagship. Executive summary, the findings catalog
+   (F-AUD-1..22), the empirical results, the materialization and third-way-strategy
+   framing, and the Tier-0→Tier-3 recommendations ladder with implementation status.
+   Start here; §0 is a 10-minute read of every verdict.
+
+### Architecture & coverage (the "what the engine is" layer)
+
+- `A1-architecture.md` — definitive architecture + data-flow map of the read path
+  (entry → planner/rewrite → operators → provider seam → Iceberg catalog/IO/decode),
+  plus the cache inventory and concurrency/memory model.
+- `A2-strategy-inventory.md` — every shipped optimization mechanism, mapped to its
+  PR/wave and switch.
+- `A3-coverage-matrix.md` — where optimization coverage is sparse or missing across
+  query shapes, folds, surfaces, and Iceberg features. Cross-references the probe
+  battery in `probes/`.
+- `B1-sota-comparison.md` — the read path vs. the state of the art (DataFusion,
+  apache/iceberg-rust), the honest DataFusion-adoption pricing (Step-1 vs Step-2),
+  and the capability gap table. Appendix D covers the arrow/iceberg-rust enablers.
+
+### Empirical results (the "what it measures" layer)
+
+- `C1-constraint-envelope.md` — the serverless (AWS Lambda) constraint envelope: the
+  deployed 180s cap + 20s heartbeat + 300s deadline reality, the query-class × wall
+  matrix, and the families that remain over the wall.
+- `C2-bench-wave1.md` — wave-1 corpus benchmark: parity (0 hash mismatches; 45/45
+  deterministic queries byte-identical native == virtual), the fused-aggregate cost
+  regime, and the stale-baseline finding.
+- `C2b-bench-wave2-probes.md` — wave-2 probe battery results: every predicted
+  coverage gap reproduced live, and the cross-surface (SPARQL == JSON-LD) proof.
+- `C3-materialization-facts.md` — fact base for materializing Iceberg into native
+  ledgers (build/serve/sync arithmetic, the pack substrate, size/time anchors).
+- `C4-solo-pipelines.md` — map of the serverless ingestion / materialization
+  pipelines the strategy options build on.
+
+### Verification (independent adversarial passes — high review value)
+
+- `V1-mor-verification.md` — verification of the merge-on-read delete-file gap
+  (correctness finding F-AUD-1), with live AWS metadata measurement.
+- `V2-membudget-verification.md` — verification of the scan-path memory-budget blind
+  spot (F-AUD-3), an attempt-to-refute that failed.
+- `RT1-redteam.md` — red-team of the strategic core (the DataFusion routing trace
+  that reframed the Step-1/Step-2 recommendation).
+- `RT2-redteam-empirics.md` — red-team recomputation of the empirical headline
+  numbers (the per-core ceiling arithmetic, the baseline-staleness floor).
+
+### Strategy
+
+- `D1-strategy-options.md` — the design space of "third-way" acceleration strategies
+  (result cache, warm tier, sidecar cubes, MPP, native-twin promotion, async), each
+  graded against the residual timeout families, with the snapshot-keyed correctness
+  lemma and the dominance/composition insights.
+
+### Parity (browse-path serialization & shape verification)
+
+- `parity/P1-serializer-verify.md` — the crawl-formatter serialization defect chain.
+- `parity/P2-boundsubject-pathmap.md` — the three bound-term code paths and the
+  VALUES-drop correctness hazard.
+- `parity/P3-shape-matrix-empirical.md` — 23 live browse queries vs. the native twin.
+- `parity/P4-famc-probe.md` — the two production-DNF shapes, code trace + measurement.
+
+### Implementation-phase reviews
+
+- `pr-reviews-impl.md` — the adversarial diff reviews of the implementation PRs
+  (the MoR guard, the memory-budget cluster, the coverage widenings, the harness/trust
+  layer, the browse-parity package, and the materialization-builder).
+
+### Reproducibility artifacts
+
+- `probes/` — the runnable coverage-gap probe battery: `probes.md` (the human-readable
+  battery description + priority order), `manifest.json` (the survey corpus manifest),
+  and `queries/*.rq` (21 SPARQL probes, 18 gap-isolators + 3 controls).
+- `data/` — benchmark run records (JSONL): `native-full-*` and `virtual-full-*` are
+  the wave-1 parity run (the 0-mismatch receipt); `virtual-rebless-merged` is the
+  re-blessed baseline; `probe-survey.*` are the wave-2 probe telemetry. Bench-host and
+  local-home identifiers in the run metadata have been neutralized; all measurement
+  fields are intact.

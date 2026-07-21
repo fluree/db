@@ -1,0 +1,15 @@
+# probe-01 asc_topk_cliff
+# GAP: scan-side top-k is DESCENDING-only (ScanTopK doc, provider.rs:106-122); an
+#   ASC ORDER BY ... LIMIT gets NEITHER a scan-side top-k NOR a LIMIT row-budget
+#   (SortOperator has no set_row_budget impl), so it degrades to a FULL scan + full sort.
+# MECHANISM that SHOULD fire (but won't): PR-5 scan-side top-k (resolve_topk_directive).
+# CONTRAST: q046 (DESC(?tot) LIMIT 10) prunes to a few files. This is byte-identical
+#   except ASC, isolating the direction asymmetry.
+# PREDICTED: files_pruned=0, scan_table n=1 FULL (all FACT_ORDER files), wall ~ q046-cold
+#   WITHOUT top-k (seconds-to-tens-of-seconds, not the sub-second q046 DESC path).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+ORDER BY ASC(?tot) ?oid
+LIMIT 10

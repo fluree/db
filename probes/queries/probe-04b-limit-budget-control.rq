@@ -1,0 +1,11 @@
+# probe-04b limit_budget_control  (POSITIVE CONTROL for probe-04)
+# Same as probe-04 but WITHOUT the OPTIONAL. Here the LIMIT budget DOES forward into the
+#   R2RML scan (FLUREE_R2RML_LIMIT_PUSHDOWN default-on), so the scan window is capped to
+#   the remaining budget and stops early.
+# PREDICTED: scan window capped ~50 rows, wall sub-second/fast, small emitted count. The
+#   probe-04 vs probe-04b delta IS the OPTIONAL budget-forwarding cliff.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+LIMIT 50

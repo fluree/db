@@ -1,0 +1,16 @@
+# probe-03 scalar_values_not_lowered
+# GAP: a VALUES binding a SCALAR-ATTRIBUTE var (not a FK-ref) is still pass-through in the
+#   rewrite (rewrite.rs:231) and never becomes a scan filter (build_scan_filters reads only
+#   FILTER/object_constant/star_constraints, operator.rs:597-666). This is the exact
+#   the round-3b forensics #9 shape (VALUES ?glAccountName over the ~50M FACT_GL_JOURNAL) that
+#   logged 183s of silence then deadline-cancelled. NOTE ALSO: ValuesOperator's nested loop
+#   has ZERO check_cancelled (values.rs), so the O(N*K) fallback is uninterruptible.
+# MECHANISM that SHOULD fire: scalar-column IN-set push (the simpler, non-ref VALUES case).
+# PREDICTED: files_pruned=0, FULL FACT_GL_JOURNAL scan; if the SF01 micro-layout is used,
+#   thousands of iceberg.parquet_read spans (cf. q040=6529). May hit timeout_s.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?acct (SUM(?deb) AS ?tot)
+FROM <enterprise-sf01-v:main>
+WHERE { VALUES ?acct { "4000 - Revenue" "5000 - COGS" "6000 - Opex" }
+        ?j a edw:GlJournalEntry ; edw:glAccountName ?acct ; edw:debitAmount ?deb . }
+GROUP BY ?acct

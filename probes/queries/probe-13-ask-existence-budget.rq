@@ -1,0 +1,13 @@
+# probe-13 ask_existence_budget
+# GAP (UNKNOWN): an ASK is logically a LIMIT-1 existence check — the first matching row can
+#   terminate the scan. It is unclear whether the ASK lowering injects a row-budget of 1 into
+#   the R2RML scan or materializes the whole predicate before testing non-emptiness. No corpus
+#   member is an ASK. The FILTER here is a decimal range that DOES prune (probe-08b), so if the
+#   scan is also budget-1 the answer is nearly free; if not, it drains the pruned set.
+# MECHANISM that SHOULD fire: LIMIT-1 budget forwarding for ASK.
+# PREDICTED: correct boolean; telemetry reveals whether emitted rows are ~1 (budgeted) or the
+#   full matching set (unbudgeted existence). Compare emitted-count to probe-08b.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+ASK
+FROM <enterprise-sf01-v:main>
+WHERE { ?j a edw:GlJournalEntry ; edw:debitAmount ?deb . FILTER(?deb > 1000000) }

@@ -1,0 +1,15 @@
+# probe-11 distinct_limit_budget_cliff
+# GAP: DistinctOperator has no set_row_budget impl -> a `SELECT DISTINCT ... LIMIT k` does
+#   not forward the budget to the scan. Even though only a handful of distinct stores exist
+#   (and k=5 is met almost immediately), the FULL FACT_ORDER is scanned before DISTINCT can
+#   know it is done. (Defensible in the worst case, but a low-cardinality DISTINCT+small-LIMIT
+#   is a classic early-stop opportunity the scan never gets.)
+# MECHANISM that SHOULD fire: budget/early-stop once k distinct values are seen.
+# CONTRAST: q047 (distinct_channels_limit) is the corpus cousin; this isolates the LIMIT.
+# PREDICTED: files_selected>0, full FACT_ORDER scan of the store column, wall NOT bounded by
+#   the tiny LIMIT.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT DISTINCT ?st
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:store ?st . }
+LIMIT 5

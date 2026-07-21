@@ -1,0 +1,17 @@
+# probe-09 multi_fact_join_aggregate
+# GAP: the fused-aggregate JOIN fold (E2) expects a fact -> DIM chain that order_chain can
+#   shape into a tree (rewrite/order_chain declines on branch/merge/cycle). A FACT -> FACT
+#   join (Order joined to Payment on the order FK, aggregating a payment measure) is not the
+#   fact-dim shape, and NO corpus member joins two FACT tables in an aggregate (verified:
+#   only q015/q016/q017/q068 relate two facts, all via a single FK in OPTIONAL/anti-join/crawl
+#   shapes, none an aggregate). Predicted: fused declines; the generic join materializes BOTH
+#   FACT_ORDER and FACT_PAYMENT in full, then folds.
+# MECHANISM that SHOULD (ideally) fire: a fact-fact join fold, or at least budgeted streaming.
+# PREDICTED: two large scan_table spans (FACT_ORDER + FACT_PAYMENT), no fused shortcut,
+#   seconds-to-tens-of-seconds cold; a candidate DNF at scale.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid (SUM(?amt) AS ?paid)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid .
+        ?p a edw:Payment ; edw:order ?o ; edw:amount ?amt . }
+GROUP BY ?oid

@@ -1,0 +1,15 @@
+# probe-05 count_distinct_decline
+# GAP: the fused aggregate admits only multiset COUNT/COUNT(col)/SUM(List)/AVG(List)
+#   (fused_aggregate.rs:385-393); COUNT(DISTINCT ...) is the unmatched CountDistinct
+#   variant and DECLINES to the generic aggregate pipeline -> full materialize + dedup.
+#   The COUNT(*) manifest shortcut (PR-1, table_row_count) also does NOT apply.
+# MECHANISM that SHOULD (ideally) fire: none today for DISTINCT; the point is to measure
+#   the decline cost vs the bare-COUNT shortcut.
+# CONTRAST: q036 (bare COUNT of orders) answers from manifest record_count (files_selected=0,
+#   scan spans MISSING). This DISTINCT variant must scan.
+# PREDICTED: files_selected>0, r2rml.scan_table span PRESENT (no manifest shortcut), full
+#   FACT_ORDER decode of the store column, seconds-class on cold.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(DISTINCT ?st) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:store ?st . }

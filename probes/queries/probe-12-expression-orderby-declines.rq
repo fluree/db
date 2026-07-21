@@ -1,0 +1,17 @@
+# probe-12 expression_orderby_declines_topk_and_fused
+# GAP: an expression ORDER BY (a synthetic sort var / order_bind) blocks BOTH fast paths:
+#   detect_fused_r2rml_aggregate declines when order_binds is non-empty (fused_aggregate.rs:316),
+#   and resolve_topk_directive only maps a bare object/star-binding var to a scan column
+#   (operator.rs:603-611) — an arithmetic sort key resolves to no single pushable column.
+#   So `ORDER BY DESC(?tot * 1) LIMIT 10`, which a human reads as the same top-k as q046,
+#   silently loses the scan-side top-k and runs a full scan + full sort.
+# MECHANISM that SHOULD fire: top-k over the base column when the sort expression is a
+#   monotone function of one scan column (not attempted today).
+# PREDICTED: files_pruned=0, full FACT_ORDER scan + full sort, wall ~ q046-without-topk.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot .
+        BIND(?tot + 0.0 AS ?sortkey) }
+ORDER BY DESC(?sortkey) ?oid
+LIMIT 10

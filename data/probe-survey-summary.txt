@@ -1,0 +1,22 @@
+probe     st       wall_s    rows scan cm   fsel  fprun   parq
+probe-01  ok         0.28      10    1  0      0      0   7670
+probe-02  ok         0.62    1100    2  0      0      0   7671
+probe-03  ok         0.56       0    1  0      0      0   7670
+probe-04  dnf       120.0       0  163  0      0      01238908
+probe-04b ok         0.02      50    1  0      0      0     18
+probe-05  ok         0.22       1    2  0      0      0   7671
+probe-06  ok         0.22       1    1  0      0      0   7670
+probe-07  ok         0.13    5000    1  0      0      0    822
+probe-08  ok          0.2       0    1  0      0      0   7670
+probe-08b ok         1.72       0    1  0      0   7670      0
+probe-09  ok         1.02  120719    2  0      0      0  15340
+probe-10  ok          3.7    5000    3  0      3      0      3
+probe-11  ok         0.46       5    2  0      0      0   7671
+probe-12  ok         0.41      10    1  0      0      0   7670
+probe-13  ok         1.76       1    1  0      0   7670      0
+probe-14  ok        10.16       1   25  0      0      0  69046
+probe-15  ok         0.28      20    1  0      0      0   7670
+probe-16  ok         0.27      15    2  0      0      0   7671
+probe-16b ok         0.22     500    2  0      0      0   7671
+probe-17  ok         0.32     500    2  0      0      0   7671
+probe-18  ok          0.7    5000    3  0      0      0  23010

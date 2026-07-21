@@ -1,0 +1,17 @@
+# probe-07 timestamp_range_no_prune
+# GAP: xsd:dateTime has no ScanValue variant (provider.rs:44-70) and no stat_bounds arm
+#   (pruning.rs:317-374 covers bool/int32/int64/date/float/double/decimal/string only). The
+#   sole dateTime column in the mapping is FACT_WEB_EVENT.EVENT_TS (edw:eventTs, mapping:235)
+#   on the ~1M-row web-event fact. A dateTime range FILTER cannot produce a scan filter, so
+#   it prunes NOTHING (unlike xsd:date, which prunes via the Int32->Date arm).
+# MECHANISM that SHOULD fire: a Timestamp ScanValue + Int64/micros stat_bounds arm.
+# CONTRAST: a date-column range (e.g. q020/q030 posting/event DATE) prunes; swapping to the
+#   dateTime column with time-of-day does not.
+# PREDICTED: files_pruned=0, FULL FACT_WEB_EVENT scan, seconds-class cold on 1M rows.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?e ?et
+FROM <enterprise-sf01-v:main>
+WHERE { ?e a edw:WebEvent ; edw:eventType ?et ; edw:eventTs ?ts .
+        FILTER(?ts > "2024-06-01T00:00:00Z"^^xsd:dateTime) }
+LIMIT 5000

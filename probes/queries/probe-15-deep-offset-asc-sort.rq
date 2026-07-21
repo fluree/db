@@ -1,0 +1,16 @@
+# probe-15 deep_offset_asc_sort
+# GAP: OFFSET forwards budget as k+offset (offset.rs:145-147), but the sort above it is ASC
+#   (no scan-side top-k) and SortOperator swallows the budget anyway, so a deep-OFFSET
+#   paginated ORDER BY over a fact reads and sorts the WHOLE table for every page. This is the
+#   pathological pagination shape a UI "page 5000" produces.
+# MECHANISM that SHOULD fire: for ASC, none (top-k is DESC-only); ideally a budget of
+#   (LIMIT+OFFSET) into a scan-side bounded sort.
+# PREDICTED: full FACT_ORDER scan + full sort regardless of how deep the OFFSET is; wall
+#   independent of page number (all pages equally expensive).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid . }
+ORDER BY ASC(?oid)
+LIMIT 20
+OFFSET 100000

@@ -1,0 +1,17 @@
+# probe-10 minus_unexercised
+# GAP: SPARQL MINUS has ZERO corpus members (the two "negation" members q017/q053 are both
+#   FILTER NOT EXISTS, which has different variable-scoping semantics). MINUS recurses in the
+#   rewrite (rewrite.rs:175-196 lowers the inner triples) but the anti-join itself is generic
+#   and MinusOperator has no set_row_budget (swallows the LIMIT). This probe establishes
+#   whether MINUS on virtual (a) returns correct rows and (b) how the negated fact side is
+#   executed (single materialize vs per-row correlate).
+# MECHANISM that SHOULD fire: batched anti-join (cf. correlated-OPTIONAL PR-4b/4c/4d); MINUS
+#   is NOT known to share that batching.
+# PREDICTED: correct rows; DIM_CUSTOMER driver is small so wall is modest, but the negated
+#   side's execution (scan_table count) reveals whether MINUS reuses the OPTIONAL batching.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cid
+FROM <enterprise-sf01-v:main>
+WHERE { ?c a edw:Customer ; edw:customerId ?cid ; edw:isCurrent true .
+        MINUS { ?c edw:isCurrent false . } }
+LIMIT 5000

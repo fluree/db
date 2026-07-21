@@ -1,0 +1,17 @@
+# probe-18 notexists_correlate_cost
+# GAP: FILTER NOT EXISTS lowers its inner triples (rewrite.rs:175-196) but the anti-join is
+#   generic and is NOT known to share the batched-correlated machinery (PR-4b/4c/4d) built for
+#   OPTIONAL. q017/q053 are the corpus tail members of exactly this shape. This probe stresses
+#   the OTHER direction (a FACT driver with a FACT existence check) to see whether the negated
+#   FACT_PAYMENT side is materialized once (hash anti-join) or re-scanned per outer order
+#   (correlated) — the difference between seconds and DNF on a ~fact-sized driver.
+# MECHANISM that SHOULD fire: a single-materialize hash anti-join, or budgeted correlation.
+# PREDICTED: if per-row correlated, scan_table on FACT_PAYMENT fires many times / huge span
+#   count -> likely timeout; if hash, two bounded scans. Telemetry (scan_table n, span count)
+#   discriminates.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:orderId ?oid .
+        FILTER NOT EXISTS { ?p a edw:Payment ; edw:order ?o . } }
+LIMIT 5000
