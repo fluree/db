@@ -5110,6 +5110,242 @@ async fn materialize_stamp_survives_pack_restore() {
     );
 }
 
+/// A dim + fact mock covering IRI, plain-string, lang-tagged, typed-decimal, and
+/// foreign-key-IRI objects — the parity-gate verification fixture.
+#[cfg(feature = "native")]
+fn verify_fixture_provider() -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    };
+
+    let mut customer = TriplesMap::new("<#Customer>", "dw.customer");
+    customer.subject_map =
+        SubjectMap::template("http://ex.org/customer/{c_key}").with_class("http://ex.org/Customer");
+    customer.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/name"),
+            object_map: ObjectMap::column("name"),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/label"),
+            object_map: ObjectMap::Column {
+                column: "label".to_string(),
+                datatype: None,
+                language: Some("en".to_string()),
+                term_type: TermType::Literal,
+            },
+        },
+    ];
+    let mut order = TriplesMap::new("<#Order>", "dw.orders");
+    order.subject_map =
+        SubjectMap::template("http://ex.org/order/{o_key}").with_class("http://ex.org/Order");
+    order.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/amount"),
+            object_map: ObjectMap::column_typed(
+                "amount",
+                "http://www.w3.org/2001/XMLSchema#decimal",
+            ),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/placedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Customer>",
+                "cust_key",
+                "c_key",
+            )),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![customer, order]));
+
+    let cust_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "c_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "name".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "label".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(10), Some(20)]),
+            Column::String(vec![Some("Acme".to_string()), Some("Globex".to_string())]),
+            Column::String(vec![Some("hola".to_string()), Some("mundo".to_string())]),
+        ],
+    )
+    .unwrap();
+    let order_batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "o_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "amount".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "cust_key".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2)]),
+            Column::String(vec![Some("9.99".to_string()), Some("5.00".to_string())]),
+            Column::Int64(vec![Some(10), Some(20)]),
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.customer".to_string(), vec![cust_batch]);
+    tables.insert("dw.orders".to_string(), vec![order_batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// PARITY GATE — pass case: a faithfully built twin matches its virtual source
+/// under both `Quick` (class counts + stratified sample) and `Full` (full-triple
+/// diff). Proves the twin-side N-Triples reader renders IRI, plain-string,
+/// lang-tagged, typed-decimal, and FK-IRI objects identically to the enumerator.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_passes_on_faithful_twin() {
+    use fluree_db_api::materialize::{verify_twin, VerifyMode};
+
+    const LEDGER: &str = "test/verify-pass:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    for mode in [VerifyMode::Quick, VerifyMode::Full] {
+        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode)
+            .await
+            .expect("verify");
+        assert!(
+            report.passed,
+            "a faithful twin must pass {mode:?}; failures: {:?}",
+            report.failures()
+        );
+        // Both classes are present and counted, and per-property is skip-with-note.
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|c| c.name == "count:http://ex.org/Order"),
+            "class-count check ran for Order"
+        );
+        assert!(
+            report.checks.iter().any(|c| c.name == "per-property-counts"
+                && matches!(
+                    c.outcome,
+                    fluree_db_api::materialize::CheckOutcome::Skipped { .. }
+                )),
+            "per-property counts are skipped-with-note"
+        );
+    }
+}
+
+/// PARITY GATE — negative case: a twin corrupted after build (a spurious extra
+/// instance injected) must FAIL the gate. The class-count check catches the
+/// cardinality change, and `Full` reports the extra triple.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_fails_on_corrupted_twin() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-corrupt:main";
+    let provider = verify_fixture_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // Corrupt the twin: inject an Order that the virtual source does not have.
+    let extra = serde_json::json!({
+        "@id": "http://ex.org/order/999",
+        "@type": "http://ex.org/Order"
+    });
+    let committed = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("inject spurious order");
+
+    let report = verify_twin(
+        &fluree,
+        &committed.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+    )
+    .await
+    .expect("verify");
+    assert!(!report.passed, "a corrupted twin must FAIL the gate");
+
+    // The Order class count mismatches (twin=3, source=2), and the full diff
+    // reports exactly the one extra twin triple.
+    let order_count = report
+        .checks
+        .iter()
+        .find(|c| c.name == "count:http://ex.org/Order")
+        .expect("Order count check present");
+    assert_eq!(
+        order_count.outcome,
+        CheckOutcome::Mismatch { source: 2, twin: 3 },
+        "the injected Order must show as a count mismatch"
+    );
+    let full = report
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert!(
+        matches!(
+            full.outcome,
+            CheckOutcome::TripleDiff { extra_in_twin, .. } if extra_in_twin >= 1
+        ),
+        "the full diff must report the extra twin triple, got {:?}",
+        full.outcome
+    );
+}
+
 /// RUNTIME GUARD: attempting a virtual materialize on a single-threaded tokio
 /// runtime must fail loud with a typed error, NOT deadlock in the producer's
 /// block_on. Production servers and the CLI run multi-thread; this guards a

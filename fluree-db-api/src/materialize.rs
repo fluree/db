@@ -13,7 +13,7 @@
 //! parity diff, or (later chunks) an ingest-sink adapter that streams the
 //! triples into the native import pipeline.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ use fluree_db_core::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, TableWatermark};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
 use fluree_db_r2rml::materialize::{
-    emit_batch, plan, MaterializeStats, ParentIndexSet, TripleObserver,
+    emit_batch, plan, MaterializeStats, NTriplesCollector, ParentIndexSet, TripleObserver,
 };
 use fluree_db_r2rml::{R2rmlError, RdfTerm};
 use fluree_db_transact::import::ParsedChunk;
@@ -664,6 +664,380 @@ where
     emit_chunk(next_idx, parsed);
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Parity gate: verify the built twin against its virtual source (DEC-003 §8)
+// ---------------------------------------------------------------------------
+
+/// How thoroughly to verify a built twin against its virtual source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Always-on default: class counts + a stratified per-subject sample.
+    Quick,
+    /// The full-triple diff — every source triple must be present in the twin and
+    /// vice-versa. Reuses the Chunk-A enumerator as the oracle side.
+    Full,
+}
+
+/// Outcome of one parity check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// Source and twin agree.
+    Match,
+    /// A count differs between the source and the twin.
+    Mismatch { source: u64, twin: u64 },
+    /// Triple sets differ (full or per-subject sample).
+    TripleDiff {
+        missing_in_twin: usize,
+        extra_in_twin: usize,
+    },
+    /// Deliberately not run (with a reason) — e.g. per-property counts that need
+    /// a manifest-sound fast path not available in this run.
+    Skipped { reason: String },
+}
+
+impl CheckOutcome {
+    /// A check passes if it matched or was deliberately skipped.
+    fn passed(&self) -> bool {
+        matches!(self, CheckOutcome::Match | CheckOutcome::Skipped { .. })
+    }
+}
+
+/// One named parity check and its outcome.
+#[derive(Debug, Clone)]
+pub struct ParityCheck {
+    pub name: String,
+    pub outcome: CheckOutcome,
+}
+
+/// The result of verifying a twin: the per-check breakdown and whether the whole
+/// gate passed. A failing gate means the twin must NOT be announced (the build is
+/// reported FAILED). Because verification needs a queryable — hence already
+/// published — twin, the sound ordering is publish-then-verify-then-drop-on-fail:
+/// the CLI/orchestrator drops (retracts) the twin when `passed` is false.
+#[derive(Debug, Clone)]
+pub struct ParityReport {
+    pub passed: bool,
+    pub checks: Vec<ParityCheck>,
+}
+
+impl ParityReport {
+    /// Human-readable summary of the failing checks (empty when passed).
+    pub fn failures(&self) -> Vec<&ParityCheck> {
+        self.checks.iter().filter(|c| !c.outcome.passed()).collect()
+    }
+}
+
+/// Subjects per class fully compared by the stratified sample (deterministic:
+/// the lexicographically first N subjects of each class).
+const SAMPLE_SUBJECTS_PER_CLASS: usize = 3;
+
+/// Verify a built native twin against its virtual R2RML source at the pinned
+/// snapshots (DEC-003 §8). The virtual side is the Chunk-A enumerator (the
+/// oracle the twin was built from); the twin side is a native wildcard query.
+/// Both are rendered to the SAME N-Triples form and compared:
+///
+/// - **Class counts (always-on):** the `rdf:type` → class triple count per class
+///   must match. Catches the realistic builder-bug classes (dropped batches,
+///   double writes, missed tables).
+/// - **Per-property counts:** skipped-with-note here — the manifest-sound
+///   non-nullable fast path (DEC-003 §5) is a real-Iceberg optimization, not run
+///   over the enumeration oracle.
+/// - **Stratified sample (`Quick`, always-on):** the full triple set of the first
+///   [`SAMPLE_SUBJECTS_PER_CLASS`] subjects of each class must match — a value-
+///   level node compare that surfaces any systematic transform bug.
+/// - **Full diff (`Full`):** every source triple is in the twin and vice-versa.
+///
+/// Returns the report; the caller decides whether to announce or drop the twin.
+pub async fn verify_twin<P>(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    provider: &P,
+    graph_source_id: &str,
+    mode: VerifyMode,
+) -> Result<ParityReport, MaterializeError>
+where
+    P: R2rmlProvider + R2rmlTableProvider,
+{
+    // Virtual oracle: enumerate the source into N-Triples (the twin was built
+    // from this exact enumeration, so it is the ground truth to diff against).
+    // Both sides are numeric-canonicalized so a value-preserving typed-literal
+    // normalization (e.g. a stored `xsd:decimal` re-rendering "5.00" as "5") is
+    // not misreported as a divergence.
+    let mut collector = NTriplesCollector::default();
+    materialize_graph(provider, graph_source_id, &mut collector).await?;
+    let source: BTreeSet<String> = collector
+        .sorted_unique()
+        .into_iter()
+        .map(|t| canonicalize_numeric_nt(&t))
+        .collect();
+
+    // Twin side: read every default-graph triple back and render identically.
+    let twin: BTreeSet<String> = read_twin_ntriples(fluree, ledger)
+        .await?
+        .into_iter()
+        .map(|t| canonicalize_numeric_nt(&t))
+        .collect();
+
+    let mapping = provider.compiled_mapping(graph_source_id, None).await?;
+    let classes: BTreeSet<String> = mapping
+        .triples_maps
+        .values()
+        .flat_map(|tm| tm.subject_map.classes.iter().cloned())
+        .collect();
+
+    let mut checks = Vec::new();
+
+    // Class counts — always on.
+    for class in &classes {
+        let suffix = format!("<{}> <{class}> .", fluree_vocab::rdf::TYPE);
+        let source_count = source.iter().filter(|t| t.ends_with(&suffix)).count() as u64;
+        let twin_count = twin.iter().filter(|t| t.ends_with(&suffix)).count() as u64;
+        checks.push(ParityCheck {
+            name: format!("count:{class}"),
+            outcome: if source_count == twin_count {
+                CheckOutcome::Match
+            } else {
+                CheckOutcome::Mismatch {
+                    source: source_count,
+                    twin: twin_count,
+                }
+            },
+        });
+    }
+
+    // Per-property counts — skipped-with-note (manifest-sound fast path only).
+    checks.push(ParityCheck {
+        name: "per-property-counts".to_string(),
+        outcome: CheckOutcome::Skipped {
+            reason: "manifest-sound non-nullable per-property counts are the \
+                     real-Iceberg fast path (DEC-003 §5); not run over the \
+                     enumeration oracle"
+                .to_string(),
+        },
+    });
+
+    match mode {
+        VerifyMode::Full => {
+            let missing_in_twin = source.difference(&twin).count();
+            let extra_in_twin = twin.difference(&source).count();
+            checks.push(ParityCheck {
+                name: "full-triple-diff".to_string(),
+                outcome: if missing_in_twin == 0 && extra_in_twin == 0 {
+                    CheckOutcome::Match
+                } else {
+                    CheckOutcome::TripleDiff {
+                        missing_in_twin,
+                        extra_in_twin,
+                    }
+                },
+            });
+        }
+        VerifyMode::Quick => {
+            checks.extend(sample_checks(&source, &twin, &classes));
+        }
+    }
+
+    let passed = checks.iter().all(|c| c.outcome.passed());
+    Ok(ParityReport { passed, checks })
+}
+
+/// Read every default-graph triple of a native twin back as N-Triples rendered
+/// identically to the enumerator's [`fluree_db_r2rml::materialize::render_term`],
+/// so the two sides diff exactly. The txn_meta stamp lives in the `#txn-meta`
+/// graph, so a default-graph wildcard never mixes it into the comparison.
+async fn read_twin_ntriples(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+) -> Result<BTreeSet<String>, MaterializeError> {
+    let db = crate::GraphDb::from_ledger_state(ledger);
+    let result = fluree
+        .query(&db, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .map_err(|e| R2rmlError::Materialization(format!("twin wildcard query: {e}")))?;
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .map_err(|e| R2rmlError::Materialization(format!("twin sparql-json: {e}")))?;
+
+    let mut set = BTreeSet::new();
+    let bindings = json["results"]["bindings"].as_array().ok_or_else(|| {
+        R2rmlError::Materialization("twin query result missing bindings".to_string())
+    })?;
+    for b in bindings {
+        let s = term_to_ntriples(&b["s"]);
+        let p = b["p"]["value"].as_str().unwrap_or_default();
+        let o = term_to_ntriples(&b["o"]);
+        set.insert(format!("{s} <{p}> {o} ."));
+    }
+    Ok(set)
+}
+
+/// Render one SPARQL-JSON result term to the N-Triples form the enumerator emits.
+fn term_to_ntriples(binding: &serde_json::Value) -> String {
+    let value = binding["value"].as_str().unwrap_or_default();
+    match binding["type"].as_str().unwrap_or_default() {
+        "uri" => format!("<{value}>"),
+        "bnode" => format!("_:{value}"),
+        _ => {
+            let escaped = escape_nt_literal(value);
+            if let Some(lang) = binding["xml:lang"].as_str() {
+                format!("\"{escaped}\"@{lang}")
+            } else {
+                match binding["datatype"].as_str() {
+                    Some(dt) if dt != fluree_vocab::xsd::STRING => {
+                        format!("\"{escaped}\"^^<{dt}>")
+                    }
+                    // xsd:string is the implicit datatype — rendered bare, matching
+                    // the enumerator (a plain literal has no datatype suffix).
+                    _ => format!("\"{escaped}\""),
+                }
+            }
+        }
+    }
+}
+
+/// Escape a literal lexical form per N-Triples, matching the enumerator's
+/// `escape_literal` so the two sides render byte-identically.
+fn escape_nt_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Canonicalize the numeric object literal of an N-Triple so two value-equal but
+/// lexically-different forms compare equal — e.g. the source's `"5.00"^^decimal`
+/// and the twin's re-rendered `"5"^^decimal`. Only a typed numeric object is
+/// touched; IRIs, plain/lang literals, and non-numeric typed literals pass
+/// through byte-for-byte. Applied to BOTH sides, so whichever canonical form each
+/// produces, they agree. (The LIVE native-sf01 full-triple diff needs the same
+/// value-level treatment for typed literals — surfaced here.)
+fn canonicalize_numeric_nt(triple: &str) -> String {
+    // `<s> <p> OBJ .` — subject/predicate are `<…>`/`_:…` with no spaces, so the
+    // first two spaces delimit them; OBJ (which may contain spaces inside quotes)
+    // is the remainder minus the trailing ` .`.
+    let mut it = triple.splitn(3, ' ');
+    let (Some(s), Some(p), Some(rest)) = (it.next(), it.next(), it.next()) else {
+        return triple.to_string();
+    };
+    let obj = rest.strip_suffix(" .").unwrap_or(rest);
+    let Some(caret) = obj.rfind("\"^^<") else {
+        return triple.to_string();
+    };
+    if !obj.starts_with('"') || !obj.ends_with('>') {
+        return triple.to_string();
+    }
+    let lex = &obj[1..caret];
+    let dt = &obj[caret + 4..obj.len() - 1];
+    if !is_numeric_datatype(dt) {
+        return triple.to_string();
+    }
+    format!("{s} {p} \"{}\"^^<{dt}> .", normalize_numeric_lexical(lex))
+}
+
+/// Drop insignificant trailing fractional zeros from a decimal lexical form
+/// (`"5.00"` → `"5"`, `"9.90"` → `"9.9"`). Integers and scientific-notation
+/// forms pass through unchanged (their canonical forms are already stable).
+fn normalize_numeric_lexical(lex: &str) -> String {
+    if lex.contains(['e', 'E']) {
+        return lex.to_string();
+    }
+    match lex.split_once('.') {
+        Some((int, frac)) => {
+            let frac = frac.trim_end_matches('0');
+            if frac.is_empty() {
+                int.to_string()
+            } else {
+                format!("{int}.{frac}")
+            }
+        }
+        None => lex.to_string(),
+    }
+}
+
+/// Whether an XSD datatype IRI names a numeric type (whose lexical form admits
+/// value-preserving normalization).
+fn is_numeric_datatype(dt: &str) -> bool {
+    matches!(
+        dt.rsplit(['#', '/']).next().unwrap_or(dt),
+        "decimal"
+            | "double"
+            | "float"
+            | "integer"
+            | "long"
+            | "int"
+            | "short"
+            | "byte"
+            | "nonNegativeInteger"
+            | "nonPositiveInteger"
+            | "negativeInteger"
+            | "positiveInteger"
+            | "unsignedLong"
+            | "unsignedInt"
+            | "unsignedShort"
+            | "unsignedByte"
+    )
+}
+
+/// The N-Triples subject token (everything up to the first space).
+fn nt_subject(triple: &str) -> &str {
+    triple.split_once(' ').map(|(s, _)| s).unwrap_or(triple)
+}
+
+/// Group N-Triples by subject token.
+fn group_by_subject(triples: &BTreeSet<String>) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut by_subject: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for t in triples {
+        by_subject.entry(nt_subject(t)).or_default().insert(t);
+    }
+    by_subject
+}
+
+/// Stratified sample: for each class, fully compare the triple set of its first
+/// [`SAMPLE_SUBJECTS_PER_CLASS`] subjects (by sorted subject) between source and
+/// twin. A systematic value/edge bug appears in every sample by construction.
+fn sample_checks(
+    source: &BTreeSet<String>,
+    twin: &BTreeSet<String>,
+    classes: &BTreeSet<String>,
+) -> Vec<ParityCheck> {
+    let source_by_subject = group_by_subject(source);
+    let twin_by_subject = group_by_subject(twin);
+    let mut checks = Vec::new();
+    for class in classes {
+        let type_suffix = format!("<{}> <{class}> .", fluree_vocab::rdf::TYPE);
+        let subjects = source_by_subject
+            .iter()
+            .filter(|(_, triples)| triples.iter().any(|t| t.ends_with(&type_suffix)))
+            .map(|(s, _)| *s)
+            .take(SAMPLE_SUBJECTS_PER_CLASS);
+        for subject in subjects {
+            let src = source_by_subject.get(subject).cloned().unwrap_or_default();
+            let tw = twin_by_subject.get(subject).cloned().unwrap_or_default();
+            let outcome = if src == tw {
+                CheckOutcome::Match
+            } else {
+                CheckOutcome::TripleDiff {
+                    missing_in_twin: src.difference(&tw).count(),
+                    extra_in_twin: tw.difference(&src).count(),
+                }
+            };
+            checks.push(ParityCheck {
+                name: format!("sample:{subject}"),
+                outcome,
+            });
+        }
+    }
+    checks
 }
 
 #[cfg(test)]
