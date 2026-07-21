@@ -96,9 +96,19 @@ pub struct LeafWriter {
     // History accumulation.
     sidecar_builder: HistSidecarBuilder,
     /// Whether a sidecar segment has been started for the current leaflet buffer.
-    /// Reset to false on flush_leaflet(). Set to true on first push_history_entry()
-    /// or on flush_leaflet() itself (which starts a segment for the encoded leaflet).
+    /// Reset to false on flush_leaflet(). Set to true when history is committed to
+    /// the current leaflet, or on flush_leaflet() itself (which starts a segment
+    /// for the encoded leaflet).
     current_segment_started: bool,
+    /// History entries pushed but not yet committed to a leaflet segment.
+    ///
+    /// In the build push order, a fact's transition entries are pushed immediately
+    /// before its materialized row (`push_record`). Buffering them here — rather
+    /// than eagerly attaching to whatever leaflet is mid-buffer — lets us commit
+    /// them to the leaflet that actually holds their row, even when that row opens
+    /// a new predicate/o_type segment (and thus a new leaflet). See
+    /// `commit_pending_for_current_segment` / `commit_all_pending`.
+    pending_history: Vec<HistEntryV2>,
 
     // Segmentation tracking.
     current_seg_p_id: Option<u32>,
@@ -135,6 +145,7 @@ impl LeafWriter {
             record_buf: Vec::with_capacity(leaflet_target_rows),
             sidecar_builder: HistSidecarBuilder::new(),
             current_segment_started: false,
+            pending_history: Vec::new(),
             current_seg_p_id: None,
             current_seg_o_type: None,
             encoded_leaflets: Vec::new(),
@@ -158,6 +169,10 @@ impl LeafWriter {
     pub fn push_record(&mut self, record: RunRecordV2) -> io::Result<()> {
         // Check segmentation constraint before buffering.
         if !self.record_buf.is_empty() && self.should_flush_for_segmentation(&record) {
+            // Trailing history matching the outgoing segment (e.g. a non-materialized
+            // fact that ends this predicate) belongs to the leaflet we're about to
+            // flush — commit it before the flush closes that leaflet's segment.
+            self.commit_pending_for_current_segment();
             self.flush_leaflet()?;
         }
 
@@ -177,6 +192,11 @@ impl LeafWriter {
             RunSortOrder::Spot => {}
         }
 
+        // This record's transition entries (and those of any preceding
+        // non-materialized facts in the same gap) belong to the leaflet that
+        // holds this record — the current one, post any segment-boundary flush.
+        self.commit_all_pending();
+
         self.record_buf.push(record);
         self.last_record = Some(record);
 
@@ -193,23 +213,68 @@ impl LeafWriter {
         Ok(())
     }
 
-    /// Push a history-only entry (retract-winner: no latest-state row,
-    /// but history must be logged).
+    /// Push a history entry for the fact whose row (if any) comes next.
     ///
-    /// History entries are associated with the current leaflet's sidecar segment.
-    /// If no segment has been started yet (before the first `flush_leaflet`),
-    /// one is started automatically. When `flush_leaflet` runs, if a segment
-    /// was already started by history entries, it keeps it; otherwise it starts
-    /// a new empty one. This ensures segment count always equals leaflet count.
+    /// Entries are buffered, not attached immediately: in the build push order a
+    /// fact's transitions precede its `push_record`, so they belong to the same
+    /// leaflet as that row — which may open a new segment (and leaflet). Buffering
+    /// lets `commit_all_pending` / `commit_pending_for_current_segment` file each
+    /// entry into the leaflet that actually holds its row. Retract-winner facts
+    /// (no materialized row) push history only; those entries are committed to the
+    /// current leaflet by the next `push_record` (or by `finish`).
     pub fn push_history_entry(&mut self, entry: HistEntryV2) {
         if self.skip_history {
             return;
         }
+        self.pending_history.push(entry);
+    }
+
+    /// Commit `entry` into the current leaflet's sidecar segment, starting the
+    /// segment if this is its first entry.
+    fn commit_history_entry(&mut self, entry: HistEntryV2) {
         if !self.current_segment_started {
             self.sidecar_builder.start_leaflet();
             self.current_segment_started = true;
         }
         self.sidecar_builder.push_entry(entry);
+    }
+
+    /// Commit every buffered history entry to the current leaflet's segment.
+    /// Called once the record opening/continuing this leaflet is known.
+    fn commit_all_pending(&mut self) {
+        if self.pending_history.is_empty() {
+            return;
+        }
+        for entry in std::mem::take(&mut self.pending_history) {
+            self.commit_history_entry(entry);
+        }
+    }
+
+    /// Commit only the buffered entries that belong to the segment currently
+    /// buffered (matching segment key), leaving the rest pending for a later
+    /// leaflet. Used just before a segment-boundary flush so a non-materialized
+    /// fact ending the outgoing segment lands in that segment's leaflet.
+    fn commit_pending_for_current_segment(&mut self) {
+        if self.pending_history.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_history);
+        let mut retained = Vec::new();
+        for entry in pending {
+            let belongs = match self.order {
+                RunSortOrder::Post | RunSortOrder::Psot => {
+                    self.current_seg_p_id == Some(entry.p_id)
+                }
+                RunSortOrder::Opst => self.current_seg_o_type == Some(entry.o_type),
+                RunSortOrder::Spot => true,
+            };
+            if belongs {
+                self.commit_history_entry(entry);
+            } else {
+                retained.push(entry);
+            }
+        }
+        self.pending_history = retained;
     }
 
     /// Drain the leaves completed so far, transferring ownership to the caller
@@ -230,6 +295,9 @@ impl LeafWriter {
     /// Consume the writer, flushing any remaining data, and return all
     /// produced leaves.
     pub fn finish(mut self) -> io::Result<Vec<LeafInfo>> {
+        // Trailing history (a non-materialized fact at the tail of the order)
+        // belongs to the final leaflet — commit it before the closing flush.
+        self.commit_all_pending();
         if !self.record_buf.is_empty() {
             self.flush_leaflet()?;
         }
@@ -263,7 +331,7 @@ impl LeafWriter {
         let row_count = encoded.row_count as u64;
 
         // Ensure a history segment exists for this leaflet.
-        // If push_history_entry() already started one, skip. Otherwise start an empty one.
+        // If committed history already started one, skip. Otherwise start an empty one.
         // This guarantees segment count == leaflet count.
         if !self.skip_history && !self.current_segment_started {
             self.sidecar_builder.start_leaflet();
