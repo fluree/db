@@ -1117,6 +1117,83 @@ pub enum Commands {
         #[command(subcommand)]
         action: IcebergAction,
     },
+
+    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
+    /// graph source: bulk-build every triple, verify it against the source, and
+    /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
+    ///
+    /// MACHINE-SAFETY: the default posture is co-resident-tolerant (a modest
+    /// fixed memory budget + low parallelism, NOT own-the-box auto-sizing).
+    /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
+    /// `--max-performance` on a cleared machine to auto-size to the host.
+    Materialize {
+        /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
+        graph_source: String,
+
+        /// Name for the twin ledger. Defaults to the graph-source id with a
+        /// `-twin` suffix (the `:branch` is preserved).
+        #[arg(long)]
+        into: Option<String>,
+
+        /// Output form: `pack` (a .flpack file, the default), `ledger` (a local
+        /// native ledger, left registered), or `s3` (direct-S3 CAS publish —
+        /// not yet wired in the file-backed CLI; see DEC-003 §3).
+        #[arg(long, value_enum, default_value_t = MaterializeOutput::Pack)]
+        output: MaterializeOutput,
+
+        /// Destination path for `--output pack` (default: `<twin>.flpack` in the
+        /// current directory).
+        #[arg(long)]
+        output_path: Option<PathBuf>,
+
+        /// Verification depth run against the built twin before it is announced:
+        /// `quick` (class counts + a stratified per-subject sample, the default)
+        /// or `full` (a full-triple diff). A failed gate drops the twin and
+        /// exits non-zero.
+        #[arg(long, value_enum, default_value_t = MaterializeVerify::Quick)]
+        verify: MaterializeVerify,
+
+        /// Own-the-box: auto-size memory/parallelism to the host (~80% RAM).
+        /// Only on a cleared machine — the default is deliberately conservative
+        /// to stay co-resident-safe.
+        #[arg(long)]
+        max_performance: bool,
+
+        /// Proceed even if a source table carries Iceberg merge-on-read delete
+        /// files (sets `FLUREE_ICEBERG_ALLOW_MOR_DELETES`). The twin is then a
+        /// point-in-time snapshot that may include rows a MoR-aware reader would
+        /// hide — documented staleness. Default: fail closed.
+        #[arg(long)]
+        allow_mor_deletes: bool,
+
+        /// Fluree home directory (overrides `$FLUREE_HOME` / the platform data
+        /// dir). Where the twin ledger and its storage live.
+        #[arg(long)]
+        home: Option<PathBuf>,
+    },
+}
+
+/// Output form for `fluree materialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaterializeOutput {
+    /// A `.flpack` pack file (prebuilt commits + index) — the negotiated door
+    /// for solo delivery. The default.
+    Pack,
+    /// A local native ledger, left registered in this home.
+    Ledger,
+    /// Direct-S3 CAS publish (the >40GB escape hatch). Not yet wired in the
+    /// file-backed CLI — see DEC-003 §3.
+    S3,
+}
+
+/// Verification depth for `fluree materialize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MaterializeVerify {
+    /// Class counts + a stratified per-subject sample. The always-on default.
+    Quick,
+    /// A full-triple diff of the whole twin against the source. Strongest;
+    /// cost roughly a second full source read.
+    Full,
 }
 
 /// Named-graph subcommands.

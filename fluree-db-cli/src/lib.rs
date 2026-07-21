@@ -688,6 +688,40 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             }
         }
 
+        #[cfg(feature = "iceberg")]
+        Commands::Materialize {
+            graph_source,
+            into,
+            output,
+            output_path,
+            verify,
+            max_performance,
+            allow_mor_deletes,
+            home,
+        } => {
+            // `--home` resolves through the same helper as `--config` (it takes
+            // precedence); else the tracked `.fluree/` or the global home.
+            let fluree_dir = config::require_fluree_dir_or_global(home.as_deref().or(config_path))?;
+            let params = commands::materialize::MaterializeParams {
+                graph_source: &graph_source,
+                into: into.as_deref(),
+                output,
+                output_path: output_path.as_deref(),
+                verify,
+                max_performance,
+                allow_mor_deletes,
+                parallelism: cli.parallelism,
+                memory_budget_mb: cli.memory_budget_mb,
+                quiet: cli.quiet,
+            };
+            commands::materialize::run(&fluree_dir, &params).await
+        }
+
+        #[cfg(not(feature = "iceberg"))]
+        Commands::Materialize { .. } => Err(error::CliError::Usage(
+            "`fluree materialize` requires the `iceberg` feature (enabled by default)".to_string(),
+        )),
+
         Commands::Mcp { action } => match action {
             cli::McpAction::Serve {
                 transport,
