@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use fluree_db_iceberg::catalog::LoadTableResponse;
 use fluree_db_iceberg::credential::VendedCredentials;
 use fluree_db_iceberg::io::S3IcebergStorage;
+use fluree_db_query::r2rml::TableWatermark;
 
 /// Master switch for all Iceberg catalog caching. Read once from
 /// `FLUREE_ICEBERG_LOADTABLE_CACHE` (only `0`/`false`/`off` disable it). When
@@ -106,6 +107,15 @@ pub(crate) struct IcebergCatalogSession {
     /// disk pointer's TTL expires between touches — the eager path then reloads
     /// only the credentials and re-pins to this location.
     location_pins: Mutex<HashMap<String, String>>,
+    /// Per-build snapshot watermarks (DEC-003 twin builder). Keyed by
+    /// `snapshot_key(graph_source_id, table_name)` — the SAME logical table name
+    /// the materialize driver passes to `scan_table`, so `pinned_tables` can
+    /// report `{table → snapshot}` for one source. Captured at each table's first
+    /// touch (first-writer-wins, mirroring `location_pins`), so a table's
+    /// watermark is the snapshot the build first read and never moves within the
+    /// build. Recorded unconditionally (independent of the loadTable cache toggle):
+    /// even with caching off, the build must record the snapshot each scan read.
+    snapshots: Mutex<HashMap<String, TableWatermark>>,
 }
 
 impl IcebergCatalogSession {
@@ -231,6 +241,37 @@ impl IcebergCatalogSession {
             return;
         }
         self.storages.lock().unwrap().insert(key, storage);
+    }
+
+    /// Cache key for a build snapshot watermark: source id + logical table name.
+    /// Distinct from [`Self::load_table_key`] (which parses `namespace.table`):
+    /// this keys by the exact `table_name` string the materialize driver passes to
+    /// `scan_table` (`TriplesMap::table_name()`), so [`Self::pinned_tables`] and the
+    /// driver's `build_watermark` agree on the table key without re-parsing.
+    pub(crate) fn snapshot_key(graph_source_id: &str, table_name: &str) -> String {
+        format!("{graph_source_id}\u{1f}{table_name}")
+    }
+
+    /// Record the pinned snapshot of a table on its first touch this build
+    /// (first-writer-wins). Recorded unconditionally — the build must know which
+    /// snapshot each scan read even when the loadTable cache is disabled. A later
+    /// scan of the same table keeps the first-recorded watermark, matching the
+    /// `metadata_location` pin.
+    pub(crate) fn record_snapshot(&self, key: String, watermark: TableWatermark) {
+        self.snapshots.lock().unwrap().entry(key).or_insert(watermark);
+    }
+
+    /// All snapshot watermarks captured this build for `graph_source_id`, as
+    /// `{table_name → watermark}` — the twin's watermark vector. Feeds
+    /// `FlureeR2rmlProvider::build_watermark`.
+    pub(crate) fn pinned_tables(&self, graph_source_id: &str) -> HashMap<String, TableWatermark> {
+        let prefix = format!("{graph_source_id}\u{1f}");
+        self.snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|t| (t.to_string(), v.clone())))
+            .collect()
     }
 }
 
@@ -444,6 +485,44 @@ mod tests {
         assert!(
             Arc::ptr_eq(&hit, &storage),
             "the cached Direct-mode client must be the same Arc across resolutions"
+        );
+    }
+
+    #[test]
+    fn snapshot_capture_is_first_writer_wins_and_scoped_by_source() {
+        let s = IcebergCatalogSession::default();
+        let wm = |loc: &str, id: i64, seq: i64| TableWatermark {
+            metadata_location: loc.to_string(),
+            snapshot_id: Some(id),
+            sequence_number: Some(seq),
+        };
+        let k_store = IcebergCatalogSession::snapshot_key("gs:main", "DW.DIM_STORE");
+        let k_geo = IcebergCatalogSession::snapshot_key("gs:main", "DW.DIM_GEOGRAPHY");
+        let k_other = IcebergCatalogSession::snapshot_key("other:main", "DW.DIM_STORE");
+
+        s.record_snapshot(k_store.clone(), wm("s3://snap-A.json", 1, 10));
+        // A later touch must NOT move the pinned snapshot (first-writer-wins).
+        s.record_snapshot(k_store.clone(), wm("s3://snap-B.json", 2, 20));
+        s.record_snapshot(k_geo, wm("s3://geo-1.json", 5, 50));
+        s.record_snapshot(k_other, wm("s3://other-store.json", 9, 90));
+
+        let pinned = s.pinned_tables("gs:main");
+        assert_eq!(pinned.len(), 2, "only this source's tables are reported");
+        assert_eq!(
+            pinned.get("DW.DIM_STORE").unwrap().metadata_location,
+            "s3://snap-A.json",
+            "first-recorded snapshot wins over a later touch"
+        );
+        assert_eq!(pinned.get("DW.DIM_STORE").unwrap().snapshot_id, Some(1));
+        assert_eq!(pinned.get("DW.DIM_STORE").unwrap().sequence_number, Some(10));
+        assert!(
+            pinned.contains_key("DW.DIM_GEOGRAPHY"),
+            "the table key is the raw logical table name, not namespace.table split"
+        );
+        assert_eq!(
+            s.pinned_tables("other:main").len(),
+            1,
+            "a different source's watermarks are isolated"
         );
     }
 

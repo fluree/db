@@ -848,6 +848,20 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
 
         Ok(compiled)
     }
+
+    /// Report the per-table build watermark from this provider's catalog session
+    /// (DEC-003). Every scan of a table this build touches records its pinned
+    /// snapshot into `self.session` (see `scan_table_inner`); this surfaces those
+    /// captures as `{table → snapshot}` for `graph_source_id`. The bulk builder
+    /// fails loud if this is empty for a non-empty table set, so a provider that
+    /// never scanned (or a session that lost its pins) cannot publish an unstamped
+    /// twin.
+    fn build_watermark(
+        &self,
+        graph_source_id: &str,
+    ) -> std::collections::HashMap<String, fluree_db_query::r2rml::TableWatermark> {
+        self.session.pinned_tables(graph_source_id)
+    }
 }
 
 /// Bounded concurrency for warming per-table catalog contexts in
@@ -1838,6 +1852,23 @@ impl FlureeR2rmlProvider<'_> {
         // scan in one query read the same pinned Iceberg snapshot.
         let (storage, metadata, metadata_location) =
             self.load_table_context(graph_source_id, table_name).await?;
+
+        // Capture this table's pinned snapshot into the build watermark (DEC-003).
+        // The single caller of `load_table_context` records here (first-writer-wins),
+        // avoiding the multiple resolution paths inside it; the ids come straight off
+        // the already-parsed metadata (no extra I/O). Harmless for ordinary queries —
+        // `build_watermark` only reads it during a materialize build.
+        self.session.record_snapshot(
+            super::catalog_session::IcebergCatalogSession::snapshot_key(
+                graph_source_id,
+                table_name,
+            ),
+            fluree_db_query::r2rml::TableWatermark {
+                metadata_location: metadata_location.clone(),
+                snapshot_id: metadata.current_snapshot_id,
+                sequence_number: metadata.current_snapshot().map(|s| s.sequence_number),
+            },
+        );
 
         // Shared on-disk cache for data files (one global byte budget, deduped per
         // directory). Threaded into the Parquet readers, which apply a
