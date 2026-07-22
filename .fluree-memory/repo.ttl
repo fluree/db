@@ -1280,6 +1280,33 @@ mem:fact-01kwx8z7tx43vecccdww6w19j9 a mem:Fact ;
     mem:createdAt "2026-07-07T03:11:58.813517+00:00"^^xsd:dateTime ;
     mem:rationale "Supersedes the earlier reverted-batched-frontier memory: the revert's conclusion (per-node reads fit early-exit searches) held only on the old substrate; with shared mmaps + cascaded seeks + galloping lookups, batched level expansion wins at every scale. Novelty semantics pinned by cypher_shortest_path_batched_lane_respects_novelty." .
 
+mem:constraint-01ky5xtjzq1mvmzatgmmpvh8pq a mem:Constraint ;
+    mem:content "RemoteAuth (nameservice-sync) round-trips asymmetrically in the CLI config store: reads go through serde (toml::from_str), but writes are HAND-ROLLED via toml_edit in write_sync_config_toml. Adding a field to RemoteAuth silently drops it on every config save unless you also add a branch to the auth_table builder AND the has_any guard in fluree-db-cli/src/config.rs. login_flow (added for honest `auth status` flow reporting) followed this pattern." ;
+    mem:tag "cli" ;
+    mem:tag "config" ;
+    mem:tag "gotcha" ;
+    mem:tag "remote-auth" ;
+    mem:tag "serialization" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-cli/src/config.rs" ;
+    mem:artifactRef "fluree-db-nameservice-sync/src/config.rs" ;
+    mem:branch "feature/cli-auth-token-and-access-disable" ;
+    mem:createdAt "2026-07-22T22:06:03.767306+00:00"^^xsd:dateTime .
+
+mem:constraint-01ky5xtw9tzntfmqwqa62zzyd1 a mem:Constraint ;
+    mem:content "Hosted-stack grants API: an EMPTY policyClasses list on a grant reads as instance-wide access (classes are optional narrowing), so `model access disable --space` must never POST an empty class list when detaching the last policy class — that would WIDEN the grant instead of revoking it. It leaves the grant untouched and tells the user to delete the grant itself; a grant naming a deleted policy class is fail-closed (selects no policies). Related parked decision (#4 of the internal CLI report): whether a class-less write grant should dominate over a class-carrying read grant in merged access reporting — router-side, undecided." ;
+    mem:tag "cli" ;
+    mem:tag "grants" ;
+    mem:tag "hosted-stack" ;
+    mem:tag "model-access" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-cli/src/commands/model/access.rs" ;
+    mem:branch "feature/cli-auth-token-and-access-disable" ;
+    mem:createdAt "2026-07-22T22:06:13.306994+00:00"^^xsd:dateTime .
+
 mem:decision-01kkymgaynzn5mrgy21pw22tf6 a mem:Decision ;
     mem:content "CLI write command naming: \"transact\" is the umbrella (API builder, HTTP endpoint), while specific operations are \"insert\", \"upsert\", and \"update\". The CLI command is `fluree update` (not `transact`) matching the API's `.transact().update()` pattern. Code: Commands::Update, commands::update::run(), UpdateFormat enum. Remote: update_jsonld()/update_sparql() both route to HTTP /transact. Internal types use \"transact\" for the generic write concept (TransactCore, GraphTransactBuilder, fluree-db-transact crate)." ;
     mem:tag "api-alignment" ;
