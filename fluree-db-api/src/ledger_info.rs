@@ -995,12 +995,26 @@ fn is_secret_config_key(key: &str) -> bool {
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
 }
 
-/// Recursively replace secret-bearing scalar values with `"[redacted]"`.
+/// Keys inside a secret-keyed reference object that identify where the secret
+/// comes from rather than what it is (the `ConfigValue::Dynamic` wire shape);
+/// their string values are preserved during subtree redaction.
+const SECRET_REF_SAFE_KEYS: &[&str] = &["env_var", "java_property"];
+
+fn is_secret_ref_safe_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_REF_SAFE_KEYS.iter().any(|s| *s == lower)
+}
+
+/// Recursively replace secret-bearing values with `"[redacted]"`.
 ///
-/// A secret held as an env-var reference object (`{"env_var": "...",
-/// "default_val": "..."}`) keeps its `env_var` name (safe, aids debugging) while
-/// the inline `default_val` fallback is masked by the recursive walk. Returns
-/// `true` when anything was redacted.
+/// A scalar under a secret key is masked outright. A container under a secret
+/// key is redacted with inverted strictness by [`redact_secret_subtree`]:
+/// every scalar leaf inside is masked except reference-identifier strings
+/// (`env_var`, `java_property` — safe, they aid debugging), so a secret held
+/// as `{"env_var": "...", "default_val": "..."}` keeps its `env_var` name
+/// while the inline `default_val` fallback is masked, and a secret hidden in
+/// an unrecognized container shape (`{"token": ["..."]}`) cannot escape.
+/// Returns `true` when anything was redacted.
 ///
 /// Value-level form of [`redact_graph_source_config`], for callers that
 /// already hold a parsed JSON tree.
@@ -1009,9 +1023,15 @@ pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
     match value {
         JsonValue::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if is_secret_config_key(k) && !v.is_object() && !v.is_array() && !v.is_null() {
-                    *v = JsonValue::String("[redacted]".to_string());
-                    redacted = true;
+                if is_secret_config_key(k) {
+                    if v.is_object() || v.is_array() {
+                        if redact_secret_subtree(v) {
+                            redacted = true;
+                        }
+                    } else if !v.is_null() {
+                        *v = JsonValue::String("[redacted]".to_string());
+                        redacted = true;
+                    }
                 } else if redact_json_secrets(v) {
                     redacted = true;
                 }
@@ -1025,6 +1045,37 @@ pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
             }
         }
         _ => {}
+    }
+    redacted
+}
+
+/// Redact every scalar leaf beneath a secret-keyed container, keeping only
+/// reference-identifier strings ([`SECRET_REF_SAFE_KEYS`]) and nulls.
+fn redact_secret_subtree(value: &mut JsonValue) -> bool {
+    let mut redacted = false;
+    match value {
+        JsonValue::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_secret_ref_safe_key(k) && v.is_string() {
+                    continue;
+                }
+                if redact_secret_subtree(v) {
+                    redacted = true;
+                }
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                if redact_secret_subtree(v) {
+                    redacted = true;
+                }
+            }
+        }
+        JsonValue::Null => {}
+        _ => {
+            *value = JsonValue::String("[redacted]".to_string());
+            redacted = true;
+        }
     }
     redacted
 }
@@ -2708,6 +2759,41 @@ mod tests {
         assert!(
             !redacted.contains("fallback-secret-value"),
             "inline default secret leaked: {redacted}"
+        );
+    }
+
+    #[test]
+    fn test_redact_graph_source_config_masks_secret_keyed_array() {
+        let config = r#"{"auth":{"token":["tok-1","tok-2"]},"table":"ns.t"}"#;
+        let redacted = redact_graph_source_config(config);
+        assert!(
+            !redacted.contains("tok-1"),
+            "array secret leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("tok-2"),
+            "array secret leaked: {redacted}"
+        );
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("ns.t"));
+    }
+
+    #[test]
+    fn test_redact_graph_source_config_masks_unrecognized_secret_object_shape() {
+        let config = r#"{"auth":{"client_secret":{"value":"s3cret-inner",
+            "env_var":"POLARIS_SECRET","nested":{"deep":"s3cret-deep"}}}}"#;
+        let redacted = redact_graph_source_config(config);
+        assert!(
+            !redacted.contains("s3cret-inner"),
+            "object-wrapped secret leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("s3cret-deep"),
+            "nested object secret leaked: {redacted}"
+        );
+        assert!(
+            redacted.contains("POLARIS_SECRET"),
+            "env var name should survive: {redacted}"
         );
     }
 
