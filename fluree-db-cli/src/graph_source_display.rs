@@ -116,6 +116,9 @@ mod tests {
         assert!(!rendered.contains("super-secret-pat"));
         assert!(!rendered.contains("live-bearer-token"));
         assert!(rendered.contains("[redacted]"));
+        // Non-secret identifying fields survive.
+        assert!(rendered.contains("my-client"));
+        assert!(rendered.contains("session:role:ICEBERG_READER"));
     }
 
     #[test]
@@ -154,34 +157,40 @@ mod tests {
     }
 
     #[test]
-    fn redacts_oauth_client_secret_and_bearer_token() {
-        let pretty = redacted_config_pretty(&secret_bearing_config());
-        assert!(!pretty.contains("super-secret-pat"));
-        assert!(!pretty.contains("live-bearer-token"));
-        assert!(pretty.contains("[redacted]"));
-        // Non-secret identifying fields survive.
-        assert!(pretty.contains("my-client"));
-        assert!(pretty.contains("session:role:ICEBERG_READER"));
-    }
-
-    #[test]
-    fn keeps_env_var_name_but_masks_inline_default() {
+    fn local_render_keeps_env_var_name_but_masks_inline_default() {
         let config = json!({
             "auth": {
                 "client_secret": { "env_var": "FLUREE_CLIENT_SECRET", "default_val": "fallback-secret" }
             }
         });
+        let gs = GraphSourceRecord::new(
+            "my-gs",
+            "main",
+            GraphSourceType::Iceberg,
+            config.to_string(),
+            vec![],
+        );
 
-        let pretty = redacted_config_pretty(&config);
-        assert!(pretty.contains("FLUREE_CLIENT_SECRET"));
-        assert!(!pretty.contains("fallback-secret"));
+        let rendered = render_local_graph_source(&gs);
+        assert!(rendered.contains("FLUREE_CLIENT_SECRET"));
+        assert!(!rendered.contains("fallback-secret"));
     }
 
     #[test]
-    fn non_secret_config_is_unchanged() {
+    fn local_render_shows_non_secret_config_in_full() {
         let config = json!({ "index": "bm25", "k1": 1.2, "b": 0.75 });
-        let pretty = redacted_config_pretty(&config);
-        let reparsed: serde_json::Value = serde_json::from_str(&pretty).unwrap();
-        assert_eq!(reparsed, config);
+        let gs = GraphSourceRecord::new(
+            "my-search",
+            "main",
+            GraphSourceType::Bm25,
+            config.to_string(),
+            vec![],
+        );
+
+        let rendered = render_local_graph_source(&gs);
+        assert!(rendered.contains("Type:           BM25"));
+        assert!(rendered.contains("\"k1\": 1.2"));
+        assert!(rendered.contains("\"b\": 0.75"));
+        assert!(!rendered.contains("[redacted]"));
     }
 }

@@ -1469,10 +1469,13 @@ pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue 
     if !record.dependencies.is_empty() {
         obj["dependencies"] = json!(record.dependencies);
     }
-    if !record.config.is_empty() && record.config != "{}" {
+    if !record.config.is_empty() {
         let redacted = redact_graph_source_config(&record.config);
         if let Ok(parsed) = serde_json::from_str::<JsonValue>(&redacted) {
-            obj["config"] = parsed;
+            let empty_object = parsed.as_object().is_some_and(serde_json::Map::is_empty);
+            if !empty_object {
+                obj["config"] = parsed;
+            }
         }
     }
 
@@ -2795,6 +2798,17 @@ mod tests {
             redacted.contains("POLARIS_SECRET"),
             "env var name should survive: {redacted}"
         );
+    }
+
+    #[test]
+    fn test_generic_gs_info_omits_empty_config_regardless_of_whitespace() {
+        for empty in ["", "{}", "{ }", "{\n}"] {
+            let info = build_generic_graph_source_info(&virtual_record(empty));
+            assert!(
+                info.get("config").is_none(),
+                "empty config {empty:?} should be omitted: {info}"
+            );
+        }
     }
 
     #[test]

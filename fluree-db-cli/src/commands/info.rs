@@ -132,25 +132,15 @@ pub async fn run(
                 println!("Type:           Ledger");
                 println!("Ledger ID:      {}", record.ledger_id);
                 println!("Commit t:       {}", record.commit_t);
-                println!(
-                    "Commit ID:      {}",
-                    record
-                        .commit_head_id
-                        .as_ref()
-                        .map(std::string::ToString::to_string)
-                        .as_deref()
-                        .unwrap_or("(none)")
-                );
+                match &record.commit_head_id {
+                    Some(id) => println!("Commit ID:      {id}"),
+                    None => println!("Commit ID:      (none)"),
+                }
                 println!("Index t:        {}", record.index_t);
-                println!(
-                    "Index ID:       {}",
-                    record
-                        .index_head_id
-                        .as_ref()
-                        .map(std::string::ToString::to_string)
-                        .as_deref()
-                        .unwrap_or("(none)")
-                );
+                match &record.index_head_id {
+                    Some(id) => println!("Index ID:       {id}"),
+                    None => println!("Index ID:       (none)"),
+                }
             } else if let Some(gs) = fluree.nameservice().lookup_graph_source(&ledger_id).await? {
                 if graph.is_some() {
                     return Err(CliError::Usage(
