@@ -2048,6 +2048,88 @@ fn auth_logout_clears_token() {
 }
 
 #[test]
+fn model_access_disable_dry_run_prints_delete_only_txn() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "model",
+            "access",
+            "disable",
+            "crm",
+            "--profile",
+            "write",
+            "--class",
+            "https://example.org/Lead",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "https://example.org/Lead/access/write/view",
+        ))
+        .stdout(predicate::str::contains(
+            "https://example.org/Lead/access/write/write",
+        ))
+        .stdout(predicate::str::contains("delete"))
+        .stdout(predicate::str::contains("insert").not());
+}
+
+#[test]
+fn model_access_disable_requires_identification() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["model", "access", "disable", "crm"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--policy-class"));
+}
+
+#[test]
+fn auth_token_prints_exactly_the_stored_token() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://localhost:8090"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["auth", "login", "--remote", "origin", "--token", "tok-789"])
+        .assert()
+        .success();
+
+    // Stdout is the token and nothing else — it must compose into
+    // FLUREE_TOKEN=$(fluree auth token) without trailing decoration.
+    fluree_cmd(&tmp)
+        .args(["auth", "token", "--remote", "origin"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("tok-789\n"));
+}
+
+#[test]
+fn auth_token_without_stored_token_errors() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["remote", "add", "origin", "http://localhost:8090"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["auth", "token", "--remote", "origin"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no token stored"));
+}
+
+#[test]
 fn auth_login_no_remote_single_remote_default() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();

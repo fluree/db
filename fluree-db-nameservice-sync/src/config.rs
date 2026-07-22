@@ -30,6 +30,18 @@ pub enum RemoteAuthType {
     OidcDevice,
 }
 
+/// Which OAuth flow an interactive OIDC login actually used. The flow is
+/// auto-detected per login from the IdP's discovery document, so this is a
+/// record of the last login — not a configuration input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OidcLoginFlow {
+    /// Device Authorization Grant (RFC 8628)
+    DeviceCode,
+    /// Authorization Code + PKCE (RFC 7636)
+    AuthCodePkce,
+}
+
 /// Authentication for a remote
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RemoteAuth {
@@ -56,6 +68,11 @@ pub struct RemoteAuth {
     /// Default tries ports 8400..8405.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_port: Option<u16>,
+    /// OAuth flow the last interactive OIDC login used (set by `auth login`,
+    /// cleared by `auth logout` and manual token logins). Display-only:
+    /// flow selection is re-discovered on every login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_flow: Option<OidcLoginFlow>,
 }
 
 /// Configuration for a named remote

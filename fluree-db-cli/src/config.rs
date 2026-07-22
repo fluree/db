@@ -642,7 +642,7 @@ impl TomlSyncConfigStore {
 
             // Build [remotes.auth] sub-table with all populated fields
             {
-                use fluree_db_nameservice_sync::RemoteAuthType;
+                use fluree_db_nameservice_sync::{OidcLoginFlow, RemoteAuthType};
 
                 let auth = &remote.auth;
                 let has_any = auth.auth_type.is_some()
@@ -652,7 +652,8 @@ impl TomlSyncConfigStore {
                     || auth.exchange_url.is_some()
                     || auth.refresh_token.is_some()
                     || auth.scopes.is_some()
-                    || auth.redirect_port.is_some();
+                    || auth.redirect_port.is_some()
+                    || auth.login_flow.is_some();
 
                 if has_any {
                     let mut auth_table = Table::new();
@@ -685,6 +686,13 @@ impl TomlSyncConfigStore {
                     }
                     if let Some(port) = auth.redirect_port {
                         auth_table.insert("redirect_port", Value::from(i64::from(port)).into());
+                    }
+                    if let Some(flow) = auth.login_flow {
+                        let flow_str = match flow {
+                            OidcLoginFlow::DeviceCode => "device_code",
+                            OidcLoginFlow::AuthCodePkce => "auth_code_pkce",
+                        };
+                        auth_table.insert("login_flow", Value::from(flow_str).into());
                     }
                     table.insert("auth", Item::Table(auth_table));
                 }
