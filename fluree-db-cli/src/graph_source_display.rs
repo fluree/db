@@ -80,8 +80,12 @@ fn render_local_graph_source(gs: &fluree_db_nameservice::GraphSourceRecord) -> S
     }
 
     if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&gs.config) {
-            write_config_section(&mut out, &parsed);
+        match serde_json::from_str::<serde_json::Value>(&gs.config) {
+            Ok(parsed) => write_config_section(&mut out, &parsed),
+            // Fail closed, matching redact_graph_source_config: a config that
+            // cannot be inspected is reported, never echoed or silently
+            // omitted.
+            Err(_) => write_config_body(&mut out, "[redacted:unparseable]"),
         }
     }
     out
@@ -99,9 +103,13 @@ pub(crate) fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) ->
 }
 
 fn write_config_section(out: &mut String, config: &serde_json::Value) {
+    write_config_body(out, &redacted_config_pretty(config));
+}
+
+fn write_config_body(out: &mut String, body: &str) {
     let _ = writeln!(out);
     let _ = writeln!(out, "Configuration:");
-    let _ = writeln!(out, "{}", redacted_config_pretty(config));
+    let _ = writeln!(out, "{body}");
 }
 
 fn redacted_config_pretty(config: &serde_json::Value) -> String {
@@ -167,6 +175,22 @@ mod tests {
         assert!(!rendered.contains("super-secret-pat"));
         assert!(!rendered.contains("live-bearer-token"));
         assert!(rendered.contains("[redacted]"));
+    }
+
+    #[test]
+    fn local_render_fails_closed_on_unparseable_config() {
+        let gs = GraphSourceRecord::new(
+            "my-gs",
+            "main",
+            GraphSourceType::Iceberg,
+            "client_secret=oops-not-json",
+            vec![],
+        );
+
+        let rendered = render_local_graph_source(&gs);
+        assert!(rendered.contains("Configuration:"));
+        assert!(rendered.contains("[redacted:unparseable]"));
+        assert!(!rendered.contains("oops-not-json"));
     }
 
     #[test]
