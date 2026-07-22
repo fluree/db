@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::error::{R2rmlError, R2rmlResult};
-use crate::mapping::{ConstantValue, ObjectMap, PredicateMap, SubjectMap, TermType};
+use crate::mapping::{ConstantValue, GraphMap, ObjectMap, PredicateMap, SubjectMap, TermType};
 
 /// Materialized RDF term
 ///
@@ -817,6 +817,36 @@ pub fn materialize_subject_from_batch(
     Err(R2rmlError::MissingProperty(
         "Subject map must have rr:template, rr:column, or rr:constant".to_string(),
     ))
+}
+
+/// Materialize the named-graph IRI for a row from a [`GraphMap`].
+///
+/// Returns `Some(graph_iri)` when the graph map yields a value, or `None` when
+/// the source value is null / the template can't expand — in which case the
+/// caller falls back to the default graph. A graph term is always an IRI (no
+/// blank-node / literal graphs), so there is no term-type branch. Reuses the
+/// exact template/column expansion the subject materializer uses, so a graph
+/// template and a subject template resolve column values identically.
+pub fn materialize_graph_from_batch(
+    graph_map: &GraphMap,
+    batch: &ColumnBatch,
+    row_idx: usize,
+) -> R2rmlResult<Option<String>> {
+    if let Some(ref constant) = graph_map.constant {
+        return Ok(Some(constant.clone()));
+    }
+    if let Some(ref column) = graph_map.column {
+        // A null graph column routes the row to the default graph.
+        return Ok(column_value_as_string(batch, column, row_idx));
+    }
+    if let Some(ref template) = graph_map.template {
+        return match expand_template_from_batch(template, batch, row_idx) {
+            Ok(expanded) => Ok(Some(expanded)),
+            // A null column in the template -> no graph IRI -> default graph.
+            Err(_) => Ok(None),
+        };
+    }
+    Ok(None)
 }
 
 /// Materialize an object term from an ObjectMap and a ColumnBatch row

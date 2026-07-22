@@ -57,7 +57,8 @@ use fluree_db_query::r2rml::R2rmlProvider;
 use fluree_db_r2rml::mapping::TriplesMap;
 use fluree_db_r2rml::materialize::{
     batch_has_column, column_is_orderable, column_sort_key, column_string,
-    materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
+    materialize_graph_from_batch, materialize_object_from_batch, materialize_subject_from_batch,
+    RdfTerm,
 };
 use fluree_vocab::UnresolvedDatatypeConstraint;
 
@@ -298,14 +299,20 @@ impl Fluree {
         //    Retraction is skipped on a brand-new target (nothing to retract) and
         //    in legacy additive mode (per-predicate upsert suffices; a subject may
         //    legitimately span rows we must not clobber).
-        let retract_all: BTreeSet<String> = if latest_by_key {
-            live.keys()
-                .cloned()
-                .chain(deletions.iter().cloned())
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
+        //
+        //    Named graphs: the retract and the re-assert are BOTH scoped to each
+        //    subject's graph — a subject in graph B is retracted/upserted only in
+        //    B, never touching the same IRI's statements in graph A. This is what
+        //    lets one entity IRI carry independent per-(tenant,user) facts. The
+        //    upsert's own retract-existing is already graph-scoped
+        //    (generate_upsert_deletions keys on graph_id), and the whole-subject
+        //    retract carries the graph via the UPDATE `graph` key.
+        let mut retract_by_graph: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+        if latest_by_key {
+            for (graph, subject) in live.keys().cloned().chain(deletions.iter().cloned()) {
+                retract_by_graph.entry(graph).or_default().insert(subject);
+            }
+        }
 
         let mut ledger = if target_existed {
             self.ledger(target_ledger_id).await?
@@ -313,23 +320,37 @@ impl Fluree {
             self.create_ledger(target_ledger_id).await?
         };
 
-        if target_existed && !retract_all.is_empty() {
-            ledger = self
-                .update(ledger, &build_retract_doc(&retract_all))
-                .await?
-                .ledger;
+        if target_existed {
+            for (graph, iris) in &retract_by_graph {
+                if iris.is_empty() {
+                    continue;
+                }
+                ledger = self
+                    .update(ledger, &build_retract_doc(iris, graph.as_deref()))
+                    .await?
+                    .ledger;
+            }
         }
 
         if latest_by_key {
             // Whole-subject replace: the retraction above cleared every seen
-            // subject, so the re-asserted nodes (carrying @type) are the sole
-            // source of truth for the subject — a single upsert is correct.
-            let mut nodes: Vec<JsonValue> =
-                live.into_values().map(SubjectNode::into_json).collect();
-            for (table, _from, to) in &table_watermarks {
-                nodes.push(watermark_node(source_graph_source_id, table, *to));
+            // subject (per graph), so the re-asserted nodes (carrying @type) are
+            // the sole source of truth for the subject in its graph — a single
+            // upsert is correct. Group nodes by graph so each lands in its own
+            // named graph; watermarks are bookkeeping and stay in the default graph.
+            let mut by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+            for ((graph, _subject), node) in live {
+                by_graph.entry(graph).or_default().push(node.into_json());
             }
-            self.upsert(ledger, &JsonValue::Array(nodes)).await?;
+            for (table, _from, to) in &table_watermarks {
+                by_graph.entry(None).or_default().push(watermark_node(
+                    source_graph_source_id,
+                    table,
+                    *to,
+                ));
+            }
+            self.upsert(ledger, &JsonValue::Array(nodes_by_graph_to_doc(by_graph)))
+                .await?;
         } else {
             // Additive mode: a subject may be contributed to by several sources —
             // a shared target ledger fed by many graph sources, or a join table
@@ -342,24 +363,39 @@ impl Fluree {
             // `entity_type` row adding `as:Announce`). Two commits: insert the
             // classes first, then upsert predicates + advance the watermark — the
             // watermark advances only in the upsert, so a crash between them
-            // re-runs this window (self-healing; insert is idempotent).
-            let mut type_nodes: Vec<JsonValue> = Vec::new();
-            let mut upsert_nodes: Vec<JsonValue> = Vec::new();
-            for node in live.into_values() {
+            // re-runs this window (self-healing; insert is idempotent). Both the
+            // type-insert and the predicate-upsert are grouped by graph so classes
+            // union and predicates upsert WITHIN each subject's graph.
+            let mut type_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+            let mut pred_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+            for ((graph, _subject), node) in live {
                 let (type_node, pred_node) = node.into_type_and_predicate_nodes();
-                type_nodes.extend(type_node);
-                upsert_nodes.extend(pred_node);
+                if let Some(tn) = type_node {
+                    type_by_graph.entry(graph.clone()).or_default().push(tn);
+                }
+                if let Some(pn) = pred_node {
+                    pred_by_graph.entry(graph).or_default().push(pn);
+                }
             }
-            if !type_nodes.is_empty() {
+            let type_doc = nodes_by_graph_to_doc(type_by_graph);
+            if !type_doc.is_empty() {
                 ledger = self
-                    .insert(ledger, &JsonValue::Array(type_nodes))
+                    .insert(ledger, &JsonValue::Array(type_doc))
                     .await?
                     .ledger;
             }
             for (table, _from, to) in &table_watermarks {
-                upsert_nodes.push(watermark_node(source_graph_source_id, table, *to));
+                pred_by_graph.entry(None).or_default().push(watermark_node(
+                    source_graph_source_id,
+                    table,
+                    *to,
+                ));
             }
-            self.upsert(ledger, &JsonValue::Array(upsert_nodes)).await?;
+            self.upsert(
+                ledger,
+                &JsonValue::Array(nodes_by_graph_to_doc(pred_by_graph)),
+            )
+            .await?;
         }
 
         Ok(MaterializeResult {
@@ -472,11 +508,14 @@ struct KeyState {
     node: Option<SubjectNode>,
 }
 
-/// Per-pass latest-by-key accumulator: one [`KeyState`] per subject IRI. The
-/// BTreeMap keeps subjects in a stable order (deterministic transaction).
+/// Per-pass latest-by-key accumulator: one [`KeyState`] per **(graph, subject)**.
+/// The graph is the materialized named-graph IRI (`None` = default graph), so the
+/// same subject IRI in two graphs is two independent keys — the basis for
+/// per-(tenant,user) statements about a shared entity. The BTreeMap keeps keys in
+/// a stable order (deterministic transaction).
 #[derive(Default)]
 struct MaterializeAccum {
-    keys: BTreeMap<String, KeyState>,
+    keys: BTreeMap<(Option<String>, String), KeyState>,
 }
 
 impl MaterializeAccum {
@@ -490,14 +529,16 @@ impl MaterializeAccum {
     /// ([`merge_live`](Self::merge_live)).
     fn record(
         &mut self,
+        graph: Option<String>,
         subject_iri: String,
         rank: Option<(i128, String)>,
         node: Option<SubjectNode>,
     ) {
-        match self.keys.get(&subject_iri) {
+        let key = (graph, subject_iri);
+        match self.keys.get(&key) {
             Some(existing) if rank < existing.rank => {} // older row: ignore
             _ => {
-                self.keys.insert(subject_iri, KeyState { rank, node });
+                self.keys.insert(key, KeyState { rank, node });
             }
         }
     }
@@ -505,15 +546,16 @@ impl MaterializeAccum {
     /// Legacy additive mode: merge a live row's node into the subject's
     /// accumulated node (a subject spanning multiple source rows collects their
     /// values). No ordering, no tombstones, no whole-subject retraction.
-    fn merge_live(&mut self, subject_iri: String, node: SubjectNode) {
-        match self.keys.get_mut(&subject_iri) {
+    fn merge_live(&mut self, graph: Option<String>, subject_iri: String, node: SubjectNode) {
+        let key = (graph, subject_iri);
+        match self.keys.get_mut(&key) {
             Some(KeyState {
                 node: Some(existing),
                 ..
             }) => existing.merge(node),
             _ => {
                 self.keys.insert(
-                    subject_iri,
+                    key,
                     KeyState {
                         rank: None,
                         node: Some(node),
@@ -525,16 +567,22 @@ impl MaterializeAccum {
 
     /// Resolve into `(live nodes to assert, subject IRIs whose latest row is a
     /// tombstone)`.
-    fn finalize(self) -> (BTreeMap<String, SubjectNode>, BTreeSet<String>) {
+    #[allow(clippy::type_complexity)]
+    fn finalize(
+        self,
+    ) -> (
+        BTreeMap<(Option<String>, String), SubjectNode>,
+        BTreeSet<(Option<String>, String)>,
+    ) {
         let mut live = BTreeMap::new();
         let mut deletions = BTreeSet::new();
-        for (iri, state) in self.keys {
+        for (key, state) in self.keys {
             match state.node {
                 Some(node) => {
-                    live.insert(iri, node);
+                    live.insert(key, node);
                 }
                 None => {
-                    deletions.insert(iri);
+                    deletions.insert(key);
                 }
             }
         }
@@ -552,16 +600,65 @@ impl MaterializeAccum {
 /// zero rows and retract nothing. The doc carries no `@context`, and the
 /// materialized IRIs are already fully expanded, so the bound Sid matches the
 /// `@id` the upsert asserted. (Shape proven in `it_transact_update.rs`.)
-fn build_retract_doc(iris: &BTreeSet<String>) -> JsonValue {
+///
+/// `graph` scopes the whole-subject retraction to a single named graph: the
+/// transaction `"graph"` key applies to the WHERE and DELETE templates, so
+/// `?s ?p ?o` binds and deletes only that graph's flakes. `None` retracts in the
+/// default graph. This keeps a subject's statements in graph A untouched when its
+/// same-IRI twin in graph B is replaced.
+fn build_retract_doc(iris: &BTreeSet<String>, graph: Option<&str>) -> JsonValue {
     let rows: Vec<JsonValue> = iris
         .iter()
         .map(|iri| JsonValue::Array(vec![json!({ "@type": "@id", "@value": iri })]))
         .collect();
-    json!({
+    let mut doc = json!({
         "values": ["?s", rows],
         "where": { "@id": "?s", "?p": "?o" },
         "delete": { "@id": "?s", "?p": "?o" }
-    })
+    });
+    if let Some(g) = graph {
+        doc.as_object_mut()
+            .expect("json! object")
+            .insert("graph".to_string(), JsonValue::String(g.to_string()));
+    }
+    doc
+}
+
+/// Flatten a per-graph node map into ONE JSON-LD transaction array. Default-graph
+/// nodes (the `None` key) are emitted as plain top-level nodes; each named-graph
+/// node carries its graph inline via a per-node `@graph` STRING selector
+/// (`{"@id": <subject>, "@graph": "<graph-iri>", …}`).
+///
+/// This is the form `parse_insert`/`parse_upsert` actually accept: the parser reads
+/// a node's `@graph` string, resolves it to a graph id, and scopes every triple that
+/// node emits (`@type` + predicates) to it. The standard JSON-LD *envelope* form
+/// `{"@id": g, "@graph": [nodes]}` (an `@graph` ARRAY) is NOT accepted by
+/// insert/upsert — the parser skips the `@graph` key, so the wrapper collapses to an
+/// `@id`-only node and yields zero triples ("an object with only @id is not a valid
+/// insert"). Only the `update` parser handles a top-level `graph` key (see
+/// `build_retract_doc`). Upsert's retract-existing is graph-scoped
+/// (`generate_upsert_deletions` keys on graph_id), so upserting a subject into graph
+/// B never clobbers the same IRI in graph A — the whole point of per-(tenant,user)
+/// graphs. Empty named-graph groups contribute nothing.
+fn nodes_by_graph_to_doc(by_graph: BTreeMap<Option<String>, Vec<JsonValue>>) -> Vec<JsonValue> {
+    let mut out = Vec::new();
+    // `None` sorts before any `Some(_)` in a BTreeMap, so default-graph nodes lead.
+    for (graph, nodes) in by_graph {
+        match graph {
+            // Default graph: plain top-level nodes, no `@graph` selector.
+            None => out.extend(nodes),
+            // Named graph: tag each node with a per-node `@graph` string selector.
+            Some(g) => {
+                for mut node in nodes {
+                    if let Some(obj) = node.as_object_mut() {
+                        obj.insert("@graph".to_string(), JsonValue::String(g.clone()));
+                    }
+                    out.push(node);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Accumulates all triples for a single subject IRI before emitting one JSON-LD
@@ -739,10 +836,21 @@ fn materialize_row_into(
         Some(RdfTerm::BlankNode(_) | RdfTerm::Literal { .. }) | None => return Ok(()),
     };
 
+    // Resolve the row's named graph from the subject-map-level graph map (R2RML
+    // rr:graph / rr:graphMap). `None` = the default graph (the common case). A
+    // per-row template (e.g. one graph per tenant/user) routes each row into its
+    // own graph so the same subject IRI holds independent per-graph statements.
+    // A null graph value materializes to `None` -> default graph (never dropped).
+    let graph_iri = match &tm.subject_map.graph_map {
+        Some(gm) => materialize_graph_from_batch(gm, batch, row)
+            .map_err(|e| ApiError::Internal(format!("R2RML graph materialization failed: {e}")))?,
+        None => None,
+    };
+
     if !latest_by_key {
-        // Legacy additive: merge this live row into the subject's node.
+        // Legacy additive: merge this live row into the (graph, subject) node.
         let node = build_live_node(tm, batch, row, subject_iri.clone())?;
-        accum.merge_live(subject_iri, node);
+        accum.merge_live(graph_iri, subject_iri, node);
         return Ok(());
     }
 
@@ -757,7 +865,7 @@ fn materialize_row_into(
     } else {
         Some(build_live_node(tm, batch, row, subject_iri.clone())?)
     };
-    accum.record(subject_iri, rank, node);
+    accum.record(graph_iri, subject_iri, rank, node);
     Ok(())
 }
 
@@ -799,44 +907,48 @@ mod tests {
     fn ts(n: i128) -> Option<(i128, String)> {
         Some((n, String::new()))
     }
+    /// Default-graph key for `(graph, subject)` map/set assertions.
+    fn dk(iri: &str) -> (Option<String>, String) {
+        (None, iri.to_string())
+    }
 
     #[test]
     fn finalize_live_only_upserts() {
         let mut a = MaterializeAccum::default();
-        a.record("urn:a".into(), None, live("urn:a"));
+        a.record(None, "urn:a".into(), None, live("urn:a"));
         let (live, del) = a.finalize();
-        assert!(live.contains_key("urn:a"));
+        assert!(live.contains_key(&dk("urn:a")));
         assert!(del.is_empty());
     }
 
     #[test]
     fn finalize_tombstone_only_retracts() {
         let mut a = MaterializeAccum::default();
-        a.record("urn:a".into(), None, None);
+        a.record(None, "urn:a".into(), None, None);
         let (live, del) = a.finalize();
         assert!(live.is_empty());
-        assert!(del.contains("urn:a"));
+        assert!(del.contains(&dk("urn:a")));
     }
 
     #[test]
     fn scan_order_last_wins_live_then_tombstone() {
         // No ordering column: last row in scan order wins -> tombstone.
         let mut a = MaterializeAccum::default();
-        a.record("urn:a".into(), None, live("urn:a"));
-        a.record("urn:a".into(), None, None);
+        a.record(None, "urn:a".into(), None, live("urn:a"));
+        a.record(None, "urn:a".into(), None, None);
         let (live, del) = a.finalize();
         assert!(live.is_empty());
-        assert!(del.contains("urn:a"));
+        assert!(del.contains(&dk("urn:a")));
     }
 
     #[test]
     fn scan_order_last_wins_tombstone_then_live() {
         let mut a = MaterializeAccum::default();
-        a.record("urn:a".into(), None, None);
-        a.record("urn:a".into(), None, live("urn:a"));
+        a.record(None, "urn:a".into(), None, None);
+        a.record(None, "urn:a".into(), None, live("urn:a"));
         let (live, del) = a.finalize();
-        assert!(live.contains_key("urn:a"));
-        assert!(!del.contains("urn:a"));
+        assert!(live.contains_key(&dk("urn:a")));
+        assert!(!del.contains(&dk("urn:a")));
     }
 
     #[test]
@@ -844,21 +956,53 @@ mod tests {
         // A higher-ranked tombstone arriving FIRST still wins over a lower-ranked
         // live row arriving later (ordering, not scan order, decides).
         let mut a = MaterializeAccum::default();
-        a.record("urn:a".into(), ts(200), None); // newer tombstone
-        a.record("urn:a".into(), ts(100), live("urn:a")); // older live
+        a.record(None, "urn:a".into(), ts(200), None); // newer tombstone
+        a.record(None, "urn:a".into(), ts(100), live("urn:a")); // older live
         let (live, del) = a.finalize();
         assert!(live.is_empty());
-        assert!(del.contains("urn:a"));
+        assert!(del.contains(&dk("urn:a")));
     }
 
     #[test]
     fn order_by_newer_live_wins_over_older_tombstone() {
         let mut a = MaterializeAccum::default();
-        a.record("urn:a".into(), ts(100), None); // older tombstone
-        a.record("urn:a".into(), ts(200), live("urn:a")); // newer live
+        a.record(None, "urn:a".into(), ts(100), None); // older tombstone
+        a.record(None, "urn:a".into(), ts(200), live("urn:a")); // newer live
         let (live, del) = a.finalize();
-        assert!(live.contains_key("urn:a"));
-        assert!(!del.contains("urn:a"));
+        assert!(live.contains_key(&dk("urn:a")));
+        assert!(!del.contains(&dk("urn:a")));
+    }
+
+    #[test]
+    fn record_isolates_same_subject_across_graphs() {
+        // The SAME subject IRI in two different graphs is two independent keys —
+        // per-(tenant,user) statements about one entity never collide. Recording a
+        // tombstone in graph A must NOT retract the live row in graph B.
+        let ga = Some("urn:g:a".to_string());
+        let gb = Some("urn:g:b".to_string());
+        let mut a = MaterializeAccum::default();
+        a.record(ga.clone(), "urn:x".into(), None, None); // tombstone in A
+        a.record(gb.clone(), "urn:x".into(), None, live("urn:x")); // live in B
+        let (live, del) = a.finalize();
+        assert!(live.contains_key(&(gb, "urn:x".to_string())));
+        assert!(del.contains(&(ga, "urn:x".to_string())));
+        assert_eq!(live.len(), 1);
+        assert_eq!(del.len(), 1);
+    }
+
+    #[test]
+    fn merge_live_isolates_same_subject_across_graphs() {
+        // Additive merge is per (graph, subject): the same IRI in two graphs
+        // accumulates independently, not into one merged node.
+        let ga = Some("urn:g:a".to_string());
+        let gb = Some("urn:g:b".to_string());
+        let mut a = MaterializeAccum::default();
+        a.merge_live(ga.clone(), "urn:x".into(), SubjectNode::new("urn:x".into()));
+        a.merge_live(gb.clone(), "urn:x".into(), SubjectNode::new("urn:x".into()));
+        let (live, _del) = a.finalize();
+        assert_eq!(live.len(), 2);
+        assert!(live.contains_key(&(ga, "urn:x".to_string())));
+        assert!(live.contains_key(&(gb, "urn:x".to_string())));
     }
 
     #[test]
@@ -866,7 +1010,7 @@ mod tests {
         let mut set = BTreeSet::new();
         set.insert("urn:a".to_string());
         set.insert("urn:b".to_string());
-        let doc = build_retract_doc(&set);
+        let doc = build_retract_doc(&set, None);
         // Subjects MUST be typed @id values, not bare strings (a bare string
         // parses to a literal that never joins a real subject Sid). BTreeSet
         // => sorted order.
@@ -880,6 +1024,41 @@ mod tests {
         );
         assert_eq!(doc["where"], json!({ "@id": "?s", "?p": "?o" }));
         assert_eq!(doc["delete"], json!({ "@id": "?s", "?p": "?o" }));
+        // Default graph: no `graph` key.
+        assert!(doc.get("graph").is_none());
+    }
+
+    #[test]
+    fn build_retract_doc_scopes_to_named_graph() {
+        let mut set = BTreeSet::new();
+        set.insert("urn:a".to_string());
+        let doc = build_retract_doc(&set, Some("urn:g:tenant/user"));
+        // The `graph` key scopes the whole-subject retract to that named graph
+        // (WHERE + DELETE), so a same-IRI twin in another graph is untouched.
+        assert_eq!(doc["graph"], json!("urn:g:tenant/user"));
+        assert_eq!(doc["delete"], json!({ "@id": "?s", "?p": "?o" }));
+    }
+
+    #[test]
+    fn nodes_by_graph_to_doc_tags_named_nodes_with_graph_selector() {
+        let mut by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+        by_graph.insert(None, vec![json!({ "@id": "urn:wm" })]);
+        by_graph.insert(
+            Some("urn:g:a".to_string()),
+            vec![json!({ "@id": "urn:x", "@type": ["ex:T"] })],
+        );
+        by_graph.insert(Some("urn:g:empty".to_string()), vec![]); // contributes nothing
+        let doc = nodes_by_graph_to_doc(by_graph);
+        // Default-graph node stays plain; the named-graph node carries a per-node
+        // `@graph` STRING selector (the form parse_insert/parse_upsert accept), NOT
+        // the `{"@id":g,"@graph":[...]}` envelope; the empty named graph adds nothing.
+        assert!(doc.contains(&json!({ "@id": "urn:wm" })));
+        assert!(doc.contains(&json!({
+            "@id": "urn:x",
+            "@graph": "urn:g:a",
+            "@type": ["ex:T"]
+        })));
+        assert_eq!(doc.len(), 2);
     }
 
     #[test]
