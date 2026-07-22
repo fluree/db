@@ -46,7 +46,7 @@ use crate::{
     CommitReceipt, Fluree, GovernanceOptions, IndexingStatus, Result, Tracker, TrackingOptions,
     TransactResultRef,
 };
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, ContentKind};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, RefKind, RefValue};
 use fluree_db_transact::{CommitOpts, TransactError};
@@ -413,32 +413,32 @@ impl Fluree {
     ///   already delivered by [`CypherTxnWriteOutcome::return_table`].
     ///
     /// An all-reads (or all-no-op) transaction publishes nothing and reports
-    /// the unchanged base head with a zero flake count.
+    /// the same no-op receipt the autocommit paths return: the empty-content
+    /// commit id and the base `t` (legitimately `0` on a ledger registered by
+    /// `create_ledger`, which writes no genesis commit).
     pub async fn commit_cypher_transaction(
         &self,
         txn: CypherTransaction,
     ) -> Result<TransactResultRef> {
         let index_config = crate::server_defaults::default_index_config();
         if txn.pending.is_empty() {
-            // Head unchanged at the pinned base. `begin` requires a resolvable
-            // ledger, so a prior commit — hence a base head id — always exists.
-            let commit_id = txn
-                .base_head
-                .as_ref()
-                .and_then(|r| r.id.clone())
-                .ok_or_else(|| {
-                    ApiError::internal(
-                        "cannot commit an all-reads Cypher transaction on an uncommitted ledger",
-                    )
-                })?;
-            let indexing = self.cypher_txn_indexing_status(&txn.state, &index_config, txn.base_t);
+            // Nothing published, head unchanged — mirror the autocommit no-op
+            // receipt exactly. A `create_ledger` ledger has a nameservice
+            // record but no genesis commit, so `base_head` is legitimately
+            // `None` here; that must stay a successful no-op, not an error.
             return Ok(TransactResultRef {
                 receipt: CommitReceipt {
-                    commit_id,
+                    commit_id: ContentId::new(ContentKind::Commit, &[]),
                     t: txn.base_t,
                     flake_count: 0,
                 },
-                indexing,
+                indexing: IndexingStatus {
+                    enabled: self.indexing_mode.is_enabled(),
+                    needed: false,
+                    novelty_size: txn.state.novelty_size(),
+                    index_t: txn.state.index_t(),
+                    commit_t: txn.base_t,
+                },
                 tally: txn.tracker.tally(),
                 cypher_return: None,
             });

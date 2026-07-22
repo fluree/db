@@ -806,6 +806,52 @@ async fn commit_result_carries_fuel_and_indexing_signals() {
 }
 
 #[tokio::test]
+async fn all_reads_commit_on_uncommitted_ledger_is_a_no_op() {
+    // `create_ledger` registers the nameservice record but writes no genesis
+    // commit, so the transaction's base head id is None and base t is 0. An
+    // all-reads COMMIT on such a ledger must succeed as a no-op — matching the
+    // autocommit no-op receipt — not error.
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("it/cyseq:uncommitted")
+        .await
+        .expect("create ledger");
+
+    let txn = fluree
+        .begin_cypher_transaction(
+            "it/cyseq:uncommitted",
+            fluree_db_api::GovernanceOptions::default(),
+            fluree_db_api::TrackingOptions::default(),
+        )
+        .await
+        .expect("begin on a ledger with no genesis commit");
+    assert!(!txn.has_writes());
+
+    let committed = fluree
+        .commit_cypher_transaction(txn)
+        .await
+        .expect("all-reads commit succeeds on an uncommitted ledger");
+    assert_eq!(committed.receipt.t, 0, "base t of an uncommitted ledger");
+    assert_eq!(committed.receipt.flake_count, 0);
+    assert!(!committed.indexing.needed, "a no-op needs no reindex");
+
+    // The ledger stays usable: data can still be added after the fact.
+    let handle = fluree
+        .ledger_cached("it/cyseq:uncommitted")
+        .await
+        .expect("cached handle");
+    let state = handle.snapshot().await.to_ledger_state();
+    let r = fluree
+        .transact_cypher(state, r#"CREATE (p:Person {name: "Ada"})"#)
+        .await
+        .expect("write after an all-reads no-op commit");
+    assert_eq!(
+        count(&fluree, &r.ledger, "MATCH (n:Person) RETURN count(n)").await,
+        1
+    );
+}
+
+#[tokio::test]
 async fn commit_without_tracking_reports_no_tally() {
     // Opting out of tracking leaves the tally empty — no accidental overhead.
     let fluree = FlureeBuilder::memory().build_memory();
