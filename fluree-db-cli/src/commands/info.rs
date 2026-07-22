@@ -1,5 +1,6 @@
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
+use crate::graph_source_display::{print_local_graph_source, print_remote_graph_source};
 use fluree_db_api::server_defaults::FlureeDir;
 
 pub async fn run(
@@ -43,7 +44,7 @@ pub async fn run(
                             "--graph is not applicable to graph sources".to_string(),
                         ));
                     }
-                    print_graph_source_info(&gs);
+                    print_local_graph_source(&gs);
                     return Ok(());
                 }
                 // Neither ledger nor graph source
@@ -73,7 +74,7 @@ pub async fn run(
                         "--graph is not applicable to graph sources".to_string(),
                     ));
                 }
-                print_remote_graph_source_info(&info);
+                print_remote_graph_source(&info);
             } else {
                 println!(
                     "Ledger:         {} (tracked)",
@@ -156,7 +157,7 @@ pub async fn run(
                         "--graph is not applicable to graph sources".to_string(),
                     ));
                 }
-                print_graph_source_info(&gs);
+                print_local_graph_source(&gs);
             } else {
                 return Err(CliError::NotFound(format!(
                     "'{alias}' not found as a ledger or graph source"
@@ -166,85 +167,4 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-/// Print graph source info from a JSON response (remote/server mode).
-fn print_remote_graph_source_info(info: &serde_json::Value) {
-    let name = info.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-    let branch = info.get("branch").and_then(|v| v.as_str()).unwrap_or("?");
-    let gs_type = info.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-    let gs_id = info
-        .get("graph_source_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-
-    println!("Name:           {name}");
-    println!("Branch:         {branch}");
-    println!("Type:           {gs_type}");
-    println!("ID:             {gs_id}");
-
-    if let Some(t) = info.get("index_t").and_then(serde_json::Value::as_i64) {
-        println!("Index t:        {t}");
-    }
-    if let Some(id) = info.get("index_id").and_then(|v| v.as_str()) {
-        println!("Index ID:       {id}");
-    }
-    if let Some(deps) = info.get("dependencies").and_then(|v| v.as_array()) {
-        let dep_strs: Vec<&str> = deps.iter().filter_map(|v| v.as_str()).collect();
-        if !dep_strs.is_empty() {
-            println!("Dependencies:   {}", dep_strs.join(", "));
-        }
-    }
-    if let Some(config) = info.get("config") {
-        println!();
-        println!("Configuration:");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(config).unwrap_or_default()
-        );
-    }
-}
-
-fn print_graph_source_info(gs: &fluree_db_nameservice::GraphSourceRecord) {
-    println!("Name:           {}", gs.name);
-    println!("Branch:         {}", gs.branch);
-    println!("Type:           {}", format_source_type(&gs.source_type));
-    println!("ID:             {}", gs.graph_source_id);
-    println!("Retracted:      {}", gs.retracted);
-    println!("Index t:        {}", gs.index_t);
-    println!(
-        "Index ID:       {}",
-        gs.index_id
-            .as_ref()
-            .map(std::string::ToString::to_string)
-            .as_deref()
-            .unwrap_or("(none)")
-    );
-
-    if !gs.dependencies.is_empty() {
-        println!("Dependencies:   {}", gs.dependencies.join(", "));
-    }
-
-    // Print config JSON (pretty)
-    if !gs.config.is_empty() && gs.config != "{}" {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&gs.config) {
-            println!();
-            println!("Configuration:");
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| gs.config.clone())
-            );
-        }
-    }
-}
-
-fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
-    match st {
-        fluree_db_nameservice::GraphSourceType::Bm25 => "BM25".to_string(),
-        fluree_db_nameservice::GraphSourceType::Vector => "Vector".to_string(),
-        fluree_db_nameservice::GraphSourceType::Geo => "Geo".to_string(),
-        fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
-        fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
-        fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
-    }
 }

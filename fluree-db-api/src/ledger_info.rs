@@ -1001,7 +1001,10 @@ fn is_secret_config_key(key: &str) -> bool {
 /// "default_val": "..."}`) keeps its `env_var` name (safe, aids debugging) while
 /// the inline `default_val` fallback is masked by the recursive walk. Returns
 /// `true` when anything was redacted.
-fn redact_json_secrets(value: &mut JsonValue) -> bool {
+///
+/// Value-level form of [`redact_graph_source_config`], for callers that
+/// already hold a parsed JSON tree.
+pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
     let mut redacted = false;
     match value {
         JsonValue::Object(map) => {
