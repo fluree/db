@@ -46,6 +46,49 @@ async fn alice_ledger(name: &str) -> (tempfile::TempDir, fluree_db_api::Fluree, 
     (tmp, fluree, ledger_id)
 }
 
+/// Two subjects, two properties, one overwrite each — enough to exercise
+/// variable subjects and variable predicates inside the quoted triple.
+///
+/// t=1: alice{name=Alice, dept=Eng}, bob{name=Bob}
+/// t=2: alice.name -> Alicia  (retract Alice, assert Alicia)
+/// t=3: bob.name   -> Bobby   (retract Bob, assert Bobby)
+async fn team_ledger(name: &str) -> (tempfile::TempDir, fluree_db_api::Fluree, String) {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = format!("test/history-sparql-team-{name}:main");
+
+    let l0 = fluree.create_ledger(&ledger_id).await.expect("create");
+    let r1 = fluree
+        .insert(
+            l0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice", "ex:dept": "Eng"},
+                {"@id": "ex:bob", "ex:name": "Bob"},
+            ]}),
+        )
+        .await
+        .expect("t=1");
+    let r2 = fluree
+        .upsert(
+            r1.ledger,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alicia"}),
+        )
+        .await
+        .expect("t=2");
+    let r3 = fluree
+        .upsert(
+            r2.ledger,
+            &json!({"@context": ctx(), "@id": "ex:bob", "ex:name": "Bobby"}),
+        )
+        .await
+        .expect("t=3");
+    assert_eq!(r3.receipt.t, 3);
+
+    (tmp, fluree, ledger_id)
+}
+
 async fn run_sparql(fluree: &fluree_db_api::Fluree, sparql: &str) -> Value {
     let result = fluree
         .query_from()
@@ -55,6 +98,19 @@ async fn run_sparql(fluree: &fluree_db_api::Fluree, sparql: &str) -> Value {
         .await
         .expect("sparql history query");
     serde_json::to_value(&result.result).expect("serialize")
+}
+
+/// Local name of an IRI binding, which typed-json may render as a bare
+/// string, `{"@id": ...}`, or `{"@value": ...}`, and either full or
+/// prefix-compacted. `http://example.org/name` and `ex:name` both yield
+/// `name`.
+fn local_name(v: &Value) -> String {
+    let s = v
+        .as_str()
+        .or_else(|| v["@id"].as_str())
+        .or_else(|| v["@value"].as_str())
+        .unwrap_or_else(|| panic!("expected an IRI binding, got {v}"));
+    s.rsplit(['/', '#', ':']).next().unwrap_or(s).to_string()
 }
 
 /// Pull `(?name, ?t, ?op)` out of a typed-json binding row.
@@ -203,14 +259,16 @@ WHERE {{ << ex:alice ex:name "Alice" >> f:t ?t . }}"#
     );
 }
 
-/// Documents a known sharp edge: selecting `?t` / `?op` in history mode
-/// WITHOUT the `<< ... >> f:t|f:op` bindings succeeds and returns history
-/// rows with both metadata columns null, giving no way to tell an assert
-/// from a retract.
+/// `?t` / `?op` are ordinary variables, not reserved names: selecting them
+/// without the `<< ... >> f:t|f:op` bindings yields unbound, exactly as any
+/// other never-bound variable would. This is standard SPARQL behaviour and
+/// is deliberately NOT an error — `?t` is a plausible user variable name
+/// ("type", "total"), and special-casing it in history mode would both
+/// deviate from the spec and break those queries.
 ///
-/// This is a regression lock on *current* behaviour, not an endorsement of
-/// it. If unbound history metadata is ever promoted to a warning or an
-/// error, update this test — do not delete the coverage.
+/// The trap is a documentation problem, handled in the gotchas section of
+/// docs/guides/cookbook-time-travel.md. This test pins the semantics so a
+/// well-meaning "fix" doesn't quietly introduce reserved variable names.
 #[tokio::test]
 async fn history_metadata_vars_without_bindings_are_null() {
     let (_tmp, fluree, ledger_id) = alice_ledger("unbound").await;
@@ -230,4 +288,207 @@ WHERE {{ ex:alice ex:name ?name . }}"
         assert!(row["?t"].is_null(), "?t is unbound without f:t: {row}");
         assert!(row["?op"].is_null(), "?op is unbound without f:op: {row}");
     }
+}
+
+/// A variable predicate inside the quoted triple gives "every change to
+/// this entity" — the SPARQL twin of the JSON-LD `"?prop": {...}` form.
+#[tokio::test]
+async fn rdf_star_history_variable_predicate() {
+    let (_tmp, fluree, ledger_id) = team_ledger("varpred").await;
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?prop ?value ?t ?op
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{ << ex:alice ?prop ?value >> f:t ?t ; f:op ?op . }}
+ORDER BY ?t ?op ?prop"
+    );
+
+    let rows = run_sparql(&fluree, &sparql).await;
+    let got: Vec<(String, String, i64, bool)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                local_name(&r["?prop"]),
+                r["?value"]["@value"].as_str().expect("?value").to_string(),
+                r["?t"]["@value"].as_i64().expect("?t bound"),
+                r["?op"]["@value"].as_bool().expect("?op bound"),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        got,
+        vec![
+            ("dept".into(), "Eng".into(), 1, true),
+            ("name".into(), "Alice".into(), 1, true),
+            ("name".into(), "Alice".into(), 2, false),
+            ("name".into(), "Alicia".into(), 2, true),
+        ],
+        "rows: {rows:#?}"
+    );
+}
+
+/// A variable subject gives "every change to this property, across
+/// subjects" — and it composes with an ordinary (non-history) triple
+/// pattern in the same WHERE block.
+#[tokio::test]
+async fn rdf_star_history_variable_subject() {
+    let (_tmp, fluree, ledger_id) = team_ledger("varsubj").await;
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?person ?value ?t ?op
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{ << ?person ex:name ?value >> f:t ?t ; f:op ?op . }}
+ORDER BY ?t ?op ?value"
+    );
+
+    let rows = run_sparql(&fluree, &sparql).await;
+    let got: Vec<(String, String, i64, bool)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                local_name(&r["?person"]),
+                r["?value"]["@value"].as_str().expect("?value").to_string(),
+                r["?t"]["@value"].as_i64().expect("?t bound"),
+                r["?op"]["@value"].as_bool().expect("?op bound"),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        got,
+        vec![
+            ("alice".into(), "Alice".into(), 1, true),
+            ("bob".into(), "Bob".into(), 1, true),
+            ("alice".into(), "Alice".into(), 2, false),
+            ("alice".into(), "Alicia".into(), 2, true),
+            ("bob".into(), "Bob".into(), 3, false),
+            ("bob".into(), "Bobby".into(), 3, true),
+        ],
+        "rows: {rows:#?}"
+    );
+}
+
+/// Retractions only, as a complete query — `f:op` is a boolean.
+#[tokio::test]
+async fn rdf_star_history_retractions_only() {
+    let (_tmp, fluree, ledger_id) = team_ledger("retractonly").await;
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?person ?old ?t
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{
+  << ?person ex:name ?old >> f:t ?t ; f:op ?op .
+  FILTER(?op = false)
+}}
+ORDER BY ?t"
+    );
+
+    let rows = run_sparql(&fluree, &sparql).await;
+    let got: Vec<(String, i64)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                r["?old"]["@value"].as_str().expect("?old").to_string(),
+                r["?t"]["@value"].as_i64().expect("?t"),
+            )
+        })
+        .collect();
+
+    assert_eq!(got, vec![("Alice".to_string(), 2), ("Bob".to_string(), 3)]);
+}
+
+/// A narrowed `FROM ... TO ...` window is what scopes the scan; rows
+/// outside it are not emitted at all.
+#[tokio::test]
+async fn rdf_star_history_narrowed_range() {
+    let (_tmp, fluree, ledger_id) = team_ledger("range").await;
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?person ?value ?t ?op
+FROM <{ledger_id}@t:3>
+TO <{ledger_id}@t:latest>
+WHERE {{ << ?person ex:name ?value >> f:t ?t ; f:op ?op . }}
+ORDER BY ?op"
+    );
+
+    let rows = run_sparql(&fluree, &sparql).await;
+    let got: Vec<(String, i64, bool)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                r["?value"]["@value"].as_str().expect("?value").to_string(),
+                r["?t"]["@value"].as_i64().expect("?t"),
+                r["?op"]["@value"].as_bool().expect("?op"),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        got,
+        vec![
+            ("Bob".to_string(), 3, false),
+            ("Bobby".to_string(), 3, true)
+        ],
+        "only the t=3 change is in range: {rows:#?}"
+    );
+}
+
+/// Aggregates work over history rows like any other solution sequence.
+#[tokio::test]
+async fn rdf_star_history_group_by_count() {
+    let (_tmp, fluree, ledger_id) = team_ledger("aggregate").await;
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?person (COUNT(*) AS ?changes)
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{
+  << ?person ex:name ?value >> f:t ?t ; f:op ?op .
+  FILTER(?op = true)
+}}
+GROUP BY ?person
+ORDER BY DESC(?changes) ?person"
+    );
+
+    let rows = run_sparql(&fluree, &sparql).await;
+    let got: Vec<(String, i64)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                local_name(&r["?person"]),
+                r["?changes"]["@value"].as_i64().expect("?changes"),
+            )
+        })
+        .collect();
+
+    // Each person has two asserts: the original and the replacement.
+    assert_eq!(
+        got,
+        vec![("alice".to_string(), 2), ("bob".to_string(), 2)],
+        "rows: {rows:#?}"
+    );
 }

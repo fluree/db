@@ -1108,6 +1108,23 @@ mem:fact-01kp4g1wa8yyty4sd2p03k6bg9 a mem:Fact ;
     mem:artifactRef "fluree-graph-json-ld/src/expand.rs" ;
     mem:createdAt "2026-04-13T22:40:33.608461+00:00"^^xsd:dateTime .
 
+mem:fact-01ky55dwckmwazppht36vrn5hk a mem:Fact ;
+    mem:content "SPARQL history queries use the legacy RDF-star form: `FROM <l@t:1> TO <l@t:latest>` + `<< s p ?o >> f:t ?t ; f:op ?op`. The carve-out fires ONLY when the quoted-triple subject is reifier-less AND the predicate is f:t/f:op; anything else takes the RDF 1.2 reification path. Inner object must be a variable (BIND target). `f:op`/`@op` is xsd:boolean — \"assert\"/\"retract\" strings match nothing. Selecting ?t/?op WITHOUT the bindings does NOT error: it returns history rows with null metadata (issue #1532; pinned by history_metadata_vars_without_bindings_are_null). `FROM..TO` is rejected on the ledger-scoped and streaming endpoints — connection-scoped `/v1/fluree/query` only." ;
+    mem:tag "docs" ;
+    mem:tag "history" ;
+    mem:tag "rdf-star" ;
+    mem:tag "sparql" ;
+    mem:tag "time-travel" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/guides/cookbook-time-travel.md" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_history_sparql.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/fluree.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:artifactRef "fluree-db-sparql/src/lower/rdf_star.rs" ;
+    mem:branch "docs/time-travel-history-audit" ;
+    mem:createdAt "2026-07-22T14:59:41.587318+00:00"^^xsd:dateTime ;
+    mem:rationale "The cookbook drifted into fully non-runnable syntax because this path had parser tests but no e2e coverage, and the unbound-metadata case fails silently rather than erroring." .
+
 mem:decision-01kwwmmezehttr76cjq1kdtfqf a mem:Decision ;
     mem:content "Bolt/Cypher node-emit strings are Arc<str> end-to-end: CypherNode/Relationship/Path fields, the hydrator memos, AND the bolt codec's Value::String + MapValue keys — names alloc once per distinct name per result, never per use (87→73ms on the 20k-node probe). IriCompactor::decode_sid_shared returns the Sid's own name (refcount bump, no alloc) for EMPTY/OVERFLOW/empty-prefix namespaces — the ready-made hot path for the planned move of default Cypher identifiers to namespace 0 (no IRI prefix instead of http://example.org/). Note: the dict already stores split (ns_code, suffix), so NS-0's win is decode-side only." ;
     mem:tag "bolt" ;

@@ -176,7 +176,7 @@ Bind `@t` and `@op` on the value object:
 
 ### Entity history (SPARQL)
 
-SPARQL uses the `FROM ... TO ...` range plus RDF-star quoted triples to bind the metadata. `f:t` and `f:op` on a quoted triple extract the flake metadata for that triple's object:
+SPARQL uses the `FROM ... TO ...` range plus an RDF-star quoted triple to bind the metadata. `f:t` and `f:op` on a quoted triple extract the flake metadata for that triple's object:
 
 ```sparql
 PREFIX ex: <http://example.org/>
@@ -200,13 +200,56 @@ Results:
 95000    4   true      ← new value asserted
 ```
 
+The `;` continuation is the idiomatic form — it binds one inner triple with two metadata extractions. Writing the quoted triple out twice is equivalent:
+
+```sparql
+<< ex:alice ex:salary ?value >> f:t ?t .
+<< ex:alice ex:salary ?value >> f:op ?op .
+```
+
+Bind only what you need — `f:t` alone is fine if you don't care about assert vs. retract.
+
+### All properties of an entity (SPARQL)
+
+Put a variable in the predicate position to get every change to a subject — the SPARQL twin of the JSON-LD `"?prop": {...}` form:
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?prop ?value ?t ?op
+FROM <mydb:main@t:1>
+TO <mydb:main@t:latest>
+WHERE {
+  << ex:alice ?prop ?value >> f:t ?t ; f:op ?op .
+}
+ORDER BY ?t ?prop
+```
+
 ### Find when a value changed
+
+For a single entity, the CLI is enough:
 
 ```bash
 fluree history ex:alice -p ex:salary
 ```
 
-or, across every subject with that property:
+Across every subject with that property, put a variable in the subject position:
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?person ?salary ?t ?op
+FROM <mydb:main@t:1>
+TO <mydb:main@t:latest>
+WHERE {
+  << ?person ex:salary ?salary >> f:t ?t ; f:op ?op .
+}
+ORDER BY ?t
+```
+
+The JSON-LD equivalent:
 
 ```json
 {
@@ -223,7 +266,23 @@ or, across every subject with that property:
 
 ### Show only retractions
 
-`@op` is a boolean. The constant shorthand filters without binding a variable:
+`f:op` is a boolean, so filter it as one — `"retract"` as a string matches nothing:
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?person ?old ?t
+FROM <mydb:main@t:1>
+TO <mydb:main@t:latest>
+WHERE {
+  << ?person ex:salary ?old >> f:t ?t ; f:op ?op .
+  FILTER(?op = false)
+}
+ORDER BY ?t
+```
+
+In JSON-LD the constant shorthand filters without binding a variable at all:
 
 ```json
 {
@@ -237,15 +296,24 @@ or, across every subject with that property:
 }
 ```
 
-In SPARQL, filter the bound variable:
-
-```sparql
-FILTER(?op = false)
-```
-
 ### Scope a range
 
-Bound the range with `from` / `to` rather than filtering on `?t` after the fact — the endpoints are what drive the scan:
+Bound the range with the `FROM` / `TO` endpoints rather than filtering on `?t` afterwards — the endpoints are what drive the scan, and a `FILTER` cannot narrow what was already read:
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?s ?p ?v ?t ?op
+FROM <mydb:main@t:10>
+TO <mydb:main@t:15>
+WHERE {
+  << ?s ?p ?v >> f:t ?t ; f:op ?op .
+}
+ORDER BY ?t
+```
+
+The JSON-LD equivalent:
 
 ```json
 {
@@ -260,7 +328,26 @@ Bound the range with `from` / `to` rather than filtering on `?t` after the fact 
 }
 ```
 
-ISO timestamps work as endpoints too: `"from": "mydb:main@iso:2025-01-01T00:00:00Z"`.
+ISO timestamps work as endpoints too, in either syntax: `FROM <mydb:main@iso:2025-01-01T00:00:00Z>`.
+
+### Count changes per entity (SPARQL)
+
+Aggregates work over history rows like any other solution sequence — here, churn per person:
+
+```sparql
+PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+
+SELECT ?person (COUNT(*) AS ?changes)
+FROM <mydb:main@t:1>
+TO <mydb:main@t:latest>
+WHERE {
+  << ?person ex:salary ?value >> f:t ?t ; f:op ?op .
+  FILTER(?op = true)
+}
+GROUP BY ?person
+ORDER BY DESC(?changes)
+```
 
 ## Patterns
 
@@ -346,8 +433,10 @@ LIMIT 10
 
 ## Gotchas
 
-**Selecting `?t` / `?op` without binding them silently returns nulls.**
-This is the most common mistake. A history query that selects `?t` and `?op` but never binds them via `@t`/`@op` (JSON-LD) or `f:t`/`f:op` (SPARQL) succeeds, returns history rows, and leaves both columns null — so asserts and retracts are indistinguishable. There is no error or warning. Always bind the metadata.
+**`?t` and `?op` are ordinary variables — you must bind them.**
+This is the most common mistake. A history query that selects `?t` and `?op` but never binds them via `@t`/`@op` (JSON-LD) or `f:t`/`f:op` (SPARQL) returns history rows with both columns null, so asserts and retracts are indistinguishable.
+
+There is no error, and there shouldn't be: this is ordinary SPARQL semantics. Selecting a variable the WHERE clause never binds is legal and yields unbound — `?t` and `?op` behave exactly as `?anythingElse` would, in history mode and out of it. They are not reserved names, and nothing about a `from`/`to` range makes them special. The metadata is available only through the binding syntax; write it explicitly.
 
 **`@op` / `f:op` is a boolean, not a string.**
 `true` = assert, `false` = retract. `"assert"` and `"retract"` are not accepted and match nothing. The CLI's *table* renderer displays `+` / `-`, but the underlying value in JSON output is `true` / `false`.
