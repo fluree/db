@@ -601,13 +601,18 @@ pub struct ObjectQuery {
 
 /// Content kinds allowed through the CID object endpoint.
 ///
-/// All replication-relevant kinds are served (commits, txns, config, and
-/// index artifacts). Only `GarbageRecord` (internal GC metadata) is excluded.
+/// All replication- and mount-relevant kinds are served: commits, txns, config,
+/// and every index artifact a remote mount may resolve from the index root —
+/// the core index tree (roots/branches/leaves), dict blobs, and the advanced
+/// index kinds (planner statistics, spatial, history sidecars, and graph-source
+/// snapshots/mappings). `GarbageRecord` (internal GC metadata) and the
+/// edge-annotation arenas are excluded — neither is fetched over a mount.
 ///
 /// **Security note:** This endpoint requires a `fluree.storage.*` bearer
-/// token (peer-replication scope). Raw index leaves and dict blobs bypass
-/// policy filtering — this is intentional for peer-to-peer replication but
-/// means `fluree.storage.*` tokens must not be issued to untrusted callers.
+/// token (peer-replication scope). Raw index artifacts bypass policy filtering
+/// — intentional for peer-to-peer replication and remote mounts, but means
+/// `fluree.storage.*` tokens must not be issued to untrusted callers. The
+/// advanced kinds are no more sensitive than the index leaves they derive from.
 fn is_allowed_object_kind(kind: ContentKind) -> bool {
     matches!(
         kind,
@@ -618,6 +623,11 @@ fn is_allowed_object_kind(kind: ContentKind) -> bool {
             | ContentKind::IndexBranch
             | ContentKind::IndexLeaf
             | ContentKind::DictBlob { .. }
+            | ContentKind::StatsSketch
+            | ContentKind::SpatialIndex
+            | ContentKind::HistorySidecar
+            | ContentKind::GraphSourceSnapshot
+            | ContentKind::GraphSourceMapping
     )
 }
 
@@ -648,7 +658,7 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 ///
 /// # Kind Allowlist
 ///
-/// All replication-relevant kinds are served:
+/// All replication- and mount-relevant kinds are served:
 /// - `Commit` — commit chain blobs
 /// - `Txn` — transaction data blobs
 /// - `LedgerConfig` — origin discovery config
@@ -656,8 +666,13 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 /// - `IndexBranch` — index branch manifests
 /// - `IndexLeaf` — index leaf files
 /// - `DictBlob` — dictionary artifacts (predicates, subjects, strings, etc.)
+/// - `StatsSketch` — query-planner statistics (HLL/NDV)
+/// - `SpatialIndex` — spatial index artifacts
+/// - `HistorySidecar` — time-travel / history sidecars
+/// - `GraphSourceSnapshot` / `GraphSourceMapping` — full-text / vector graph sources
 ///
-/// Only `GarbageRecord` (internal GC metadata) returns 404.
+/// `GarbageRecord` (internal GC metadata) and the edge-annotation arenas
+/// return 404 — neither is resolved over a remote mount.
 ///
 /// # Path Parameters
 /// - `cid`: CIDv1 string (base32-lower, e.g., `"bafybeig..."`)
