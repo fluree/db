@@ -2,15 +2,18 @@
 //!
 //! Every path that prints a graph-source config must go through this module:
 //! stored configs can carry literal auth secrets (OAuth2 client secrets,
-//! bearer tokens), so the config JSON is redacted before printing.
+//! bearer tokens), so the config JSON is redacted before printing. Local
+//! records are converted through [`build_generic_graph_source_info`] — the
+//! same redacted view the server's `/info` route emits — so local and remote
+//! sources render identically through one renderer.
 
 use std::fmt::Write;
 
-use fluree_db_api::ledger_info::redact_json_secrets;
+use fluree_db_api::ledger_info::{build_generic_graph_source_info, redact_json_secrets};
 
 /// Print graph source info from a JSON response (remote/server mode).
 pub(crate) fn print_remote_graph_source(info: &serde_json::Value) {
-    print!("{}", render_remote_graph_source(info));
+    print!("{}", render_graph_source(info));
 }
 
 /// Print graph source info from a locally-read nameservice record.
@@ -18,8 +21,13 @@ pub(crate) fn print_local_graph_source(gs: &fluree_db_nameservice::GraphSourceRe
     print!("{}", render_local_graph_source(gs));
 }
 
-/// Render graph source info from a JSON response (remote/server mode).
-fn render_remote_graph_source(info: &serde_json::Value) -> String {
+fn render_local_graph_source(gs: &fluree_db_nameservice::GraphSourceRecord) -> String {
+    render_graph_source(&build_generic_graph_source_info(gs))
+}
+
+/// Render graph-source info from its redacted JSON view (a server `/info`
+/// response, or [`build_generic_graph_source_info`] output for local records).
+fn render_graph_source(info: &serde_json::Value) -> String {
     let name = info.get("name").and_then(|v| v.as_str()).unwrap_or("?");
     let branch = info.get("branch").and_then(|v| v.as_str()).unwrap_or("?");
     let gs_type = info.get("type").and_then(|v| v.as_str()).unwrap_or("?");
@@ -34,12 +42,15 @@ fn render_remote_graph_source(info: &serde_json::Value) -> String {
     let _ = writeln!(out, "Type:           {gs_type}");
     let _ = writeln!(out, "ID:             {gs_id}");
 
+    if let Some(retracted) = info.get("retracted").and_then(serde_json::Value::as_bool) {
+        let _ = writeln!(out, "Retracted:      {retracted}");
+    }
     if let Some(t) = info.get("index_t").and_then(serde_json::Value::as_i64) {
         let _ = writeln!(out, "Index t:        {t}");
     }
-    if let Some(id) = info.get("index_id").and_then(|v| v.as_str()) {
-        let _ = writeln!(out, "Index ID:       {id}");
-    }
+    let index_id = info.get("index_id").and_then(|v| v.as_str());
+    let _ = writeln!(out, "Index ID:       {}", index_id.unwrap_or("(none)"));
+
     if let Some(deps) = info.get("dependencies").and_then(|v| v.as_array()) {
         let dep_strs: Vec<&str> = deps.iter().filter_map(|v| v.as_str()).collect();
         if !dep_strs.is_empty() {
@@ -52,64 +63,10 @@ fn render_remote_graph_source(info: &serde_json::Value) -> String {
     out
 }
 
-/// Render graph source info from a locally-read nameservice record.
-fn render_local_graph_source(gs: &fluree_db_nameservice::GraphSourceRecord) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "Name:           {}", gs.name);
-    let _ = writeln!(out, "Branch:         {}", gs.branch);
-    let _ = writeln!(
-        out,
-        "Type:           {}",
-        format_source_type(&gs.source_type)
-    );
-    let _ = writeln!(out, "ID:             {}", gs.graph_source_id);
-    let _ = writeln!(out, "Retracted:      {}", gs.retracted);
-    let _ = writeln!(out, "Index t:        {}", gs.index_t);
-    let _ = writeln!(
-        out,
-        "Index ID:       {}",
-        gs.index_id
-            .as_ref()
-            .map(std::string::ToString::to_string)
-            .as_deref()
-            .unwrap_or("(none)")
-    );
-
-    if !gs.dependencies.is_empty() {
-        let _ = writeln!(out, "Dependencies:   {}", gs.dependencies.join(", "));
-    }
-
-    if !gs.config.is_empty() && gs.config != "{}" {
-        match serde_json::from_str::<serde_json::Value>(&gs.config) {
-            Ok(parsed) => write_config_section(&mut out, &parsed),
-            // Fail closed, matching redact_graph_source_config: a config that
-            // cannot be inspected is reported, never echoed or silently
-            // omitted.
-            Err(_) => write_config_body(&mut out, "[redacted:unparseable]"),
-        }
-    }
-    out
-}
-
-pub(crate) fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
-    match st {
-        fluree_db_nameservice::GraphSourceType::Bm25 => "BM25".to_string(),
-        fluree_db_nameservice::GraphSourceType::Vector => "Vector".to_string(),
-        fluree_db_nameservice::GraphSourceType::Geo => "Geo".to_string(),
-        fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
-        fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
-        fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
-    }
-}
-
 fn write_config_section(out: &mut String, config: &serde_json::Value) {
-    write_config_body(out, &redacted_config_pretty(config));
-}
-
-fn write_config_body(out: &mut String, body: &str) {
     let _ = writeln!(out);
     let _ = writeln!(out, "Configuration:");
-    let _ = writeln!(out, "{body}");
+    let _ = writeln!(out, "{}", redacted_config_pretty(config));
 }
 
 fn redacted_config_pretty(config: &serde_json::Value) -> String {
@@ -152,6 +109,9 @@ mod tests {
 
         let rendered = render_local_graph_source(&gs);
         assert!(rendered.contains("Name:           my-gs"));
+        assert!(rendered.contains("Type:           Iceberg"));
+        assert!(rendered.contains("Retracted:      false"));
+        assert!(rendered.contains("Index ID:       (none)"));
         assert!(rendered.contains("Configuration:"));
         assert!(!rendered.contains("super-secret-pat"));
         assert!(!rendered.contains("live-bearer-token"));
@@ -169,7 +129,7 @@ mod tests {
             "config": secret_bearing_config()
         });
 
-        let rendered = render_remote_graph_source(&info);
+        let rendered = render_graph_source(&info);
         assert!(rendered.contains("Name:           my-gs"));
         assert!(rendered.contains("Configuration:"));
         assert!(!rendered.contains("super-secret-pat"));

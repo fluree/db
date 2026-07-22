@@ -1,9 +1,9 @@
 use crate::config::{self, TomlSyncConfigStore};
 use crate::context;
 use crate::error::{CliError, CliResult};
-use crate::graph_source_display::format_source_type;
 use colored::Colorize;
 use comfy_table::{ContentArrangement, Table};
+use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
 pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> CliResult<()> {
@@ -82,7 +82,7 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
                     " ".to_string(),
                     gs.name.clone(),
                     gs.branch.clone(),
-                    format_source_type(&gs.source_type),
+                    graph_source_type_label(&gs.source_type),
                     t_str,
                 ]);
             }

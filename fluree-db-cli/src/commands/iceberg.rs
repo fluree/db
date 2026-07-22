@@ -1,10 +1,9 @@
 use crate::cli::IcebergMapArgs;
 use crate::context;
 use crate::error::{CliError, CliResult};
-use crate::graph_source_display::{
-    format_source_type, print_local_graph_source, print_remote_graph_source,
-};
+use crate::graph_source_display::{print_local_graph_source, print_remote_graph_source};
 use comfy_table::{ContentArrangement, Table};
+use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
 // =============================================================================
@@ -95,7 +94,7 @@ pub async fn run_iceberg_list(
         table.add_row(vec![
             gs.name,
             gs.branch,
-            format_source_type(&gs.source_type),
+            graph_source_type_label(&gs.source_type),
             t_str,
         ]);
     }

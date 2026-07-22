@@ -473,23 +473,12 @@ pub async fn list_ledgers(State(state): State<Arc<AppState>>) -> Result<Json<Vec
         entries.push(ListEntry {
             name: gs.name.clone(),
             branch: gs.branch.clone(),
-            entry_type: format_source_type(&gs.source_type),
+            entry_type: fluree_db_api::ledger_info::graph_source_type_label(&gs.source_type),
             t: gs.index_t,
         });
     }
 
     Ok(Json(entries))
-}
-
-fn format_source_type(st: &fluree_db_nameservice::GraphSourceType) -> String {
-    match st {
-        fluree_db_nameservice::GraphSourceType::Bm25 => "BM25".to_string(),
-        fluree_db_nameservice::GraphSourceType::Vector => "Vector".to_string(),
-        fluree_db_nameservice::GraphSourceType::Geo => "Geo".to_string(),
-        fluree_db_nameservice::GraphSourceType::R2rml => "R2RML".to_string(),
-        fluree_db_nameservice::GraphSourceType::Iceberg => "Iceberg".to_string(),
-        fluree_db_nameservice::GraphSourceType::Unknown(s) => format!("Unknown({s})"),
-    }
 }
 
 // =============================================================================

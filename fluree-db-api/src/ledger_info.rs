@@ -1108,7 +1108,7 @@ pub fn redact_graph_source_config(config: &str) -> String {
 // ============================================================================
 
 /// Human-readable label for a graph-source type (e.g. `"Iceberg"`, `"R2RML"`).
-fn graph_source_type_label(source_type: &GraphSourceType) -> String {
+pub fn graph_source_type_label(source_type: &GraphSourceType) -> String {
     match source_type {
         GraphSourceType::Bm25 => "BM25".to_string(),
         GraphSourceType::Vector => "Vector".to_string(),
@@ -1449,11 +1449,11 @@ pub fn build_virtual_ledger_info(
     }
 }
 
-/// Thin (redacted) metadata view for a graph source that is not a virtual
-/// R2RML/Iceberg dataset (BM25 / Vector / Geo / Unknown). Preserves the
-/// historical `/info` stub shape but routes the config through
-/// [`redact_graph_source_config`] so no secret can leak.
-fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
+/// Thin (redacted) metadata view of a graph-source record. Routes the config
+/// through [`redact_graph_source_config`] so no secret can leak; the historical
+/// `/info` stub shape for sources that are not virtual R2RML/Iceberg datasets
+/// (BM25 / Vector / Geo / Unknown).
+pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
     let mut obj = json!({
         "name": record.name,
         "branch": record.branch,
