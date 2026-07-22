@@ -782,7 +782,7 @@ pub enum Commands {
         #[arg(short = 'p', long)]
         predicate: Option<String>,
 
-        /// Output format (json, table, csv, or tsv)
+        /// Output format (json, table, or csv)
         #[arg(long, default_value = "table")]
         format: String,
 
