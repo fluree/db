@@ -37,7 +37,7 @@ pub mod watch_sse;
 
 pub use client::{HttpRemoteClient, RemoteNameserviceClient, RemoteSnapshot};
 pub use config::{
-    MemorySyncConfigStore, RemoteAuth, RemoteAuthType, RemoteConfig, RemoteEndpoint,
+    MemorySyncConfigStore, OidcLoginFlow, RemoteAuth, RemoteAuthType, RemoteConfig, RemoteEndpoint,
     SyncConfigStore, UpstreamConfig,
 };
 pub use driver::{FetchResult, PullResult, PushResult, SyncDriver};

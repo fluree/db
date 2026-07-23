@@ -26,6 +26,7 @@ Compile an access profile into policies on a dataset.
 
 ```bash
 fluree model access enable <DATASET> --profile <read|write|intake> --class <IRI> [OPTIONS]
+fluree model access disable <DATASET> (--profile <p> --class <IRI> | --policy-class <IRI>) [OPTIONS]
 fluree model access show <DATASET>
 ```
 
@@ -56,6 +57,24 @@ Three class-shaped things are in play, with distinct roles: `--class` restricts 
 ### Semantics of re-running
 
 `enable` **replaces** the two policy nodes it owns (`{policy-class}/view`, `{policy-class}/write`) atomically: one transaction wildcard-deletes both ids and inserts the fresh compilation. A property from a previous run cannot linger (the policy loader gives `f:allow` precedence over `f:query`, so a stale `f:allow: true` would silently disable a newly added `--connected` gate), and profile switches on the same policy class are exact — switching `write` → `read` revokes `{policy-class}/write`.
+
+### Disabling a profile
+
+`disable` is the inverse of `enable`: it deletes the policy class node and both owned policy nodes (`{policy-class}/view`, `{policy-class}/write`) in one transaction. Identify the policy class the same way it was enabled — `--profile` + `--class` derives the default `{class}/access/{profile}` id; pass `--policy-class` instead if enable used an override. Deletes are delete-if-exists, so disabling an already-disabled profile is a no-op.
+
+With `--space <id> --remote <r>`, the policy class is first detached from the space's grant on the dataset (grant detach runs before policy deletion, mirroring enable's policies-before-grant ordering). Other classes on the grant — and the grant itself, with its access level — are left in place. If the class being detached is the grant's **last** policy class, the grant is left unchanged: on hosted stacks a class-less grant reads as instance-wide access, so posting an empty class list would widen the grant rather than revoke it. The stale class reference is fail-closed (it selects no policies once they're deleted); remove the grant itself via the stack UI/API to revoke the space's access entirely.
+
+```bash
+# Undo an enable (same identification)
+fluree model access disable crm --profile write --class https://example.org/Lead
+
+# Hosted stack: also detach the policy class from the space grant
+fluree model access disable crm --profile write --class https://example.org/Lead \
+  --space 01hx... --remote prod
+
+# Enable used --policy-class? Disable takes it directly
+fluree model access disable crm --policy-class https://example.org/custom-policy-class
+```
 
 ### Examples
 
