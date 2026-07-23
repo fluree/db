@@ -1,10 +1,12 @@
-//! Auth management commands: status, login, logout
+//! Auth management commands: status, login, logout, token
 //!
 //! Manages bearer tokens stored in remote configs. Tokens are stored
 //! in `.fluree/config.toml` as part of the remote's `auth` section.
 //!
-//! Token values are never printed to stdout — `status` shows presence,
-//! expiry, and identity only.
+//! Token values reach stdout only through the explicit `auth token`
+//! subcommand (the scripting escape hatch — one access token, nothing
+//! else). `status` shows presence, expiry, and identity only, and
+//! refresh tokens are never printed by any command.
 //!
 //! For OIDC remotes (`auth.type = "oidc_device"`), `login` auto-detects
 //! the appropriate OAuth flow based on the IdP's discovery document:
@@ -20,7 +22,7 @@ use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_nameservice::RemoteName;
-use fluree_db_nameservice_sync::{RemoteAuthType, RemoteEndpoint, SyncConfigStore};
+use fluree_db_nameservice_sync::{OidcLoginFlow, RemoteAuthType, RemoteEndpoint, SyncConfigStore};
 use std::io::{self, Read};
 
 pub async fn run(action: AuthAction, dirs: &FlureeDir) -> CliResult<()> {
@@ -30,6 +32,7 @@ pub async fn run(action: AuthAction, dirs: &FlureeDir) -> CliResult<()> {
         AuthAction::Status { remote } => run_status(&store, remote.as_deref()).await,
         AuthAction::Login { remote, token } => run_login(&store, remote.as_deref(), token).await,
         AuthAction::Logout { remote } => run_logout(&store, remote.as_deref()).await,
+        AuthAction::Token { remote } => run_token(&store, remote.as_deref()).await,
     }
 }
 
@@ -74,10 +77,23 @@ async fn run_status(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliRes
     println!("{}", "Auth Status:".bold());
     println!("  Remote: {}", name.green());
 
-    // Show auth type
+    // Show auth type. The config discriminator for OIDC is `oidc_device`
+    // for historical reasons, but the flow is auto-detected per login —
+    // report what the last login actually ran, not the config label.
     match config.auth.auth_type.as_ref() {
         Some(RemoteAuthType::OidcDevice) => {
-            println!("  Auth type: {}", "oidc_device".cyan());
+            println!("  Auth type: {}", "oidc".cyan());
+            match config.auth.login_flow {
+                Some(OidcLoginFlow::DeviceCode) => {
+                    println!("  Login flow: device code");
+                }
+                Some(OidcLoginFlow::AuthCodePkce) => {
+                    println!("  Login flow: authorization code + PKCE");
+                }
+                None => {
+                    println!("  Login flow: auto-detected at login");
+                }
+            }
             if let Some(ref issuer) = config.auth.issuer {
                 println!("  Issuer: {issuer}");
             }
@@ -163,11 +179,13 @@ async fn run_login(
             // No discovery available — fall back to manual token prompt
             let token = read_token(token_arg)?;
             config.auth.token = Some(token);
+            config.auth.login_flow = None;
         }
     } else {
         // Manual token flow (explicit token or token auth type)
         let token = read_token(token_arg)?;
         config.auth.token = Some(token);
+        config.auth.login_flow = None;
     }
 
     store
@@ -353,6 +371,7 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
             device_authorization_endpoint,
             token_endpoint,
         } => {
+            config.auth.login_flow = Some(OidcLoginFlow::DeviceCode);
             run_device_code_flow(
                 &http,
                 &device_authorization_endpoint,
@@ -370,6 +389,7 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
                 "  {} IdP does not support device flow; using authorization code + PKCE",
                 "info:".cyan().bold()
             );
+            config.auth.login_flow = Some(OidcLoginFlow::AuthCodePkce);
             run_auth_code_flow(
                 &http,
                 &authorization_endpoint,
@@ -1102,6 +1122,7 @@ async fn run_logout(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliRes
 
     config.auth.token = None;
     config.auth.refresh_token = None;
+    config.auth.login_flow = None;
     store
         .set_remote(&config)
         .await
@@ -1112,11 +1133,49 @@ async fn run_logout(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliRes
 }
 
 // =============================================================================
+// Token (print the stored access token for scripting)
+// =============================================================================
+
+/// Print the stored access token for one remote — the scripting escape
+/// hatch (`FLUREE_TOKEN=$(fluree auth token)` in .env workflows). Exactly
+/// the token goes to stdout; diagnostics (expiry warning) go to stderr.
+/// The refresh token is never printed.
+async fn run_token(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliResult<()> {
+    let name = resolve_remote_name(store, remote).await?;
+    let remote_name = RemoteName::new(&name);
+    let config = store
+        .get_remote(&remote_name)
+        .await
+        .map_err(|e| CliError::Config(e.to_string()))?
+        .ok_or_else(|| CliError::NotFound(format!("remote '{name}' not found")))?;
+
+    let token = config.auth.token.ok_or_else(|| {
+        CliError::NotFound(format!(
+            "no token stored for remote '{name}'; run `fluree auth login --remote {name}`"
+        ))
+    })?;
+
+    if let Ok(summary) = decode_token_summary(&token) {
+        if summary.expired {
+            eprintln!(
+                "{} token for remote '{name}' is expired; run `fluree auth login --remote {name}`",
+                "warning:".yellow().bold()
+            );
+        }
+    }
+
+    println!("{token}");
+    Ok(())
+}
+
+// =============================================================================
 // Token summary decoding (no verification)
 // =============================================================================
 
 struct TokenSummary {
     expiry: Option<String>,
+    /// True when the `exp` claim is present and in the past.
+    expired: bool,
     identity: Option<String>,
     issuer: Option<String>,
     subject: Option<String>,
@@ -1134,22 +1193,21 @@ fn decode_token_summary(token: &str) -> Result<TokenSummary, ()> {
     let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).map_err(|_| ())?;
     let claims: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|_| ())?;
 
-    let expiry = claims
-        .get("exp")
-        .and_then(serde_json::Value::as_u64)
-        .map(|exp| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            if exp < now {
-                format!("{} (expired)", format_timestamp(exp))
-                    .red()
-                    .to_string()
-            } else {
-                format_timestamp(exp)
-            }
-        });
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let exp_claim = claims.get("exp").and_then(serde_json::Value::as_u64);
+    let expired = exp_claim.is_some_and(|exp| exp < now);
+    let expiry = exp_claim.map(|exp| {
+        if exp < now {
+            format!("{} (expired)", format_timestamp(exp))
+                .red()
+                .to_string()
+        } else {
+            format_timestamp(exp)
+        }
+    });
 
     let identity = claims
         .get("fluree.identity")
@@ -1162,6 +1220,7 @@ fn decode_token_summary(token: &str) -> Result<TokenSummary, ()> {
 
     Ok(TokenSummary {
         expiry,
+        expired,
         identity,
         issuer,
         subject,

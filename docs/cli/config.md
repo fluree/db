@@ -57,6 +57,8 @@ storage.path = "/custom/storage/path"
 storage.encryption = "aes256"
 ```
 
+> **Credential note:** `config list` dumps the entire config file, including access **and refresh** tokens for every configured remote. For scripts that need a single access token (e.g. `.env` workflows), use [`fluree auth token`](auth.md#fluree-auth-token) instead — it prints exactly one token and never exposes refresh tokens.
+
 If no configuration is set:
 ```
 (no configuration set)
