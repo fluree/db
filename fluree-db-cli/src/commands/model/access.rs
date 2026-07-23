@@ -250,6 +250,7 @@ async fn run_enable(
             dataset,
             space_id,
             &policy_class,
+            profile.as_str(),
             !profile.write_verbs().is_empty(),
         )
         .await?;
@@ -697,6 +698,28 @@ fn grant_classes(grant: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Resolve the grant's post-upsert access level plus a provenance note
+/// explaining where that level came from. The note is what keeps a read
+/// enable onto a pre-existing write grant from reading as "I just granted
+/// write": the level line always says whether THIS enable set, upgraded,
+/// or merely inherited it.
+fn grant_access_transition(
+    existing_access: Option<&str>,
+    wants_write: bool,
+) -> (String, &'static str) {
+    match (existing_access, wants_write) {
+        (Some("read"), true) => (
+            "write".to_string(),
+            "upgraded from read — this profile requires writes",
+        ),
+        (Some(a), _) => (a.to_string(), "pre-existing, unchanged by this enable"),
+        (None, _) => (
+            if wants_write { "write" } else { "read" }.to_string(),
+            "set by this enable",
+        ),
+    }
+}
+
 /// Merge `policy_class` into the space's grant on the dataset via the stack's
 /// grants API. System-plane state (grants) is the one place the compiler
 /// talks to an API instead of the data plane — grants are router-owned
@@ -707,6 +730,7 @@ async fn attach_grant(
     dataset: &str,
     space_id: &str,
     policy_class: &str,
+    profile: &str,
     wants_write: bool,
 ) -> CliResult<()> {
     let api = GrantsApi::resolve(dirs, remote_name, dataset).await?;
@@ -724,26 +748,25 @@ async fn attach_grant(
         .as_ref()
         .and_then(|g| g["access"].as_str())
         .map(String::from);
-    let access = match (&existing_access, wants_write) {
-        (Some(a), true) if a == "read" => {
-            println!("  grant access upgraded read → write (profile requires writes)");
-            "write".to_string()
-        }
-        (Some(a), _) => a.clone(),
-        (None, true) => "write".to_string(),
-        (None, false) => "read".to_string(),
-    };
+    let (access, access_note) = grant_access_transition(existing_access.as_deref(), wants_write);
 
     api.upsert(&http, space_id, &access, &classes).await?;
 
-    // Report the grant's MERGED state and label it as such — the access
-    // level and class count reflect every enable that ever touched this
-    // grant, not just the profile attached by this run.
+    // Two separate facts, two separate lines: what THIS enable attached
+    // (the class and its profile), and the grant's merged state (class
+    // count + grant-wide access level, which may predate this enable).
+    // The access level is a grant-wide ceiling; what each class actually
+    // permits is its compiled policies — point at `show` for that view.
     println!("Grant attached: space {space_id} → {}", api.dataset_id);
+    println!("  attached:    {policy_class} ({profile} profile)");
     println!(
-        "  grant now carries {} policy class{} at {access} access (cumulative across enables)",
+        "  grant state: {} policy class{}; access level: {access} ({access_note})",
         classes.len(),
         if classes.len() == 1 { "" } else { "es" }
+    );
+    println!(
+        "  per-class grants: fluree model access show {} --remote {remote_name}",
+        api.dataset_id
     );
     Ok(())
 }
@@ -979,6 +1002,32 @@ mod tests {
         let where_clause = txn["where"].as_array().unwrap();
         assert_eq!(where_clause.len(), 3);
         assert!(where_clause.iter().all(|w| w[0] == "optional"));
+    }
+
+    #[test]
+    fn grant_access_transition_labels_provenance() {
+        // The confusing case from user feedback: read profile attached to a
+        // pre-existing write grant — level stays write but must read as
+        // inherited, not as the result of this enable.
+        let (access, note) = grant_access_transition(Some("write"), false);
+        assert_eq!(access, "write");
+        assert_eq!(note, "pre-existing, unchanged by this enable");
+
+        let (access, note) = grant_access_transition(Some("read"), true);
+        assert_eq!(access, "write");
+        assert!(note.starts_with("upgraded from read"));
+
+        let (access, note) = grant_access_transition(Some("write"), true);
+        assert_eq!(access, "write");
+        assert_eq!(note, "pre-existing, unchanged by this enable");
+
+        let (access, note) = grant_access_transition(None, false);
+        assert_eq!(access, "read");
+        assert_eq!(note, "set by this enable");
+
+        let (access, note) = grant_access_transition(None, true);
+        assert_eq!(access, "write");
+        assert_eq!(note, "set by this enable");
     }
 
     #[test]
