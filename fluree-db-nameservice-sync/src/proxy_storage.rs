@@ -31,7 +31,7 @@
 use async_trait::async_trait;
 use fluree_db_core::error::{Error as CoreError, Result};
 use fluree_db_core::format_ledger_id;
-use fluree_db_core::storage::ReadHint;
+use fluree_db_core::storage::{ReadHint, GRAPH_SOURCES_PATH_SEGMENT};
 use fluree_db_core::{
     ContentAddressedWrite, ContentId, ContentKind, ContentWriteResult, StorageRead, StorageWrite,
     CODEC_FLUREE_COMMIT, CODEC_FLUREE_DICT_BLOB, CODEC_FLUREE_GARBAGE,
@@ -153,13 +153,23 @@ fn cid_and_ledger_from_address(address: &str) -> Option<(ContentId, String)> {
         // path; the default branch stands in and the server resolves it to
         // a live branch of the name.
         (CODEC_FLUREE_DICT_BLOB, 0, n - 3, false)
-    } else if n >= 5 && parts[0] == "graph-sources" && parts[n - 2] == "snapshots" {
+    } else if n >= 5 && parts[0] == GRAPH_SOURCES_PATH_SEGMENT && parts[n - 2] == "snapshots" {
         // GraphSourceSnapshot: graph-sources/{name}/{branch}/snapshots/{hash}.gssnap
-        // The ledger is not the leading segment here, so the alias slice
+        // The alias is not the leading segment here, so the alias slice
         // starts at 1 (after the literal `graph-sources` prefix).
+        //
+        // NOTE: for the two graph-source kinds the recovered "ledger" is
+        // actually a **graph_source_id** — that is what `content_path` was
+        // given at write time (see bm25.rs / r2rml.rs). Callers pass it as
+        // the server's `?ledger=` parameter, which the object endpoint cannot
+        // resolve today (`ns.lookup()` skips graph-source records); serving
+        // these kinds is tracked in fluree/db#1539. Parsing them here is
+        // still correct and forward-compatible: the client forms the right
+        // request as soon as the server learns to answer it.
         (CODEC_FLUREE_GRAPH_SOURCE_SNAPSHOT, 1, n - 2, true)
-    } else if n >= 5 && parts[0] == "graph-sources" && parts[n - 2] == "mapping" {
+    } else if n >= 5 && parts[0] == GRAPH_SOURCES_PATH_SEGMENT && parts[n - 2] == "mapping" {
         // GraphSourceMapping: graph-sources/{name}/{branch}/mapping/{hash}.ttl
+        // (same graph_source_id caveat as the snapshots arm above)
         (CODEC_FLUREE_GRAPH_SOURCE_MAPPING, 1, n - 2, true)
     } else {
         return None;

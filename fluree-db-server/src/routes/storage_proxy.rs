@@ -601,12 +601,25 @@ pub struct ObjectQuery {
 
 /// Content kinds allowed through the CID object endpoint.
 ///
-/// All replication- and mount-relevant kinds are served: commits, txns, config,
-/// and every index artifact a remote mount may resolve from the index root —
-/// the core index tree (roots/branches/leaves), dict blobs, and the advanced
-/// index kinds (planner statistics, spatial, history sidecars, and graph-source
-/// snapshots/mappings). `GarbageRecord` (internal GC metadata) and the
-/// edge-annotation arenas are excluded — neither is fetched over a mount.
+/// All replication- and mount-relevant *ledger-scoped* kinds are served:
+/// commits, txns, config, the core index tree (roots/branches/leaves), dict
+/// blobs, and the ledger-scoped advanced index kinds (planner statistics,
+/// spatial, history sidecars). Excluded:
+///
+/// - `GarbageRecord` (internal GC metadata) — never fetched over a mount.
+/// - The edge-annotation arenas — `content_path` gives them no distinct
+///   address (shared `blob/` catch-all), so they cannot be resolved by CID.
+/// - `GraphSourceSnapshot` / `GraphSourceMapping` — these are addressed by
+///   **graph_source_id**, not ledger id, so `resolve_block_ledger` cannot
+///   resolve them (`ns.lookup()` deliberately skips graph-source records) and
+///   the token-scope / serving-gate semantics for gs artifacts are undecided
+///   (a graph source can depend on *multiple* ledgers). Serving them is
+///   tracked in #1539; until then they 404 here at the kind gate.
+///
+/// The Filtered tier (`POST /storage/block`, `is_allowed_block_kind` in
+/// fluree-db-api) intentionally excludes *all* advanced kinds per the v1
+/// all-or-nothing serving design — that asymmetry with this list is
+/// deliberate, not an oversight.
 ///
 /// **Security note:** This endpoint requires a `fluree.storage.*` bearer
 /// token (peer-replication scope). Raw index artifacts bypass policy filtering
@@ -626,8 +639,6 @@ fn is_allowed_object_kind(kind: ContentKind) -> bool {
             | ContentKind::StatsSketch
             | ContentKind::SpatialIndex
             | ContentKind::HistorySidecar
-            | ContentKind::GraphSourceSnapshot
-            | ContentKind::GraphSourceMapping
     )
 }
 
@@ -658,7 +669,7 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 ///
 /// # Kind Allowlist
 ///
-/// All replication- and mount-relevant kinds are served:
+/// All replication- and mount-relevant ledger-scoped kinds are served:
 /// - `Commit` — commit chain blobs
 /// - `Txn` — transaction data blobs
 /// - `LedgerConfig` — origin discovery config
@@ -669,10 +680,10 @@ fn verify_object_integrity(id: &ContentId, bytes: &[u8]) -> bool {
 /// - `StatsSketch` — query-planner statistics (HLL/NDV)
 /// - `SpatialIndex` — spatial index artifacts
 /// - `HistorySidecar` — time-travel / history sidecars
-/// - `GraphSourceSnapshot` / `GraphSourceMapping` — full-text / vector graph sources
 ///
-/// `GarbageRecord` (internal GC metadata) and the edge-annotation arenas
-/// return 404 — neither is resolved over a remote mount.
+/// `GarbageRecord`, the edge-annotation arenas, and the graph-source kinds
+/// (`GraphSourceSnapshot` / `GraphSourceMapping` — addressed by graph_source_id,
+/// serving tracked in #1539) return 404. See [`is_allowed_object_kind`].
 ///
 /// # Path Parameters
 /// - `cid`: CIDv1 string (base32-lower, e.g., `"bafybeig..."`)
@@ -792,4 +803,50 @@ pub async fn get_object_by_cid(
         .header("X-Fluree-Content-Kind", kind_label)
         .body(Body::from(bytes))
         .map_err(|e| ServerError::internal(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::DictKind;
+
+    /// Direct pin of the object-endpoint kind allowlist. The integration
+    /// tests exercise the endpoint end-to-end, but a re-widened allowlist
+    /// could still 404 there for downstream reasons (unresolvable gs id,
+    /// missing bytes) — this asserts the gate itself, so serving a new kind
+    /// is always a deliberate edit here plus #1539-style design work.
+    #[test]
+    fn object_kind_allowlist_pins_served_and_excluded_kinds() {
+        for kind in [
+            ContentKind::Commit,
+            ContentKind::Txn,
+            ContentKind::LedgerConfig,
+            ContentKind::IndexRoot,
+            ContentKind::IndexBranch,
+            ContentKind::IndexLeaf,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            ContentKind::StatsSketch,
+            ContentKind::SpatialIndex,
+            ContentKind::HistorySidecar,
+        ] {
+            assert!(is_allowed_object_kind(kind), "{kind:?} must be served");
+        }
+        for kind in [
+            // Graph-source kinds: addressed by graph_source_id; serving
+            // (resolution + token-scope semantics) is tracked in #1539.
+            ContentKind::GraphSourceSnapshot,
+            ContentKind::GraphSourceMapping,
+            // Internal GC metadata — never served.
+            ContentKind::GarbageRecord,
+            // Annotation arenas — no distinct CAS address (shared blob/).
+            ContentKind::AnnotationForwardBranch,
+            ContentKind::AnnotationForwardLeaf,
+            ContentKind::AnnotationReverseBranch,
+            ContentKind::AnnotationReverseLeaf,
+        ] {
+            assert!(!is_allowed_object_kind(kind), "{kind:?} must NOT be served");
+        }
+    }
 }
