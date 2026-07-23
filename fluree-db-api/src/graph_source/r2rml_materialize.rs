@@ -391,11 +391,14 @@ impl Fluree {
                         .or_default()
                         .push(node.into_json());
                 }
-                self.upsert(
-                    ledger,
-                    &JsonValue::Array(nodes_by_graph_to_doc(nodes_by_graph)),
-                )
-                .await?;
+                // A delete-only window (tombstones, no live rows) leaves
+                // `nodes_by_graph` empty; skip the upsert rather than send an
+                // empty `[]` doc (the transactor rejects an upsert with no
+                // predicate/@type). The retracts above already applied.
+                let live_doc = nodes_by_graph_to_doc(nodes_by_graph);
+                if !live_doc.is_empty() {
+                    self.upsert(ledger, &JsonValue::Array(live_doc)).await?;
+                }
             } else {
                 // Additive mode: assert `@type` via an idempotent `insert` so
                 // classes UNION across sources, and `upsert` only the remaining
@@ -420,11 +423,17 @@ impl Fluree {
                         .await?
                         .ledger;
                 }
-                self.upsert(
-                    ledger,
-                    &JsonValue::Array(nodes_by_graph_to_doc(pred_by_graph)),
-                )
-                .await?;
+                // A type-only source (e.g. an r2rml `entity_type` map: subject +
+                // rdf:type, no other predicates) leaves `pred_by_graph` empty, so
+                // the doc is `[]`; skip the upsert rather than send an empty doc.
+                // An unconditional `upsert([])` is rejected ("Upsert must contain
+                // at least one predicate or @type"), which aborts the sync BEFORE
+                // its watermark advances — so the next poll full-rescans and
+                // re-fails forever (churn: a new @type-insert commit every poll).
+                let pred_doc = nodes_by_graph_to_doc(pred_by_graph);
+                if !pred_doc.is_empty() {
+                    self.upsert(ledger, &JsonValue::Array(pred_doc)).await?;
+                }
             }
         }
 
@@ -1184,6 +1193,36 @@ mod tests {
             "@type": ["ex:T"]
         })));
         assert_eq!(doc.len(), 2);
+    }
+
+    #[test]
+    fn type_only_source_yields_no_predicate_upsert() {
+        // A type-only source (r2rml `entity_type`: subject + rdf:type, no other
+        // predicates) splits into a @type node and NO predicate node, so the
+        // additive-mode predicate doc is empty. The materialize loop MUST skip the
+        // upsert in that case: an `upsert([])` is rejected by the transactor
+        // ("Upsert must contain at least one predicate or @type"), which aborts
+        // the sync before its watermark advances → the next poll full-rescans and
+        // re-fails forever (a new @type-insert commit every poll — pure churn).
+        let mut node = SubjectNode::new("urn:e:1".to_string());
+        node.add_type("https://www.w3.org/ns/activitystreams#Article");
+        let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+        assert!(type_node.is_some(), "type-only node must emit a @type node");
+        assert!(
+            pred_node.is_none(),
+            "type-only node must emit NO predicate node"
+        );
+
+        // Reproduce how the additive branch assembles the predicate doc.
+        let mut pred_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+        if let Some(pn) = pred_node {
+            pred_by_graph.entry(None).or_default().push(pn);
+        }
+        let pred_doc = nodes_by_graph_to_doc(pred_by_graph);
+        assert!(
+            pred_doc.is_empty(),
+            "type-only source must produce an empty predicate doc (skip the upsert)"
+        );
     }
 
     #[test]
