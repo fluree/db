@@ -405,25 +405,16 @@ fn parse_node_pattern(
             continue;
         }
 
-        // Resolve predicate IRI
-        let predicate_iri = expand_iri(key, context)?;
-        let predicate_sid = resolve_iri(&predicate_iri, snapshot)?;
+        let predicate = parse_predicate_term(key, context, snapshot)?;
 
         // Parse object(s)
         match value {
             JsonValue::Array(arr) => {
                 for item in arr {
-                    let obj = parse_object_value(
-                        item,
-                        context,
-                        snapshot,
-                        patterns,
-                        &subject,
-                        &predicate_sid,
-                    )?;
+                    let obj = parse_object_value(item, context, snapshot, patterns)?;
                     patterns.push(RuleTriplePattern {
                         subject: subject.clone(),
-                        predicate: RuleTerm::Sid(predicate_sid.clone()),
+                        predicate: predicate.clone(),
                         object: obj,
                     });
                 }
@@ -441,7 +432,7 @@ fn parse_node_pattern(
                 // Add pattern linking parent to nested subject
                 patterns.push(RuleTriplePattern {
                     subject: subject.clone(),
-                    predicate: RuleTerm::Sid(predicate_sid.clone()),
+                    predicate: predicate.clone(),
                     object: nested_subject.clone(),
                 });
 
@@ -460,7 +451,7 @@ fn parse_node_pattern(
                 let obj = parse_term(value, context, snapshot)?;
                 patterns.push(RuleTriplePattern {
                     subject: subject.clone(),
-                    predicate: RuleTerm::Sid(predicate_sid.clone()),
+                    predicate: predicate.clone(),
                     object: obj,
                 });
             }
@@ -470,14 +461,27 @@ fn parse_node_pattern(
     Ok(())
 }
 
+/// Parse a node-map key into a predicate term: a `?`-prefixed key is a
+/// variable; anything else expands and resolves as an IRI.
+fn parse_predicate_term(
+    key: &str,
+    context: &JsonValue,
+    snapshot: &LedgerSnapshot,
+) -> Result<RuleTerm> {
+    if key.starts_with('?') {
+        Ok(RuleTerm::var(key))
+    } else {
+        let iri = expand_iri(key, context)?;
+        Ok(RuleTerm::Sid(resolve_iri(&iri, snapshot)?))
+    }
+}
+
 /// Parse an object value, handling nested structures
 fn parse_object_value(
     value: &JsonValue,
     context: &JsonValue,
     snapshot: &LedgerSnapshot,
     patterns: &mut Vec<RuleTriplePattern>,
-    _parent_subject: &RuleTerm,
-    _predicate_sid: &Sid,
 ) -> Result<RuleTerm> {
     match value {
         JsonValue::Object(nested) if nested.contains_key("@id") => {
