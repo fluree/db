@@ -2919,7 +2919,7 @@ See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync)
 
 ### POST {api_base_url}/iceberg/materialize
 
-Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-table watermark persisted in the target, or fully with `force_full`. Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
+Materialize a graph source into a native ledger (so BM25 / vector / reasoning can run over it). Reads incrementally from a per-`(source, target, table)` watermark persisted in a shared `fluree_materialize_state:main` ledger, or fully with `force_full`. `target` may be a template that fans out into one ledger per partition (see the field table). Admin-protected; `iceberg` feature only. See [Materialization](../graph-sources/iceberg.md#materialization-into-a-native-ledger).
 
 **Request Body:**
 
@@ -2930,7 +2930,7 @@ Materialize a graph source into a native ledger (so BM25 / vector / reasoning ca
 | Field | Type | Description |
 |-------|------|-------------|
 | `source` | string | Source graph source id to read (required) |
-| `target` | string | Target native ledger to write (required; created if absent) |
+| `target` | string | Target native ledger to write (required; created if absent). May be a **template** with `{column}` placeholders (e.g. `orders_{tenant_id}_{user_id}:main`) resolved per source row, fanning the job out into one native ledger per partition value. A placeholder-free value is a single target (unchanged). |
 | `force_full` | bool | Ignore the watermark and re-read the whole table (default `false`) |
 
 **Response:**
@@ -2949,7 +2949,7 @@ Materialize a graph source into a native ledger (so BM25 / vector / reasoning ca
 }
 ```
 
-`committed: false` means a no-delta poll (nothing changed since the watermark). `from_snapshot_id`/`to_snapshot_id` are populated for single-table mappings (multi-table watermarks live per-table in the target ledger).
+`committed: false` means a no-delta poll (nothing changed since the watermark). `from_snapshot_id`/`to_snapshot_id` are populated for single-table mappings (multi-table watermarks live per `(source, target, table)` in the shared `fluree_materialize_state:main` state ledger, not in the target).
 
 **Status Codes:** `200 OK`; `400` invalid request / config; `401/403` admin auth; `500` scan or commit failure.
 
@@ -2966,12 +2966,12 @@ Register a `source → target` materialization job with the in-process tracking 
 | Field | Type | Description |
 |-------|------|-------------|
 | `source` | string | Graph-source id to read. Required. |
-| `target` | string | Native ledger to keep materialized. Required. |
+| `target` | string | Native ledger to keep materialized. Required. May be a **template** with `{column}` placeholders (e.g. `orders_{tenant_id}_{user_id}:main`), fanning the job out into one native ledger per partition value. |
 | `poll_interval_secs` | number | This job's own re-sync cadence, in seconds. Optional — defaults to the worker's configured interval (30s). Must be > 0. Each tracked job runs on its own timer. |
 
 **Response:** `{ "source", "target", "tracked": true, "poll_interval_secs": 300, "tracked_jobs": 1, "initial": { …materialize response… } }`
 
-Tracked jobs are held in memory (re-issue `track` after a restart; the watermark in the target ledger means it resumes incrementally). The worker runs on write nodes only.
+Tracked jobs are held in memory (re-issue `track` after a restart; the watermark in the `fluree_materialize_state:main` state ledger means it resumes incrementally). The worker runs on write nodes only.
 
 ### POST {api_base_url}/iceberg/untrack
 

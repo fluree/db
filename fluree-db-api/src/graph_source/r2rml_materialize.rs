@@ -57,24 +57,35 @@ use fluree_db_query::r2rml::R2rmlProvider;
 use fluree_db_r2rml::mapping::TriplesMap;
 use fluree_db_r2rml::materialize::{
     batch_has_column, column_is_orderable, column_sort_key, column_string,
-    materialize_graph_from_batch, materialize_object_from_batch, materialize_subject_from_batch,
-    RdfTerm,
+    expand_template_from_batch, materialize_graph_from_batch, materialize_object_from_batch,
+    materialize_subject_from_batch, RdfTerm,
 };
 use fluree_vocab::UnresolvedDatatypeConstraint;
 
 use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
 
-/// Subject-IRI prefix for the per-(source, table) materialization watermark
-/// stored in the target ledger. The full subject is
-/// `{PREFIX}{source_graph_source_id}:{table_name}` so one target ledger can
-/// track several sources — and each source's tables — independently.
+/// The shared ledger that holds materialization job watermarks (last materialized
+/// source snapshot id per `(source, target-spec, table)`), for EVERY job — plain
+/// or templated. Keeping watermarks here, out of the materialized target
+/// ledger(s), (a) removes bookkeeping triples from user data, and (b) gives one
+/// generic home a fan-out job can read *before* it discovers its per-row targets.
+/// Ledger names are not charset-reserved from users, so this uses a clearly
+/// namespaced id; collisions with a real user ledger of this exact name are the
+/// operator's responsibility to avoid.
+const MATERIALIZE_STATE_LEDGER: &str = "fluree_materialize_state:main";
+/// Subject-IRI prefix for the per-(source, target-spec, table) materialization
+/// watermark. The full subject is `{PREFIX}{source}:{target-spec}:{table}` so the
+/// state ledger tracks every source → target → table independently.
 const WATERMARK_SUBJECT_PREFIX: &str = "urn:fluree:materialize-state:";
 /// Predicate holding the last materialized source snapshot id (stored as a
 /// string to preserve full i64 precision for 19-digit snapshot ids).
 const WATERMARK_SNAPSHOT_PRED: &str = "urn:fluree:materialize#lastSnapshotId";
 /// Predicate recording which source the watermark belongs to (informational).
 const WATERMARK_SOURCE_PRED: &str = "urn:fluree:materialize#source";
+/// Predicate recording which target-spec (ledger id or template) the watermark
+/// belongs to (informational).
+const WATERMARK_TARGET_PRED: &str = "urn:fluree:materialize#target";
 /// Predicate recording which source table the watermark belongs to.
 const WATERMARK_TABLE_PRED: &str = "urn:fluree:materialize#table";
 
@@ -159,7 +170,6 @@ impl Fluree {
         // configuring a delete convention and/or an ordering column. With neither,
         // the pass is the legacy additive merge (a subject may span multiple rows).
         let latest_by_key = delete_convention.is_some() || order_by.is_some();
-        let target_existed = self.ledger_exists(target_ledger_id).await?;
 
         // 2. Group triples maps by their logical table (deterministic order), then
         //    read each table ONCE against its OWN per-(source,table) watermark and
@@ -196,11 +206,16 @@ impl Fluree {
         let mut table_watermarks: Vec<(String, Option<i64>, i64)> = Vec::new();
 
         for (table_name, tms) in &tables {
-            let from_t = if force_full || !target_existed {
+            let from_t = if force_full {
                 None
             } else {
-                self.materialize_watermark(target_ledger_id, source_graph_source_id, table_name)
-                    .await?
+                self.materialize_watermark(
+                    MATERIALIZE_STATE_LEDGER,
+                    source_graph_source_id,
+                    target_ledger_id,
+                    table_name,
+                )
+                .await?
             };
 
             let (to_id, incremental, batches) = provider
@@ -245,11 +260,23 @@ impl Fluree {
                 }
                 for row in 0..batch.num_rows {
                     rows_read += 1;
+                    // Resolve this row's TARGET ledger. A placeholder-free target
+                    // is used verbatim for every row (plain single-target job); a
+                    // templated target (e.g. `silver_{tenant_id}_{user_id}:main`)
+                    // is expanded from the row's columns, so ONE job fans out into
+                    // a ledger per (tenant,user). A row whose template columns are
+                    // null cannot be routed to a ledger — skip it (it could not be
+                    // isolated to a user anyway).
+                    let Some(row_target) = resolve_target_ledger(target_ledger_id, batch, row)
+                    else {
+                        continue;
+                    };
                     for tm in tms {
                         materialize_row_into(
                             tm,
                             batch,
                             row,
+                            row_target.clone(),
                             delete_convention.as_ref(),
                             order_by.as_deref(),
                             latest_by_key,
@@ -270,12 +297,9 @@ impl Fluree {
         };
 
         // 3. Finalize the latest-by-key state: live nodes to (re)assert and the
-        //    set of subjects whose latest row is a tombstone (deletions).
+        //    set of keys whose latest row is a tombstone (deletions).
         let (live, deletions) = accum.finalize();
         let subjects_upserted = live.len();
-        // Deletions are only actually applied when the target already existed
-        // (retraction is skipped on a brand-new target — nothing to retract).
-        let subjects_retracted = if target_existed { deletions.len() } else { 0 };
 
         // No-delta short-circuit: nothing read and no watermark advanced.
         if live.is_empty() && deletions.is_empty() && all_watermarks_unchanged {
@@ -290,112 +314,140 @@ impl Fluree {
             });
         }
 
-        // 4. In latest-by-key mode, whole-subject REPLACE: retract every subject
-        //    seen in this window (live OR tombstone) so a live revision that
-        //    dropped a field clears the stale value and a tombstone is removed;
-        //    then re-assert the live nodes + advance the per-table watermarks. Two
-        //    ordered commits keep the watermark advancing ONLY in the upsert
-        //    (crash-safe: a crash between them re-reads the same window next run).
-        //    Retraction is skipped on a brand-new target (nothing to retract) and
-        //    in legacy additive mode (per-predicate upsert suffices; a subject may
-        //    legitimately span rows we must not clobber).
-        //
-        //    Named graphs: the retract and the re-assert are BOTH scoped to each
-        //    subject's graph — a subject in graph B is retracted/upserted only in
-        //    B, never touching the same IRI's statements in graph A. This is what
-        //    lets one entity IRI carry independent per-(tenant,user) facts. The
-        //    upsert's own retract-existing is already graph-scoped
-        //    (generate_upsert_deletions keys on graph_id), and the whole-subject
-        //    retract carries the graph via the UPDATE `graph` key.
-        let mut retract_by_graph: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
-        if latest_by_key {
-            for (graph, subject) in live.keys().cloned().chain(deletions.iter().cloned()) {
-                retract_by_graph.entry(graph).or_default().insert(subject);
-            }
+        // 4. Group the finalized state by TARGET ledger, then commit each target
+        //    INDEPENDENTLY. A plain job has exactly one target; a templated target
+        //    (e.g. `silver_{tenant_id}_{user_id}:main`) fans out into one ledger
+        //    per (tenant,user). Per-graph scoping (rr:graphMap) still applies
+        //    WITHIN each target. The job watermark(s) advance ONCE afterwards in
+        //    the shared state ledger — never bundled into a target's data commit.
+        type TargetState = (
+            BTreeMap<(Option<String>, String), SubjectNode>,
+            BTreeSet<(Option<String>, String)>,
+        );
+        let mut by_target: BTreeMap<String, TargetState> = BTreeMap::new();
+        for ((target, graph, subject), node) in live {
+            by_target
+                .entry(target)
+                .or_default()
+                .0
+                .insert((graph, subject), node);
+        }
+        for (target, graph, subject) in deletions {
+            by_target
+                .entry(target)
+                .or_default()
+                .1
+                .insert((graph, subject));
         }
 
-        let mut ledger = if target_existed {
-            self.ledger(target_ledger_id).await?
-        } else {
-            self.create_ledger(target_ledger_id).await?
-        };
+        let mut subjects_retracted = 0usize;
+        for (target, (live, deletions)) in by_target {
+            // Retraction is skipped on a brand-new target (nothing to retract);
+            // deletions only count against a pre-existing target.
+            let target_existed = self.ledger_exists(&target).await?;
+            if target_existed {
+                subjects_retracted += deletions.len();
+            }
 
-        if target_existed {
-            for (graph, iris) in &retract_by_graph {
-                if iris.is_empty() {
-                    continue;
+            // Whole-subject REPLACE (latest-by-key): retract every subject seen in
+            // this window (live OR tombstone) — per graph — before re-asserting, so
+            // a dropped field clears and a tombstone is removed. The retract and
+            // re-assert are both graph-scoped, so a subject in graph B never touches
+            // the same IRI in graph A. Additive mode skips this (per-predicate
+            // upsert suffices; a subject may legitimately span rows).
+            let mut retract_by_graph: BTreeMap<Option<String>, BTreeSet<String>> = BTreeMap::new();
+            if latest_by_key {
+                for (graph, subject) in live.keys().cloned().chain(deletions.iter().cloned()) {
+                    retract_by_graph.entry(graph).or_default().insert(subject);
                 }
-                ledger = self
-                    .update(ledger, &build_retract_doc(iris, graph.as_deref()))
-                    .await?
-                    .ledger;
             }
-        }
 
-        if latest_by_key {
-            // Whole-subject replace: the retraction above cleared every seen
-            // subject (per graph), so the re-asserted nodes (carrying @type) are
-            // the sole source of truth for the subject in its graph — a single
-            // upsert is correct. Group nodes by graph so each lands in its own
-            // named graph; watermarks are bookkeeping and stay in the default graph.
-            let mut by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
-            for ((graph, _subject), node) in live {
-                by_graph.entry(graph).or_default().push(node.into_json());
+            let mut ledger = if target_existed {
+                self.ledger(&target).await?
+            } else {
+                self.create_ledger(&target).await?
+            };
+
+            if target_existed {
+                for (graph, iris) in &retract_by_graph {
+                    if iris.is_empty() {
+                        continue;
+                    }
+                    ledger = self
+                        .update(ledger, &build_retract_doc(iris, graph.as_deref()))
+                        .await?
+                        .ledger;
+                }
             }
-            for (table, _from, to) in &table_watermarks {
-                by_graph.entry(None).or_default().push(watermark_node(
-                    source_graph_source_id,
-                    table,
-                    *to,
-                ));
-            }
-            self.upsert(ledger, &JsonValue::Array(nodes_by_graph_to_doc(by_graph)))
+
+            if latest_by_key {
+                // The retraction cleared every seen subject (per graph), so the
+                // re-asserted nodes (carrying @type) are the sole source of truth —
+                // a single upsert per graph is correct.
+                let mut nodes_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+                for ((graph, _subject), node) in live {
+                    nodes_by_graph
+                        .entry(graph)
+                        .or_default()
+                        .push(node.into_json());
+                }
+                self.upsert(
+                    ledger,
+                    &JsonValue::Array(nodes_by_graph_to_doc(nodes_by_graph)),
+                )
                 .await?;
-        } else {
-            // Additive mode: a subject may be contributed to by several sources —
-            // a shared target ledger fed by many graph sources, or a join table
-            // that only adds an edge to a parent entity. Assert `@type` with an
-            // idempotent `insert` so classes UNION across sources, and `upsert`
-            // only the remaining predicates. A single upsert carrying `@type`
-            // would retract-then-insert rdf:type per predicate, so the last source
-            // to touch a shared subject would CLOBBER the classes the others added
-            // (e.g. a `silver_article_tag` join row re-typing its article, or an
-            // `entity_type` row adding `as:Announce`). Two commits: insert the
-            // classes first, then upsert predicates + advance the watermark — the
-            // watermark advances only in the upsert, so a crash between them
-            // re-runs this window (self-healing; insert is idempotent). Both the
-            // type-insert and the predicate-upsert are grouped by graph so classes
-            // union and predicates upsert WITHIN each subject's graph.
-            let mut type_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
-            let mut pred_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
-            for ((graph, _subject), node) in live {
-                let (type_node, pred_node) = node.into_type_and_predicate_nodes();
-                if let Some(tn) = type_node {
-                    type_by_graph.entry(graph.clone()).or_default().push(tn);
+            } else {
+                // Additive mode: assert `@type` via an idempotent `insert` so
+                // classes UNION across sources, and `upsert` only the remaining
+                // predicates (a single upsert carrying `@type` would retract-then-
+                // insert rdf:type per predicate, clobbering classes other sources
+                // added). Both grouped per graph.
+                let mut type_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+                let mut pred_by_graph: BTreeMap<Option<String>, Vec<JsonValue>> = BTreeMap::new();
+                for ((graph, _subject), node) in live {
+                    let (type_node, pred_node) = node.into_type_and_predicate_nodes();
+                    if let Some(tn) = type_node {
+                        type_by_graph.entry(graph.clone()).or_default().push(tn);
+                    }
+                    if let Some(pn) = pred_node {
+                        pred_by_graph.entry(graph).or_default().push(pn);
+                    }
                 }
-                if let Some(pn) = pred_node {
-                    pred_by_graph.entry(graph).or_default().push(pn);
+                let type_doc = nodes_by_graph_to_doc(type_by_graph);
+                if !type_doc.is_empty() {
+                    ledger = self
+                        .insert(ledger, &JsonValue::Array(type_doc))
+                        .await?
+                        .ledger;
                 }
+                self.upsert(
+                    ledger,
+                    &JsonValue::Array(nodes_by_graph_to_doc(pred_by_graph)),
+                )
+                .await?;
             }
-            let type_doc = nodes_by_graph_to_doc(type_by_graph);
-            if !type_doc.is_empty() {
-                ledger = self
-                    .insert(ledger, &JsonValue::Array(type_doc))
-                    .await?
-                    .ledger;
-            }
-            for (table, _from, to) in &table_watermarks {
-                pred_by_graph.entry(None).or_default().push(watermark_node(
-                    source_graph_source_id,
-                    table,
-                    *to,
-                ));
-            }
-            self.upsert(
-                ledger,
-                &JsonValue::Array(nodes_by_graph_to_doc(pred_by_graph)),
-            )
-            .await?;
+        }
+
+        // 5. Advance the job watermark(s) in the shared state ledger — AFTER every
+        //    target data commit. Crash-safety: the watermark never advances before
+        //    the data, so a crash in the gap re-reads the window (idempotent:
+        //    whole-subject replace / idempotent insert+upsert). Keyed by
+        //    (source, target-spec, table), so a templated job keeps ONE watermark
+        //    per source table regardless of how many ledgers it fanned into.
+        if !table_watermarks.is_empty() {
+            let state = if self.ledger_exists(MATERIALIZE_STATE_LEDGER).await? {
+                self.ledger(MATERIALIZE_STATE_LEDGER).await?
+            } else {
+                self.create_ledger(MATERIALIZE_STATE_LEDGER).await?
+            };
+            let watermark_nodes: Vec<JsonValue> = table_watermarks
+                .iter()
+                .map(|(table, _from, to)| {
+                    watermark_node(source_graph_source_id, target_ledger_id, table, *to)
+                })
+                .collect();
+            self.upsert(state, &JsonValue::Array(watermark_nodes))
+                .await?;
         }
 
         Ok(MaterializeResult {
@@ -409,22 +461,27 @@ impl Fluree {
         })
     }
 
-    /// Read the per-table materialization watermark (last materialized source
-    /// snapshot id) for `(source_graph_source_id, table_name)` from the target
-    /// ledger. Returns `None` if the target ledger does not exist yet or carries
-    /// no watermark for that source table.
+    /// Read the per-job materialization watermark (last materialized source
+    /// snapshot id) for `(source_graph_source_id, target_spec, table_name)` from
+    /// the shared materialization-state ledger. `target_spec` is the job's target
+    /// *as configured* — a concrete ledger id for a plain job, or the target
+    /// TEMPLATE (e.g. `silver_{tenant_id}_{user_id}:main`) for a fan-out job — so
+    /// one templated job that fans out into many ledgers keeps ONE watermark per
+    /// source table (a single scan feeds all its targets). Returns `None` if the
+    /// state ledger does not exist yet or carries no watermark for that job/table.
     pub async fn materialize_watermark(
         &self,
-        target_ledger_id: &str,
+        state_ledger_id: &str,
         source_graph_source_id: &str,
+        target_spec: &str,
         table_name: &str,
     ) -> Result<Option<i64>> {
-        if !self.ledger_exists(target_ledger_id).await? {
+        if !self.ledger_exists(state_ledger_id).await? {
             return Ok(None);
         }
-        let db = self.db(target_ledger_id).await?;
+        let db = self.db(state_ledger_id).await?;
 
-        let subject = watermark_subject(source_graph_source_id, table_name);
+        let subject = watermark_subject(source_graph_source_id, target_spec, table_name);
         let mut where_obj = Map::new();
         where_obj.insert("@id".to_string(), JsonValue::String(subject));
         where_obj.insert(
@@ -441,33 +498,39 @@ impl Fluree {
     }
 }
 
-/// The per-(source, table) watermark subject IRI. Both segments are escaped
-/// (`%` -> `%25`, `:` -> `%3A`) before joining with `:` so the encoding is
-/// injective — distinct `(source, table)` pairs can never collide (e.g.
-/// `("a:b","c")` vs `("a","b:c")`).
-fn watermark_subject(source_graph_source_id: &str, table_name: &str) -> String {
+/// The per-(source, target-spec, table) watermark subject IRI. All three segments
+/// are escaped (`%` -> `%25`, `:` -> `%3A`) before joining with `:` so the
+/// encoding is injective — distinct `(source, target, table)` triples can never
+/// collide even when a segment itself contains `:` (e.g. a `name:branch` target).
+fn watermark_subject(source_graph_source_id: &str, target_spec: &str, table_name: &str) -> String {
     fn esc(s: &str) -> String {
         s.replace('%', "%25").replace(':', "%3A")
     }
     format!(
-        "{WATERMARK_SUBJECT_PREFIX}{}:{}",
+        "{WATERMARK_SUBJECT_PREFIX}{}:{}:{}",
         esc(source_graph_source_id),
+        esc(target_spec),
         esc(table_name)
     )
 }
 
-/// Build the watermark JSON-LD node (`@id` + last snapshot id + source + table).
-/// The snapshot id is stored as a string to preserve full i64 precision;
+/// Build the watermark JSON-LD node (`@id` + last snapshot id + source + target +
+/// table). The snapshot id is stored as a string to preserve full i64 precision;
 /// `upsert` retracts-then-asserts so the watermark advances cleanly in place.
 fn watermark_node(
     source_graph_source_id: &str,
+    target_spec: &str,
     table_name: &str,
     to_snapshot_id: i64,
 ) -> JsonValue {
     let mut node = Map::new();
     node.insert(
         "@id".to_string(),
-        JsonValue::String(watermark_subject(source_graph_source_id, table_name)),
+        JsonValue::String(watermark_subject(
+            source_graph_source_id,
+            target_spec,
+            table_name,
+        )),
     );
     node.insert(
         WATERMARK_SNAPSHOT_PRED.to_string(),
@@ -476,6 +539,10 @@ fn watermark_node(
     node.insert(
         WATERMARK_SOURCE_PRED.to_string(),
         JsonValue::String(source_graph_source_id.to_string()),
+    );
+    node.insert(
+        WATERMARK_TARGET_PRED.to_string(),
+        JsonValue::String(target_spec.to_string()),
     );
     node.insert(
         WATERMARK_TABLE_PRED.to_string(),
@@ -508,33 +575,44 @@ struct KeyState {
     node: Option<SubjectNode>,
 }
 
-/// Per-pass latest-by-key accumulator: one [`KeyState`] per **(graph, subject)**.
-/// The graph is the materialized named-graph IRI (`None` = default graph), so the
-/// same subject IRI in two graphs is two independent keys — the basis for
-/// per-(tenant,user) statements about a shared entity. The BTreeMap keeps keys in
-/// a stable order (deterministic transaction).
+/// Accumulator key: **(target ledger, graph, subject)**.
+///
+/// - `target` is the concrete ledger a row is materialized into. With a plain
+///   `target` it is the same for every row; with a **templated** target (e.g.
+///   `silver_{tenant_id}_{user_id}:main`) it is resolved per row from the row's
+///   columns, so ONE job fans out into a ledger per (tenant,user).
+/// - `graph` is the materialized named-graph IRI (`None` = default graph), from
+///   R2RML `rr:graphMap` — orthogonal to the target and usually `None`.
+///
+/// So the same subject IRI in two targets (or two graphs) is independent keys.
+type AccumKey = (String, Option<String>, String);
+
+/// Per-pass latest-by-key accumulator: one [`KeyState`] per [`AccumKey`]. The
+/// BTreeMap keeps keys in a stable order (deterministic transaction) and groups
+/// naturally by target ledger (the first tuple element) at commit time.
 #[derive(Default)]
 struct MaterializeAccum {
-    keys: BTreeMap<(Option<String>, String), KeyState>,
+    keys: BTreeMap<AccumKey, KeyState>,
 }
 
 impl MaterializeAccum {
-    /// Record a classified row for `subject_iri`. `rank` is the row's ordering
-    /// key (from the `order_by` column) or `None` for scan-order. `node` is the
-    /// live node, or `None` for a tombstone. The row wins (replaces the prior
-    /// state) unless its rank is strictly older than the stored rank — so with an
-    /// ordering column the highest-ordered row wins, and without one (all ranks
-    /// equal `None`) the last row in scan order wins. This is a whole-row
-    /// REPLACE; per-subject merge across rows is the legacy additive path
-    /// ([`merge_live`](Self::merge_live)).
+    /// Record a classified row for `subject_iri` in `target` / `graph`. `rank` is
+    /// the row's ordering key (from the `order_by` column) or `None` for
+    /// scan-order. `node` is the live node, or `None` for a tombstone. The row
+    /// wins (replaces the prior state) unless its rank is strictly older than the
+    /// stored rank — so with an ordering column the highest-ordered row wins, and
+    /// without one (all ranks equal `None`) the last row in scan order wins. This
+    /// is a whole-row REPLACE; per-subject merge across rows is the legacy
+    /// additive path ([`merge_live`](Self::merge_live)).
     fn record(
         &mut self,
+        target: String,
         graph: Option<String>,
         subject_iri: String,
         rank: Option<(i128, String)>,
         node: Option<SubjectNode>,
     ) {
-        let key = (graph, subject_iri);
+        let key = (target, graph, subject_iri);
         match self.keys.get(&key) {
             Some(existing) if rank < existing.rank => {} // older row: ignore
             _ => {
@@ -546,8 +624,14 @@ impl MaterializeAccum {
     /// Legacy additive mode: merge a live row's node into the subject's
     /// accumulated node (a subject spanning multiple source rows collects their
     /// values). No ordering, no tombstones, no whole-subject retraction.
-    fn merge_live(&mut self, graph: Option<String>, subject_iri: String, node: SubjectNode) {
-        let key = (graph, subject_iri);
+    fn merge_live(
+        &mut self,
+        target: String,
+        graph: Option<String>,
+        subject_iri: String,
+        node: SubjectNode,
+    ) {
+        let key = (target, graph, subject_iri);
         match self.keys.get_mut(&key) {
             Some(KeyState {
                 node: Some(existing),
@@ -565,15 +649,9 @@ impl MaterializeAccum {
         }
     }
 
-    /// Resolve into `(live nodes to assert, subject IRIs whose latest row is a
-    /// tombstone)`.
+    /// Resolve into `(live nodes to assert, keys whose latest row is a tombstone)`.
     #[allow(clippy::type_complexity)]
-    fn finalize(
-        self,
-    ) -> (
-        BTreeMap<(Option<String>, String), SubjectNode>,
-        BTreeSet<(Option<String>, String)>,
-    ) {
+    fn finalize(self) -> (BTreeMap<AccumKey, SubjectNode>, BTreeSet<AccumKey>) {
         let mut live = BTreeMap::new();
         let mut deletions = BTreeSet::new();
         for (key, state) in self.keys {
@@ -818,10 +896,25 @@ fn build_live_node(
 /// as a whole-row REPLACE — the latest row per key wins. Otherwise (legacy
 /// additive mode) the live row's triples are MERGED into the subject's node, so
 /// a subject spanning multiple rows accumulates their values.
+/// Resolve a materialization row's TARGET ledger id. A `target` with no `{...}`
+/// placeholder is used verbatim (a plain single-target job routes every row to
+/// the same ledger). A templated target is expanded against the row's columns
+/// (fan-out: one ledger per partition, e.g. per (tenant,user)). Returns `None`
+/// when a template placeholder column is null/missing — the row cannot be routed
+/// to a ledger and is skipped (it could not be isolated to a user anyway).
+fn resolve_target_ledger(target: &str, batch: &ColumnBatch, row: usize) -> Option<String> {
+    if !target.contains('{') {
+        return Some(target.to_string());
+    }
+    expand_template_from_batch(target, batch, row).ok()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn materialize_row_into(
     tm: &TriplesMap,
     batch: &ColumnBatch,
     row: usize,
+    target_ledger: String,
     convention: Option<&DeleteConvention>,
     order_by: Option<&str>,
     latest_by_key: bool,
@@ -848,9 +941,9 @@ fn materialize_row_into(
     };
 
     if !latest_by_key {
-        // Legacy additive: merge this live row into the (graph, subject) node.
+        // Legacy additive: merge this live row into the (target, graph, subject) node.
         let node = build_live_node(tm, batch, row, subject_iri.clone())?;
-        accum.merge_live(graph_iri, subject_iri, node);
+        accum.merge_live(target_ledger, graph_iri, subject_iri, node);
         return Ok(());
     }
 
@@ -865,7 +958,7 @@ fn materialize_row_into(
     } else {
         Some(build_live_node(tm, batch, row, subject_iri.clone())?)
     };
-    accum.record(graph_iri, subject_iri, rank, node);
+    accum.record(target_ledger, graph_iri, subject_iri, rank, node);
     Ok(())
 }
 
@@ -907,15 +1000,17 @@ mod tests {
     fn ts(n: i128) -> Option<(i128, String)> {
         Some((n, String::new()))
     }
-    /// Default-graph key for `(graph, subject)` map/set assertions.
-    fn dk(iri: &str) -> (Option<String>, String) {
-        (None, iri.to_string())
+    /// Fixed target ledger for accumulator tests that don't exercise fan-out.
+    const TGT: &str = "t:main";
+    /// Default-graph key `(target, graph, subject)` for map/set assertions.
+    fn dk(iri: &str) -> (String, Option<String>, String) {
+        (TGT.to_string(), None, iri.to_string())
     }
 
     #[test]
     fn finalize_live_only_upserts() {
         let mut a = MaterializeAccum::default();
-        a.record(None, "urn:a".into(), None, live("urn:a"));
+        a.record(TGT.into(), None, "urn:a".into(), None, live("urn:a"));
         let (live, del) = a.finalize();
         assert!(live.contains_key(&dk("urn:a")));
         assert!(del.is_empty());
@@ -924,7 +1019,7 @@ mod tests {
     #[test]
     fn finalize_tombstone_only_retracts() {
         let mut a = MaterializeAccum::default();
-        a.record(None, "urn:a".into(), None, None);
+        a.record(TGT.into(), None, "urn:a".into(), None, None);
         let (live, del) = a.finalize();
         assert!(live.is_empty());
         assert!(del.contains(&dk("urn:a")));
@@ -934,8 +1029,8 @@ mod tests {
     fn scan_order_last_wins_live_then_tombstone() {
         // No ordering column: last row in scan order wins -> tombstone.
         let mut a = MaterializeAccum::default();
-        a.record(None, "urn:a".into(), None, live("urn:a"));
-        a.record(None, "urn:a".into(), None, None);
+        a.record(TGT.into(), None, "urn:a".into(), None, live("urn:a"));
+        a.record(TGT.into(), None, "urn:a".into(), None, None);
         let (live, del) = a.finalize();
         assert!(live.is_empty());
         assert!(del.contains(&dk("urn:a")));
@@ -944,8 +1039,8 @@ mod tests {
     #[test]
     fn scan_order_last_wins_tombstone_then_live() {
         let mut a = MaterializeAccum::default();
-        a.record(None, "urn:a".into(), None, None);
-        a.record(None, "urn:a".into(), None, live("urn:a"));
+        a.record(TGT.into(), None, "urn:a".into(), None, None);
+        a.record(TGT.into(), None, "urn:a".into(), None, live("urn:a"));
         let (live, del) = a.finalize();
         assert!(live.contains_key(&dk("urn:a")));
         assert!(!del.contains(&dk("urn:a")));
@@ -956,8 +1051,8 @@ mod tests {
         // A higher-ranked tombstone arriving FIRST still wins over a lower-ranked
         // live row arriving later (ordering, not scan order, decides).
         let mut a = MaterializeAccum::default();
-        a.record(None, "urn:a".into(), ts(200), None); // newer tombstone
-        a.record(None, "urn:a".into(), ts(100), live("urn:a")); // older live
+        a.record(TGT.into(), None, "urn:a".into(), ts(200), None); // newer tombstone
+        a.record(TGT.into(), None, "urn:a".into(), ts(100), live("urn:a")); // older live
         let (live, del) = a.finalize();
         assert!(live.is_empty());
         assert!(del.contains(&dk("urn:a")));
@@ -966,8 +1061,8 @@ mod tests {
     #[test]
     fn order_by_newer_live_wins_over_older_tombstone() {
         let mut a = MaterializeAccum::default();
-        a.record(None, "urn:a".into(), ts(100), None); // older tombstone
-        a.record(None, "urn:a".into(), ts(200), live("urn:a")); // newer live
+        a.record(TGT.into(), None, "urn:a".into(), ts(100), None); // older tombstone
+        a.record(TGT.into(), None, "urn:a".into(), ts(200), live("urn:a")); // newer live
         let (live, del) = a.finalize();
         assert!(live.contains_key(&dk("urn:a")));
         assert!(!del.contains(&dk("urn:a")));
@@ -981,28 +1076,58 @@ mod tests {
         let ga = Some("urn:g:a".to_string());
         let gb = Some("urn:g:b".to_string());
         let mut a = MaterializeAccum::default();
-        a.record(ga.clone(), "urn:x".into(), None, None); // tombstone in A
-        a.record(gb.clone(), "urn:x".into(), None, live("urn:x")); // live in B
+        a.record(TGT.into(), ga.clone(), "urn:x".into(), None, None); // tombstone in A
+        a.record(TGT.into(), gb.clone(), "urn:x".into(), None, live("urn:x")); // live in B
         let (live, del) = a.finalize();
-        assert!(live.contains_key(&(gb, "urn:x".to_string())));
-        assert!(del.contains(&(ga, "urn:x".to_string())));
+        assert!(live.contains_key(&(TGT.to_string(), gb, "urn:x".to_string())));
+        assert!(del.contains(&(TGT.to_string(), ga, "urn:x".to_string())));
+        assert_eq!(live.len(), 1);
+        assert_eq!(del.len(), 1);
+    }
+
+    #[test]
+    fn record_isolates_same_subject_across_targets() {
+        // The SAME subject IRI in two different TARGET ledgers is two independent
+        // keys — a fan-out job's per-(tenant,user) ledgers never collide.
+        let mut a = MaterializeAccum::default();
+        a.record("silver_T1_U1:main".into(), None, "urn:x".into(), None, None); // tombstone in U1
+        a.record(
+            "silver_T1_U2:main".into(),
+            None,
+            "urn:x".into(),
+            None,
+            live("urn:x"),
+        ); // live in U2
+        let (live, del) = a.finalize();
+        assert!(live.contains_key(&("silver_T1_U2:main".to_string(), None, "urn:x".to_string())));
+        assert!(del.contains(&("silver_T1_U1:main".to_string(), None, "urn:x".to_string())));
         assert_eq!(live.len(), 1);
         assert_eq!(del.len(), 1);
     }
 
     #[test]
     fn merge_live_isolates_same_subject_across_graphs() {
-        // Additive merge is per (graph, subject): the same IRI in two graphs
-        // accumulates independently, not into one merged node.
+        // Additive merge is per (target, graph, subject): the same IRI in two
+        // graphs accumulates independently, not into one merged node.
         let ga = Some("urn:g:a".to_string());
         let gb = Some("urn:g:b".to_string());
         let mut a = MaterializeAccum::default();
-        a.merge_live(ga.clone(), "urn:x".into(), SubjectNode::new("urn:x".into()));
-        a.merge_live(gb.clone(), "urn:x".into(), SubjectNode::new("urn:x".into()));
+        a.merge_live(
+            TGT.into(),
+            ga.clone(),
+            "urn:x".into(),
+            SubjectNode::new("urn:x".into()),
+        );
+        a.merge_live(
+            TGT.into(),
+            gb.clone(),
+            "urn:x".into(),
+            SubjectNode::new("urn:x".into()),
+        );
         let (live, _del) = a.finalize();
         assert_eq!(live.len(), 2);
-        assert!(live.contains_key(&(ga, "urn:x".to_string())));
-        assert!(live.contains_key(&(gb, "urn:x".to_string())));
+        assert!(live.contains_key(&(TGT.to_string(), ga, "urn:x".to_string())));
+        assert!(live.contains_key(&(TGT.to_string(), gb, "urn:x".to_string())));
     }
 
     #[test]
@@ -1062,24 +1187,38 @@ mod tests {
     }
 
     #[test]
-    fn watermark_node_is_per_table_and_string_encoded() {
-        let node = watermark_node("people:main", "demo.actors", 5_648_190_075_564_901_028);
-        // Source's ':' is escaped (%3A) so (source, table) encoding is injective.
+    fn watermark_node_is_per_job_and_string_encoded() {
+        let node = watermark_node(
+            "people:main",
+            "silver:main",
+            "demo.actors",
+            5_648_190_075_564_901_028,
+        );
+        // Every segment's ':' is escaped (%3A) so the (source, target, table)
+        // encoding is injective.
         assert_eq!(
             node["@id"],
-            json!("urn:fluree:materialize-state:people%3Amain:demo.actors")
+            json!("urn:fluree:materialize-state:people%3Amain:silver%3Amain:demo.actors")
         );
         // String-encoded to preserve full i64 precision.
         assert_eq!(node[WATERMARK_SNAPSHOT_PRED], json!("5648190075564901028"));
         assert_eq!(node[WATERMARK_SOURCE_PRED], json!("people:main"));
+        assert_eq!(node[WATERMARK_TARGET_PRED], json!("silver:main"));
         assert_eq!(node[WATERMARK_TABLE_PRED], json!("demo.actors"));
     }
 
     #[test]
     fn watermark_subject_is_injective() {
-        // Distinct (source, table) pairs that would collide under a naive ':'
-        // join must produce distinct subjects.
-        assert_ne!(watermark_subject("a:b", "c"), watermark_subject("a", "b:c"));
+        // Distinct (source, target, table) triples that would collide under a
+        // naive ':' join must produce distinct subjects.
+        assert_ne!(
+            watermark_subject("a:b", "t", "c"),
+            watermark_subject("a", "t", "b:c")
+        );
+        assert_ne!(
+            watermark_subject("s", "a:b", "c"),
+            watermark_subject("s", "a", "b:c")
+        );
     }
 
     #[test]

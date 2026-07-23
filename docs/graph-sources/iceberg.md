@@ -359,11 +359,14 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/materialize \
 }
 ```
 
-The materialized snapshot id is persisted as a **watermark** inside the target
-ledger (one per source table), so re-running resumes **incrementally** — only
-the rows added since the last run are read. You track nothing; just call it
-again. A run with no new data commits nothing and returns `committed: false`.
-Pass `"force_full": true` to ignore the watermark and re-read the whole table.
+The materialized snapshot id is persisted as a **watermark** — one per
+`(source, target, table)` — in a shared materialization-state ledger
+(`fluree_materialize_state:main`, created automatically), so re-running resumes
+**incrementally** — only the rows added since the last run are read. Keeping the
+watermark out of the target ledger means bookkeeping never mixes with your
+materialized data. You track nothing; just call it again. A run with no new data
+commits nothing and returns `committed: false`. Pass `"force_full": true` to
+ignore the watermark and re-read the whole table.
 
 Incremental reads apply when the source's snapshot window is append- or
 compaction-only; an `overwrite`/`delete` snapshot, or expired history, falls back
@@ -386,8 +389,34 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
 - `GET {api_base_url}/iceberg/tracking` — list tracked jobs and worker stats.
 
 The worker runs on write nodes (not peers). Tracked jobs are held in memory, so
-after a restart re-issue `track` — the watermark in the target ledger means it
+after a restart re-issue `track` — the watermark in the state ledger means it
 resumes incrementally rather than re-reading everything.
+
+### One ledger per partition (templated target)
+
+`target` may be a **template** with `{column}` placeholders resolved from each
+source row, so a single materialize/track job **fans out** into one native ledger
+per partition value — e.g. isolating each `(tenant, user)` into its own ledger:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/iceberg/materialize \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{ "source": "orders:main", "target": "orders_{tenant_id}_{user_id}:main" }'
+```
+
+Each row is routed to the ledger its columns expand to (e.g. `orders_acme_u42:main`),
+creating that ledger on first sight; a row whose template columns are null is
+skipped. One scan of the source feeds every target, and the job keeps **one
+watermark per source table** (in the state ledger) regardless of how many ledgers
+it writes. A placeholder-free `target` is the ordinary single-ledger case,
+unchanged.
+
+This is the way to give each partition its **own** ledger for per-partition
+access isolation: Fluree's read policy is graph-blind, so separate access regimes
+are separate ledgers (isolated by the per-ledger read gate) rather than named
+graphs. Within each per-partition ledger, `rr:graphMap` named-graph routing still
+applies independently.
 
 ### Multiple sources into one target (additive)
 
@@ -466,13 +495,15 @@ target. The materializer enforces what it can and documents the rest:
   enforced). A row with a null ordering value sorts as oldest.
 - **The target ledger is dedicated to one source.** Whole-subject retraction owns
   the subject; don't mix other sources or hand-written data about the same IRIs
-  into the same target.
+  into the same target. (With a templated target, each fanned-out per-partition
+  ledger is likewise dedicated to that source+partition.)
 - **Deletes must be expressed as tombstone rows.** A key that simply stops
   appearing — with no tombstone — is not reconciled (a set-difference pass is a
   possible future addition).
-- Retract and re-assert are two ordered commits; the watermark advances only in
-  the second, so an interrupted run re-materializes the same window on the next
-  pass (self-healing).
+- The target data is committed first; the watermark then advances in a **separate
+  commit to the state ledger**, never before the data — so an interrupted run
+  re-materializes the same window on the next pass (self-healing, because the data
+  writes are idempotent: whole-subject replace / idempotent insert+upsert).
 
 ## Partition Pruning
 
