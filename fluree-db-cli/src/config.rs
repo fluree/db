@@ -1036,6 +1036,83 @@ mod tests {
         assert_eq!(result, fluree_dir.join("storage"));
     }
 
+    /// Regression guard for the read/write asymmetry of the remote config:
+    /// reads deserialize via serde, but writes go through the hand-rolled
+    /// `toml_edit` builder in `write_sync_config_toml` — a field missing
+    /// from that builder round-trips to `None` with green CI everywhere
+    /// else. Every `RemoteAuth` field is constructed here WITHOUT
+    /// `..Default::default()`, so adding a field breaks this test at
+    /// compile time and forces both the writer branch and this assertion
+    /// to be updated together.
+    #[tokio::test]
+    async fn remote_auth_round_trips_every_field_through_toml_store() {
+        use fluree_db_nameservice::RemoteName;
+        use fluree_db_nameservice_sync::{
+            OidcLoginFlow, RemoteAuth, RemoteAuthType, RemoteConfig, RemoteEndpoint,
+            SyncConfigStore,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = TomlSyncConfigStore::new(tmp.path().to_path_buf());
+
+        let auth = RemoteAuth {
+            auth_type: Some(RemoteAuthType::OidcDevice),
+            token: Some("access-tok".into()),
+            issuer: Some("https://idp.example.com".into()),
+            client_id: Some("fluree-cli".into()),
+            exchange_url: Some("https://api.example.com/auth/exchange".into()),
+            refresh_token: Some("refresh-tok".into()),
+            scopes: Some(vec!["openid".into(), "offline_access".into()]),
+            redirect_port: Some(8400),
+            login_flow: Some(OidcLoginFlow::AuthCodePkce),
+        };
+        store
+            .set_remote(&RemoteConfig {
+                name: RemoteName::new("origin"),
+                endpoint: RemoteEndpoint::Http {
+                    base_url: "https://api.example.com/v1/fluree".into(),
+                },
+                auth: auth.clone(),
+                fetch_interval_secs: Some(30),
+            })
+            .await
+            .unwrap();
+
+        let read = store
+            .get_remote(&RemoteName::new("origin"))
+            .await
+            .unwrap()
+            .expect("remote persisted")
+            .auth;
+
+        assert_eq!(read.auth_type, auth.auth_type);
+        assert_eq!(read.token, auth.token);
+        assert_eq!(read.issuer, auth.issuer);
+        assert_eq!(read.client_id, auth.client_id);
+        assert_eq!(read.exchange_url, auth.exchange_url);
+        assert_eq!(read.refresh_token, auth.refresh_token);
+        assert_eq!(read.scopes, auth.scopes);
+        assert_eq!(read.redirect_port, auth.redirect_port);
+        assert_eq!(read.login_flow, auth.login_flow);
+
+        // Second write cycle: set_remote reads the existing file, rebuilds
+        // the auth table, and rewrites it — the pass where a writer-omitted
+        // field actually vanishes. Flip the flow to prove overwrites stick.
+        let mut updated = store
+            .get_remote(&RemoteName::new("origin"))
+            .await
+            .unwrap()
+            .unwrap();
+        updated.auth.login_flow = Some(OidcLoginFlow::DeviceCode);
+        store.set_remote(&updated).await.unwrap();
+        let reread = store
+            .get_remote(&RemoteName::new("origin"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reread.auth.login_flow, Some(OidcLoginFlow::DeviceCode));
+    }
+
     #[cfg(unix)]
     #[test]
     fn init_fluree_dir_restricts_token_file_permissions() {
