@@ -2027,47 +2027,32 @@ mod tests {
 
     /// `[ ex:p [ ex:p … ex:o … ] ] .` nested `depth` levels.
     fn nested_property_lists(depth: usize) -> String {
-        let mut input = String::from("@prefix ex: <http://example.org/> .\n");
-        for _ in 0..depth {
-            input.push_str("[ ex:p ");
-        }
-        input.push_str("ex:o");
-        for _ in 0..depth {
-            input.push_str(" ]");
-        }
-        input.push_str(" .");
-        input
+        format!(
+            "@prefix ex: <http://example.org/> .\n{}ex:o{} .",
+            "[ ex:p ".repeat(depth),
+            " ]".repeat(depth)
+        )
     }
 
     /// `ex:s ex:p ( ( … ( ex:o ) … ) ) .` nested `depth` levels. The
     /// innermost collection holds a real item — a bare `()` lexes as a
     /// single `Nil` token and would not count as a nesting level.
     fn nested_collections(depth: usize) -> String {
-        let mut input = String::from("@prefix ex: <http://example.org/> .\nex:s ex:p ");
-        for _ in 0..depth {
-            input.push_str("( ");
-        }
-        input.push_str("ex:o");
-        for _ in 0..depth {
-            input.push_str(" )");
-        }
-        input.push_str(" .");
-        input
+        format!(
+            "@prefix ex: <http://example.org/> .\nex:s ex:p {}ex:o{} .",
+            "( ".repeat(depth),
+            " )".repeat(depth)
+        )
     }
 
     /// `<< … << ex:s ex:p ex:o >> … ex:p ex:o >> ex:p ex:o .` nested
     /// `depth` levels via the reified-triple subject position.
     fn nested_reified_triples(depth: usize) -> String {
-        let mut input = String::from("@prefix ex: <http://example.org/> .\n");
-        for _ in 0..depth {
-            input.push_str("<< ");
-        }
-        input.push_str("ex:s ex:p ex:o");
-        for _ in 0..depth {
-            input.push_str(" >> ex:p ex:o");
-        }
-        input.push_str(" .");
-        input
+        format!(
+            "@prefix ex: <http://example.org/> .\n{}ex:s ex:p ex:o{} .",
+            "<< ".repeat(depth),
+            " >> ex:p ex:o".repeat(depth)
+        )
     }
 
     fn assert_depth_err(err: TurtleError) {
@@ -2077,9 +2062,11 @@ mod tests {
         );
     }
 
+    /// The ceiling is inclusive: depth == MAX_NESTING_DEPTH parses, pinning
+    /// the boundary against a stricter-by-one guard regression.
     #[test]
-    fn nesting_below_the_ceiling_parses() {
-        let depth = (crate::error::MAX_NESTING_DEPTH - 1) as usize;
+    fn nesting_at_the_ceiling_parses() {
+        let depth = crate::error::MAX_NESTING_DEPTH as usize;
         parse_to_graph(&nested_property_lists(depth)).expect("property lists");
         parse_to_graph(&nested_collections(depth)).expect("collections");
         parse_star(&nested_reified_triples(depth));
