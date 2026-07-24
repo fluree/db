@@ -18,6 +18,9 @@ pub enum JsonLdError {
     #[error("Sequential values within sequential values not allowed at index: {idx:?}")]
     NestedSequence { idx: Vec<JsonValue> },
 
+    #[error("JSON-LD nesting exceeds the maximum depth of {max}")]
+    NestingTooDeep { max: usize },
+
     #[error("Unexpected error: {message}")]
     Unexpected { message: String },
 
