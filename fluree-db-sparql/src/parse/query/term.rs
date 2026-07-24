@@ -105,7 +105,17 @@ impl super::Parser<'_> {
     /// The optional in-triple `~ reifier` tail is the RDF 1.2
     /// `ReifiedTriple` form; without it the node stays eligible for the
     /// legacy Fluree `f:t`/`f:op` history reading (decided at lowering).
+    ///
+    /// Recursion-guarded: a quoted triple's subject or object may be another
+    /// quoted triple (via `parse_subject`/`parse_object`), so each level
+    /// counts against the stream's depth ceiling. Quoted triples fully parse
+    /// before lowering rejects unsupported nesting, so the crash would occur
+    /// at parse time without this guard.
     pub(super) fn parse_quoted_triple(&mut self) -> Option<QuotedTriple> {
+        self.with_recursion_guard(Self::parse_quoted_triple_inner)
+    }
+
+    fn parse_quoted_triple_inner(&mut self) -> Option<QuotedTriple> {
         let start = self.stream.current_span();
 
         // Consume <<

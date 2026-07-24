@@ -3499,6 +3499,12 @@ fn deeply_nested_constructs_do_not_overflow_the_stack() {
         "(".repeat(DOS_DEPTH),
         ")".repeat(DOS_DEPTH)
     ));
+    // RDF-star quoted triple `<< s p o >>` nested via the subject position.
+    assert_depth_error(&format!(
+        "ASK {{ {}<u:a> <u:b> <u:c>{} <u:p> <u:o> }}",
+        "<< ".repeat(DOS_DEPTH),
+        " >> <u:p> <u:o>".repeat(DOS_DEPTH - 1)
+    ));
 }
 
 /// All constructs share one depth counter, so mixed nesting is bounded even
