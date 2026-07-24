@@ -572,11 +572,6 @@ fn expand_iri(compact: &str, context: &JsonValue) -> Result<String> {
         return Ok(compact.to_string());
     }
 
-    // Check if it's a variable
-    if compact.starts_with('?') {
-        return Ok(compact.to_string());
-    }
-
     // Try to expand using context
     if let Some(colon_pos) = compact.find(':') {
         let prefix = &compact[..colon_pos];
@@ -770,9 +765,19 @@ async fn match_pattern_with_bindings(
     db: GraphDbRef<'_>,
     bindings: &Bindings,
 ) -> Result<Vec<Bindings>> {
-    // Resolve pattern terms using existing bindings
-    let (subject_sid, subject_var) = resolve_term_with_bindings(&pattern.subject, bindings)?;
-    let (predicate_sid, predicate_var) = resolve_term_with_bindings(&pattern.predicate, bindings)?;
+    // Resolve pattern terms using existing bindings. A subject/predicate
+    // variable bound to a non-Sid value can never occupy that position in a
+    // flake, so the pattern matches nothing for this binding row.
+    let Some((subject_sid, subject_var)) =
+        resolve_term_with_bindings(&pattern.subject, bindings)?.split()
+    else {
+        return Ok(Vec::new());
+    };
+    let Some((predicate_sid, predicate_var)) =
+        resolve_term_with_bindings(&pattern.predicate, bindings)?.split()
+    else {
+        return Ok(Vec::new());
+    };
     let (object_match, object_var) = resolve_object_term_with_bindings(&pattern.object, bindings)?;
 
     // Choose index based on what's bound
@@ -851,26 +856,37 @@ async fn match_pattern_with_bindings(
     Ok(results)
 }
 
-/// Resolve a term using existing bindings, returning (resolved_sid, unbound_var_name)
-fn resolve_term_with_bindings(
-    term: &RuleTerm,
-    bindings: &Bindings,
-) -> Result<(Option<Sid>, Option<Arc<str>>)> {
-    match term {
-        RuleTerm::Sid(sid) => Ok((Some(sid.clone()), None)),
-        RuleTerm::Var(var) => {
-            // Check if variable is already bound
-            if let Some(binding) = bindings.get(var.as_ref()) {
-                match binding {
-                    BindingValue::Sid(sid) => Ok((Some(sid.clone()), None)),
-                    _ => Err(QueryError::InvalidQuery(format!(
-                        "Variable {var} bound to non-SID value in subject/predicate position"
-                    ))),
-                }
-            } else {
-                Ok((None, Some(var.clone())))
-            }
+/// Resolution of a subject- or predicate-position term against existing bindings
+enum TermResolution {
+    /// Constant, or a variable already bound to a Sid
+    Bound(Sid),
+    /// Unbound variable, to be bound from each matched flake
+    Unbound(Arc<str>),
+    /// Variable bound to a non-Sid value: no flake can carry it in this
+    /// position, so the pattern matches nothing (an empty join, not an error)
+    Incompatible,
+}
+
+impl TermResolution {
+    /// Split into `(bound_sid, unbound_var)`, or `None` when incompatible
+    fn split(self) -> Option<(Option<Sid>, Option<Arc<str>>)> {
+        match self {
+            TermResolution::Bound(sid) => Some((Some(sid), None)),
+            TermResolution::Unbound(var) => Some((None, Some(var))),
+            TermResolution::Incompatible => None,
         }
+    }
+}
+
+/// Resolve a subject- or predicate-position term using existing bindings
+fn resolve_term_with_bindings(term: &RuleTerm, bindings: &Bindings) -> Result<TermResolution> {
+    match term {
+        RuleTerm::Sid(sid) => Ok(TermResolution::Bound(sid.clone())),
+        RuleTerm::Var(var) => match bindings.get(var.as_ref()) {
+            Some(BindingValue::Sid(sid)) => Ok(TermResolution::Bound(sid.clone())),
+            Some(_) => Ok(TermResolution::Incompatible),
+            None => Ok(TermResolution::Unbound(var.clone())),
+        },
         RuleTerm::Value(_) => Err(QueryError::InvalidQuery(
             "Literal value not allowed in subject/predicate position".to_string(),
         )),
@@ -1304,10 +1320,16 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_iri_variable() {
-        let context = serde_json::json!({});
-        let result = expand_iri("?person", &context).unwrap();
-        assert_eq!(result, "?person");
+    fn resolve_term_non_sid_binding_is_incompatible() {
+        // A subject/predicate variable bound to a literal can never match a
+        // flake; resolution must report an empty join, not an error, so one
+        // bad binding row cannot abort the whole rule execution.
+        let mut bindings = Bindings::new();
+        bindings.insert(Arc::from("?p"), BindingValue::String("blue".to_string()));
+
+        let resolved = resolve_term_with_bindings(&RuleTerm::var("?p"), &bindings).unwrap();
+        assert!(matches!(resolved, TermResolution::Incompatible));
+        assert!(resolved.split().is_none());
     }
 
     fn dec(s: &str) -> FlakeValue {
