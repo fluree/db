@@ -988,8 +988,21 @@ impl BinaryIndexStore {
                 fluree_db_core::temporal::DayTimeDuration::from_micros(key.decode_day_time_dur()),
             ))),
             DecodeKind::Duration => {
-                // Compound duration — not yet fully supported in V5 either.
-                Ok(FlakeValue::Null)
+                // Generic duration: o_key is the string-dictionary id of the
+                // canonical lexical form (see the resolver's DurationStr arm).
+                let s = self.resolve_string_value(o_key as u32).map_err(|e| {
+                    tracing::debug!(
+                        g_id,
+                        str_id = o_key as u32,
+                        error = %e,
+                        "binary index failed to resolve duration lexical value"
+                    );
+                    e
+                })?;
+                match fluree_db_core::temporal::Duration::parse(&s) {
+                    Ok(d) => Ok(FlakeValue::Duration(Box::new(d))),
+                    Err(_) => Ok(FlakeValue::String(s)),
+                }
             }
             DecodeKind::GeoPoint => Ok(FlakeValue::GeoPoint(fluree_db_core::GeoPointBits(o_key))),
             DecodeKind::BlankNode => {
