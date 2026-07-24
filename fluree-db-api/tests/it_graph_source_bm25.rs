@@ -728,6 +728,74 @@ async fn bm25_query_connection_with_idx_pattern() {
     );
 }
 
+/// Regression: embedded `f:searchText` must resolve through the STANDARD query
+/// path (`query_connection`), not only the dedicated `query_connection_with_bm25`.
+///
+/// This is exactly what the HTTP `POST /v1/fluree/query` route executes (via
+/// `query_from()`). Before the dataset/view execution context wired a
+/// `FlureeIndexProvider` as `bm25_provider`, this returned
+/// `InvalidQuery("BM25 IndexSearch requires ExecutionContext.bm25_search_provider
+/// or bm25_provider (not configured)")`. It must now succeed.
+#[tokio::test]
+async fn bm25_embedded_search_via_plain_query_connection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/plain-qc:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide", "ex:author":"Alice" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Rust and WebAssembly", "ex:author":"Bob" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"Python for beginners", "ex:author":"Charlie" }
+        ]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.expect("insert failed");
+
+    let index_query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let cfg = Bm25CreateConfig::new("plain-qc-search", ledger_id, index_query);
+    let created = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index failed");
+
+    let idx_query = json!({
+        "@context": { "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" },
+        "from": ledger_id,
+        "where": [
+            {
+                "f:graphSource": &created.graph_source_id,
+                "f:searchText": "rust",
+                "f:searchLimit": 10,
+                "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+            },
+            { "@id": "?doc", "ex:author": "?author" }
+        ],
+        "select": ["?doc", "?score", "?author"]
+    });
+
+    // The PLAIN connection path — NOT `_with_bm25`. This mirrors the HTTP query
+    // route; it must now serve the embedded BM25 search rather than error.
+    let result = fluree
+        .query_connection(&idx_query)
+        .await
+        .expect("plain query_connection must serve f:searchText (bm25 provider wired into the query context)");
+
+    let total: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+    assert!(
+        total >= 2,
+        "expected >=2 rust docs via plain query_connection, got {total}"
+    );
+    assert!(
+        result.vars.get("?score").is_some(),
+        "expected ?score binding from the embedded BM25 search"
+    );
+}
+
 /// Test BM25 federated query with aggregation: search + join + groupBy/count
 ///
 /// Scenario: federated BM25 aggregation scenarios.
