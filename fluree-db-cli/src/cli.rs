@@ -400,6 +400,26 @@ pub enum Commands {
         action: GraphAction,
     },
 
+    /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
+    ///
+    /// BM25 index creation has no HTTP endpoint today — it is a Rust-API-only
+    /// operation (`Bm25CreateConfig` + `create_full_text_index`). These commands
+    /// expose it: they run in-process against local storage (no server
+    /// round-trip), so they work under `docker exec` against a running server's
+    /// data directory. Querying the resulting index is done either through the
+    /// standalone `fluree-search-httpd` service (`POST /v1/search`) or, embedded,
+    /// via an FQL `f:searchText` query.
+    ///
+    /// Examples:
+    ///   fluree bm25 create --name silver-search --ledger silver:main -f index-query.json
+    ///   fluree bm25 list --stale
+    ///   fluree bm25 sync --index silver-search:main
+    ///   fluree bm25 drop --index silver-search:main
+    Bm25 {
+        #[command(subcommand)]
+        action: Bm25Action,
+    },
+
     /// Insert data into a ledger
     ///
     /// Examples:
@@ -1122,6 +1142,84 @@ pub enum Commands {
     Iceberg {
         #[command(subcommand)]
         action: IcebergAction,
+    },
+}
+
+/// BM25 full-text index subcommands.
+#[derive(Subcommand)]
+pub enum Bm25Action {
+    /// Create a BM25 full-text search index over a ledger.
+    ///
+    /// The indexing query (FQL / JSON-LD) selects the documents and the text
+    /// properties to index; it MUST select `@id`. Example indexing query:
+    ///   {"@context":{"as":"https://www.w3.org/ns/activitystreams#"},
+    ///    "where":{"@id":"?s"},
+    ///    "select":{"?s":["@id","as:content","as:name","as:summary"]}}
+    Create {
+        /// Graph-source name for the index (no ':'). The alias is
+        /// `<name>:<branch>` (e.g. `silver-search:main`).
+        #[arg(long)]
+        name: String,
+
+        /// Source ledger alias to index (e.g. "silver:main").
+        #[arg(long)]
+        ledger: String,
+
+        /// Branch for the index graph source (default "main").
+        #[arg(long, default_value = "main")]
+        branch: String,
+
+        /// Inline indexing query (FQL / JSON-LD).
+        #[arg(short = 'e', long = "query")]
+        query: Option<String>,
+
+        /// Read the indexing query from a file (`-` for stdin).
+        #[arg(short = 'f', long = "query-file")]
+        query_file: Option<PathBuf>,
+
+        /// BM25 k1 (term-frequency saturation). Default 1.2.
+        #[arg(long)]
+        k1: Option<f64>,
+
+        /// BM25 b (document-length normalization, 0..=1). Default 0.75.
+        #[arg(long)]
+        b: Option<f64>,
+    },
+
+    /// Drop (retract) a BM25 full-text index and delete its snapshots.
+    Drop {
+        /// Index graph-source alias to drop (e.g. "silver-search:main").
+        #[arg(long)]
+        index: String,
+    },
+
+    /// Sync a BM25 full-text index up to its source ledger's latest state.
+    ///
+    /// Incremental when possible — only re-indexes the subjects changed since
+    /// the index's stored watermark — falling back to a full rebuild if needed.
+    /// A no-op when the index is already current. Run this from a maintenance
+    /// job (once per index) to keep search fresh as the source ledger is
+    /// materialized/updated; it runs in-process against local storage, so it
+    /// works under `docker exec` against a running server's data directory
+    /// (same as `create`/`drop`).
+    Sync {
+        /// Index graph-source alias to sync (e.g. "silver-search:main").
+        #[arg(long)]
+        index: String,
+    },
+
+    /// List BM25 full-text indexes with their source ledger and staleness.
+    ///
+    /// For each index: its alias, the source ledger it covers, the index
+    /// watermark (`index_t`), the source ledger's current `t`, and whether the
+    /// index is STALE (source advanced past the index). This is what a
+    /// maintenance job enumerates to decide which indexes to `sync` — unlike
+    /// `fluree list`, it shows the source ledger and staleness. With `--stale`,
+    /// print only stale indexes (one alias per line, for scripting a sync loop).
+    List {
+        /// Print only stale indexes, one alias per line (script-friendly).
+        #[arg(long)]
+        stale: bool,
     },
 }
 

@@ -10,6 +10,7 @@ pub mod create;
 pub mod docs;
 pub mod drop;
 pub mod export;
+pub mod bm25;
 pub mod graph;
 pub mod history;
 pub mod iceberg;
