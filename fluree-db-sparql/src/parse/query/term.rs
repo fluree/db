@@ -1034,7 +1034,17 @@ impl super::Parser<'_> {
     /// A bare `<<( s p o )>> .` is not accepted as a statement (the enclosing
     /// triples-block requires a predicate-object list after the subject), so
     /// `tripleterm-separate-*` stay rejected.
+    ///
+    /// Recursion-guarded: in a pattern context a triple term's subject or
+    /// object may be another triple term, so each `<<(` level counts against
+    /// the stream's depth ceiling. Like quoted triples, triple terms fully
+    /// parse before lowering rejects unsupported nesting, so the crash would
+    /// occur at parse time without this guard.
     pub(super) fn parse_triple_term_value(&mut self, in_pattern: bool) -> Option<TripleTerm> {
+        self.with_recursion_guard(|p| p.parse_triple_term_value_inner(in_pattern))
+    }
+
+    fn parse_triple_term_value_inner(&mut self, in_pattern: bool) -> Option<TripleTerm> {
         let start = self.stream.current_span();
         if !self.stream.match_token(&TokenKind::TripleTermStart) {
             self.stream
