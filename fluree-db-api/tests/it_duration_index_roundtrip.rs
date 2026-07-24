@@ -186,6 +186,82 @@ async fn generic_duration_bound_object_count_after_reindex() {
     );
 }
 
+/// Non-canonical lexical input: the novelty read preserves the original
+/// form, while the indexed read returns the canonical form the resolver
+/// interned — the value-based-storage design shared by all temporal types,
+/// pinned here for generic durations.
+#[tokio::test]
+async fn generic_duration_non_canonical_input_canonicalizes_on_reindex() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "duration-index:non-canonical";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:task", "ex:took": {"@value": "P0Y14MT0S", "@type": "xsd:duration"}}
+        ]
+    });
+    let novelty = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let took_novelty = rows_for(&fluree, &novelty, "ex:took").await;
+    assert_eq!(
+        normalize_rows(&took_novelty),
+        normalize_rows(&json!([[{"@value": "P0Y14MT0S", "@type": "xsd:duration"}]])),
+        "novelty read preserves the original lexical, got {took_novelty}"
+    );
+
+    let indexed = reindex_and_load(&fluree, ledger_id).await;
+
+    let took = rows_for(&fluree, &indexed, "ex:took").await;
+    assert_eq!(
+        normalize_rows(&took),
+        normalize_rows(&json!([[{"@value": "P1Y2M", "@type": "xsd:duration"}]])),
+        "indexed read returns the canonical lexical, got {took}"
+    );
+}
+
+/// A negative mixed duration is already canonical and must round-trip
+/// identically on both paths.
+#[tokio::test]
+async fn negative_generic_duration_round_trips_through_binary_index() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "duration-index:negative";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:task", "ex:took": {"@value": "-P1Y2M3DT4H5M6S", "@type": "xsd:duration"}}
+        ]
+    });
+    let novelty = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let took_novelty = rows_for(&fluree, &novelty, "ex:took").await;
+    assert_eq!(
+        normalize_rows(&took_novelty),
+        normalize_rows(&json!([[{"@value": "-P1Y2M3DT4H5M6S", "@type": "xsd:duration"}]])),
+        "novelty read should return the typed negative duration, got {took_novelty}"
+    );
+
+    let indexed = reindex_and_load(&fluree, ledger_id).await;
+
+    let took = rows_for(&fluree, &indexed, "ex:took").await;
+    assert_eq!(
+        normalize_rows(&took),
+        normalize_rows(&took_novelty),
+        "negative generic duration must round-trip through the binary index, got {took}"
+    );
+}
+
 /// A generic duration asserted AFTER indexing (novelty on top of a binary
 /// base) must read back correctly through the overlay-translation path.
 #[tokio::test]
