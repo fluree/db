@@ -2283,6 +2283,18 @@ impl BinaryGraphView {
                             return Ok(FlakeValue::Json(s));
                         }
                     }
+                    DecodeKind::Duration => {
+                        // Generic durations are string-dict-backed; an overlay
+                        // row can carry a novelty string id (the canonical
+                        // lexical interned by an unrelated novelty string),
+                        // which the store's base-only resolve cannot see.
+                        if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
+                            return Ok(match fluree_db_core::temporal::Duration::parse(&s) {
+                                Ok(d) => FlakeValue::Duration(Box::new(d)),
+                                Err(_) => FlakeValue::String(s),
+                            });
+                        }
+                    }
                     _ => {} // Non-dict types: straight to store
                 }
             }
@@ -2291,7 +2303,10 @@ impl BinaryGraphView {
         // encoded) and we didn't already satisfy it from novelty above.
         if matches!(
             kind,
-            DecodeKind::IriRef | DecodeKind::StringDict | DecodeKind::JsonArena
+            DecodeKind::IriRef
+                | DecodeKind::StringDict
+                | DecodeKind::JsonArena
+                | DecodeKind::Duration
         ) {
             self.charge_dict_touch()?;
         }
@@ -2322,6 +2337,21 @@ impl BinaryGraphView {
                     }
                 } else if o_kind == ObjKind::LEX_ID.as_u8() {
                     if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
+                        // A LEX_ID value decodes per its datatype: generic
+                        // durations intern their canonical lexical form but
+                        // decode as FlakeValue::Duration, not String.
+                        let registry = OTypeRegistry::builtin_only();
+                        let ot = registry.resolve(
+                            ObjKind::LEX_ID,
+                            DatatypeDictId::from_u16(dt_id),
+                            lang_id,
+                        );
+                        if ot.decode_kind() == DecodeKind::Duration {
+                            return Ok(match fluree_db_core::temporal::Duration::parse(&s) {
+                                Ok(d) => FlakeValue::Duration(Box::new(d)),
+                                Err(_) => FlakeValue::String(s),
+                            });
+                        }
                         return Ok(FlakeValue::String(s));
                     }
                 } else if o_kind == ObjKind::JSON_ID.as_u8() {
