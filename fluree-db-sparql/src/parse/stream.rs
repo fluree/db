@@ -11,6 +11,17 @@ use crate::lex::{Token, TokenKind};
 use crate::span::SourceSpan;
 use std::sync::Arc;
 
+/// Maximum recursion depth for nested parser productions — group graph
+/// patterns, expressions, property paths, blank-node property lists, and
+/// collections all recurse through the parser, so unbounded nesting lets a
+/// small hostile query overflow the stack and abort the process (a Rust
+/// stack overflow is not catchable). Past this ceiling parsing fails with a
+/// [`DiagCode::NestingTooDeep`](crate::diag::DiagCode::NestingTooDeep)
+/// diagnostic. All productions share one counter, so mixed nesting is
+/// bounded too; it lives on the stream so it spans sub-parsers (EXISTS
+/// groups) that share it.
+pub(crate) const MAX_PARSE_DEPTH: u32 = 128;
+
 /// A stream of tokens for parsing.
 ///
 /// Provides lookahead, matching, and error recovery utilities.
@@ -22,6 +33,11 @@ pub struct TokenStream {
     pos: usize,
     /// Collected diagnostics
     diagnostics: Vec<Diagnostic>,
+    /// Live recursion depth of nested parser productions, bounded by
+    /// [`MAX_PARSE_DEPTH`]. Mirrors the call stack (not the token
+    /// position), so backtracking via [`Self::restore`] needs no
+    /// snapshotting.
+    depth: u32,
 }
 
 impl TokenStream {
@@ -31,7 +47,41 @@ impl TokenStream {
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            depth: 0,
         }
+    }
+
+    /// Enter one recursion level, or refuse at [`MAX_PARSE_DEPTH`]. Callers
+    /// must pair a `true` return with [`Self::leave_recursion`] — use the
+    /// `with_recursion_guard` wrappers rather than calling this directly.
+    pub(crate) fn try_enter_recursion(&mut self) -> bool {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    /// Leave one recursion level entered via [`Self::try_enter_recursion`].
+    pub(crate) fn leave_recursion(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Run `f` one recursion level deeper, erroring past
+    /// [`MAX_PARSE_DEPTH`]. Owns both sides of the depth bookkeeping for the
+    /// `Result`-based parsers (expressions, property paths).
+    pub(crate) fn with_recursion_guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !self.try_enter_recursion() {
+            return Err(format!(
+                "nesting exceeds the maximum depth of {MAX_PARSE_DEPTH}"
+            ));
+        }
+        let result = f(self);
+        self.leave_recursion();
+        result
     }
 
     /// Get the current position in the stream.

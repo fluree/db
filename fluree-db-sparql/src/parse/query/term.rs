@@ -251,9 +251,14 @@ impl super::Parser<'_> {
                     }
                     return Some(Verb::Path(path));
                 }
-                Err(_) => {
-                    // Restore position and try simple predicate
+                Err(msg) => {
+                    // Restore position; a simple predicate would have parsed
+                    // as an Ok(simple) path, so this is a genuine path error —
+                    // surface its message (e.g. the nesting-depth ceiling)
+                    // rather than the generic fallback below.
                     self.stream.restore(pos);
+                    self.stream.error_at_current(&msg);
+                    return None;
                 }
             }
         }
@@ -530,7 +535,13 @@ impl super::Parser<'_> {
     /// triples-block parser to fold into its BGP; the blank node itself is
     /// returned as this term (usable in object or subject position). Nested
     /// `[ … ]` lists recurse through `parse_object` → here.
+    /// Recursion-guarded: nested `[ … ]` re-enters through the object terms,
+    /// so each list counts one nesting level against the depth ceiling.
     fn parse_blank_node_property_list(&mut self, start: SourceSpan) -> Option<BlankNode> {
+        self.with_recursion_guard(|p| p.parse_blank_node_property_list_inner(start))
+    }
+
+    fn parse_blank_node_property_list_inner(&mut self, start: SourceSpan) -> Option<BlankNode> {
         // `#` is not a valid blank-node-label character (it is outside PN_CHARS),
         // so the lexer can never produce this label — a user-written `_:…` can
         // never collide with it and be accidentally joined to the synthetic node.
@@ -605,7 +616,14 @@ impl super::Parser<'_> {
     /// they add only ordinary triples (no new AST/IR/engine surface). This
     /// mirrors Fluree's Turtle ingest, which desugars collections to the
     /// same `rdf:first`/`rdf:rest` predicates.
+    /// Recursion-guarded: nested `( … )` items re-enter through the object
+    /// terms, so each collection counts one nesting level against the depth
+    /// ceiling.
     fn parse_collection(&mut self) -> Option<ObjectTerm> {
+        self.with_recursion_guard(Self::parse_collection_inner)
+    }
+
+    fn parse_collection_inner(&mut self) -> Option<ObjectTerm> {
         // `()` (with optional interior whitespace) lexes as a single Nil
         // token — the empty list is just the IRI rdf:nil.
         if self.stream.check(&TokenKind::Nil) {
