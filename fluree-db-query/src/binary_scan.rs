@@ -3420,6 +3420,27 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
+        FlakeValue::YearMonthDuration(d) => Ok((
+            OType::XSD_YEAR_MONTH_DURATION,
+            ObjKey::encode_year_month_dur(d.months()).as_u64(),
+        )),
+        FlakeValue::DayTimeDuration(d) => Ok((
+            OType::XSD_DAY_TIME_DURATION,
+            ObjKey::encode_day_time_dur(d.micros()).as_u64(),
+        )),
+        FlakeValue::Duration(d) => {
+            // Generic durations intern their canonical lexical form in the
+            // string dict (see DecodeKind::Duration on the decode side), so a
+            // miss is a reliable "absent from base dict" signal (NotFound),
+            // like String.
+            let str_id = store
+                .find_string_id(&d.to_canonical_string())
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::NotFound, "duration value not found in V6 dict")
+                })?;
+            Ok((OType::XSD_DURATION, str_id as u64))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),

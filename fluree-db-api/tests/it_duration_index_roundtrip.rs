@@ -148,6 +148,44 @@ async fn generic_duration_matches_bound_object_after_reindex() {
     );
 }
 
+/// A SPARQL COUNT with a bound generic-duration object — the shape served by
+/// the V6 count fast path — must count exactly the matching subjects.
+#[tokio::test]
+async fn generic_duration_bound_object_count_after_reindex() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "duration-index:count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:a", "ex:took": {"@value": "P1Y2M3DT4H5M6S", "@type": "xsd:duration"}},
+            {"@id": "ex:b", "ex:took": {"@value": "P1Y2M3DT4H5M6S", "@type": "xsd:duration"}},
+            {"@id": "ex:c", "ex:took": {"@value": "P2YT1S", "@type": "xsd:duration"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let indexed = reindex_and_load(&fluree, ledger_id).await;
+
+    let q = r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT (COUNT(?s) AS ?n)
+        WHERE { ?s ex:took "P1Y2M3DT4H5M6S"^^xsd:duration }
+    "#;
+    let rows = support::query_sparql(&fluree, &indexed, q)
+        .await
+        .expect("sparql count should succeed")
+        .to_jsonld(&indexed.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([[2]])),
+        "bound-duration COUNT must count the two matching subjects, got {rows}"
+    );
+}
+
 /// A generic duration asserted AFTER indexing (novelty on top of a binary
 /// base) must read back correctly through the overlay-translation path.
 #[tokio::test]
