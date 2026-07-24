@@ -3037,11 +3037,16 @@ fn value_to_otype_okey(
         )),
         // Generic duration: keyed by the string-dict id of its canonical
         // lexical form, mirroring the resolver's DurationStr arm so overlay
-        // rows key identically to indexed rows of the same value. A canonical
-        // form the dicts have never seen (e.g. asserted in novelty under a
-        // non-canonical lexical) errs, and the raw-flake lane preserves it.
+        // rows key identically to indexed rows of the same value. DictNovelty
+        // never interns duration lexicals, so a canonical form absent from the
+        // persisted dict is the normal novelty-only case. That miss must
+        // surface as Unsupported: the SPOT-cursor translation lane routes only
+        // Unsupported to its raw-flake path and DROPS other error kinds, while
+        // the binary-range lane raw-routes any error — Unsupported is the one
+        // signal every lane preserves.
         FlakeValue::Duration(d) => {
-            let str_id = resolve_string_v3(&d.to_canonical_string(), store, dict_novelty)?;
+            let str_id = resolve_string_v3(&d.to_canonical_string(), store, dict_novelty)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Unsupported, e))?;
             Ok((OType::XSD_DURATION, str_id as u64))
         }
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
