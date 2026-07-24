@@ -3035,6 +3035,15 @@ fn value_to_otype_okey(
             OType::XSD_DAY_TIME_DURATION,
             ObjKey::encode_day_time_dur(d.micros()).as_u64(),
         )),
+        // Generic duration: keyed by the string-dict id of its canonical
+        // lexical form, mirroring the resolver's DurationStr arm so overlay
+        // rows key identically to indexed rows of the same value. A canonical
+        // form the dicts have never seen (e.g. asserted in novelty under a
+        // non-canonical lexical) errs, and the raw-flake lane preserves it.
+        FlakeValue::Duration(d) => {
+            let str_id = resolve_string_v3(&d.to_canonical_string(), store, dict_novelty)?;
+            Ok((OType::XSD_DURATION, str_id as u64))
+        }
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
         // Big numerics mirror the resolver: i64-fitting integers are inline;
         // everything else is keyed by a per-(graph, predicate) NumBig arena
@@ -3055,8 +3064,7 @@ fn value_to_otype_okey(
         }
         FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
-        // intended lane) and generic Duration (its V3 decode is a stub —
-        // the raw flake preserves the value, the binary row would not).
+        // intended lane).
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V3 overlay: {val:?}"),
