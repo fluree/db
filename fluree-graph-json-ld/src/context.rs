@@ -211,6 +211,25 @@ impl ParsedContext {
         base_context: Option<&ParsedContext>,
         context: &JsonValue,
     ) -> Result<ParsedContext> {
+        Self::parse_guarded(base_context, context, 0)
+    }
+
+    /// Depth-guarded core of [`Self::parse`]. Wrapped `@context`, sequential
+    /// context arrays, and scoped `@context` term definitions all recurse
+    /// through here, so one counter bounds every context-parse cycle against
+    /// [`crate::expand::MAX_EXPAND_DEPTH`] — the same stack-overflow ceiling
+    /// node expansion uses, since a programmatically built context bypasses
+    /// serde_json's deserialization recursion limit too.
+    fn parse_guarded(
+        base_context: Option<&ParsedContext>,
+        context: &JsonValue,
+        depth: usize,
+    ) -> Result<ParsedContext> {
+        if depth > crate::expand::MAX_EXPAND_DEPTH {
+            return Err(JsonLdError::NestingTooDeep {
+                max: crate::expand::MAX_EXPAND_DEPTH,
+            });
+        }
         let mut active = base_context.cloned().unwrap_or_else(|| ParsedContext {
             id_key: "@id".to_string(),
             type_key: "@type".to_string(),
@@ -239,15 +258,15 @@ impl ParsedContext {
             JsonValue::Object(map) => {
                 // Check for wrapped @context
                 if let Some(inner) = map.get("@context") {
-                    return Self::parse(Some(&active), inner);
+                    return Self::parse_guarded(Some(&active), inner, depth + 1);
                 }
-                parse_context_map(&active, map)
+                parse_context_map(&active, map, depth)
             }
 
             JsonValue::Array(arr) => {
                 // Sequential contexts: process in order
                 for ctx in arr {
-                    active = Self::parse(Some(&active), ctx)?;
+                    active = Self::parse_guarded(Some(&active), ctx, depth + 1)?;
                 }
                 Ok(active)
             }
@@ -298,7 +317,11 @@ fn compute_vocab(
 }
 
 /// Parse a context object (map)
-fn parse_context_map(base: &ParsedContext, map: &Map<String, JsonValue>) -> Result<ParsedContext> {
+fn parse_context_map(
+    base: &ParsedContext,
+    map: &Map<String, JsonValue>,
+    depth: usize,
+) -> Result<ParsedContext> {
     let mut result = base.clone();
 
     // First pass: extract @-prefixed keys
@@ -335,7 +358,8 @@ fn parse_context_map(base: &ParsedContext, map: &Map<String, JsonValue>) -> Resu
     // Second pass: parse term definitions
     for (key, value) in map {
         if !key.starts_with('@') {
-            let entry = parse_context_entry(key, value, map, base, default_vocab.as_deref())?;
+            let entry =
+                parse_context_entry(key, value, map, base, default_vocab.as_deref(), depth)?;
 
             // Track if this entry defines @id
             if entry.id.as_deref() == Some("@id") {
@@ -511,6 +535,7 @@ fn parse_context_entry(
     original_context: &Map<String, JsonValue>,
     base_context: &ParsedContext,
     default_vocab: Option<&str>,
+    depth: usize,
 ) -> Result<ContextEntry> {
     match value {
         JsonValue::String(s) => {
@@ -559,7 +584,11 @@ fn parse_context_entry(
                         entry.container = Some(parse_container(v)?);
                     }
                     "@context" => {
-                        let nested = ParsedContext::parse(Some(&ParsedContext::new()), v)?;
+                        let nested = ParsedContext::parse_guarded(
+                            Some(&ParsedContext::new()),
+                            v,
+                            depth + 1,
+                        )?;
                         entry.context = Some(Box::new(nested));
                     }
                     "@language" => {
@@ -602,6 +631,35 @@ mod tests {
     use super::*;
     use fluree_vocab::owl;
     use serde_json::json;
+
+    /// A term definition whose `@context` nests another such definition,
+    /// `depth` levels deep.
+    fn nested_scoped_context(depth: usize) -> JsonValue {
+        let mut ctx = json!({"leaf": "http://example.org/leaf"});
+        for _ in 0..depth {
+            ctx = json!({"term": {"@id": "http://example.org/term", "@context": ctx}});
+        }
+        ctx
+    }
+
+    /// Scoped-context nesting well below the ceiling parses.
+    #[test]
+    fn scoped_context_below_the_ceiling_parses() {
+        ParsedContext::parse(None, &nested_scoped_context(50)).expect("must parse");
+    }
+
+    /// Scoped `@context` recursion is over the same untrusted surface as node
+    /// expansion; a programmatically built value bypasses serde_json's limit,
+    /// so context parsing must refuse deep nesting rather than overflow.
+    #[test]
+    fn deeply_nested_scoped_context_errors_cleanly() {
+        let err = ParsedContext::parse(None, &nested_scoped_context(2_000))
+            .expect_err("expected depth error");
+        assert!(
+            matches!(err, JsonLdError::NestingTooDeep { .. }),
+            "expected NestingTooDeep, got: {err}"
+        );
+    }
 
     #[test]
     fn test_default_vocabularies() {

@@ -22,6 +22,12 @@ use std::sync::Arc;
 /// groups) that share it.
 pub(crate) const MAX_PARSE_DEPTH: u32 = 128;
 
+/// Maximum diagnostics collected per parse. Real queries produce a handful;
+/// the cap only bites on pathological/adversarial input, bounding error-
+/// recovery allocation to a constant. Well above any plausible legitimate
+/// error count so no real query loses diagnostics.
+pub(crate) const MAX_DIAGNOSTICS: usize = 256;
+
 /// A stream of tokens for parsing.
 ///
 /// Provides lookahead, matching, and error recovery utilities.
@@ -104,9 +110,16 @@ impl TokenStream {
         std::mem::take(&mut self.diagnostics)
     }
 
-    /// Add a diagnostic.
+    /// Add a diagnostic, up to [`MAX_DIAGNOSTICS`]. Beyond the cap further
+    /// diagnostics are dropped: a hostile deeply-nested query that trips the
+    /// recursion ceiling would otherwise emit one heap-allocated diagnostic
+    /// per surplus token during error recovery (O(input) allocation on
+    /// attacker-controlled input). The first (most relevant) diagnostics —
+    /// including the root cause — are kept.
     pub fn add_diagnostic(&mut self, diag: Diagnostic) {
-        self.diagnostics.push(diag);
+        if self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics.push(diag);
+        }
     }
 
     /// Check if at end of stream (only EOF remains).

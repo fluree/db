@@ -3435,9 +3435,11 @@ fn test_cross_operation_delete_side_bnode_labels_are_independent() {
 // Recursion depth ceiling
 // =============================================================================
 
-/// Depth used for the adversarial shapes: far past the ceiling, deep enough
-/// that unguarded recursion would overflow the stack and abort the process.
-const DOS_DEPTH: usize = 100_000;
+/// Depth used for the adversarial shapes: far past the 128 ceiling and well
+/// past any plausible stack limit (unguarded recursion overflows at a few
+/// thousand frames), so it proves the no-overflow property without the
+/// wasted cost of a 100k-token input.
+const DOS_DEPTH: usize = 10_000;
 
 /// The pattern/term parsers emit `NestingTooDeep` directly; the
 /// `Result`-based expression and path parsers surface the depth error
@@ -3512,6 +3514,20 @@ fn deeply_nested_constructs_do_not_overflow_the_stack() {
         "<<( ".repeat(DOS_DEPTH),
         " <u:p> <u:o> )>>".repeat(DOS_DEPTH)
     ));
+}
+
+/// Error recovery on a deeply-nested hostile query must not accumulate one
+/// diagnostic per surplus token: the count is capped, bounding diagnostic
+/// memory to a constant regardless of input size.
+#[test]
+fn deeply_nested_input_diagnostics_are_capped() {
+    let result = parse(&nested_groups(DOS_DEPTH));
+    assert!(
+        result.diagnostics.len() <= crate::parse::stream::MAX_DIAGNOSTICS,
+        "diagnostics ({}) exceeded the cap ({})",
+        result.diagnostics.len(),
+        crate::parse::stream::MAX_DIAGNOSTICS
+    );
 }
 
 /// All constructs share one depth counter, so mixed nesting is bounded even
