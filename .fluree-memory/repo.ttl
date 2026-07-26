@@ -2576,6 +2576,33 @@ mem:fact-01kxtfwy7tzh5vebpny7sayycv a mem:Fact ;
     mem:branch "main" ;
     mem:createdAt "2026-07-18T11:31:02.010277+00:00"^^xsd:dateTime .
 
+mem:fact-01kye0dqrnn5ffnwnwwnk9f0bp a mem:Fact ;
+    mem:content "WHERE-level early dedup (project dead vars + DistinctOperator between joins) is gated by `where_dedup_safe`, computed in build_operator_tree_inner: grouping present → ALL aggregates must be AggregateFn::duplicate_insensitive() (DISTINCT-marked or MIN/MAX/SAMPLE); no grouping → SELECT DISTINCT. The old gate was `query.output.is_distinct()` alone, which (1) never fired for COUNT(DISTINCT) chains — the PrimeKG q66 2,490×-redundancy/404×-slowdown bug — and (2) was UNSOUND for `SELECT DISTINCT (COUNT(?x))`: it collapsed pre-aggregation rows and halved counts. Outer DISTINCT never licenses pre-aggregation dedup." ;
+    mem:tag "aggregates" ;
+    mem:tag "correctness" ;
+    mem:tag "dedup" ;
+    mem:tag "distinct" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/ir/grouping.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-26T01:25:23.861334+00:00"^^xsd:dateTime ;
+    mem:rationale "Any future change to the dedup gate or aggregate variants must preserve both directions: fire for duplicate-insensitive aggregate chains (perf) and never fire under a duplicate-sensitive aggregate (correctness). Plan-shape guards live in it_query_explain.rs (explain_chain_* tests)." .
+
+mem:fact-01kye0e6kqs8q712xrcvdednee a mem:Fact ;
+    mem:content "hash-join-reason \"subject-driven-forward-join\" is an intentional structural short-circuit, not a costing bug: HashJoinOperator only implements object→subject joins (build keyed on the probe's OBJECT var, one PSOT partition scan). object_hash_shape() classifies subject-bound/object-new patterns as SubjectDriven and explain_object_hash_join returns chosen=false before any cost gate. Forward joins use the batched-SUBJECT SPOT galloping path, cheap per probe — a forward join with driving-est ≫ probe-count usually signals duplicate multiplicity feeding it (see early-dedup gate), not a wrong join choice. No subject-keyed/build-on-right hash join variant exists." ;
+    mem:tag "explain" ;
+    mem:tag "hash-join" ;
+    mem:tag "planner" ;
+    mem:tag "query-perf" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/hash_join.rs" ;
+    mem:branch "main" ;
+    mem:createdAt "2026-07-26T01:25:39.063758+00:00"^^xsd:dateTime .
+
 mem:constraint-01kp8yczz09ndt54ztchbheeyb a mem:Constraint ;
     mem:content "JSON-LD transaction parsing does NOT auto-promote bare string values to IRI references. User data becomes an IRI only when wrapped in `{\"@id\": \"...\"}` or when the property has `@type: \"@id\"` in `@context`. The former `looks_like_iri` heuristic (three sites in parse/jsonld.rs) was removed — it silently promoted strings starting with `http://`/`https://`/`did:`/`fluree:`/`urn:` to IRIs, which violated the JSON-LD spec (especially for `{\"@value\": \"...\"}`, explicitly a literal)." ;
     mem:tag "iri" ;

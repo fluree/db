@@ -2938,12 +2938,27 @@ fn build_operator_tree_inner(
         .flat_map(Grouping::group_by_vars)
         .collect();
 
+    // WHERE-level early dedup (project away dead vars, collapse duplicate rows
+    // between joins) is sound only when downstream cannot observe row
+    // multiplicity. With a grouping phase, that is decided by the aggregates
+    // alone: every one must be duplicate-insensitive (COUNT/SUM/AVG/… DISTINCT,
+    // or MIN/MAX/SAMPLE). An outer SELECT DISTINCT does NOT license it — it
+    // dedups result rows *after* aggregation, so a plain COUNT under it still
+    // observes pre-aggregation multiplicity. Without grouping, SELECT DISTINCT
+    // is exactly the license.
+    let where_dedup_safe = match query.grouping.as_ref() {
+        Some(g) => g
+            .aggregates()
+            .all(|spec| spec.function.duplicate_insensitive()),
+        None => query.output.is_distinct(),
+    };
+
     let mut operator = build_where_operators_with_needed(
         &query.patterns,
         stats,
         &needed_where_vars,
         &group_by_vec,
-        query.output.is_distinct(),
+        where_dedup_safe,
         required_where_vars,
         planning,
     )?;
