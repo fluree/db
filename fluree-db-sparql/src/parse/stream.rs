@@ -76,14 +76,25 @@ impl TokenStream {
     /// Run `f` one recursion level deeper, erroring past
     /// [`MAX_PARSE_DEPTH`]. Owns both sides of the depth bookkeeping for the
     /// `Result`-based parsers (expressions, property paths).
+    ///
+    /// On refusal it records the [`DiagCode::NestingTooDeep`] diagnostic
+    /// directly, so the specific depth code reaches the output regardless of
+    /// how the caller maps the returned `Err` string (several sites turn it
+    /// into a generic `ExpectedToken`, and the `GROUP BY`/`ORDER BY`
+    /// speculative sites drop it entirely on backtrack).
     pub(crate) fn with_recursion_guard<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, String>,
     ) -> Result<T, String> {
         if !self.try_enter_recursion() {
-            return Err(format!(
-                "nesting exceeds the maximum depth of {MAX_PARSE_DEPTH}"
+            let msg = format!("nesting exceeds the maximum depth of {MAX_PARSE_DEPTH}");
+            let span = self.current_span();
+            self.add_diagnostic(Diagnostic::error(
+                DiagCode::NestingTooDeep,
+                msg.clone(),
+                span,
             ));
+            return Err(msg);
         }
         let result = f(self);
         self.leave_recursion();

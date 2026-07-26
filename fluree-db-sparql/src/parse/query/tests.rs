@@ -3441,17 +3441,17 @@ fn test_cross_operation_delete_side_bnode_labels_are_independent() {
 /// wasted cost of a 100k-token input.
 const DOS_DEPTH: usize = 10_000;
 
-/// The pattern/term parsers emit `NestingTooDeep` directly; the
-/// `Result`-based expression and path parsers surface the depth error
-/// through their existing string-to-diagnostic conversion, so match either.
+/// Every recursion lane records a `NestingTooDeep` (S010) diagnostic —
+/// the pattern/term parsers directly, the `Result`-based expression and path
+/// parsers via the guard's source emission — so match on the code.
 fn assert_depth_error(query: &str) {
     let result = parse(query);
     assert!(
         result
             .diagnostics
             .iter()
-            .any(|d| d.code == DiagCode::NestingTooDeep || d.message.contains("maximum depth")),
-        "expected a nesting-depth diagnostic, got {:?}",
+            .any(|d| d.code == DiagCode::NestingTooDeep),
+        "expected a NestingTooDeep diagnostic, got {:?}",
         result
             .diagnostics
             .iter()
