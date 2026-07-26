@@ -226,9 +226,7 @@ impl ParsedContext {
         depth: usize,
     ) -> Result<ParsedContext> {
         if depth > crate::expand::MAX_EXPAND_DEPTH {
-            return Err(JsonLdError::NestingTooDeep {
-                max: crate::expand::MAX_EXPAND_DEPTH,
-            });
+            return Err(JsonLdError::NestingTooDeep);
         }
         let mut active = base_context.cloned().unwrap_or_else(|| ParsedContext {
             id_key: "@id".to_string(),
@@ -656,7 +654,7 @@ mod tests {
         let err = ParsedContext::parse(None, &nested_scoped_context(2_000))
             .expect_err("expected depth error");
         assert!(
-            matches!(err, JsonLdError::NestingTooDeep { .. }),
+            matches!(err, JsonLdError::NestingTooDeep),
             "expected NestingTooDeep, got: {err}"
         );
     }

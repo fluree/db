@@ -533,7 +533,7 @@ fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
 /// programmatically built `JsonValue` bypasses that — without this guard,
 /// deep nesting would overflow the stack and abort the process (a Rust
 /// stack overflow is not catchable).
-pub const MAX_EXPAND_DEPTH: usize = 128;
+pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
 
 /// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The `idx` path vector gains at
 /// least one element on each recursion edge (an array index or property key,
@@ -543,9 +543,7 @@ pub const MAX_EXPAND_DEPTH: usize = 128;
 /// which never re-enters `expand_node_internal` — is bounded too.
 fn guard_depth(idx: &[JsonValue]) -> Result<()> {
     if idx.len() > MAX_EXPAND_DEPTH {
-        return Err(JsonLdError::NestingTooDeep {
-            max: MAX_EXPAND_DEPTH,
-        });
+        return Err(JsonLdError::NestingTooDeep);
     }
     Ok(())
 }
@@ -1068,7 +1066,7 @@ mod tests {
     fn deeply_nested_programmatic_value_errors_cleanly() {
         let err = crate::expand(&nested_nodes(2_000)).expect_err("expected depth error");
         assert!(
-            matches!(err, JsonLdError::NestingTooDeep { .. }),
+            matches!(err, JsonLdError::NestingTooDeep),
             "expected NestingTooDeep, got: {err}"
         );
     }
@@ -1081,7 +1079,7 @@ mod tests {
         for key in ["@list", "@set"] {
             let err = crate::expand(&nested_containers(2_000, key)).expect_err("expected error");
             assert!(
-                matches!(err, JsonLdError::NestingTooDeep { .. }),
+                matches!(err, JsonLdError::NestingTooDeep),
                 "expected NestingTooDeep for {key}, got: {err}"
             );
         }
