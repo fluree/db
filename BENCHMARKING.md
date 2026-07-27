@@ -103,15 +103,23 @@ on-demand):
      at runtime (bad SPARQL, broken setup, missing API surface).
 2. **Per-PR compare (`ci.yml` `bench-compare`).** Runs the cheap subset
    (`query_overlay_matrix` + `query_hot_bsbm`) at `tiny`/`quick` and compares
-   against the committed baseline via the `bench-baseline` bin. **Memory
-   breaches fail the job; wall-clock time breaches are advisory** (see
-   [Baselines](#baselines-capture--compare) for why). The nightly `bench-gate`
-   runs the same compare over a larger sample.
+   against the committed baseline via the `bench-baseline` bin. **Both metrics
+   enforce only when the baseline's `runner_class` matches the runner's; against
+   a cross-class baseline both are advisory** (see
+   [Baselines](#baselines-capture--compare) for why). Today's committed baseline
+   is `runner_class=local`, so on `ubuntu-latest` the job currently annotates and
+   exits 0. The nightly `bench-gate` runs the same compare over a larger sample.
+
+   The job costs ~30 minutes, so it is gated on a `bench-paths` job that skips it
+   when a PR touches nothing perf-relevant (engine crates, bench crates,
+   `bench-baselines/`, `regression-budget.json`, `Cargo.toml`/`Cargo.lock`, or the
+   CI/bench workflows). The list errs inclusive: a false positive costs one bench
+   run, a false negative lets a regression through.
 
 3. **CI-class capture (`bench.yml` `bench-capture`, `workflow_dispatch`).**
    Captures the cheap subset on `ubuntu-latest` (`runner_class=ci-ubuntu-latest`)
    and uploads it as an artifact; committing it lands a CI-class baseline that
-   makes the per-PR time half enforce.
+   flips **both** metrics to enforcing, with no code change.
 
 > **Visibility gap (documented; fix is a follow-up).** The per-PR gate only
 > *compiles* benches — `clippy --all --all-features --all-targets` in `ci.yml`
@@ -160,32 +168,50 @@ for a phase is captured at the branch's **merge-base** (see
 
 ```bash
 cargo run -p fluree-bench-support --bin bench-baseline -- \
-    compare --baseline bench-baselines/guardrails-pre.json [--only <substr>] [--time-advisory]
+    compare --baseline bench-baselines/guardrails-pre.json [--only <substr>] [--advisory]
 ```
 
 Each scenario present in both runs is checked against `baseline × (1 +
-budget_pct/100)` from `regression-budget.json`, **per metric**:
+budget_pct/100)` from `regression-budget.json`, for both wall-clock time
+(criterion `mean`) and peak memory (`peak_bytes`). **One rule covers both
+metrics:** they enforce when the baseline's `runner_class` matches the comparing
+runner's, and are **advisory** (`::warning::` annotations, non-gating) when it
+doesn't. `--advisory` forces advisory for both.
 
-- **Memory (`peak_bytes`) is always enforced.** Peak allocation is comparable
-  across machine classes (measured within ±2.2% local-vs-CI), and the recorded
-  value is scenario-attributable (`peak − live-at-reset`), so a real memory
-  regression gates regardless of where the baseline was captured.
-- **Wall-clock time is enforced only when the baseline's `runner_class` matches
-  the comparing runner's**; otherwise it is **advisory** (`::warning::`
-  annotations, non-gating). `--time-advisory` forces advisory.
+| baseline vs runner class | time breach | peak_mem breach | exit |
+| --- | --- | --- | --- |
+| matched | fails the gate | fails the gate | 1 |
+| mismatched | `::warning::` | `::warning::` | 0 |
 
-### Why time can't gate cross-machine
+### Why the gate has two phases
 
-`ubuntu-latest` shared runners flap; a 5–10% threshold on a single PR run
-comparing absolute nanoseconds against a baseline captured on different (local
-Apple-silicon) hardware false-positives every few PRs. So the committed
-`guardrails-pre.json` is `runner_class=local` and the per-PR gate enforces only
-memory until a CI-class baseline exists. Two ways to make time enforce:
+Neither metric survives a cross-machine comparison. `ubuntu-latest` shared
+runners flap, so a 5–10% threshold on a single PR run comparing absolute
+nanoseconds against a baseline captured on different (local Apple-silicon)
+hardware false-positives every few PRs. Peak memory is steadier but not
+portable either: allocator behaviour, page size, and background load all move a
+tracking allocator's peak, and the ±2.2% local-vs-CI figure this gate was first
+built on is one measurement between two specific machines — not a portability
+result. Gating on it while merely warning on time would also put the *less*
+portable of the two signals in the blocking position.
+
+So the gate runs in two phases:
+
+- **Phase 1 (today).** The committed `guardrails-pre.json` is
+  `runner_class=local`, CI runs as `ci-ubuntu-latest`, the classes don't match,
+  and both metrics annotate without gating. The job still earns its keep: the
+  annotations surface real movement on the PR that caused it, and the compare
+  itself exercises the capture/compare machinery.
+- **Phase 2.** Commit a CI-class baseline and both metrics start gating on the
+  next PR, automatically — the rule reads the baseline's `runner_class`, so
+  there is no code or workflow change to make.
+
+Two ways to reach phase 2:
 
 1. **Committed CI-class baseline (implemented).** Run `bench.yml`'s
    `workflow_dispatch` `bench-capture` job, download the artifact, and commit it
-   — its `runner_class=ci-ubuntu-latest` matches CI, so the per-PR time half
-   enforces automatically.
+   — its `runner_class=ci-ubuntu-latest` matches CI, so both metrics enforce
+   automatically.
 2. **Same-runner interleaved base-vs-HEAD (documented future option).** Measure
    merge-base and HEAD in the *same* job on the *same* runner and compare those,
    instead of any committed cross-machine file — the only design that survives
