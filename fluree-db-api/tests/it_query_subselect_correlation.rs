@@ -181,8 +181,20 @@ async fn sparql_subselect_bind_projection_multiset() {
 }
 
 /// JSON-LD `["query", ...]` surface parity for the issue-#1388 shape: the
-/// correlated (per-row seeded) path must enforce the same merge-time check on
-/// the aggregate-produced `?c`.
+/// aggregate-produced `?c` must be reconciled at merge time, the same as the
+/// SPARQL sub-SELECT above.
+///
+/// NOTE: on this fixture this runs `join_mode=true`, NOT the per-row seeded
+/// route. The sub-SELECT builds `uncorrelated=false, est_rows=None`, so
+/// `must_materialize_once` is false and the cardinality guard
+/// (`child.estimated_rows().is_none_or(|n| n >= SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS)`,
+/// subquery.rs) resolves the `None` estimate to join-mode — like every other
+/// test here. The reconcile check is load-bearing in join-mode too, so this
+/// still exercises it (disabling the check turns this test red). The per-row
+/// seeded route — the one c0f63e4c3 singles out as needing the seed fix — is
+/// covered by the Family-B tests in `it_query_filter_scope.rs`; a parent whose
+/// child reports a concrete estimate below the threshold would flip this test
+/// onto it.
 #[tokio::test]
 async fn jsonld_subquery_aggregate_correlation_var_is_joined() {
     let fluree = FlureeBuilder::memory().build_memory();
