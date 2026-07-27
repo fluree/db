@@ -184,6 +184,12 @@ path = "tests/grp_reasoning.rs"
 name = "grp_transact"
 path = "tests/grp_transact.rs"
 
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# fast-path routing, so it must not share a process with either.
+[[test]]
+name = "it_count_datatype_pin"
+path = "tests/it_count_datatype_pin.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
