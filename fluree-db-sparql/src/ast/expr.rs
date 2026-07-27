@@ -474,6 +474,15 @@ pub enum FunctionName {
     CosineSimilarity,
     EuclideanDistance,
 
+    // SPARQL 1.2 triple-term functions (RDF-star). Accept-then-defer per
+    // burn-down decision D-1: parsed and arity-validated here, but lowering
+    // rejects them with `not_implemented` (no evaluable capability yet).
+    Triple,    // TRIPLE(s, p, o)
+    Subject,   // SUBJECT(t)
+    Predicate, // PREDICATE(t)
+    Object,    // OBJECT(t)
+    IsTriple,  // isTRIPLE(t)
+
     /// Custom extension function (IRI)
     Extension(Iri),
 }
@@ -541,6 +550,14 @@ impl FunctionName {
             "EUCLIDEANDISTANCE" | "EUCLIDEAN_DISTANCE" | "EUCLIDIANDISTANCE" => {
                 Some(FunctionName::EuclideanDistance)
             }
+            // SPARQL 1.2 triple-term functions (case-insensitive, matching the
+            // grammar's BuiltInCall keywords). `isTRIPLE` uppercases to
+            // `ISTRIPLE`.
+            "TRIPLE" => Some(FunctionName::Triple),
+            "SUBJECT" => Some(FunctionName::Subject),
+            "PREDICATE" => Some(FunctionName::Predicate),
+            "OBJECT" => Some(FunctionName::Object),
+            "ISTRIPLE" => Some(FunctionName::IsTriple),
             _ => None,
         }
     }

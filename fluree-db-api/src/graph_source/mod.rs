@@ -115,16 +115,25 @@ mod vector;
 mod catalog_session;
 
 #[cfg(feature = "iceberg")]
+pub(crate) mod crawl;
+
+#[cfg(feature = "iceberg")]
 mod r2rml;
 
 #[cfg(feature = "iceberg")]
 mod iceberg_catalog;
 
 #[cfg(feature = "iceberg")]
+mod iceberg_sample;
+
+#[cfg(feature = "iceberg")]
 mod iceberg_generate;
 
 #[cfg(feature = "iceberg")]
 mod iceberg_validate;
+
+#[cfg(feature = "iceberg")]
+mod ephemeral;
 
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
@@ -143,9 +152,21 @@ pub use iceberg_catalog::{
 };
 
 #[cfg(feature = "iceberg")]
+pub use iceberg_sample::{sample_column_values, sample_iceberg_rows};
+
+// Internal-only: the virtual-dataset `/info` row-count fetch (ledger_info.rs)
+// reuses the shared REST-client cache key and the metadata→schema extraction that
+// the scan / preview paths already own, so it shares one catalog client and never
+// re-derives snapshot/row-count logic.
+#[cfg(feature = "iceberg")]
+pub(crate) use iceberg_catalog::table_schema_from_metadata;
+#[cfg(feature = "iceberg")]
+pub(crate) use r2rml::rest_client_cache_key;
+
+#[cfg(feature = "iceberg")]
 pub use iceberg_generate::{
     Diagnostic, GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse,
-    StructuredR2rmlMapping, TableOverride,
+    StructuredR2rmlMapping, SubjectStrategy, TableOverride,
 };
 
 #[cfg(feature = "iceberg")]

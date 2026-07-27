@@ -1420,3 +1420,34 @@ fn property_reading_edge_var_ignores_reified_gate() {
         lower_with_reified_flag("MATCH (a)-[e:knows]->(b) WHERE e.since > 5 RETURN a", true);
     assert_eq!(with_flag.patterns.len(), without_flag.patterns.len());
 }
+
+#[test]
+fn regex_match_lowers_to_anchored_regex() {
+    // `=~` is a whole-string match in Cypher; the engine's REGEX is partial,
+    // so the lowering must anchor the pattern via CONCAT("^(?:", pat, ")$").
+    let q = lower(r#"MATCH (n:Person) WHERE n.name =~ "Ali.*" RETURN n"#);
+    let filter = q
+        .patterns
+        .iter()
+        .find_map(|p| match p {
+            Pattern::Filter(expr) => Some(expr),
+            _ => None,
+        })
+        .expect("expected a Filter pattern for =~");
+    assert!(
+        filter.contains_function(&Function::Regex),
+        "filter must call REGEX: {filter:?}"
+    );
+    assert!(
+        filter.contains_function(&Function::Concat),
+        "pattern must be anchored via CONCAT: {filter:?}"
+    );
+}
+
+#[test]
+fn regex_match_binds_tighter_than_comparison() {
+    // `x =~ p = b` should parse with `=~` at string-predicate precedence
+    // (like STARTS WITH), i.e. `(x =~ p) = b`, not fail to parse.
+    let out = parse_cypher(r#"MATCH (n) WHERE (n.name =~ "a+") = true RETURN n"#);
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+}

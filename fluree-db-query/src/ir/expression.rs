@@ -237,6 +237,61 @@ impl Expression {
             Expression::Resolved(_) => false,
         }
     }
+
+    /// Visit every pattern list embedded in this expression — EXISTS / NOT
+    /// EXISTS sub-patterns (`FILTER(EXISTS { … } && …)`, `BIND(EXISTS { … }
+    /// AS ?x)`) and pattern comprehensions — recursing through
+    /// sub-expressions. The callback receives each embedded list once;
+    /// callers that need to walk *nested* pattern structure recurse
+    /// themselves (mirrors [`Self::contains_function`]'s traversal).
+    pub fn for_each_embedded_patterns(&self, f: &mut dyn FnMut(&[Pattern])) {
+        match self {
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => {}
+            Expression::Call { args, .. } => {
+                for a in args {
+                    a.for_each_embedded_patterns(f);
+                }
+            }
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.for_each_embedded_patterns(f);
+                }
+            }
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.for_each_embedded_patterns(f);
+                if let Some(x) = filter {
+                    x.for_each_embedded_patterns(f);
+                }
+                if let Some(x) = map {
+                    x.for_each_embedded_patterns(f);
+                }
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                init.for_each_embedded_patterns(f);
+                list.for_each_embedded_patterns(f);
+                body.for_each_embedded_patterns(f);
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => {
+                list.for_each_embedded_patterns(f);
+                predicate.for_each_embedded_patterns(f);
+            }
+            Expression::Member { target, .. } => target.for_each_embedded_patterns(f),
+            Expression::Exists { patterns, .. } => f(patterns),
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                f(patterns);
+                projection.for_each_embedded_patterns(f);
+            }
+        }
+    }
 }
 
 // Manual PartialEq: Pattern doesn't implement PartialEq, so we can't derive.

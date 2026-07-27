@@ -14,8 +14,63 @@
 //! These restrictions are enforced at the validation layer, not during parsing.
 
 use super::pattern::{GraphName, GraphPattern, TriplePattern};
+use super::query::Prologue;
 use super::term::Iri;
 use crate::span::SourceSpan;
+
+/// A complete SPARQL Update request: `Prologue ( Update1 ( ';' Update )? )?`.
+///
+/// A request is a *sequence* of operations separated by `;`, sharing an
+/// accumulating prologue (a `PREFIX`/`BASE` declared after a `;` is visible
+/// to every subsequent operation). Per the grammar the operation list is
+/// optional, so an empty or prologue-only request is a **valid no-op** and
+/// parses to an `UpdateRequest` with zero operations.
+///
+/// Execution semantics (SPARQL 1.1 Update §3.1): operations apply in
+/// sequence, each observing the graph-store state left by the previous one;
+/// Fluree stages the whole request as ONE atomic commit (roadmap D-10).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateRequest {
+    /// The `;`-separated operations, in request order. Empty = valid no-op.
+    pub operations: Vec<UpdateRequestOp>,
+    /// Source span of the whole request.
+    pub span: SourceSpan,
+}
+
+impl UpdateRequest {
+    /// Create a new update request.
+    pub fn new(operations: Vec<UpdateRequestOp>, span: SourceSpan) -> Self {
+        Self { operations, span }
+    }
+
+    /// Wrap a single operation as a one-element request (the effective
+    /// prologue is the request prologue). Convenience for tests and
+    /// programmatic AST construction.
+    pub fn single(prologue: Prologue, operation: UpdateOperation, span: SourceSpan) -> Self {
+        Self {
+            operations: vec![UpdateRequestOp {
+                prologue,
+                operation,
+            }],
+            span,
+        }
+    }
+}
+
+/// One operation of an [`UpdateRequest`], carrying the prologue in effect
+/// for that operation.
+///
+/// The prologue is the request-initial prologue plus every `PREFIX`/`BASE`
+/// declared before this operation. Snapshotting it per operation keeps
+/// prefix resolution correct when a later operation redeclares a prefix
+/// (the earlier operation must still resolve through the earlier binding).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateRequestOp {
+    /// The accumulated prologue in effect for this operation.
+    pub prologue: Prologue,
+    /// The operation itself.
+    pub operation: UpdateOperation,
+}
 
 /// A SPARQL Update operation.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +84,96 @@ pub enum UpdateOperation {
     /// INSERT/DELETE with WHERE clause (Modify operation)
     /// Boxed to reduce enum size (Modify is ~288 bytes vs ~56 for others)
     Modify(Box<Modify>),
+    /// `LOAD [SILENT] <source> [INTO GRAPH <into>]` (SPARQL 1.1 Update §3.1.4)
+    Load(Load),
+    /// `CLEAR [SILENT] (GRAPH <iri> | DEFAULT | NAMED | ALL)` (§3.1.5)
+    Clear(GraphMgmtRef),
+    /// `DROP [SILENT] (GRAPH <iri> | DEFAULT | NAMED | ALL)` (§3.1.5)
+    Drop(GraphMgmtRef),
+    /// `CREATE [SILENT] GRAPH <iri>` (§3.1.5)
+    Create(Create),
+    /// `ADD [SILENT] <from> TO <to>` (§3.2.5)
+    Add(GraphTransfer),
+    /// `COPY [SILENT] <from> TO <to>` (§3.2.3)
+    Copy(GraphTransfer),
+    /// `MOVE [SILENT] <from> TO <to>` (§3.2.4)
+    Move(GraphTransfer),
+}
+
+/// A `GraphRefAll` reference — the target of `CLEAR`/`DROP`.
+///
+/// Grammar (SPARQL 1.1 Update): `GraphRefAll ::= GRAPH iri | DEFAULT | NAMED | ALL`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphRefAll {
+    /// A specific named graph: `GRAPH <iri>`
+    Graph(Iri),
+    /// The default graph: `DEFAULT`
+    Default,
+    /// All named graphs (not the default): `NAMED`
+    Named,
+    /// The default graph and every named graph: `ALL`
+    All,
+}
+
+/// A `GraphOrDefault` reference — the source/destination of `ADD`/`COPY`/`MOVE`.
+///
+/// Grammar: `GraphOrDefault ::= DEFAULT | GRAPH? iri` (the `GRAPH` keyword is
+/// optional before the IRI).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphOrDefault {
+    /// The default graph: `DEFAULT`
+    Default,
+    /// A specific named graph: `[GRAPH] <iri>`
+    Graph(Iri),
+}
+
+/// `LOAD [SILENT] <source> [INTO GRAPH <into>]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Load {
+    /// `SILENT` suppresses the "could not fetch" error (making the op a no-op).
+    pub silent: bool,
+    /// The remote RDF document IRI to load.
+    pub source: Iri,
+    /// Optional destination named graph (`INTO GRAPH <into>`); `None` loads
+    /// into the default graph.
+    pub into: Option<Iri>,
+    /// Source span.
+    pub span: SourceSpan,
+}
+
+/// `CLEAR [SILENT] GraphRefAll` / `DROP [SILENT] GraphRefAll`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphMgmtRef {
+    /// `SILENT` suppresses the "graph does not exist" error.
+    pub silent: bool,
+    /// The graph(s) to clear/drop.
+    pub target: GraphRefAll,
+    /// Source span.
+    pub span: SourceSpan,
+}
+
+/// `CREATE [SILENT] GRAPH <iri>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Create {
+    /// `SILENT` suppresses the "graph already exists" error.
+    pub silent: bool,
+    /// The named graph to create.
+    pub graph: Iri,
+    /// Source span.
+    pub span: SourceSpan,
+}
+
+/// `ADD [SILENT] from TO to` / `COPY ...` / `MOVE ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphTransfer {
+    /// `SILENT` suppresses the "source graph does not exist" error.
+    pub silent: bool,
+    /// The source graph.
+    pub from: GraphOrDefault,
+    /// The destination graph.
+    pub to: GraphOrDefault,
+    /// Source span.
+    pub span: SourceSpan,
 }
 
 /// INSERT DATA operation.

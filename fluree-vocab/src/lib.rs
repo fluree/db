@@ -12,10 +12,12 @@
 //! - `owl` - OWL vocabulary (http://www.w3.org/2002/07/owl#)
 //! - `namespaces` - Namespace codes used for IRI encoding
 //! - `errors` - Error type compact IRIs for API responses
+//! - `iri` - IRI reference resolution against a base (RFC 3986 §5)
 
 use std::sync::Arc;
 
 pub mod errors;
+pub mod iri;
 
 /// Constraint on the datatype of an unresolved literal, using IRI strings.
 ///

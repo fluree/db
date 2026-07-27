@@ -155,11 +155,15 @@ impl Committer for LocalCommitter {
                 }
                 TransactionBody::Sparql(query) => staged.sparql_update(query.as_str()),
                 TransactionBody::Cypher { .. } => {
-                    let resolved = cypher_txn.expect("cypher_txn is Some for a Cypher body");
-                    let staged = staged.txn(resolved.primary);
-                    match resolved.followup {
-                        Some(followup) => staged.txn_followup(followup),
-                        None => staged,
+                    match cypher_txn.expect("cypher_txn is Some for a Cypher body") {
+                        CypherWriteUnderLock::Resolved(resolved) => {
+                            let staged = staged.txn(resolved.primary);
+                            match resolved.followup {
+                                Some(followup) => staged.txn_followup(followup),
+                                None => staged,
+                            }
+                        }
+                        CypherWriteUnderLock::Sequential(input) => staged.cypher_sequential(*input),
                     }
                 }
             };
@@ -180,6 +184,7 @@ impl Committer for LocalCommitter {
                         idempotency_key,
                         commit: result.receipt,
                         tally: result.tally,
+                        cypher_return: result.cypher_return,
                     });
                 }
                 Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
@@ -404,6 +409,14 @@ pub(crate) async fn build_policy_context(
     .map_err(execution_failure)
 }
 
+/// A Cypher write statement resolved under the serialized commit path:
+/// either concrete `Txn`s ready to stage, or a multi-clause plan the
+/// sequential driver executes inside the builder (under the write lock).
+pub(crate) enum CypherWriteUnderLock {
+    Resolved(Box<fluree_db_api::cypher_write::ResolvedConditional>),
+    Sequential(Box<fluree_db_api::cypher_seq::CypherSeqInput>),
+}
+
 /// Lower a Cypher write statement to a `Txn` against the ledger's
 /// current (locked) state, resolving a conditional `MERGE` plan with a
 /// policy-wrapped probe.
@@ -416,9 +429,11 @@ pub(crate) async fn build_policy_context(
 /// policy wrap mirrors the Cypher read / SPARQL surfaces so a
 /// restricted writer's branch selection sees only policy-visible data.
 ///
-/// Returns the resolved write (a primary `Txn` plus an optional follow-up that
-/// must commit atomically with it); the caller maps [`ApiError`] into its own
-/// failure type.
+/// Returns the resolved write (a primary `Txn` plus an optional follow-up
+/// that must commit atomically with it) or a sequential multi-clause plan
+/// (its probes run inside the builder, against the locked state, so the
+/// under-lock contract holds identically); the caller maps [`ApiError`] into
+/// its own failure type.
 pub(crate) async fn resolve_cypher_under_lock(
     fluree: &Fluree,
     ledger_handle: &LedgerHandle,
@@ -427,16 +442,22 @@ pub(crate) async fn resolve_cypher_under_lock(
     params: Option<&serde_json::Map<String, serde_json::Value>>,
     governance: &GovernanceOptions,
     skolem_txn_id: Option<String>,
-) -> Result<fluree_db_api::cypher_write::ResolvedConditional, ApiError> {
+) -> Result<CypherWriteUnderLock, ApiError> {
     use fluree_db_api::cypher_write::ResolvedConditional;
     let snap = ledger_handle.snapshot().await;
     let plan = fluree
-        .cypher_write_plan_with_skolem(query, params, ledger_id, &snap.snapshot, skolem_txn_id)
+        .cypher_write_plan_with_skolem(
+            query,
+            params,
+            ledger_id,
+            &snap.snapshot,
+            skolem_txn_id.clone(),
+        )
         .await?;
     match plan {
-        fluree_db_api::cypher_write::WritePlan::Single(txn) => {
-            Ok(ResolvedConditional::single(*txn))
-        }
+        fluree_db_api::cypher_write::WritePlan::Single(txn) => Ok(CypherWriteUnderLock::Resolved(
+            Box::new(ResolvedConditional::single(*txn)),
+        )),
         fluree_db_api::cypher_write::WritePlan::Conditional(cw) => {
             // Fresh owned state for the branch-choosing probe (cheap — the
             // snapshot is Arc-shared); `snap` stays borrowed for the resolve.
@@ -450,7 +471,15 @@ pub(crate) async fn resolve_cypher_under_lock(
             fluree
                 .resolve_conditional_cypher(&cw, probe, ledger_id, &snap.snapshot)
                 .await
+                .map(|r| CypherWriteUnderLock::Resolved(Box::new(r)))
         }
+        fluree_db_api::cypher_write::WritePlan::Sequential(sq) => Ok(
+            CypherWriteUnderLock::Sequential(Box::new(fluree_db_api::cypher_seq::CypherSeqInput {
+                plan: *sq,
+                governance: governance.clone(),
+                skolem_txn_id,
+            })),
+        ),
     }
 }
 

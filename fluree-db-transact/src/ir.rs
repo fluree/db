@@ -190,6 +190,78 @@ pub struct Txn {
     /// JSON-LD producers (`parse_transaction`) share the staging registry and
     /// leave this empty.
     pub namespace_delta: std::collections::HashMap<u16, String>,
+
+    /// SPARQL graph-management directive (CLEAR/DROP/COPY/MOVE/ADD).
+    ///
+    /// When `Some`, this transaction retracts and/or re-homes whole graphs by
+    /// scanning the ledger at staging time, rather than by instantiating the
+    /// DELETE/INSERT templates above (which stay empty). `None` for every
+    /// ordinary insert/upsert/update transaction — the hot path is untouched.
+    ///
+    /// See [`GraphMgmtOp`] and `stage_graph_mgmt`.
+    pub graph_mgmt: Option<GraphMgmtOp>,
+}
+
+/// A SPARQL graph-management operation, executed by whole-graph scan/re-home
+/// at staging time (SPARQL 1.1 Update §3.2). Carried on [`Txn::graph_mgmt`].
+///
+/// `CREATE` and a `SILENT` `LOAD` of an unfetchable source lower to an ordinary
+/// empty no-op `Txn` (Fluree cannot represent an empty named graph — roadmap
+/// D-6), so they are **not** represented here.
+#[derive(Debug, Clone)]
+pub enum GraphMgmtOp {
+    /// Retract every flake in the target graph(s). Backs both `CLEAR` and
+    /// `DROP` — the two are indistinguishable in Fluree's flake-tagged model
+    /// (the registry is additive-only and the harness cannot observe an empty
+    /// graph), so `DROP ≡ CLEAR` (roadmap decision D-6).
+    Clear(GraphTarget),
+
+    /// Copy all flakes from `from` into `to` (`ADD`), optionally clearing the
+    /// destination first (`COPY`, `MOVE`) and/or the source afterwards
+    /// (`MOVE`). A `from == to` transfer is a no-op (staging short-circuits).
+    Transfer {
+        /// Source graph to scan.
+        from: GraphSel,
+        /// Destination graph to assert the copied flakes into.
+        to: GraphSel,
+        /// Retract the destination before copying (COPY / MOVE, not ADD).
+        clear_dest: bool,
+        /// Retract the source after copying (MOVE only).
+        clear_src: bool,
+        /// `SILENT`: suppress the "source graph does not exist" error. Per
+        /// SPARQL 1.1 Update §3.2, a transfer from a never-registered source
+        /// graph errors unless `SILENT`; without the guard COPY/MOVE would
+        /// clear the destination and copy nothing back in, silently emptying it
+        /// (roadmap O3). An emptied-but-registered source is a legitimate empty
+        /// source (registry is additive-only, D-6), not an error.
+        silent: bool,
+    },
+}
+
+/// Target of a `CLEAR`/`DROP` — one graph, or a registry-resolved scope.
+///
+/// `Named`/`All` are expanded against the ledger's `GraphRegistry` at staging
+/// time (the set of populated named graphs is only known then).
+#[derive(Debug, Clone)]
+pub enum GraphTarget {
+    /// The default graph (g_id 0).
+    Default,
+    /// A single named graph, by expanded IRI.
+    Graph(String),
+    /// Every populated named graph (not the default graph).
+    Named,
+    /// The default graph and every populated named graph.
+    All,
+}
+
+/// A single-graph selector: the default graph or one named graph (expanded IRI).
+/// Source/destination of a [`GraphMgmtOp::Transfer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphSel {
+    /// The default graph.
+    Default,
+    /// A named graph, by expanded IRI.
+    Graph(String),
 }
 
 impl Txn {
@@ -209,7 +281,98 @@ impl Txn {
             txn_meta: Vec::new(),
             graph_delta: FxHashMap::default(),
             namespace_delta: std::collections::HashMap::new(),
+            graph_mgmt: None,
         }
+    }
+
+    /// Create a graph-management transaction (CLEAR/DROP/COPY/MOVE/ADD).
+    ///
+    /// The DELETE/INSERT templates and WHERE clause are empty; staging reads
+    /// the directive from [`Txn::graph_mgmt`] and executes it by whole-graph
+    /// scan. `graph_delta` still carries any newly-referenced destination
+    /// graph IRI so the commit envelope registers it.
+    pub fn graph_mgmt(op: GraphMgmtOp) -> Self {
+        Self {
+            graph_mgmt: Some(op),
+            ..Self::update()
+        }
+    }
+
+    /// Retract every flake in a named graph (the non-SPARQL analog of
+    /// `CLEAR GRAPH <iri>`). In Fluree's model this is indistinguishable from
+    /// [`Txn::drop_graph`] (roadmap D-6).
+    pub fn clear_graph(iri: impl Into<String>) -> Self {
+        Txn::graph_mgmt(GraphMgmtOp::Clear(GraphTarget::Graph(iri.into())))
+    }
+
+    /// Drop a named graph (retract all of its flakes). `DROP ≡ CLEAR` in
+    /// Fluree's additive-only registry model (roadmap D-6).
+    pub fn drop_graph(iri: impl Into<String>) -> Self {
+        Txn::clear_graph(iri)
+    }
+
+    /// Retract every flake in the default graph.
+    pub fn clear_default_graph() -> Self {
+        Txn::graph_mgmt(GraphMgmtOp::Clear(GraphTarget::Default))
+    }
+
+    /// Copy all flakes from one named graph into another, replacing the
+    /// destination's prior contents (the non-SPARQL analog of `COPY <from> TO
+    /// <to>`). A destination equal to the source is a no-op.
+    pub fn copy_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
+        let to_iri = to.into();
+        let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+            from: GraphSel::Graph(from.into()),
+            to: GraphSel::Graph(to_iri.clone()),
+            clear_dest: true,
+            clear_src: false,
+            // Builder-API COPY errors on a never-registered source, matching
+            // non-SILENT SPARQL COPY (roadmap O3).
+            silent: false,
+        });
+        // Register the (possibly-new) destination graph so the commit envelope
+        // persists its g_id; `apply_delta` skips already-registered IRIs.
+        txn.graph_delta
+            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn
+    }
+
+    /// Move all flakes from one named graph into another — copy semantics plus
+    /// retraction of the source (the non-SPARQL analog of `MOVE <from> TO
+    /// <to>`). A destination equal to the source is a no-op.
+    pub fn move_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
+        let to_iri = to.into();
+        let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+            from: GraphSel::Graph(from.into()),
+            to: GraphSel::Graph(to_iri.clone()),
+            clear_dest: true,
+            clear_src: true,
+            // Builder-API MOVE errors on a never-registered source, matching
+            // non-SILENT SPARQL MOVE (roadmap O3).
+            silent: false,
+        });
+        txn.graph_delta
+            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn
+    }
+
+    /// Merge all flakes from one named graph into another, keeping the
+    /// destination's prior contents (the non-SPARQL analog of `ADD <from> TO
+    /// <to>`). A destination equal to the source is a no-op.
+    pub fn add_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
+        let to_iri = to.into();
+        let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+            from: GraphSel::Graph(from.into()),
+            to: GraphSel::Graph(to_iri.clone()),
+            clear_dest: false,
+            clear_src: false,
+            // Builder-API ADD errors on a never-registered source, matching
+            // non-SILENT SPARQL ADD (roadmap O3).
+            silent: false,
+        });
+        txn.graph_delta
+            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn
     }
 
     /// Create a new empty upsert transaction

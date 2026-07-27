@@ -171,6 +171,24 @@ pub enum TokenKind {
     RBrace,
 
     // =========================================================================
+    // RDF 1.2 (Turtle-star)
+    // =========================================================================
+    /// `<<` — reified-triple open (RDF 1.2 asserting form)
+    ReifiedTripleStart,
+    /// `>>` — reified-triple close
+    ReifiedTripleEnd,
+    /// `<<(` — triple-term open (RDF 1.2 triple terms as values).
+    /// Lexed so the parser can reject it with a specific deferred error;
+    /// no closing `)>>` token is needed because parsing stops here.
+    TripleTermStart,
+    /// `{|` — annotation block open
+    AnnotationOpen,
+    /// `|}` — annotation block close
+    AnnotationClose,
+    /// `~` — reifier marker
+    Tilde,
+
+    // =========================================================================
     // Special
     // =========================================================================
     /// End of input
@@ -213,6 +231,12 @@ impl std::fmt::Display for TokenKind {
             TokenKind::RParen => write!(f, ")"),
             TokenKind::LBrace => write!(f, "{{"),
             TokenKind::RBrace => write!(f, "}}"),
+            TokenKind::ReifiedTripleStart => write!(f, "<<"),
+            TokenKind::ReifiedTripleEnd => write!(f, ">>"),
+            TokenKind::TripleTermStart => write!(f, "<<("),
+            TokenKind::AnnotationOpen => write!(f, "{{|"),
+            TokenKind::AnnotationClose => write!(f, "|}}"),
+            TokenKind::Tilde => write!(f, "~"),
             TokenKind::Eof => write!(f, "EOF"),
         }
     }

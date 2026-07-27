@@ -187,12 +187,23 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 SELECT (COUNT(?m) AS ?count) (COUNT(DISTINCT ?m) AS ?distinctMembers)
                 WHERE { ?m a msg:Member ; msg:userId hr:employee/e1 . }
             ";
-            let q_graph = r"
+            // Explicit `GRAPH <ledger-alias>` addresses the default graph on
+            // the file-backed/binary-index path (the kept half of the #1279
+            // extension). The unbound `GRAPH ?g` form no longer enumerates the
+            // default graph (W3C semantics, D-2 / #1442) — pinned below.
+            let q_graph = format!(
+                r"
                 PREFIX msg: <https://ns.flur.ee/messaging/>
                 PREFIX hr: <https://ns.flur.ee/hr/>
-                SELECT ?g (COUNT(*) AS ?c)
+                SELECT (COUNT(*) AS ?c)
+                WHERE {{ GRAPH <{ledger_id}> {{ msg:member/m1 msg:userId hr:employee/e1 . }} }}
+            "
+            );
+            let q_graph_var = r"
+                PREFIX msg: <https://ns.flur.ee/messaging/>
+                PREFIX hr: <https://ns.flur.ee/hr/>
+                SELECT ?g
                 WHERE { GRAPH ?g { msg:member/m1 msg:userId hr:employee/e1 . } }
-                GROUP BY ?g
             ";
 
             let var_count = query_sparql(&fluree2, &ledger2_loaded, q_var)
@@ -215,7 +226,12 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 .unwrap()
                 .to_jsonld(&ledger2_loaded.snapshot)
                 .unwrap();
-            let graph_counts = query_sparql(&fluree2, &ledger2_loaded, q_graph)
+            let graph_counts = query_sparql(&fluree2, &ledger2_loaded, &q_graph)
+                .await
+                .unwrap()
+                .to_jsonld(&ledger2_loaded.snapshot)
+                .unwrap();
+            let graph_var_rows = query_sparql(&fluree2, &ledger2_loaded, q_graph_var)
                 .await
                 .unwrap()
                 .to_jsonld(&ledger2_loaded.snapshot)
@@ -225,7 +241,11 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
             assert_eq!(var_count, json!([[1]]));
             assert_eq!(type_count, json!([[1]]));
             assert_eq!(join_counts, json!([[1, 1]]));
-            assert_eq!(graph_counts, json!([[ledger_id, 1]]));
+            // Explicit alias addressing reaches the default graph (count=1, no
+            // duplicate solutions on the binary-index path)…
+            assert_eq!(graph_counts, json!([[1]]));
+            // …while unbound GRAPH ?g does not enumerate the default graph.
+            assert_eq!(graph_var_rows, json!([]));
 
             // Compare COUNT(*) vs raw bindings row count + decoded identity.
             let raw_bindings = query_sparql(&fluree2, &ledger2_loaded, q_var_bindings)

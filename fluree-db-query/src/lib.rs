@@ -143,7 +143,7 @@ pub use ir::{
 };
 pub use join::{BindInstruction, NestedLoopJoinOperator, PatternPosition, UnifyInstruction};
 pub use limit::LimitOperator;
-pub use materializer::{ComparableValue, JoinKey, Materializer};
+pub use materializer::{ComparableValue, JoinKey, JoinKeyMode, Materializer};
 pub use minus::MinusOperator;
 pub use offset::OffsetOperator;
 pub use operator::{BoxedOperator, Operator, OperatorState};

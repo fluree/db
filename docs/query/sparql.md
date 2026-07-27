@@ -546,10 +546,15 @@ required:
 # Returns the named graph's triples even with no FROM NAMED
 SELECT ?s ?p ?o WHERE { GRAPH <urn:probegraph> { ?s ?p ?o } }
 
-# Discovers every user-registered named graph (plus the ledger alias,
-# which addresses the default graph)
+# Discovers every user-registered named graph
 SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }
 ```
+
+An unbound `GRAPH ?g` ranges over **named graphs only**, per SPARQL 1.1: it
+binds `?g` to each user-registered named graph and never to the default
+graph. The default graph remains explicitly addressable by the ledger alias
+(`GRAPH <mydb:main> { ... }`) when named directly or bound from another
+pattern — it just isn't enumerated.
 
 Only user-registered named graphs are exposed this way; the reserved system
 graphs (`#txn-meta`, `#config`) remain addressable only via an explicit
@@ -1109,6 +1114,29 @@ INSERT DATA {
   ex:alice ex:name "アリス"@ja .
 }
 ```
+
+### Multi-operation requests
+
+A single request may contain multiple operations separated by `;`. Operations
+execute **sequentially** — each operation's `WHERE` observes the graph-store
+state left by the previous one (SPARQL 1.1 Update §3.1) — and the whole
+request commits as **one atomic transaction**: one commit, one `t`, and a
+failure anywhere aborts the entire request with no partial effects.
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+INSERT DATA { ex:s ex:p "first" } ;
+INSERT { ?s ex:q "second" } WHERE { ?s ex:p "first" }
+```
+
+Validation (policy, SHACL, uniqueness) runs **per operation** against the
+sequential state, not once against the final state. A request that is
+transiently invalid but finally valid — say, an operation that duplicates a
+unique property value that a later operation would free up — aborts at the
+offending operation. Ordered uniqueness checking requires this; for SHACL it
+is a deliberate choice (every intermediate state must satisfy the shapes,
+like a database without deferred constraints).
 
 ### SPARQL UPDATE Restrictions
 

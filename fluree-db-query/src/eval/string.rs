@@ -328,20 +328,48 @@ pub fn eval_concat<R: RowAccess>(
     // Per W3C: preserve language tag only if ALL args have the same tag
     let mut common_lang: Option<Option<Arc<str>>> = None;
     for arg in args {
-        let lang = extract_lang_tag(arg, row, ctx);
+        // CONCAT requires string arguments (§17.4.3.5). A non-string bound value
+        // (e.g. an xsd:integer) or an unbound argument is a type error, so the
+        // whole result is unbound — not silently skipped/coerced (concat02).
+        let Some(val) = arg.eval_to_comparable(row, ctx)? else {
+            return Ok(None);
+        };
+        // §17.4.3.5: CONCAT accepts only strings — plain, xsd:string, or
+        // language-tagged. An IRI or a foreign-datatype literal (both of which
+        // `as_str()` would expose) is a type error → the whole result is unbound.
+        let s = match &val {
+            ComparableValue::String(s) => s.as_ref(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s),
+                dtc,
+            } if !matches!(dtc, Some(UnresolvedDatatypeConstraint::Explicit(_))) => s.as_str(),
+            _ => return Ok(None),
+        };
+        // The language tag can live on the VALUE itself (a constant `"a"@en`,
+        // a STRLANG/REPLACE result — both `TypedLiteral{LangTag}`) or only on
+        // the raw BINDING (the Var fast paths `extract_lang_tag` reads).
+        // Prefer the value's own tag, then fall back to the binding's —
+        // reading only the binding dropped the tag for constant/computed
+        // args, so `CONCAT("a"@en, "b"@en)` came back plain instead of @en.
+        let value_lang = match &val {
+            ComparableValue::TypedLiteral {
+                dtc: Some(UnresolvedDatatypeConstraint::LangTag(t)),
+                ..
+            } => Some(Arc::clone(t)),
+            _ => None,
+        };
+        let lang = value_lang.or_else(|| extract_lang_tag(arg, row, ctx));
         match &common_lang {
             None => common_lang = Some(lang),
-            Some(prev) => {
-                if *prev != lang {
-                    common_lang = Some(None); // mismatch → no tag
-                }
-            }
+            // RDF 1.1 language tags compare case-insensitively; the first
+            // argument's spelling is kept for the result.
+            Some(Some(prev)) => match &lang {
+                Some(l) if prev.eq_ignore_ascii_case(l) => {}
+                _ => common_lang = Some(None), // mismatch → no tag
+            },
+            Some(None) => {}
         }
-        if let Some(val) = arg.eval_to_comparable(row, ctx)? {
-            if let Some(s) = val.as_str() {
-                result.push_str(s);
-            }
-        }
+        result.push_str(s);
     }
     let lang = common_lang.flatten();
     Ok(Some(string_with_lang(&result, lang)))
@@ -626,11 +654,21 @@ pub fn eval_str_dt<R: RowAccess>(
     let dt = args[1].eval_to_comparable(row, ctx)?;
     match (val, dt) {
         (Some(ComparableValue::String(s)), Some(dt_val)) => {
+            // The datatype argument usually arrives as a Sid — a constant IRI
+            // in expression position lowers through the IRI encoder — which
+            // `as_str()` deliberately does not expose. Decode it back to the
+            // full IRI; without it the constructed literal silently lost its
+            // datatype (DATATYPE(STRDT(?x, xsd:integer)) came back unbound
+            // and the EBV/equality paths saw a plain string).
+            let dt_iri: Option<Arc<str>> = match &dt_val {
+                ComparableValue::Sid(sid) => ctx
+                    .and_then(|c| c.active_snapshot.decode_sid(sid))
+                    .map(Arc::from),
+                other => other.as_str().map(Arc::from),
+            };
             Ok(Some(ComparableValue::TypedLiteral {
                 val: FlakeValue::String(s.to_string()),
-                dtc: dt_val
-                    .as_str()
-                    .map(|s| UnresolvedDatatypeConstraint::Explicit(Arc::from(s))),
+                dtc: dt_iri.map(UnresolvedDatatypeConstraint::Explicit),
             }))
         }
         (Some(_), Some(_)) => Ok(None),

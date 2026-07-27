@@ -1673,24 +1673,21 @@ fn build_match_val_for_snapshot(
     };
 
     let reencode_sid = |sid: &Sid| -> Option<Sid> {
-        // Pattern SIDs are encoded in the primary snapshot's namespace space.
-        // Decode to canonical IRI and re-encode into the target snapshot.
-        // Use `original_snapshot` (the primary) rather than `snapshot`
-        // (which may be a per-graph snapshot with different namespace codes).
-        if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
-            if let Some(store) = ctx.binary_store.as_deref() {
+        // Pattern SIDs are encoded in the primary snapshot's namespace space;
+        // re-encode into `snapshot` (a per-graph snapshot may code the same IRI
+        // differently) via the shared `context::reencode_sid`. The binary
+        // store's own persisted subject SID, when present, takes precedence.
+        if let Some(store) = ctx.binary_store.as_deref() {
+            if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
                 if let Ok(Some(persisted_sid)) = store.find_subject_sid(&iri) {
                     return Some(persisted_sid);
                 }
             }
-            snapshot.encode_iri(&iri)
-        } else {
-            // If the SID can't be decoded (namespace code missing), preserve the
-            // raw SID. This is important when the namespace table has been
-            // extended in novelty but the snapshot's namespace map is not yet
-            // able to decode the SID. Range scans can still match by raw SID.
-            Some(sid.clone())
         }
+        // Fall back to the raw SID when it can't be decoded/re-encoded: a range
+        // scan can still match by raw SID (e.g. a novelty-extended namespace the
+        // snapshot's map cannot yet decode).
+        crate::context::reencode_sid(ctx, snapshot, sid).or_else(|| Some(sid.clone()))
     };
 
     match &pattern.s {

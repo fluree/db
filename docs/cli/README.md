@@ -61,6 +61,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`load`](load.md) | Stream a CSV into a ledger as batched Cypher/JSON-LD upserts (`LOAD CSV`) |
 | [`query`](query.md) | Query a ledger |
 | [`validate`](validate.md) | Validate data against SHACL shapes (report) |
+| [`model`](model.md) | Governance model tooling — access profiles, SHACL entity shapes, class hierarchy |
 | [`history`](history.md) | Show change history for an entity |
 | [`export`](export.md) | Export ledger data |
 | [`log`](log.md) | Show commit log |
@@ -101,7 +102,7 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 | Command | Description |
 |---------|-------------|
 | [`token`](token.md) | Create, inspect, and manage JWS tokens |
-| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status) |
+| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token) |
 
 ### Configuration
 

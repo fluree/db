@@ -2336,55 +2336,531 @@ async fn update_values_wildcard_delete_after_updates_and_indexing() {
         .await;
 }
 
-/// Issue #1438: a multi-operation SPARQL UPDATE request (`INSERT ...; DELETE
-/// ...`) used to execute ONLY the first operation, silently discarding
-/// everything after the first ';' — silent data loss through the public
-/// transact path. Until PR-U2 adds real multi-op support, such a request
-/// must fail loudly (D-10a interim guard: the trailing-token/EOF assertion
-/// at the parse entry, enforced because parse-error diagnostics are
-/// authoritative at the API seam).
+/// Issue #1438 (resolved): a multi-operation SPARQL UPDATE request
+/// (`INSERT ...; DELETE ...`) used to execute ONLY the first operation,
+/// silently discarding everything after the first ';' — silent data loss
+/// through the public transact path. PR-3's interim guard made that fail
+/// loudly; the request-level `;` loop + sequential staging now execute the
+/// full sequence in ONE atomic commit, each operation observing the state
+/// its predecessors produced (SPARQL 1.1 Update §3.1 / roadmap D-10).
 #[tokio::test]
-async fn multi_operation_sparql_update_rejected_loudly() {
+async fn multi_operation_sparql_update_executes_sequentially() {
     let fluree = FlureeBuilder::memory().build_memory();
     fluree
         .create_ledger("multiop:main")
         .await
         .expect("create ledger");
 
+    // Op 2's WHERE must observe op 1's insert within the same request —
+    // the truncation bug's core scenario, now the sequential-staging one.
     let two_ops = r#"
         PREFIX ex: <http://example.org/ns/>
         INSERT DATA { ex:s ex:p "first" } ;
-        DELETE DATA { ex:s ex:p "first" }
+        INSERT { ?s ex:q "second" } WHERE { ?s ex:p "first" }
     "#;
-
-    let err = fluree
+    let result = fluree
         .graph("multiop:main")
         .transact()
         .sparql_update(two_ops)
         .commit()
         .await
-        .expect_err("two-op update must be rejected loudly, not truncated to its first op");
+        .expect("two-op request executes as one atomic commit");
+    assert_eq!(result.receipt.t, 1, "one request = one commit");
+
+    let ledger = fluree.ledger("multiop:main").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?p ?o WHERE { ex:s ?p ?o } ORDER BY ?o",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let bindings = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "both operations' effects must be visible: {json}"
+    );
+    assert_eq!(bindings[0]["o"]["value"], "first");
+    assert_eq!(bindings[1]["o"]["value"], "second");
+
+    // Insert-then-delete of the same fact in one request nets to absence
+    // (ordered application), while a fact asserted before the request and
+    // deleted-then-reasserted inside it survives.
+    let insert_delete = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:tmp ex:p "transient" } ;
+        DELETE DATA { ex:tmp ex:p "transient" }
+    "#;
+    fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(insert_delete)
+        .commit()
+        .await
+        .expect("insert-then-delete request commits");
+    let ledger = fluree.ledger("multiop:main").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:tmp ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
     assert!(
-        err.to_string().contains("multi-operation SPARQL UPDATE"),
-        "error should name the multi-op limitation, got: {err}"
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "insert-then-delete within one request must net to absence: {json}"
     );
 
-    // Control: one operation with the grammar's optional trailing ';'
-    // (Update ::= Prologue ( Update1 ( ';' Update )? )?) still commits —
-    // and lands at t=1, proving the rejected two-op request above staged
-    // nothing at all (not even its first operation).
+    let delete_insert = r#"
+        PREFIX ex: <http://example.org/ns/>
+        DELETE DATA { ex:s ex:p "first" } ;
+        INSERT DATA { ex:s ex:p "first" }
+    "#;
+    fluree
+        .graph("multiop:main")
+        .transact()
+        .sparql_update(delete_insert)
+        .commit()
+        .await
+        .expect("delete-then-reinsert request commits");
+    let ledger = fluree.ledger("multiop:main").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:s ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "delete-then-reinsert within one request must net to presence: {json}"
+    );
+}
+
+/// PR-1454 review: atomicity on mid-request failure. Op 1 stages
+/// successfully; op 2 — evaluating over op 1's data, proving it actually
+/// ran against the sequential state — fails at staging. The request must
+/// fail as a unit: an error response, `t` unchanged, and no trace of
+/// op 1's insert.
+#[tokio::test]
+async fn multi_operation_request_failing_mid_request_leaves_no_trace() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:atomicity")
+        .await
+        .expect("create ledger");
+
+    let seeded = fluree
+        .graph("multiop:atomicity")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:pre ex:p "pre-existing" }"#,
+        )
+        .commit()
+        .await
+        .expect("seed commit");
+    let t_before = seeded.receipt.t;
+
+    // Op 2's BIND(STRDT(?m, <bad:datatype>)) evaluates over op 1's staged
+    // fact and fails at staging time — after op 1 already staged cleanly.
+    let failing = r#"
+        PREFIX ex: <http://example.org/ns/>
+        INSERT DATA { ex:mid ex:p "landed" } ;
+        INSERT { ?s ex:q ?bad }
+        WHERE { ?s ex:p ?m . FILTER(?m = "landed") BIND(STRDT(?m, <bad:datatype>) AS ?bad) }
+    "#;
+    let result = fluree
+        .graph("multiop:atomicity")
+        .transact()
+        .sparql_update(failing)
+        .commit()
+        .await;
+    assert!(
+        result.is_err(),
+        "a mid-request staging failure must fail the whole request"
+    );
+
+    let ledger = fluree.ledger("multiop:atomicity").await.expect("ledger");
+    assert_eq!(
+        ledger.t(),
+        t_before,
+        "a failed request must not advance `t`"
+    );
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:mid ex:p ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "op 1's insert must leave no trace after the request fails: {json}"
+    );
+}
+
+/// PR-1454 review: constant IRIs in UPDATE operations must resolve against
+/// the request `BASE` exactly as the query surface resolves them — one
+/// document, one set of IRIs. The update path used to store the literal
+/// relative forms (`s1`, `g1`), which BASE-carrying queries could never
+/// find.
+#[tokio::test]
+async fn sparql_update_constant_iris_resolve_against_base_at_the_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("base:main")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("base:main")
+        .transact()
+        .sparql_update(
+            r#"BASE <http://x.example/>
+               INSERT DATA { <s1> <p1> "v" . GRAPH <g1> { <s2> <p1> "w" } }"#,
+        )
+        .commit()
+        .await
+        .expect("BASE-relative INSERT DATA commits");
+
+    let ledger = fluree.ledger("base:main").await.expect("ledger");
+
+    // The same document shape on the query surface resolves to the same
+    // absolute IRIs and finds the data …
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"BASE <http://x.example/> SELECT ?o WHERE { <s1> <p1> ?o }",
+    )
+    .await
+    .expect("BASE query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "the BASE-resolved subject must be found by a BASE-resolved query: {json}"
+    );
+    assert_eq!(bindings[0]["o"]["value"], "v");
+
+    // … because the stored terms ARE the absolute IRIs.
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"SELECT ?o WHERE { <http://x.example/s1> <http://x.example/p1> ?o }",
+    )
+    .await
+    .expect("absolute query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "absolute-IRI lookup must find the BASE-resolved fact: {json}"
+    );
+
+    // GRAPH names route through the same expansion.
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"SELECT ?o WHERE { GRAPH <http://x.example/g1> { <http://x.example/s2> <http://x.example/p1> ?o } }",
+    )
+    .await
+    .expect("named-graph query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "the BASE-resolved graph name must address the named graph: {json}"
+    );
+}
+
+/// PR-1454 review: the per-operation validation semantics, pinned.
+/// Constraint checks (uniqueness here; policy and SHACL ride the same
+/// per-op pipeline) run against the SEQUENTIAL state after each operation
+/// — a transiently-invalid-but-finally-valid request aborts at the
+/// offending operation. Required for ordered uniqueness; deliberate for
+/// SHACL (no deferred constraints). Documented in docs/query/sparql.md.
+#[tokio::test]
+async fn multi_operation_validation_is_per_operation_not_final_state() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:per-op-validation")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:per-op-validation")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:old ex:email "shared@example.org" }"#,
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    // The final state would be valid (op 2 frees the value), but op 1
+    // transiently duplicates the unique value → the request aborts there.
+    let opts = TxnOpts {
+        unique_properties: Some(vec!["http://example.org/ns/email".to_string()]),
+        ..TxnOpts::default()
+    };
+    let err = fluree
+        .graph("multiop:per-op-validation")
+        .transact()
+        .txn_opts(opts)
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { ex:new ex:email "shared@example.org" } ;
+               DELETE DATA { ex:old ex:email "shared@example.org" }"#,
+        )
+        .commit()
+        .await
+        .expect_err("a transiently-duplicated unique value must abort the request");
+    assert!(
+        err.to_string().to_lowercase().contains("unique"),
+        "expected a uniqueness violation, got: {err}"
+    );
+
+    let ledger = fluree
+        .ledger("multiop:per-op-validation")
+        .await
+        .expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s WHERE { ?s ex:email ?o }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "only the seeded holder survives the aborted request: {json}"
+    );
+}
+
+/// PR-1454 review (bplatz): a blank-node label reused across DELETE WHERE
+/// operations is two independently-scoped existential matches — the
+/// request must execute (it used to be rejected as a duplicate label), and
+/// each operation deletes its own matches.
+#[tokio::test]
+async fn multi_operation_delete_where_reusing_bnode_labels_executes_independently() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:dw-bnode")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:dw-bnode")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA {
+                   ex:x ex:flag "a" .
+                   ex:y ex:flag "b" .
+                   ex:z ex:keep "c"
+               }"#,
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    fluree
+        .graph("multiop:dw-bnode")
+        .transact()
+        .sparql_update(
+            r#"PREFIX ex: <http://example.org/ns/>
+               DELETE WHERE { _:b1 ex:flag "a" } ;
+               DELETE WHERE { _:b1 ex:flag "b" }"#,
+        )
+        .commit()
+        .await
+        .expect("label reuse across DELETE WHERE operations must be accepted");
+
+    let ledger = fluree.ledger("multiop:dw-bnode").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?s ?o WHERE { ?s ex:flag ?o }",
+    )
+    .await
+    .expect("query flags");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "each DELETE WHERE must delete its own matches: {json}"
+    );
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX ex: <http://example.org/ns/>
+           SELECT ?o WHERE { ex:z ex:keep ?o }",
+    )
+    .await
+    .expect("query keep");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert_eq!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len(),
+        1,
+        "unmatched data must survive: {json}"
+    );
+}
+
+/// The W3C `dawg-delete-insert-01c` shape end-to-end: `INSERT ... WHERE ;
+/// DELETE ... WHERE`, where op 1 makes a relation bidirectional and op 2 —
+/// evaluating over op 1's output — deletes every edge. Under first-op-only
+/// truncation this left 2 edges; under op-isolated (non-sequential)
+/// staging it would leave 1.
+#[tokio::test]
+async fn multi_operation_modify_sequence_matches_w3c_semantics() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:w3c")
+        .await
+        .expect("create ledger");
+
+    fluree
+        .graph("multiop:w3c")
+        .transact()
+        .sparql_update(
+            r"PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+               PREFIX ex: <http://example.org/>
+               INSERT DATA { ex:alice foaf:knows ex:bob }",
+        )
+        .commit()
+        .await
+        .expect("seed");
+
+    fluree
+        .graph("multiop:w3c")
+        .transact()
+        .sparql_update(
+            r"PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+               INSERT { ?b foaf:knows ?a } WHERE { ?a foaf:knows ?b } ;
+               DELETE { ?a foaf:knows ?b } WHERE { ?a foaf:knows ?b }",
+        )
+        .commit()
+        .await
+        .expect("01c-shaped request commits");
+
+    let ledger = fluree.ledger("multiop:w3c").await.expect("ledger");
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        r"PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+           SELECT ?a ?b WHERE { ?a foaf:knows ?b }",
+    )
+    .await
+    .expect("query");
+    let json = rows.to_sparql_json(&ledger.snapshot).expect("sparql json");
+    assert!(
+        json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .is_empty(),
+        "op 2 must delete every knows edge, including op 1's insertions: {json}"
+    );
+}
+
+/// Grammar edge cases at the transact seam: one trailing ';' is legal; an
+/// empty request is a valid no-op (reported as an empty transaction, the
+/// same outcome as an update whose WHERE matched nothing); a blank-node
+/// label reused across operations is a loud parse error.
+#[tokio::test]
+async fn sparql_update_request_grammar_edges_at_the_seam() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("multiop:edges")
+        .await
+        .expect("create ledger");
+
+    // One operation with the grammar's optional trailing ';'.
     let one_op = r#"
         PREFIX ex: <http://example.org/ns/>
         INSERT DATA { ex:s ex:p "only" } ;
     "#;
     let result = fluree
-        .graph("multiop:main")
+        .graph("multiop:edges")
         .transact()
         .sparql_update(one_op)
         .commit()
         .await
         .expect("single-op update with a trailing ';' is valid SPARQL and should commit");
     assert_eq!(result.receipt.t, 1);
+
+    // Prologue-only request: valid no-op — succeeds through the existing
+    // zero-staged-flakes no-op path without creating a commit (t unchanged,
+    // zero flakes), rather than erroring as a parse failure.
+    let result = fluree
+        .graph("multiop:edges")
+        .transact()
+        .sparql_update("PREFIX ex: <http://example.org/ns/>")
+        .commit()
+        .await
+        .expect("prologue-only request is a valid no-op");
+    assert_eq!(result.receipt.flake_count, 0, "no-op stages nothing");
+    assert_eq!(result.receipt.t, 1, "no-op creates no new commit");
+
+    // Cross-operation blank-node label reuse: loud parse error (W3C
+    // syntax-update-54 semantics), nothing staged.
+    let err = fluree
+        .graph("multiop:edges")
+        .transact()
+        .sparql_update(
+            r"PREFIX ex: <http://example.org/ns/>
+               INSERT DATA { _:b1 ex:p ex:o } ;
+               INSERT DATA { _:b1 ex:p ex:o }",
+        )
+        .commit()
+        .await
+        .expect_err("cross-op bnode label reuse must be rejected");
+    assert!(
+        err.to_string().contains("blank node label"),
+        "error should name the bnode scope violation, got: {err}"
+    );
 }
 
 /// bplatz review feedback on #1453: validator-side UPDATE rules must apply

@@ -150,6 +150,23 @@ pub fn lower_expr<E: IriEncoder>(
             let r = lower_expr(ctx, r, aux)?;
             Ok(Expression::binary(Function::Contains, l, r))
         }
+        Expr::RegexMatch(l, r, _) => {
+            // Neo4j `=~` matches the WHOLE string; the engine's REGEX is a
+            // SPARQL-style partial match. Anchor with a non-capturing group so
+            // alternations keep their meaning (`a|b` ⇒ `^(?:a|b)$`), building
+            // the pattern with CONCAT so runtime patterns anchor too.
+            let l = lower_expr(ctx, l, aux)?;
+            let r = lower_expr(ctx, r, aux)?;
+            let anchored = Expression::call(
+                Function::Concat,
+                vec![
+                    Expression::Const(FlakeValue::String("^(?:".to_string())),
+                    r,
+                    Expression::Const(FlakeValue::String(")$".to_string())),
+                ],
+            );
+            Ok(Expression::binary(Function::Regex, l, anchored))
+        }
         Expr::Case(case) => lower_case(ctx, case, aux),
         Expr::Exists(pattern, inner_where, _) => {
             let mut patterns = lower_pattern(ctx, pattern)?;

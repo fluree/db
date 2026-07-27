@@ -46,8 +46,9 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphPattern, Iri, IriValue,
-    Literal, LiteralValue as SparqlLiteralValue, Modify, PredicateTerm, Prologue, PropertyPath,
+    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphMgmtRef, GraphOrDefault,
+    GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
+    LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
     QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
     TriplePattern, UpdateOperation,
 };
@@ -55,7 +56,10 @@ use fluree_db_sparql::SourceSpan;
 use rustc_hash::FxHashMap;
 use thiserror::Error;
 
-use crate::ir::{SparqlWhereClause, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{
+    GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateTerm, TripleTemplate, Txn,
+    TxnOpts, TxnType,
+};
 use crate::namespace::NamespaceRegistry;
 use fluree_vocab::{fluree, xsd};
 
@@ -108,7 +112,11 @@ impl BlankNodeCounter {
     }
 
     fn next(&mut self) -> String {
-        let label = format!("_:b{}", self.next);
+        // `[` is outside PN_CHARS, so no hand-written `_:label` can collide
+        // with a minted anonymous label (a user's `_:b0` next to a template
+        // `[]` used to fuse into one node — the same forgeability class as
+        // the query-side `_:[]{N}` scheme this matches).
+        let label = format!("_:[]{}", self.next);
         self.next += 1;
         label
     }
@@ -299,6 +307,18 @@ fn expand_annotated_triples(
             });
         }
 
+        // Same for an RDF 1.2 triple-term subject (`<<( s p o )>>`,
+        // accept-then-defer, D-1): this expansion pre-pass runs BEFORE the
+        // quad-pattern lowering whose TripleTerm arms defer cleanly, and
+        // `subject_to_object` below would hit its `unreachable!()` panic.
+        if let SubjectTerm::TripleTerm(tt) = &tp.subject {
+            return Err(LowerError::UnsupportedFeature {
+                feature: "SPARQL 1.2 triple-term subject combined with an RDF 1.2 \
+                          annotation tail (`{| ... |}`) in SPARQL UPDATE (deferred)",
+                span: tt.span,
+            });
+        }
+
         // Reify the base edge and emit base + per-unit bundle + body.
         // The base triple stripped of its annotation goes through
         // unchanged; each annotation unit (`~ r? {| … |}?`) contributes
@@ -405,6 +425,9 @@ fn subject_to_object(s: &SubjectTerm) -> Term {
         SubjectTerm::BlankNode(b) => Term::BlankNode(b.clone()),
         SubjectTerm::QuotedTriple(_) => {
             unreachable!("RDF-star quoted triples are rejected before annotation expansion")
+        }
+        SubjectTerm::TripleTerm(_) => {
+            unreachable!("SPARQL 1.2 triple-term values are rejected before annotation expansion")
         }
     }
 }
@@ -732,25 +755,59 @@ struct LiteralResult {
     dtc: Option<DatatypeConstraint>,
 }
 
-/// Lower a parsed SPARQL AST to the Transaction IR.
+/// Lower a parsed SPARQL UPDATE request to a sequence of Transaction IRs,
+/// one per `;`-separated operation, in request order.
 ///
-/// This is a convenience wrapper that extracts the `UpdateOperation` and `Prologue`
-/// from a `SparqlAst` and calls `lower_sparql_update`.
-///
-/// # Arguments
-///
-/// * `ast` - The parsed SPARQL AST (must contain an UPDATE operation)
-/// * `ns` - The namespace registry for IRI-to-Sid encoding
-/// * `opts` - Transaction options (branch, context, etc.)
-///
-/// # Returns
-///
-/// A `Txn` that can be staged using the shared transaction pipeline.
+/// Each operation is lowered against the prologue in effect for it (the
+/// grammar's accumulating `PREFIX`/`BASE` scope). The returned `Txn`s must
+/// be staged **sequentially** — SPARQL 1.1 Update §3.1 requires operation
+/// N+1 to observe the graph-store state operation N produced — and
+/// committed as ONE atomic commit (roadmap decision D-10). An empty vector
+/// (empty or prologue-only request) is a valid no-op.
 ///
 /// # Errors
 ///
 /// Returns `LowerError` if:
-/// - The AST body is not an UPDATE operation (is a query)
+/// - The AST body is not an UPDATE request (is a query)
+/// - WITH or USING clauses are present
+/// - Blank nodes appear in WHERE patterns
+/// - RDF-star quoted triples are used
+pub fn lower_sparql_update_request(
+    ast: &SparqlAst,
+    ns: &mut NamespaceRegistry,
+    opts: TxnOpts,
+) -> Result<Vec<Txn>, LowerError> {
+    let request = match &ast.body {
+        QueryBody::Update(request) => request,
+        _ => {
+            return Err(LowerError::NotAnUpdate { span: ast.span });
+        }
+    };
+    let mut txns = Vec::with_capacity(request.operations.len());
+    for op in &request.operations {
+        txns.push(lower_sparql_update(
+            &op.operation,
+            &op.prologue,
+            ns,
+            opts.clone(),
+        )?);
+    }
+    Ok(txns)
+}
+
+/// Lower a parsed **single-operation** SPARQL AST to the Transaction IR.
+///
+/// This is a convenience wrapper over [`lower_sparql_update_request`] for
+/// the common one-operation request. It fails loudly on a request with
+/// zero or multiple operations — callers that accept the full request
+/// grammar (the API transaction seam) must use
+/// [`lower_sparql_update_request`] and stage the sequence.
+///
+/// # Errors
+///
+/// Returns `LowerError` if:
+/// - The AST body is not an UPDATE request (is a query)
+/// - The request does not contain exactly one operation
 /// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
@@ -759,13 +816,25 @@ pub fn lower_sparql_update_ast(
     ns: &mut NamespaceRegistry,
     opts: TxnOpts,
 ) -> Result<Txn, LowerError> {
-    let update_op = match &ast.body {
-        QueryBody::Update(op) => op,
+    let request = match &ast.body {
+        QueryBody::Update(request) => request,
         _ => {
             return Err(LowerError::NotAnUpdate { span: ast.span });
         }
     };
-    lower_sparql_update(update_op, &ast.prologue, ns, opts)
+    match request.operations.as_slice() {
+        [op] => lower_sparql_update(&op.operation, &op.prologue, ns, opts),
+        [] => Err(LowerError::UnsupportedFeature {
+            feature: "empty update request (no operation) in single-operation lowering; \
+                      use lower_sparql_update_request",
+            span: ast.span,
+        }),
+        _ => Err(LowerError::UnsupportedFeature {
+            feature: "multi-operation update request in single-operation lowering; \
+                      use lower_sparql_update_request",
+            span: ast.span,
+        }),
+    }
 }
 
 /// Lower a SPARQL UPDATE operation to the Transaction IR.
@@ -809,6 +878,36 @@ pub fn lower_sparql_update(
         UpdateOperation::Modify(modify) => {
             lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
+        // Graph-management verbs. CLEAR/DROP/ADD/COPY/MOVE lower to a
+        // graph-management directive executed by whole-graph scan at staging
+        // time; CREATE and SILENT LOAD lower to an empty no-op transaction;
+        // non-SILENT remote LOAD is a documented divergence (D-5).
+        UpdateOperation::Clear(gm) | UpdateOperation::Drop(gm) => {
+            lower_clear_drop(gm, prologue, opts)?
+        }
+        UpdateOperation::Create(create) => {
+            // Fluree cannot represent an empty named graph (roadmap D-6), so
+            // CREATE stages no flakes — but it DOES register the graph IRI in
+            // the additive registry (same `graph_delta` mechanism as a
+            // transfer destination). Registration is what O3's source-existence
+            // check consults, so `CREATE GRAPH <g>` followed by a non-SILENT
+            // `COPY <g> TO <h>` is a legitimate empty source rather than the
+            // contradictory "source graph does not exist" error. CREATE of an
+            // ALREADY-registered graph stays a no-op rather than the spec's
+            // §3.2.2 error (D-6: the registry can't distinguish an
+            // intentionally-created empty graph from an emptied one), so
+            // `silent` has nothing to suppress; the graph remains
+            // non-enumerable until a flake lands in it.
+            let iri = expand_iri(&create.graph, prologue)?;
+            let mut txn = Txn::update().with_opts(opts);
+            txn.graph_delta
+                .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, iri);
+            txn
+        }
+        UpdateOperation::Add(t) => lower_transfer(t, prologue, TransferMode::Add, opts)?,
+        UpdateOperation::Copy(t) => lower_transfer(t, prologue, TransferMode::Copy, opts)?,
+        UpdateOperation::Move(t) => lower_transfer(t, prologue, TransferMode::Move, opts)?,
+        UpdateOperation::Load(load) => lower_load(load, opts)?,
     };
     // Hand off the lowering registry's allocations so `stage_transaction_from_txn`
     // can merge them into its own snapshot-derived registry. Without this, the
@@ -818,6 +917,123 @@ pub fn lower_sparql_update(
     // the predicate IRI back to the same Sid.
     txn.namespace_delta = ns.delta().clone();
     Ok(txn)
+}
+
+/// Which of the three transfer verbs is being lowered.
+#[derive(Clone, Copy)]
+enum TransferMode {
+    /// `ADD`: copy source into destination, destination untouched otherwise.
+    Add,
+    /// `COPY`: clear destination, then copy source into it.
+    Copy,
+    /// `MOVE`: clear destination, copy source into it, then clear source.
+    Move,
+}
+
+/// Resolve a `CLEAR`/`DROP` target to an IR [`GraphTarget`], expanding a named
+/// graph's IRI through the prologue.
+fn graph_ref_all_to_target(
+    target: &GraphRefAll,
+    prologue: &Prologue,
+) -> Result<GraphTarget, LowerError> {
+    Ok(match target {
+        GraphRefAll::Default => GraphTarget::Default,
+        GraphRefAll::Named => GraphTarget::Named,
+        GraphRefAll::All => GraphTarget::All,
+        GraphRefAll::Graph(iri) => GraphTarget::Graph(expand_iri(iri, prologue)?),
+    })
+}
+
+/// Resolve an `ADD`/`COPY`/`MOVE` endpoint to an IR [`GraphSel`], expanding a
+/// named graph's IRI through the prologue.
+fn graph_or_default_to_sel(
+    g: &GraphOrDefault,
+    prologue: &Prologue,
+) -> Result<GraphSel, LowerError> {
+    Ok(match g {
+        GraphOrDefault::Default => GraphSel::Default,
+        GraphOrDefault::Graph(iri) => GraphSel::Graph(expand_iri(iri, prologue)?),
+    })
+}
+
+/// Lower `CLEAR`/`DROP` to a graph-management retract-all directive.
+///
+/// `DROP ≡ CLEAR` in Fluree's model (roadmap D-6): the graph registry is
+/// additive-only and an emptied graph is indistinguishable from a dropped one.
+///
+/// The parsed `SILENT` flag is deliberately not consulted: in the D-6 model a
+/// CLEAR/DROP of an unregistered graph is a no-op rather than the spec's
+/// "graph does not exist" error, so there is no error for SILENT to suppress —
+/// a documented divergence, symmetric with CREATE-of-existing staying a no-op.
+fn lower_clear_drop(
+    gm: &GraphMgmtRef,
+    prologue: &Prologue,
+    opts: TxnOpts,
+) -> Result<Txn, LowerError> {
+    let target = graph_ref_all_to_target(&gm.target, prologue)?;
+    Ok(Txn::graph_mgmt(GraphMgmtOp::Clear(target)).with_opts(opts))
+}
+
+/// Lower `ADD`/`COPY`/`MOVE` to a graph-management transfer directive.
+///
+/// Composes over the CLEAR primitive: COPY/MOVE clear the destination first,
+/// MOVE additionally clears the source afterward. A destination named graph is
+/// recorded in `graph_delta` so the commit envelope registers it even when it
+/// did not previously exist (COPY/ADD into a fresh graph).
+fn lower_transfer(
+    t: &GraphTransfer,
+    prologue: &Prologue,
+    mode: TransferMode,
+    opts: TxnOpts,
+) -> Result<Txn, LowerError> {
+    let from = graph_or_default_to_sel(&t.from, prologue)?;
+    let to = graph_or_default_to_sel(&t.to, prologue)?;
+    let (clear_dest, clear_src) = match mode {
+        TransferMode::Add => (false, false),
+        TransferMode::Copy => (true, false),
+        TransferMode::Move => (true, true),
+    };
+    let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
+        from,
+        to: to.clone(),
+        clear_dest,
+        clear_src,
+        // Thread SILENT through so staging can suppress the missing-source
+        // error (SPARQL §3.2 / roadmap O3) exactly when the user opted in.
+        silent: t.silent,
+    })
+    .with_opts(opts);
+    // Register a (possibly-new) destination named graph so the commit envelope
+    // persists its g_id. `apply_delta` skips already-registered IRIs, so this
+    // is harmless when the destination already exists. The txn-local key is
+    // arbitrary — `apply_delta`/`provisional_ids` re-derive the ledger g_id
+    // deterministically from the IRI.
+    if let GraphSel::Graph(iri) = &to {
+        txn.graph_delta.insert(
+            fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
+            iri.clone(),
+        );
+    }
+    Ok(txn)
+}
+
+/// Lower `LOAD`.
+///
+/// The embedded transact path has no HTTP client, so a remote `LOAD` cannot
+/// fetch. `SILENT` swallows the failure (a no-op, leaving the store unchanged);
+/// a non-`SILENT` `LOAD` is a documented divergence (roadmap D-5) surfaced as a
+/// clear error. No W3C eval test requires a real fetch.
+fn lower_load(load: &Load, opts: TxnOpts) -> Result<Txn, LowerError> {
+    if load.silent {
+        Ok(Txn::update().with_opts(opts))
+    } else {
+        Err(LowerError::UnsupportedFeature {
+            feature: "remote LOAD of an external RDF document — the embedded SPARQL UPDATE \
+                      path has no HTTP client (documented divergence, roadmap D-5). Use \
+                      `LOAD SILENT` for a no-op, or ingest the document via the insert API",
+            span: load.span,
+        })
+    }
 }
 
 /// Lower INSERT DATA operation.
@@ -869,6 +1085,7 @@ fn lower_insert_data(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -920,6 +1137,7 @@ fn lower_delete_data(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1020,6 +1238,7 @@ fn lower_delete_where(
         txn_meta: Vec::new(),
         graph_delta: FxHashMap::default(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1081,6 +1300,7 @@ fn lower_delete_where_with_graphs(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1322,6 +1542,7 @@ fn lower_modify(
         txn_meta: Vec::new(),
         graph_delta: graph_ids.delta(),
         namespace_delta: std::collections::HashMap::new(),
+        graph_mgmt: None,
     })
 }
 
@@ -1425,6 +1646,10 @@ fn subject_to_unresolved_delete_where(
             feature: "RDF-star quoted triple",
             span: qt.span,
         }),
+        SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
+        }),
     }
 }
 
@@ -1474,6 +1699,10 @@ fn object_to_unresolved_delete_where(
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
             span: qt.span,
         }),
+        Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
+        }),
     }
 }
 
@@ -1509,6 +1738,13 @@ fn lower_triple_to_delete_template_delete_where(
             return Err(LowerError::UnsupportedFeature {
                 feature: "RDF-star quoted triple",
                 span: qt.span,
+            });
+        }
+        SubjectTerm::TripleTerm(tt) => {
+            return Err(LowerError::UnsupportedFeature {
+                feature:
+                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                span: tt.span,
             });
         }
     };
@@ -1553,6 +1789,13 @@ fn lower_triple_to_delete_template_delete_where(
             return Err(LowerError::UnsupportedFeature {
                 feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
                 span: qt.span,
+            });
+        }
+        Term::TripleTerm(tt) => {
+            return Err(LowerError::UnsupportedFeature {
+                feature:
+                    "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+                span: tt.span,
             });
         }
     };
@@ -1677,6 +1920,10 @@ fn subject_to_template(
             feature: "RDF-star quoted triple",
             span: qt.span,
         }),
+        SubjectTerm::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
+        }),
     }
 }
 
@@ -1738,6 +1985,10 @@ fn object_to_template(
         Term::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
             span: qt.span,
+        }),
+        Term::TripleTerm(tt) => Err(LowerError::UnsupportedFeature {
+            feature: "SPARQL 1.2 triple-term value (`<<( s p o )>>`) in SPARQL UPDATE (deferred)",
+            span: tt.span,
         }),
     }
 }
@@ -1806,15 +2057,45 @@ fn literal_to_template(
 // IRI expansion
 // =============================================================================
 
-/// Expand an IRI using prologue PREFIX declarations.
+/// Expand a constant IRI using the operation's prologue: prefixed names
+/// expand against PREFIX declarations, and relative references resolve
+/// against `BASE` — the same `fluree_vocab::iri`-backed semantics as the
+/// query path's `expand_iri_with` (RFC 3986 §5; SPARQL 1.1 §4.1.1) — so one
+/// document's constant IRIs denote the same absolute IRI on the update and
+/// query surfaces. `BASE <http://x/> INSERT DATA { <s1> <p1> "v" }` used to
+/// commit literal `s1`/`p1` that a query for `<http://x/s1>` could never
+/// find. Without a BASE, relative references stay as written (Fluree
+/// accepts them as ledger-local names).
 fn expand_iri(iri: &Iri, prologue: &Prologue) -> Result<String, LowerError> {
+    let base: Option<&str> = prologue.base.as_ref().map(|b| b.iri.as_ref());
     match &iri.value {
-        IriValue::Full(full) => Ok(full.to_string()),
+        IriValue::Full(full) => {
+            if let Some(base) = base {
+                if !fluree_vocab::iri::is_absolute_iri(full) {
+                    return Ok(fluree_vocab::iri::resolve_iri(base, full));
+                }
+            }
+            Ok(full.to_string())
+        }
         IriValue::Prefixed { prefix, local } => {
-            // Look up prefix in prologue
+            // Look up prefix in prologue (first declaration wins, matching
+            // `Prologue::get_prefix`)
             for decl in &prologue.prefixes {
                 if decl.prefix.as_ref() == prefix.as_ref() {
-                    return Ok(format!("{}{}", decl.iri, local));
+                    // A PREFIX namespace may itself be a relative reference
+                    // (`PREFIX : <#>`); per SPARQL 1.1 §4.1.1 it resolves
+                    // against BASE too.
+                    let expanded = match base {
+                        Some(base) if !fluree_vocab::iri::is_absolute_iri(&decl.iri) => {
+                            format!(
+                                "{}{}",
+                                fluree_vocab::iri::resolve_iri(base, &decl.iri),
+                                local
+                            )
+                        }
+                        _ => format!("{}{}", decl.iri, local),
+                    };
+                    return Ok(expanded);
                 }
             }
             // Undefined prefix is an error
@@ -1975,6 +2256,80 @@ mod tests {
         ));
     }
 
+    fn test_prologue_with_base(base: &str) -> Prologue {
+        Prologue {
+            base: Some(fluree_db_sparql::ast::BaseDecl::new(base, test_span())),
+            prefixes: vec![
+                PrefixDecl {
+                    prefix: Arc::from("ex"),
+                    iri: Arc::from("http://example.org/"),
+                    span: test_span(),
+                },
+                PrefixDecl {
+                    prefix: Arc::from("rel"),
+                    iri: Arc::from("#"),
+                    span: test_span(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_expand_relative_iri_against_base() {
+        // PR-1454 review: the update surface must resolve constant IRIs
+        // against BASE with the same RFC 3986 §5 semantics as the query
+        // surface — `BASE <…> INSERT DATA { <s1> … }` used to store the
+        // literal `s1` that a query for the resolved IRI could never find.
+        let prologue = test_prologue_with_base("http://x.example/dir/doc");
+        for (input, expected) in [
+            ("s1", "http://x.example/dir/s1"),
+            ("", "http://x.example/dir/doc"),
+            ("#frag", "http://x.example/dir/doc#frag"),
+            ("/rooted", "http://x.example/rooted"),
+            ("../up", "http://x.example/up"),
+        ] {
+            let iri = Iri::full(input, test_span());
+            assert_eq!(
+                expand_iri(&iri, &prologue).unwrap(),
+                expected,
+                "for <{input}>"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_absolute_iri_ignores_base() {
+        // Any valid scheme passes through verbatim — including non-`://`
+        // forms like `urn:` / `did:`.
+        let prologue = test_prologue_with_base("http://x.example/");
+        for absolute in ["http://other.example/a", "urn:uuid:abc", "did:key:xyz"] {
+            let iri = Iri::full(absolute, test_span());
+            assert_eq!(expand_iri(&iri, &prologue).unwrap(), absolute);
+        }
+    }
+
+    #[test]
+    fn test_expand_relative_prefix_namespace_against_base() {
+        // A PREFIX namespace that is itself a relative reference resolves
+        // against BASE (SPARQL 1.1 §4.1.1) before local-name concatenation
+        // — same as the query path's `prologue_environment`.
+        let prologue = test_prologue_with_base("http://x.example/doc");
+        let iri = Iri::prefixed("rel", "x", test_span());
+        assert_eq!(
+            expand_iri(&iri, &prologue).unwrap(),
+            "http://x.example/doc#x"
+        );
+    }
+
+    #[test]
+    fn test_expand_relative_iri_without_base_stays_as_written() {
+        // Fluree accepts relative references as ledger-local names when no
+        // BASE is declared.
+        let iri = Iri::full("ledger-local", test_span());
+        let prologue = test_prologue();
+        assert_eq!(expand_iri(&iri, &prologue).unwrap(), "ledger-local");
+    }
+
     #[test]
     fn test_variable_normalization() {
         use fluree_db_sparql::ast::Var;
@@ -2025,9 +2380,9 @@ mod tests {
     #[test]
     fn test_blank_node_counter() {
         let mut counter = BlankNodeCounter::new();
-        assert_eq!(counter.next(), "_:b0");
-        assert_eq!(counter.next(), "_:b1");
-        assert_eq!(counter.next(), "_:b2");
+        assert_eq!(counter.next(), "_:[]0");
+        assert_eq!(counter.next(), "_:[]1");
+        assert_eq!(counter.next(), "_:[]2");
     }
 
     #[test]
@@ -2365,5 +2720,78 @@ mod tests {
             UnresolvedTerm::Literal(LiteralValue::Vector(v)) => assert_eq!(v.len(), 2),
             other => panic!("expected LiteralValue::Vector, got {other:?}"),
         }
+    }
+
+    /// Parse a SPARQL UPDATE string and lower it, asserting the parser
+    /// accepted it — for negative tests that pin a clean *lowering* error
+    /// (never a panic) on parse-accepted input.
+    fn parse_and_lower(sparql: &str) -> Result<Txn, LowerError> {
+        let parsed = fluree_db_sparql::parse_sparql(sparql);
+        assert!(
+            !parsed.has_errors(),
+            "input must be parse-accepted (accept-then-defer): {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("parse produced an AST");
+        let mut ns = NamespaceRegistry::new();
+        lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default())
+    }
+
+    /// D-1 accept-then-defer: a triple-term SUBJECT carrying an annotation
+    /// tail parses, and must lower to a clean `UnsupportedFeature` — the
+    /// annotation-expansion pre-pass runs before the quad-pattern TripleTerm
+    /// defer arms, and without its own guard `subject_to_object` panics via
+    /// `unreachable!` (the pre-fix behavior this test locks out).
+    #[test]
+    fn test_triple_term_subject_with_annotation_tail_defers_in_insert_data() {
+        let result = parse_and_lower(
+            r"PREFIX ex: <http://example.org/>
+               INSERT DATA { <<( ex:s ex:p ex:o )>> ex:q ex:o2 {| ex:a ex:b |} }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(LowerError::UnsupportedFeature { feature, .. })
+                    if feature.contains("triple-term subject")
+            ),
+            "expected a clean triple-term-subject UnsupportedFeature, got {result:?}"
+        );
+    }
+
+    /// Same shape through the Modify (DELETE template) path, where variables
+    /// are allowed inside the triple term.
+    #[test]
+    fn test_triple_term_subject_with_annotation_tail_defers_in_delete_template() {
+        let result = parse_and_lower(
+            r"PREFIX ex: <http://example.org/>
+               DELETE { <<( ?s ex:p ?o )>> ex:q ex:o2 {| ex:a ex:b |} }
+               WHERE { ?s ex:p ?o }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(LowerError::UnsupportedFeature { feature, .. })
+                    if feature.contains("triple-term subject")
+            ),
+            "expected a clean triple-term-subject UnsupportedFeature, got {result:?}"
+        );
+    }
+
+    /// The pre-existing QuotedTriple twin of the guard: `<< s p o >>` subject
+    /// + annotation tail is likewise a clean error, not a panic.
+    #[test]
+    fn test_quoted_triple_subject_with_annotation_tail_is_rejected() {
+        let result = parse_and_lower(
+            r"PREFIX ex: <http://example.org/>
+               INSERT DATA { << ex:s ex:p ex:o >> ex:q ex:o2 {| ex:a ex:b |} }",
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(LowerError::UnsupportedFeature { feature, .. })
+                    if feature.contains("quoted-triple subject")
+            ),
+            "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
+        );
     }
 }

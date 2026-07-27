@@ -112,6 +112,49 @@ pub trait GraphSink {
         let _ = index;
         self.emit_triple(subject, predicate, object);
     }
+
+    /// Whether this sink can consume RDF 1.2 reified-triple events
+    /// ([`Self::emit_reified_triple`]).
+    ///
+    /// Parsers MUST check this before emitting any reified-triple event
+    /// and reject the input with a clear "deferred / unsupported on this
+    /// path" error when it returns `false`. Defaults to `false` so
+    /// existing sinks (graph collectors, directive preludes, …) keep
+    /// rejecting Turtle-star input instead of silently dropping the
+    /// reifier semantics.
+    fn supports_reified_triples(&self) -> bool {
+        false
+    }
+
+    /// Emit an RDF 1.2 reified-triple event: `reifier` reifies the base
+    /// triple `(subject, predicate, object)`.
+    ///
+    /// Contract:
+    /// - The parser has ALREADY emitted the base triple via
+    ///   [`Self::emit_triple`] (Fluree's edge-annotation model reifies an
+    ///   asserted edge). This event only records the reifier attachment.
+    /// - The parser mints a FRESH blank-node reifier per anonymous
+    ///   occurrence (`<< s p o >>` / `{| … |}` without `~ reifier`) and
+    ///   never deduplicates reifiers by base-triple identity; sinks must
+    ///   not dedup either.
+    /// - Annotation-body properties (`{| p o |}`) arrive as ordinary
+    ///   [`Self::emit_triple`] events with `reifier` as the subject.
+    ///
+    /// Only called when [`Self::supports_reified_triples`] returns `true`;
+    /// the default implementation is a no-op guarded by a debug assert.
+    fn emit_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+    ) {
+        let _ = (subject, predicate, object, reifier);
+        debug_assert!(
+            self.supports_reified_triples(),
+            "emit_reified_triple called on a sink that does not support reified triples"
+        );
+    }
 }
 
 /// A sink that collects triples into a Graph

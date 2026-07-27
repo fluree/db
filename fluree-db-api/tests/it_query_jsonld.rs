@@ -1948,8 +1948,13 @@ async fn jsonld_float_divided_by_integer_promotes() {
         .await
         .expect("query");
     let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
-    // xsd:double renders as a JSON number: 10.0 / 4 = 2.5.
-    assert_eq!(normalize_rows(&json_rows), normalize_rows(&json!([2.5])));
+    // xsd:float(10) / 4 = 2.5. Unlike xsd:double (a bare JSON number), xsd:float has
+    // no shorthand JSON rendering, so it round-trips as an explicit typed literal that
+    // preserves the datatype (float/integer promotion lands on xsd:float per XPath).
+    assert_eq!(
+        normalize_rows(&json_rows),
+        normalize_rows(&json!([{"@value": "2.5", "@type": "xsd:float"}]))
+    );
 }
 
 /// Parity for W3C bind02: chained BINDs.

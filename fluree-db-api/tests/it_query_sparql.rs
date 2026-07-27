@@ -4729,7 +4729,9 @@ async fn sparql_float_divided_by_integer_promotes() {
         .await
         .expect("float / integer query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!([[2.5]]));
+    // xsd:float(10) / 4 = 2.5; xsd:float has no bare-number JSON form (unlike
+    // xsd:double), so it round-trips as an explicit typed literal preserving the type.
+    assert_eq!(jsonld, json!([[{"@value": "2.5", "@type": "xsd:float"}]]));
 }
 
 #[tokio::test]
@@ -6316,4 +6318,220 @@ async fn sparql_zero_or_one_both_bound() {
             "{s} p? {o} expected reachable={expect}, got {rows} rows: {j}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// BASE-relative IRI resolution (roadmap PR-BASE; W3C base-prefix-2/5,
+// graph-exist, iri01 mechanisms).
+//
+// Constant IRIs anywhere in the query (patterns, GRAPH names, IRI()/URI()
+// constant arguments, relative PREFIX namespaces) resolve against the query's
+// `BASE` declaration at lowering time, per RFC 3986 §5. Without a BASE,
+// relative IRIs stay as written (ledger-local names keep working).
+// ---------------------------------------------------------------------------
+
+/// Seed absolute-IRI data shaped like the W3C `basic/` base-prefix fixtures:
+/// one fragment-style subject/predicate pair and one path-style pair, both
+/// under `http://example.org/x/`.
+async fn seed_base_resolution(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@graph": [
+            {"@id": "http://example.org/x/#x", "http://example.org/x/#p": "hit-fragment"},
+            {"@id": "http://example.org/x/x", "http://example.org/x/p": "hit-path"}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert base-resolution fixture")
+        .ledger
+}
+
+/// Fragment references `<#x>` / `<#p>` resolve against BASE (the W3C
+/// `base-prefix-5` shape). Before PR-BASE, `#`-prefixed references were
+/// passed through unresolved and matched nothing.
+#[tokio::test]
+async fn sparql_base_resolves_fragment_references() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-frag").await;
+
+    let q = r"BASE <http://example.org/x/>
+        SELECT ?v WHERE { <#x> <#p> ?v }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("fragment refs resolve");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-fragment"]])),
+        "fragment refs should resolve against BASE: {j}"
+    );
+}
+
+/// A relative PREFIX namespace (`PREFIX : <#>`) resolves against BASE before
+/// prefixed-name expansion (the W3C `base-prefix-2` shape).
+#[tokio::test]
+async fn sparql_base_resolves_relative_prefix_namespace() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-prefix").await;
+
+    let q = r"BASE <http://example.org/x/>
+        PREFIX : <#>
+        SELECT ?v WHERE { :x :p ?v }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("relative prefix namespace resolves");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-fragment"]])),
+        "relative PREFIX namespace should resolve against BASE: {j}"
+    );
+}
+
+/// Path-style relative references resolve RFC 3986-correctly: against a
+/// directory-style BASE the last segment merges (`<x>` → `…/x/x`), not naive
+/// string concatenation.
+#[tokio::test]
+async fn sparql_base_resolves_path_references() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-path").await;
+
+    let q = r"BASE <http://example.org/x/>
+        SELECT ?v WHERE { <x> <p> ?v }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("path refs resolve");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-path"]])),
+        "path refs should resolve against BASE: {j}"
+    );
+
+    // Sibling-document form: BASE names a document, the reference replaces
+    // its last segment (the `graph-exist` mechanism).
+    let q2 = r"BASE <http://example.org/x/query.rq>
+        SELECT ?v WHERE { <x> <p> ?v }";
+    let r2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .expect("sibling refs resolve");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["hit-path"]])),
+        "sibling refs should replace the base's last segment: {j2}"
+    );
+}
+
+/// A constant `GRAPH <relative>` name resolves against BASE to the absolute
+/// IRI the named graph is registered under (the W3C `graph-exist` failure:
+/// the query says `<data-g1.ttl>`, the registry key is the absolute URL).
+#[tokio::test]
+async fn sparql_base_resolves_constant_graph_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:base-graph");
+    let trig = r#"
+        @prefix ex: <http://example.org/ns/> .
+        @prefix schema: <http://schema.org/> .
+
+        ex:alice schema:name "Alice" .
+
+        GRAPH <http://example.org/tests/data-g1.ttl> {
+            ex:bob schema:name "Bob" .
+        }
+    "#;
+    let ledger = fluree
+        .stage_owned(ledger0)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig upsert")
+        .ledger;
+
+    let q = r"BASE <http://example.org/tests/query.rq>
+        PREFIX schema: <http://schema.org/>
+        SELECT ?name WHERE { GRAPH <data-g1.ttl> { ?s schema:name ?name } }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("relative graph name resolves");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["Bob"]])),
+        "GRAPH <relative> should resolve to the registered absolute IRI: {j}"
+    );
+}
+
+/// IRI()/URI() constant arguments resolve against BASE (expression-semantics
+/// D8; W3C `iri01`). The resolution is constant-folded at lowering time —
+/// the eval path never sees a base.
+#[tokio::test]
+async fn sparql_iri_function_resolves_constant_against_base() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_base_resolution(&fluree, "it/sparql:base-irifn").await;
+
+    let q = r#"BASE <http://example.org/x/>
+        SELECT ?v WHERE { ?s <p> ?v . FILTER(?s = IRI("x")) }"#;
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("IRI() constant resolves");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["hit-path"]])),
+        "IRI(\"x\") should resolve to <http://example.org/x/x>: {j}"
+    );
+
+    // URI() is the same function; absolute arguments stay verbatim.
+    let q2 = r#"BASE <http://example.org/x/>
+        SELECT ?v WHERE { ?s <p> ?v . FILTER(?s = URI("http://example.org/x/x")) }"#;
+    let r2 = support::query_sparql(&fluree, &ledger, q2)
+        .await
+        .expect("URI() absolute stays verbatim");
+    let j2 = r2.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j2),
+        normalize_rows(&json!([["hit-path"]])),
+        "absolute URI() argument should pass through: {j2}"
+    );
+}
+
+/// Without a BASE, relative IRIs keep their historical passthrough behavior.
+/// The JSON-LD surface stores raw relative `@id`s (no `@base`/`@vocab`
+/// required), and SPARQL must keep matching them verbatim — resolution is
+/// only ever performed against an explicit BASE.
+#[tokio::test]
+async fn sparql_no_base_keeps_relative_iris_verbatim() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/sparql:no-base");
+    let insert = json!({
+        "@graph": [
+            {"@id": "local-x", "http://schema.org/name": "Bob"}
+        ]
+    });
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert relative-id fixture")
+        .ledger;
+
+    let q = r"PREFIX schema: <http://schema.org/>
+        SELECT ?name WHERE { <local-x> schema:name ?name }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("verbatim relative IRI without BASE");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&j),
+        normalize_rows(&json!([["Bob"]])),
+        "without BASE, relative IRIs match verbatim: {j}"
+    );
 }

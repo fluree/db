@@ -11,8 +11,11 @@
 
 #![cfg(feature = "native")]
 
-use crate::support::{genesis_ledger, start_background_indexer_local, trigger_index_and_wait};
+use crate::support::{
+    self, genesis_ledger, start_background_indexer_local, trigger_index_and_wait,
+};
 use fluree_db_api::{FlureeBuilder, LedgerManagerConfig};
+use fluree_db_transact::Txn;
 use serde_json::json;
 
 // =============================================================================
@@ -1183,6 +1186,128 @@ async fn test_update_from_multiple_default_graphs_merge_where() {
         .await;
 }
 
+/// Count the (s, p, o) triples visible in a single named graph, addressed by
+/// its composite `<ledger_id>#<graph-iri>` key. Borrows `fluree` so it can be
+/// called repeatedly between updates without moving it out of the test scope.
+async fn count_named_graph_triples(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    named_graph_from: &str,
+) -> usize {
+    let query = json!({
+        "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+        "from": named_graph_from,
+        "select": ["?s", "?p", "?o"],
+        "where": { "@id": "?s", "?p": "?o" }
+    });
+    let results = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph count query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let results = results.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    results.as_array().expect("array").len()
+}
+
+#[tokio::test]
+async fn test_update_delete_where_graph_block_restricted_to_from_named() {
+    // JSON-LD parity for the SPARQL USING + explicit-GRAPH over-delete fix
+    // (W3C dawg-delete-using-02a/06a, #1441). `fromNamed` is the JSON-LD
+    // `USING NAMED` equivalent: it defines the set of named graphs visible to
+    // WHERE evaluation exactly. An explicit `["graph", <g>, ...]` block in the
+    // WHERE must therefore match nothing when `<g>` is NOT in `fromNamed` — it
+    // must not "override" the dataset scoping and over-reach into `<g>`. This
+    // exercises the same shared runtime-dataset named-graph restriction in
+    // `stream_where_into_accumulator` that SPARQL `USING` now routes through.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/update-delete-where-graph-restricted:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let ledger = genesis_ledger(&fluree, ledger_id);
+
+            // g2 holds Chris (name + email) and Eve (name); g3 holds Dan.
+            let seed = json!({
+                "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+                "insert": [
+                    ["graph", "http://example.org/g2", { "@id": "ex:c", "schema:name": "Chris" }],
+                    ["graph", "http://example.org/g2", { "@id": "ex:c", "schema:email": "chris@example.org" }],
+                    ["graph", "http://example.org/g2", { "@id": "ex:e", "schema:name": "Eve" }],
+                    ["graph", "http://example.org/g3", { "@id": "ex:d", "schema:name": "Dan" }]
+                ]
+            });
+            let result = fluree.update(ledger, &seed).await.expect("seed");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            // Count the triples currently in g2 (queried via the composite key).
+            let named_g2 = format!("{ledger_id}#http://example.org/g2");
+
+            assert_eq!(
+                count_named_graph_triples(&fluree, ledger_id, &named_g2).await,
+                3,
+                "g2 should start with 3 triples (Chris name+email, Eve name)"
+            );
+
+            // Restricted case: fromNamed lists ONLY g3, so the explicit
+            // `["graph", g2, ...]` WHERE block must match nothing even though g2
+            // physically contains a matching `schema:name "Chris"` row. Nothing
+            // is deleted — the graph block does not override the fromNamed scope.
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            let restricted = json!({
+                "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+                "fromNamed": [ { "graph": "http://example.org/g3" } ],
+                "delete": [ ["graph", "http://example.org/g2", { "@id": "?s", "?p": "?o" }] ],
+                "where":  [ ["graph", "http://example.org/g2", { "@id": "?s", "schema:name": "Chris", "?p": "?o" }] ]
+            });
+            let result = fluree
+                .update(ledger, &restricted)
+                .await
+                .expect("restricted delete-where");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            assert_eq!(
+                count_named_graph_triples(&fluree, ledger_id, &named_g2).await,
+                3,
+                "g2 must be UNCHANGED: the graph-scoped WHERE block on g2 was \
+                 scoped out by fromNamed=[g3] and must not over-delete"
+            );
+
+            // Positive control: with g2 IN fromNamed, the identical delete-where
+            // now sees g2 and removes exactly Chris's two triples, leaving Eve.
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            let in_scope = json!({
+                "@context": { "ex": "http://example.org/", "schema": "http://schema.org/" },
+                "fromNamed": [ { "graph": "http://example.org/g2" } ],
+                "delete": [ ["graph", "http://example.org/g2", { "@id": "?s", "?p": "?o" }] ],
+                "where":  [ ["graph", "http://example.org/g2", { "@id": "?s", "schema:name": "Chris", "?p": "?o" }] ]
+            });
+            let result = fluree
+                .update(ledger, &in_scope)
+                .await
+                .expect("in-scope delete-where");
+            trigger_index_and_wait(&handle, ledger_id, result.receipt.t).await;
+
+            assert_eq!(
+                count_named_graph_triples(&fluree, ledger_id, &named_g2).await,
+                1,
+                "with g2 in fromNamed the delete-where fires: Chris's name+email \
+                 are removed, leaving only Eve's name"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn test_update_from_named_alias_usable_in_templates() {
     // Ensure `fromNamed.alias` can be used consistently in UPDATE templates
@@ -1899,4 +2024,924 @@ async fn test_named_graph_retraction() {
             assert_eq!(arr.len(), 3, "should have 3 active users at t=1: {arr:?}");
         })
         .await;
+}
+
+// =============================================================================
+// PR-U3 — graph-management query-surface parity (transact builder / Txn IR)
+// =============================================================================
+
+/// Count the triples currently visible in named graph `iri` of `ledger`.
+async fn count_in_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    iri: &str,
+) -> usize {
+    let sparql = format!("SELECT ?s ?p ?o WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}");
+    let result = support::query_sparql(fluree, ledger, &sparql)
+        .await
+        .expect("graph count query");
+    let v = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    match v.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    }
+}
+
+/// PR-U3 query-surface parity (compliance case 2): the SPARQL 1.1 Update
+/// graph-management verbs are a genuinely new *capability* (retract-all /
+/// copy a whole graph), so they are exposed on the non-SPARQL transact surface
+/// too — `Txn::clear_graph`/`drop_graph`/`copy_graph` (shared by the JSON-LD
+/// and FQL transact paths, since all lower to the one `Txn` IR + staging).
+/// This test drives that builder API directly (no SPARQL text) and asserts the
+/// outcome is identical to the equivalent SPARQL `CLEAR`/`COPY GRAPH`.
+#[tokio::test]
+async fn test_graph_mgmt_transact_builder_parity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let g3 = "http://example.org/g3";
+
+    let seed = format!(
+        r#"INSERT DATA {{
+            GRAPH <{g1}> {{ <http://example.org/s1> <http://example.org/p> "in-g1" }}
+            GRAPH <{g2}> {{ <http://example.org/s2> <http://example.org/p> "in-g2" }}
+        }}"#
+    );
+
+    // --- Builder-API path: clear_graph + copy_graph via the Txn IR ---
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-parity-builder:main");
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, g1).await, 1);
+    assert_eq!(count_in_graph(&fluree, &ledger, g2).await, 1);
+
+    // copy_graph(g1 -> g3): g3 gains g1's content.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::copy_graph(g1, g3))
+        .execute()
+        .await
+        .expect("Txn::copy_graph")
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g3).await,
+        1,
+        "copy_graph copied g1 into g3"
+    );
+
+    // clear_graph(g1): g1 emptied, g2 and the g3 copy untouched.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::clear_graph(g1))
+        .execute()
+        .await
+        .expect("Txn::clear_graph")
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g1).await,
+        0,
+        "clear_graph emptied g1"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        1,
+        "g2 untouched"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g3).await,
+        1,
+        "g3 copy kept"
+    );
+
+    // --- SPARQL path: identical outcome for CLEAR GRAPH (parity) ---
+    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-parity-sparql:main");
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &seed).await.ledger;
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("CLEAR GRAPH <{g1}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_s, g1).await,
+        0,
+        "SPARQL CLEAR GRAPH matches the builder clear_graph"
+    );
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 1);
+}
+
+/// Like [`run_sparql_update`] but returns the staging `Result` (mapped to its
+/// error string) instead of `expect`-ing success — for negative tests that
+/// assert an operation is *rejected*.
+async fn try_run_sparql_update(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    sparql: &str,
+) -> std::result::Result<(), String> {
+    let parsed = fluree_db_sparql::parse_sparql(sparql);
+    assert!(
+        !parsed.has_errors(),
+        "SPARQL parse errors: {:?}",
+        parsed.diagnostics
+    );
+    let ast = parsed.ast.expect("SPARQL AST");
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let txn = fluree_db_transact::lower_sparql_update_ast(
+        &ast,
+        &mut ns,
+        fluree_db_transact::TxnOpts::default(),
+    )
+    .expect("lower SPARQL UPDATE to Txn IR");
+    fluree
+        .stage_owned(ledger)
+        .txn(txn)
+        .execute()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// B2: graph-management (CLEAR/DROP/COPY/MOVE/ADD) must reject the reserved
+/// system graphs — `#config` (g_id 2, seeds SHACL/uniqueness governance and
+/// cross-ledger rules) and `#txn-meta` (g_id 1, commit metadata) — by IRI, the
+/// same way the `Named`/`All` scope already filters them out by g_id. On
+/// `burndown/wave-3` these operations silently retract governance / shred
+/// commit metadata (CLEAR/DROP) or inject flakes into them (COPY/MOVE/ADD dest);
+/// here every one must error. (Remove the guards and this test fails: the ops
+/// succeed and mutate the reserved graphs.)
+#[tokio::test]
+async fn test_graph_mgmt_rejects_reserved_graph_targets() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-reserved:main";
+    let config_iri = fluree_db_core::config_graph_iri(ledger_id);
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
+    let g1 = "http://example.org/g1";
+
+    // Seed one user graph so COPY/MOVE/ADD have a valid non-reserved end.
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{g1}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // Reserved graph as CLEAR/DROP target, and as COPY/MOVE/ADD source AND
+    // destination — every one must be refused. (`ledger.clone()` is a cheap
+    // Arc bump; `stage_owned` consumes it, so each attempt gets its own.)
+    let reserved_cases = [
+        format!("CLEAR GRAPH <{config_iri}>"),
+        format!("DROP GRAPH <{config_iri}>"),
+        format!("CLEAR GRAPH <{txn_meta_iri}>"),
+        format!("DROP GRAPH <{txn_meta_iri}>"),
+        format!("COPY <{g1}> TO <{config_iri}>"), // reserved destination
+        format!("MOVE <{g1}> TO <{txn_meta_iri}>"), // reserved destination
+        format!("COPY <{config_iri}> TO <{g1}>"), // reserved source
+        format!("ADD <{txn_meta_iri}> TO <{g1}>"), // reserved source
+    ];
+    for sparql in reserved_cases {
+        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&format!("reserved-graph op must be rejected: {sparql}"));
+        assert!(
+            err.contains("reserved system graph"),
+            "expected a reserved-graph rejection for `{sparql}`, got: {err}"
+        );
+    }
+
+    // Control: the same verbs against a normal user graph still succeed, so the
+    // guard rejects the reserved graphs specifically, not graph-management.
+    try_run_sparql_update(&fluree, ledger.clone(), &format!("CLEAR GRAPH <{g1}>"))
+        .await
+        .expect("CLEAR of a user graph must still succeed");
+}
+
+/// O5: COPY/MOVE/ADD of a named graph that contains edge annotations
+/// (`f:reifies*` flakes) must fail loud. Re-homing rewrites only each flake's
+/// `g`, desyncing the `f:reifiesGraph` anchor, so on `burndown/wave-3` the
+/// annotation is silently dropped at read time (both JSON-LD hydration and the
+/// attachment indexer skip a `GraphMismatch` bundle). Here the transfer must
+/// error instead of silently losing the annotation. (Remove the guard and this
+/// test fails: the COPY/MOVE/ADD succeeds and the annotation is lost.)
+#[tokio::test]
+async fn test_graph_mgmt_rejects_annotation_bearing_transfer() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-annotation:main";
+    let g2 = "http://example.org/g2";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Seed an annotated edge: the base triple AND its `f:reifies*` bundle land
+    // in the default graph. SPARQL UPDATE only accepts annotation tails in the
+    // default graph in v1 (the JSON-LD surface can place them in a named graph),
+    // but the guard fires on `f:reifies*` flakes in ANY source graph, so a
+    // default-graph source exercises the same path — and DEFAULT -> named is
+    // itself an orphaning case: the re-homed bundle would need an
+    // `f:reifiesGraph` anchor the source never had.
+    let seed = r#"PREFIX ex: <http://example.org/>
+INSERT DATA {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} .
+}"#;
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+
+    for verb in ["COPY", "MOVE", "ADD"] {
+        let sparql = format!("{verb} DEFAULT TO <{g2}>");
+        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&format!("annotation-bearing {verb} must be rejected"));
+        assert!(
+            err.contains("edge annotations"),
+            "expected an annotation-transfer rejection for `{sparql}`, got: {err}"
+        );
+    }
+
+    // Control: COPY of an annotation-free graph still succeeds.
+    let plain_iri = "http://example.org/plain";
+    let plain = format!(
+        r#"INSERT DATA {{ GRAPH <{plain_iri}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &plain).await.ledger;
+    try_run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY <{plain_iri}> TO <http://example.org/plain-copy>"),
+    )
+    .await
+    .expect("COPY of an annotation-free graph must still succeed");
+}
+
+/// Graph management runs the SAME enforce_modify_policies as any other
+/// transaction — the policy is NOT bypassed on the whole-graph scan/re-home
+/// path (stage.rs:1270-1275, a reviewer-praised load-bearing invariant).
+/// Regression-lock for the new path: no prior test exercised a graph-mgmt verb
+/// under a modify PolicyContext (it_policy_named_graphs covers only query/insert).
+/// Passes on both wave-3 and this branch (the gate already exists); this pins it.
+#[tokio::test]
+async fn test_graph_mgmt_honors_modify_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-policy:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // One non-schema flake in the default graph (schema flakes bypass modify
+    // policy via is_schema_flake, so use a plain triple).
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        r#"INSERT DATA { <http://example.org/s> <http://example.org/p> "v" }"#,
+    )
+    .await
+    .ledger;
+
+    // View-only, default-deny policy: modifying any flake is forbidden.
+    let policy = json!([{
+        "@id": "ex:viewOnly",
+        "f:action": [{"@id": "f:view"}],
+        "f:allow": true
+    }]);
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        policy: Some(policy),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = fluree_db_api::policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    // CLEAR DEFAULT retracts the seeded flake; enforce_modify_policies must
+    // REJECT it under the view-only policy (policy not bypassed on graph-mgmt).
+    let result = fluree
+        .stage_owned(ledger.clone())
+        .txn(Txn::clear_default_graph())
+        .policy(policy_ctx)
+        .execute()
+        .await;
+    assert!(
+        result.is_err(),
+        "CLEAR under a view-only modify policy must be rejected, not bypassed"
+    );
+
+    // The rejected CLEAR did not commit — the flake is intact.
+    let survived = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT ?p WHERE { <http://example.org/s> ?p ?o }",
+    )
+    .await
+    .expect("post-clear query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    let surviving_rows = match survived.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    };
+    assert_eq!(
+        surviving_rows, 1,
+        "policy-rejected CLEAR must leave the flake intact, got: {survived:?}"
+    );
+}
+
+/// O3: a graph-management transfer (ADD/COPY/MOVE) whose SOURCE graph was never
+/// registered — a typo'd or never-written IRI — must error (SPARQL 1.1 Update
+/// §3.2), not silently empty the destination. On `burndown/wave-3` the missing
+/// source resolves to `None`, scans as empty, and COPY/MOVE clear the entire
+/// destination and copy nothing back in, so `COPY <typo> TO <important>`
+/// silently destroys `<important>` (data loss). Here every non-SILENT transfer
+/// from a missing source is refused and the destination is preserved.
+///
+/// The additive-only registry (roadmap D-6) keeps a never-registered source
+/// (`None` → error) distinguishable from an emptied-but-registered source
+/// (`Some(g_id)` → a legitimate empty source that proceeds); the control at the
+/// end pins that distinction, so the guard rejects typos specifically, not
+/// every empty source.
+///
+/// (Remove the source-resolution guard and this test fails: the non-SILENT
+/// COPY/MOVE/ADD succeed and the destination is emptied — the wave-3 bug.)
+#[tokio::test]
+async fn test_graph_mgmt_missing_source_errors() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-missing-source:main";
+    let dest = "http://example.org/important";
+    let missing = "http://example.org/typo"; // never registered
+
+    // Seed only the destination; the source IRI is never written, so it is
+    // never entered into the graph registry (resolves to `None` at staging).
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{dest}> {{
+            <http://example.org/s1> <http://example.org/p> "a" .
+            <http://example.org/s2> <http://example.org/p> "b"
+        }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    let before = count_in_graph(&fluree, &ledger, dest).await;
+    assert_eq!(before, 2, "destination seeded with two triples");
+
+    // Every non-SILENT transfer verb from the missing source must error, and
+    // the destination must be left intact — the rejected txn never commits, so
+    // the pre-txn snapshot still holds the data. (`ledger.clone()` is a cheap
+    // Arc bump; `stage_owned` consumes it, so each attempt gets its own.)
+    for verb in ["COPY", "MOVE", "ADD"] {
+        let sparql = format!("{verb} <{missing}> TO <{dest}>");
+        let err = try_run_sparql_update(&fluree, ledger.clone(), &sparql)
+            .await
+            .expect_err(&format!("{verb} from a missing source must be rejected"));
+        assert!(
+            err.contains("does not exist"),
+            "expected a missing-source rejection for `{sparql}`, got: {err}"
+        );
+        assert_eq!(
+            count_in_graph(&fluree, &ledger, dest).await,
+            before,
+            "destination must be preserved after the rejected `{sparql}`"
+        );
+    }
+
+    // SILENT opts into the clear-and-copy-nothing behavior: no error, and the
+    // destination is emptied (COPY overwrites it with the missing source's
+    // empty contents). The user asked to ignore the missing source.
+    let ledger_silent = run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY SILENT <{missing}> TO <{dest}>"),
+    )
+    .await
+    .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_silent, dest).await,
+        0,
+        "COPY SILENT from a missing source clears the destination (opted in)"
+    );
+
+    // Control: a source graph that WAS registered and then emptied (CLEAR keeps
+    // it in the additive-only registry, D-6) is a legitimate empty source, so
+    // COPY from it must NOT error — distinguishing it from the never-registered
+    // case above and proving the guard rejects typos specifically, not every
+    // empty source. Uses an independent ledger so the committed SILENT case
+    // above does not advance this scenario's head.
+    let src = "http://example.org/src";
+    let ledger_ctl = genesis_ledger(&fluree, "it/graph-mgmt-empty-source:main");
+    let seed_ctl = format!(
+        r#"INSERT DATA {{
+            GRAPH <{src}> {{ <http://example.org/x> <http://example.org/p> "seed" }}
+            GRAPH <{dest}> {{ <http://example.org/s1> <http://example.org/p> "a" }}
+        }}"#
+    );
+    let ledger_ctl = run_sparql_update(&fluree, ledger_ctl, &seed_ctl)
+        .await
+        .ledger;
+    // Empty the source but keep it registered.
+    let ledger_ctl = run_sparql_update(&fluree, ledger_ctl, &format!("CLEAR GRAPH <{src}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_ctl, src).await,
+        0,
+        "source graph emptied but still registered"
+    );
+    // Registered-but-empty source: COPY proceeds without error (run_sparql_update
+    // `expect`s staging success, so a spurious rejection would panic here) and
+    // overwrites the destination with the empty source (dest: 1 -> 0).
+    let ledger_ctl = run_sparql_update(&fluree, ledger_ctl, &format!("COPY <{src}> TO <{dest}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger_ctl, dest).await,
+        0,
+        "COPY from a legitimately empty (registered) source clears the destination without error"
+    );
+}
+
+/// Count the DEFAULT-graph triples visible to a plain (ambient) query.
+async fn count_in_default(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> usize {
+    let result = support::query_sparql(fluree, ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("default-graph count query");
+    let v = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    match v.as_array() {
+        Some(rows) => rows.len(),
+        None => 0,
+    }
+}
+
+/// SPARQL 1.1 §13.2.1 (via Update §3.1.3): `USING NAMED` without a plain
+/// `USING` gives the WHERE dataset an EMPTY default graph — a default-scoped
+/// WHERE pattern binds nothing. Before the fix, default-graph selection fell
+/// through to the ledger's real default graph, so
+/// `DELETE { ?s ?p ?o } USING NAMED <h> WHERE { ?s ?p ?o }` deleted the whole
+/// default graph (the same over-reach class as #1441, one clause over).
+/// (Remove the `where_default_is_empty` arm in stage.rs and the first
+/// assertion fails: the default graph is emptied.)
+#[tokio::test]
+async fn test_using_named_only_where_default_graph_is_empty() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/using-named-only:main";
+    let h = "http://example.org/h";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{
+            <http://example.org/s1> <http://example.org/p> "a" .
+            <http://example.org/s2> <http://example.org/p> "b" .
+            GRAPH <{h}> {{ <http://example.org/s3> <http://example.org/p> "c" }}
+        }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    assert_eq!(count_in_default(&fluree, &ledger).await, 2);
+    assert_eq!(count_in_graph(&fluree, &ledger, h).await, 1);
+
+    // USING NAMED only + default-scoped WHERE: binds nothing, deletes nothing.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!("DELETE {{ ?s ?p ?o }} USING NAMED <{h}> WHERE {{ ?s ?p ?o }}"),
+    )
+    .await
+    .ledger;
+    assert_eq!(
+        count_in_default(&fluree, &ledger).await,
+        2,
+        "USING NAMED-only WHERE must see an EMPTY default graph, not the real one"
+    );
+    assert_eq!(count_in_graph(&fluree, &ledger, h).await, 1);
+
+    // The named set is still visible: an explicit GRAPH block over the USING
+    // NAMED graph matches and deletes from it.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        &format!(
+            "DELETE {{ GRAPH <{h}> {{ ?s ?p ?o }} }} USING NAMED <{h}> \
+             WHERE {{ GRAPH <{h}> {{ ?s ?p ?o }} }}"
+        ),
+    )
+    .await
+    .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, h).await, 0);
+    assert_eq!(count_in_default(&fluree, &ledger).await, 2);
+
+    // Control: the no-USING ambient path is untouched — a plain DELETE WHERE
+    // over the default graph still matches it.
+    let ledger = run_sparql_update(&fluree, ledger, "DELETE { ?s ?p ?o } WHERE { ?s ?p ?o }")
+        .await
+        .ledger;
+    assert_eq!(count_in_default(&fluree, &ledger).await, 0);
+}
+
+/// Builder↔SPARQL parity for the two transfer verbs the builder previously
+/// lacked: `Txn::move_graph` ≡ `MOVE <from> TO <to>` (source retracted) and
+/// `Txn::add_graph` ≡ `ADD <from> TO <to>` (destination contents kept).
+#[tokio::test]
+async fn test_graph_mgmt_builder_move_add_parity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+    let seed = format!(
+        r#"INSERT DATA {{
+            GRAPH <{g1}> {{ <http://example.org/s1> <http://example.org/p> "in-g1" }}
+            GRAPH <{g2}> {{ <http://example.org/s2> <http://example.org/p> "in-g2" }}
+        }}"#
+    );
+
+    // --- Builder path ---
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-builder:main");
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // add_graph(g1 -> g2): g2 keeps its own triple AND gains g1's; g1 intact.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::add_graph(g1, g2))
+        .execute()
+        .await
+        .expect("Txn::add_graph")
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g1).await,
+        1,
+        "ADD keeps source"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        2,
+        "ADD merges into dest"
+    );
+
+    // move_graph(g1 -> g2): dest replaced by source; source gone.
+    let ledger = fluree
+        .stage_owned(ledger)
+        .txn(Txn::move_graph(g1, g2))
+        .execute()
+        .await
+        .expect("Txn::move_graph")
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g1).await,
+        0,
+        "MOVE retracts source"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        1,
+        "MOVE replaces dest"
+    );
+
+    // --- SPARQL path: identical outcomes ---
+    let ledger_s = genesis_ledger(&fluree, "it/graph-mgmt-moveadd-sparql:main");
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &seed).await.ledger;
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("ADD <{g1}> TO <{g2}>"))
+        .await
+        .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g1).await, 1);
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 2);
+    let ledger_s = run_sparql_update(&fluree, ledger_s, &format!("MOVE <{g1}> TO <{g2}>"))
+        .await
+        .ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g1).await, 0);
+    assert_eq!(count_in_graph(&fluree, &ledger_s, g2).await, 1);
+}
+
+/// SPARQL 1.1 §3.2.3-3.2.5: COPY/MOVE/ADD of a graph onto itself is a no-op —
+/// "no operation will be performed and the data will be left as it was." The
+/// guard (`from == to` short-circuit in stage_graph_mgmt) is the only thing
+/// between a refactor and MOVE's clear_dest destroying the graph, so pin it
+/// for all three verbs on both the SPARQL and builder surfaces.
+#[tokio::test]
+async fn test_graph_mgmt_same_graph_transfer_is_noop() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let g = "http://example.org/g";
+    let ledger = genesis_ledger(&fluree, "it/graph-mgmt-same-graph:main");
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{g}> {{
+            <http://example.org/s1> <http://example.org/p> "a" .
+            <http://example.org/s2> <http://example.org/p> "b"
+        }} }}"#
+    );
+    let mut ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+    assert_eq!(count_in_graph(&fluree, &ledger, g).await, 2);
+
+    for verb in ["COPY", "MOVE", "ADD"] {
+        ledger = run_sparql_update(&fluree, ledger.clone(), &format!("{verb} <{g}> TO <{g}>"))
+            .await
+            .ledger;
+        assert_eq!(
+            count_in_graph(&fluree, &ledger, g).await,
+            2,
+            "{verb} <g> TO <g> must leave the graph exactly as it was"
+        );
+    }
+
+    // Builder surface too (same Txn IR, same guard).
+    for txn in [
+        Txn::copy_graph(g, g),
+        Txn::move_graph(g, g),
+        Txn::add_graph(g, g),
+    ] {
+        ledger = fluree
+            .stage_owned(ledger.clone())
+            .txn(txn)
+            .execute()
+            .await
+            .expect("same-graph builder transfer is a no-op, not an error")
+            .ledger;
+        assert_eq!(count_in_graph(&fluree, &ledger, g).await, 2);
+    }
+
+    // A reserved system graph is refused even in the same-graph shape — the
+    // no-op must not read as accepting `#config` as a transfer target.
+    let config_iri = fluree_db_core::config_graph_iri("it/graph-mgmt-same-graph:main");
+    let err = try_run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY <{config_iri}> TO <{config_iri}>"),
+    )
+    .await
+    .expect_err("same-graph COPY of a reserved graph must be refused");
+    assert!(
+        err.contains("reserved system graph"),
+        "expected the reserved-graph rejection, got: {err}"
+    );
+}
+
+/// A multi-operation request mixing a DATA op with a graph-management op:
+/// each op stages sequentially in ONE atomic commit (§3.1 / D-10), so the
+/// COPY/CLEAR must observe the graph its predecessor just created — including
+/// the g_id registered earlier in the SAME request (the sequential-staging
+/// novelty view + provisional graph registration working together).
+#[tokio::test]
+async fn test_multi_op_update_mixes_data_and_graph_mgmt() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_ledger("it/multiop-graph-mgmt:main")
+        .await
+        .expect("create ledger");
+    let g = "http://example.org/g";
+    let h = "http://example.org/h";
+
+    // Op 1 creates <g>; op 2 copies the just-created graph into <h>.
+    let insert_then_copy = format!(
+        r#"INSERT DATA {{ GRAPH <{g}> {{ <http://example.org/s> <http://example.org/p> "v" }} }} ;
+           COPY <{g}> TO <{h}>"#
+    );
+    fluree
+        .graph("it/multiop-graph-mgmt:main")
+        .transact()
+        .sparql_update(&insert_then_copy)
+        .commit()
+        .await
+        .expect("INSERT DATA ; COPY executes as one atomic commit");
+    let ledger = fluree
+        .ledger("it/multiop-graph-mgmt:main")
+        .await
+        .expect("ledger");
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g).await,
+        1,
+        "op 1's graph survives (COPY keeps its source)"
+    );
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, h).await,
+        1,
+        "COPY must see the graph op 1 created in the same request"
+    );
+
+    // Insert-then-CLEAR of the same graph in one request nets to empty —
+    // CLEAR sees the same-request insert through the sequential novelty view.
+    let g2 = "http://example.org/g2";
+    let insert_then_clear = format!(
+        r#"INSERT DATA {{ GRAPH <{g2}> {{ <http://example.org/s2> <http://example.org/p> "w" }} }} ;
+           CLEAR GRAPH <{g2}>"#
+    );
+    fluree
+        .graph("it/multiop-graph-mgmt:main")
+        .transact()
+        .sparql_update(&insert_then_clear)
+        .commit()
+        .await
+        .expect("INSERT DATA ; CLEAR executes as one atomic commit");
+    let ledger = fluree
+        .ledger("it/multiop-graph-mgmt:main")
+        .await
+        .expect("ledger");
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, g2).await,
+        0,
+        "CLEAR must retract the same-request insert"
+    );
+}
+
+/// CLEAR of an annotation-bearing graph retracts the whole reification bundle
+/// (base edge + f:reifies* anchors) cleanly: the graph reads empty, and
+/// re-inserting the SAME annotated edge afterwards succeeds — a leftover
+/// (orphaned) anchor would collide with the re-insert's bundle instead.
+#[tokio::test]
+async fn test_clear_of_annotation_bearing_graph_is_clean() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/clear-annotations:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = r#"PREFIX ex: <http://example.org/>
+INSERT DATA { ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} . }"#;
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+    assert!(
+        count_in_default(&fluree, &ledger).await >= 1,
+        "annotated edge seeded"
+    );
+
+    // CLEAR DEFAULT retracts base edge AND annotation bundle.
+    let ledger = run_sparql_update(&fluree, ledger, "CLEAR DEFAULT")
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_default(&fluree, &ledger).await,
+        0,
+        "CLEAR DEFAULT must leave nothing behind (no orphaned anchors)"
+    );
+
+    // Re-inserting the identical annotated edge succeeds cleanly — a leftover
+    // anchor from an incomplete retraction would corrupt this bundle.
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+    assert!(
+        count_in_default(&fluree, &ledger).await >= 1,
+        "re-insert after CLEAR must succeed with a clean bundle"
+    );
+}
+
+/// CREATE registers the graph in the additive registry, so a subsequent
+/// non-SILENT COPY/MOVE/ADD from it is a legitimate EMPTY source — not the O3
+/// "source graph does not exist" error, which contradicted CREATE's reported
+/// success. Covers both the cross-request and the same-request (multi-op)
+/// flow; the never-CREATEd control still errors.
+#[tokio::test]
+async fn test_create_registers_graph_as_transfer_source() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/create-registers:main";
+    let dest = "http://example.org/dest";
+    let fresh = "http://example.org/fresh";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = format!(
+        r#"INSERT DATA {{ GRAPH <{dest}> {{ <http://example.org/s> <http://example.org/p> "v" }} }}"#
+    );
+    let ledger = run_sparql_update(&fluree, ledger, &seed).await.ledger;
+
+    // Cross-request: CREATE then COPY. The COPY must succeed (empty source
+    // overwrites dest → dest emptied), not raise SourceGraphNotFound.
+    let ledger = run_sparql_update(&fluree, ledger, &format!("CREATE GRAPH <{fresh}>"))
+        .await
+        .ledger;
+    let ledger = run_sparql_update(&fluree, ledger, &format!("COPY <{fresh}> TO <{dest}>"))
+        .await
+        .ledger;
+    assert_eq!(
+        count_in_graph(&fluree, &ledger, dest).await,
+        0,
+        "COPY from a CREATEd (registered, empty) source must proceed"
+    );
+
+    // Control: a never-CREATEd source still errors non-SILENTLY.
+    let err = try_run_sparql_update(
+        &fluree,
+        ledger.clone(),
+        &format!("COPY <http://example.org/never> TO <{dest}>"),
+    )
+    .await
+    .expect_err("COPY from a never-registered source must still error");
+    assert!(err.contains("does not exist"), "got: {err}");
+
+    // Same-request (multi-op): CREATE ; ADD in one atomic commit — the second
+    // op must see the first's provisional registration.
+    fluree
+        .create_ledger("it/create-registers-multi:main")
+        .await
+        .expect("create ledger");
+    fluree
+        .graph("it/create-registers-multi:main")
+        .transact()
+        .sparql_update(
+            "CREATE GRAPH <http://example.org/g1> ; \
+             ADD <http://example.org/g1> TO <http://example.org/g2>",
+        )
+        .commit()
+        .await
+        .expect("CREATE ; ADD must commit (registered empty source)");
+}
+
+/// O7 (transact-template twin): an anonymous `[]` in an INSERT template mints
+/// a non-lexable `_:[]{n}` label, so it can never collide with a hand-written
+/// `_:bN` in the same template. Before the fix the first anon minted `_:b0`,
+/// fusing with a user's `_:b0` into ONE node per solution.
+#[tokio::test]
+async fn test_insert_template_anon_blank_never_merges_with_labeled() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/template-anon-blanks:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let seed = r#"INSERT DATA { <http://example.org/s> <http://example.org/handle> "h1" }"#;
+    let ledger = run_sparql_update(&fluree, ledger, seed).await.ledger;
+
+    // One solution row; the template mints `[]` AND user-labeled `_:b0` —
+    // they must become TWO distinct blank nodes.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX ex: <http://example.org/>
+INSERT { [] ex:tagQ ?h . _:b0 ex:tagP ?h }
+WHERE { ?s ex:handle ?h }",
+    )
+    .await
+    .ledger;
+
+    // No single subject may carry BOTH tag predicates (the fusion signature).
+    let fused = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?b WHERE { ?b ex:tagQ ?h . ?b ex:tagP ?h }",
+    )
+    .await
+    .expect("fusion probe")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        fused.as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "anon [] and user _:b0 template blanks fused into one node: {fused}"
+    );
+
+    // And both tags landed (two distinct blank subjects exist).
+    for tag in ["tagQ", "tagP"] {
+        let rows = support::query_sparql(
+            &fluree,
+            &ledger,
+            &format!("PREFIX ex: <http://example.org/> SELECT ?b WHERE {{ ?b ex:{tag} ?h }}"),
+        )
+        .await
+        .expect("tag probe")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+        assert_eq!(
+            rows.as_array().map(Vec::len).unwrap_or(0),
+            1,
+            "expected exactly one {tag} subject: {rows}"
+        );
+    }
+}
+
+/// N3 contract pin: schema flakes (rdfs:Class / rdfs:subClassOf …) are exempt
+/// from modify policy (`is_schema_flake`), so a view-only, default-deny
+/// identity CAN `CLEAR DEFAULT` a schema-only default graph — the documented
+/// (policy-unblockable) ontology-wipe footgun. The companion test above
+/// proves the SAME identity is rejected for non-schema flakes, so this pins
+/// the boundary rather than a policy hole: if the always-allow schema
+/// exemption is ever narrowed, this test flips and the change is deliberate.
+#[tokio::test]
+async fn test_clear_default_schema_flakes_bypass_modify_policy() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-mgmt-schema-policy:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    // Schema-only default graph: one class declaration.
+    let ledger = run_sparql_update(
+        &fluree,
+        ledger,
+        r"PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+INSERT DATA { <http://example.org/MyClass> a rdfs:Class }",
+    )
+    .await
+    .ledger;
+    assert_eq!(count_in_default(&fluree, &ledger).await, 1);
+
+    // Same view-only, default-deny policy the non-schema test uses.
+    let policy = json!([{
+        "@id": "ex:viewOnly",
+        "f:action": [{"@id": "f:view"}],
+        "f:allow": true
+    }]);
+    let qc_opts = fluree_db_api::GovernanceOptions {
+        policy: Some(policy),
+        default_allow: false,
+        ..Default::default()
+    };
+    let policy_ctx = fluree_db_api::policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &qc_opts,
+        &[0],
+    )
+    .await
+    .expect("build policy context");
+
+    // CLEAR DEFAULT succeeds — the schema retraction is not policy-blockable.
+    let result = fluree
+        .stage_owned(ledger.clone())
+        .txn(Txn::clear_default_graph())
+        .policy(policy_ctx)
+        .execute()
+        .await
+        .expect("schema-only CLEAR DEFAULT bypasses modify policy (N3 contract)");
+    assert_eq!(
+        count_in_default(&fluree, &result.ledger).await,
+        0,
+        "the ontology was wiped by a view-only identity — the pinned N3 contract"
+    );
 }

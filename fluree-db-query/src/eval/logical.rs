@@ -2,44 +2,58 @@
 //!
 //! Implements logical operators: AND, OR, NOT
 
+use super::compare::{rdf_term_equal, EqOutcome};
 use super::value::ComparableValue;
 use crate::binding::RowAccess;
 use crate::context::ExecutionContext;
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::ir::Expression;
 
-/// Evaluate logical AND
-///
-/// Returns true if all arguments evaluate to true.
-/// Short-circuits on first false value.
+/// Evaluate logical AND with SPARQL 1.1 §17.2 three-valued semantics: `false`
+/// dominates (`false && error = false`), otherwise a demotable operand error
+/// makes the whole conjunction an error rather than aborting on the first one.
 pub fn eval_and<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
+    let mut pending_error: Option<QueryError> = None;
     for arg in args {
-        if !arg.eval_to_bool(row, ctx)? {
-            return Ok(Some(ComparableValue::Bool(false)));
+        match arg.eval_to_bool(row, ctx) {
+            Ok(false) => return Ok(Some(ComparableValue::Bool(false))),
+            Ok(true) => {}
+            Err(e) if e.can_demote_in_expression() => pending_error = Some(e),
+            Err(e) => return Err(e),
         }
     }
-    Ok(Some(ComparableValue::Bool(true)))
+    match pending_error {
+        Some(e) => Err(e),
+        None => Ok(Some(ComparableValue::Bool(true))),
+    }
 }
 
-/// Evaluate logical OR
-///
-/// Returns true if any argument evaluates to true.
-/// Short-circuits on first true value.
+/// Evaluate logical OR with SPARQL 1.1 §17.2 three-valued semantics: `true`
+/// dominates (`true || error = true`), otherwise a demotable operand error
+/// makes the whole disjunction an error rather than aborting on the first one
+/// (open-cmp-02: `?a < ?b || ?a = ?b || ?a > ?b` on unorderable terms).
 pub fn eval_or<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
+    let mut pending_error: Option<QueryError> = None;
     for arg in args {
-        if arg.eval_to_bool(row, ctx)? {
-            return Ok(Some(ComparableValue::Bool(true)));
+        match arg.eval_to_bool(row, ctx) {
+            Ok(true) => return Ok(Some(ComparableValue::Bool(true))),
+            Ok(false) => {}
+            Err(e) if e.can_demote_in_expression() => pending_error = Some(e),
+            Err(e) => return Err(e),
         }
     }
-    Ok(Some(ComparableValue::Bool(false)))
+    match pending_error {
+        Some(e) => Err(e),
+        None => Ok(Some(ComparableValue::Bool(false))),
+    }
 }
 
 /// Evaluate logical NOT
@@ -93,7 +107,11 @@ pub fn eval_in<R: RowAccess>(
             let mut found = false;
             for v in &args[1..] {
                 match v.eval_to_comparable(row, ctx) {
-                    Ok(Some(cv)) if cv == tv => {
+                    // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
+                    // like `1 = 1.0` — not the variant-exact derived `==`. The
+                    // §17.4.1.9 error-in-IN 3-valued half is deferred (Ne and a
+                    // type error both read as "no match" here).
+                    Ok(Some(cv)) if matches!(rdf_term_equal(&cv, &tv), EqOutcome::Eq) => {
                         found = true;
                         break;
                     }
@@ -127,7 +145,11 @@ pub fn eval_not_in<R: RowAccess>(
             let mut found = false;
             for v in &args[1..] {
                 match v.eval_to_comparable(row, ctx) {
-                    Ok(Some(cv)) if cv == tv => {
+                    // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
+                    // like `1 = 1.0` — not the variant-exact derived `==`. The
+                    // §17.4.1.9 error-in-IN 3-valued half is deferred (Ne and a
+                    // type error both read as "no match" here).
+                    Ok(Some(cv)) if matches!(rdf_term_equal(&cv, &tv), EqOutcome::Eq) => {
                         found = true;
                         break;
                     }

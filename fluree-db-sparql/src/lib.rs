@@ -51,4 +51,7 @@ pub use span::SourceSpan;
 pub use validate::{validate, Capabilities};
 
 #[cfg(feature = "lowering")]
-pub use lower::{lower_sparql, lower_sparql_with_source, LowerError};
+pub use lower::{
+    lower_sparql, lower_sparql_with_source, resolve_dataset_clause, LowerError,
+    ResolvedDatasetClause,
+};

@@ -36,6 +36,9 @@ pub enum Expr {
     EndsWith(Box<Expr>, Box<Expr>, SourceSpan),
     /// `expr CONTAINS expr`.
     Contains(Box<Expr>, Box<Expr>, SourceSpan),
+    /// `expr =~ pattern` — regular-expression match (full-string, Neo4j
+    /// semantics).
+    RegexMatch(Box<Expr>, Box<Expr>, SourceSpan),
     /// `CASE ... WHEN ... THEN ... ELSE ... END`.
     Case(Box<CaseExpr>),
     /// `EXISTS { pattern }` or the subquery form
@@ -147,6 +150,7 @@ impl Expr {
             | Expr::StartsWith(_, _, s)
             | Expr::EndsWith(_, _, s)
             | Expr::Contains(_, _, s)
+            | Expr::RegexMatch(_, _, s)
             | Expr::Exists(_, _, s)
             | Expr::List(_, s)
             | Expr::Map(_, s)

@@ -75,6 +75,20 @@ pub fn format_data_model_markdown(alias: &str, info: &JsonValue) -> String {
             lines.push(format!("- Size: {}", format_bytes(size)));
         }
 
+        // Virtual (query-in-place) datasets derive their counts from source table
+        // metadata (≈ table row counts), not exact per-property / distinct-value
+        // statistics, so flag them as coarse estimates for the reading model. Only
+        // emitted for virtual sources — native output stays byte-identical.
+        if is_virtual_source(info) {
+            lines.push(String::new());
+            lines.push(
+                "> Note: This is a virtual (query-in-place) dataset. Instance and property \
+                 counts shown below are COARSE ESTIMATES derived from source table metadata \
+                 (approximate row counts), not exact distinct-value statistics."
+                    .to_string(),
+            );
+        }
+
         lines.push(String::new());
 
         // Classes section (limited to avoid unbounded output)
@@ -116,6 +130,17 @@ pub fn format_data_model_markdown(alias: &str, info: &JsonValue) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Detect a virtual (query-in-place) dataset from the `/info` `source` block that
+/// `build_virtual_ledger_info` emits. Native `/info` omits `source` entirely, so a
+/// present `source.virtual == true` (or `source.type == "Iceberg"`) is the signal
+/// that the reported instance/property counts are coarse metadata estimates.
+fn is_virtual_source(info: &JsonValue) -> bool {
+    info.get("source").is_some_and(|source| {
+        source.get("virtual").and_then(JsonValue::as_bool) == Some(true)
+            || source.get("type").and_then(JsonValue::as_str) == Some("Iceberg")
+    })
 }
 
 /// Format a single class and its properties
@@ -333,5 +358,45 @@ mod tests {
         assert!(markdown.contains("## Classes"));
         assert!(markdown.contains("### http://example.org/Person — 100 instances"));
         assert!(markdown.contains("1. http://example.org/name"));
+        // Native (non-virtual) info has no `source` block, so no coarse-estimate
+        // note is emitted — native markdown stays byte-identical.
+        assert!(!markdown.contains("COARSE ESTIMATES"));
+    }
+
+    #[test]
+    fn test_format_data_model_virtual_note() {
+        // A virtual dataset carries a `source` block with `virtual: true`.
+        let info = json!({
+            "source": { "virtual": true, "type": "Iceberg" },
+            "stats": {
+                "flakes": 150,
+                "classes": {
+                    "http://ex.org/Airline": { "count": 100, "properties": {} }
+                },
+                "properties": {
+                    "http://ex.org/name": { "count": 100 }
+                }
+            }
+        });
+
+        let markdown = format_data_model_markdown("sales:main", &info);
+
+        // The coarse-estimate note appears within the statistics section.
+        assert!(
+            markdown.contains("COARSE ESTIMATES"),
+            "virtual dataset markdown missing the coarse-estimate note:\n{markdown}"
+        );
+        assert!(markdown.contains("virtual (query-in-place) dataset"));
+    }
+
+    #[test]
+    fn test_is_virtual_source() {
+        assert!(is_virtual_source(&json!({ "source": { "virtual": true } })));
+        assert!(is_virtual_source(
+            &json!({ "source": { "type": "Iceberg" } })
+        ));
+        // Native `/info` omits `source` entirely.
+        assert!(!is_virtual_source(&json!({ "stats": {} })));
+        assert!(!is_virtual_source(&json!({ "source": null })));
     }
 }

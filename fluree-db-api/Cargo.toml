@@ -193,6 +193,14 @@ name = "it_cyclic_bgp_probe"
 path = "tests/it_cyclic_bgp_probe.rs"
 
 [[test]]
+name = "it_multi_graph_property_path"
+path = "tests/it_multi_graph_property_path.rs"
+
+[[test]]
+name = "it_cypher_seq_writes"
+path = "tests/it_cypher_seq_writes.rs"
+
+[[test]]
 name = "it_query_cypher"
 path = "tests/it_query_cypher.rs"
 
@@ -236,6 +244,21 @@ required-features = ["credential"]
 [[test]]
 name = "it_graph_source_r2rml"
 path = "tests/it_graph_source_r2rml.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_generate_live"
+path = "tests/it_iceberg_generate_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_sample_live"
+path = "tests/it_iceberg_sample_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_provisional_live"
+path = "tests/it_iceberg_provisional_live.rs"
 required-features = ["iceberg"]
 
 [[test]]

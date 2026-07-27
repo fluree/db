@@ -1766,12 +1766,30 @@ fn test_select_no_dataset() {
 // SPARQL Update Tests (Phase 7)
 // ========================================================================
 
+/// Extract the operation of a single-operation update request.
+///
+/// `QueryBody::Update` now carries a full `UpdateRequest` (a `;`-separated
+/// operation sequence); most update tests exercise exactly one operation.
+fn single_update_op(ast: &crate::ast::SparqlAst) -> &UpdateOperation {
+    match &ast.body {
+        QueryBody::Update(req) => {
+            assert_eq!(
+                req.operations.len(),
+                1,
+                "expected a single-operation update request: {req:?}"
+            );
+            &req.operations[0].operation
+        }
+        other => panic!("Expected an update request, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_insert_data_simple() {
     let ast =
         assert_parses("INSERT DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::InsertData(insert) => {
             assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
@@ -1783,8 +1801,8 @@ fn test_insert_data_multiple_triples() {
     let ast = assert_parses(
         "INSERT DATA { <http://example.org/s1> <http://example.org/p> \"v1\" . <http://example.org/s2> <http://example.org/p> \"v2\" }"
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::InsertData(insert) => {
             assert_eq!(insert.data.quads.len(), 2);
         }
         _ => panic!("Expected INSERT DATA"),
@@ -1794,8 +1812,8 @@ fn test_insert_data_multiple_triples() {
 #[test]
 fn test_insert_data_prefixed() {
     let ast = assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p \"value\" }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::InsertData(insert) => {
             assert_eq!(insert.data.quads.len(), 1);
         }
         _ => panic!("Expected INSERT DATA"),
@@ -1806,8 +1824,8 @@ fn test_insert_data_prefixed() {
 fn test_delete_data_simple() {
     let ast =
         assert_parses("DELETE DATA { <http://example.org/s> <http://example.org/p> \"value\" }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::DeleteData(delete) => {
             assert_eq!(delete.data.quads.len(), 1);
         }
         _ => panic!("Expected DELETE DATA"),
@@ -1822,8 +1840,8 @@ fn test_insert_data_graph_block() {
     let ast = assert_parses(
         "INSERT DATA { GRAPH <https://example.org/g/1> { <https://example.org/s/1> <https://example.org/p> \"v\" } }"
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::InsertData(insert) => {
             assert_eq!(insert.data.quads.len(), 1);
             match &insert.data.quads[0] {
                 QuadPatternElement::Graph { name, triples, .. } => {
@@ -1843,8 +1861,8 @@ fn test_insert_data_mixed_default_and_graph() {
     let ast = assert_parses(
         "PREFIX ex: <http://example.org/> INSERT DATA { ex:a ex:p \"d\" . GRAPH <urn:g> { ex:b ex:p \"n\" } }"
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::InsertData(insert)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::InsertData(insert) => {
             assert_eq!(insert.data.quads.len(), 2);
             assert!(matches!(
                 insert.data.quads[0],
@@ -1865,8 +1883,8 @@ fn test_delete_data_graph_block() {
     let ast = assert_parses(
         "DELETE DATA { GRAPH <urn:g> { <http://example.org/s> <http://example.org/p> \"v\" } }",
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::DeleteData(delete)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::DeleteData(delete) => {
             assert_eq!(delete.data.quads.len(), 1);
             assert!(matches!(
                 delete.data.quads[0],
@@ -1880,8 +1898,8 @@ fn test_delete_data_graph_block() {
 #[test]
 fn test_delete_where_simple() {
     let ast = assert_parses("DELETE WHERE { ?s ex:obsolete ?o }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::DeleteWhere(delete)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::DeleteWhere(delete) => {
             assert_eq!(delete.pattern.patterns.len(), 1);
         }
         _ => panic!("Expected DELETE WHERE"),
@@ -1891,8 +1909,8 @@ fn test_delete_where_simple() {
 #[test]
 fn test_delete_where_multiple_patterns() {
     let ast = assert_parses("DELETE WHERE { ?s ex:old ?o . ?s ex:deprecated ?x }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::DeleteWhere(delete)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::DeleteWhere(delete) => {
             assert_eq!(delete.pattern.patterns.len(), 2);
         }
         _ => panic!("Expected DELETE WHERE"),
@@ -1903,8 +1921,8 @@ fn test_delete_where_multiple_patterns() {
 fn test_modify_delete_insert() {
     let ast =
         assert_parses("DELETE { ?s ex:old ?o } INSERT { ?s ex:new ?o } WHERE { ?s ex:old ?o }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.delete_clause.is_some());
             assert!(modify.insert_clause.is_some());
             // where_clause is now a GraphPattern; a single-BGP body parses as Bgp directly.
@@ -1922,8 +1940,8 @@ fn test_modify_delete_insert() {
 #[test]
 fn test_modify_delete_only() {
     let ast = assert_parses("DELETE { ?s ex:old ?o } WHERE { ?s ex:old ?o }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.delete_clause.is_some());
             assert!(modify.insert_clause.is_none());
         }
@@ -1934,8 +1952,8 @@ fn test_modify_delete_only() {
 #[test]
 fn test_modify_insert_only() {
     let ast = assert_parses("INSERT { ?s ex:new ?o } WHERE { ?s ex:old ?o }");
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.delete_clause.is_none());
             assert!(modify.insert_clause.is_some());
         }
@@ -1948,8 +1966,8 @@ fn test_modify_with_clause() {
     let ast = assert_parses(
         "WITH <http://example.org/graph> DELETE { ?s ex:old ?o } WHERE { ?s ex:old ?o }",
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.with_iri.is_some());
             assert!(modify.delete_clause.is_some());
         }
@@ -1962,8 +1980,8 @@ fn test_modify_with_using() {
     let ast = assert_parses(
         "DELETE { ?s ex:old ?o } USING <http://example.org/graph> WHERE { ?s ex:old ?o }",
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.using.is_some());
             let using = modify.using.as_ref().unwrap();
             assert_eq!(using.default_graphs.len(), 1);
@@ -1977,8 +1995,8 @@ fn test_modify_with_multiple_using() {
     let ast = assert_parses(
         "DELETE { ?s ex:old ?o } USING <http://example.org/g1> USING <http://example.org/g2> WHERE { ?s ex:old ?o }",
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.using.is_some());
             let using = modify.using.as_ref().unwrap();
             assert_eq!(using.default_graphs.len(), 2);
@@ -1992,8 +2010,8 @@ fn test_modify_full() {
     let ast = assert_parses(
         "WITH <http://example.org/graph> DELETE { ?s ex:old ?o } INSERT { ?s ex:new ?o } USING <http://example.org/source> WHERE { ?s ex:old ?o }"
     );
-    match &ast.body {
-        QueryBody::Update(UpdateOperation::Modify(modify)) => {
+    match single_update_op(&ast) {
+        UpdateOperation::Modify(modify) => {
             assert!(modify.with_iri.is_some());
             assert!(modify.delete_clause.is_some());
             assert!(modify.insert_clause.is_some());
@@ -2589,11 +2607,13 @@ fn annotation_on_literal_object_parses_cleanly() {
 }
 
 #[test]
-fn triple_term_outside_rdf_reifies_is_rejected() {
-    assert_parse_error(
-        &format!("{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"),
-        "object of rdf:reifies",
-    );
+fn triple_term_outside_rdf_reifies_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): a bare `<<( s p o )>>` triple-term
+    // value in object position for a non-`rdf:reifies` predicate now parses
+    // (W3C `basic-tripleterm-02`); evaluation is rejected at lower time.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"
+    ));
 }
 
 #[test]
@@ -2683,26 +2703,25 @@ fn interleaved_reifiers_and_blocks_follow_attachment_rule() {
 // ----- Existing legacy `<< s p ?o >> f:t ?t` form regression check ---------
 
 #[test]
-fn rdf_reifies_in_insert_data_is_rejected_with_clear_error() {
-    // The rdf:reifies + triple-term form is WHERE-only in v1.
-    // SPARQL UPDATE uses the `~ {| |}` form instead.
-    assert_parse_error(
-        &format!(
-            "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
-        ),
-        "object of rdf:reifies",
-    );
+fn rdf_reifies_triple_term_in_insert_data_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): the ground triple-term value parses;
+    // it is rejected at lower time (transact reports the deferred feature),
+    // not at parse. (Cf. the WHERE-only executable `rdf:reifies` form.)
+    assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
+    ));
 }
 
 #[test]
-fn rdf_reifies_in_insert_template_is_rejected_with_clear_error() {
-    assert_parse_error(
-        &format!(
-            "{RDF_PREFIX}{EX_PREFIX}\
-             INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
-        ),
-        "object of rdf:reifies",
-    );
+fn rdf_reifies_triple_term_in_insert_template_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): a triple-term value is accepted in
+    // an INSERT template regardless of predicate and rejected at lower time,
+    // not at parse. (The executable `rdf:reifies` reifier form is WHERE-only;
+    // here `<<( … )>>` is a plain deferred triple-term value.)
+    assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}\
+         INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
+    ));
 }
 
 #[test]
@@ -2784,8 +2803,13 @@ fn annotation_block_with_path_verb_parses() {
 fn standalone_triple_term_still_rejected() {
     // W3C NEGATIVE tripleterm-separate-01: `<<( ?s ?p ?o )>> .` — a
     // bare triple term is a value, not a statement (contrast the
-    // standalone REIFIED triple, which is valid).
-    assert_parse_error("SELECT * WHERE { <<( ?s ?p ?o )>> . }", "unexpected token");
+    // standalone REIFIED triple, which is valid). Now that triple-term
+    // *values* are accepted (D-1), the subject parses but the missing
+    // predicate-object list is rejected with a targeted message.
+    assert_parse_error(
+        "SELECT * WHERE { <<( ?s ?p ?o )>> . }",
+        "a bare triple term is not a statement",
+    );
 }
 
 #[test]
@@ -3204,34 +3228,205 @@ fn test_trailing_tokens_after_query_rejected() {
     );
 }
 
+// =========================================================================
+// Multi-operation UPDATE requests (issue #1438 / PR-U2)
+// =========================================================================
+
+/// Extract the update request from an AST.
+fn update_request(ast: &crate::ast::SparqlAst) -> &crate::ast::UpdateRequest {
+    match &ast.body {
+        QueryBody::Update(req) => req,
+        other => panic!("Expected an update request, got {other:?}"),
+    }
+}
+
 #[test]
-fn test_multi_operation_update_rejected_loudly() {
+fn test_multi_operation_update_parses_all_operations() {
     // Issue #1438: `INSERT ...; DELETE ...` used to parse as the INSERT
     // alone, silently discarding every following operation (silent data
-    // loss at commit time). Until PR-U2 adds real multi-op support, the
-    // request must fail loudly (D-10a interim guard) — and the AST must be
-    // suppressed, or a caller of the public `lower_sparql_update_ast` that
-    // skips `has_errors()` would still stage the first operation alone.
-    assert_parse_error_no_ast(
+    // loss at commit time). The request-level `;` loop now parses the full
+    // sequence, in request order.
+    let ast = assert_parses(
         "PREFIX ex: <http://example.org/> \
          INSERT DATA { ex:s ex:p 1 } ; DELETE DATA { ex:s ex:p 1 }",
-        "multi-operation SPARQL UPDATE",
     );
-    assert_parse_error_no_ast(
-        "PREFIX ex: <http://example.org/> \
-         INSERT DATA { ex:s ex:p 1 } ; INSERT DATA { ex:s ex:p 2 }",
-        "multi-operation SPARQL UPDATE",
+    let req = update_request(&ast);
+    assert_eq!(req.operations.len(), 2);
+    assert!(matches!(
+        req.operations[0].operation,
+        UpdateOperation::InsertData(_)
+    ));
+    assert!(matches!(
+        req.operations[1].operation,
+        UpdateOperation::DeleteData(_)
+    ));
+
+    // The W3C dawg-delete-insert-01c shape: Modify ; Modify.
+    let ast = assert_parses(
+        "PREFIX foaf: <http://xmlns.com/foaf/0.1/> \
+         INSERT { ?b foaf:knows ?a } WHERE { ?a foaf:knows ?b } ; \
+         DELETE { ?a foaf:knows ?b } WHERE { ?a foaf:knows ?b }",
     );
+    let req = update_request(&ast);
+    assert_eq!(req.operations.len(), 2);
+    assert!(matches!(
+        req.operations[0].operation,
+        UpdateOperation::Modify(_)
+    ));
+    assert!(matches!(
+        req.operations[1].operation,
+        UpdateOperation::Modify(_)
+    ));
+}
+
+#[test]
+fn test_multi_operation_prologue_accumulates_across_semicolons() {
+    // Update ::= Prologue ( Update1 ( ';' Update )? )? — the recursive
+    // Update carries its own Prologue, so PREFIX/BASE may appear after a
+    // ';' and are visible to every *subsequent* operation.
+    let ast = assert_parses(
+        "PREFIX a: <http://example.org/a#> \
+         INSERT DATA { a:s a:p 1 } ; \
+         PREFIX b: <http://example.org/b#> \
+         INSERT DATA { a:s b:p 2 }",
+    );
+    let req = update_request(&ast);
+    assert_eq!(req.operations.len(), 2);
+    // Op 1 sees only `a:`.
+    assert!(req.operations[0].prologue.get_prefix("a").is_some());
+    assert!(req.operations[0].prologue.get_prefix("b").is_none());
+    // Op 2 sees the accumulated prologue.
+    assert!(req.operations[1].prologue.get_prefix("a").is_some());
+    assert!(req.operations[1].prologue.get_prefix("b").is_some());
+    // The AST-level prologue is the full accumulation.
+    assert!(ast.prologue.get_prefix("b").is_some());
+}
+
+#[test]
+fn test_multi_operation_prefix_redeclaration_snapshots_per_op() {
+    // A prefix redeclared after ';' binds for subsequent operations only;
+    // the earlier operation's snapshot keeps the earlier binding.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/one#> \
+         INSERT DATA { ex:s ex:p 1 } ; \
+         PREFIX ex: <http://example.org/two#> \
+         INSERT DATA { ex:s ex:p 2 }",
+    );
+    let req = update_request(&ast);
+    assert_eq!(req.operations.len(), 2);
+    assert_eq!(
+        req.operations[0]
+            .prologue
+            .get_prefix("ex")
+            .unwrap()
+            .as_ref(),
+        "http://example.org/one#"
+    );
+    assert_eq!(
+        req.operations[1]
+            .prologue
+            .get_prefix("ex")
+            .unwrap()
+            .as_ref(),
+        "http://example.org/two#"
+    );
+}
+
+#[test]
+fn test_empty_and_prologue_only_update_requests_are_valid_noops() {
+    // W3C syntax-update-1 test_38/39/40: the operation list is optional,
+    // so an empty, BASE-only, or PREFIX-only request parses as a valid
+    // zero-operation request.
+    for input in [
+        "",
+        "# Empty",
+        "BASE <http://example/>",
+        "PREFIX : <http://example/>",
+        "PREFIX : <http://example/> # Otherwise empty",
+    ] {
+        let ast = assert_parses(input);
+        let req = update_request(&ast);
+        assert!(
+            req.operations.is_empty(),
+            "expected a zero-operation request for {input:?}"
+        );
+    }
 }
 
 #[test]
 fn test_single_trailing_semicolon_after_update_is_legal() {
     // Update ::= Prologue ( Update1 ( ';' Update )? )? — the recursive
     // Update may be empty, so one trailing ';' is valid SPARQL.
-    assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
-    // ...but only one.
+    let ast = assert_parses("PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ;");
+    assert_eq!(update_request(&ast).operations.len(), 1);
+    // ...but a second ';' is not an operation.
     assert_parse_error_no_ast(
         "PREFIX ex: <http://example.org/> INSERT DATA { ex:s ex:p 1 } ; ;",
-        "multi-operation SPARQL UPDATE",
+        "expected query form",
     );
+}
+
+#[test]
+fn test_cross_operation_bnode_label_reuse_rejected() {
+    // W3C syntax-update-54: a blank node label in GROUND DATA is scoped to one
+    // operation; reusing it in a later INSERT DATA / DELETE DATA of the same
+    // request is a syntax error.
+    assert_parse_error(
+        "PREFIX : <http://www.example.org/> \
+         INSERT DATA { _:b1 :p :o } ; INSERT DATA { _:b1 :p :o }",
+        "blank node label",
+    );
+    // Template bnode reuse across MODIFY (INSERT/DELETE ... WHERE) operations is
+    // NOT a violation — template blank nodes are per-solution/per-operation
+    // (CONSTRUCT-style), so the two `_:b1` denote DISTINCT nodes. W3C's approved
+    // positive tests `insert-where-same-bnode`/`-2` require this to parse and
+    // execute successfully.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         INSERT { _:b1 :p ?o } WHERE { ?s :q ?o } ; \
+         INSERT { _:b1 :p ?o } WHERE { ?s :q ?o }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+    // Reuse *within* one operation stays legal.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         INSERT DATA { _:b1 :p :o . _:b1 :q :o } ; INSERT DATA { _:b2 :p :o }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+    // Distinct labels across operations stay legal.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         INSERT DATA { _:b1 :p :o } ; INSERT DATA { _:b2 :p :o }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+}
+
+#[test]
+fn test_cross_operation_delete_side_bnode_labels_are_independent() {
+    // PR-1454 review (bplatz): §19.6's cross-operation label ban protects
+    // blank-node *minting* positions only. DELETE WHERE blank nodes are
+    // locally-scoped existential matching variables under Fluree's
+    // documented extension — reusing `_:b1` across two DELETE WHERE
+    // operations is two independent matches and must parse.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         DELETE WHERE { _:b1 :flag \"a\" } ; DELETE WHERE { _:b1 :flag \"b\" }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+    // DELETE-template labels likewise stay out of the reuse check: the
+    // strict validator rejects DELETE-side blank nodes outright with the
+    // real error, which a cross-operation-label complaint would mask.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         DELETE { _:b1 :p ?o } WHERE { ?s :q ?o } ; \
+         DELETE { _:b1 :p ?o } WHERE { ?s :q ?o }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
+    // A minted label followed by a DELETE WHERE reuse is fine too — only
+    // minting positions participate in the §19.6 scope rule.
+    let ast = assert_parses(
+        "PREFIX : <http://www.example.org/> \
+         INSERT DATA { _:b1 :p :o } ; DELETE WHERE { _:b1 :flag \"a\" }",
+    );
+    assert_eq!(update_request(&ast).operations.len(), 2);
 }

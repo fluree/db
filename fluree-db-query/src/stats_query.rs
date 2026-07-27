@@ -65,7 +65,10 @@ pub fn stats_count_by_predicate_operator(
                 return Ok(None);
             };
 
-            let dt = WellKnownDatatypes::new().xsd_long;
+            // SPARQL COUNT yields xsd:integer (§18.5.1.6); the materialized and
+            // streaming aggregate paths already tag it so — this per-predicate
+            // fast-path must match or a COUNT re-typed as xsd:long leaks (agg02).
+            let dt = WellKnownDatatypes::new().xsd_integer;
             let mut pred_col: Vec<Binding> = Vec::with_capacity(counts.len());
             let mut count_col: Vec<Binding> = Vec::with_capacity(counts.len());
             for (p_id, count) in counts {

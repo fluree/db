@@ -424,6 +424,8 @@ SPARQL, JSON-LD query, and Cypher (`fluree-db-cypher`) all compile to the **same
 
 3. **SPARQL-only surface features**: property paths syntax, RDF-star/annotation syntax, ASK query form, and SPARQL UPDATE text forms have no JSON-LD equivalent. These don't require syntax parity — but if the underlying IR/engine capability is new (e.g., a new pattern type), consider whether JSON-LD should be able to express it and record the decision.
 
+   Recorded exemption — **CONSTRUCT blank-node templates**: the FQL `construct` template is a JSON-LD node map, where a node without `@id` becomes an auto-generated *subject variable* and an explicit `"@id": "_:b0"` denotes one fixed document-scoped blank node — there is no syntax for SPARQL's per-solution-row fresh-blank-node template semantics (`[ … ]` / `_:label` minting a new node per row). The per-row minting machinery (`ConstructTemplate.bnode_vars` → `cst{n}` labels) is therefore exercised by SPARQL-surface tests only (`it_query_construct.rs`); a JSON-LD template syntax for it would be a new surface-design decision, not a parity gap.
+
 **Cypher is deliberately excluded from this guideline.** We do not own the openCypher grammar and do not introduce custom Cypher syntax, so SPARQL compliance work carries no Cypher syntax obligations. Cypher benefits from IR/engine-level fixes automatically; what openCypher exposes is governed separately by `docs/reference/cypher-support-matrix.md`.
 
 **Regression-test rule:** a compliance fix is not done when the W3C test goes green — it is done when the register entry is removed AND an equivalent JSON-LD test exists for behavior that JSON-LD can express.

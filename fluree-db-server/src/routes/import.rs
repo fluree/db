@@ -17,7 +17,10 @@
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
-use crate::import_jobs::{ImportJob, ImportStatus, MultipartPlan, StagedResidue, IMPORT_JOB_TTL};
+use crate::import_jobs::{
+    CompletionTarget, ImportJob, ImportSourceKind, ImportStatus, MultipartPlan,
+    SourceImportOptions, StagedResidue, IMPORT_JOB_TTL,
+};
 use crate::state::AppState;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -124,6 +127,125 @@ struct MintRequest {
     /// an archive at or above the configured threshold is minted as multipart.
     #[serde(default)]
     size: Option<u64>,
+    /// What the upload contains: `"flpack"` (default — wholesale restore) or
+    /// `"source"` (raw data for the bulk-import pipeline, same formats as
+    /// `fluree create --from`). Source uploads must also send `filename`.
+    #[serde(default)]
+    source_kind: Option<String>,
+    /// Original filename of a `"source"` upload. Only its extension is used —
+    /// the bulk pipeline sniffs the format from it (`.ttl`, `.jsonl`,
+    /// `.csv`, `.cypher`, …, with `.gz`/`.zst` on RDF/JSONL formats).
+    #[serde(default)]
+    filename: Option<String>,
+    /// CSV/Cypher relationship-property encoding (`annotated`, `plain`, or
+    /// `nary`), matching `fluree create --edge-properties`.
+    #[serde(default)]
+    edge_properties: Option<String>,
+    /// CSV/Cypher namespace for minted names, matching
+    /// `fluree create --base-iri`.
+    #[serde(default)]
+    base_iri: Option<String>,
+}
+
+/// Pipeline-native single-file extensions (importable as staged, and the only
+/// ones that may carry a `.gz`/`.zst` compression suffix).
+const SOURCE_DATA_EXTENSIONS: &[&str] = &[
+    "ttl", "nt", "nq", "trig", "jsonld", "json", "jsonl", "ndjson",
+];
+/// Extensions converted server-side to `.jsonl` shards before import.
+const SOURCE_CONVERT_EXTENSIONS: &[&str] = &["csv", "cypher", "cyp", "cql"];
+
+/// Validate a source upload's filename and return the extension suffix the
+/// staged file must keep (e.g. `ttl`, `ttl.gz`, `csv`, `cypher`) so the bulk
+/// pipeline's extension-based format sniffing sees the real format. Only the
+/// extension is trusted — the client's path/stem never touches the filesystem.
+fn source_staged_extension(filename: &str) -> Result<String> {
+    let name = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+    let mut parts: Vec<&str> = name.split('.').collect();
+    let compression = match parts.last() {
+        Some(&("gz" | "zst")) => {
+            let c = parts.pop().expect("checked last");
+            Some(c.to_ascii_lowercase())
+        }
+        _ => None,
+    };
+    let ext = parts
+        .last()
+        .filter(|e| !e.is_empty() && parts.len() > 1)
+        .map(|e| e.to_ascii_lowercase())
+        .ok_or_else(|| {
+            ServerError::bad_request(format!(
+                "source filename '{filename}' has no recognizable format extension"
+            ))
+        })?;
+    let is_data = SOURCE_DATA_EXTENSIONS.contains(&ext.as_str());
+    let is_convert = SOURCE_CONVERT_EXTENSIONS.contains(&ext.as_str());
+    if !is_data && !is_convert {
+        return Err(ServerError::bad_request(format!(
+            "unsupported source format '.{ext}'; supported: {} (optionally .gz/.zst), {}",
+            SOURCE_DATA_EXTENSIONS.join("/."),
+            SOURCE_CONVERT_EXTENSIONS.join("/.")
+        )));
+    }
+    match compression {
+        Some(c) if is_data => Ok(format!("{ext}.{c}")),
+        Some(c) => Err(ServerError::bad_request(format!(
+            "compressed {ext} is not supported (.{ext}.{c}); upload it uncompressed"
+        ))),
+        None => Ok(ext),
+    }
+}
+
+/// Whether server-side bulk import is available on this deployment. False on
+/// Raft-replicated servers: the pipeline publishes commit/index heads to the
+/// nameservice directly and repeatedly, bypassing the replicated write log.
+/// `.flpack` restore (single final head-set) remains available there.
+pub(crate) fn source_import_supported(state: &AppState) -> bool {
+    #[cfg(feature = "raft")]
+    if state.raft.is_some() {
+        return false;
+    }
+    let _ = state;
+    true
+}
+
+/// The source formats advertised in discovery (`import.source_formats`).
+pub(crate) fn advertised_source_formats() -> Vec<&'static str> {
+    SOURCE_DATA_EXTENSIONS
+        .iter()
+        .chain(SOURCE_CONVERT_EXTENSIONS)
+        .copied()
+        .collect()
+}
+
+fn ensure_source_import_supported(state: &AppState) -> Result<()> {
+    if source_import_supported(state) {
+        Ok(())
+    } else {
+        Err(ServerError::bad_request(
+            "server-side bulk import is not supported on Raft-replicated servers; \
+             use a .flpack restore instead",
+        ))
+    }
+}
+
+fn source_import_options(req: &MintRequest) -> Result<SourceImportOptions> {
+    use fluree_db_api::csv_import::EdgePolicy;
+
+    let edge_policy = match req.edge_properties.as_deref() {
+        None | Some("annotated") => EdgePolicy::Annotated,
+        Some("plain") => EdgePolicy::Plain,
+        Some("nary") => EdgePolicy::Nary,
+        Some(other) => {
+            return Err(ServerError::bad_request(format!(
+                "unknown edge_properties '{other}' (expected \"annotated\", \"plain\", or \"nary\")"
+            )))
+        }
+    };
+    Ok(SourceImportOptions {
+        edge_policy,
+        base_iri: req.base_iri.clone(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -223,6 +345,35 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
     let req: MintRequest = serde_json::from_slice(&body)
         .map_err(|e| ServerError::bad_request(format!("invalid mint request: {e}")))?;
 
+    // Resolve what the upload contains. Source uploads must carry a filename
+    // whose extension the staged file keeps (format sniffing), and are
+    // refused up front on deployments that can't run the pipeline.
+    let (source, staged_ext, source_options) = match req.source_kind.as_deref() {
+        None | Some("flpack") => (
+            ImportSourceKind::Flpack,
+            "flpack".to_string(),
+            SourceImportOptions::default(),
+        ),
+        Some("source") => {
+            ensure_source_import_supported(&state)?;
+            let filename = req.filename.as_deref().ok_or_else(|| {
+                ServerError::bad_request(
+                    "source uploads must include \"filename\" so the format can be detected",
+                )
+            })?;
+            (
+                ImportSourceKind::Source,
+                source_staged_extension(filename)?,
+                source_import_options(&req)?,
+            )
+        }
+        Some(other) => {
+            return Err(ServerError::bad_request(format!(
+                "unknown source_kind '{other}' (expected \"flpack\" or \"source\")"
+            )))
+        }
+    };
+
     // Opaque, unguessable identifiers. `import_id` keys the job; `token` is the
     // capability embedded in the upload URL (models a presigned signature).
     let import_id = format!("imp_{:016x}", rand::random::<u64>());
@@ -238,7 +389,7 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
     tokio::fs::create_dir_all(&staging_dir)
         .await
         .map_err(|e| ServerError::internal(format!("failed to create staging dir: {e}")))?;
-    let staged_path = staging_dir.join(format!("{import_id}.flpack"));
+    let staged_path = staging_dir.join(format!("{import_id}.{staged_ext}"));
 
     let expires_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -274,6 +425,8 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
             import_id.clone(),
             ImportJob {
                 ledger_id: req.ledger.clone(),
+                source,
+                source_options: source_options.clone(),
                 token: token.clone(),
                 staged_path,
                 multipart: Some(MultipartPlan {
@@ -303,6 +456,8 @@ async fn mint_upload_local(state: Arc<AppState>, request: Request) -> Result<Res
             import_id.clone(),
             ImportJob {
                 ledger_id: req.ledger.clone(),
+                source,
+                source_options,
                 token: token.clone(),
                 staged_path,
                 multipart: None,
@@ -515,7 +670,15 @@ async fn complete_upload_local(
 ) -> Result<Response> {
     ensure_presign_enabled(&state)?;
 
-    let (ledger_id, staged_path, status, multipart, created_at) = state
+    let CompletionTarget {
+        ledger_id,
+        staged_path,
+        status,
+        multipart,
+        created_at,
+        source,
+        source_options,
+    } = state
         .import_jobs
         .completion_target(&import_id)
         .ok_or_else(|| ServerError::not_found("unknown import_id"))?;
@@ -591,20 +754,27 @@ async fn complete_upload_local(
                     .await
                     .map_err(|e| format!("failed to assemble multipart upload: {e}"))?;
             }
-            let mut file = tokio::fs::File::open(&staged_path)
-                .await
-                .map_err(|e| format!("failed to open staged archive: {e}"))?;
-            bg_state
-                .fluree
-                .restore_ledger(&ledger_id, &mut file)
-                .await
-                .map_err(|e| e.to_string())
+            match source {
+                ImportSourceKind::Flpack => {
+                    let mut file = tokio::fs::File::open(&staged_path)
+                        .await
+                        .map_err(|e| format!("failed to open staged archive: {e}"))?;
+                    bg_state
+                        .fluree
+                        .restore_ledger(&ledger_id, &mut file)
+                        .await
+                        .map(|r| serde_json::to_value(&r).unwrap_or_else(|_| serde_json::json!({})))
+                        .map_err(|e| e.to_string())
+                }
+                ImportSourceKind::Source => {
+                    run_source_import(&bg_state, &ledger_id, &staged_path, &source_options).await
+                }
+            }
         }
         .await;
 
         match outcome {
-            Ok(result) => {
-                let json = serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({}));
+            Ok(json) => {
                 bg_state.import_jobs.set_succeeded(&bg_import_id, json);
             }
             Err(msg) => {
@@ -618,6 +788,120 @@ async fn complete_upload_local(
 
     let response = serde_json::json!({ "import_id": import_id, "status": "running" });
     Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+/// Run the bulk-import pipeline over a staged source upload: CSV/Cypher
+/// inputs are first converted to `.jsonl` shards in a scratch dir beside the
+/// staged file (the same conversion `fluree create --from` runs client-side),
+/// then the pipeline ingests the file (or shard dir) and publishes the new
+/// ledger. Returns the success JSON stored on the job.
+async fn run_source_import(
+    state: &Arc<AppState>,
+    ledger_id: &str,
+    staged_path: &FsPath,
+    options: &SourceImportOptions,
+) -> std::result::Result<serde_json::Value, String> {
+    let ext = staged_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // CSV/Cypher: convert into a scratch dir of `.jsonl` shards. The
+    // conversion is synchronous streaming IO — run it off the async runtime.
+    let (import_path, _shards_guard) = if SOURCE_CONVERT_EXTENSIONS.contains(&ext.as_str()) {
+        let shards_dir = staged_path.with_extension(format!("{ext}.shards"));
+        tokio::fs::create_dir_all(&shards_dir)
+            .await
+            .map_err(|e| format!("failed to create conversion scratch dir: {e}"))?;
+        let src = staged_path.to_path_buf();
+        let out = shards_dir.clone();
+        let is_csv = ext == "csv";
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            if is_csv {
+                fluree_db_api::import_source::csv_to_shards(
+                    &src,
+                    &fluree_db_api::csv_import::CsvImportOptions {
+                        edge_policy: options.edge_policy,
+                        base_iri: options.base_iri.clone().unwrap_or_else(|| {
+                            fluree_db_api::csv_import::CsvImportOptions::default().base_iri
+                        }),
+                        ..Default::default()
+                    },
+                    &out,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            } else {
+                fluree_db_api::import_source::cypher_to_shards(
+                    &src,
+                    fluree_db_api::cypher_import::CypherImportOptions {
+                        edge_policy: options.edge_policy,
+                        vocab: options.base_iri.clone(),
+                    },
+                    &out,
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+            }
+        })
+        .await
+        .map_err(|e| format!("conversion task failed: {e}"))??;
+        (shards_dir.clone(), Some(ScratchDirGuard(shards_dir)))
+    } else {
+        (staged_path.to_path_buf(), None)
+    };
+
+    let result = state
+        .fluree
+        .create(ledger_id)
+        .import(&import_path)
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // The bulk-imported root carries `annotation_index: None`. One reindex
+    // through the api's attachment provider runs the bulk-import bootstrap
+    // scan and seals an authoritative annotation arena, so relationship-
+    // binding queries take the arena probe instead of scan-fallback —
+    // mirroring what `fluree create --from` does after a local import.
+    let sealed_root_id = if result.has_annotations {
+        Some(
+            state
+                .fluree
+                .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+                .await
+                .map_err(|e| format!("post-import annotation-arena seal (reindex): {e}"))?
+                .root_id,
+        )
+    } else {
+        None
+    };
+
+    Ok(serde_json::json!({
+        "kind": "bulk-import",
+        "ledger_id": result.ledger_id,
+        "t": result.t,
+        "flake_count": result.flake_count,
+        "commit_head_id": result.commit_head_id.to_string(),
+        "root_id": sealed_root_id
+            .as_ref()
+            .or(result.root_id.as_ref())
+            .map(std::string::ToString::to_string),
+        "index_t": result.index_t,
+        "has_annotations": result.has_annotations,
+    }))
+}
+
+/// Deletes a conversion scratch dir when the import (success or failure)
+/// finishes.
+struct ScratchDirGuard(PathBuf);
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Best-effort deletion of the staged residue of swept (expired) jobs: the

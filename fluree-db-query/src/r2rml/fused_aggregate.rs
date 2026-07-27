@@ -1112,6 +1112,11 @@ impl FusedR2rmlAggregateOperator {
             &self.graph_iri,
             ctx.active_snapshot,
             mapping.as_deref(),
+            ctx.reasoning_active,
+            // Count/aggregate path never merges a projected type-var (it folds
+            // scalar columns and materializes no type rows); keep the two-scan
+            // rewrite so the browse merge is confined to the crawl projection path.
+            false,
         );
         if rr.unconverted_count > 0 {
             return Ok(None);
@@ -1352,6 +1357,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 
@@ -1414,6 +1420,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -1443,6 +1450,7 @@ mod tests {
                 offset: None,
                 post_values: None,
                 include_system_facts: false,
+                cypher_vocab: None,
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }

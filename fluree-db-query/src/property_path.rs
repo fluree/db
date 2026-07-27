@@ -84,6 +84,16 @@ pub(crate) fn is_reserved_edge_predicate(p: &Sid) -> bool {
     fluree_db_core::is_rdf_type(p) || fluree_db_core::is_reserved_reifies_predicate(p)
 }
 
+/// Re-encode a pattern-constant predicate `Sid` into the active graph's dict,
+/// falling back to the raw SID. A path runs against a per-`GRAPH` snapshot that
+/// may code the same IRI differently than the primary snapshot the predicate
+/// was encoded against; without this the traversal reads the wrong SID and finds
+/// no edges. Thin wrapper over [`crate::context::reencode_sid`].
+#[inline]
+fn reencode_pred(ctx: &ExecutionContext<'_>, db: &fluree_db_core::LedgerSnapshot, p: &Sid) -> Sid {
+    crate::context::reencode_sid(ctx, db, p).unwrap_or_else(|| p.clone())
+}
+
 /// Property path operator - transitive graph traversal
 ///
 /// Supports two execution modes:
@@ -311,10 +321,13 @@ impl PropertyPathOperator {
         use_post: bool,
     ) -> Result<Vec<Sid>> {
         let (db, overlay, to_t) = ctx.require_single_graph()?;
+        // Re-encode traversal predicates into the active graph's dict (see
+        // `reencode_pred`).
+        let preds: Vec<Sid> = preds.iter().map(|p| reencode_pred(ctx, db, p)).collect();
         let mut out = Vec::new();
         let mut seen: HashSet<Sid> = HashSet::new();
         for node in nodes {
-            for pred in preds {
+            for pred in &preds {
                 let (index, range_match) = if use_post {
                     (
                         IndexType::Post,
@@ -791,7 +804,8 @@ impl PropertyPathOperator {
             }
         } else {
             for pred in &self.pattern.predicates {
-                let range_match = RangeMatch::predicate(pred.clone());
+                // Re-encode into the active graph's dict — see `reencode_pred`.
+                let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
                 let flakes = range_with_overlay(
                     db,
                     ctx.binary_g_id,
@@ -960,7 +974,8 @@ impl PropertyPathOperator {
         let mut seen: HashSet<Sid> = HashSet::new();
         let mut out = Vec::new();
         for pred in &self.pattern.predicates {
-            let range_match = RangeMatch::predicate(pred.clone());
+            // Re-encode into the active graph's dict — see `reencode_pred`.
+            let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
@@ -1005,7 +1020,8 @@ impl PropertyPathOperator {
                 .flat_map(|s| s.predicates.iter()),
         );
         for pred in all_preds {
-            let range_match = RangeMatch::predicate(pred.clone());
+            // Re-encode into the active graph's dict — see `reencode_pred`.
+            let range_match = RangeMatch::predicate(reencode_pred(ctx, db, pred));
             let flakes = range_with_overlay(
                 db,
                 ctx.binary_g_id,
@@ -1465,7 +1481,12 @@ impl PropertyPathOperator {
         let binary_store = ctx.binary_store.as_ref();
         let resolve_sid = |term: &Ref, binding: Option<&Binding>| -> Option<Sid> {
             match term {
-                Ref::Sid(s) => Some(s.clone()),
+                // Re-encode a pattern-constant endpoint into the active graph
+                // (like the `Ref::Iri` arm) so a divergent-namespace endpoint
+                // matches; falls back to the raw SID when undecodable.
+                Ref::Sid(s) => {
+                    crate::context::reencode_sid(ctx, db_for_encode, s).or_else(|| Some(s.clone()))
+                }
                 Ref::Iri(iri) => db_for_encode.encode_iri(iri),
                 Ref::Var(_) => binding.and_then(|b| match b {
                     Binding::Sid { sid: s, .. } => Some(s.clone()),

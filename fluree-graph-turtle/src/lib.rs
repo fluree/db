@@ -23,6 +23,13 @@
 //! // Option 2: Parse directly to transaction JSON
 //! let json = parse_to_json(turtle).unwrap();
 //! ```
+//!
+//! # Limits
+//!
+//! Input is bounded by [`error::MAX_INPUT_BYTES`] per parse call, and
+//! recursive constructs (property lists, collections, reified triples) by
+//! [`error::MAX_NESTING_DEPTH`] nesting levels; exceeding either produces a
+//! parse error.
 
 pub mod adapter;
 pub mod error;

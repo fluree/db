@@ -39,6 +39,13 @@ pub struct Test {
     /// (e.g. `ut:success`) — distinguishes "expected: empty store" declared
     /// on purpose from an unrecognized/mis-parsed `mf:result` shape.
     pub result_success: bool,
+    /// Whether an `mf:result` node was present at all (as an IRI or a blank
+    /// node). Many W3C graph-management tests (`DROP ALL`, the `update-silent`
+    /// cases) express "expected: empty store" as a bare `mf:result []` with no
+    /// `ut:data`/`ut:graphData`/`ut:result` — a legitimate, deliberate empty
+    /// expectation. This flag distinguishes that from an `mf:result` that was
+    /// entirely absent (a genuine manifest mis-parse).
+    pub result_present: bool,
 }
 
 /// Iterator over W3C test cases, loading manifests lazily.
@@ -221,16 +228,17 @@ impl TestManifest {
         // blank node with ut:data / ut:graphData (update eval: expected
         // post-update graph store state).
         let result_term = self.object_for(&subject, mf::RESULT);
-        let (result, result_data, result_graph_data, result_success) = match result_term {
-            Some(term) if term.is_iri() => (term_to_string(term), None, vec![], false),
-            Some(term) if term.is_blank() => {
-                let result_data = self.object_for(term, ut::DATA).and_then(term_to_string);
-                let result_graph_data = self.get_graph_data(term, ut::GRAPH_DATA);
-                let result_success = self.object_for(term, ut::RESULT).is_some();
-                (None, result_data, result_graph_data, result_success)
-            }
-            _ => (None, None, vec![], false),
-        };
+        let (result, result_data, result_graph_data, result_success, result_present) =
+            match result_term {
+                Some(term) if term.is_iri() => (term_to_string(term), None, vec![], false, true),
+                Some(term) if term.is_blank() => {
+                    let result_data = self.object_for(term, ut::DATA).and_then(term_to_string);
+                    let result_graph_data = self.get_graph_data(term, ut::GRAPH_DATA);
+                    let result_success = self.object_for(term, ut::RESULT).is_some();
+                    (None, result_data, result_graph_data, result_success, true)
+                }
+                _ => (None, None, vec![], false, false),
+            };
 
         Ok(Some(Test {
             id: test_id.to_string(),
@@ -246,6 +254,7 @@ impl TestManifest {
             result_data,
             result_graph_data,
             result_success,
+            result_present,
         }))
     }
 

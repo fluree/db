@@ -185,7 +185,11 @@ fn graph_source_to_sse_event(record: &GraphSourceRecord) -> Event {
             "name": record.name,
             "branch": record.branch,
             "source_type": record.source_type.to_type_string(),
-            "config": record.config,
+            // Redact any auth/credential leaves: this graph-source record streams
+            // to every SSE subscriber, so a literal OAuth2 secret / bearer token
+            // in the config must never reach a client (no-op for secret-free
+            // configs, which stay byte-identical).
+            "config": fluree_db_api::ledger_info::redact_graph_source_config(&record.config),
             "dependencies": record.dependencies,
             "index_id": index_id,
             "index_t": record.index_t,
