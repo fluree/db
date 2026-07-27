@@ -2254,8 +2254,9 @@ impl FusedR2rmlAggregateOperator {
                     if any_null {
                         continue;
                     }
-                    // Decline the fused plan on a CONFLICTING duplicate dim join-key
-                    // (see `insert_dim_gkeys` for the soundness argument).
+                    // Decline the fused plan on ANY duplicate dim join-key (B1: an
+                    // equal-value duplicate also under-counts the materialized fan-out,
+                    // so it declines too — see `insert_dim_gkeys` for the argument).
                     if !insert_dim_gkeys(&mut map, key, gkeys) {
                         return Ok(None);
                     }
@@ -2306,7 +2307,7 @@ impl FusedR2rmlAggregateOperator {
                         continue;
                     }
                     if let Some(gkeys) = map.get(&fk_next) {
-                        // Same conflicting-duplicate soundness as the terminal scan.
+                        // Same any-duplicate soundness as the terminal scan (B1).
                         if !insert_dim_gkeys(&mut next_map, pk, gkeys.clone()) {
                             return Ok(None);
                         }
@@ -2682,6 +2683,195 @@ mod tests {
             vec!["2".to_string()],
             vec![GKey::Int(9)]
         ));
+    }
+
+    /// D2 (#1514 review): this PR WIDENS fused-aggregate admission into the JOIN fold
+    /// (W4-2 mixed fact+dim GROUP BY keys, and dim-side E2), which reaches
+    /// `insert_dim_gkeys` via `resolve_join_at_open`'s terminal-dim scan. B1 made
+    /// `insert_dim_gkeys` decline ANY duplicate parent join key; `dim_dup_join_key_
+    /// always_declines` guards that primitive. THIS test guards the other half — that
+    /// the CALLER (`resolve_join_at_open`, reached only by the widened join shapes)
+    /// propagates the decline to `Ok(None)` when the dim has a NON-PK (repeating) join
+    /// key, so the fuse falls back to the sound materialize path instead of
+    /// under-counting the fan-out. A UNIQUE-key control FUSES (`Ok(Some)`), isolating
+    /// the duplicate key as the sole cause: a broken fixture would fail the control
+    /// rather than pass vacuously. SF01's unique PKs mean the corpus can never raise
+    /// this, which is exactly why 0 hash mismatches is not evidence here.
+    ///
+    /// BOUNDARY: only the JOIN fold reaches `insert_dim_gkeys`. E1 (disjoint-colocated
+    /// shared-predicate class fusion), C5 (single-data-view fold), and a fact-only E2
+    /// flag all take the SINGLE-scan fold (`resolve_at_open`, `scan_table` n=1) and
+    /// never build a FK→GKey map — so the widened-shape concern does not extend to
+    /// them. `route_group_key_sources_mixed_and_declines` covers which keys route to a
+    /// dim vs the fact.
+    #[tokio::test]
+    async fn join_fold_declines_on_non_pk_dim_join_key() {
+        use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use async_trait::async_trait;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
+        use std::sync::Arc;
+
+        // Star mapping: SALES (fact) --custRef(RefObjectMap CUST_FK->CID)--> CUSTOMER
+        // (dim). Fact scalar attr `channel` (CHANNEL col), dim scalar attr `region`
+        // (REGION col) — the two group keys of a W4-2 MIXED rollup.
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![
+            TriplesMap::new("#Sales", "sales")
+                .with_subject_template("http://ex/sale/{SID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/channel"),
+                    object_map: ObjectMap::column("CHANNEL"),
+                })
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/custRef"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CUST_FK",
+                        "CID",
+                    )),
+                }),
+            TriplesMap::new("#Customer", "customer")
+                .with_subject_template("http://ex/cust/{CID}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("http://ex/region"),
+                    object_map: ObjectMap::column("REGION"),
+                }),
+        ]));
+
+        // W4-2 patterns: fact(subj ?0) binds channel=?10 (fact key) and custRef=?1
+        // (=dim subject, the join var); dim(subj ?1) binds region=?11 (dim key).
+        let (s, cust, channel, region, cnt) = (VarId(0), VarId(1), VarId(10), VarId(11), VarId(20));
+        let mut fact = R2rmlPattern::new("gs", s, None);
+        fact.triples_map_iri = Some("#Sales".to_string());
+        fact.star_bindings = vec![
+            ("http://ex/channel".to_string(), channel),
+            ("http://ex/custRef".to_string(), cust),
+        ];
+        let mut dim = R2rmlPattern::new("gs", cust, None);
+        dim.triples_map_iri = Some("#Customer".to_string());
+        dim.star_bindings = vec![("http://ex/region".to_string(), region)];
+        let pats = [&fact, &dim];
+
+        fn customer_batch(cids: Vec<Option<i64>>) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(vec![
+                FieldInfo {
+                    name: "CID".to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id: 1,
+                },
+                FieldInfo {
+                    name: "REGION".to_string(),
+                    field_type: FieldType::String,
+                    nullable: true,
+                    field_id: 2,
+                },
+            ]));
+            let regions: Vec<Option<String>> =
+                vec![Some("East".to_string()), Some("West".to_string())];
+            ColumnBatch::new(schema, vec![Column::Int64(cids), Column::String(regions)]).unwrap()
+        }
+
+        // The terminal-dim provider. `dup` toggles the CUSTOMER join key from a proper
+        // PK (10, 20) to a NON-PK repeat (10, 10) — the fan-out the single-entry
+        // FK->GKey map cannot represent. (resolve_join_at_open scans ONLY the dim; the
+        // fact scan is deferred to next_batch.)
+        #[derive(Debug)]
+        struct DimProvider {
+            dup: bool,
+        }
+        #[async_trait]
+        impl R2rmlTableProvider for DimProvider {
+            async fn scan_table(
+                &self,
+                _gs: &str,
+                table: &str,
+                _proj: &[String],
+                _filters: &[ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                assert_eq!(
+                    table, "customer",
+                    "the one-hop join scans only the dim here"
+                );
+                let cids = if self.dup {
+                    vec![Some(10), Some(10)]
+                } else {
+                    vec![Some(10), Some(20)]
+                };
+                let b = customer_batch(cids);
+                Ok(Box::pin(futures::stream::once(async move { Ok(b) })))
+            }
+        }
+
+        #[derive(Debug)]
+        struct MapProvider(Arc<CompiledR2rmlMapping>);
+        #[async_trait]
+        impl R2rmlProvider for MapProvider {
+            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
+                true
+            }
+            async fn compiled_mapping(
+                &self,
+                _gs: &str,
+                _t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                Ok(Arc::clone(&self.0))
+            }
+        }
+
+        let make_op = || {
+            let plan = FusedAggregatePlan {
+                graph_iri: Arc::from("gs"),
+                inner_patterns: vec![],
+                filter: None,
+                agg_binds: vec![],
+                group_by: vec![channel, region], // W4-2 MIXED: fact key + dim key
+                aggregates: vec![(cnt, AggregateFn::CountAll)],
+            };
+            FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
+        };
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let map_provider = MapProvider(Arc::clone(&mapping));
+
+        // CONTROL: a proper PK dim → the widened W4-2 join fold RESOLVES (fuses). This
+        // proves the mapping/patterns/plan are valid, so the decline below is caused by
+        // the duplicate key alone.
+        let unique = DimProvider { dup: false };
+        let ctx_u =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&map_provider, &unique);
+        let resolved_u = make_op()
+            .resolve_join_at_open(&ctx_u, &pats, mapping.as_ref())
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved_u.is_some(),
+            "a unique dim join key must FUSE (control: the fixture is otherwise valid)"
+        );
+
+        // A non-PK (repeating) dim join key must DECLINE the fused join fold — the
+        // widened shape reaches insert_dim_gkeys, which now refuses the fan-out.
+        let dup = DimProvider { dup: true };
+        let ctx_d =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&map_provider, &dup);
+        let resolved_d = make_op()
+            .resolve_join_at_open(&ctx_d, &pats, mapping.as_ref())
+            .await
+            .expect("resolve must not error");
+        assert!(
+            resolved_d.is_none(),
+            "a non-PK (duplicate) dim join key must DECLINE the fused join fold \
+             (fall back to the materialize path), not silently under-count"
+        );
     }
 
     #[test]
