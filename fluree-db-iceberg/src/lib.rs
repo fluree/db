@@ -71,7 +71,8 @@ pub use config_value::ConfigValue;
 pub use error::{IcebergError, Result};
 pub use mor_guard::{
     ensure_manifests_scannable, ensure_no_delete_manifests, ensure_no_summary_deletes,
-    ensure_summary_scannable, mor_deletes_allowed, ALLOW_MOR_DELETES_ENV,
+    ensure_summary_scannable, mor_deletes_allowed, summary_indicates_deletes,
+    ALLOW_MOR_DELETES_ENV,
 };
 
 // Re-export Phase 2 types for convenience

@@ -61,26 +61,72 @@ fn env_truthy(value: Option<&str>) -> bool {
     )
 }
 
+/// The three snapshot-summary counters that report merge-on-read delete files.
+/// The Iceberg spec types `summary` as `map<string,string>` with these as
+/// string-encoded integers, so a conforming writer never emits a non-integer.
+const SUMMARY_DELETE_KEYS: [&str; 3] = [
+    "total-delete-files",
+    "total-position-deletes",
+    "total-equality-deletes",
+];
+
+/// Scan the summary delete counters with **fail-closed** semantics, returning a
+/// human-readable evidence fragment for every counter that indicates — or might
+/// indicate — deletes. A counter contributes evidence when it is *present* and
+/// either fails to parse as `i64` or parses to a non-zero value (a negative is
+/// treated as deletes-present, not clamped to zero). An *absent* counter
+/// contributes nothing: the manifest-list check ([`ensure_no_delete_manifests`])
+/// is the backstop for writers that omit the counters. An empty result means the
+/// summary is clean.
+///
+/// The distinction between "absent" and "present-but-unparseable" has to be drawn
+/// here, on the raw `summary` map: the typed accessors on [`Snapshot`] collapse
+/// both to `None`, which would let a garbled counter read as zero (fail-open) —
+/// the exact hole this guard closes.
+fn summary_delete_evidence(snapshot: &Snapshot) -> Vec<String> {
+    let mut evidence = Vec::new();
+    for key in SUMMARY_DELETE_KEYS {
+        let Some(raw) = snapshot.summary.get(key) else {
+            continue; // absent → manifest-list backstop covers it
+        };
+        match raw.parse::<i64>() {
+            Ok(0) => {}
+            Ok(n) if n < 0 => evidence.push(format!("{key}={n} (negative)")),
+            Ok(n) => evidence.push(format!("{key}={n}")),
+            Err(_) => evidence.push(format!("{key}={raw:?} (unparseable)")),
+        }
+    }
+    evidence
+}
+
+/// Whether the snapshot summary indicates (or, fail-closed, might indicate)
+/// merge-on-read delete files: any present counter that is non-zero, negative, or
+/// unparseable. Used to caveat a read that proceeds under the override
+/// ([`ALLOW_MOR_DELETES_ENV`]) — its row/COUNT totals are then upper bounds.
+pub fn summary_indicates_deletes(snapshot: &Snapshot) -> bool {
+    !summary_delete_evidence(snapshot).is_empty()
+}
+
 /// Fail closed if the snapshot **summary** reports any merge-on-read delete
-/// files. Zero extra I/O: `snapshot.summary` is already loaded. An absent
-/// counter reads as `0` (the manifest-list check in [`ensure_no_delete_manifests`]
-/// is the backstop for writers that omit the counters).
+/// files. Zero extra I/O: `snapshot.summary` is already loaded. A *present*
+/// counter that is non-zero, negative, or unparseable refuses; only an *absent*
+/// counter proceeds (the manifest-list check in [`ensure_no_delete_manifests`] is
+/// the backstop for writers that omit the counters). Failing closed on a
+/// malformed value has ~zero false-positive risk against a spec-conforming writer
+/// (the counters are always string-encoded integers).
 ///
 /// `allowed` is the operator opt-out ([`mor_deletes_allowed`]); pass it in so
 /// callers read the env once and this stays pure/testable.
 pub fn ensure_no_summary_deletes(snapshot: &Snapshot, table: &str, allowed: bool) -> Result<()> {
-    let files = snapshot.total_delete_files().unwrap_or(0).max(0);
-    let pos = snapshot.total_position_deletes().unwrap_or(0).max(0);
-    let eq = snapshot.total_equality_deletes().unwrap_or(0).max(0);
-    if files == 0 && pos == 0 && eq == 0 {
+    let evidence = summary_delete_evidence(snapshot);
+    if evidence.is_empty() {
         return Ok(());
     }
     decide(
         table,
         &format!(
-            "snapshot summary reports merge-on-read delete files \
-             (total-delete-files={files}, total-position-deletes={pos}, \
-             total-equality-deletes={eq})"
+            "snapshot summary reports merge-on-read delete files ({})",
+            evidence.join(", ")
         ),
         allowed,
     )
@@ -284,18 +330,89 @@ mod tests {
     }
 
     #[test]
+    fn summary_unparseable_counter_refuses() {
+        // W1: a present-but-unparseable counter must FAIL CLOSED (read as
+        // deletes-present), not silently read as zero via `.parse().ok()`.
+        let snap = snapshot_with(&[("total-delete-files", "garbage")]);
+        let err = ensure_no_summary_deletes(&snap, "t", false).unwrap_err();
+        assert!(matches!(err, IcebergError::MergeOnReadDeletes(_)));
+        assert!(
+            err.to_string().contains("garbage"),
+            "evidence names the malformed value: {err}"
+        );
+    }
+
+    #[test]
+    fn summary_negative_counter_refuses() {
+        // W1: a negative counter is nonsensical for a count; fail closed rather
+        // than clamp-to-zero-and-proceed.
+        let snap = snapshot_with(&[("total-position-deletes", "-1")]);
+        assert!(ensure_no_summary_deletes(&snap, "t", false).is_err());
+    }
+
+    #[test]
+    fn summary_absent_counters_proceed() {
+        // W1: absent counters still proceed here — the manifest-list backstop
+        // covers omission — and are not flagged by `summary_indicates_deletes`.
+        let snap = snapshot_with(&[("total-records", "1000"), ("operation", "append")]);
+        assert!(ensure_no_summary_deletes(&snap, "t", false).is_ok());
+        assert!(!summary_indicates_deletes(&snap));
+    }
+
+    #[test]
+    fn summary_indicates_deletes_classifies_counters() {
+        // Non-zero / unparseable ⇒ deletes; zero / absent ⇒ clean.
+        assert!(summary_indicates_deletes(&snapshot_with(&[(
+            "total-delete-files",
+            "1"
+        )])));
+        assert!(summary_indicates_deletes(&snapshot_with(&[(
+            "total-equality-deletes",
+            "garbage"
+        )])));
+        assert!(!summary_indicates_deletes(&snapshot_with(&[(
+            "total-delete-files",
+            "0"
+        )])));
+        assert!(!summary_indicates_deletes(&snapshot_with(&[(
+            "total-records",
+            "5"
+        )])));
+    }
+
+    #[test]
     fn error_message_is_actionable() {
-        // (d) the error names the table and the override switch verbatim.
+        // W2: the refusal must name the identifier the REAL call sites pass, the
+        // override switch, and the risk. The scan planners pass `metadata.location`
+        // (`scan/planner.rs`, `scan/send_planner.rs`); the preview passes
+        // "qualified (location)" (`fluree-db-api` `iceberg_catalog.rs`). Assert
+        // both shapes so the test tracks what the sites actually emit, not a bare
+        // literal no site produces.
         let snap = snapshot_with(&[("total-delete-files", "9")]);
-        let msg = ensure_no_summary_deletes(&snap, "dw.dim_customer", false)
+
+        // Planner shape: storage location only.
+        let location = "s3://bucket/dw/dim_customer";
+        let msg = ensure_no_summary_deletes(&snap, location, false)
             .unwrap_err()
             .to_string();
-        assert!(msg.contains("dw.dim_customer"), "names the table: {msg}");
+        assert!(msg.contains(location), "names the storage location: {msg}");
         assert!(
             msg.contains(ALLOW_MOR_DELETES_ENV),
             "names the override switch: {msg}"
         );
         assert!(msg.contains("deleted rows"), "explains the risk: {msg}");
+
+        // Preview shape: catalog-qualified name AND storage location, so an
+        // operator grepping logs from either path finds a common identifier.
+        let preview_id = format!("dw.dim_customer ({location})");
+        let msg = ensure_no_summary_deletes(&snap, &preview_id, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("dw.dim_customer"),
+            "names the qualified table: {msg}"
+        );
+        assert!(msg.contains(location), "names the storage location: {msg}");
     }
 
     #[test]
