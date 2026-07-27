@@ -1650,9 +1650,7 @@ async fn fetch_virtual_table_row_counts(
                     // subtract position/equality deletes, which Fluree recognizes but
                     // does not yet apply). Flag such a table so its count is reported
                     // as an upper bound. Zero-I/O — reads only the in-memory summary.
-                    let has_deletes = metadata
-                        .current_snapshot()
-                        .is_some_and(fluree_db_iceberg::mor_guard::summary_indicates_deletes);
+                    let has_deletes = metadata_indicates_mor_approximate_count(metadata);
                     let schema =
                         crate::graph_source::table_schema_from_metadata(&api_id, metadata).ok()?;
                     Some((table, schema.row_count, schema.snapshot.id, has_deletes))
@@ -1678,6 +1676,22 @@ async fn fetch_virtual_table_row_counts(
     }
     mor_approximate_tables.sort();
     (counts, snapshot_id, mor_approximate_tables)
+}
+
+/// Whether a virtual (Iceberg) table's snapshot-summary row count must be treated
+/// as a merge-on-read UPPER BOUND rather than exact — i.e. the table belongs in
+/// [`Source::mor_approximate_tables`]. Fail-closed via
+/// [`fluree_db_iceberg::mor_guard::summary_indicates_deletes`]: a present delete
+/// counter that is non-zero, negative, or unparseable flags the table, so a
+/// malformed counter can never let an over-counted total masquerade as exact
+/// (audit 1528-W1). Zero-I/O — reads only the current snapshot's in-memory summary.
+#[cfg(feature = "iceberg")]
+fn metadata_indicates_mor_approximate_count(
+    metadata: &fluree_db_iceberg::metadata::TableMetadata,
+) -> bool {
+    metadata
+        .current_snapshot()
+        .is_some_and(fluree_db_iceberg::mor_guard::summary_indicates_deletes)
 }
 
 /// Async orchestration for the Iceberg/R2RML virtual-info path: resolve the
@@ -2580,6 +2594,49 @@ mod tests {
             json!(["openflights.airlines"]),
             "the MoR table is flagged approximate"
         );
+    }
+
+    /// 1528-W1 (/info side): the fail-closed summary classifier must make a table
+    /// whose current-snapshot summary carries a garbled or negative delete counter
+    /// land in `mor-approximate-tables` (its row count reported as an upper bound),
+    /// never silently counted as exact. A clean append snapshot is not flagged.
+    /// Exercises the exact predicate `fetch_virtual_table_row_counts` uses.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn mor_approximate_count_flags_malformed_summary_counter() {
+        fn metadata_with_summary(summary_json: &str) -> fluree_db_iceberg::metadata::TableMetadata {
+            let json = format!(
+                r#"{{
+                  "format-version": 2,
+                  "location": "s3://b/t",
+                  "last-updated-ms": 0,
+                  "last-column-id": 1,
+                  "current-snapshot-id": 1,
+                  "snapshots": [
+                    {{
+                      "snapshot-id": 1,
+                      "timestamp-ms": 0,
+                      "summary": {summary_json}
+                    }}
+                  ]
+                }}"#
+            );
+            fluree_db_iceberg::metadata::TableMetadata::from_json_str(&json)
+                .expect("valid test metadata")
+        }
+
+        // Present-but-unparseable counter → flagged (upper bound), not exact.
+        let garbled = metadata_with_summary(r#"{"total-delete-files": "garbage"}"#);
+        assert!(
+            metadata_indicates_mor_approximate_count(&garbled),
+            "a malformed delete counter must flag the table as mor-approximate"
+        );
+        // A negative counter is likewise flagged (fail-closed, not clamp-to-zero).
+        let negative = metadata_with_summary(r#"{"total-position-deletes": "-1"}"#);
+        assert!(metadata_indicates_mor_approximate_count(&negative));
+        // A clean append snapshot (no delete counters) is NOT flagged → exact count.
+        let clean = metadata_with_summary(r#"{"total-records": "1000", "operation": "append"}"#);
+        assert!(!metadata_indicates_mor_approximate_count(&clean));
     }
 
     #[test]
