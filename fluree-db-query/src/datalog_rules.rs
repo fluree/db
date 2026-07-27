@@ -769,12 +769,12 @@ async fn match_pattern_with_bindings(
     // variable bound to a non-Sid value can never occupy that position in a
     // flake, so the pattern matches nothing for this binding row.
     let Some((subject_sid, subject_var)) =
-        resolve_term_with_bindings(&pattern.subject, bindings)?.split()
+        resolve_term_with_bindings(&pattern.subject, bindings).split()
     else {
         return Ok(Vec::new());
     };
     let Some((predicate_sid, predicate_var)) =
-        resolve_term_with_bindings(&pattern.predicate, bindings)?.split()
+        resolve_term_with_bindings(&pattern.predicate, bindings).split()
     else {
         return Ok(Vec::new());
     };
@@ -862,8 +862,9 @@ enum TermResolution {
     Bound(Sid),
     /// Unbound variable, to be bound from each matched flake
     Unbound(Arc<str>),
-    /// Variable bound to a non-Sid value: no flake can carry it in this
-    /// position, so the pattern matches nothing (an empty join, not an error)
+    /// A literal constant, or a variable bound to a non-Sid value: no flake
+    /// can carry a literal in subject/predicate position, so the pattern
+    /// matches nothing (an empty join, not an error)
     Incompatible,
 }
 
@@ -878,18 +879,22 @@ impl TermResolution {
     }
 }
 
-/// Resolve a subject- or predicate-position term using existing bindings
-fn resolve_term_with_bindings(term: &RuleTerm, bindings: &Bindings) -> Result<TermResolution> {
+/// Resolve a subject- or predicate-position term using existing bindings.
+///
+/// Total: a literal constant (`RuleTerm::Value`) — a plausible typo for an
+/// unprefixed IRI like `{"@id": "Alice"}` — can no more occupy subject or
+/// predicate position than a variable bound to a literal, so it resolves to
+/// `Incompatible` (that pattern matches nothing) rather than erroring, which
+/// would abort the whole fixpoint and drop every rule's derivations.
+fn resolve_term_with_bindings(term: &RuleTerm, bindings: &Bindings) -> TermResolution {
     match term {
-        RuleTerm::Sid(sid) => Ok(TermResolution::Bound(sid.clone())),
+        RuleTerm::Sid(sid) => TermResolution::Bound(sid.clone()),
         RuleTerm::Var(var) => match bindings.get(var.as_ref()) {
-            Some(BindingValue::Sid(sid)) => Ok(TermResolution::Bound(sid.clone())),
-            Some(_) => Ok(TermResolution::Incompatible),
-            None => Ok(TermResolution::Unbound(var.clone())),
+            Some(BindingValue::Sid(sid)) => TermResolution::Bound(sid.clone()),
+            Some(_) => TermResolution::Incompatible,
+            None => TermResolution::Unbound(var.clone()),
         },
-        RuleTerm::Value(_) => Err(QueryError::InvalidQuery(
-            "Literal value not allowed in subject/predicate position".to_string(),
-        )),
+        RuleTerm::Value(_) => TermResolution::Incompatible,
     }
 }
 
@@ -1327,7 +1332,21 @@ mod tests {
         let mut bindings = Bindings::new();
         bindings.insert(Arc::from("?p"), BindingValue::String("blue".to_string()));
 
-        let resolved = resolve_term_with_bindings(&RuleTerm::var("?p"), &bindings).unwrap();
+        let resolved = resolve_term_with_bindings(&RuleTerm::var("?p"), &bindings);
+        assert!(matches!(resolved, TermResolution::Incompatible));
+        assert!(resolved.split().is_none());
+    }
+
+    #[test]
+    fn resolve_term_literal_constant_is_incompatible() {
+        // A literal constant in subject/predicate position (e.g. a typo like
+        // `{"@id": "Alice"}` parsed as a string value) can never match a
+        // flake; resolution must report an empty join, not an error, so the
+        // authoring mistake cannot abort the whole fixpoint.
+        let bindings = Bindings::new();
+        let literal = RuleTerm::Value(RuleValue::String("Alice".to_string()));
+
+        let resolved = resolve_term_with_bindings(&literal, &bindings);
         assert!(matches!(resolved, TermResolution::Incompatible));
         assert!(resolved.split().is_none());
     }

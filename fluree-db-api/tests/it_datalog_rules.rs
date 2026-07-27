@@ -1299,3 +1299,74 @@ async fn datalog_rule_literal_bound_property_variable_does_not_abort_other_rules
          predicate var, got {results:?}"
     );
 }
+
+/// A literal *constant* in subject position (a plausible typo for a prefixed
+/// IRI, e.g. `{"@id": "Alice"}` instead of `{"@id": "ex:Alice"}`) can never
+/// match a flake, so that rule derives nothing — but it must not abort the
+/// fixpoint and drop every other rule's derivations.
+#[tokio::test]
+async fn datalog_rule_literal_subject_constant_does_not_abort_other_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/literal-subject");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // `"Alice"` is colon-less and non-`?`, so it parses as a string
+                // literal in subject position — a rule that can never match.
+                "@id": "ex:literalSubjectRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "Alice", "ex:parent": "?p"},
+                        "insert": {"@id": "Alice", "ex:derived": "?p"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "sound rule's derivations must survive a sibling rule's literal subject \
+         constant, got {results:?}"
+    );
+}
