@@ -27,7 +27,7 @@ use fluree_db_reasoner::{
 };
 use fluree_vocab::namespaces::FLUREE_DB;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{QueryError, Result};
@@ -600,6 +600,69 @@ fn resolve_iri(iri: &str, snapshot: &LedgerSnapshot) -> Result<Sid> {
 // Pattern Matching Execution
 // ============================================================================
 
+/// Whether `term` grounds an index lookup: a constant, or a variable already
+/// bound by an earlier pattern. Grounding the subject or predicate keeps a
+/// pattern off the full-scan path in [`choose_index_and_match`].
+fn term_is_grounded(term: &RuleTerm, bound: &HashSet<Arc<str>>) -> bool {
+    match term {
+        RuleTerm::Sid(_) | RuleTerm::Value(_) => true,
+        RuleTerm::Var(v) => bound.contains(v),
+    }
+}
+
+/// Selectivity score for matching `pattern` given the currently-bound
+/// variables. A grounded subject or predicate (worth 2 each) avoids the
+/// `(None, None)` full ledger scan; a grounded object (worth 1) constrains
+/// the result further. Higher is cheaper to match.
+fn pattern_selectivity(pattern: &RuleTriplePattern, bound: &HashSet<Arc<str>>) -> u32 {
+    2 * term_is_grounded(&pattern.subject, bound) as u32
+        + 2 * term_is_grounded(&pattern.predicate, bound) as u32
+        + term_is_grounded(&pattern.object, bound) as u32
+}
+
+/// Record `pattern`'s variables as bound (they will be after it matches).
+fn bind_pattern_vars(pattern: &RuleTriplePattern, bound: &mut HashSet<Arc<str>>) {
+    for term in [&pattern.subject, &pattern.predicate, &pattern.object] {
+        if let RuleTerm::Var(v) = term {
+            bound.insert(v.clone());
+        }
+    }
+}
+
+/// Order `patterns` most-constrained-first via a greedy join order: at each
+/// step take the pattern with the highest [`pattern_selectivity`] given the
+/// variables already bound, then mark its variables bound. A where-clause is
+/// a conjunction, so the join result is order-independent — this only lowers
+/// matching cost, keeping an all-unbound pattern (a full ledger scan) from
+/// leading when another pattern can ground its variables first. Ties keep
+/// source order.
+fn selective_pattern_order(patterns: &[RuleTriplePattern]) -> Vec<usize> {
+    let mut bound: HashSet<Arc<str>> = HashSet::new();
+    let mut remaining: Vec<usize> = (0..patterns.len()).collect();
+    let mut order = Vec::with_capacity(patterns.len());
+
+    while !remaining.is_empty() {
+        let best = remaining
+            .iter()
+            .enumerate()
+            .max_by_key(|(rank, &idx)| {
+                // Higher selectivity wins; on ties the lower source index
+                // (earlier `rank`) wins, so `max_by_key` compares Reverse.
+                (
+                    pattern_selectivity(&patterns[idx], &bound),
+                    std::cmp::Reverse(*rank),
+                )
+            })
+            .map(|(rank, _)| rank)
+            .expect("remaining is non-empty");
+        let idx = remaining.remove(best);
+        bind_pattern_vars(&patterns[idx], &mut bound);
+        order.push(idx);
+    }
+
+    order
+}
+
 /// Execute pattern matching for a datalog rule against the database
 ///
 /// Finds all bindings that satisfy the rule's where patterns and filters, and returns them.
@@ -612,11 +675,20 @@ pub async fn execute_rule_matching(
         return Ok(Vec::new());
     }
 
+    // Match patterns most-constrained-first so a pattern whose subject and
+    // predicate are both unbound variables — a full ledger scan (the
+    // `(None, None)` arm of `choose_index_and_match`), now reachable via
+    // property-position variables — does not lead when another pattern can
+    // ground its variables first.
+    let order = selective_pattern_order(&rule.where_patterns);
+    let mut patterns = order.iter().map(|&i| &rule.where_patterns[i]);
+
     // Start with the first pattern to get initial bindings
-    let mut binding_rows = match_pattern(&rule.where_patterns[0], db, &[]).await?;
+    let first = patterns.next().expect("where_patterns is non-empty");
+    let mut binding_rows = match_pattern(first, db, &[]).await?;
 
     // Join with subsequent patterns
-    for pattern in rule.where_patterns.iter().skip(1) {
+    for pattern in patterns {
         if binding_rows.is_empty() {
             break;
         }
@@ -1335,6 +1407,49 @@ mod tests {
         let resolved = resolve_term_with_bindings(&RuleTerm::var("?p"), &bindings);
         assert!(matches!(resolved, TermResolution::Incompatible));
         assert!(resolved.split().is_none());
+    }
+
+    fn triple(subject: RuleTerm, predicate: RuleTerm, object: RuleTerm) -> RuleTriplePattern {
+        RuleTriplePattern {
+            subject,
+            predicate,
+            object,
+        }
+    }
+
+    #[test]
+    fn selective_order_hoists_grounded_pattern_ahead_of_all_unbound_leading() {
+        // where: [ {?s ?p ?o}, {?s ex:parent ?o} ]
+        // The all-unbound pattern is written first (a full ledger scan), but
+        // the constant-predicate pattern must be matched first so it grounds
+        // ?s/?o before the unbound pattern runs.
+        let ex_parent = Sid::new(0, "http://example.org/parent");
+        let patterns = vec![
+            triple(
+                RuleTerm::var("?s"),
+                RuleTerm::var("?p"),
+                RuleTerm::var("?o"),
+            ),
+            triple(
+                RuleTerm::var("?s"),
+                RuleTerm::sid(ex_parent),
+                RuleTerm::var("?o"),
+            ),
+        ];
+        assert_eq!(selective_pattern_order(&patterns), vec![1, 0]);
+    }
+
+    #[test]
+    fn selective_order_keeps_source_order_on_ties() {
+        // Two equally-grounded patterns (both constant predicate) keep their
+        // written order — reordering is deterministic.
+        let p1 = Sid::new(0, "http://example.org/a");
+        let p2 = Sid::new(0, "http://example.org/b");
+        let patterns = vec![
+            triple(RuleTerm::var("?s"), RuleTerm::sid(p1), RuleTerm::var("?o")),
+            triple(RuleTerm::var("?x"), RuleTerm::sid(p2), RuleTerm::var("?y")),
+        ];
+        assert_eq!(selective_pattern_order(&patterns), vec![0, 1]);
     }
 
     #[test]

@@ -1370,3 +1370,65 @@ async fn datalog_rule_literal_subject_constant_does_not_abort_other_rules() {
          constant, got {results:?}"
     );
 }
+
+/// A copy-properties rule whose all-unbound pattern `{?other ?prop ?val}` is
+/// written FIRST (the full-scan-leading order) must still derive correctly —
+/// the matcher reorders patterns most-constrained-first, hoisting the
+/// grounding `ex:sameAs` pattern ahead of it. Mirrors
+/// `datalog_rule_where_property_variable_binds_and_substitutes` with the
+/// where patterns reversed.
+#[tokio::test]
+async fn datalog_rule_all_unbound_leading_pattern_still_derives_correctly() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/reorder-leading-unbound");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:copyRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?other", "?prop": "?val"},
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}}
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:sameAs": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:color": "blue", "ex:size": 5}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?color", "?size"],
+        "where": {"@id": "ex:a", "ex:color": "?color", "ex:size": "?size"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!(["blue", 5])),
+        "reordered rule with all-unbound leading pattern must still derive, got {results:?}"
+    );
+}
