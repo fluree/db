@@ -242,6 +242,13 @@ pub(crate) const DISTINCT_COUNT_WARNING: &str =
     "distinct_count (NDV) is unavailable from metadata alone; it requires column \
      profiling and is deferred to PR-5.";
 
+/// Caveat pushed onto a preview that proceeded past the fail-closed MoR guard
+/// under the `FLUREE_ICEBERG_ALLOW_MOR_DELETES` override: its counts include
+/// deleted rows and are therefore upper bounds. Shared by both preview tiers.
+const MOR_UPPER_BOUND_WARNING: &str =
+    "Table has merge-on-read delete files; row/value/null counts are upper bounds \
+     (position/equality deletes are not subtracted).";
+
 /// Which statistics tier a preview should compute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -584,6 +591,42 @@ pub(crate) fn table_schema_from_metadata(
     })
 }
 
+/// Run the zero-I/O snapshot-summary MoR guard (audit F-AUD-1) that BOTH preview
+/// tiers share, BEFORE any summary-derived count is surfaced. The Schema tier
+/// fills `row_count` from `total-records` and the Stats tier aggregates over the
+/// live data files; neither subtracts merge-on-read deletes, so both over-count a
+/// MoR snapshot. Mirrors the two scan planners (`ensure_summary_scannable`), so
+/// the preview can no longer return silent over-counts the planners would refuse.
+///
+/// Returns the operator override flag (`FLUREE_ICEBERG_ALLOW_MOR_DELETES`) so the
+/// Stats-tier manifest-list backstop reuses it and the env is read exactly once.
+/// `table_display` is the W2 "qualified (location)" identifier. Extracted so the
+/// two-tier guard is unit-testable without a live catalog.
+fn preview_summary_guard(metadata: &TableMetadata, table_display: &str) -> Result<bool> {
+    match metadata.current_snapshot() {
+        Some(snapshot) => Ok(fluree_db_iceberg::ensure_summary_scannable(
+            snapshot,
+            table_display,
+        )?),
+        // No current snapshot ⇒ no counts to over-count; still surface the
+        // override flag for the (delete-free) Stats manifest path.
+        None => Ok(fluree_db_iceberg::mor_deletes_allowed()),
+    }
+}
+
+/// Whether a proceeded preview must caveat that its counts are upper bounds: true
+/// iff the read proceeded under the override AND either delete signal fired — the
+/// manifest-list (`has_delete_files`) or the snapshot summary. The summary arm
+/// covers a delete manifest that mis-parsed as data (F-AUD-1 sub-claim (a)), the
+/// gap that made the preview's two "signals" effectively one.
+fn preview_counts_are_upper_bounds(
+    allow_mor: bool,
+    has_delete_files: bool,
+    summary_deletes: bool,
+) -> bool {
+    allow_mor && (has_delete_files || summary_deletes)
+}
+
 /// Preview an Iceberg table's schema (Tier-A) and, at `tier = Stats`, its
 /// per-column statistics (Tier-B).
 ///
@@ -613,19 +656,41 @@ pub async fn preview_iceberg_table(
         ))
     })?;
 
+    // W2: name BOTH the catalog-qualified table and its storage location, so an
+    // operator grepping logs finds the same identifier the scan planners emit
+    // (they pass the location) plus the friendlier qualified name.
+    let table_display = format!("{} ({})", table.qualified(), metadata.location);
+
+    // D1 (audit F-AUD-1): run the summary MoR guard for EVERY tier before any
+    // summary-derived count is surfaced. Returns the override flag reused by the
+    // Stats-tier manifest backstop below.
+    let allow_mor = preview_summary_guard(metadata, &table_display)?;
+
     let mut schema = table_schema_from_metadata(&table, metadata)?;
 
     match tier {
-        StatsTier::Schema => Ok(TablePreview {
-            schema,
-            stats_completeness: StatsCompleteness {
-                tier: "schema".to_string(),
-                manifests_read: 0,
-                had_column_bounds: false,
-                has_delete_files: false,
-            },
-            warnings: Vec::new(),
-        }),
+        StatsTier::Schema => {
+            // Schema tier reads no manifests (`has_delete_files` stays false), but
+            // its `row_count` comes from `total-records`, which over-counts a MoR
+            // snapshot. Under the override the guard proceeded, so caveat the count.
+            let mut warnings = Vec::new();
+            let summary_deletes = metadata
+                .current_snapshot()
+                .is_some_and(fluree_db_iceberg::summary_indicates_deletes);
+            if preview_counts_are_upper_bounds(allow_mor, false, summary_deletes) {
+                warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
+            }
+            Ok(TablePreview {
+                schema,
+                stats_completeness: StatsCompleteness {
+                    tier: "schema".to_string(),
+                    manifests_read: 0,
+                    had_column_bounds: false,
+                    has_delete_files: false,
+                },
+                warnings,
+            })
+        }
         StatsTier::Stats => {
             let mut warnings = vec![DISTINCT_COUNT_WARNING.to_string()];
 
@@ -677,24 +742,27 @@ pub async fn preview_iceberg_table(
                     schema.total_bytes = schema.total_bytes.or(Some(agg.total_bytes));
 
                     if has_delete_files {
-                        // Fail closed (F-AUD-1): the aggregated row/value/null
-                        // counts sum live data-file records and do NOT subtract
-                        // merge-on-read deletes, so they over-count. Refuse unless
-                        // the operator opted out via FLUREE_ICEBERG_ALLOW_MOR_DELETES.
-                        let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
+                        // Manifest-list backstop (F-AUD-1): the aggregated
+                        // row/value/null counts sum live data-file records and do
+                        // NOT subtract merge-on-read deletes, so they over-count.
+                        // Reuse the hoisted override flag (env read once) and raise
+                        // the TYPED error (W3) so the 409 discriminant survives
+                        // instead of flattening to a 400 "Invalid configuration".
                         fluree_db_iceberg::ensure_no_delete_manifests(
                             usize::from(has_delete_files),
-                            &table.qualified(),
+                            &table_display,
                             allow_mor,
-                        )
-                        .map_err(|e| crate::ApiError::config(e.to_string()))?;
-                        // Only reached under the override: surface the caveat.
-                        warnings.push(
-                            "Table has merge-on-read delete files; aggregated row/value/null \
-                                 counts are upper bounds (position/equality deletes are not \
-                                 subtracted)."
-                                .to_string(),
-                        );
+                        )?;
+                    }
+                    // Reachable only under the override once a delete signal fired;
+                    // caveat the counts regardless of WHICH signal saw them (the
+                    // summary arm covers a delete manifest that mis-parsed as data).
+                    if preview_counts_are_upper_bounds(
+                        allow_mor,
+                        has_delete_files,
+                        fluree_db_iceberg::summary_indicates_deletes(snapshot),
+                    ) {
+                        warnings.push(MOR_UPPER_BOUND_WARNING.to_string());
                     }
 
                     (manifests_read, agg.had_column_bounds, has_delete_files)
@@ -990,6 +1058,75 @@ mod tests {
                 .await
                 .expect_err("Direct mode must not be previewable");
         assert!(err.to_string().contains("Direct catalog mode"));
+    }
+
+    /// Clone `SAMPLE_METADATA` and inject a merge-on-read delete counter into the
+    /// CURRENT snapshot summary, so the summary-signal guard fires.
+    fn metadata_with_summary_deletes() -> TableMetadata {
+        let mut metadata = TableMetadata::from_json_str(SAMPLE_METADATA).unwrap();
+        let cur_id = metadata.current_snapshot_id.unwrap();
+        let cur = metadata
+            .snapshots
+            .iter_mut()
+            .find(|s| s.snapshot_id == cur_id)
+            .expect("current snapshot present");
+        cur.summary
+            .insert("total-position-deletes".to_string(), "3".to_string());
+        metadata
+    }
+
+    #[test]
+    fn preview_summary_guard_refuses_mor_deletes_for_both_tiers() {
+        // D1: the summary guard runs BEFORE the tier split, so a single refusal
+        // covers Schema AND Stats (the tier arms are unreachable once it errors).
+        // Guard active: FLUREE_ICEBERG_ALLOW_MOR_DELETES is unset in the test env.
+        let metadata = metadata_with_summary_deletes();
+        let err = preview_summary_guard(&metadata, "DW.SALES (s3://bucket/dw/sales)")
+            .expect_err("summary-reported deletes must refuse");
+        // W3: typed error → 409 Conflict, not a 400 config error.
+        assert_eq!(
+            err.status_code(),
+            409,
+            "MoR refusal is a 409 conflict, not 400 config"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.starts_with("Invalid configuration"),
+            "typed variant must not flatten to a config error: {msg}"
+        );
+        assert!(
+            msg.contains("merge-on-read"),
+            "guard message verbatim: {msg}"
+        );
+        assert!(
+            msg.contains("FLUREE_ICEBERG_ALLOW_MOR_DELETES"),
+            "names the override switch: {msg}"
+        );
+        // W2: both identifiers are present in the refusal.
+        assert!(msg.contains("DW.SALES"), "names the qualified table: {msg}");
+        assert!(
+            msg.contains("s3://bucket/dw/sales"),
+            "names the storage location: {msg}"
+        );
+    }
+
+    #[test]
+    fn preview_summary_guard_allows_clean_table() {
+        // No delete counters + guard active ⇒ proceed; override flag off in the
+        // test env.
+        let metadata = TableMetadata::from_json_str(SAMPLE_METADATA).unwrap();
+        assert!(!preview_summary_guard(&metadata, "DW.SALES (s3://bucket/dw/sales)").unwrap());
+    }
+
+    #[test]
+    fn preview_upper_bound_caveat_only_under_override_with_deletes() {
+        // Reached only when the read proceeded under the override AND a delete
+        // signal fired; the summary arm covers a delete manifest that mis-parsed
+        // to `has_delete_files = false` (the D1 two-signal gap).
+        assert!(preview_counts_are_upper_bounds(true, true, false));
+        assert!(preview_counts_are_upper_bounds(true, false, true));
+        assert!(!preview_counts_are_upper_bounds(true, false, false));
+        assert!(!preview_counts_are_upper_bounds(false, true, true));
     }
 
     /// Preview surfaces the emitter's canonical `xsd_datatype` map (pinned at
