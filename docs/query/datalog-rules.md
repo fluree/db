@@ -331,8 +331,7 @@ This means:
 - **Recursive rules work.** A rule can produce facts that trigger itself again.
 - **Rule chaining works.** Rule A can produce facts that trigger Rule B, and
   vice versa.
-- **Termination is guaranteed** by the budget controls (max iterations, max
-  facts, max time, max memory).
+- **Termination is guaranteed** by a maximum fixpoint-iteration bound.
 
 ### Execution order
 
