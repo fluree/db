@@ -148,6 +148,10 @@ Fluree parses Turtle 1.1:
 - Collections
 - Blank nodes
 
+Resource limits: recursive constructs (property lists, collections, reified
+triples) may nest at most 128 levels deep, and a single parse accepts at most
+4 GiB of input; either limit produces a clean parse error.
+
 **Specification:** https://www.w3.org/TR/turtle/
 
 ### JSON Web Signature (JWS)

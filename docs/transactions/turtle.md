@@ -329,6 +329,18 @@ riot --validate data.ttl
 }
 ```
 
+### Parser Limits
+
+The parser enforces two resource limits; input past either is rejected with a
+parse error rather than ingested:
+
+- Blank-node property lists (`[ ... ]`), collections (`( ... )`), and reified
+  triples (`<< ... >>`) may nest at most 128 levels deep. Wide structures are
+  unaffected — a flat list of any length counts as one level; only the nesting
+  chain is limited.
+- A single parse call accepts at most 4 GiB (`u32::MAX` bytes) of input. Bulk
+  import splits files into chunks well below this automatically.
+
 ## Performance Tips
 
 ### 1. Use Batch Import
