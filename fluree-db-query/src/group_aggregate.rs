@@ -813,6 +813,11 @@ impl Operator for GroupAggregateOperator {
                 input_batches = tracing::field::Empty,
                 input_rows = tracing::field::Empty,
                 groups = tracing::field::Empty,
+                // APPROXIMATE recorded memory (rows x cols x flat per-binding est), not
+                // measured bytes — the `_est` suffix flags it so a 507 debugger doesn't
+                // read it as exact. Declared here so the record below is not a silent
+                // no-op (tracing drops records for undeclared fields).
+                mem_used_bytes_est = tracing::field::Empty,
                 drain_ms = tracing::field::Empty
             );
             async {
@@ -894,7 +899,7 @@ impl Operator for GroupAggregateOperator {
                     span.record("input_batches", input_batches);
                     span.record("input_rows", input_rows);
                     span.record("groups", self.partitioned_groups.len() as u64);
-                    span.record("mem_used_bytes", ctx.mem_used() as u64);
+                    span.record("mem_used_bytes_est", ctx.mem_used() as u64);
                     span.record(
                         "drain_ms",
                         (drain_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -999,7 +1004,7 @@ impl Operator for GroupAggregateOperator {
                 span.record("groups", self.groups.len() as u64);
                 // Growth-curve telemetry: the query's retained post-scan memory as
                 // observed at the end of the fold (see `ExecutionContext::checkpoint`).
-                span.record("mem_used_bytes", ctx.mem_used() as u64);
+                span.record("mem_used_bytes_est", ctx.mem_used() as u64);
                 span.record(
                     "drain_ms",
                     (drain_start.elapsed().as_secs_f64() * 1000.0) as u64,

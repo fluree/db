@@ -1149,6 +1149,105 @@ mod tests {
         );
     }
 
+    /// D1: the rebuild-boundary release stops a REBUILT inner subplan from
+    /// over-counting the shared memory budget into a false 507. A correlated
+    /// GraphOperator / batched-OPTIONAL rebuilds its inner (a hash join here) once
+    /// per parent row/batch on ONE shared cancellation handle; without a release the
+    /// monotonic counter grows ~N× the true one-build peak and aborts a legitimate
+    /// query. This isolates the mechanism: two INDEPENDENT builds on one handle, the
+    /// first dropped before the second, under a budget that admits one build's peak
+    /// but not the two-build sum — with the boundary release (the exact snapshot→
+    /// charge→drop→release pattern the operators now apply) the second build MUST
+    /// complete. See `GraphOperator::execute_in_graph{,_batched}` and
+    /// `OptionalOperator::build_batch`.
+    #[tokio::test]
+    async fn d1_rebuild_boundary_release_no_false_abort() {
+        use crate::context::ExecutionContext;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let mut vars = VarRegistry::new();
+        let x = vars.get_or_insert("?x");
+        let driver = vars.get_or_insert("?driver");
+        let s = vars.get_or_insert("?s");
+
+        // One build charges 1 row x 2 build-schema cols x 64 = 128 B. Pin the ceiling
+        // at 200 B: > one 128 B build, < the 256 B two-build running sum.
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(200);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+
+        let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
+        let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
+        let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
+        let make_hj = || {
+            let build_batch =
+                Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+            let probe_batch =
+                Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+            let right_pattern =
+                TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
+            HashJoinOperator::new(
+                Box::new(OnceOp {
+                    schema: build_schema.clone(),
+                    batch: Some(build_batch),
+                }),
+                Box::new(OnceOp {
+                    schema: probe_schema.clone(),
+                    batch: Some(probe_batch),
+                }),
+                x,
+                None,
+                right_pattern,
+                None,
+                crate::temporal_mode::PlanningContext::current().mode(),
+            )
+        };
+
+        // ---- First rebuild. Snapshot before the inner charges, drain it, drop it.
+        let mem_before_1 = ctx.mem_used();
+        {
+            let mut hj1 = make_hj();
+            hj1.open(&ctx).await.expect("first build is within budget");
+            while hj1.next_batch(&ctx).await.expect("drain hj1").is_some() {}
+            hj1.close();
+        }
+        // (negative control) The dropped inner's charge is still on the shared counter
+        // — record_alloc never auto-releases — so a second build's running sum WOULD
+        // exceed the budget. This is what makes the release load-bearing, not the test
+        // vacuous.
+        let accumulated = ctx.mem_used();
+        assert_eq!(
+            accumulated,
+            mem_before_1 + 128,
+            "the finished inner's build charge is retained until released"
+        );
+        assert!(
+            accumulated + 128 > 200,
+            "two un-released builds would exceed the pinned budget (the D1 false 507)"
+        );
+
+        // ---- Release at the rebuild boundary (exactly what the operators now do).
+        ctx.release(ctx.mem_used().saturating_sub(mem_before_1));
+        assert_eq!(
+            ctx.mem_used(),
+            mem_before_1,
+            "boundary release nets the finished rebuild to zero"
+        );
+
+        // ---- Second rebuild on the SAME handle: true peak is again one 128 B build,
+        // so it MUST NOT false-abort now that the first was released.
+        {
+            let mut hj2 = make_hj();
+            hj2.open(&ctx)
+                .await
+                .expect("second build must NOT false-abort after the boundary release");
+            while hj2.next_batch(&ctx).await.expect("drain hj2").is_some() {}
+            hj2.close();
+        }
+    }
+
     #[test]
     fn explains_subject_driven_forward_join() {
         // `?review rev:reviewer ?reviewer` with ?review bound from the left and
