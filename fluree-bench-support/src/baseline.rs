@@ -63,12 +63,17 @@ pub struct BaselineFile {
     pub profile: String,
     pub scale: String,
     /// Runner class the baseline was captured on (env `FLUREE_BENCH_RUNNER_CLASS`,
-    /// default `"local"`). Load-bearing for the gate: cross-machine wall-clock
-    /// TIME is not comparable (shared CI runners flap; local silicon differs),
-    /// so when this differs from the comparing runner's class `compare` reports
-    /// time breaches as ADVISORY and enforces only memory (which the reviewer
-    /// measured within ±2.2% cross-machine). `#[serde(default)]` so pre-field
-    /// baselines still load (treated as `"local"`).
+    /// default `"local"`). Load-bearing for the gate: NEITHER metric is
+    /// comparable across machine classes. Wall-clock time obviously isn't
+    /// (shared CI runners flap; local silicon differs), and a tracking
+    /// allocator's peak isn't either — allocator behaviour, page size, and
+    /// background load move it too. The one ±2.2% cross-machine memory
+    /// measurement this gate was originally built on is a single pair of
+    /// machines, not a portability result. So when this differs from the
+    /// comparing runner's class, `compare` reports BOTH time and peak_mem
+    /// breaches as ADVISORY and gates on neither; when the classes match, both
+    /// enforce. `#[serde(default)]` so pre-field baselines still load (treated
+    /// as `"local"`).
     #[serde(default = "default_runner_class")]
     pub runner_class: String,
     /// Host the baseline was captured on — informational provenance.
@@ -83,8 +88,8 @@ fn default_runner_class() -> String {
 
 /// The runner class of the current environment, from `FLUREE_BENCH_RUNNER_CLASS`
 /// (default `"local"`). CI capture/compare jobs set it (e.g.
-/// `ci-ubuntu-latest`); a match between baseline and current enables time
-/// enforcement, a mismatch makes time advisory.
+/// `ci-ubuntu-latest`); a match between baseline and current enables
+/// enforcement of both metrics, a mismatch makes both advisory.
 pub fn runner_class() -> String {
     std::env::var("FLUREE_BENCH_RUNNER_CLASS").unwrap_or_else(|_| default_runner_class())
 }
@@ -220,9 +225,9 @@ pub struct Comparison {
     pub change_pct: f64,
     pub budget_pct: f64,
     pub status: CompareStatus,
-    /// Whether an `Exceeded` here fails the gate. Memory is always enforced
-    /// (sound cross-machine); time is enforced only when the baseline and the
-    /// comparing runner share a runner class — otherwise it is advisory.
+    /// Whether an `Exceeded` here fails the gate. Symmetric across metrics:
+    /// both time and peak_mem enforce when the baseline and the comparing
+    /// runner share a runner class, and both are advisory when they don't.
     pub enforced: bool,
 }
 
@@ -244,8 +249,9 @@ impl CompareReport {
             .iter()
             .filter(|c| c.status == CompareStatus::Exceeded && c.enforced)
     }
-    /// Advisory breaches — an `Exceeded` on a non-enforced metric (cross-machine
-    /// time). Reported as annotations; they do NOT fail the gate.
+    /// Advisory breaches — an `Exceeded` measured against a baseline from a
+    /// different runner class. Reported as annotations; they do NOT fail the
+    /// gate.
     pub fn advisories(&self) -> impl Iterator<Item = &Comparison> {
         self.comparisons
             .iter()
@@ -309,16 +315,18 @@ fn classify(baseline: f64, observed: f64, budget_pct: f64) -> (f64, CompareStatu
 /// `only` restricts the comparison to scenario IDs containing the given
 /// substring (PR-scoped subset runs).
 ///
-/// `time_advisory` marks TIME comparisons as non-enforced (breaches reported
-/// but not gate-failing) — memory stays enforced. Callers set it when the
-/// baseline's runner class differs from the comparing runner's (cross-machine
-/// wall-clock is not comparable) or via an explicit override.
+/// `advisory` marks EVERY comparison as non-enforced (breaches reported but not
+/// gate-failing). Callers set it when the baseline's runner class differs from
+/// the comparing runner's, or via an explicit override. It is deliberately not
+/// per-metric: a cross-machine baseline is untrustworthy for wall-clock time
+/// and for a tracking allocator's peak alike, and gating on the less portable
+/// of the two while merely warning on the other is the wrong way round.
 pub fn compare(
     baseline: &BaselineFile,
     current: &BTreeMap<String, BaselineEntry>,
     budget: &RegressionBudget,
     only: Option<&str>,
-    time_advisory: bool,
+    advisory: bool,
 ) -> CompareReport {
     let selected = |id: &str| only.is_none_or(|f| id.contains(f));
     let mut report = CompareReport::default();
@@ -353,7 +361,7 @@ pub fn compare(
                 change_pct,
                 budget_pct,
                 status,
-                enforced: !time_advisory,
+                enforced: !advisory,
             });
         }
         if let (Some(bm), Some(cm)) = (base.mem, cur.mem) {
@@ -367,8 +375,9 @@ pub fn compare(
                 change_pct,
                 budget_pct,
                 status,
-                // Memory is comparable cross-machine — always enforced.
-                enforced: true,
+                // Same rule as time: a tracking allocator's peak is no more
+                // portable across machine classes than wall clock is.
+                enforced: !advisory,
             });
         }
     }
@@ -525,42 +534,116 @@ mod tests {
         assert_eq!(breach.metric, "peak_mem");
     }
 
+    /// The whole gate rule, as a truth table over
+    /// (runner class matched?) × (which metric breached).
+    ///
+    /// Matched → both metrics enforce. Mismatched → both are advisory, so the
+    /// gate passes while still annotating. The mismatched+memory row is the one
+    /// that used to fail: memory gated on a `runner_class=local` baseline, which
+    /// meant every PR compared a shared `ubuntu-latest` peak against a number
+    /// captured on somebody's laptop.
     #[test]
-    fn time_advisory_reports_but_only_memory_gates() {
-        // +100% on BOTH time and mem for the one scenario.
-        let base = baseline_with(vec![("g/q1/small", mem_entry(1000.0, 1_000_000))]);
-        let mut current = BTreeMap::new();
-        current.insert("g/q1/small".to_string(), mem_entry(2000.0, 2_000_000));
+    fn gate_truth_table_over_runner_class_match() {
         let budget = RegressionBudget::empty(5.0);
-
-        // Enforced time: both breaches gate.
-        let strict = compare(&base, &current, &budget, None, false);
-        assert!(!strict.passed());
-        assert_eq!(strict.breaches().count(), 2);
-
-        // Advisory time: mem still gates (fail), time is advisory only.
-        let advisory = compare(&base, &current, &budget, None, true);
-        assert!(!advisory.passed(), "mem breach must still fail the gate");
-        assert_eq!(advisory.breaches().count(), 1);
-        assert_eq!(advisory.breaches().next().unwrap().metric, "peak_mem");
-        assert_eq!(advisory.advisories().count(), 1);
-        assert_eq!(advisory.advisories().next().unwrap().metric, "time");
+        let base = baseline_with(vec![("g/q1/small", mem_entry(1000.0, 1_000_000))]);
+        // (label, current entry, mismatched?, expect_pass, expect_breaches, expect_advisories)
+        let cases = [
+            (
+                "matched + clean",
+                mem_entry(1000.0, 1_000_000),
+                false,
+                true,
+                0,
+                0,
+            ),
+            (
+                "matched + time breach",
+                mem_entry(2000.0, 1_000_000),
+                false,
+                false,
+                1,
+                0,
+            ),
+            (
+                "matched + mem breach",
+                mem_entry(1000.0, 2_000_000),
+                false,
+                false,
+                1,
+                0,
+            ),
+            (
+                "matched + both breach",
+                mem_entry(2000.0, 2_000_000),
+                false,
+                false,
+                2,
+                0,
+            ),
+            (
+                "mismatched + clean",
+                mem_entry(1000.0, 1_000_000),
+                true,
+                true,
+                0,
+                0,
+            ),
+            (
+                "mismatched + time breach",
+                mem_entry(2000.0, 1_000_000),
+                true,
+                true,
+                0,
+                1,
+            ),
+            (
+                "mismatched + mem breach",
+                mem_entry(1000.0, 2_000_000),
+                true,
+                true,
+                0,
+                1,
+            ),
+            (
+                "mismatched + both breach",
+                mem_entry(2000.0, 2_000_000),
+                true,
+                true,
+                0,
+                2,
+            ),
+        ];
+        for (label, cur, advisory, expect_pass, breaches, advisories) in cases {
+            let mut current = BTreeMap::new();
+            current.insert("g/q1/small".to_string(), cur);
+            let report = compare(&base, &current, &budget, None, advisory);
+            assert_eq!(report.passed(), expect_pass, "{label}: gate outcome");
+            assert_eq!(report.breaches().count(), breaches, "{label}: breach count");
+            assert_eq!(
+                report.advisories().count(),
+                advisories,
+                "{label}: advisory count"
+            );
+        }
     }
 
     #[test]
-    fn advisory_time_only_breach_passes() {
-        // Only TIME regresses; MEM flat. Under advisory time the gate passes.
+    fn mismatched_runner_class_never_gates_on_memory() {
+        // The asymmetry bplatz flagged, pinned directly: a memory-only breach
+        // against a cross-class baseline must annotate, not fail.
         let base = baseline_with(vec![("g/q1/small", mem_entry(1000.0, 1_000_000))]);
         let mut current = BTreeMap::new();
-        current.insert("g/q1/small".to_string(), mem_entry(2000.0, 1_000_000));
+        current.insert("g/q1/small".to_string(), mem_entry(1000.0, 5_000_000));
         let budget = RegressionBudget::empty(5.0);
 
         let report = compare(&base, &current, &budget, None, true);
         assert!(
             report.passed(),
-            "advisory time breach must not fail the gate"
+            "cross-class memory breach must not fail the gate"
         );
-        assert_eq!(report.advisories().count(), 1);
+        let advisory = report.advisories().next().unwrap();
+        assert_eq!(advisory.metric, "peak_mem");
+        assert!(!advisory.enforced);
     }
 
     #[test]

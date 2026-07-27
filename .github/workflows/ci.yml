@@ -117,24 +117,75 @@ jobs:
         timeout-minutes: 45
         run: cargo test
 
+  bench-paths:
+    # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's
+    # `paths:` filter is workflow-scoped and the rest of this workflow must run
+    # on every PR, so the filter lives here as a job output instead. Kept in
+    # ci.yml (rather than split into its own workflow) so the perf gate stays
+    # visible alongside the other required checks.
+    #
+    # Deliberately inclusive — a false positive costs one bench run, a false
+    # negative lets a regression through. Cargo.toml/Cargo.lock are in the list
+    # because a dependency or profile change moves timings without touching a
+    # single engine file.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Pushes to main always run: main is where baselines are captured from.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request — running bench-compare"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
+          echo "changed files:"; echo "$changed"
+          if echo "$changed" | grep -qE '^(fluree-db-query|fluree-db-api|fluree-db-core|fluree-db-novelty|fluree-db-binary-index|fluree-db-indexer|fluree-bench-[a-z-]+)/|^bench-baselines/|^regression-budget\.json$|^Cargo\.(toml|lock)$|^\.github/workflows/(ci|bench)\.yml$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no perf-relevant paths changed — skipping bench-compare"
+          fi
+
   bench-compare:
     # Cheap per-PR perf gate. Runs the two cheapest benches at tiny/quick and
-    # compares against the committed baseline. MEMORY breaches FAIL the job
-    # (peak_mem is comparable cross-machine — reviewer measured ±2.2%); wall-clock
-    # TIME breaches are ADVISORY (::warning:: annotations, non-gating) because the
-    # committed baseline is runner_class=local and shared ubuntu-latest runners
-    # flap — a 10% time budget on a single PR run false-positives (BENCHMARKING.md,
-    # "Baselines: capture & compare"). Once a ci-* baseline is committed (via
-    # bench.yml's workflow_dispatch capture job) the runner classes match and time
-    # enforces automatically. The committed baseline contains exactly this cheap
-    # subset, so `compare` needs no `--only`. Full workspace + medium: nightly.
+    # compares against the committed baseline.
+    #
+    # Both metrics enforce ONLY when the baseline's runner_class matches this
+    # runner's. It currently does not — the committed baseline is
+    # runner_class=local — so on every PR today both wall-clock TIME and
+    # PEAK_MEM breaches print as ::warning:: annotations and the job exits 0.
+    #
+    # Why not gate on memory now: shared ubuntu-latest runners flap, and a
+    # tracking allocator's peak moves with allocator behaviour, page size, and
+    # background load. The ±2.2% cross-machine figure this gate was first built
+    # on is one measurement between two specific machines, not a portability
+    # result — gating on it would fail unrelated PRs with no obvious cause, and
+    # it would be the LESS portable of the two signals doing the blocking.
+    #
+    # Capture a ci-ubuntu-latest baseline (bench.yml's workflow_dispatch capture
+    # job) and commit it, and both metrics flip to enforcing automatically —
+    # no code change. See BENCHMARKING.md, "Baselines: capture & compare".
+    #
+    # The committed baseline contains exactly this cheap subset, so `compare`
+    # needs no `--only`. Full workspace + medium: nightly.
+    needs: bench-paths
+    if: needs.bench-paths.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
-      # CI-class marker: baseline is runner_class=local, so compare auto-treats
-      # time as advisory and enforces only memory.
+      # CI-class marker. The committed baseline is runner_class=local, so this
+      # mismatch is what makes both metrics advisory today.
       FLUREE_BENCH_RUNNER_CLASS: ci-ubuntu-latest
     steps:
       - name: Free disk space
@@ -162,8 +213,10 @@ jobs:
           cargo bench -p fluree-db-api --bench query_overlay_matrix
           cargo bench -p fluree-db-api --bench query_hot_bsbm
 
-      # Compare against the committed baseline: exit 1 on any MEMORY breach;
-      # cross-machine time breaches print as ::warning:: annotations only.
+      # Compare against the committed baseline. Exit 1 on any breach of a metric
+      # the runner-class match makes enforcing; against a cross-class baseline
+      # (today's state) every breach prints as a ::warning:: annotation and the
+      # step exits 0.
       - name: Compare against committed baseline
         run: |
           cargo run -p fluree-bench-support --bin bench-baseline -- \

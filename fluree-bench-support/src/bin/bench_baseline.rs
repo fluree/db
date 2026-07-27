@@ -59,10 +59,11 @@ fn print_usage() {
         "bench-baseline — capture and compare performance baselines\n\n\
          USAGE:\n  \
          bench-baseline capture --label <name> --out <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--clean-mem]\n  \
-         bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--budget <file>] [--only <substr>] [--time-advisory]\n\n\
-         Memory is always enforced; TIME is enforced only when the baseline's\n\
-         runner_class matches this runner's (env FLUREE_BENCH_RUNNER_CLASS,\n\
-         default \"local\") — else advisory. --time-advisory forces advisory.\n\n\
+         bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>] [--budget <file>] [--only <substr>] [--advisory]\n\n\
+         TIME and PEAK_MEM both enforce only when the baseline's runner_class\n\
+         matches this runner's (env FLUREE_BENCH_RUNNER_CLASS, default\n\
+         \"local\"); on a mismatch both are advisory and the gate passes.\n\
+         --advisory forces advisory for both.\n\n\
          Run the benches first (`cargo bench ...`); this tool reads criterion's\n\
          output from target/criterion and memory sidecars from\n\
          target/fluree-bench-mem. See BENCHMARKING.md (\"Baselines\")."
@@ -198,7 +199,7 @@ fn run_compare(args: &[String]) -> ExitCode {
             "--budget",
             "--only",
         ],
-        &["--time-advisory"],
+        &["--advisory"],
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -220,12 +221,13 @@ fn run_compare(args: &[String]) -> ExitCode {
         }
     };
 
-    // TIME is not comparable across machine classes; enforce it only when the
-    // baseline and this runner share a runner class (or when neither opts out).
-    // MEMORY is always enforced. `--time-advisory` forces advisory regardless.
+    // Neither metric is comparable across machine classes, so BOTH enforce only
+    // when the baseline and this runner share a runner class; on a mismatch both
+    // are advisory. `--advisory` forces advisory regardless. Committing a
+    // baseline captured under the CI runner class is what flips them to
+    // enforcing — no code change needed.
     let current_rc = runner_class();
-    let time_advisory =
-        flags.contains_key("--time-advisory") || baseline.runner_class != current_rc;
+    let advisory = flags.contains_key("--advisory") || baseline.runner_class != current_rc;
     let budgets = match flags.get("--budget") {
         Some(p) => budget::load_from(PathBuf::from(p).as_path()),
         None => budget::load(),
@@ -249,7 +251,7 @@ fn run_compare(args: &[String]) -> ExitCode {
         &current,
         &budgets,
         flags.get("--only").map(String::as_str),
-        time_advisory,
+        advisory,
     );
 
     println!(
@@ -262,13 +264,13 @@ fn run_compare(args: &[String]) -> ExitCode {
         baseline.runner_class,
     );
     println!(
-        "runner_class: baseline={} current={} → TIME {} (memory always enforced)",
+        "runner_class: baseline={} current={} → time + peak_mem {}",
         baseline.runner_class,
         current_rc,
-        if time_advisory {
+        if advisory {
             "ADVISORY (cross-machine or overridden; not gating)"
         } else {
-            "enforced"
+            "ENFORCED"
         },
     );
     println!();
@@ -313,13 +315,19 @@ fn run_compare(args: &[String]) -> ExitCode {
 
     let advisories: Vec<_> = report.advisories().collect();
     if !advisories.is_empty() {
+        let reason = if baseline.runner_class != current_rc {
+            format!(
+                "baseline runner_class {} != {}; commit a {}-class baseline to make these enforce",
+                baseline.runner_class, current_rc, current_rc
+            )
+        } else {
+            "--advisory was passed".to_string()
+        };
         println!(
-            "\n::warning::advisory time regressions (not gating — runner_class {} != {}): {}",
-            baseline.runner_class,
-            current_rc,
+            "\n::warning::advisory regressions (not gating — {reason}): {}",
             advisories
                 .iter()
-                .map(|c| format!("{} {:+.1}%", c.id, c.change_pct))
+                .map(|c| format!("{} [{}] {:+.1}%", c.id, c.metric, c.change_pct))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
