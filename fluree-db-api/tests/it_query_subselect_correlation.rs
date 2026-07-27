@@ -9,6 +9,27 @@
 //! the parent's binding is dropped, while an unbound side stays compatible and
 //! adopts the bound side's value, per SPARQL §18.4 compatible mappings.
 //!
+//! Issue #1388's fix (c0f63e4c3) has TWO halves, both required to close it:
+//!   1. the merge-time reconcile in `SubqueryOperator::process_parent_batch`
+//!      (drop a row whose reconcile var conflicts with the parent, as above);
+//!   2. the per-row seed exclusion (`subquery.rs`: seed only `join_keys`, never
+//!      the reconcile vars, so a reconcile var is produced independently and
+//!      reconciled rather than pinned to the parent value).
+//!
+//! This file pins half 1 for the issue's AGGREGATE producer: the aggregate
+//! cases below return #1388's wrong output `[ex:a, ex:b]` when the reconcile
+//! check is disabled. (The BIND case below is end-to-end only — its conflicting
+//! row is dropped upstream of the merge, see that test's note — so it does not
+//! guard the mechanism.)
+//!
+//! Half 2, and the issue's OPTIONAL producer (W3C `var-scope-join-1`), are
+//! pinned in a DIFFERENT binary (`grp_query`, not `grp_query_sparql`) by the
+//! Family-B tests in `it_query_filter_scope.rs`:
+//! `subselect_optional_bound_correlation_var_reconciles_to_empty` (which also
+//! goes red if the seed exclusion is reverted) and
+//! `nested_subselects_reconcile_optional_bound_correlation_var`. Between the two
+//! files, all three producers and both halves of the fix are covered.
+//!
 //! All inserts and queries are explicit with `@context` / `PREFIX`.
 
 use crate::support;
