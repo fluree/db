@@ -138,12 +138,20 @@ async fn sparql_subselect_aggregate_correlation_var_unbound_parent_is_compatible
     );
 }
 
-/// A BIND-produced correlation variable inside the sub-SELECT is likewise not
-/// self-produced by a triple and must be reconciled at merge time. The
-/// sub-SELECT emits `(ex:a, 2)` once per `ex:r` link, so `ex:a` appears twice
-/// (multiset join semantics); `ex:b` conflicts (5 ≠ 2) and is dropped.
+/// End-to-end correctness for a BIND-produced correlation variable: `?c` is
+/// bound by `BIND(2 AS ?c)` in the sub-SELECT and the result must agree with
+/// the parent's `?c`. The sub-SELECT emits `(ex:a, 2)` once per `ex:r` link,
+/// so `ex:a` appears twice (multiset join semantics); `ex:b` (parent `?c` = 5)
+/// does not agree and is dropped.
+///
+/// NOTE: unlike the aggregate cases above, this shape eliminates `ex:b`
+/// *before* the merge-time reconcile check — disabling that check (subquery.rs
+/// `process_parent_batch`) leaves this test green — so it is an end-to-end
+/// correctness assertion, not a regression guard for the reconcile mechanism.
+/// The aggregate cases here, and the OPTIONAL Family-B tests in
+/// `it_query_filter_scope.rs`, pin the reconcile merge itself.
 #[tokio::test]
-async fn sparql_subselect_bind_correlation_var_is_joined() {
+async fn sparql_subselect_bind_correlation_var_end_to_end() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_counts(&fluree, "subsel-corr:bind").await;
 
