@@ -32,12 +32,33 @@ use crate::var_registry::VarId;
 pub struct ConstructTemplate {
     /// Template patterns (resolved TriplePatterns with Sids and VarIds)
     pub patterns: Vec<TriplePattern>,
+    /// Variables that originated as template blank nodes (`[ ]`, `_:a`, or the
+    /// blank cells of a desugared RDF collection `( ... )`).
+    ///
+    /// These are never produced by the WHERE clause, so the CONSTRUCT output
+    /// path must mint a FRESH blank node for each on every solution row —
+    /// shared across a row's template triples, distinct across rows — rather
+    /// than resolving them against the (absent) bindings. Empty for templates
+    /// with no blank nodes, including every JSON-LD/FQL construct and DESCRIBE.
+    pub bnode_vars: HashSet<VarId>,
 }
 
 impl ConstructTemplate {
-    /// Create a new construct template from patterns
+    /// Create a construct template from patterns with no template blank nodes.
     pub fn new(patterns: Vec<TriplePattern>) -> Self {
-        Self { patterns }
+        Self {
+            patterns,
+            bnode_vars: HashSet::new(),
+        }
+    }
+
+    /// Create a construct template carrying its template blank-node variables
+    /// (see [`ConstructTemplate::bnode_vars`]).
+    pub fn with_bnode_vars(patterns: Vec<TriplePattern>, bnode_vars: HashSet<VarId>) -> Self {
+        Self {
+            patterns,
+            bnode_vars,
+        }
     }
 
     /// Collect all variables referenced in the template patterns.
@@ -281,6 +302,12 @@ pub struct Query {
     /// rejection is the contract-level boundary; this flag only
     /// relaxes the per-row scan filter for `?p`-shape patterns.
     pub include_system_facts: bool,
+    /// `@vocab` prefix of the ledger context a Cypher query was lowered
+    /// against, if any. Read by `labels()`/`type()`/`keys()`/`properties()`
+    /// evaluation so IRI compaction matches `db.labels()`: strip the vocab
+    /// prefix when it applies, otherwise keep the full IRI (round-trippable).
+    /// `None` for JSON-LD/SPARQL queries and vocab-less Cypher.
+    pub cypher_vocab: Option<std::sync::Arc<str>>,
 }
 
 impl Query {
@@ -299,6 +326,7 @@ impl Query {
             reasoning: ReasoningConfig::default(),
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 
@@ -320,6 +348,7 @@ impl Query {
             reasoning: self.reasoning.clone(),
             post_values: self.post_values.clone(),
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
         }
     }
 }

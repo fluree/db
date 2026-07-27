@@ -47,6 +47,12 @@ pub struct LeafUpdateInput<'a> {
     pub novelty: &'a [RunRecordV2],
     /// Parallel ops array (same length as `novelty`): 1=assert, 0=retract.
     pub novelty_ops: &'a [u8],
+    /// Superseded events for this leaf's key range, sorted by `order`
+    /// (see [`MergeInput::superseded`]). Every superseded event's identity
+    /// has a winner in `novelty`.
+    pub superseded: &'a [RunRecordV2],
+    /// Parallel ops array for `superseded`.
+    pub superseded_ops: &'a [u8],
     /// Sort order.
     pub order: RunSortOrder,
     /// Graph id (for routing context; not encoded in leaf V3).
@@ -72,6 +78,32 @@ pub struct NewLeafBlob {
 pub struct LeafUpdateOutput {
     /// New leaf blobs (1 in common case; 2+ if splits occurred).
     pub leaves: Vec<NewLeafBlob>,
+    /// Novelty ops whose identity matched an existing base row, aggregated
+    /// across this leaf's merged leaflets (see [`MergeOutput::matched`]).
+    pub matched: Vec<RunRecordV2>,
+}
+
+/// One key range's portion of the winner and superseded streams, sliced
+/// together so the two can never be indexed inconsistently. Constructed
+/// only by the paired slicing functions ([`slice_streams_to_leaflets`],
+/// `slice_streams_to_leaves`), which establish the co-routing invariant at
+/// the single point where slices come into existence: a range without
+/// novelty holds no superseded events, because every superseded identity
+/// routes with its winner.
+///
+/// Co-routing is sound because slicing compares sort-key identity columns
+/// only ([`fluree_db_binary_index::format::run_record_v2::cmp_v2_for_order`]
+/// carries no `t` or `op`): all events of one identity compare equal to
+/// each other and to any boundary key, so a
+/// partition point can never fall between a winner and its superseded
+/// events — a boundary key taken from an existing row cannot sort between
+/// two same-identity events.
+#[derive(Clone, Copy)]
+pub struct StreamSlices<'a> {
+    pub novelty: &'a [RunRecordV2],
+    pub novelty_ops: &'a [u8],
+    pub superseded: &'a [RunRecordV2],
+    pub superseded_ops: &'a [u8],
 }
 
 // ============================================================================
@@ -112,25 +144,29 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
         // No novelty — return the leaf unchanged.
         // The caller should detect this and skip the update entirely,
         // but we handle it gracefully.
+        debug_assert!(
+            input.superseded.is_empty(),
+            "a leaf without novelty cannot hold superseded events: every \
+             superseded identity routes with its winner"
+        );
         return passthrough_entire_leaf(input);
     }
 
     let header = decode_leaf_header_v3(input.leaf_bytes)?;
     let dir = decode_leaf_dir_v3_with_base(input.leaf_bytes, &header)?;
 
-    // Slice novelty to leaflets.
-    let novelty_slices =
-        slice_novelty_to_leaflets(input.novelty, input.novelty_ops, &dir, input.order);
+    let leaflet_slices = slice_streams_to_leaflets(input, &dir);
 
     // Process each leaflet.
     let mut processed: Vec<ProcessedLeafletV3> = Vec::with_capacity(
         header.leaflet_count as usize + input.novelty.len() / input.leaflet_target_rows,
     );
+    let mut matched: Vec<RunRecordV2> = Vec::new();
 
-    for (i, (nov_slice, ops_slice)) in novelty_slices.iter().enumerate() {
+    for (i, slices) in leaflet_slices.iter().enumerate() {
         let entry = &dir.entries[i];
 
-        if nov_slice.is_empty() {
+        if slices.novelty.is_empty() {
             // No novelty overlaps this leaflet — passthrough.
             processed.push(passthrough_leaflet(
                 input.leaf_bytes,
@@ -140,19 +176,55 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
             )?);
         } else {
             // Decode, merge, re-encode.
-            let mut merged =
-                merge_and_encode_leaflet(input, entry, dir.payload_base, nov_slice, ops_slice)?;
+            let mut merged = merge_and_encode_leaflet(
+                input,
+                entry,
+                dir.payload_base,
+                (slices.novelty, slices.novelty_ops),
+                (slices.superseded, slices.superseded_ops),
+                &mut matched,
+            )?;
             processed.append(&mut merged);
         }
     }
 
     // Assemble processed leaflets into leaf blob(s).
-    assemble_output_leaves(processed, input)
+    let mut output = assemble_output_leaves(processed, input)?;
+    output.matched = matched;
+    Ok(output)
 }
 
 // ============================================================================
 // Novelty slicing
 // ============================================================================
+
+/// Slice both streams to leaflets as paired [`StreamSlices`], checking the
+/// co-routing invariant where the slices are created.
+fn slice_streams_to_leaflets<'a>(
+    input: &LeafUpdateInput<'a>,
+    dir: &DecodedLeafDirV3,
+) -> Vec<StreamSlices<'a>> {
+    let novelty = slice_novelty_to_leaflets(input.novelty, input.novelty_ops, dir, input.order);
+    let superseded =
+        slice_novelty_to_leaflets(input.superseded, input.superseded_ops, dir, input.order);
+    novelty
+        .into_iter()
+        .zip(superseded)
+        .map(|((novelty, novelty_ops), (superseded, superseded_ops))| {
+            debug_assert!(
+                !novelty.is_empty() || superseded.is_empty(),
+                "a leaflet without novelty cannot hold superseded events: \
+                     every superseded identity routes with its winner"
+            );
+            StreamSlices {
+                novelty,
+                novelty_ops,
+                superseded,
+                superseded_ops,
+            }
+        })
+        .collect()
+}
 
 /// Slice novelty records and ops to leaflets using half-open boundary intervals.
 ///
@@ -249,6 +321,7 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
                 re_encoded_leaflet_count: 0,
             },
         }],
+        matched: Vec::new(),
     })
 }
 
@@ -288,8 +361,9 @@ fn merge_and_encode_leaflet(
     input: &LeafUpdateInput<'_>,
     entry: &LeafletDirEntryV3,
     payload_base: usize,
-    novelty: &[RunRecordV2],
-    novelty_ops: &[u8],
+    (novelty, novelty_ops): (&[RunRecordV2], &[u8]),
+    (superseded, superseded_ops): (&[RunRecordV2], &[u8]),
+    matched: &mut Vec<RunRecordV2>,
 ) -> io::Result<Vec<ProcessedLeafletV3>> {
     // 1. Load existing leaflet columns.
     let projection = ColumnProjection::all();
@@ -314,12 +388,16 @@ fn merge_and_encode_leaflet(
         existing_history: &existing_history,
         novelty,
         novelty_ops,
+        superseded,
+        superseded_ops,
         order,
     };
     let MergeOutput {
         records: merged,
         history,
+        matched: leaflet_matched,
     } = merge_novelty(&merge_input);
+    matched.extend(leaflet_matched);
 
     // 4. Handle empty-after-retract: valid in V3 (history preserved in sidecar).
     //    Preserve the original leaflet's key range and constants so branch
@@ -475,7 +553,10 @@ fn assemble_output_leaves(
     use fluree_db_binary_index::format::leaflet::EncodedLeaflet;
 
     if processed.is_empty() {
-        return Ok(LeafUpdateOutput { leaves: vec![] });
+        return Ok(LeafUpdateOutput {
+            leaves: vec![],
+            matched: Vec::new(),
+        });
     }
 
     // Convert ProcessedLeafletV3 into (EncodedLeaflet, Vec<HistEntryV2>, was_re_encoded)
@@ -521,7 +602,10 @@ fn assemble_output_leaves(
         output.push(NewLeafBlob { info: leaf_info });
     }
 
-    Ok(LeafUpdateOutput { leaves: output })
+    Ok(LeafUpdateOutput {
+        leaves: output,
+        matched: Vec::new(),
+    })
 }
 
 /// Build a single leaf blob from a group of (EncodedLeaflet, history, was_re_encoded) triples.
@@ -742,6 +826,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &[],
             novelty_ops: &[],
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -768,6 +854,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -833,6 +921,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -845,8 +935,8 @@ mod tests {
         assert_eq!(output.leaves.len(), 1);
         assert_eq!(output.leaves[0].info.total_rows, 3);
 
-        // Verify sidecar was produced (history for the insert).
-        assert!(output.leaves[0].info.sidecar_bytes.is_some());
+        // The inserted row carries its own assert; no history entries exist.
+        assert!(output.leaves[0].info.sidecar_bytes.is_none());
     }
 
     #[test]
@@ -861,6 +951,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -886,6 +978,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -920,6 +1014,8 @@ mod tests {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,
@@ -947,25 +1043,32 @@ mod tests {
 
     /// Regression: when a leaflet splits into multiple chunks, history entries
     /// must be partitioned to the correct chunk (not all in chunk 0).
+    /// Retracting the lowest and highest existing facts produces entries
+    /// (migrated row assert + retract each) at both ends of the key range,
+    /// while the inserts force the split.
     #[test]
     fn test_leaflet_split_partitions_history() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a leaf with a few existing records.
-        let existing = vec![rec2(1, 1, 10, 1), rec2(2, 1, 20, 1), rec2(3, 1, 30, 1)];
+        // Create a leaf with existing records spread across the key range.
+        let existing = vec![rec2(1, 1, 10, 1), rec2(5, 1, 50, 1), rec2(9, 1, 90, 1)];
         let (leaf_bytes, sidecar) = build_test_leaf(&existing, RunSortOrder::Spot);
 
-        // Add enough novelty to force a split (target_rows=3).
+        // Retract both ends; insert enough rows to force a split (target=3).
         let novelty = vec![
-            rec2(4, 1, 40, 5),
-            rec2(5, 1, 50, 5),
+            rec2(1, 1, 10, 5),
+            rec2(2, 1, 20, 5),
+            rec2(3, 1, 30, 5),
             rec2(6, 1, 60, 5),
             rec2(7, 1, 70, 5),
+            rec2(9, 1, 90, 5),
         ];
-        let ops = vec![1u8, 1, 1, 1];
+        let ops = vec![0u8, 1, 1, 1, 1, 0];
 
         let input = LeafUpdateInput {
             leaf_bytes: &leaf_bytes,
             novelty: &novelty,
             novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
             order: RunSortOrder::Spot,
             g_id: 0,
             zstd_level: 1,

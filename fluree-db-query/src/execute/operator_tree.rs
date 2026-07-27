@@ -3357,6 +3357,14 @@ pub(crate) fn apply_solution_modifiers(
             _ => 0,
         };
         let can_topk = limit.is_some();
+        // Deliberately NO scan-side `set_topk` here, unlike the sibling branch
+        // below: the DISTINCT sits BELOW the sort on this path, so k scan rows can
+        // dedup to FEWER than k. Pruning the scan to its top-k by sort key would
+        // drop rows that dedup would have made room for, under-producing DISTINCT
+        // results — so the push-down is unsound here even though `k`/`can_topk` are
+        // computed identically to the sibling. This `SortOperator`'s own
+        // post-DISTINCT top-k stays sound; only the scan-side prune is declined
+        // (mirror of the ASC-declines note in the `else` branch below).
         let mut sort_op = if can_topk {
             SortOperator::new_topk(operator, ordering.to_vec(), k)
         } else {
@@ -3538,6 +3546,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 
@@ -3563,6 +3572,7 @@ mod tests {
             ))],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            cypher_vocab: None,
             grouping: Grouping::assemble(
                 vec![p],
                 vec![AggregateSpec {
@@ -3638,6 +3648,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
 
         let spec =
@@ -3668,6 +3679,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
 
         let result = build_operator_tree(
@@ -3696,6 +3708,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
 
         let result = build_operator_tree(
@@ -3772,6 +3785,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
         let reversed = Query {
             context: ParsedContext::default(),
@@ -3797,6 +3811,7 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         };
         assert_eq!(
             detect_exists_join_count_distinct_object(&counted_first),
@@ -3833,6 +3848,7 @@ mod tests {
             ],
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            cypher_vocab: None,
             grouping: Some(Grouping::Implicit {
                 aggregation: Aggregation {
                     aggregates: fluree_db_core::NonEmpty::try_from_vec(vec![
@@ -3896,6 +3912,7 @@ mod tests {
             patterns,
             reasoning: ReasoningConfig::default(),
             include_system_facts: false,
+            cypher_vocab: None,
             grouping: None,
             ordering,
             order_binds: Vec::new(),

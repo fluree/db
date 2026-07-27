@@ -170,6 +170,8 @@ async fn run_update_branch(
     branch_bytes: Vec<u8>,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
+    sorted_superseded: Vec<RunRecordV2>,
+    sorted_superseded_ops: Vec<u8>,
     branch_config: BranchUpdateConfig,
     content_store: Arc<dyn fluree_db_core::storage::ContentStore>,
     tracker: fluree_db_core::tracking::Tracker,
@@ -311,6 +313,8 @@ async fn run_update_branch(
             &branch_bytes,
             &sorted_records,
             &sorted_ops,
+            &sorted_superseded,
+            &sorted_superseded_ops,
             &branch_config,
             &|cid| {
                 leaf_map
@@ -387,7 +391,26 @@ struct Phase2Task {
     order: RunSortOrder,
     sorted_records: Vec<RunRecordV2>,
     sorted_ops: Vec<u8>,
+    /// Superseded events for this (graph, order), sorted like
+    /// `sorted_records`. Their real-transition subset becomes history-sidecar
+    /// entries in the leaf merge.
+    sorted_superseded: Vec<RunRecordV2>,
+    sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
+}
+
+/// Graph-scoped V2 fact identity: `(g_id, s_id, p_id, o_type, o_key, o_i)`.
+type FactIdentityKey = (u16, u64, u32, u16, u64, u32);
+
+fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
+    (
+        rec.g_id,
+        rec.s_id.as_u64(),
+        rec.p_id,
+        rec.o_type,
+        rec.o_key,
+        rec.o_i,
+    )
 }
 
 enum Phase2TaskUpdate {
@@ -404,6 +427,9 @@ struct Phase2TaskOutput {
     replaced_sidecar_cids: Vec<ContentId>,
     new_leaf_count: usize,
     fetch_stats: Phase2FetchStatsSnapshot,
+    /// Novelty ops whose identity matched an existing base row (SPOT task
+    /// only; fresh-graph tasks have no base rows to match).
+    matched: Vec<RunRecordV2>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -422,6 +448,8 @@ async fn execute_phase2_task(
         order,
         sorted_records,
         sorted_ops,
+        sorted_superseded,
+        sorted_superseded_ops,
         kind,
     } = task;
 
@@ -434,6 +462,9 @@ async fn execute_phase2_task(
             .leaflet_rows
             .max(1)
             .saturating_mul(config.leaflets_per_leaf.max(1)),
+        // Fact identity is order-independent; collect base-row matches from
+        // the SPOT task only (they feed the Phase 3b stats deltas).
+        collect_matched: order == RunSortOrder::Spot,
     };
 
     let started = Instant::now();
@@ -452,6 +483,8 @@ async fn execute_phase2_task(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -472,9 +505,26 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
+                matched: meta.matched,
             }
         }
         Phase2TaskKind::DefaultFresh => {
+            if !sorted_superseded.is_empty() {
+                // Permanent gap: these are real in-window transitions (e.g. a
+                // fact born and deleted between two index builds) and the next
+                // window's novelty never re-sees them. Reachable beyond
+                // genesis — the root format permits graphs with fewer than
+                // four materialized orders, so a newly added order takes this
+                // arm for an existing graph, leaving that order's replay
+                // without history its sibling orders have.
+                tracing::warn!(
+                    g_id,
+                    ?order,
+                    dropped = sorted_superseded.len(),
+                    "fresh default-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
+                );
+            }
             let BranchUpdateResult {
                 leaf_entries,
                 new_leaf_blobs,
@@ -499,6 +549,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: Vec::new(),
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
             }
         }
         Phase2TaskKind::NamedExisting { branch_cid } => {
@@ -513,6 +564,8 @@ async fn execute_phase2_task(
                 branch_bytes,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 branch_config,
                 Arc::clone(&content_store),
                 tracker.clone(),
@@ -537,9 +590,20 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
                 new_leaf_count: meta.new_leaf_count,
                 fetch_stats,
+                matched: meta.matched,
             }
         }
         Phase2TaskKind::NamedFresh => {
+            if !sorted_superseded.is_empty() {
+                // Permanent gap; see the DefaultFresh arm above.
+                tracing::warn!(
+                    g_id,
+                    ?order,
+                    dropped = sorted_superseded.len(),
+                    "fresh named-graph order has no sidecar to merge into; \
+                     dropping this window's intra-window transition history"
+                );
+            }
             let BranchUpdateResult {
                 new_leaf_blobs,
                 replaced_leaf_cids,
@@ -573,6 +637,7 @@ async fn execute_phase2_task(
                 replaced_sidecar_cids,
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
+                matched: Vec::new(),
             }
         }
     };
@@ -689,6 +754,11 @@ pub async fn incremental_index(
     for (idx, rec) in novelty.records.iter().enumerate() {
         by_graph.entry(rec.g_id).or_default().push(idx);
     }
+    let mut superseded_by_graph: std::collections::BTreeMap<u16, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, rec) in novelty.superseded.iter().enumerate() {
+        superseded_by_graph.entry(rec.g_id).or_default().push(idx);
+    }
 
     let base_root = &novelty.base_root;
     let mut root_builder = IncrementalRootBuilder::from_old_root(novelty.base_root.clone());
@@ -708,6 +778,13 @@ pub async fn incremental_index(
         let indices = &by_graph[&g_id];
         let graph_records: Vec<RunRecordV2> = indices.iter().map(|&i| novelty.records[i]).collect();
         let graph_ops: Vec<u8> = indices.iter().map(|&i| novelty.ops[i]).collect();
+        let superseded_indices = superseded_by_graph.get(&g_id);
+        let graph_superseded: Vec<RunRecordV2> = superseded_indices
+            .map(|idxs| idxs.iter().map(|&i| novelty.superseded[i]).collect())
+            .unwrap_or_default();
+        let graph_superseded_ops: Vec<u8> = superseded_indices
+            .map(|idxs| idxs.iter().map(|&i| novelty.superseded_ops[i]).collect())
+            .unwrap_or_default();
 
         for &order in &all_orders {
             let cmp = cmp_v2_for_order(order);
@@ -716,6 +793,17 @@ pub async fn incremental_index(
             let sorted_records: Vec<RunRecordV2> =
                 sorted_indices.iter().map(|&i| graph_records[i]).collect();
             let sorted_ops: Vec<u8> = sorted_indices.iter().map(|&i| graph_ops[i]).collect();
+            let mut sorted_superseded_indices: Vec<usize> = (0..graph_superseded.len()).collect();
+            sorted_superseded_indices
+                .sort_unstable_by(|&a, &b| cmp(&graph_superseded[a], &graph_superseded[b]));
+            let sorted_superseded: Vec<RunRecordV2> = sorted_superseded_indices
+                .iter()
+                .map(|&i| graph_superseded[i])
+                .collect();
+            let sorted_superseded_ops: Vec<u8> = sorted_superseded_indices
+                .iter()
+                .map(|&i| graph_superseded_ops[i])
+                .collect();
 
             let kind = if g_id == 0 {
                 match base_root
@@ -746,6 +834,8 @@ pub async fn incremental_index(
                 order,
                 sorted_records,
                 sorted_ops,
+                sorted_superseded,
+                sorted_superseded_ops,
                 kind,
             });
         }
@@ -788,9 +878,16 @@ pub async fn incremental_index(
         phase2_results.into_iter().collect::<Result<Vec<_>>>()?;
     phase2_outputs.sort_unstable_by_key(|output| output.seq);
 
+    // Fact identities the SPOT merges matched against existing base rows.
+    // Phase 3b derives materialized-state stat deltas from this: an assert of
+    // a base-present fact and a retract of a base-absent fact change no rows.
+    let mut base_matched: std::collections::HashSet<FactIdentityKey> =
+        std::collections::HashSet::new();
+
     let mut phase2_fetch_totals = Phase2FetchStatsSnapshot::default();
     for output in phase2_outputs {
         total_new_leaves += output.new_leaf_count;
+        base_matched.extend(output.matched.iter().map(fact_identity_key));
         phase2_fetch_totals.leaf_fetches += output.fetch_stats.leaf_fetches;
         phase2_fetch_totals.leaf_cache_hits += output.fetch_stats.leaf_cache_hits;
         phase2_fetch_totals.leaf_cache_misses += output.fetch_stats.leaf_cache_misses;
@@ -1977,11 +2074,16 @@ pub async fn incremental_index(
             }
         }
 
-        // Feed all novelty records.
+        // Feed all novelty records. Counts are base-seeded, so each record's
+        // signed delta reflects its materialized state transition (derived
+        // from the SPOT merge's base-row matches), not its raw op: a
+        // re-assert of a base-present fact and a retract of a base-absent
+        // fact change no rows and contribute 0.
         for (i, rec) in novelty.records.iter().enumerate() {
             let op = novelty.ops[i];
             let sr = stats::stats_record_from_v2(rec, op);
-            stats_hook.on_record(&sr);
+            let base_present = base_matched.contains(&fact_identity_key(rec));
+            stats_hook.on_record_with_base_presence(&sr, base_present);
         }
 
         // Upload HLL sketches (before finalize consumes the hook).
@@ -2767,13 +2869,20 @@ pub async fn incremental_index(
                             }
                             // Resolve classes for endpoints not already known from this batch
                             // (stable base entities) via one batched rdf:type lookup; endpoints
-                            // in base_subject_classes (re-typed / novelty) use those maps.
+                            // in either batch map (re-typed / novelty) use those maps. A subject
+                            // typed for the FIRST time this batch has no base entry — only a net
+                            // one — so both maps must be checked or it would be mistaken for a
+                            // stable (still class-less) base entity.
                             let mut external_sids: Vec<u64> = Vec::new();
                             for &(s, _p, o) in &edges {
-                                if !base_subject_classes.contains_key(&(g_id, s)) {
+                                if !base_subject_classes.contains_key(&(g_id, s))
+                                    && !subject_classes.contains_key(&(g_id, s))
+                                {
                                     external_sids.push(s);
                                 }
-                                if !base_subject_classes.contains_key(&(g_id, o)) {
+                                if !base_subject_classes.contains_key(&(g_id, o))
+                                    && !subject_classes.contains_key(&(g_id, o))
+                                {
                                     external_sids.push(o);
                                 }
                             }
@@ -2805,11 +2914,21 @@ pub async fn incremental_index(
                             };
                             // (base_classes, net_classes) for an endpoint. A stable base
                             // entity has base == net (its type did not change this batch).
+                            // Batch-local membership is keyed on EITHER map: a first-time-typed
+                            // subject is absent from base but present in net; keying on base
+                            // alone would resolve it externally as class-less and drop the +1
+                            // side of its edge moves.
                             let resolve = |sid: u64| -> (Vec<u64>, Vec<u64>) {
-                                if let Some(b) = base_subject_classes.get(&(g_id, sid)) {
-                                    let base: Vec<u64> = b.iter().copied().collect();
+                                let key = (g_id, sid);
+                                if base_subject_classes.contains_key(&key)
+                                    || subject_classes.contains_key(&key)
+                                {
+                                    let base: Vec<u64> = base_subject_classes
+                                        .get(&key)
+                                        .map(|b| b.iter().copied().collect())
+                                        .unwrap_or_default();
                                     let net: Vec<u64> = subject_classes
-                                        .get(&(g_id, sid))
+                                        .get(&key)
                                         .map(|s| s.iter().copied().collect())
                                         .unwrap_or_default();
                                     (base, net)
@@ -4049,6 +4168,7 @@ fn build_fresh_default_graph_v3(
         replaced_sidecar_cids: Vec::new(),
         branch_bytes,
         branch_cid,
+        matched: Vec::new(),
     })
 }
 

@@ -52,6 +52,7 @@ pub fn lower_query<E: IriEncoder>(
         post_values: None,
         // System-fact filter ON — hides f:reifies* from untyped relationship matches.
         include_system_facts: false,
+        cypher_vocab: None,
     })
 }
 
@@ -144,6 +145,7 @@ fn lower_union_query<E: IriEncoder>(
         reasoning: Default::default(),
         post_values: None,
         include_system_facts: false,
+        cypher_vocab: None,
     })
 }
 
@@ -686,7 +688,8 @@ fn expr_touches_list<E: IriEncoder>(
         | Expr::In(a, b, _)
         | Expr::StartsWith(a, b, _)
         | Expr::EndsWith(a, b, _)
-        | Expr::Contains(a, b, _) => {
+        | Expr::Contains(a, b, _)
+        | Expr::RegexMatch(a, b, _) => {
             expr_touches_list(ctx, a, list_outputs) || expr_touches_list(ctx, b, list_outputs)
         }
         Expr::UnaryOp(_, a, _)
@@ -753,6 +756,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => expr_has_aggregate(l) || expr_has_aggregate(r),
         Expr::UnaryOp(_, x, _)
         | Expr::IsNull(x, _)
@@ -841,6 +845,7 @@ fn extract_aggregates_inner<E: IriEncoder>(
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             extract_aggregates_inner(ctx, l, patterns, aggregates, counter, false)?;
             extract_aggregates_inner(ctx, r, patterns, aggregates, counter, false)
@@ -916,6 +921,7 @@ fn composite_references_grouping_value(e: &Expr) -> bool {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             composite_references_grouping_value(l) || composite_references_grouping_value(r)
         }
@@ -1486,7 +1492,13 @@ fn lower_call_branch<E: IriEncoder>(
     }
 
     match branch.into_subquery_pattern(select) {
-        Pattern::Subquery(sq) => Ok((sq, return_vars)),
+        // Pin the CALL imports: openCypher defines `CALL (p)` as a per-row
+        // lateral binding, so `p` must be SEEDED even when the body binds it
+        // only via OPTIONAL MATCH (the shared engine's Family-B rule would
+        // otherwise leave it unseeded and reconcile at merge, dropping a
+        // zero-match parent that `OPTIONAL MATCH … RETURN count(…)` must
+        // retain as 0).
+        Pattern::Subquery(sq) => Ok((sq.with_pinned_vars(import_vars.to_vec()), return_vars)),
         _ => unreachable!("into_subquery_pattern always yields Pattern::Subquery"),
     }
 }

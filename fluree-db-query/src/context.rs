@@ -207,6 +207,11 @@ pub struct ExecutionContext<'a> {
     /// `false`. Surfaced through `opts.includeSystemFacts: true` on
     /// JSON-LD queries.
     pub include_system_facts: bool,
+    /// `@vocab` prefix a Cypher query was lowered against (from
+    /// `Query::cypher_vocab`). Used by `labels()`/`type()`/`keys()`
+    /// evaluation to compact IRIs the way `db.labels()` does: strip the
+    /// vocab prefix, otherwise return the full IRI.
+    pub cypher_vocab: Option<Arc<str>>,
     /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
     /// IRI template over the FK join columns is rendered directly from the child
     /// row's FK columns, skipping the parent-table scan and its referential
@@ -379,6 +384,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -434,6 +440,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -493,6 +500,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -541,6 +549,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -588,6 +597,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -637,6 +647,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -1200,6 +1211,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1258,6 +1270,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1312,6 +1325,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,

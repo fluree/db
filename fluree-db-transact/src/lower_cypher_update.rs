@@ -92,6 +92,12 @@ pub struct CypherLowerOpts {
     /// read-path `LoweringContext::overrides`, ensuring write Cypher
     /// honors the same ledger context mappings as read Cypher.
     pub overrides: std::collections::HashMap<String, String>,
+    /// Variables the caller binds externally by appending a
+    /// `UnresolvedPattern::Values` row block to the lowered `Txn`'s
+    /// `where_patterns` (see the Cypher sequential write driver). Lowering
+    /// treats them as bound — templates may reference them, SET/REMOVE
+    /// target checks pass — and flips the transaction into `Update` mode.
+    pub seeded_vars: Vec<String>,
 }
 
 /// Lower a parsed Cypher AST to a `Txn`. Only valid for write
@@ -170,19 +176,26 @@ struct CypherLowering<'a> {
 
 impl<'a> CypherLowering<'a> {
     fn new(ns: &'a mut NamespaceRegistry, opts: TxnOpts, cypher_opts: CypherLowerOpts) -> Self {
+        let seeded = !cypher_opts.seeded_vars.is_empty();
         Self {
             ns,
             vocab: cypher_opts.vocab,
             overrides: cypher_opts.overrides,
             vars: VarRegistry::new(),
-            txn_type: TxnType::Insert,
+            // Seeded statements are WHERE-driven (the caller appends the row
+            // block), so they stage as updates even with no read clauses.
+            txn_type: if seeded {
+                TxnType::Update
+            } else {
+                TxnType::Insert
+            },
             where_patterns: Vec::new(),
             delete_templates: Vec::new(),
             insert_templates: Vec::new(),
             opts,
             bnode_counter: 0,
             synth_counter: 0,
-            bound_vars: std::collections::HashSet::new(),
+            bound_vars: cypher_opts.seeded_vars.into_iter().collect(),
             rel_var_edges: std::collections::HashMap::new(),
             created_rel_vars: std::collections::HashSet::new(),
             node_subject_cache: std::collections::HashMap::new(),
@@ -205,6 +218,7 @@ impl<'a> CypherLowering<'a> {
             txn_meta: Vec::new(),
             graph_delta: Default::default(),
             namespace_delta: std::collections::HashMap::new(),
+            graph_mgmt: None,
         }
     }
 
@@ -307,11 +321,16 @@ impl<'a> CypherLowering<'a> {
             ));
         }
 
+        // Externally-seeded columns (`CypherLowerOpts::seeded_vars`) bind
+        // variables the same way a read clause would — captured before the
+        // read clauses add their own MATCH vars.
+        let seeded = !self.bound_vars.is_empty();
+
         // Lower any leading MATCH / OPTIONAL MATCH into where_patterns.
         // Their presence flips the transaction into Update mode (DELETE /
         // INSERT templates reference the bound variables).
-        let has_match = !update.read_clauses.is_empty();
-        if has_match {
+        let has_match = !update.read_clauses.is_empty() || seeded;
+        if !update.read_clauses.is_empty() {
             self.lower_read_clauses(&update.read_clauses)?;
             self.txn_type = TxnType::Update;
         }
@@ -390,6 +409,9 @@ impl<'a> CypherLowering<'a> {
                 // rewrite). Bind each column as a VALUES block; the MATCH and
                 // CREATE/SET templates then fire once per row.
                 ReadClause::InlineRows { vars, rows } => {
+                    for v in vars {
+                        self.bound_vars.insert(v.name.clone());
+                    }
                     let value_vars: Vec<Arc<str>> = vars
                         .iter()
                         .map(|v| Arc::from(var_name(&v.name).as_str()))
@@ -817,6 +839,21 @@ impl<'a> CypherLowering<'a> {
                 let l = self.lower_filter_expr(l, aux)?;
                 let r = self.lower_filter_expr(r, aux)?;
                 Ok(unresolved_call("contains", vec![l, r]))
+            }
+            Expr::RegexMatch(l, r, _) => {
+                // Neo4j `=~` is a whole-string match; REGEX is partial —
+                // anchor with a non-capturing group (same as the read path).
+                let l = self.lower_filter_expr(l, aux)?;
+                let r = self.lower_filter_expr(r, aux)?;
+                let anchored = unresolved_call(
+                    "concat",
+                    vec![
+                        UnresolvedExpression::string("^(?:"),
+                        r,
+                        UnresolvedExpression::string(")$"),
+                    ],
+                );
+                Ok(unresolved_call("regex", vec![l, anchored]))
             }
             Expr::List(items, _) => {
                 let args = items

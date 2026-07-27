@@ -25,6 +25,8 @@ pub fn eval_abs<R: RowAccess>(
         Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(Box::new(
             n.magnitude().clone().into(),
         )))),
+        // xsd:float stays xsd:float (fn:abs is type-preserving).
+        Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(f.abs()))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
@@ -52,6 +54,12 @@ pub fn eval_round<R: RowAccess>(
             let rounded = (&*d + &half).with_scale_round(0, RoundingMode::Floor);
             Ok(Some(ComparableValue::Decimal(Box::new(rounded))))
         }
+        // xsd:float stays xsd:float; W3C half toward positive infinity (see the
+        // Double arm) — `(f + 0.5).floor()`, not f32::round (half away from zero).
+        Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float((f + 0.5).floor()))),
+        // An xsd:integer beyond i64 is already integral: identity (ABS has the
+        // matching BigInt arm; without this the catch-all returned unbound).
+        Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(n))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
@@ -70,6 +78,10 @@ pub fn eval_ceil<R: RowAccess>(
             let ceiled = d.with_scale_round(0, RoundingMode::Ceiling);
             Ok(Some(ComparableValue::Decimal(Box::new(ceiled))))
         }
+        // xsd:float stays xsd:float (fn:ceiling is type-preserving).
+        Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(f.ceil()))),
+        // Big integers are already integral: identity.
+        Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(n))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
@@ -88,6 +100,10 @@ pub fn eval_floor<R: RowAccess>(
             let floored = d.with_scale_round(0, RoundingMode::Floor);
             Ok(Some(ComparableValue::Decimal(Box::new(floored))))
         }
+        // xsd:float stays xsd:float (fn:floor is type-preserving).
+        Some(ComparableValue::Float(f)) => Ok(Some(ComparableValue::Float(f.floor()))),
+        // Big integers are already integral: identity.
+        Some(ComparableValue::BigInt(n)) => Ok(Some(ComparableValue::BigInt(n))),
         None => Ok(None),
         Some(_) => Ok(None),
     }
@@ -108,6 +124,7 @@ fn numeric_f64(v: &ComparableValue) -> Option<f64> {
     match v.clone().coerce_numeric_operand() {
         ComparableValue::Long(n) => Some(n as f64),
         ComparableValue::Double(d) => Some(d),
+        ComparableValue::Float(f) => Some(f as f64),
         ComparableValue::Decimal(d) => d.to_string().parse().ok(),
         ComparableValue::BigInt(n) => n.to_string().parse().ok(),
         _ => None,

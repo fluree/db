@@ -338,12 +338,28 @@ impl CompareOp {
                 None => return Ok(Some(ComparableValue::Bool(false))),
             };
 
-            let satisfied = match cmp_values(&prev, &curr) {
-                Some(ord) => self.satisfies(ord),
-                None => match self {
-                    CompareOp::Eq => false,
-                    CompareOp::Ne => true,
-                    _ => {
+            let satisfied = match self {
+                // `=`/`!=` follow RDFterm-equal / the SPARQL operator mapping:
+                // value equality with numeric promotion, plain = xsd:string, and
+                // case-insensitive language tags; incomparable operands (an
+                // unrecognized/ill-typed datatype that might still denote the same
+                // value) are a type error that excludes the row for BOTH `=` and
+                // `!=` (open-eq-04..12, eq-2/4, eq-graph, eq-dateTime).
+                CompareOp::Eq | CompareOp::Ne => match rdf_term_equal(&prev, &curr) {
+                    EqOutcome::Eq => matches!(self, CompareOp::Eq),
+                    EqOutcome::Ne => matches!(self, CompareOp::Ne),
+                    EqOutcome::TypeError => {
+                        return Err(ComparisonError::TypeMismatch {
+                            operator: self.symbol(),
+                            left_type: prev.type_name(),
+                            right_type: curr.type_name(),
+                        }
+                        .into())
+                    }
+                },
+                _ => match cmp_values(&prev, &curr) {
+                    Some(ord) => self.satisfies(ord),
+                    None => {
                         return Err(ComparisonError::TypeMismatch {
                             operator: self.symbol(),
                             left_type: prev.type_name(),
@@ -369,6 +385,18 @@ impl CompareOp {
 /// Returns `None` for type mismatches (incomparable types).
 /// Delegates to FlakeValue's comparison methods for numeric and temporal types.
 fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Ordering> {
+    cmp_values_inner(left, right, true)
+}
+
+/// Ordering of two comparable values. `temporal_string_coerce` enables parsing
+/// a plain string as a temporal to order it against a typed temporal (a LEX_ID
+/// storage aid, used for `<`/`>`); it is disabled for `=`/`!=`, where a plain
+/// string is never value-equal to a temporal (eq-dateTime).
+fn cmp_values_inner(
+    left: &ComparableValue,
+    right: &ComparableValue,
+    temporal_string_coerce: bool,
+) -> Option<Ordering> {
     // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float, whose
     // value is stored string-backed) into their primitive numeric variant so the
     // numeric comparison below applies — mirroring arithmetic's operand coercion.
@@ -397,10 +425,12 @@ fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Orderin
         return Some(ordering);
     }
 
-    // Cross-type coercion: when one side is a temporal type and the other
-    // is a string, try to parse the string as that temporal type.
-    if let Some(ordering) = try_coerce_temporal_string_cmp(&left_fv, &right_fv) {
-        return Some(ordering);
+    // Cross-type coercion: when one side is a temporal type and the other is a
+    // string, try to parse the string as that temporal type (ordering only).
+    if temporal_string_coerce {
+        if let Some(ordering) = try_coerce_temporal_string_cmp(&left_fv, &right_fv) {
+            return Some(ordering);
+        }
     }
 
     // Fall back to same-type comparisons for non-numeric, non-temporal types
@@ -411,6 +441,134 @@ fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Orderin
         (ComparableValue::Iri(a), ComparableValue::Iri(b)) => Some(a.cmp(b)),
         // Type mismatch
         _ => None,
+    }
+}
+
+/// Outcome of RDFterm-equal (`=` / `!=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EqOutcome {
+    /// Equal (value equality, or the same term).
+    Eq,
+    /// Known to be different.
+    Ne,
+    /// A type error — an unrecognized / ill-typed datatype that might still
+    /// denote the same value; excludes the row for BOTH `=` and `!=`.
+    TypeError,
+}
+
+/// Equality kind of a value, for the RDFterm-equal fallback used when two
+/// operands are not value-comparable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EqKind {
+    Numeric,
+    Str,
+    Bool,
+    Temporal,
+    Resource,
+    Lang,
+    Foreign,
+    Other,
+}
+
+impl EqKind {
+    /// A recognized value type (numeric / string / boolean / temporal): two
+    /// distinct recognized types are known-unequal rather than a type error.
+    fn recognized(self) -> bool {
+        matches!(
+            self,
+            EqKind::Numeric | EqKind::Str | EqKind::Bool | EqKind::Temporal
+        )
+    }
+}
+
+fn eq_kind(v: &ComparableValue) -> EqKind {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    match v {
+        ComparableValue::Long(_)
+        | ComparableValue::Double(_)
+        | ComparableValue::Float(_)
+        | ComparableValue::BigInt(_)
+        | ComparableValue::Decimal(_) => EqKind::Numeric,
+        ComparableValue::String(_) => EqKind::Str,
+        ComparableValue::Bool(_) => EqKind::Bool,
+        ComparableValue::DateTime(_) | ComparableValue::Date(_) | ComparableValue::Time(_) => {
+            EqKind::Temporal
+        }
+        ComparableValue::Sid(_) | ComparableValue::Iri(_) => EqKind::Resource,
+        ComparableValue::TypedLiteral { dtc, .. } => match dtc {
+            Some(U::LangTag(_)) => EqKind::Lang,
+            Some(U::Explicit(_)) => EqKind::Foreign,
+            None => EqKind::Str,
+        },
+        ComparableValue::Vector(_) | ComparableValue::GeoPoint(_) => EqKind::Other,
+    }
+}
+
+/// `(lexical form, language tag)` of a language-tagged literal.
+fn lang_parts(v: &ComparableValue) -> Option<(&str, &str)> {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    match v {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            dtc: Some(U::LangTag(tag)),
+        } => Some((s.as_str(), tag.as_ref())),
+        _ => None,
+    }
+}
+
+/// SPARQL RDFterm-equal (`=`, and negated, `!=`): §17.4.1.7 and the §17.3
+/// operator mapping. Returns a three-valued outcome so an incomparable pair is
+/// a type error (excluding the row) rather than silently `false`/`true`.
+pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
+    // XPath op:numeric-equal (F&O §4.2.3): NaN is not equal to anything,
+    // including itself — `NaN = NaN` is false and `NaN != NaN` is true. The
+    // numeric fast path below bottoms out in `numeric_cmp`'s bit-level total
+    // order (wanted for ORDER BY stability), which reports two identical-bit
+    // NaNs as Equal, so the equality entry point must catch NaN first. Scoped
+    // to numeric-vs-numeric so NaN vs an unrecognized-datatype literal still
+    // reaches the TypeError arm below. (A NaN hidden in a string-backed
+    // `TypedLiteral` — `STRDT("NaN", xsd:double)` — still takes the coercing
+    // fast path; accepted corner.)
+    let is_nan = |v: &ComparableValue| {
+        matches!(v, ComparableValue::Double(d) if d.is_nan())
+            || matches!(v, ComparableValue::Float(f) if f.is_nan())
+    };
+    if (is_nan(a) || is_nan(b)) && eq_kind(a) == EqKind::Numeric && eq_kind(b) == EqKind::Numeric {
+        return EqOutcome::Ne;
+    }
+    // Value-comparable fast path: numeric promotion, string, boolean, temporal.
+    // No plain-string↔temporal coercion (equality, not ordering).
+    if let Some(ord) = cmp_values_inner(a, b, false) {
+        return if ord == Ordering::Equal {
+            EqOutcome::Eq
+        } else {
+            EqOutcome::Ne
+        };
+    }
+    // Same term (reflexivity): equal even for ill-typed / unrecognized literals.
+    if a == b {
+        return EqOutcome::Eq;
+    }
+    match (eq_kind(a), eq_kind(b)) {
+        // Both language-tagged: equal iff same lexical form and same tag (tags
+        // compared case-insensitively). Same-term already handled above.
+        (EqKind::Lang, EqKind::Lang) => match (lang_parts(a), lang_parts(b)) {
+            (Some((la, ta)), Some((lb, tb))) if la == lb && ta.eq_ignore_ascii_case(tb) => {
+                EqOutcome::Eq
+            }
+            _ => EqOutcome::Ne,
+        },
+        // A resource is never equal to a literal or a different resource (the
+        // same resource is caught by the value path / same-term above).
+        (EqKind::Resource, _) | (_, EqKind::Resource) => EqOutcome::Ne,
+        // A language-tagged literal vs a non-language literal → known different.
+        (EqKind::Lang, _) | (_, EqKind::Lang) => EqOutcome::Ne,
+        // Two recognized but differently-typed value literals (e.g. string vs
+        // number) → known different.
+        (ka, kb) if ka.recognized() && kb.recognized() => EqOutcome::Ne,
+        // Otherwise at least one operand has an unrecognized / ill-typed datatype
+        // that might still denote the same value → type error.
+        _ => EqOutcome::TypeError,
     }
 }
 
@@ -507,6 +665,44 @@ mod tests {
         let string = ComparableValue::String(Arc::from("10"));
         // Type mismatch returns None
         assert_eq!(cmp_values(&long, &string), None);
+    }
+
+    // XPath op:numeric-equal: NaN is never equal, including to itself; `!=`
+    // is therefore true. numeric_cmp's bit-level total order (kept for ORDER
+    // BY) would otherwise report identical-bit NaNs as Equal.
+    #[test]
+    fn test_rdf_term_equal_nan_is_never_equal() {
+        let d_nan = ComparableValue::Double(f64::NAN);
+        let f_nan = ComparableValue::Float(f32::NAN);
+        let one = ComparableValue::Double(1.0);
+        assert_eq!(rdf_term_equal(&d_nan, &d_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&f_nan, &f_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&d_nan, &f_nan), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&d_nan, &one), EqOutcome::Ne);
+        assert_eq!(rdf_term_equal(&one, &d_nan), EqOutcome::Ne);
+        assert_eq!(
+            rdf_term_equal(&d_nan, &ComparableValue::Long(1)),
+            EqOutcome::Ne
+        );
+    }
+
+    // The NaN carve-out is equality-only: the ORDER BY total order still
+    // places identical-bit NaNs as Equal (stability), and NaN vs a
+    // non-numeric operand keeps its existing outcome (recognized pair → Ne
+    // via the kind table; unrecognized-datatype literal stays a TypeError).
+    #[test]
+    fn test_nan_scope_is_equality_only() {
+        let d_nan = ComparableValue::Double(f64::NAN);
+        assert_eq!(cmp_values(&d_nan, &d_nan), Some(Ordering::Equal));
+        let s = ComparableValue::String(Arc::from("NaN"));
+        assert_eq!(rdf_term_equal(&d_nan, &s), EqOutcome::Ne);
+        let foreign = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("x".to_string()),
+            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                Arc::from("http://example.org/dt"),
+            )),
+        };
+        assert_eq!(rdf_term_equal(&d_nan, &foreign), EqOutcome::TypeError);
     }
 
     // =========================================================================

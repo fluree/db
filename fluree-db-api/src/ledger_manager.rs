@@ -1045,6 +1045,38 @@ impl LedgerManager {
         Some(RunningAttachmentEvents { coverage, events })
     }
 
+    /// Side-effect-free variant of `get_or_load` +
+    /// [`Self::try_running_attachment_events`] for a ledger that is NOT
+    /// resident in the cache: load a transient `LedgerState` straight from
+    /// the backend (never inserted into the cache — cache insertion from a
+    /// background context disturbs the running handle's novelty
+    /// bookkeeping; see
+    /// `it_select_star_novelty_retract::expansion_applies_novelty_retractions`)
+    /// and snapshot its attachment events. The load replays every
+    /// post-index commit into the transient novelty, so a never-indexed
+    /// ledger yields the complete event history (`Authoritative` at
+    /// `snapshot.t == 0`) — exactly what a first background index build
+    /// needs to seal an authoritative arena for a write-only ingest flow.
+    pub async fn transient_attachment_events(
+        &self,
+        ledger_id: &str,
+    ) -> Option<RunningAttachmentEvents> {
+        let canonical_alias =
+            normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        let state = LedgerState::load(&self.nameservice_mode, &canonical_alias, &self.backend)
+            .await
+            .ok()?;
+        // Same coverage heuristic as `try_running_attachment_events`: a
+        // fresh load at snapshot.t == 0 walked every commit since genesis.
+        let coverage = if state.snapshot.t == 0 {
+            RunningCoverage::Authoritative
+        } else {
+            RunningCoverage::Augment
+        };
+        let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
+        Some(RunningAttachmentEvents { coverage, events })
+    }
+
     /// Return a read-only `LedgerView` for a currently-loaded ledger
     /// without forcing a load. Returns `None` when the ledger isn't
     /// in the cache.

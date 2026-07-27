@@ -4729,7 +4729,9 @@ async fn sparql_float_divided_by_integer_promotes() {
         .await
         .expect("float / integer query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!([[2.5]]));
+    // xsd:float(10) / 4 = 2.5; xsd:float has no bare-number JSON form (unlike
+    // xsd:double), so it round-trips as an explicit typed literal preserving the type.
+    assert_eq!(jsonld, json!([[{"@value": "2.5", "@type": "xsd:float"}]]));
 }
 
 #[tokio::test]

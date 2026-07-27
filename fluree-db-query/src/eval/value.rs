@@ -142,6 +142,27 @@ impl ArithmeticOp {
                 };
                 Ok(ComparableValue::Double(result))
             }
+            // Float <op> Float = Float (xsd:float stays float under promotion)
+            (ComparableValue::Float(a), ComparableValue::Float(b)) => {
+                let result = match self {
+                    ArithmeticOp::Add => a + b,
+                    ArithmeticOp::Sub => a - b,
+                    ArithmeticOp::Mul => a * b,
+                    ArithmeticOp::Mod => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a % b
+                    }
+                    ArithmeticOp::Div => {
+                        if b == 0.0 {
+                            return Err(ArithmeticError::DivideByZero);
+                        }
+                        a / b
+                    }
+                };
+                Ok(ComparableValue::Float(result))
+            }
             // BigInt <op> BigInt
             (ComparableValue::BigInt(a), ComparableValue::BigInt(b)) => match self {
                 ArithmeticOp::Add => Ok(ComparableValue::BigInt(Box::new(*a + &*b))),
@@ -231,21 +252,50 @@ impl ArithmeticOp {
                 let af = a.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
                 self.apply(ComparableValue::Double(af), ComparableValue::Double(b))
             }
-            // Double <-> Decimal -> Decimal (if possible)
+            // Double <-> Decimal -> Double. xsd:double is the widest type in the
+            // XPath promotion lattice (integer < decimal < float < double), so a
+            // double∘decimal is a double, not a decimal (tP-03/29, expr-ops).
             (ComparableValue::Double(a), ComparableValue::Decimal(b)) => {
-                let ad = BigDecimal::try_from(a).map_err(|_| ArithmeticError::TypeMismatch)?;
-                self.apply(
-                    ComparableValue::Decimal(Box::new(ad)),
-                    ComparableValue::Decimal(b),
-                )
+                let bd = b.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Double(a), ComparableValue::Double(bd))
             }
             (ComparableValue::Decimal(a), ComparableValue::Double(b)) => {
-                let bd = BigDecimal::try_from(b).map_err(|_| ArithmeticError::TypeMismatch)?;
-                self.apply(
-                    ComparableValue::Decimal(a),
-                    ComparableValue::Decimal(Box::new(bd)),
-                )
+                let ad = a.to_f64().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Double(ad), ComparableValue::Double(b))
             }
+            // Float <-> {Long, BigInt, Decimal} -> Float; Float <-> Double ->
+            // Double. Per XPath, integer/decimal promote up to float, and float
+            // promotes up to double (tP-04/05/21/30, unplus-2/unminus-2).
+            (ComparableValue::Float(a), ComparableValue::Long(b)) => {
+                self.apply(ComparableValue::Float(a), ComparableValue::Float(b as f32))
+            }
+            (ComparableValue::Long(a), ComparableValue::Float(b)) => {
+                self.apply(ComparableValue::Float(a as f32), ComparableValue::Float(b))
+            }
+            (ComparableValue::Float(a), ComparableValue::BigInt(b)) => {
+                let bf = b.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(a), ComparableValue::Float(bf))
+            }
+            (ComparableValue::BigInt(a), ComparableValue::Float(b)) => {
+                let af = a.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(af), ComparableValue::Float(b))
+            }
+            (ComparableValue::Float(a), ComparableValue::Decimal(b)) => {
+                let bf = b.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(a), ComparableValue::Float(bf))
+            }
+            (ComparableValue::Decimal(a), ComparableValue::Float(b)) => {
+                let af = a.to_f32().ok_or(ArithmeticError::TypeMismatch)?;
+                self.apply(ComparableValue::Float(af), ComparableValue::Float(b))
+            }
+            (ComparableValue::Float(a), ComparableValue::Double(b)) => self.apply(
+                ComparableValue::Double(a as f64),
+                ComparableValue::Double(b),
+            ),
+            (ComparableValue::Double(a), ComparableValue::Float(b)) => self.apply(
+                ComparableValue::Double(a),
+                ComparableValue::Double(b as f64),
+            ),
             // Non-numeric types can't do arithmetic
             _ => Err(ArithmeticError::TypeMismatch),
         }
@@ -260,6 +310,11 @@ impl ArithmeticOp {
 pub enum ComparableValue {
     Long(i64),
     Double(f64),
+    /// xsd:float, kept distinct from Double so XPath numeric promotion keeps a
+    /// float result float (float∘{integer,decimal,float}→float) while
+    /// float∘double→double. xsd:float is *stored* as f64 (`coerce.rs`); the f32
+    /// here only tags the type — arithmetic/comparison widen to f64 as needed.
+    Float(f32),
     String(Arc<str>),
     Bool(bool),
     Sid(fluree_db_core::Sid),
@@ -294,6 +349,7 @@ impl From<ComparableValue> for bool {
             ComparableValue::Iri(s) => !s.is_empty(),
             ComparableValue::Long(n) => n != 0,
             ComparableValue::Double(d) => !d.is_nan() && d != 0.0,
+            ComparableValue::Float(f) => !f.is_nan() && f != 0.0,
             ComparableValue::BigInt(n) => !n.is_zero(),
             ComparableValue::Decimal(d) => !d.is_zero(),
             // Other types: Sid, Vector, DateTime, etc. are truthy if present
@@ -308,6 +364,7 @@ impl ComparableValue {
         match self {
             ComparableValue::Long(_) => "long",
             ComparableValue::Double(_) => "double",
+            ComparableValue::Float(_) => "float",
             ComparableValue::String(_) => "string",
             ComparableValue::Bool(_) => "boolean",
             ComparableValue::Sid(_) => "sid",
@@ -353,6 +410,13 @@ impl ComparableValue {
                 // TypeMismatch in `apply`.
                 if let Some(UnresolvedDatatypeConstraint::Explicit(iri)) = &dtc {
                     if let Ok(coerced) = coerce_value(FlakeValue::String(s.clone()), iri.as_ref()) {
+                        // xsd:float coerces (via coerce.rs) to an f64; tag it
+                        // Float so promotion keeps a float result float.
+                        if iri.as_ref() == fluree_vocab::xsd::FLOAT {
+                            if let FlakeValue::Double(d) = coerced {
+                                return ComparableValue::Float(d as f32);
+                            }
+                        }
                         if let Ok(
                             cv @ (ComparableValue::Long(_)
                             | ComparableValue::Double(_)
@@ -404,6 +468,9 @@ impl ComparableValue {
             )))),
             ComparableValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
             ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+            ComparableValue::Float(f) => Some(ComparableValue::String(Arc::from(
+                super::cast::format_f32(f),
+            ))),
             ComparableValue::Bool(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
             ComparableValue::BigInt(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
             ComparableValue::Decimal(d) => {
@@ -472,6 +539,12 @@ impl ComparableValue {
             ComparableValue::Double(d) => Ok(Binding::lit(
                 FlakeValue::Double(d),
                 datatypes.xsd_double.clone(),
+            )),
+            // xsd:float renders its lexical form from the f32 (avoiding f64
+            // display artifacts) and carries the xsd:float datatype.
+            ComparableValue::Float(f) => Ok(Binding::lit(
+                FlakeValue::String(super::cast::format_f32(f)),
+                datatypes.xsd_float.clone(),
             )),
             ComparableValue::String(s) => Ok(Binding::lit(
                 FlakeValue::String(s.to_string()),
@@ -664,6 +737,7 @@ impl From<ComparableValue> for FlakeValue {
         match val {
             ComparableValue::Long(n) => FlakeValue::Long(n),
             ComparableValue::Double(d) => FlakeValue::Double(d),
+            ComparableValue::Float(f) => FlakeValue::Double(f as f64),
             ComparableValue::String(s) => FlakeValue::String(s.to_string()),
             ComparableValue::Bool(b) => FlakeValue::Boolean(b),
             ComparableValue::Sid(sid) => FlakeValue::Ref(sid),
@@ -685,6 +759,7 @@ impl From<&ComparableValue> for FlakeValue {
         match val {
             ComparableValue::Long(n) => FlakeValue::Long(*n),
             ComparableValue::Double(d) => FlakeValue::Double(*d),
+            ComparableValue::Float(f) => FlakeValue::Double(*f as f64),
             ComparableValue::String(s) => FlakeValue::String(s.to_string()),
             ComparableValue::Bool(b) => FlakeValue::Boolean(*b),
             ComparableValue::Sid(sid) => FlakeValue::Ref(sid.clone()),
@@ -770,8 +845,9 @@ mod tests {
 
     #[test]
     fn test_arithmetic_float_typed_literal_promotes() {
-        // Bug repro: xsd:float(?a) is carried as a String-backed TypedLiteral.
-        // Dividing it by an integer must promote, not error with TypeMismatch.
+        // xsd:float(?a) is carried as a String-backed TypedLiteral. Dividing it
+        // by an integer promotes to xsd:float (float∘integer→float), keeping the
+        // result float rather than widening to double (D4).
         let float_ten = ComparableValue::TypedLiteral {
             val: FlakeValue::String("10".to_string()),
             dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
@@ -780,7 +856,7 @@ mod tests {
         };
         assert_eq!(
             ArithmeticOp::Div.apply(float_ten, ComparableValue::Long(4)),
-            Ok(ComparableValue::Double(2.5))
+            Ok(ComparableValue::Float(2.5))
         );
     }
 
@@ -822,7 +898,7 @@ mod tests {
         };
         assert_eq!(
             ArithmeticOp::Mul.apply(inf, ComparableValue::Long(2)),
-            Ok(ComparableValue::Double(f64::INFINITY))
+            Ok(ComparableValue::Float(f32::INFINITY))
         );
     }
 

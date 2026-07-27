@@ -306,6 +306,15 @@ pub enum Term {
     /// layer performs that desugaring; contexts that cannot express it
     /// (e.g. UPDATE templates) reject with a clean deferred error.
     QuotedTriple(Box<QuotedTriple>),
+    /// RDF 1.2 triple term *value* `<<( s p o )>>` in object position
+    /// (outside the `rdf:reifies` object slot, which is modelled as
+    /// `GraphPattern::AnnotationTarget`). Accept-then-defer per burn-down
+    /// decision D-1: the parser builds this node honoring the grammar
+    /// guardrails, and lowering rejects it with `not_implemented` — there
+    /// is no first-class triple-term value yet. The object of a triple
+    /// term may itself be a triple term (`Term::TripleTerm`), which is how
+    /// nesting is represented.
+    TripleTerm(Box<crate::ast::annotation::TripleTerm>),
 }
 
 impl Term {
@@ -317,6 +326,7 @@ impl Term {
             Term::Literal(l) => l.span,
             Term::BlankNode(b) => b.span,
             Term::QuotedTriple(q) => q.span,
+            Term::TripleTerm(t) => t.span,
         }
     }
 
@@ -420,6 +430,13 @@ pub enum SubjectTerm {
     BlankNode(BlankNode),
     /// RDF-star quoted triple
     QuotedTriple(QuotedTriple),
+    /// RDF 1.2 triple term *value* `<<( s p o )>>` in subject position
+    /// (accept-then-defer, burn-down decision D-1). The parser accepts it
+    /// only when a predicate-object list follows (a bare `<<( s p o )>> .`
+    /// is not a statement and stays rejected); lowering defers with
+    /// `not_implemented`. A triple term's own subject may never be a triple
+    /// term, so this only occurs at statement-subject depth.
+    TripleTerm(Box<crate::ast::annotation::TripleTerm>),
 }
 
 impl SubjectTerm {
@@ -430,6 +447,7 @@ impl SubjectTerm {
             SubjectTerm::Iri(i) => i.span,
             SubjectTerm::BlankNode(b) => b.span,
             SubjectTerm::QuotedTriple(q) => q.span,
+            SubjectTerm::TripleTerm(t) => t.span,
         }
     }
 }
@@ -449,6 +467,8 @@ impl SubjectTerm {
             SubjectTerm::Iri(i) => Some(Term::Iri(i)),
             SubjectTerm::BlankNode(b) => Some(Term::BlankNode(b)),
             SubjectTerm::QuotedTriple(_) => None,
+            // A triple-term subject carries into object position unchanged.
+            SubjectTerm::TripleTerm(t) => Some(Term::TripleTerm(t)),
         }
     }
 }

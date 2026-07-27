@@ -50,6 +50,7 @@ pub use term::{
     QtReifier, QuotedTriple, Spanned, SubjectTerm, Term, Var,
 };
 pub use update::{
-    DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
-    UpdateOperation, UpdateRequest, UpdateRequestOp, UsingClause,
+    Create, DeleteData, DeleteWhere, GraphMgmtRef, GraphOrDefault, GraphRefAll, GraphTransfer,
+    InsertData, Load, Modify, QuadData, QuadPattern, QuadPatternElement, UpdateOperation,
+    UpdateRequest, UpdateRequestOp, UsingClause,
 };

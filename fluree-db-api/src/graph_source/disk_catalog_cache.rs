@@ -143,6 +143,12 @@ struct PersistedScanFiles {
     estimated_row_count: i64,
     files_selected: usize,
     files_pruned: usize,
+    /// Whether the source snapshot carried merge-on-read delete files (only ever
+    /// `true` when the fail-closed guard was overridden at plan time). Added in
+    /// `CACHE_FORMAT_VERSION` 3; a v2 entry (pre-guard) lacks it and is a clean
+    /// miss under the version check, so it is recomputed through the guard rather
+    /// than served silently (audit F-AUD-1, cache-arm follow-up).
+    has_delete_manifests: bool,
 }
 
 /// On-disk form of the `COUNT(*)` manifest read
@@ -211,7 +217,13 @@ fn pointer_is_usable(
 /// mtime prune, exactly as a superseded `metadata_location`'s entries already are (a
 /// table commit orphans its old key the same way — no new leak class). Bump this
 /// only for a PAYLOAD change; a re-key needs no bump.
-const CACHE_FORMAT_VERSION: u32 = 2;
+///
+/// **v3** = [`PersistedScanFiles`] gained `has_delete_manifests` for the
+/// merge-on-read fail-closed guard (audit F-AUD-1). A v2 `scanfiles` entry was
+/// written BEFORE the guard existed, so it could describe a delete-bearing
+/// snapshot; the version bump makes every v2 entry a clean miss so it is
+/// recomputed THROUGH the guard rather than served silently by a cache-hit arm.
+const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// Versioned on-disk envelope. The version is checked before the payload is
 /// trusted; a mismatch (or any deserialize failure) is a miss, never an error.
@@ -400,6 +412,7 @@ impl DiskCatalogCache {
             estimated_row_count: p.estimated_row_count,
             files_selected: p.files_selected,
             files_pruned: p.files_pruned,
+            has_delete_manifests: p.has_delete_manifests,
         }))
     }
 
@@ -412,6 +425,7 @@ impl DiskCatalogCache {
             estimated_row_count: sf.estimated_row_count,
             files_selected: sf.files_selected,
             files_pruned: sf.files_pruned,
+            has_delete_manifests: sf.has_delete_manifests,
         };
         self.write(metadata_location, "scanfiles", &p);
     }
@@ -578,6 +592,7 @@ mod tests {
             estimated_row_count: 30,
             files_selected: 2,
             files_pruned: 5,
+            has_delete_manifests: false,
         };
         cache.put_scan_files(loc, &sf);
         let got = cache.get_scan_files(loc).expect("hit after put");
@@ -586,6 +601,7 @@ mod tests {
         assert_eq!(got.files_selected, 2);
         assert_eq!(got.files_pruned, 5);
         assert_eq!(got.data_files[0].record_count, 23);
+        assert!(!got.has_delete_manifests, "delete flag round-trips");
         // A different (content-addressed) location is a clean miss.
         assert!(cache
             .get_scan_files("s3://bucket/warehouse/t/metadata/00043-def.metadata.json")
@@ -785,11 +801,41 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
         assert!(
             cache.get_count_stats(loc).is_none(),
-            "a v1-versioned entry is a miss under CACHE_FORMAT_VERSION = 2"
+            "a v1-versioned entry is a miss under CACHE_FORMAT_VERSION = 3"
         );
         assert!(
             !path.exists(),
             "a version-mismatched entry is deleted so it stops occupying the cap"
+        );
+    }
+
+    /// F-AUD-1 cache-arm follow-up: a `scanfiles` entry written by a PRE-GUARD
+    /// binary (format v2, before `has_delete_manifests` existed) could describe a
+    /// delete-bearing snapshot. The version bump to 3 must make it a clean MISS so
+    /// the file list is recomputed THROUGH the merge-on-read guard, never served
+    /// silently by the disk-cache-hit arm.
+    #[test]
+    fn pre_guard_v2_scanfiles_entry_is_a_miss_recomputed() {
+        let dir = tmp_dir("v2scanfiles");
+        let cache = DiskCatalogCache::for_dir(&dir);
+        let loc = "s3://b/warehouse/t/metadata/00007-mor.metadata.json";
+        let sf = CachedScanFiles {
+            data_files: Arc::new(vec![data_file("s3://b/live.parquet", 500)]),
+            estimated_row_count: 500,
+            files_selected: 1,
+            files_pruned: 0,
+            has_delete_manifests: true,
+        };
+        cache.put_scan_files(loc, &sf);
+        // Downgrade the on-disk envelope to the pre-guard version, payload intact.
+        let path = only_entry(&dir);
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        v["format_version"] = serde_json::json!(2u32);
+        std::fs::write(&path, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(
+            cache.get_scan_files(loc).is_none(),
+            "a pre-guard v2 scanfiles entry must be a miss (recomputed through the guard)"
         );
     }
 }

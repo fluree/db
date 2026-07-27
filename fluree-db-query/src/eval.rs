@@ -52,7 +52,9 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::{Expression, FlakeValue};
 use crate::var_registry::VarId;
+use fluree_db_core::DatatypeConstraint;
 use helpers::eval_cached_bool_predicate;
+use num_traits::Zero;
 use std::sync::Arc;
 
 impl Expression {
@@ -62,7 +64,7 @@ impl Expression {
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<bool> {
         match self {
-            Expression::Var(var) => Ok(row.get(*var).is_some_and(Into::into)),
+            Expression::Var(var) => binding_effective_bool(row.get(*var), ctx),
 
             Expression::Const(val) => {
                 // Constant as boolean
@@ -147,7 +149,7 @@ impl Expression {
     ) -> Result<Option<ComparableValue>> {
         match self {
             Expression::Var(var) => match row.get(*var) {
-                Some(Binding::Lit { val, .. }) => Ok(ComparableValue::try_from(val).ok()),
+                Some(Binding::Lit { val, dtc, .. }) => Ok(lit_to_comparable(val, dtc, ctx)),
                 Some(Binding::EncodedLit {
                     o_kind,
                     o_key,
@@ -430,6 +432,263 @@ pub fn passes_filters(
         }
     }
     Ok(true)
+}
+
+/// Convert a literal binding's value to a `ComparableValue`, carrying the
+/// datatype for the datatype-sensitive cases:
+/// - xsd:float (stored as an f64, tagged only by its datatype) becomes `Float`
+///   so numeric promotion keeps a float result float;
+/// - a string literal with a NON-xsd:string datatype or a language tag becomes
+///   a `TypedLiteral` so `=`/`!=` can be datatype-aware (D5/D7).
+///
+/// The Long fast path is byte-identical to `TryFrom<&FlakeValue>`; the
+/// xsd:double and xsd:string/plain-string paths yield the same `ComparableValue`
+/// but each pay one cheap datatype check (float-vs-double, resp.
+/// xsd:string-vs-foreign/lang). Foreign string literals are rare (BSBM has none).
+fn lit_to_comparable(
+    val: &FlakeValue,
+    dtc: &DatatypeConstraint,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<ComparableValue> {
+    match val {
+        FlakeValue::Long(n) => Some(ComparableValue::Long(*n)),
+        FlakeValue::Double(d) if is_xsd_float(dtc) => Some(ComparableValue::Float(*d as f32)),
+        FlakeValue::Double(d) => Some(ComparableValue::Double(*d)),
+        FlakeValue::String(s) if is_xsd_string(dtc) => {
+            Some(ComparableValue::String(Arc::from(s.as_str())))
+        }
+        // A string literal with a foreign *datatype* becomes a `TypedLiteral` so
+        // `=`/`!=` can distinguish it (D5). A language-tagged literal stays a
+        // plain String: no greenable equality test needs language-aware `=`, and
+        // carrying the tag would break the string builtins (CONTAINS/REPLACE/…)
+        // that operate on a String. Resolving the datatype Sid to an IRI needs
+        // the snapshot; without it, degrade to a bare string.
+        FlakeValue::String(s) => match dtc {
+            DatatypeConstraint::LangTag(_) => Some(ComparableValue::String(Arc::from(s.as_str()))),
+            DatatypeConstraint::Explicit(_) => {
+                match ctx.and_then(|c| dtc.to_unresolved(c.active_snapshot)) {
+                    Some(u) => Some(ComparableValue::TypedLiteral {
+                        val: FlakeValue::String(s.clone()),
+                        dtc: Some(u),
+                    }),
+                    None => Some(ComparableValue::String(Arc::from(s.as_str()))),
+                }
+            }
+        },
+        _ => ComparableValue::try_from(val).ok(),
+    }
+}
+
+/// Whether a datatype constraint is exactly xsd:float.
+fn is_xsd_float(dtc: &DatatypeConstraint) -> bool {
+    matches!(
+        dtc,
+        DatatypeConstraint::Explicit(sid)
+            if sid.namespace_code == fluree_vocab::namespaces::XSD
+                && sid.name.as_ref() == fluree_vocab::xsd_names::FLOAT
+    )
+}
+
+/// Whether a datatype constraint is exactly xsd:string.
+fn is_xsd_string(dtc: &DatatypeConstraint) -> bool {
+    matches!(
+        dtc,
+        DatatypeConstraint::Explicit(sid)
+            if sid.namespace_code == fluree_vocab::namespaces::XSD
+                && sid.name.as_ref() == fluree_vocab::xsd_names::STRING
+    )
+}
+
+/// SPARQL Effective Boolean Value of a bound term (§17.2.2), as a fallible
+/// result: a value with no EBV — a language-tagged or foreign-datatype literal,
+/// an IRI/blank node, an ill-typed literal, or unbound — is a type error, not
+/// silently truthy. The error is a demotable Comparison error, so a FILTER
+/// excludes the row and a BIND/Extend leaves the variable unbound
+/// (dawg-bev-1..6, not-not). Cypher structural truthiness (lists/maps/paths/
+/// relationships) is preserved; the lenient `From<&Binding>`/`From<Comparable
+/// Value>` EBVs stay in place for the non-SPARQL surfaces that use them.
+fn binding_effective_bool(
+    binding: Option<&Binding>,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Result<bool> {
+    match binding {
+        Some(Binding::Lit { val, dtc, .. }) => lit_effective_bool(val, dtc),
+        Some(Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        }) => {
+            let decoded =
+                ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
+            match decoded {
+                Some(Ok(val)) => match ComparableValue::try_from(&val) {
+                    Ok(cv) => comparable_effective_bool(&cv),
+                    Err(_) => Err(ebv_type_error()),
+                },
+                _ => Err(ebv_type_error()),
+            }
+        }
+        // Cypher structural truthiness (non-SPARQL surface).
+        Some(Binding::List(items)) => Ok(!items.is_empty()),
+        Some(Binding::Map(entries)) => Ok(!entries.is_empty()),
+        Some(Binding::Path { .. } | Binding::Rel(_)) => Ok(true),
+        // IRI/blank node/ref and unbound/poisoned have no effective boolean value.
+        _ => Err(ebv_type_error()),
+    }
+}
+
+/// Full XSD IRI when `dtc` names a numeric or boolean XSD datatype — the
+/// family whose string-backed lexical forms still have an EBV (§17.2.2) —
+/// `None` for everything else (string is handled separately; a lang-tagged or
+/// foreign-datatype literal has no EBV).
+fn numeric_or_boolean_xsd_iri(dtc: &DatatypeConstraint) -> Option<&'static str> {
+    use fluree_vocab::{namespaces::XSD, xsd, xsd_names as n};
+    let DatatypeConstraint::Explicit(sid) = dtc else {
+        return None;
+    };
+    if sid.namespace_code != XSD {
+        return None;
+    }
+    Some(match sid.name.as_ref() {
+        n::INTEGER => xsd::INTEGER,
+        n::LONG => xsd::LONG,
+        n::INT => xsd::INT,
+        n::SHORT => xsd::SHORT,
+        n::BYTE => xsd::BYTE,
+        n::UNSIGNED_LONG => xsd::UNSIGNED_LONG,
+        n::UNSIGNED_INT => xsd::UNSIGNED_INT,
+        n::UNSIGNED_SHORT => xsd::UNSIGNED_SHORT,
+        n::UNSIGNED_BYTE => xsd::UNSIGNED_BYTE,
+        n::NON_NEGATIVE_INTEGER => xsd::NON_NEGATIVE_INTEGER,
+        n::POSITIVE_INTEGER => xsd::POSITIVE_INTEGER,
+        n::NON_POSITIVE_INTEGER => xsd::NON_POSITIVE_INTEGER,
+        n::NEGATIVE_INTEGER => xsd::NEGATIVE_INTEGER,
+        n::DECIMAL => xsd::DECIMAL,
+        n::FLOAT => xsd::FLOAT,
+        n::DOUBLE => xsd::DOUBLE,
+        n::BOOLEAN => xsd::BOOLEAN,
+        _ => return None,
+    })
+}
+
+/// The IRI-keyed twin of [`numeric_or_boolean_xsd_iri`], for
+/// `UnresolvedDatatypeConstraint::Explicit` (which carries a full IRI string).
+fn iri_is_numeric_or_boolean_xsd(iri: &str) -> bool {
+    use fluree_vocab::xsd;
+    [
+        xsd::INTEGER,
+        xsd::LONG,
+        xsd::INT,
+        xsd::SHORT,
+        xsd::BYTE,
+        xsd::UNSIGNED_LONG,
+        xsd::UNSIGNED_INT,
+        xsd::UNSIGNED_SHORT,
+        xsd::UNSIGNED_BYTE,
+        xsd::NON_NEGATIVE_INTEGER,
+        xsd::POSITIVE_INTEGER,
+        xsd::NON_POSITIVE_INTEGER,
+        xsd::NEGATIVE_INTEGER,
+        xsd::DECIMAL,
+        xsd::FLOAT,
+        xsd::DOUBLE,
+        xsd::BOOLEAN,
+    ]
+    .contains(&iri)
+}
+
+/// EBV of a parsed (coerced) boolean/numeric value; `None` when the coercion
+/// produced something with no direct numeric/boolean EBV.
+fn coerced_effective_bool(v: &FlakeValue) -> Option<bool> {
+    match v {
+        FlakeValue::Boolean(b) => Some(*b),
+        FlakeValue::Long(n) => Some(*n != 0),
+        FlakeValue::Double(d) => Some(!d.is_nan() && *d != 0.0),
+        FlakeValue::BigInt(n) => Some(!n.is_zero()),
+        FlakeValue::Decimal(d) => Some(!d.is_zero()),
+        _ => None,
+    }
+}
+
+/// EBV of a literal value + its datatype constraint (the common, non-encoded
+/// path). Numeric → non-zero and non-NaN; xsd:string/plain → non-empty; a
+/// language-tagged or foreign-datatype literal has no EBV.
+fn lit_effective_bool(val: &FlakeValue, dtc: &DatatypeConstraint) -> Result<bool> {
+    match val {
+        FlakeValue::Boolean(b) => Ok(*b),
+        FlakeValue::Long(n) => Ok(*n != 0),
+        FlakeValue::Double(d) => Ok(!d.is_nan() && *d != 0.0),
+        FlakeValue::BigInt(n) => Ok(!n.is_zero()),
+        FlakeValue::Decimal(d) => Ok(!d.is_zero()),
+        FlakeValue::String(s) if is_xsd_string(dtc) => Ok(!s.is_empty()),
+        // §17.2.2: a numeric- or boolean-typed literal that arrives
+        // string-backed — a cast/computed value like `xsd:float("1.5")`
+        // (BIND stores it as a String tagged xsd:float), or a STRDT/stored
+        // lexical form — still has an EBV. Parse the lexical form: a
+        // well-formed value follows the numeric/boolean rule, and an
+        // ILL-FORMED boolean/numeric lexical form is EBV FALSE per the
+        // spec's rule 1, not a type error.
+        FlakeValue::String(s) => {
+            let Some(dt_iri) = numeric_or_boolean_xsd_iri(dtc) else {
+                return Err(ebv_type_error());
+            };
+            match fluree_db_core::coerce_value(FlakeValue::String(s.clone()), dt_iri) {
+                Ok(v) => Ok(coerced_effective_bool(&v).unwrap_or(false)),
+                Err(_) => Ok(false),
+            }
+        }
+        _ => Err(ebv_type_error()),
+    }
+}
+
+/// EBV of an already-materialized comparable value (the late-materialized
+/// encoded path and direct expression results). It cannot observe an encoded
+/// language tag, so an encoded lang-string reads as a string here — an
+/// untested corner no register test exercises.
+pub(crate) fn comparable_effective_bool(cv: &ComparableValue) -> Result<bool> {
+    match cv {
+        ComparableValue::Bool(b) => Ok(*b),
+        ComparableValue::Long(n) => Ok(*n != 0),
+        ComparableValue::Double(d) => Ok(!d.is_nan() && *d != 0.0),
+        ComparableValue::Float(f) => Ok(!f.is_nan() && *f != 0.0),
+        ComparableValue::BigInt(n) => Ok(!n.is_zero()),
+        ComparableValue::Decimal(d) => Ok(!d.is_zero()),
+        ComparableValue::String(s) => Ok(!s.is_empty()),
+        // §17.2.2 for string-backed typed literals (cast/STRDT results that
+        // reach EBV directly, without a BIND round-trip): numeric/boolean
+        // datatypes parse to their value's EBV, ill-formed lexical forms are
+        // EBV false (rule 1); a plain-string TypedLiteral is string EBV; a
+        // lang-tagged or foreign-datatype literal has no EBV.
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::String(s),
+            dtc,
+        } => match dtc {
+            Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(iri))
+                if iri_is_numeric_or_boolean_xsd(iri) =>
+            {
+                match fluree_db_core::coerce_value(FlakeValue::String(s.clone()), iri) {
+                    Ok(v) => Ok(coerced_effective_bool(&v).unwrap_or(false)),
+                    Err(_) => Ok(false),
+                }
+            }
+            None => Ok(!s.is_empty()),
+            _ => Err(ebv_type_error()),
+        },
+        _ => Err(ebv_type_error()),
+    }
+}
+
+/// A value with no effective boolean value is a (demotable) type error.
+fn ebv_type_error() -> QueryError {
+    ComparisonError::TypeMismatch {
+        operator: "EBV",
+        left_type: "term",
+        right_type: "xsd:boolean",
+    }
+    .into()
 }
 
 fn decode_lookup_error(
