@@ -118,6 +118,12 @@ fn parse_string_pred(s: &mut TokenStream) -> Result<Expr, Diagnostic> {
             let span = left.span().union(right.span());
             Ok(Expr::Contains(Box::new(left), Box::new(right), span))
         }
+        TokenKind::RegexEq => {
+            s.advance();
+            let right = parse_null_pred(s)?;
+            let span = left.span().union(right.span());
+            Ok(Expr::RegexMatch(Box::new(left), Box::new(right), span))
+        }
         TokenKind::In => {
             s.advance();
             let right = parse_null_pred(s)?;

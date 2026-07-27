@@ -103,13 +103,11 @@ pub(crate) fn recognize_annotation_edge(patterns: &[Pattern]) -> Option<Annotati
         return None;
     };
 
-    // Predicate must be a constant relationship type (a typed Cypher
-    // relationship lowers to `Ref::Iri`; a `Ref::Sid` is also accepted).
-    // A variable predicate is not a fixed edge type → fall back.
-    let p_pred = match &base.p {
-        Ref::Iri(_) | Ref::Sid(_) => base.p.clone(),
-        Ref::Var(_) => return None,
-    };
+    // Constant relationship type (a typed Cypher relationship lowers to
+    // `Ref::Iri`; a `Ref::Sid` is also accepted) or a variable predicate
+    // (untyped `-[p]->`): the probe resolves a variable per row from the
+    // base-edge binding, so both are probeable.
+    let p_pred = base.p.clone();
     // Subject and object must be node refs (no IRI/literal objects in v1).
     let s_pos = EdgePos::from_ref(&base.s)?;
     let o_pos = EdgePos::from_term(&base.o)?;
@@ -185,8 +183,9 @@ pub struct AnnotationEdgeProbeOperator {
     ann_var: VarId,
     /// Base-edge subject source.
     s_pos: EdgePos,
-    /// Base-edge predicate (constant for a typed relationship).
-    p_sid: Sid,
+    /// Base-edge predicate source: constant for a typed relationship,
+    /// per-row for an untyped `-[p]->` (the base scan binds it as a Sid).
+    p_pos: EdgePos,
     /// Base-edge object source.
     o_pos: EdgePos,
     schema: Arc<[VarId]>,
@@ -213,7 +212,7 @@ impl AnnotationEdgeProbeOperator {
         child: BoxedOperator,
         ann_var: VarId,
         s_pos: EdgePos,
-        p_sid: Sid,
+        p_pos: EdgePos,
         o_pos: EdgePos,
     ) -> Self {
         let mut schema_vec: Vec<VarId> = child.schema().to_vec();
@@ -226,7 +225,7 @@ impl AnnotationEdgeProbeOperator {
             child,
             ann_var,
             s_pos,
-            p_sid,
+            p_pos,
             o_pos,
             schema,
             state: OperatorState::Created,
@@ -252,6 +251,9 @@ impl AnnotationEdgeProbeOperator {
         let Some(s) = self.resolve_ref(batch, row, &self.s_pos, view)? else {
             return Ok(None);
         };
+        let Some(p) = self.resolve_pred(batch, row)? else {
+            return Ok(None);
+        };
         // Object: ref-valued for a relationship edge. Resolve to a Sid
         // and wrap as a ref FlakeValue with the `@id` datatype, matching
         // how the arena stored the edge.
@@ -261,12 +263,30 @@ impl AnnotationEdgeProbeOperator {
         Ok(Some(EdgeKey {
             g: None,
             s,
-            p: self.p_sid.clone(),
+            p,
             o: FlakeValue::Ref(o),
             dt: id_datatype_sid(),
             lang: None,
             list_i: None,
         }))
+    }
+
+    /// Resolve the predicate position. A variable predicate is bound by
+    /// the base-edge scan as an eager `Binding::Sid` (predicates decode
+    /// through the predicate dictionary, never late-materialized), so an
+    /// encoded binding here is a shape violation — surface it loudly
+    /// rather than decoding through the wrong (subject) dictionary.
+    fn resolve_pred(&self, batch: &Batch, row: usize) -> Result<Option<Sid>> {
+        match &self.p_pos {
+            EdgePos::Const(sid) => Ok(Some(sid.clone())),
+            EdgePos::Var(v) => match batch.get(row, *v) {
+                Some(Binding::Sid { sid, .. }) => Ok(Some(sid.clone())),
+                Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
+                Some(other) => Err(QueryError::execution(format!(
+                    "annotation edge probe: predicate position bound to non-Sid {other:?}"
+                ))),
+            },
+        }
     }
 
     /// Resolve an edge position to a concrete `Sid`. Handles the two

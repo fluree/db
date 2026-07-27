@@ -1648,6 +1648,18 @@ impl crate::Fluree {
             handle.wait_for_idle(&ledger_id).await;
         }
 
+        // Re-fetch the record after the background indexer has quiesced: a
+        // background build racing this reindex may have published between
+        // the lookup above and the cancel. The stale record's
+        // `index_head_id` (None, or an older root) would make the rebuild
+        // lose sight of the just-published root — including a sealed
+        // annotation arena the Augment merge in root assembly needs.
+        let record = self
+            .nameservice()
+            .lookup(&ledger_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("Ledger not found: {ledger_id}")))?;
+
         // 3. Build binary index from commit chain
         let mut indexer_config = opts.indexer_config.clone().unwrap_or_default();
         let gc_max_old_indexes = indexer_config.gc_max_old_indexes;

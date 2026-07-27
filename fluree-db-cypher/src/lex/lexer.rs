@@ -100,6 +100,10 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
                 push(&mut out, TokenKind::PlusEq, start, i + 2);
                 i += 2;
             }
+            b'=' if peek(bytes, i + 1) == Some(b'~') => {
+                push(&mut out, TokenKind::RegexEq, start, i + 2);
+                i += 2;
+            }
             b'.' if peek(bytes, i + 1) == Some(b'.') => {
                 push(&mut out, TokenKind::DotDot, start, i + 2);
                 i += 2;

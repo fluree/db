@@ -145,6 +145,16 @@ impl Fluree {
         query: &str,
         params: Option<&crate::CypherParamMap>,
     ) -> Result<CypherTxnWriteOutcome> {
+        // Multi-clause statements: the sequential driver stages against the
+        // transaction's private state (probes see earlier statements), and
+        // answers a trailing RETURN from its final row table. Detected before
+        // the created-entity RETURN planner, which would reject its RETURN.
+        if let Ok(ast) = crate::query::helpers::substituted_cypher_ast(query, params) {
+            if let Some(sq) = crate::cypher_seq::detect_sequential(&ast) {
+                return self.cypher_transaction_write_sequential(txn, &sq).await;
+            }
+        }
+
         let return_plan = cypher_write::plan_write_return_source(query, params)?;
         let skolem_txn_id = return_plan
             .as_ref()
@@ -174,6 +184,12 @@ impl Fluree {
                 };
                 self.resolve_conditional_cypher(&cw, probe, &txn.ledger_id, &txn.state.snapshot)
                     .await?
+            }
+            WritePlan::Sequential(_) => {
+                // Handled by the early detect_sequential branch above.
+                return Err(ApiError::internal(
+                    "sequential Cypher write reached the single-statement path",
+                ));
             }
         };
 
@@ -215,6 +231,84 @@ impl Fluree {
             )
             .await?
         };
+
+        let flake_count = self
+            .pend_stage_result(txn, stage_result, &index_config)
+            .await?;
+        let return_table = match (&return_plan, &skolem_txn_id) {
+            (Some(plan), Some(skolem)) => {
+                Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
+            }
+            _ => None,
+        };
+        Ok(CypherTxnWriteOutcome {
+            flake_count,
+            return_table,
+        })
+    }
+
+    /// The sequential-driver arm of [`Self::cypher_transaction_write`]:
+    /// stage the multi-clause statement against the transaction's private
+    /// state, pend the merged commit, and answer its RETURN as typed rows.
+    async fn cypher_transaction_write_sequential(
+        &self,
+        txn: &mut CypherTransaction,
+        plan: &crate::cypher_seq::SequentialCypherWrite,
+    ) -> Result<CypherTxnWriteOutcome> {
+        let policy = crate::build_transact_policy_context(
+            self,
+            &txn.state.snapshot,
+            txn.state.novelty.as_ref(),
+            Some(txn.state.novelty.as_ref()),
+            txn.state.t(),
+            &txn.governance,
+        )
+        .await?;
+
+        let index_config = crate::server_defaults::default_index_config();
+        let tracker = Tracker::disabled();
+        let ledger_id = txn.ledger_id.clone();
+        let outcome = self
+            .stage_cypher_sequential(
+                txn.state.clone(),
+                plan,
+                &ledger_id,
+                Some(&txn.governance),
+                Some(&index_config),
+                policy.as_ref(),
+                Some(&tracker),
+                None,
+            )
+            .await?;
+
+        let flake_count = self
+            .pend_stage_result(txn, outcome.stage_result, &index_config)
+            .await?;
+        let return_table = match outcome.return_result {
+            Some(qr) => {
+                let view = self.cypher_transaction_view(txn).await?;
+                Some(qr.to_cypher_typed_table(&view).await.map_err(|e| {
+                    ApiError::internal(format!("sequential write RETURN formatting: {e}"))
+                })?)
+            }
+            None => None,
+        };
+        Ok(CypherTxnWriteOutcome {
+            flake_count,
+            return_table,
+        })
+    }
+
+    /// Shared tail of a transaction-scoped write statement: build a pending
+    /// commit from a staged result and advance the private state. A
+    /// zero-effect statement (Cypher's zero-updates success) advances nothing
+    /// and pends nothing. Returns the statement's flake count.
+    async fn pend_stage_result(
+        &self,
+        txn: &mut CypherTransaction,
+        stage_result: crate::StageResult,
+        index_config: &fluree_db_ledger::IndexConfig,
+    ) -> Result<usize> {
         let crate::StageResult {
             view,
             ns_registry,
@@ -222,21 +316,10 @@ impl Fluree {
             graph_delta,
         } = stage_result;
 
-        // Zero-effect statement (`MATCH … SET` matching nothing): Cypher
-        // semantics succeed with zero updates; nothing to commit.
         if !view.has_staged() {
             let (base, _flakes) = view.into_parts();
             txn.state = base;
-            let return_table = match (&return_plan, &skolem_txn_id) {
-                (Some(plan), Some(skolem)) => {
-                    Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
-                }
-                _ => None,
-            };
-            return Ok(CypherTxnWriteOutcome {
-                flake_count: 0,
-                return_table,
-            });
+            return Ok(0);
         }
 
         let mut commit_opts = CommitOpts::default()
@@ -268,7 +351,7 @@ impl Fluree {
             ns_registry,
             expected_head_ref,
             None,
-            &index_config,
+            index_config,
             commit_opts,
         )
         .await
@@ -288,17 +371,7 @@ impl Fluree {
             t: receipt.t,
         });
         txn.state = next_state;
-
-        let return_table = match (&return_plan, &skolem_txn_id) {
-            (Some(plan), Some(skolem)) => {
-                Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
-            }
-            _ => None,
-        };
-        Ok(CypherTxnWriteOutcome {
-            flake_count: receipt.flake_count,
-            return_table,
-        })
+        Ok(receipt.flake_count)
     }
 
     /// Publish the transaction atomically. Verifies under the ledger write

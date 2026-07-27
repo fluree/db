@@ -808,6 +808,302 @@ async fn ref_class_reattributed_after_both_endpoints_retype() {
         .await;
 }
 
+/// Untyped→typed (Case B variant): an OBJECT that had NO rdf:type when its
+/// inbound refs were indexed gains its FIRST type in a later batch. The edges
+/// must attribute to the new object class — a first-time-typed subject has no
+/// `base_subject_classes` entry, so this exercises the net-map branch of the
+/// endpoint resolver (a plain re-type does not).
+#[tokio::test]
+async fn ref_class_attributed_when_object_typed_later() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-object-typed-later:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // org1 is a bare reference target: no rdf:type yet.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:bob","@type":"ex:Employee","ex:worksFor":{"@id":"ex:org1"}}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let o1 =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o1 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded1 = load_ledger_snapshot(&storage, &root_id.expect("root1"), ledger_id)
+                .await
+                .expect("load snapshot 1");
+            assert_eq!(
+                ref_class_total(
+                    &loaded1,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                None,
+                "first index: org1 untyped, so no object-class bucket yet"
+            );
+
+            // org1 gains its FIRST type; the worksFor edges are untouched.
+            let type_later = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r2 = fluree
+                .insert_with_opts(
+                    r1.ledger,
+                    &type_later,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("type org1");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(2),
+                "both pre-existing edges attribute once org1 is typed"
+            );
+        })
+        .await;
+}
+
+/// Untyped→typed (Case A variant): a SUBJECT with existing outgoing refs gains
+/// its FIRST type in a later batch. Its edges must appear under the new
+/// subject-class bucket.
+#[tokio::test]
+async fn ref_class_attributed_when_subject_typed_later() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-subject-typed-later:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // alice has an edge but no rdf:type yet; org1 is typed.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","ex:worksFor":{"@id":"ex:org1"}},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            // alice gains her FIRST type; worksFor untouched.
+            let type_later = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee"}
+                ]
+            });
+            let r2 = fluree
+                .insert_with_opts(
+                    r1.ledger,
+                    &type_later,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("type alice");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "pre-existing edge attributes once alice is typed"
+            );
+        })
+        .await;
+}
+
+/// Untyped→typed, both endpoints: subject AND object of an existing edge gain
+/// their FIRST types in the same later batch. The edge must land in the new
+/// (subject_class, p, object_class) bucket exactly once.
+#[tokio::test]
+async fn ref_class_attributed_when_both_endpoints_typed_later() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/ref-both-typed-later:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            // Neither endpoint has a type yet.
+            let txn1 = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","ex:worksFor":{"@id":"ex:org1"}}
+                ]
+            });
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &txn1,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert txn1");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            let type_later = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@graph": [
+                    {"@id":"ex:alice","@type":"ex:Employee"},
+                    {"@id":"ex:org1","@type":"ex:Organization"}
+                ]
+            });
+            let r2 = fluree
+                .insert_with_opts(
+                    r1.ledger,
+                    &type_later,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("type both");
+            let o2 =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = o2 else {
+                unreachable!("helper only returns Completed")
+            };
+            let loaded2 = load_ledger_snapshot(&storage, &root_id.expect("root2"), ledger_id)
+                .await
+                .expect("load snapshot 2");
+            assert_eq!(
+                ref_class_total(
+                    &loaded2,
+                    "http://example.org/Employee",
+                    "http://example.org/worksFor",
+                    "http://example.org/Organization"
+                ),
+                Some(1),
+                "edge attributes exactly once when both endpoints gain first types"
+            );
+        })
+        .await;
+}
+
 /// #1266 — rebuild gate: a re-type batch above the threshold aborts incremental
 /// and the caller falls back to a full rebuild, which recomputes class/ref stats
 /// from scratch (so the result is still current-state-correct).

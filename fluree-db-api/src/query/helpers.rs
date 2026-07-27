@@ -239,13 +239,16 @@ pub(crate) fn lower_cypher_ast_to_ir(
 
     let mut vars = VarRegistry::new();
     let mut ctx = fluree_db_cypher::LoweringContext::new(snapshot, &mut vars)
-        .with_vocab_opt(vocab)
+        .with_vocab_opt(vocab.clone())
         .with_allow_full_scan(cypher_full_scan_enabled())
         .with_reified_edges_possible(reified_edges_possible(snapshot, overlay));
     if !overrides.is_empty() {
         ctx = ctx.with_overrides(overrides);
     }
-    let parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
+    let mut parsed = fluree_db_cypher::lower_cypher_with_context(ast, &mut ctx)?;
+    // Carried to `labels()`/`type()`/`keys()` evaluation so name compaction
+    // matches `db.labels()` (vocab-strip or full IRI).
+    parsed.cypher_vocab = vocab.map(std::sync::Arc::from);
     Ok((vars, parsed))
 }
 

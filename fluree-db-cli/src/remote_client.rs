@@ -225,6 +225,13 @@ impl ImportCapability {
             .any(|m| m == "presigned-put" || m == "multipart-put")
     }
 
+    /// Whether the server accepts raw source-data uploads (`source-upload`):
+    /// the mint endpoint runs the bulk-import pipeline server-side over the
+    /// same formats `fluree create --from` takes locally.
+    pub fn supports_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload")
+    }
+
     /// Whether an archive of `size` bytes should take the negotiated upload
     /// path: a negotiated mode must be offered, and either direct isn't offered
     /// at all or the archive exceeds the advertised direct cap.
@@ -1103,6 +1110,24 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Explain a Cypher query plan against a ledger. The body may be raw
+    /// Cypher or a `{"cypher": ..., "params": ...}` envelope; the server
+    /// extracts it.
+    pub async fn explain_cypher(
+        &self,
+        ledger: &str,
+        cypher: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url("explain", ledger);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/cypher",
+            Some(RequestBody::Text(cypher)),
+        )
+        .await
+    }
+
     /// Explain a JSON-LD connection query plan (ledger specified via `from` in body).
     pub async fn explain_connection_jsonld(
         &self,
@@ -1529,6 +1554,44 @@ impl RemoteLedgerClient {
         let mut body = serde_json::json!({ "ledger": ledger });
         if let Some(size) = size {
             body["size"] = serde_json::Value::from(size);
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+        )
+        .await
+    }
+
+    /// Mint a raw source-data upload slot. The server keeps the filename's
+    /// extension, applies the CSV/Cypher conversion options, and runs the
+    /// bulk-import pipeline on `complete`.
+    pub async fn mint_source_import_upload(
+        &self,
+        ledger: &str,
+        size: Option<u64>,
+        filename: &str,
+        edge_policy: fluree_db_api::csv_import::EdgePolicy,
+        base_iri: Option<&str>,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("import-upload");
+        let edge_properties = match edge_policy {
+            fluree_db_api::csv_import::EdgePolicy::Annotated => "annotated",
+            fluree_db_api::csv_import::EdgePolicy::Plain => "plain",
+            fluree_db_api::csv_import::EdgePolicy::Nary => "nary",
+        };
+        let mut body = serde_json::json!({
+            "ledger": ledger,
+            "source_kind": "source",
+            "filename": filename,
+            "edge_properties": edge_properties,
+        });
+        if let Some(size) = size {
+            body["size"] = serde_json::Value::from(size);
+        }
+        if let Some(base_iri) = base_iri {
+            body["base_iri"] = serde_json::Value::from(base_iri);
         }
         self.send_json(
             reqwest::Method::POST,

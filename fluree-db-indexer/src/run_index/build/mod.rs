@@ -7,4 +7,6 @@ pub mod incremental_root;
 pub mod index_build;
 pub mod merge;
 pub mod novelty_merge;
+#[cfg(test)]
+mod replay_property_tests;
 pub mod shared_pool;

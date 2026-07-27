@@ -473,3 +473,130 @@ async fn cypher_http_write_with_return() {
     assert!(status.is_success());
     assert!(body.contains("commit"), "receipt shape unchanged: {body}");
 }
+
+#[tokio::test]
+async fn cypher_http_multi_clause_merge_chain() {
+    // Multi-clause MERGE composition over HTTP: the sequential driver stages
+    // clause-by-clause into one commit through the consensus committer.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyseqhttp").await;
+
+    let stmt = r#"MERGE (a:Person {name: "Alice"}) MERGE (b:City {name: "Paris"}) MERGE (a)-[:LIVES_IN]->(b)"#;
+    let (status, body) = post_cypher(&state, "/v1/fluree/update/cyseqhttp", stmt).await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    assert!(body.contains("commit"), "receipt shape: {body}");
+
+    // Everything landed in one commit; re-running is a no-op.
+    let (status, body) = post_cypher(&state, "/v1/fluree/update/cyseqhttp", stmt).await;
+    assert!(
+        status.is_success(),
+        "idempotent: status={status}; body={body}"
+    );
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqhttp",
+        "MATCH (a:Person)-[r:LIVES_IN]->(b:City) RETURN count(r)",
+    )
+    .await;
+    assert!(status.is_success(), "read back: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(1), "{body}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqhttp",
+        "MATCH (n:Person) RETURN count(n)",
+    )
+    .await;
+    assert!(status.is_success());
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(1), "{body}");
+}
+
+#[tokio::test]
+async fn cypher_http_multi_clause_merge_with_return() {
+    // The trailing RETURN of a sequential write answers from the driver's
+    // final row table (matched bindings included) via the receipt channel.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyseqret").await;
+    let (status, _b) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyseqret",
+        r#"CREATE (a:Person {name: "Alice", age: 42})"#,
+    )
+    .await;
+    assert!(status.is_success());
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/update/cyseqret",
+        r#"MERGE (a:Person {name: "Alice"}) MERGE (b:City {name: "Rome"}) MERGE (a)-[:LIVES_IN]->(b) RETURN a.age AS age, b"#,
+    )
+    .await;
+    assert!(status.is_success(), "status={status}; body={body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("cypher-json envelope");
+    assert_eq!(json["results"][0]["columns"], json!(["age", "b"]), "{body}");
+    let data = json["results"][0]["data"].as_array().expect("data");
+    assert_eq!(data.len(), 1, "{body}");
+    assert_eq!(
+        data[0]["row"][0],
+        json!(42),
+        "a.age reads the MATCHED node: {body}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_http_unwind_batch_merge_chain() {
+    // The canonical loading idiom via the params envelope.
+    let (_tmp, state) = server_state().await;
+    create_ledger(&state, "cyseqbatch").await;
+
+    let envelope = json!({
+        "cypher": "UNWIND $rows AS row MERGE (a:P {id: row.src}) MERGE (b:P {id: row.dst}) MERGE (a)-[:KNOWS]->(b)",
+        "params": {"rows": [
+            {"src": 1, "dst": 2},
+            {"src": 1, "dst": 3},
+            {"src": 2, "dst": 3},
+        ]}
+    });
+    let resp = build_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update/cyseqbatch")
+                .header("content-type", "application/cypher")
+                .body(Body::from(envelope.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    assert!(status.is_success(), "status={status}; body={body}");
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqbatch",
+        "MATCH (n:P) RETURN count(n)",
+    )
+    .await;
+    assert!(status.is_success());
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(
+        json["results"][0]["data"][0]["row"][0],
+        json!(3),
+        "three distinct endpoints: {body}"
+    );
+
+    let (status, body) = post_cypher(
+        &state,
+        "/v1/fluree/query/cyseqbatch",
+        "MATCH (:P)-[r:KNOWS]->(:P) RETURN count(r)",
+    )
+    .await;
+    assert!(status.is_success());
+    let json: serde_json::Value = serde_json::from_str(&body).expect("envelope");
+    assert_eq!(json["results"][0]["data"][0]["row"][0], json!(3), "{body}");
+}

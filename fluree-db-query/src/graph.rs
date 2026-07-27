@@ -358,6 +358,17 @@ impl GraphOperator {
         if let Some((sort_var, k, ascending)) = self.topk {
             inner.set_topk(sort_var, k, ascending);
         }
+        // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
+        // rebuilt per parent row/batch and is genuinely dropped at the end of this
+        // call, so its recorded bytes (hash-join / GROUP BY / fused-dim build tables)
+        // are provably freed HERE. Snapshot the shared counter before the inner charges
+        // anything, then release exactly its delta after it drains and closes (below).
+        // This releases only what the finished inner charged — never a live/persistent
+        // build (the delta is 0 if the inner retained nothing) — and execution on one
+        // handle is sequential, so no other charger races the delta. Without it the
+        // counter grows ~N× the true one-build peak across N rebuilds and false-aborts
+        // a legitimate correlated query with a typed 507.
+        let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
 
         // NumBig arena handles are scoped per (graph, predicate). When this
@@ -463,6 +474,10 @@ impl GraphOperator {
         }
 
         inner.close();
+        // Release this rebuild's charge (see the snapshot before `inner.open`). An
+        // early `?`-exit in the drain loop skips this — that only over-counts (the
+        // safe direction) and the query is aborting on that path anyway.
+        graph_ctx.release(graph_ctx.mem_used().saturating_sub(mem_before_inner));
         Ok(())
     }
 
@@ -536,6 +551,17 @@ impl GraphOperator {
         if let Some((sort_var, k, ascending)) = self.topk {
             inner.set_topk(sort_var, k, ascending);
         }
+        // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
+        // rebuilt per parent row/batch and is genuinely dropped at the end of this
+        // call, so its recorded bytes (hash-join / GROUP BY / fused-dim build tables)
+        // are provably freed HERE. Snapshot the shared counter before the inner charges
+        // anything, then release exactly its delta after it drains and closes (below).
+        // This releases only what the finished inner charged — never a live/persistent
+        // build (the delta is 0 if the inner retained nothing) — and execution on one
+        // handle is sequential, so no other charger races the delta. Without it the
+        // counter grows ~N× the true one-build peak across N rebuilds and false-aborts
+        // a legitimate correlated query with a typed 507.
+        let mem_before_inner = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
 
         let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
@@ -581,6 +607,10 @@ impl GraphOperator {
         }
 
         inner.close();
+        // Release this rebuild's charge (see the snapshot before `inner.open`). An
+        // early `?`-exit in the drain loop skips this — that only over-counts (the
+        // safe direction) and the query is aborting on that path anyway.
+        graph_ctx.release(graph_ctx.mem_used().saturating_sub(mem_before_inner));
         Ok(())
     }
 

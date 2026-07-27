@@ -1094,6 +1094,12 @@ pub enum Commands {
         action: ServerAction,
     },
 
+    /// Governance model tooling — access profiles, entities, reasoning
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+
     /// Developer memory — store and recall facts, decisions, constraints
     Memory {
         #[command(subcommand)]
@@ -1480,6 +1486,201 @@ pub enum ClusterAction {
         /// Admin URL of the node to query.
         #[arg(long)]
         addr: String,
+    },
+}
+
+/// Governance model subcommands.
+#[derive(Subcommand)]
+pub enum ModelAction {
+    /// Access control — compile intent into ledger policies
+    Access {
+        #[command(subcommand)]
+        action: ModelAccessAction,
+    },
+
+    /// Entity definitions — author SHACL shapes (the single source of truth
+    /// that access profiles, validation, and codegen derive from)
+    Entity {
+        #[command(subcommand)]
+        action: ModelEntityAction,
+    },
+
+    /// Class hierarchy — RDFS subclass relations (the reasoning facet's
+    /// vocabulary; entailment follows rdfs:subClassOf in query and policy)
+    Class {
+        #[command(subcommand)]
+        action: ModelClassAction,
+    },
+}
+
+/// Class-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelClassAction {
+    /// Define (or update) a class and its place in the hierarchy
+    Define {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        class: String,
+
+        /// Parent class IRI (repeatable) — becomes rdfs:subClassOf
+        #[arg(long = "subclass-of")]
+        subclass_of: Vec<String>,
+
+        /// Remove ALL parents (deletes every rdfs:subClassOf edge). With
+        /// RDFS entailment, a stale parent widens every grant on it — use
+        /// this to sever the hierarchy; --subclass-of cannot express empty.
+        #[arg(long = "clear-subclass-of", conflicts_with = "subclass_of")]
+        clear_subclass_of: bool,
+
+        /// Human label for the class
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show the class hierarchy on a dataset (policy classes excluded)
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Entity-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelEntityAction {
+    /// Define (or update) an entity: compiles to a SHACL node shape
+    ///
+    /// NOTE: Fluree enforces SHACL at transaction time once any shapes exist
+    /// in a ledger (reject mode by default) — defining an entity activates
+    /// validation for its class.
+    Define {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Entity class IRI (absolute, e.g. https://example.org/Lead)
+        #[arg(long)]
+        entity: String,
+
+        /// Property spec: "<iri> [string|integer|decimal|boolean|date|datetime|iri] [required] [in[v1,v2,...]]"
+        /// (repeatable; type omitted = untyped)
+        #[arg(long = "property", required = true)]
+        properties: Vec<String>,
+
+        /// Human label for the class
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Closed shape: instances may carry ONLY the declared properties
+        /// (rdf:type excepted). Recommended for app-writable entities —
+        /// validation owns the property surface, so access grants stay
+        /// thin class policies.
+        #[arg(long)]
+        closed: bool,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show entity definitions (SHACL node shapes) on a dataset
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Access-facet subcommands of `fluree model`.
+#[derive(Subcommand)]
+pub enum ModelAccessAction {
+    /// Enable an access profile on a dataset (emits thin verb policies)
+    ///
+    /// Declares WHO may cause which state transitions on a class, in the
+    /// engine's own vocabulary: read → a view policy; write → view +
+    /// create/update/delete on the class; intake → create-only. Verb
+    /// semantics are exact (class targeting matches pre ∪ post state and
+    /// rdf:type writes match the class they mint), so no property
+    /// allow-list is needed — the property SURFACE of the class belongs
+    /// to its SHACL shape (`model entity define --closed`). Re-running is
+    /// idempotent (deterministic policy ids); there is no stored intent
+    /// node and nothing to sync.
+    Enable {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Profile: read | write | intake
+        #[arg(long)]
+        profile: String,
+
+        /// Target class IRI whose instances the profile governs (absolute,
+        /// e.g. https://example.org/Lead) — compiles to f:onClass
+        #[arg(long)]
+        class: String,
+
+        /// Optional COLUMN narrowing for the write policy (absolute IRIs):
+        /// the grant covers only these properties of the class ("may edit
+        /// status of Leads, nothing else"). Omit for whole-instance access.
+        #[arg(long = "property")]
+        properties: Vec<String>,
+
+        /// Policy class IRI override (default: {class}/access/{profile}).
+        /// The policy class is the assignment unit grants and tokens carry
+        /// — how a request selects its policy set, not a data restriction.
+        #[arg(long)]
+        policy_class: Option<String>,
+
+        /// Attach the policy class to this space's grant on the dataset
+        /// (hosted stacks; requires --remote). Merges with existing classes.
+        #[arg(long)]
+        space: Option<String>,
+
+        /// Relationship gate (read profile only): a SPARQL property path
+        /// from the requesting identity to the instance, with angle-bracketed
+        /// IRIs. e.g. "^<https://example.org/owner>" (I see what I own) or
+        /// "<https://example.org/memberOf>/^<https://example.org/team>"
+        /// (I see entities whose team I'm a member of). Stored verbatim in
+        /// the policy via the engine's @path context term.
+        #[arg(long)]
+        connected: Option<String>,
+
+        /// Print the compiled JSON-LD without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show compiled access policies on a dataset (grouped by policy class)
+    Show {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
     },
 }
 

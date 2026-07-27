@@ -73,8 +73,15 @@ pub enum QueryError {
     /// memory budget (R3-B). A cooperative pre-OOM abort: it fails the query with
     /// a typed error the caller can DISTINGUISH from a timeout (`Cancelled`) and
     /// degrade on, instead of the runtime killing the container with a raw OOM.
-    #[error("Query memory budget exceeded: used ~{used_bytes} B > budget {budget_bytes} B")]
+    #[error(
+        "Query memory budget exceeded: used ~{used_bytes} B (estimated) > budget {budget_bytes} B"
+    )]
     MemoryBudgetExceeded {
+        /// APPROXIMATE recorded query memory (rows x declared-schema cols x a flat
+        /// per-binding estimate), NOT measured bytes: it can be off in both directions
+        /// on a wide, string-heavy build (under on long IRIs / GROUP_CONCAT state, over
+        /// on narrow declared-but-empty columns). Enough to catch a runaway before OOM;
+        /// don't debug exact allocations against it. Field name kept stable (public API).
         used_bytes: usize,
         budget_bytes: usize,
     },
