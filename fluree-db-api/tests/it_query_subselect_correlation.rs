@@ -145,20 +145,22 @@ async fn sparql_subselect_aggregate_correlation_var_unbound_parent_is_compatible
     );
 }
 
-/// End-to-end correctness for a BIND-produced correlation variable: `?c` is
-/// bound by `BIND(2 AS ?c)` in the sub-SELECT and the result must agree with
-/// the parent's `?c`. The sub-SELECT emits `(ex:a, 2)` once per `ex:r` link,
-/// so `ex:a` appears twice (multiset join semantics); `ex:b` (parent `?c` = 5)
-/// does not agree and is dropped.
+/// End-to-end (multiset-semantics) assertion for a BIND'd sub-SELECT
+/// projection. `?c` is bound by `BIND(2 AS ?c)` and the result must agree with
+/// the parent's `?c`: the sub-SELECT emits `(ex:a, 2)` once per `ex:r` link, so
+/// `ex:a` appears twice (`normalize_rows` sorts but does not dedupe, so the
+/// duplicate has teeth); `ex:b` (parent `?c` = 5) does not agree and is dropped.
 ///
-/// NOTE: unlike the aggregate cases above, this shape eliminates `ex:b`
-/// *before* the merge-time reconcile check — disabling that check (subquery.rs
-/// `process_parent_batch`) leaves this test green — so it is an end-to-end
-/// correctness assertion, not a regression guard for the reconcile mechanism.
-/// The aggregate cases here, and the OPTIONAL Family-B tests in
-/// `it_query_filter_scope.rs`, pin the reconcile merge itself.
+/// NOTE: this does NOT exercise the merge-time reconcile check. On this
+/// fixture the sub-SELECT plans UNCORRELATED — the `SubqueryOperator` builds
+/// with `correlation_vars=[]` / `reconcile_vars=[]` (`?c` never becomes a
+/// correlation variable), so `reconcile_vars.is_empty()` short-circuits the
+/// check at `subquery.rs:472` and `ex:b` is dropped by the outer `?s ex:p ?c`
+/// join instead. Disabling the reconcile check leaves this test green. The
+/// reconcile mechanism itself is pinned by the aggregate cases above and the
+/// OPTIONAL Family-B tests in `it_query_filter_scope.rs`.
 #[tokio::test]
-async fn sparql_subselect_bind_correlation_var_end_to_end() {
+async fn sparql_subselect_bind_projection_multiset() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_counts(&fluree, "subsel-corr:bind").await;
 
@@ -174,7 +176,7 @@ async fn sparql_subselect_bind_correlation_var_end_to_end() {
     assert_eq!(
         normalize_rows(&rows),
         normalize_rows(&json!([["ex:a"], ["ex:a"]])),
-        "BIND-produced ?c must be join-checked against the parent, got {rows}"
+        "BIND'd ?c must agree with the parent, keeping ex:a twice (multiset), got {rows}"
     );
 }
 
