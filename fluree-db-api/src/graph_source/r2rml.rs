@@ -24,7 +24,9 @@ use fluree_db_iceberg::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
     },
-    stats::{aggregate_column_stats, send_read_snapshot_data_files},
+    stats::{
+        aggregate_column_stats, send_read_snapshot_data_files, send_snapshot_has_delete_manifests,
+    },
     IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
@@ -1016,6 +1018,21 @@ async fn resolve_rest_load_and_storage(
     Ok((storage, load_response))
 }
 
+/// Decide whether a cached scan-file selection may be SERVED, or must be treated
+/// as a cache MISS and recomputed via a fresh `plan_scan` (audit F-AUD-1,
+/// cache-arm follow-up).
+///
+/// A cached entry whose source snapshot carried merge-on-read delete manifests is
+/// NEVER served: the cached file list enumerates only live data files and does
+/// not apply the deletes, so serving it would silently return deleted rows. There
+/// is no merge-on-read guard at this rung, so this is a plain fall-through to a
+/// re-plan (never an override re-check); when the guard lands, this decision point
+/// is where the guarded re-check goes. Applied identically at BOTH scan-file cache
+/// hit arms (in-memory and disk) so the flag can re-refuse regardless of tier.
+fn servable_scan_files(entry: Option<Arc<CachedScanFiles>>) -> Option<Arc<CachedScanFiles>> {
+    entry.filter(|c| !c.has_delete_manifests)
+}
+
 impl FlureeR2rmlProvider<'_> {
     /// Body of [`R2rmlTableProvider::table_row_count`], split out so the trait
     /// method can wrap it in the `r2rml.count_manifest` timing span via
@@ -1750,7 +1767,9 @@ impl FlureeR2rmlProvider<'_> {
                 plan.files_pruned,
                 plan.estimated_row_count,
             )
-        } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
+        } else if let Some(cached) =
+            servable_scan_files(cache.get_scan_files(&metadata_location).await)
+        {
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = cached.data_files.len(),
@@ -1777,7 +1796,9 @@ impl FlureeR2rmlProvider<'_> {
                 cached.files_pruned,
                 cached.estimated_row_count,
             )
-        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&metadata_location) {
+        } else if let Some(disk) =
+            servable_scan_files(self.catalog_disk_cache().get_scan_files(&metadata_location))
+        {
             // PR-8 slice 2: in-memory miss, but the persistent disk catalog
             // cache has this snapshot's (unfiltered) file list — a warm-catalog
             // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
@@ -1821,6 +1842,26 @@ impl FlureeR2rmlProvider<'_> {
                 .await
                 .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
 
+            // Stamp whether this snapshot carries merge-on-read delete manifests so
+            // a later cache hit (in-memory or disk) can re-refuse a delete-omitting
+            // file list instead of serving it (audit F-AUD-1). Detected from the
+            // manifest LIST only — one read, mirroring the COUNT(*) path's delete
+            // signal — rather than re-reading the data manifests `plan_scan` already
+            // read. `plan_scan` on this rung has no merge-on-read guard, so a
+            // delete-bearing table is planned unguarded here; the flag ensures its
+            // cached selection is never SERVED (a hit re-plans instead). No current
+            // snapshot (an empty table) trivially has no deletes.
+            let has_delete_manifests = match metadata.current_snapshot() {
+                Some(snapshot) => send_snapshot_has_delete_manifests(storage.as_ref(), snapshot)
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read manifest list for delete detection: {e}"
+                        ))
+                    })?,
+                None => false,
+            };
+
             let cached = Arc::new(CachedScanFiles {
                 data_files: Arc::new(
                     plan.tasks
@@ -1831,6 +1872,7 @@ impl FlureeR2rmlProvider<'_> {
                 estimated_row_count: plan.estimated_row_count,
                 files_selected: plan.files_selected,
                 files_pruned: plan.files_pruned,
+                has_delete_manifests,
             });
             cache
                 .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
@@ -2489,5 +2531,33 @@ mod tests {
             sound_manifest_row_count(&schema, &files, false, &["NOPE".to_string()]),
             None
         );
+    }
+
+    fn cached_scan_files(has_delete_manifests: bool) -> Arc<CachedScanFiles> {
+        Arc::new(CachedScanFiles {
+            data_files: Arc::new(vec![]),
+            estimated_row_count: 0,
+            files_selected: 0,
+            files_pruned: 0,
+            has_delete_manifests,
+        })
+    }
+
+    #[test]
+    fn scan_files_with_delete_manifests_is_not_served() {
+        // Both scan-file cache hit arms (in-memory + disk) route the fetched entry
+        // through `servable_scan_files`. An entry whose source snapshot carried
+        // merge-on-read delete manifests must be a MISS (recomputed via plan_scan),
+        // never served, because the cached file list omits the deletes (F-AUD-1).
+        assert!(
+            servable_scan_files(Some(cached_scan_files(true))).is_none(),
+            "a delete-bearing cached entry must not be served (both arms)"
+        );
+        // A clean entry is served normally; an absent entry stays a miss.
+        assert!(
+            servable_scan_files(Some(cached_scan_files(false))).is_some(),
+            "a delete-free cached entry is served normally"
+        );
+        assert!(servable_scan_files(None).is_none());
     }
 }
