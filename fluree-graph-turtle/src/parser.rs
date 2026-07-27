@@ -60,6 +60,11 @@ pub struct Parser<'a, 'input, S> {
     /// deferred v1 shapes — mirrors the JSON-LD `@annotation` lowering,
     /// which rejects the same nesting.
     annotation_depth: u32,
+    /// Combined nesting depth of the recursive constructs (property lists,
+    /// collections, reified triples), bounded by
+    /// [`crate::error::MAX_NESTING_DEPTH`] so adversarial nesting errors
+    /// instead of overflowing the stack.
+    nesting_depth: u32,
 }
 
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
@@ -97,7 +102,29 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             prefixes: FxHashMap::default(),
             base: None,
             annotation_depth: 0,
+            nesting_depth: 0,
         })
+    }
+
+    /// Run `f` one nesting level deeper, erroring past
+    /// [`crate::error::MAX_NESTING_DEPTH`]. Owns both sides of the depth
+    /// bookkeeping so call sites cannot increment without the matching
+    /// decrement.
+    fn with_nesting<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if self.nesting_depth >= crate::error::MAX_NESTING_DEPTH {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "nesting of property lists, collections, and reified triples \
+                     exceeds the maximum depth of {}",
+                    crate::error::MAX_NESTING_DEPTH
+                ),
+            ));
+        }
+        self.nesting_depth += 1;
+        let result = f(self);
+        self.nesting_depth -= 1;
+        result
     }
 
     /// Parse the entire Turtle document.
@@ -617,15 +644,17 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse a collection in object position as indexed list items.
     fn parse_collection_as_list(&mut self, subject: TermId, predicate: TermId) -> Result<()> {
-        self.expect(&TokenKind::LParen)?;
-        let mut index: i32 = 0;
-        while !matches!(self.current().kind, TokenKind::RParen) {
-            let item = self.parse_object()?;
-            self.sink_emit_list_item(subject, predicate, item, index);
-            index += 1;
-        }
-        self.expect(&TokenKind::RParen)?;
-        Ok(())
+        self.with_nesting(|p| {
+            p.expect(&TokenKind::LParen)?;
+            let mut index: i32 = 0;
+            while !matches!(p.current().kind, TokenKind::RParen) {
+                let item = p.parse_object()?;
+                p.sink_emit_list_item(subject, predicate, item, index);
+                index += 1;
+            }
+            p.expect(&TokenKind::RParen)?;
+            Ok(())
+        })
     }
 
     /// Parse an object term.
@@ -840,51 +869,55 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse a blank node property list: `[ predicate object ; ... ]`
     fn parse_blank_node_property_list(&mut self) -> Result<TermId> {
-        self.expect(&TokenKind::LBracket)?;
+        self.with_nesting(|p| {
+            p.expect(&TokenKind::LBracket)?;
 
-        let bnode = self.sink_term_blank(None);
+            let bnode = p.sink_term_blank(None);
 
-        if !matches!(self.current().kind, TokenKind::RBracket) {
-            self.parse_predicate_object_list(bnode)?;
-        }
+            if !matches!(p.current().kind, TokenKind::RBracket) {
+                p.parse_predicate_object_list(bnode)?;
+            }
 
-        self.expect(&TokenKind::RBracket)?;
+            p.expect(&TokenKind::RBracket)?;
 
-        Ok(bnode)
+            Ok(bnode)
+        })
     }
 
     /// Parse a collection (RDF list): `( item1 item2 ... )`
     fn parse_collection(&mut self) -> Result<TermId> {
-        self.expect(&TokenKind::LParen)?;
+        self.with_nesting(|p| {
+            p.expect(&TokenKind::LParen)?;
 
-        if matches!(self.current().kind, TokenKind::RParen) {
-            self.advance()?;
-            return Ok(self.rdf_nil());
-        }
-
-        let rdf_first = self.rdf_first();
-        let rdf_rest = self.rdf_rest();
-        let rdf_nil = self.rdf_nil();
-
-        let first_node = self.sink_term_blank(None);
-        let mut current_node = first_node;
-
-        loop {
-            let item = self.parse_object()?;
-            self.sink_emit_triple(current_node, rdf_first, item);
-
-            if matches!(self.current().kind, TokenKind::RParen) {
-                self.sink_emit_triple(current_node, rdf_rest, rdf_nil);
-                break;
+            if matches!(p.current().kind, TokenKind::RParen) {
+                p.advance()?;
+                return Ok(p.rdf_nil());
             }
-            let next_node = self.sink_term_blank(None);
-            self.sink_emit_triple(current_node, rdf_rest, next_node);
-            current_node = next_node;
-        }
 
-        self.expect(&TokenKind::RParen)?;
+            let rdf_first = p.rdf_first();
+            let rdf_rest = p.rdf_rest();
+            let rdf_nil = p.rdf_nil();
 
-        Ok(first_node)
+            let first_node = p.sink_term_blank(None);
+            let mut current_node = first_node;
+
+            loop {
+                let item = p.parse_object()?;
+                p.sink_emit_triple(current_node, rdf_first, item);
+
+                if matches!(p.current().kind, TokenKind::RParen) {
+                    p.sink_emit_triple(current_node, rdf_rest, rdf_nil);
+                    break;
+                }
+                let next_node = p.sink_term_blank(None);
+                p.sink_emit_triple(current_node, rdf_rest, next_node);
+                current_node = next_node;
+            }
+
+            p.expect(&TokenKind::RParen)?;
+
+            Ok(first_node)
+        })
     }
 
     // =========================================================================
@@ -970,32 +1003,34 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// reifier (mirrors the JSON-LD `_:fluree_ann_N` minting; W3C
     /// eval-triple-terms `pattern-3-nomatch` depends on this).
     fn parse_reified_triple(&mut self) -> Result<TermId> {
-        self.check_star_allowed("reified triple ('<< … >>')")?;
-        self.expect(&TokenKind::ReifiedTripleStart)?;
+        self.with_nesting(|p| {
+            p.check_star_allowed("reified triple ('<< … >>')")?;
+            p.expect(&TokenKind::ReifiedTripleStart)?;
 
-        let subject = self.parse_rt_subject()?;
-        let predicate = self.parse_predicate()?;
-        let object = self.parse_rt_object()?;
+            let subject = p.parse_rt_subject()?;
+            let predicate = p.parse_predicate()?;
+            let object = p.parse_rt_object()?;
 
-        // Optional reifier: `~` (iri | BlankNode)? — bare `~` mints fresh.
-        let reifier = if matches!(self.current().kind, TokenKind::Tilde) {
-            self.advance()?;
-            self.parse_reifier_term()?
-        } else {
-            self.sink_term_blank(None)
-        };
+            // Optional reifier: `~` (iri | BlankNode)? — bare `~` mints fresh.
+            let reifier = if matches!(p.current().kind, TokenKind::Tilde) {
+                p.advance()?;
+                p.parse_reifier_term()?
+            } else {
+                p.sink_term_blank(None)
+            };
 
-        self.expect(&TokenKind::ReifiedTripleEnd)?;
+            p.expect(&TokenKind::ReifiedTripleEnd)?;
 
-        // Fluree's edge-annotation model reifies an asserted edge: emit the
-        // base triple, then the reifier attachment (documented divergence
-        // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
-        // inventory).
-        self.sink_emit_triple(subject, predicate, object);
-        self.sink
-            .emit_reified_triple(subject, predicate, object, reifier);
+            // Fluree's edge-annotation model reifies an asserted edge: emit the
+            // base triple, then the reifier attachment (documented divergence
+            // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
+            // inventory).
+            p.sink_emit_triple(subject, predicate, object);
+            p.sink
+                .emit_reified_triple(subject, predicate, object, reifier);
 
-        Ok(reifier)
+            Ok(reifier)
+        })
     }
 
     /// rtSubject ::= iri | BlankNode | reifiedTriple
@@ -1985,5 +2020,82 @@ mod tests {
             .map(|(s, _, _)| s.clone())
             .expect(":b2 a2 triple");
         assert_ne!(b2_object, b2_subject, "pattern-3-nomatch must stay empty");
+    }
+    // =========================================================================
+    // Recursion depth ceiling (issue #1480)
+    // =========================================================================
+
+    /// `[ ex:p [ ex:p … ex:o … ] ] .` nested `depth` levels.
+    fn nested_property_lists(depth: usize) -> String {
+        format!(
+            "@prefix ex: <http://example.org/> .\n{}ex:o{} .",
+            "[ ex:p ".repeat(depth),
+            " ]".repeat(depth)
+        )
+    }
+
+    /// `ex:s ex:p ( ( … ( ex:o ) … ) ) .` nested `depth` levels. The
+    /// innermost collection holds a real item — a bare `()` lexes as a
+    /// single `Nil` token and would not count as a nesting level.
+    fn nested_collections(depth: usize) -> String {
+        format!(
+            "@prefix ex: <http://example.org/> .\nex:s ex:p {}ex:o{} .",
+            "( ".repeat(depth),
+            " )".repeat(depth)
+        )
+    }
+
+    /// `<< … << ex:s ex:p ex:o >> … ex:p ex:o >> ex:p ex:o .` nested
+    /// `depth` levels via the reified-triple subject position.
+    fn nested_reified_triples(depth: usize) -> String {
+        format!(
+            "@prefix ex: <http://example.org/> .\n{}ex:s ex:p ex:o{} .",
+            "<< ".repeat(depth),
+            " >> ex:p ex:o".repeat(depth)
+        )
+    }
+
+    fn assert_depth_err(err: TurtleError) {
+        assert!(
+            err.to_string().contains("maximum depth"),
+            "expected the nesting-depth error, got: {err}"
+        );
+    }
+
+    /// The ceiling is inclusive: depth == MAX_NESTING_DEPTH parses, pinning
+    /// the boundary against a stricter-by-one guard regression.
+    #[test]
+    fn nesting_at_the_ceiling_parses() {
+        let depth = crate::error::MAX_NESTING_DEPTH as usize;
+        parse_to_graph(&nested_property_lists(depth)).expect("property lists");
+        parse_to_graph(&nested_collections(depth)).expect("collections");
+        parse_star(&nested_reified_triples(depth));
+    }
+
+    #[test]
+    fn nesting_past_the_ceiling_errors_cleanly() {
+        let depth = (crate::error::MAX_NESTING_DEPTH + 1) as usize;
+        assert_depth_err(parse_to_graph(&nested_property_lists(depth)).expect_err("lists"));
+        assert_depth_err(parse_to_graph(&nested_collections(depth)).expect_err("collections"));
+        let mut sink = StarSink::default();
+        assert_depth_err(parse(&nested_reified_triples(depth), &mut sink).expect_err("reified"));
+    }
+
+    /// The original DoS shape: a small document with adversarial nesting
+    /// depth must fail with a clean parse error, not a stack overflow.
+    #[test]
+    fn deeply_nested_property_lists_do_not_overflow_the_stack() {
+        assert_depth_err(parse_to_graph(&nested_property_lists(100_000)).expect_err("deep"));
+    }
+
+    /// Siblings at the same level do not accumulate depth: only the nesting
+    /// chain counts, so wide-but-shallow documents stay parseable.
+    #[test]
+    fn sibling_nesting_does_not_accumulate_depth() {
+        let mut input = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..(crate::error::MAX_NESTING_DEPTH as usize * 4) {
+            input.push_str(&format!("ex:s{i} ex:p [ ex:q ( ex:o ) ] .\n"));
+        }
+        parse_to_graph(&input).expect("sibling nesting must not accumulate");
     }
 }
