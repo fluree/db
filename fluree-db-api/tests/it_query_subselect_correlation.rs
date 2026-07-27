@@ -19,6 +19,10 @@ use serde_json::json;
 /// `ex:a` has `ex:p 2` and two `ex:r` links (COUNT = 2, matches).
 /// `ex:b` has `ex:p 5` and one `ex:r` link (COUNT = 1, does not match).
 /// `ex:c` has no `ex:p` and three `ex:r` links (parent side unbound).
+/// `ex:d` has `ex:p 6` — equal to the TOTAL `ex:r` count (2 + 1 + 3 = 6) — and
+/// no `ex:r` links, so it is the sole match for the scalar-aggregate test.
+/// Having no `ex:r`, it never appears in the per-subject subqueries (they
+/// require an `ex:r` join), so it leaves every other test's result unchanged.
 async fn seed_counts(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
     let ledger0 = genesis_ledger(fluree, ledger_id);
     let insert = json!({
@@ -29,7 +33,8 @@ async fn seed_counts(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
             {"@id": "ex:b", "ex:name": "b", "ex:p": 5,
              "ex:r": [{"@id": "ex:y1"}]},
             {"@id": "ex:c", "ex:name": "c",
-             "ex:r": [{"@id": "ex:z1"}, {"@id": "ex:z2"}, {"@id": "ex:z3"}]}
+             "ex:r": [{"@id": "ex:z1"}, {"@id": "ex:z2"}, {"@id": "ex:z3"}]},
+            {"@id": "ex:d", "ex:name": "d", "ex:p": 6}
         ]
     });
     fluree.insert(ledger0, &insert).await.unwrap().ledger
@@ -91,7 +96,9 @@ async fn sparql_subselect_aggregate_correlation_var_order_independent() {
 
 /// A scalar (ungrouped) aggregate correlation var: the sub-SELECT produces one
 /// row with the total `ex:r` count (6), so only the parent row whose `ex:p`
-/// equals 6 survives the join — here, none.
+/// equals 6 survives the join — here, `ex:d`. Asserting a specific row (not
+/// merely the absence of rows) also catches a regression where the scalar
+/// subquery path stops producing at all.
 #[tokio::test]
 async fn sparql_subselect_scalar_aggregate_correlation_var_is_joined() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -108,8 +115,8 @@ async fn sparql_subselect_scalar_aggregate_correlation_var_is_joined() {
     let rows = sparql_rows(&fluree, &ledger, q).await;
     assert_eq!(
         normalize_rows(&rows),
-        normalize_rows(&json!([])),
-        "no parent ex:p equals the total count 6, got {rows}"
+        normalize_rows(&json!([["ex:d"]])),
+        "only ex:d (ex:p 6) equals the total count 6, got {rows}"
     );
 }
 
