@@ -331,7 +331,13 @@ This means:
 - **Recursive rules work.** A rule can produce facts that trigger itself again.
 - **Rule chaining works.** Rule A can produce facts that trigger Rule B, and
   vice versa.
-- **Termination is guaranteed** by a maximum fixpoint-iteration bound.
+- **Termination is guaranteed** by a maximum fixpoint-iteration bound and by
+  the shared reasoning budget — a maximum derived-fact count and a maximum
+  wall-clock time, the same budget OWL2-RL uses. Hitting the budget stops
+  early and marks the result `capped` in the tracked response's `reasoning`
+  block. Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds`
+  (ledger config), `"reasoningBudget"` (query), or
+  `FLUREE_REASONING_MAX_FACTS` / `FLUREE_REASONING_MAX_SECONDS` (server).
 
 ### Execution order
 

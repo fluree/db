@@ -23,12 +23,14 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, Sid};
 use fluree_db_reasoner::{
     BindingValue, Bindings, CompareOp, DatalogRule, DatalogRuleSet, DerivedFactsBuilder,
-    FrozenSameAs, RuleFilter, RuleTerm, RuleTriplePattern, RuleValue,
+    FrozenSameAs, ReasoningBudget, ReasoningDiagnostics, RuleFilter, RuleTerm, RuleTriplePattern,
+    RuleValue,
 };
 use fluree_vocab::namespaces::FLUREE_DB;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::{QueryError, Result};
 
@@ -1172,10 +1174,10 @@ fn bindings_equal(a: &BindingValue, b: &BindingValue) -> bool {
 pub struct DatalogExecutionResult {
     /// Derived flakes from rule execution
     pub derived_flakes: Vec<Flake>,
-    /// Number of fixpoint iterations
-    pub iterations: usize,
-    /// Number of rules executed
-    pub rules_executed: usize,
+    /// Fixpoint diagnostics (iterations, facts, capped flag, duration) — the
+    /// same type OWL2-RL returns, so a capped run surfaces on the query
+    /// response the same way (see `reasoning_prep`).
+    pub diagnostics: ReasoningDiagnostics,
 }
 
 /// Execute datalog rules to fixpoint, generating derived facts
@@ -1201,7 +1203,14 @@ pub async fn execute_datalog_rules(
     db: GraphDbRef<'_>,
     max_iterations: usize,
 ) -> Result<DatalogExecutionResult> {
-    execute_datalog_rules_with_query_rules(db, max_iterations, &[], None).await
+    execute_datalog_rules_with_query_rules(
+        db,
+        max_iterations,
+        &[],
+        None,
+        &ReasoningBudget::unlimited(),
+    )
+    .await
 }
 
 /// Execute datalog rules with optional query-time rules
@@ -1214,11 +1223,19 @@ pub async fn execute_datalog_rules(
 /// `db.g_id` (legacy behaviour). When `Some(g)`, a separate
 /// `GraphDbRef` is built at graph `g` and used only for rule
 /// extraction — the fixpoint loop still executes against `db`.
+///
+/// `budget` bounds the fixpoint by derived-fact count and wall-clock time
+/// (checked between iterations, mirroring OWL2-RL's `fixpoint.rs`). This is
+/// load-bearing because a rule with an unbound-subject-and-predicate `where`
+/// pattern scans the whole ledger every iteration; `max_iterations` alone is
+/// not a defensible ceiling for that. Exhausting the budget stops early and
+/// sets `diagnostics.capped`.
 pub async fn execute_datalog_rules_with_query_rules(
     db: GraphDbRef<'_>,
     max_iterations: usize,
     query_time_rules: &[serde_json::Value],
     rules_source_g_id: Option<fluree_db_core::GraphId>,
+    budget: &ReasoningBudget,
 ) -> Result<DatalogExecutionResult> {
     // Extract rules from the configured source graph if set,
     // otherwise from the query graph. The fixpoint loop below
@@ -1244,8 +1261,7 @@ pub async fn execute_datalog_rules_with_query_rules(
     if rule_set.is_empty() {
         return Ok(DatalogExecutionResult {
             derived_flakes: Vec::new(),
-            iterations: 0,
-            rules_executed: 0,
+            diagnostics: ReasoningDiagnostics::completed(0, 0, std::time::Duration::ZERO),
         });
     }
 
@@ -1266,7 +1282,6 @@ pub async fn execute_datalog_rules_with_query_rules(
         Flake,
     > = HashMap::new();
     let mut iterations = 0;
-    let mut rules_executed = 0;
 
     // Use the same t as the query for derived facts (matching OWL2-RL approach)
     // This is important because the overlay filters with flake.t <= to_t
@@ -1275,7 +1290,22 @@ pub async fn execute_datalog_rules_with_query_rules(
     // Track derived overlay for recursive rule support
     let mut derived_overlay: Option<Arc<fluree_db_reasoner::DerivedFactsOverlay>> = None;
 
+    let start = Instant::now();
+    let mut capped: Option<&str> = None;
+
     loop {
+        // Budget check BEFORE another round — a round can scan the whole ledger
+        // per rule, so stop before paying for one we can't afford. Mirrors the
+        // OWL2-RL fixpoint (`fluree-db-reasoner/src/fixpoint.rs`).
+        if start.elapsed() > budget.max_duration {
+            capped = Some("time");
+            break;
+        }
+        if all_derived.len() > budget.max_facts {
+            capped = Some("facts");
+            break;
+        }
+
         iterations += 1;
         let mut new_facts_this_round = 0;
 
@@ -1292,8 +1322,6 @@ pub async fn execute_datalog_rules_with_query_rules(
 
         // Execute each rule in order
         for rule in rule_set.iter_in_order() {
-            rules_executed += 1;
-
             // Find all bindings matching the where patterns
             // Use effective_overlay which includes derived facts from previous iterations
             let iter_db = GraphDbRef::new(db.snapshot, db.g_id, effective_overlay.as_ref(), db.t);
@@ -1344,10 +1372,17 @@ pub async fn execute_datalog_rules_with_query_rules(
         ));
     }
 
+    let facts = all_derived.len();
+    let elapsed = start.elapsed();
+    let mut diagnostics = ReasoningDiagnostics::default();
+    match capped {
+        Some(reason) => diagnostics.mark_capped(reason, iterations, facts, elapsed),
+        None => diagnostics.mark_completed(iterations, facts, elapsed),
+    }
+
     Ok(DatalogExecutionResult {
         derived_flakes: all_derived.into_values().collect(),
-        iterations,
-        rules_executed,
+        diagnostics,
     })
 }
 
