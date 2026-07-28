@@ -190,6 +190,20 @@ pub enum ApiError {
     #[error("Credential error: {0}")]
     Credential(#[from] fluree_db_credential::CredentialError),
 
+    /// Iceberg graph-source errors (requires `iceberg` feature).
+    ///
+    /// Preserves the typed discriminant from `fluree_db_iceberg` — notably
+    /// [`fluree_db_iceberg::IcebergError::MergeOnReadDeletes`], which the
+    /// fail-closed MoR guard raises for a correctly-configured table that merely
+    /// carries delete files (a 409 Conflict, not a 400 config error). Display is
+    /// the inner error verbatim (no prefix) so the guard's actionable message —
+    /// including the `merge-on-read` substring the CLI/solo classifiers match on
+    /// and the `FLUREE_ICEBERG_ALLOW_MOR_DELETES` override name — reaches the
+    /// caller unchanged.
+    #[cfg(feature = "iceberg")]
+    #[error("{0}")]
+    Iceberg(#[from] fluree_db_iceberg::IcebergError),
+
     /// Core/Storage errors
     #[error("Core error: {0}")]
     Core(#[from] fluree_db_core::Error),
@@ -399,6 +413,15 @@ impl ApiError {
             ApiError::Http { status, .. } => *status,
             #[cfg(feature = "credential")]
             ApiError::Credential(e) => e.status_code(),
+            // A correctly-configured Iceberg table that merely carries
+            // merge-on-read delete files is a conflict (unsupported state), not
+            // bad input — 409. Other Iceberg errors preserve the pre-typed-variant
+            // 400 (they previously flowed through `ApiError::config`).
+            #[cfg(feature = "iceberg")]
+            ApiError::Iceberg(e) => match e {
+                fluree_db_iceberg::IcebergError::MergeOnReadDeletes(_) => 409,
+                _ => 400,
+            },
             ApiError::InvalidBranch(_) => 400,
             ApiError::BranchConflict(_) => 409,
             ApiError::NotFound(_) => 404,
