@@ -49,7 +49,7 @@ pub async fn run(action: Bm25Action, dirs: &FlureeDir) -> CliResult<()> {
             )
             .await
         }
-        Bm25Action::Drop { index } => run_drop(&index, dirs).await,
+        Bm25Action::Drop { index, force } => run_drop(&index, force, dirs).await,
         Bm25Action::Sync { index } => run_sync(&index, dirs).await,
         Bm25Action::List { stale } => run_list(stale, dirs).await,
     }
@@ -228,7 +228,18 @@ async fn run_sync(index: &str, dirs: &FlureeDir) -> CliResult<()> {
     Ok(())
 }
 
-async fn run_drop(index: &str, dirs: &FlureeDir) -> CliResult<()> {
+/// Drop is destructive — it retracts the nameservice record *and* deletes the
+/// snapshot blobs — so it gates behind `--force` like every other destructive
+/// command here (`fluree drop` for a ledger, `fluree iceberg drop` for the
+/// adjacent graph-source family). Rebuilding an index over a large corpus is
+/// expensive enough that the confirmation earns its keep.
+async fn run_drop(index: &str, force: bool, dirs: &FlureeDir) -> CliResult<()> {
+    if !force {
+        return Err(CliError::Usage(format!(
+            "use --force to confirm deletion of '{index}'"
+        )));
+    }
+
     let fluree = build_fluree(dirs)?;
     let result = fluree
         .drop_full_text_index(index)

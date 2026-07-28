@@ -679,10 +679,17 @@ impl Fluree {
             };
 
         // Wire the BM25 index provider so embedded `f:searchText` graph-source
-        // queries execute in-process (parity with `query_dataset_with_bm25`).
+        // queries execute in-process over the standard query route.
         // It is a zero-cost `&Fluree` wrapper and is only consulted by the
         // `IndexSearch` operator, so non-search queries are unaffected. Declared
         // before `config` so it outlives the borrow held by the context.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
         let index_provider = crate::FlureeIndexProvider::new(self);
 
         let config = ContextConfig {
@@ -827,9 +834,16 @@ impl Fluree {
             };
 
         // Wire the BM25 index provider so embedded `f:searchText` graph-source
-        // queries execute in-process (parity with `query_dataset_with_bm25`).
+        // queries execute in-process over the standard query route.
         // Zero-cost `&Fluree` wrapper, only consulted by the `IndexSearch`
         // operator; declared before `config` so it outlives the context borrow.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
         let index_provider = crate::FlureeIndexProvider::new(self);
 
         let config = ContextConfig {

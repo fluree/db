@@ -1173,7 +1173,7 @@ pub enum Bm25Action {
         #[arg(short = 'e', long = "query")]
         query: Option<String>,
 
-        /// Read the indexing query from a file (`-` for stdin).
+        /// Read the indexing query from a file (or pipe it via stdin).
         #[arg(short = 'f', long = "query-file")]
         query_file: Option<PathBuf>,
 
@@ -1191,6 +1191,10 @@ pub enum Bm25Action {
         /// Index graph-source alias to drop (e.g. "silver-search:main").
         #[arg(long)]
         index: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
     },
 
     /// Sync a BM25 full-text index up to its source ledger's latest state.

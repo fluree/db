@@ -93,11 +93,17 @@ macro_rules! view_context_config {
             None
         };
         // Wire the BM25 index provider so embedded `f:searchText` graph-source
-        // queries execute in-process on the single-graph view path too (parity
-        // with `query_dataset_with_bm25` and the dataset path). Zero-cost
-        // `&Fluree` wrapper, only consulted by the `IndexSearch` operator, so
-        // non-search queries are unaffected. Declared before `$cfg` so it
-        // outlives the borrow the context holds.
+        // queries execute in-process on the single-graph view path too.
+        // Zero-cost `&Fluree` wrapper, only consulted by the `IndexSearch`
+        // operator, so non-search queries are unaffected. Declared before `$cfg`
+        // so it outlives the borrow the context holds.
+        //
+        // `bm25_provider` (the "legacy" index-provider slot), NOT the
+        // "preferred" `bm25_search_provider` that `ContextConfig` steers you
+        // toward: view-policy enforcement on a hit only works in index-provider
+        // mode. Search-provider mode has no local flakes and fails closed
+        // (`operator.rs`), so it would return zero rows for every
+        // policy-enforced query. Do not "upgrade" this.
         let __index_provider = $crate::FlureeIndexProvider::new($self);
         let $cfg = ContextConfig {
             tracker: Some($tracker),
