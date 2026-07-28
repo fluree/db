@@ -23,12 +23,14 @@ use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, Sid};
 use fluree_db_reasoner::{
     BindingValue, Bindings, CompareOp, DatalogRule, DatalogRuleSet, DerivedFactsBuilder,
-    FrozenSameAs, RuleFilter, RuleTerm, RuleTriplePattern, RuleValue,
+    FrozenSameAs, ReasoningBudget, ReasoningDiagnostics, RuleFilter, RuleTerm, RuleTriplePattern,
+    RuleValue,
 };
 use fluree_vocab::namespaces::FLUREE_DB;
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::{QueryError, Result};
 
@@ -405,25 +407,16 @@ fn parse_node_pattern(
             continue;
         }
 
-        // Resolve predicate IRI
-        let predicate_iri = expand_iri(key, context)?;
-        let predicate_sid = resolve_iri(&predicate_iri, snapshot)?;
+        let predicate = parse_predicate_term(key, context, snapshot)?;
 
         // Parse object(s)
         match value {
             JsonValue::Array(arr) => {
                 for item in arr {
-                    let obj = parse_object_value(
-                        item,
-                        context,
-                        snapshot,
-                        patterns,
-                        &subject,
-                        &predicate_sid,
-                    )?;
+                    let obj = parse_object_value(item, context, snapshot, patterns)?;
                     patterns.push(RuleTriplePattern {
                         subject: subject.clone(),
-                        predicate: RuleTerm::Sid(predicate_sid.clone()),
+                        predicate: predicate.clone(),
                         object: obj,
                     });
                 }
@@ -441,7 +434,7 @@ fn parse_node_pattern(
                 // Add pattern linking parent to nested subject
                 patterns.push(RuleTriplePattern {
                     subject: subject.clone(),
-                    predicate: RuleTerm::Sid(predicate_sid.clone()),
+                    predicate: predicate.clone(),
                     object: nested_subject.clone(),
                 });
 
@@ -460,7 +453,7 @@ fn parse_node_pattern(
                 let obj = parse_term(value, context, snapshot)?;
                 patterns.push(RuleTriplePattern {
                     subject: subject.clone(),
-                    predicate: RuleTerm::Sid(predicate_sid.clone()),
+                    predicate: predicate.clone(),
                     object: obj,
                 });
             }
@@ -470,14 +463,27 @@ fn parse_node_pattern(
     Ok(())
 }
 
+/// Parse a node-map key into a predicate term: a `?`-prefixed key is a
+/// variable; anything else expands and resolves as an IRI.
+fn parse_predicate_term(
+    key: &str,
+    context: &JsonValue,
+    snapshot: &LedgerSnapshot,
+) -> Result<RuleTerm> {
+    if key.starts_with('?') {
+        Ok(RuleTerm::var(key))
+    } else {
+        let iri = expand_iri(key, context)?;
+        Ok(RuleTerm::Sid(resolve_iri(&iri, snapshot)?))
+    }
+}
+
 /// Parse an object value, handling nested structures
 fn parse_object_value(
     value: &JsonValue,
     context: &JsonValue,
     snapshot: &LedgerSnapshot,
     patterns: &mut Vec<RuleTriplePattern>,
-    _parent_subject: &RuleTerm,
-    _predicate_sid: &Sid,
 ) -> Result<RuleTerm> {
     match value {
         JsonValue::Object(nested) if nested.contains_key("@id") => {
@@ -568,11 +574,6 @@ fn expand_iri(compact: &str, context: &JsonValue) -> Result<String> {
         return Ok(compact.to_string());
     }
 
-    // Check if it's a variable
-    if compact.starts_with('?') {
-        return Ok(compact.to_string());
-    }
-
     // Try to expand using context
     if let Some(colon_pos) = compact.find(':') {
         let prefix = &compact[..colon_pos];
@@ -601,6 +602,69 @@ fn resolve_iri(iri: &str, snapshot: &LedgerSnapshot) -> Result<Sid> {
 // Pattern Matching Execution
 // ============================================================================
 
+/// Whether `term` grounds an index lookup: a constant, or a variable already
+/// bound by an earlier pattern. Grounding the subject or predicate keeps a
+/// pattern off the full-scan path in [`choose_index_and_match`].
+fn term_is_grounded(term: &RuleTerm, bound: &HashSet<Arc<str>>) -> bool {
+    match term {
+        RuleTerm::Sid(_) | RuleTerm::Value(_) => true,
+        RuleTerm::Var(v) => bound.contains(v),
+    }
+}
+
+/// Selectivity score for matching `pattern` given the currently-bound
+/// variables. A grounded subject or predicate (worth 2 each) avoids the
+/// `(None, None)` full ledger scan; a grounded object (worth 1) constrains
+/// the result further. Higher is cheaper to match.
+fn pattern_selectivity(pattern: &RuleTriplePattern, bound: &HashSet<Arc<str>>) -> u32 {
+    2 * term_is_grounded(&pattern.subject, bound) as u32
+        + 2 * term_is_grounded(&pattern.predicate, bound) as u32
+        + term_is_grounded(&pattern.object, bound) as u32
+}
+
+/// Record `pattern`'s variables as bound (they will be after it matches).
+fn bind_pattern_vars(pattern: &RuleTriplePattern, bound: &mut HashSet<Arc<str>>) {
+    for term in [&pattern.subject, &pattern.predicate, &pattern.object] {
+        if let RuleTerm::Var(v) = term {
+            bound.insert(v.clone());
+        }
+    }
+}
+
+/// Order `patterns` most-constrained-first via a greedy join order: at each
+/// step take the pattern with the highest [`pattern_selectivity`] given the
+/// variables already bound, then mark its variables bound. A where-clause is
+/// a conjunction, so the join result is order-independent — this only lowers
+/// matching cost, keeping an all-unbound pattern (a full ledger scan) from
+/// leading when another pattern can ground its variables first. Ties keep
+/// source order.
+fn selective_pattern_order(patterns: &[RuleTriplePattern]) -> Vec<usize> {
+    let mut bound: HashSet<Arc<str>> = HashSet::new();
+    let mut remaining: Vec<usize> = (0..patterns.len()).collect();
+    let mut order = Vec::with_capacity(patterns.len());
+
+    while !remaining.is_empty() {
+        let best = remaining
+            .iter()
+            .enumerate()
+            .max_by_key(|(rank, &idx)| {
+                // Higher selectivity wins; on ties the lower source index
+                // (earlier `rank`) wins, so `max_by_key` compares Reverse.
+                (
+                    pattern_selectivity(&patterns[idx], &bound),
+                    std::cmp::Reverse(*rank),
+                )
+            })
+            .map(|(rank, _)| rank)
+            .expect("remaining is non-empty");
+        let idx = remaining.remove(best);
+        bind_pattern_vars(&patterns[idx], &mut bound);
+        order.push(idx);
+    }
+
+    order
+}
+
 /// Execute pattern matching for a datalog rule against the database
 ///
 /// Finds all bindings that satisfy the rule's where patterns and filters, and returns them.
@@ -613,11 +677,20 @@ pub async fn execute_rule_matching(
         return Ok(Vec::new());
     }
 
+    // Match patterns most-constrained-first so a pattern whose subject and
+    // predicate are both unbound variables — a full ledger scan (the
+    // `(None, None)` arm of `choose_index_and_match`), now reachable via
+    // property-position variables — does not lead when another pattern can
+    // ground its variables first.
+    let order = selective_pattern_order(&rule.where_patterns);
+    let mut patterns = order.iter().map(|&i| &rule.where_patterns[i]);
+
     // Start with the first pattern to get initial bindings
-    let mut binding_rows = match_pattern(&rule.where_patterns[0], db, &[]).await?;
+    let first = patterns.next().expect("where_patterns is non-empty");
+    let mut binding_rows = match_pattern(first, db, &[]).await?;
 
     // Join with subsequent patterns
-    for pattern in rule.where_patterns.iter().skip(1) {
+    for pattern in patterns {
         if binding_rows.is_empty() {
             break;
         }
@@ -766,9 +839,19 @@ async fn match_pattern_with_bindings(
     db: GraphDbRef<'_>,
     bindings: &Bindings,
 ) -> Result<Vec<Bindings>> {
-    // Resolve pattern terms using existing bindings
-    let (subject_sid, subject_var) = resolve_term_with_bindings(&pattern.subject, bindings)?;
-    let (predicate_sid, predicate_var) = resolve_term_with_bindings(&pattern.predicate, bindings)?;
+    // Resolve pattern terms using existing bindings. A subject/predicate
+    // variable bound to a non-Sid value can never occupy that position in a
+    // flake, so the pattern matches nothing for this binding row.
+    let Some((subject_sid, subject_var)) =
+        resolve_term_with_bindings(&pattern.subject, bindings).split()
+    else {
+        return Ok(Vec::new());
+    };
+    let Some((predicate_sid, predicate_var)) =
+        resolve_term_with_bindings(&pattern.predicate, bindings).split()
+    else {
+        return Ok(Vec::new());
+    };
     let (object_match, object_var) = resolve_object_term_with_bindings(&pattern.object, bindings)?;
 
     // Choose index based on what's bound
@@ -847,29 +930,45 @@ async fn match_pattern_with_bindings(
     Ok(results)
 }
 
-/// Resolve a term using existing bindings, returning (resolved_sid, unbound_var_name)
-fn resolve_term_with_bindings(
-    term: &RuleTerm,
-    bindings: &Bindings,
-) -> Result<(Option<Sid>, Option<Arc<str>>)> {
-    match term {
-        RuleTerm::Sid(sid) => Ok((Some(sid.clone()), None)),
-        RuleTerm::Var(var) => {
-            // Check if variable is already bound
-            if let Some(binding) = bindings.get(var.as_ref()) {
-                match binding {
-                    BindingValue::Sid(sid) => Ok((Some(sid.clone()), None)),
-                    _ => Err(QueryError::InvalidQuery(format!(
-                        "Variable {var} bound to non-SID value in subject/predicate position"
-                    ))),
-                }
-            } else {
-                Ok((None, Some(var.clone())))
-            }
+/// Resolution of a subject- or predicate-position term against existing bindings
+enum TermResolution {
+    /// Constant, or a variable already bound to a Sid
+    Bound(Sid),
+    /// Unbound variable, to be bound from each matched flake
+    Unbound(Arc<str>),
+    /// A literal constant, or a variable bound to a non-Sid value: no flake
+    /// can carry a literal in subject/predicate position, so the pattern
+    /// matches nothing (an empty join, not an error)
+    Incompatible,
+}
+
+impl TermResolution {
+    /// Split into `(bound_sid, unbound_var)`, or `None` when incompatible
+    fn split(self) -> Option<(Option<Sid>, Option<Arc<str>>)> {
+        match self {
+            TermResolution::Bound(sid) => Some((Some(sid), None)),
+            TermResolution::Unbound(var) => Some((None, Some(var))),
+            TermResolution::Incompatible => None,
         }
-        RuleTerm::Value(_) => Err(QueryError::InvalidQuery(
-            "Literal value not allowed in subject/predicate position".to_string(),
-        )),
+    }
+}
+
+/// Resolve a subject- or predicate-position term using existing bindings.
+///
+/// Total: a literal constant (`RuleTerm::Value`) — a plausible typo for an
+/// unprefixed IRI like `{"@id": "Alice"}` — can no more occupy subject or
+/// predicate position than a variable bound to a literal, so it resolves to
+/// `Incompatible` (that pattern matches nothing) rather than erroring, which
+/// would abort the whole fixpoint and drop every rule's derivations.
+fn resolve_term_with_bindings(term: &RuleTerm, bindings: &Bindings) -> TermResolution {
+    match term {
+        RuleTerm::Sid(sid) => TermResolution::Bound(sid.clone()),
+        RuleTerm::Var(var) => match bindings.get(var.as_ref()) {
+            Some(BindingValue::Sid(sid)) => TermResolution::Bound(sid.clone()),
+            Some(_) => TermResolution::Incompatible,
+            None => TermResolution::Unbound(var.clone()),
+        },
+        RuleTerm::Value(_) => TermResolution::Incompatible,
     }
 }
 
@@ -1075,10 +1174,10 @@ fn bindings_equal(a: &BindingValue, b: &BindingValue) -> bool {
 pub struct DatalogExecutionResult {
     /// Derived flakes from rule execution
     pub derived_flakes: Vec<Flake>,
-    /// Number of fixpoint iterations
-    pub iterations: usize,
-    /// Number of rules executed
-    pub rules_executed: usize,
+    /// Fixpoint diagnostics (iterations, facts, capped flag, duration) — the
+    /// same type OWL2-RL returns, so a capped run surfaces on the query
+    /// response the same way (see `reasoning_prep`).
+    pub diagnostics: ReasoningDiagnostics,
 }
 
 /// Execute datalog rules to fixpoint, generating derived facts
@@ -1104,7 +1203,14 @@ pub async fn execute_datalog_rules(
     db: GraphDbRef<'_>,
     max_iterations: usize,
 ) -> Result<DatalogExecutionResult> {
-    execute_datalog_rules_with_query_rules(db, max_iterations, &[], None).await
+    execute_datalog_rules_with_query_rules(
+        db,
+        max_iterations,
+        &[],
+        None,
+        &ReasoningBudget::unlimited(),
+    )
+    .await
 }
 
 /// Execute datalog rules with optional query-time rules
@@ -1117,11 +1223,19 @@ pub async fn execute_datalog_rules(
 /// `db.g_id` (legacy behaviour). When `Some(g)`, a separate
 /// `GraphDbRef` is built at graph `g` and used only for rule
 /// extraction — the fixpoint loop still executes against `db`.
+///
+/// `budget` bounds the fixpoint by derived-fact count and wall-clock time
+/// (checked between iterations, mirroring OWL2-RL's `fixpoint.rs`). This is
+/// load-bearing because a rule with an unbound-subject-and-predicate `where`
+/// pattern scans the whole ledger every iteration; `max_iterations` alone is
+/// not a defensible ceiling for that. Exhausting the budget stops early and
+/// sets `diagnostics.capped`.
 pub async fn execute_datalog_rules_with_query_rules(
     db: GraphDbRef<'_>,
     max_iterations: usize,
     query_time_rules: &[serde_json::Value],
     rules_source_g_id: Option<fluree_db_core::GraphId>,
+    budget: &ReasoningBudget,
 ) -> Result<DatalogExecutionResult> {
     // Extract rules from the configured source graph if set,
     // otherwise from the query graph. The fixpoint loop below
@@ -1147,8 +1261,7 @@ pub async fn execute_datalog_rules_with_query_rules(
     if rule_set.is_empty() {
         return Ok(DatalogExecutionResult {
             derived_flakes: Vec::new(),
-            iterations: 0,
-            rules_executed: 0,
+            diagnostics: ReasoningDiagnostics::completed(0, 0, std::time::Duration::ZERO),
         });
     }
 
@@ -1169,7 +1282,6 @@ pub async fn execute_datalog_rules_with_query_rules(
         Flake,
     > = HashMap::new();
     let mut iterations = 0;
-    let mut rules_executed = 0;
 
     // Use the same t as the query for derived facts (matching OWL2-RL approach)
     // This is important because the overlay filters with flake.t <= to_t
@@ -1178,7 +1290,22 @@ pub async fn execute_datalog_rules_with_query_rules(
     // Track derived overlay for recursive rule support
     let mut derived_overlay: Option<Arc<fluree_db_reasoner::DerivedFactsOverlay>> = None;
 
+    let start = Instant::now();
+    let mut capped: Option<&str> = None;
+
     loop {
+        // Budget check BEFORE another round — a round can scan the whole ledger
+        // per rule, so stop before paying for one we can't afford. Mirrors the
+        // OWL2-RL fixpoint (`fluree-db-reasoner/src/fixpoint.rs`).
+        if start.elapsed() > budget.max_duration {
+            capped = Some("time");
+            break;
+        }
+        if all_derived.len() > budget.max_facts {
+            capped = Some("facts");
+            break;
+        }
+
         iterations += 1;
         let mut new_facts_this_round = 0;
 
@@ -1195,8 +1322,6 @@ pub async fn execute_datalog_rules_with_query_rules(
 
         // Execute each rule in order
         for rule in rule_set.iter_in_order() {
-            rules_executed += 1;
-
             // Find all bindings matching the where patterns
             // Use effective_overlay which includes derived facts from previous iterations
             let iter_db = GraphDbRef::new(db.snapshot, db.g_id, effective_overlay.as_ref(), db.t);
@@ -1247,10 +1372,17 @@ pub async fn execute_datalog_rules_with_query_rules(
         ));
     }
 
+    let facts = all_derived.len();
+    let elapsed = start.elapsed();
+    let mut diagnostics = ReasoningDiagnostics::default();
+    match capped {
+        Some(reason) => diagnostics.mark_capped(reason, iterations, facts, elapsed),
+        None => diagnostics.mark_completed(iterations, facts, elapsed),
+    }
+
     Ok(DatalogExecutionResult {
         derived_flakes: all_derived.into_values().collect(),
-        iterations,
-        rules_executed,
+        diagnostics,
     })
 }
 
@@ -1300,10 +1432,73 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_iri_variable() {
-        let context = serde_json::json!({});
-        let result = expand_iri("?person", &context).unwrap();
-        assert_eq!(result, "?person");
+    fn resolve_term_non_sid_binding_is_incompatible() {
+        // A subject/predicate variable bound to a literal can never match a
+        // flake; resolution must report an empty join, not an error, so one
+        // bad binding row cannot abort the whole rule execution.
+        let mut bindings = Bindings::new();
+        bindings.insert(Arc::from("?p"), BindingValue::String("blue".to_string()));
+
+        let resolved = resolve_term_with_bindings(&RuleTerm::var("?p"), &bindings);
+        assert!(matches!(resolved, TermResolution::Incompatible));
+        assert!(resolved.split().is_none());
+    }
+
+    fn triple(subject: RuleTerm, predicate: RuleTerm, object: RuleTerm) -> RuleTriplePattern {
+        RuleTriplePattern {
+            subject,
+            predicate,
+            object,
+        }
+    }
+
+    #[test]
+    fn selective_order_hoists_grounded_pattern_ahead_of_all_unbound_leading() {
+        // where: [ {?s ?p ?o}, {?s ex:parent ?o} ]
+        // The all-unbound pattern is written first (a full ledger scan), but
+        // the constant-predicate pattern must be matched first so it grounds
+        // ?s/?o before the unbound pattern runs.
+        let ex_parent = Sid::new(0, "http://example.org/parent");
+        let patterns = vec![
+            triple(
+                RuleTerm::var("?s"),
+                RuleTerm::var("?p"),
+                RuleTerm::var("?o"),
+            ),
+            triple(
+                RuleTerm::var("?s"),
+                RuleTerm::sid(ex_parent),
+                RuleTerm::var("?o"),
+            ),
+        ];
+        assert_eq!(selective_pattern_order(&patterns), vec![1, 0]);
+    }
+
+    #[test]
+    fn selective_order_keeps_source_order_on_ties() {
+        // Two equally-grounded patterns (both constant predicate) keep their
+        // written order — reordering is deterministic.
+        let p1 = Sid::new(0, "http://example.org/a");
+        let p2 = Sid::new(0, "http://example.org/b");
+        let patterns = vec![
+            triple(RuleTerm::var("?s"), RuleTerm::sid(p1), RuleTerm::var("?o")),
+            triple(RuleTerm::var("?x"), RuleTerm::sid(p2), RuleTerm::var("?y")),
+        ];
+        assert_eq!(selective_pattern_order(&patterns), vec![0, 1]);
+    }
+
+    #[test]
+    fn resolve_term_literal_constant_is_incompatible() {
+        // A literal constant in subject/predicate position (e.g. a typo like
+        // `{"@id": "Alice"}` parsed as a string value) can never match a
+        // flake; resolution must report an empty join, not an error, so the
+        // authoring mistake cannot abort the whole fixpoint.
+        let bindings = Bindings::new();
+        let literal = RuleTerm::Value(RuleValue::String("Alice".to_string()));
+
+        let resolved = resolve_term_with_bindings(&literal, &bindings);
+        assert!(matches!(resolved, TermResolution::Incompatible));
+        assert!(resolved.split().is_none());
     }
 
     fn dec(s: &str) -> FlakeValue {

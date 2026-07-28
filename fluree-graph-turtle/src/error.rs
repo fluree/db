@@ -54,6 +54,14 @@ impl TurtleError {
 /// wrapped offset that would later panic when slicing the source.
 pub const MAX_INPUT_BYTES: usize = u32::MAX as usize;
 
+/// Maximum nesting depth for the recursive Turtle constructs — blank-node
+/// property lists (`[ … ]`), collections (`( … )`), and reified triples
+/// (`<< … >>`). Each level recurses through the parser, so unbounded nesting
+/// lets a small adversarial document overflow the stack and abort the
+/// process; past this ceiling parsing fails with a clean parse error. The
+/// three constructs share one counter, so mixed nesting is bounded too.
+pub const MAX_NESTING_DEPTH: u32 = 128;
+
 /// Reject input too large for `u32` token-span offsets.
 ///
 /// Called at every lexer/parser entry point. Compares via `u64` so the check is
