@@ -91,6 +91,10 @@ pub enum DiagCode {
     #[serde(rename = "S009")]
     UndefinedPrefix,
 
+    /// Nesting exceeds the parser's recursion depth ceiling
+    #[serde(rename = "S010")]
+    NestingTooDeep,
+
     // =========================================================================
     // Fluree restrictions (F001-F099) - "Fluree doesn't support this"
     // =========================================================================
@@ -211,6 +215,7 @@ impl DiagCode {
             Self::InvalidBlankNode => "S007",
             Self::InvalidPrefixedName => "S008",
             Self::UndefinedPrefix => "S009",
+            Self::NestingTooDeep => "S010",
             // Fluree
             Self::UnsupportedPropertyPathDepth => "F001",
             Self::UnsupportedPropertyPathPrimary => "F002",

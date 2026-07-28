@@ -3430,3 +3430,125 @@ fn test_cross_operation_delete_side_bnode_labels_are_independent() {
     );
     assert_eq!(update_request(&ast).operations.len(), 2);
 }
+
+// =============================================================================
+// Recursion depth ceiling
+// =============================================================================
+
+/// Depth used for the adversarial shapes: far past the 128 ceiling and well
+/// past any plausible stack limit (unguarded recursion overflows at a few
+/// thousand frames), so it proves the no-overflow property without the
+/// wasted cost of a 100k-token input.
+const DOS_DEPTH: usize = 10_000;
+
+/// Every recursion lane records a `NestingTooDeep` (S010) diagnostic —
+/// the pattern/term parsers directly, the `Result`-based expression and path
+/// parsers via the guard's source emission — so match on the code.
+fn assert_depth_error(query: &str) {
+    let result = parse(query);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagCode::NestingTooDeep),
+        "expected a NestingTooDeep diagnostic, got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn nested_groups(depth: usize) -> String {
+    format!("ASK {}{}", "{ ".repeat(depth), "} ".repeat(depth))
+}
+
+/// The ceiling is inclusive: groups nested exactly MAX_PARSE_DEPTH deep
+/// parse, one deeper fails with the NestingTooDeep diagnostic.
+#[test]
+fn group_nesting_at_the_ceiling_parses() {
+    let depth = crate::parse::stream::MAX_PARSE_DEPTH as usize;
+    assert_parses(&nested_groups(depth));
+    assert_depth_error(&nested_groups(depth + 1));
+}
+
+/// Each construct family that recurses through the parser must fail cleanly
+/// at adversarial depth instead of overflowing the stack: nested groups,
+/// parenthesized expressions, stacked unary operators, blank-node property
+/// lists, collections, and grouped property paths.
+#[test]
+fn deeply_nested_constructs_do_not_overflow_the_stack() {
+    assert_depth_error(&nested_groups(DOS_DEPTH));
+    assert_depth_error(&format!(
+        "ASK {{ FILTER{}1{} }}",
+        "(".repeat(DOS_DEPTH),
+        ")".repeat(DOS_DEPTH)
+    ));
+    assert_depth_error(&format!("ASK {{ FILTER({}true) }}", "!".repeat(DOS_DEPTH)));
+    assert_depth_error(&format!(
+        "ASK {{ {}1{} }}",
+        "[ <u:p> ".repeat(DOS_DEPTH),
+        " ]".repeat(DOS_DEPTH)
+    ));
+    assert_depth_error(&format!(
+        "ASK {{ <u:s> <u:p> {}1{} }}",
+        "( ".repeat(DOS_DEPTH),
+        " )".repeat(DOS_DEPTH)
+    ));
+    assert_depth_error(&format!(
+        "ASK {{ ?s {}<u:p>{} ?o }}",
+        "(".repeat(DOS_DEPTH),
+        ")".repeat(DOS_DEPTH)
+    ));
+    // RDF-star quoted triple `<< s p o >>` nested via the subject position.
+    assert_depth_error(&format!(
+        "ASK {{ {}<u:a> <u:b> <u:c>{} <u:p> <u:o> }}",
+        "<< ".repeat(DOS_DEPTH),
+        " >> <u:p> <u:o>".repeat(DOS_DEPTH - 1)
+    ));
+    // RDF 1.2 triple term `<<( s p o )>>` nested via the subject position
+    // (permitted in pattern context, so it recurses at parse time).
+    assert_depth_error(&format!(
+        "ASK {{ ?s ?p {}<u:a> <u:b> <u:c>{} }}",
+        "<<( ".repeat(DOS_DEPTH),
+        " <u:p> <u:o> )>>".repeat(DOS_DEPTH)
+    ));
+}
+
+/// Error recovery on a deeply-nested hostile query must not accumulate one
+/// diagnostic per surplus token: the count is capped, bounding diagnostic
+/// memory to a constant regardless of input size.
+#[test]
+fn deeply_nested_input_diagnostics_are_capped() {
+    let result = parse(&nested_groups(DOS_DEPTH));
+    assert!(
+        result.diagnostics.len() <= crate::parse::stream::MAX_DIAGNOSTICS,
+        "diagnostics ({}) exceeded the cap ({})",
+        result.diagnostics.len(),
+        crate::parse::stream::MAX_DIAGNOSTICS
+    );
+}
+
+/// All constructs share one depth counter, so mixed nesting is bounded even
+/// when no single family exceeds the ceiling on its own.
+#[test]
+fn mixed_construct_nesting_shares_the_ceiling() {
+    let half = (crate::parse::stream::MAX_PARSE_DEPTH / 2 + 1) as usize;
+    assert_depth_error(&format!(
+        "ASK {}FILTER{}1{}{}",
+        "{ ".repeat(half),
+        "(".repeat(half),
+        ")".repeat(half),
+        "} ".repeat(half)
+    ));
+}
+
+/// Realistic wide-but-shallow queries are unaffected: sibling constructs at
+/// the same level do not accumulate depth.
+#[test]
+fn sibling_nesting_does_not_accumulate_depth() {
+    let unions = "UNION { ?s <u:p> [ <u:q> ( 1 2 ) ] } "
+        .repeat(crate::parse::stream::MAX_PARSE_DEPTH as usize * 2);
+    assert_parses(&format!("ASK {{ {{ ?s <u:p> ?o }} {unions} }}"));
+}
