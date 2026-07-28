@@ -125,8 +125,23 @@ impl AggregateFn {
     /// planner may project away dead variables and collapse duplicate rows
     /// between joins without changing results (see
     /// `where_plan::build_sequential_join_block`).
+    /// Matched exhaustively on purpose: this is a soundness-critical
+    /// partition, so a new variant must be classified deliberately rather
+    /// than defaulting (silently to `false` — safe, but it would lose the
+    /// optimization with no signal).
     pub fn duplicate_insensitive(&self) -> bool {
-        matches!(self, Self::Min(_) | Self::Max(_) | Self::Sample(_)) || self.is_distinct()
+        match self {
+            Self::Min(_) | Self::Max(_) | Self::Sample(_) => true,
+            Self::CountAll | Self::Count(_) => false,
+            Self::CountDistinct(_)
+            | Self::Sum(..)
+            | Self::Avg(..)
+            | Self::Median(..)
+            | Self::Variance(..)
+            | Self::Stddev(..)
+            | Self::Collect(..)
+            | Self::GroupConcat { .. } => self.is_distinct(),
+        }
     }
 }
 

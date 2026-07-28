@@ -162,12 +162,24 @@ streaming `DistinctOperator` so duplicates collapse before the next join.
 `build_operator_tree_inner`): collapsing duplicate rows is only legal when
 downstream cannot observe WHERE-output multiplicity —
 
-- **grouping present** → every aggregate must be *duplicate-insensitive*:
-  `AggregateFn::duplicate_insensitive()` = any `DISTINCT`-marked aggregate
-  (`COUNT/SUM/AVG/MEDIAN/VARIANCE/STDDEV/GROUP_CONCAT/collect DISTINCT`) plus
-  `MIN`/`MAX`/`SAMPLE`. A single plain `COUNT`/`SUM`/… blocks dedup for the
-  whole WHERE.
+- **grouping present** → *both* of:
+  - every aggregate must be *duplicate-insensitive*:
+    `AggregateFn::duplicate_insensitive()` = any `DISTINCT`-marked aggregate
+    (`COUNT/SUM/AVG/MEDIAN/VARIANCE/STDDEV/GROUP_CONCAT/collect DISTINCT`) plus
+    `MIN`/`MAX`/`SAMPLE`. A single plain `COUNT`/`SUM`/… blocks dedup for the
+    whole WHERE.
+  - no variable may pass through the grouping stage *raw*: every var in
+    `VariableDeps::required_aggregate_vars` must be a `GROUP BY` key or an
+    aggregate output. A non-key variable that survives grouping is emitted as
+    a per-group **list** (`Binding::Grouped`, the JSON-LD grouped-projection
+    feature — SPARQL rejects the shape), and that list observes row
+    multiplicity. This clause also covers the `GROUP BY ?g` case with *no*
+    aggregation stage, where the aggregate check alone is vacuously true.
 - **no grouping** → the query itself must be `SELECT DISTINCT`.
+
+Both clauses are checked against `variable_deps`; when it is `None`
+(wildcard/boolean/construct) dedup is off anyway, since projection pushdown —
+and therefore the live-var trimming that triggers dedup — is disabled.
 
 An outer `SELECT DISTINCT` over an aggregate query does **not** license WHERE
 dedup — it dedups *result* rows after aggregation, while a plain `COUNT` under
@@ -176,7 +188,11 @@ correctness bug fixed alongside the aggregate-aware gate).
 
 The dedup is inserted only at steps where trimming actually dropped a dead
 variable, so queries whose variables all stay live (e.g. same-subject stars
-feeding the projection) pay nothing. Subqueries dedup at their own boundary
+feeding the projection) pay nothing. Note the memory trade: `DistinctOperator`
+holds an uncapped, non-spilling hash set of the distinct rows seen at each
+insertion point, so an aggregate query that previously streamed (e.g. a
+`MAX`-only chain whose intermediates are large and already near-distinct)
+becomes resident-memory-bound for no gain. The gate errs toward the speed win. Subqueries dedup at their own boundary
 (`apply_solution_modifiers` applies the subquery's `DISTINCT`) rather than
 per-step.
 
