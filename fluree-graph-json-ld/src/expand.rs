@@ -533,6 +533,10 @@ fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
 /// programmatically built `JsonValue` bypasses that — without this guard,
 /// deep nesting would overflow the stack and abort the process (a Rust
 /// stack overflow is not catchable).
+///
+/// This bounds recursion frames, not user-visible nesting levels: `@list`/
+/// `@set` container chains add two frames per level and so are refused at
+/// ~64 levels rather than 128. See [`guard_depth`].
 pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
 
 /// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The `idx` path vector gains at
@@ -541,6 +545,13 @@ pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
 /// recursion entry points ([`expand_node_internal`] and [`parse_node_value`])
 /// call this, so the `@list`/`@set` self-recursion in `parse_node_value` —
 /// which never re-enters `expand_node_internal` — is bounded too.
+///
+/// The bound is on `idx` entries (recursion frames), not user-visible nesting
+/// levels, and the two are not the same: a plain node chain adds one entry per
+/// level, so it reaches `MAX_EXPAND_DEPTH` levels, but each `@list`/`@set`
+/// container level adds two (the property key, then the container marker), so
+/// container chains are refused at roughly half that — ~64 user-visible levels.
+/// A container-chain rejection near 64 is expected, not a bug.
 fn guard_depth(idx: &[JsonValue]) -> Result<()> {
     if idx.len() > MAX_EXPAND_DEPTH {
         return Err(JsonLdError::NestingTooDeep);
