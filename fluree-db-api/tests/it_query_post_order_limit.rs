@@ -225,6 +225,79 @@ async fn indexed_post_order_desc_string_falls_back_correctly() {
     .await;
 }
 
+/// Generic `xsd:duration` ordering. `XSD_DURATION` sits inside the
+/// `is_temporal()` range that gates the reverse-POST fast path, but unlike the
+/// other temporal types its `o_key` is a string-dict id (the canonical
+/// lexical), not an order-preserving encoding — the same property that makes
+/// the `ex:name` string case above bail. Before `is_post_desc_orderable`
+/// excluded it, the fast path served `ORDER BY DESC` in dict-insertion order
+/// instead of value order; on `main` that was masked because every generic
+/// duration decoded to `null`, and #1326 makes the path reachable with real
+/// values. Insertion order (3Y, 1Y, 2Y) is deliberately NOT value order, so an
+/// insertion-ordered result would be visibly wrong. The correct order here is
+/// exactly what the value-level novelty path returns.
+#[tokio::test]
+async fn indexed_post_order_desc_generic_duration_falls_back_correctly() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/post-order-duration:main";
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "xsd": "http://www.w3.org/2001/XMLSchema#"
+    });
+
+    let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+    // Mixed (year-month + day-time) durations take the generic string-dict
+    // path. They differ only in the year component, so all three are mutually
+    // comparable; inserted 3Y, 1Y, 2Y but value-DESC order is 3Y, 2Y, 1Y.
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:a", "ex:took": {"@value": "P3Y1M1DT1H", "@type": "xsd:duration"}},
+            {"@id": "ex:b", "ex:took": {"@value": "P1Y1M1DT1H", "@type": "xsd:duration"}},
+            {"@id": "ex:c", "ex:took": {"@value": "P2Y1M1DT1H", "@type": "xsd:duration"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("insert").ledger;
+    let t = ledger.t();
+
+    let sparql = r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s ?d
+        WHERE { ?s ex:took ?d . }
+        ORDER BY DESC(?d) LIMIT 3
+    ";
+
+    // Novelty (pre-index) path: value-level ordering, the source of truth.
+    let novelty_view = fluree.db_at_t(ledger_id, t).await.expect("novelty view");
+    let novelty = fluree
+        .query(&novelty_view, QueryInput::Sparql(sparql))
+        .await
+        .expect("novelty query");
+    let novelty_order = col0(&novelty.to_jsonld(&novelty_view.snapshot).expect("to_jsonld"));
+    assert_eq!(
+        novelty_order,
+        vec!["ex:a", "ex:c", "ex:b"],
+        "novelty DESC(?d) must be value order 3Y, 2Y, 1Y"
+    );
+
+    // Indexed path: must agree with the value-level novelty order, not return
+    // dict-insertion order.
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let view = fluree.db(ledger_id).await.expect("load indexed view");
+    let res = fluree
+        .query(&view, QueryInput::Sparql(sparql))
+        .await
+        .expect("indexed query");
+    let indexed_order = col0(&res.to_jsonld(&view.snapshot).expect("to_jsonld"));
+    assert_eq!(
+        indexed_order, novelty_order,
+        "indexed DESC(?d) over generic durations must match the novelty value \
+         order, not dict-insertion order"
+    );
+}
+
 #[tokio::test]
 async fn overlay_post_order_desc_reflects_novelty() {
     // Index the baseline (c1..c5 Conversations, dateModified 2024-01..05; note1 a
