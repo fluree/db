@@ -2860,30 +2860,46 @@ fn resolve_subject_v3(
 }
 
 /// Resolve a string value to a string_id using persisted dict then DictNovelty.
-fn resolve_string_v3(
+/// Look up `value`'s string-dict id across the persisted and novelty dicts.
+///
+/// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
+/// allocation, so callers on hot paths (every novelty duration flake) pay
+/// nothing to distinguish it. `Err` is a real dict/mmap I/O error propagated
+/// verbatim from `find_string_id`, so a corrupt dictionary surfaces as an error
+/// instead of being conflated with a miss.
+fn find_string_id_v3(
     value: &str,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
-) -> std::io::Result<u32> {
+) -> std::io::Result<Option<u32>> {
     // 1. Persisted
     if let Some(id) = store.find_string_id(value)? {
-        return Ok(id);
+        return Ok(Some(id));
     }
     // 2. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
             if let Some(id) = dn.strings.find_string(value) {
-                return Ok(id);
+                return Ok(Some(id));
             }
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!(
-            "string not found in dict: {}",
-            &value[..value.len().min(50)]
-        ),
-    ))
+    Ok(None)
+}
+
+/// [`find_string_id_v3`] for callers that treat "not in dict" as an error,
+/// rendering a miss as `NotFound`.
+fn resolve_string_v3(
+    value: &str,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<u32> {
+    find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("string not found in dict: {}", &value[..value.len().min(50)]),
+        )
+    })
 }
 
 /// Convert a FlakeValue to `(OType, o_key)` in V3 encoding.
@@ -3043,11 +3059,17 @@ fn value_to_otype_okey(
         // surface as Unsupported: the SPOT-cursor translation lane routes only
         // Unsupported to its raw-flake path and DROPS other error kinds, while
         // the binary-range lane raw-routes any error — Unsupported is the one
-        // signal every lane preserves.
+        // signal every lane preserves. A real dict I/O error, by contrast,
+        // propagates verbatim (not relabelled Unsupported) so a corrupt
+        // dictionary surfaces instead of silently taking the raw-flake path.
         FlakeValue::Duration(d) => {
-            let str_id = resolve_string_v3(&d.to_canonical_string(), store, dict_novelty)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Unsupported, e))?;
-            Ok((OType::XSD_DURATION, str_id as u64))
+            match find_string_id_v3(&d.to_canonical_string(), store, dict_novelty)? {
+                Some(str_id) => Ok((OType::XSD_DURATION, str_id as u64)),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "generic duration not in persisted dict (novelty-only); use raw flake path",
+                )),
+            }
         }
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
         // Big numerics mirror the resolver: i64-fitting integers are inline;
