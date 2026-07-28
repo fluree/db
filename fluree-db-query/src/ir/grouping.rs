@@ -114,6 +114,35 @@ impl AggregateFn {
                 | Self::Collect(_, InputSemantics::Set)
         )
     }
+
+    /// Whether the aggregate's result is unchanged when duplicate input ROWS
+    /// are collapsed to one — i.e. it observes only the *set* of values, not
+    /// their multiplicity. True for every `DISTINCT`-marked variant plus
+    /// `Min`/`Max`/`Sample` (order statistics / arbitrary pick).
+    ///
+    /// This is the soundness condition for WHERE-level early dedup: when
+    /// every aggregate in the grouping phase is duplicate-insensitive, the
+    /// planner may project away dead variables and collapse duplicate rows
+    /// between joins without changing results (see
+    /// `where_plan::build_sequential_join_block`).
+    /// Matched exhaustively on purpose: this is a soundness-critical
+    /// partition, so a new variant must be classified deliberately rather
+    /// than defaulting (silently to `false` — safe, but it would lose the
+    /// optimization with no signal).
+    pub fn duplicate_insensitive(&self) -> bool {
+        match self {
+            Self::Min(_) | Self::Max(_) | Self::Sample(_) => true,
+            Self::CountAll | Self::Count(_) => false,
+            Self::CountDistinct(_)
+            | Self::Sum(..)
+            | Self::Avg(..)
+            | Self::Median(..)
+            | Self::Variance(..)
+            | Self::Stddev(..)
+            | Self::Collect(..)
+            | Self::GroupConcat { .. } => self.is_distinct(),
+        }
+    }
 }
 
 impl AggregateFn {
@@ -326,6 +355,56 @@ impl Grouping {
         }
         if let Some(expr) = having {
             expr.substitute_var(old, new);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::var_registry::VarId;
+
+    #[test]
+    fn duplicate_insensitive_partitions_aggregates() {
+        let v = VarId(0);
+        // Insensitive: every DISTINCT-marked variant plus MIN/MAX/SAMPLE.
+        for f in [
+            AggregateFn::CountDistinct(v),
+            AggregateFn::Sum(v, InputSemantics::Set),
+            AggregateFn::Avg(v, InputSemantics::Set),
+            AggregateFn::Median(v, InputSemantics::Set),
+            AggregateFn::Variance(v, InputSemantics::Set),
+            AggregateFn::Stddev(v, InputSemantics::Set),
+            AggregateFn::GroupConcat {
+                input: v,
+                semantics: InputSemantics::Set,
+                separator: ",".into(),
+            },
+            AggregateFn::Collect(v, InputSemantics::Set),
+            AggregateFn::Min(v),
+            AggregateFn::Max(v),
+            AggregateFn::Sample(v),
+        ] {
+            assert!(f.duplicate_insensitive(), "{f:?} must be insensitive");
+        }
+        // Sensitive: multiplicity-observing variants — WHERE-level early dedup
+        // must be blocked when any of these is present.
+        for f in [
+            AggregateFn::Count(v),
+            AggregateFn::CountAll,
+            AggregateFn::Sum(v, InputSemantics::List),
+            AggregateFn::Avg(v, InputSemantics::List),
+            AggregateFn::Median(v, InputSemantics::List),
+            AggregateFn::Variance(v, InputSemantics::List),
+            AggregateFn::Stddev(v, InputSemantics::List),
+            AggregateFn::GroupConcat {
+                input: v,
+                semantics: InputSemantics::List,
+                separator: ",".into(),
+            },
+            AggregateFn::Collect(v, InputSemantics::List),
+        ] {
+            assert!(!f.duplicate_insensitive(), "{f:?} must be sensitive");
         }
     }
 }

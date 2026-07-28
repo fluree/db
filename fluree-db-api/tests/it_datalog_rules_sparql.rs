@@ -191,3 +191,69 @@ async fn sparql_rule_unsupported_construct_skipped() {
         "unsupported rule must be skipped, not partially applied"
     );
 }
+
+/// SPARQL twin of `datalog_rule_literal_bound_property_variable_does_not_abort_other_rules`
+/// in `it_datalog_rules.rs`. `TermResolution::Incompatible` is shared engine
+/// code below both front-ends, and a SPARQL rule can put a variable in
+/// predicate position too (`?x ?p ?v`). A rule that binds `?p` to a literal and
+/// then reuses it as a predicate matches nothing — but must NOT abort the
+/// sibling rule's derivations for the whole query (the pre-fix behaviour turned
+/// the literal-in-predicate case into a hard error that dropped every rule).
+#[tokio::test]
+async fn sparql_rule_literal_bound_predicate_variable_does_not_abort_other_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/sparql-literal-pred");
+
+    let rule_data = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@graph": [
+            {
+                "@id": "http://example.org/grandparentRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?person ex:grandparent ?gp } \
+                               WHERE { ?person ex:parent ?p . ?p ex:parent ?gp }"
+                }
+            },
+            {
+                // `?tp` binds to the STRING value of ex:tag, then is reused in
+                // predicate position — a literal can never be a predicate.
+                "@id": "http://example.org/literalPredicateRule",
+                "f:rule": {
+                    "@type": "https://ns.flur.ee/db#sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?x ex:derived ?v } \
+                               WHERE { ?x ex:tag ?tp . ?x ?tp ?v }"
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}, "ex:tag": "blue"},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": { "ex": "http://example.org/" },
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert!(
+        normalize_rows(&rows).contains(&json!("ex:charlie")),
+        "sound rule's derivations must survive a sibling SPARQL rule's literal-bound \
+         predicate variable, got {rows:?}"
+    );
+}

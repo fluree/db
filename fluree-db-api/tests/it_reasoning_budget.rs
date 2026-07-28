@@ -281,3 +281,87 @@ async fn query_budget_overrides_permissive_config_budget() {
     );
     assert_eq!(reasoning.derived_facts, 3);
 }
+
+// ============================================================================
+// Datalog rules honour the same budget and surface `capped` the same way
+// ============================================================================
+
+/// Seed a few plain entities (no OWL) for datalog rules to scan.
+async fn seed_entities(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    let _ = apply_trig(
+        fluree,
+        ledger,
+        r#"
+        @prefix ex: <http://example.org/> .
+        ex:a ex:name "a" .
+        ex:b ex:name "b" .
+        ex:c ex:name "c" .
+        "#,
+    )
+    .await;
+}
+
+/// A datalog query whose one rule has an ALL-UNBOUND leading `where` pattern
+/// `{?s ?p ?o}` — the full-ledger-scan shape the budget must bound (issue
+/// #1541 review) — deriving `ex:touched true` for every subject.
+fn datalog_fullscan_query(ledger_id: &str) -> serde_json::Value {
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ledger_id,
+        "select": ["?s"],
+        "where": {"@id": "?s", "ex:touched": true},
+        "reasoning": "datalog",
+        "rules": [{
+            "@context": {"ex": "http://example.org/"},
+            "where": {"@id": "?s", "?p": "?o"},
+            "insert": {"@id": "?s", "ex:touched": true}
+        }]
+    })
+}
+
+#[tokio::test]
+async fn datalog_uncapped_reports_complete_in_tracking() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/datalog-budget-uncapped:main";
+    seed_entities(&fluree, ledger_id).await;
+
+    let resp = run_tracked(&fluree, &datalog_fullscan_query(ledger_id)).await;
+
+    let reasoning = resp
+        .reasoning
+        .expect("tracked datalog query reports a reasoning block");
+    assert!(
+        !reasoning.capped,
+        "unbounded budget must not cap: {reasoning:?}"
+    );
+    assert!(reasoning.capped_reason.is_none());
+    assert!(
+        reasoning.derived_facts >= 3,
+        "every seeded subject is touched: {reasoning:?}"
+    );
+}
+
+#[tokio::test]
+async fn datalog_query_budget_caps_fixpoint_and_surfaces_in_tracking() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/datalog-budget-query:main";
+    seed_entities(&fluree, ledger_id).await;
+
+    let mut query = datalog_fullscan_query(ledger_id);
+    query["reasoningBudget"] = json!({"maxFacts": 1});
+
+    let resp = run_tracked(&fluree, &query).await;
+
+    let reasoning = resp
+        .reasoning
+        .expect("tracked datalog query reports a reasoning block");
+    assert!(
+        reasoning.capped,
+        "maxFacts=1 must cap a multi-subject full-scan rule: {reasoning:?}"
+    );
+    assert!(
+        reasoning.capped_reason.is_some(),
+        "capped result carries a reason"
+    );
+}

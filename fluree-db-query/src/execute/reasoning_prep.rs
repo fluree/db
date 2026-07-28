@@ -243,11 +243,15 @@ pub async fn compute_derived_facts(
     let mut same_as = FrozenSameAs::empty();
     let mut diagnostics = None;
 
+    // One budget for both reasoning mechanisms — datalog reuses it rather than
+    // standing up a second cap.
+    let budget = reasoning_budget(reasoning);
+
     // OWL2-RL materialization
     if reasoning.owl2rl {
         tracing::debug!("computing OWL2-RL derived facts");
         let reasoning_opts = ReasoningOptions {
-            budget: reasoning_budget(reasoning),
+            budget: budget.clone(),
             ..Default::default()
         };
         let cache = global_reasoning_cache();
@@ -337,6 +341,7 @@ pub async fn compute_derived_facts(
                 MAX_DATALOG_ITERATIONS,
                 &reasoning.rules,
                 rules_source_g_id,
+                &budget,
             )
             .await
         } else {
@@ -346,16 +351,49 @@ pub async fn compute_derived_facts(
                 MAX_DATALOG_ITERATIONS,
                 &reasoning.rules,
                 rules_source_g_id,
+                &budget,
             )
             .await
         };
 
         match datalog_result {
             Ok(datalog_result) => {
-                tracing::debug!(
-                    datalog_facts = datalog_result.derived_flakes.len(),
-                    "datalog rules completed"
-                );
+                let dl_diag = datalog_result.diagnostics;
+                if dl_diag.capped {
+                    // A capped fixpoint is an INCOMPLETE derivation: reasoning
+                    // queries silently miss facts. Loud, like OWL2-RL — a
+                    // correctness event, not a perf detail.
+                    tracing::warn!(
+                        derived_facts = dl_diag.facts_derived,
+                        capped_reason = dl_diag.capped_reason.as_deref(),
+                        iterations = dl_diag.iterations,
+                        duration_ms = dl_diag.duration.as_millis() as u64,
+                        "datalog rule materialization hit its budget before reaching \
+                         fixpoint; query results may be missing derived facts. \
+                         Raise the budget via f:reasoningMaxFacts/f:reasoningMaxSeconds \
+                         (ledger config), \"reasoningBudget\" (query), or \
+                         FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS (server)."
+                    );
+                } else {
+                    tracing::debug!(
+                        datalog_facts = datalog_result.derived_flakes.len(),
+                        "datalog rules completed"
+                    );
+                }
+                // Fold datalog diagnostics into the outcome; if OWL2-RL also
+                // ran, OR the capped flags and combine the counts so one tally
+                // reflects both mechanisms.
+                diagnostics = Some(match diagnostics.take() {
+                    None => dl_diag,
+                    Some(owl) => fluree_db_reasoner::ReasoningDiagnostics {
+                        iterations: owl.iterations + dl_diag.iterations,
+                        facts_derived: owl.facts_derived + dl_diag.facts_derived,
+                        capped: owl.capped || dl_diag.capped,
+                        capped_reason: owl.capped_reason.or(dl_diag.capped_reason),
+                        duration: owl.duration + dl_diag.duration,
+                        rules_fired: owl.rules_fired,
+                    },
+                });
                 all_flakes.extend(datalog_result.derived_flakes);
             }
             Err(e) => {

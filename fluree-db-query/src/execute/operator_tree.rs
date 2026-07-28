@@ -2938,12 +2938,45 @@ fn build_operator_tree_inner(
         .flat_map(Grouping::group_by_vars)
         .collect();
 
+    // WHERE-level early dedup (project away dead vars, collapse duplicate rows
+    // between joins) is sound only when downstream cannot observe row
+    // multiplicity. With a grouping phase there are two consumers to clear:
+    // every aggregate must be duplicate-insensitive (COUNT/SUM/AVG/… DISTINCT,
+    // or MIN/MAX/SAMPLE), AND nothing may read a non-key variable raw. A
+    // non-key variable surviving the grouping stage comes out as a per-group
+    // LIST (the JSON-LD grouped projection), which observes multiplicity —
+    // note `aggregates()` is empty for a dedup-only `GROUP BY ?g`, where the
+    // aggregate check alone is vacuously true. An outer SELECT DISTINCT does
+    // NOT license dedup — it dedups result rows *after* aggregation, so a
+    // plain COUNT under it still observes pre-aggregation multiplicity.
+    // Without grouping, SELECT DISTINCT is exactly the license.
+    let where_dedup_safe = match query.grouping.as_ref() {
+        Some(g) => {
+            let aggregates_ok = g
+                .aggregates()
+                .all(|spec| spec.function.duplicate_insensitive());
+            // `required_aggregate_vars` is what the grouping stage's OUTPUT must
+            // carry, so it already folds in projection, HAVING, post-binds and
+            // ORDER BY. Anything in it that is not a GROUP BY key or an
+            // aggregate output passes through raw as a grouped list.
+            let keys: HashSet<VarId> = g.group_by_vars().collect();
+            let agg_outputs: HashSet<VarId> = g.aggregates().map(|s| s.output_var).collect();
+            let no_raw_passthrough = variable_deps.as_ref().is_some_and(|d| {
+                d.required_aggregate_vars
+                    .iter()
+                    .all(|v| keys.contains(v) || agg_outputs.contains(v))
+            });
+            aggregates_ok && no_raw_passthrough
+        }
+        None => query.output.is_distinct(),
+    };
+
     let mut operator = build_where_operators_with_needed(
         &query.patterns,
         stats,
         &needed_where_vars,
         &group_by_vec,
-        query.output.is_distinct(),
+        where_dedup_safe,
         required_where_vars,
         planning,
     )?;
