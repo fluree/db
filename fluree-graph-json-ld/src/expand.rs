@@ -1050,6 +1050,19 @@ mod tests {
         value
     }
 
+    /// A `@list`/`@set` nested DIRECTLY inside another, with NO property key
+    /// between levels: a single outer property key, then `depth` bare container
+    /// wrappers. Unlike [`nested_containers`], nothing re-enters
+    /// `expand_node_internal` between levels, so the chain self-recurses purely
+    /// within `parse_node_value` and only that function's own guard can stop it.
+    fn direct_container_chain(depth: usize, key: &str) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({key: value});
+        }
+        json!({"http://example.org/p": value})
+    }
+
     /// Realistic nesting well below the ceiling expands unchanged.
     #[test]
     fn nesting_below_the_ceiling_expands() {
@@ -1081,6 +1094,25 @@ mod tests {
             assert!(
                 matches!(err, JsonLdError::NestingTooDeep),
                 "expected NestingTooDeep for {key}, got: {err}"
+            );
+        }
+    }
+
+    /// A `@list`/`@set` nested directly inside itself with no property key
+    /// between levels recurses purely within `parse_node_value`, never
+    /// re-entering `expand_node_internal`. Only the `parse_node_value` guard
+    /// stops it — the property-keyed `nested_containers` chain is caught one
+    /// level up in `expand_node_internal`, so without this case that guard is
+    /// uncovered and a refactor could delete it while every other depth test
+    /// stays green.
+    #[test]
+    fn deeply_nested_direct_containers_error_cleanly() {
+        for key in ["@list", "@set"] {
+            let err =
+                crate::expand(&direct_container_chain(2_000, key)).expect_err("expected error");
+            assert!(
+                matches!(err, JsonLdError::NestingTooDeep),
+                "expected NestingTooDeep for direct {key} chain, got: {err}"
             );
         }
     }
