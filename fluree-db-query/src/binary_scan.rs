@@ -2897,7 +2897,10 @@ fn resolve_string_v3(
     find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("string not found in dict: {}", &value[..value.len().min(50)]),
+            format!(
+                "string not found in dict: {}",
+                &value[..value.len().min(50)]
+            ),
         )
     })
 }

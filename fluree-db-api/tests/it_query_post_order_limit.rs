@@ -259,7 +259,11 @@ async fn indexed_post_order_desc_generic_duration_falls_back_correctly() {
             {"@id": "ex:c", "ex:took": {"@value": "P2Y1M1DT1H", "@type": "xsd:duration"}}
         ]
     });
-    let ledger = fluree.insert(ledger0, &insert).await.expect("insert").ledger;
+    let ledger = fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert")
+        .ledger;
     let t = ledger.t();
 
     let sparql = r"
@@ -275,7 +279,11 @@ async fn indexed_post_order_desc_generic_duration_falls_back_correctly() {
         .query(&novelty_view, QueryInput::Sparql(sparql))
         .await
         .expect("novelty query");
-    let novelty_order = col0(&novelty.to_jsonld(&novelty_view.snapshot).expect("to_jsonld"));
+    let novelty_order = col0(
+        &novelty
+            .to_jsonld(&novelty_view.snapshot)
+            .expect("to_jsonld"),
+    );
     assert_eq!(
         novelty_order,
         vec!["ex:a", "ex:c", "ex:b"],
