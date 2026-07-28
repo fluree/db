@@ -2309,6 +2309,24 @@ mem:constraint-01kv3h37ky6wpm8c8jdvpnamjk a mem:Constraint ;
     mem:createdAt "2026-06-14T16:58:01.214124+00:00"^^xsd:dateTime ;
     mem:rationale "Non-obvious behavior change: distinguishing \"WHERE matched nothing\" (no-op) from \"no WHERE clause\" (fire once) and the OPTIONAL=1-row subtlety prevents future regressions or confusion when touching stage.rs." .
 
+mem:constraint-01kyke812e1np5c9ag45ac7580 a mem:Constraint ;
+    mem:content "The WHERE early-dedup gate (`where_dedup_safe`) must check BOTH that every aggregate is `duplicate_insensitive()` AND that every var in `VariableDeps::required_aggregate_vars` is a GROUP BY key or an aggregate output. A non-key var surviving the grouping stage is emitted as `Binding::Grouped` — a per-group LIST (JSON-LD-only feature; SPARQL rejects the shape) that observes row multiplicity. Note `aggregates()` is EMPTY for a dedup-only `GROUP BY ?g`, so the aggregate check alone is vacuously true there." ;
+    mem:tag "aggregates" ;
+    mem:tag "correctness" ;
+    mem:tag "dedup" ;
+    mem:tag "grouping" ;
+    mem:tag "jsonld" ;
+    mem:tag "planner" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/tests/it_query_grouping.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/dependency.rs" ;
+    mem:artifactRef "fluree-db-query/src/execute/operator_tree.rs" ;
+    mem:artifactRef "fluree-db-query/src/groupby.rs" ;
+    mem:branch "fix/where-early-dedup-aggregate-gate" ;
+    mem:createdAt "2026-07-28T04:03:09.006298+00:00"^^xsd:dateTime ;
+    mem:rationale "Using required_aggregate_vars (rather than checking the projection directly) folds in projection, HAVING, post-binds and ORDER BY in one check — a post-bind whose EXPRESSION reads a non-key var still reads a grouped list, which a bind-output whitelist would miss. Regression tests need a fan-in fixture; the pinned grouped-list test has none and cannot catch dedup." .
+
 mem:constraint-01kjte29y3cp8mae56xy6yfv2n a mem:Constraint ;
     mem:content "SPARQL↔JSON-LD Parity: both compile to the same IR (fluree-db-query/src/ir.rs) and share the entire execution engine. When adding SPARQL features: (1) shared IR changes already affect JSON-LD — verify JSON-LD tests pass, (2) if expressible in JSON-LD, add parallel tests, (3) execution path missing in JSON-LD lower → track follow-up.\n\nSPARQL tests: it_query_sparql.rs | JSON-LD tests: it_query.rs, it_query_analytical.rs, it_query_grouping.rs\nValidate: `cd testsuite-sparql && make test-eval-cat CAT=<cat>` then `cargo test -p fluree-db-api --test it_query`" ;
     mem:tag "compliance" ;
@@ -2577,7 +2595,7 @@ mem:fact-01kxtfwy7tzh5vebpny7sayycv a mem:Fact ;
     mem:createdAt "2026-07-18T11:31:02.010277+00:00"^^xsd:dateTime .
 
 mem:fact-01kye0dqrnn5ffnwnwwnk9f0bp a mem:Fact ;
-    mem:content "WHERE-level early dedup (project dead vars + DistinctOperator between joins) is gated by `where_dedup_safe`, computed in build_operator_tree_inner: grouping present → ALL aggregates must be AggregateFn::duplicate_insensitive() (DISTINCT-marked or MIN/MAX/SAMPLE); no grouping → SELECT DISTINCT. The old gate was `query.output.is_distinct()` alone, which (1) never fired for COUNT(DISTINCT) chains — the PrimeKG q66 2,490×-redundancy/404×-slowdown bug — and (2) was UNSOUND for `SELECT DISTINCT (COUNT(?x))`: it collapsed pre-aggregation rows and halved counts. Outer DISTINCT never licenses pre-aggregation dedup." ;
+    mem:content "WHERE-level early dedup (project dead vars + DistinctOperator between joins) is gated by `where_dedup_safe`, computed in build_operator_tree_inner: grouping present → ALL aggregates duplicate_insensitive() (DISTINCT-marked or MIN/MAX/SAMPLE) AND no raw non-key var passes through grouping; no grouping → SELECT DISTINCT. The old gate was `query.output.is_distinct()` alone, which (1) never fired for COUNT(DISTINCT) chains — the PrimeKG q66 2,490×-redundancy/404×-slowdown bug — and (2) was UNSOUND for `SELECT DISTINCT (COUNT(?x))`: it collapsed pre-aggregation rows and halved counts. Outer DISTINCT never licenses pre-aggregation dedup." ;
     mem:tag "aggregates" ;
     mem:tag "correctness" ;
     mem:tag "dedup" ;
