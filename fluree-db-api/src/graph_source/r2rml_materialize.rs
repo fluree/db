@@ -64,6 +64,7 @@ use fluree_vocab::UnresolvedDatatypeConstraint;
 
 use crate::graph_source::FlureeR2rmlProvider;
 use crate::{ApiError, Fluree, Result};
+use tracing::info;
 
 /// The shared ledger that holds materialization job watermarks (last materialized
 /// source snapshot id per `(source, target-spec, table)`), for EVERY job — plain
@@ -88,6 +89,37 @@ const WATERMARK_SOURCE_PRED: &str = "urn:fluree:materialize#source";
 const WATERMARK_TARGET_PRED: &str = "urn:fluree:materialize#target";
 /// Predicate recording which source table the watermark belongs to.
 const WATERMARK_TABLE_PRED: &str = "urn:fluree:materialize#table";
+
+/// Subject-IRI prefix for a persisted tracking job. The full subject is
+/// `{PREFIX}{source}:{target-spec}`, matching the worker's own
+/// `(source, target)` job key.
+const JOB_SUBJECT_PREFIX: &str = "urn:fluree:materialize-job:";
+/// Predicate holding the job as one serialized JSON blob. A single opaque value
+/// keeps the restore decoder trivial and lets the job gain fields without a
+/// schema migration; the `source`/`target`/`tracked` predicates below duplicate
+/// the identifying bits as plain triples so an operator can see jobs with the
+/// same SPARQL they already use for watermarks.
+const JOB_BLOB_PRED: &str = "urn:fluree:materialize#job";
+/// Predicate marking whether the job is currently tracked. `untrack` sets this
+/// to `false` rather than retracting the row, so the record survives as an
+/// audit trail and there is no delete path to get wrong.
+const JOB_TRACKED_PRED: &str = "urn:fluree:materialize#tracked";
+
+/// A tracking job as persisted in the shared materialization-state ledger.
+///
+/// Jobs used to be in-memory only, so a server restart silently stopped every
+/// materialization until a client re-issued `POST /iceberg/track`. This is the
+/// durable record that makes a restart recover on its own.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedMaterializeJob {
+    /// Graph source to read.
+    pub source: String,
+    /// Target ledger id, or the target TEMPLATE for a fan-out job — stored as
+    /// configured, exactly like the watermark's target-spec.
+    pub target: String,
+    /// This job's own poll cadence.
+    pub poll_interval_secs: u64,
+}
 
 /// Outcome of one materialization pass.
 #[derive(Debug, Clone)]
@@ -444,11 +476,7 @@ impl Fluree {
         //    (source, target-spec, table), so a templated job keeps ONE watermark
         //    per source table regardless of how many ledgers it fanned into.
         if !table_watermarks.is_empty() {
-            let state = if self.ledger_exists(MATERIALIZE_STATE_LEDGER).await? {
-                self.ledger(MATERIALIZE_STATE_LEDGER).await?
-            } else {
-                self.create_ledger(MATERIALIZE_STATE_LEDGER).await?
-            };
+            let state = self.materialize_state_ledger().await?;
             let watermark_nodes: Vec<JsonValue> = table_watermarks
                 .iter()
                 .map(|(table, _from, to)| {
@@ -505,6 +533,95 @@ impl Fluree {
             .map_err(|e| ApiError::Internal(format!("Failed to format watermark query: {e}")))?;
         Ok(extract_first_i64(&json))
     }
+
+    /// Open the shared materialization-state ledger, creating it if absent.
+    ///
+    /// Tolerates losing the create race: two concurrent pollers (or a poller and
+    /// a `track` call) can both see it missing, and the loser gets
+    /// `LedgerExists` rather than a ledger. Before this existed the same
+    /// check-then-create sat inline in the watermark write and could fail a
+    /// whole materialization pass on that race.
+    async fn materialize_state_ledger(&self) -> Result<crate::LedgerState> {
+        if self.ledger_exists(MATERIALIZE_STATE_LEDGER).await? {
+            return self.ledger(MATERIALIZE_STATE_LEDGER).await;
+        }
+        match self.create_ledger(MATERIALIZE_STATE_LEDGER).await {
+            Ok(state) => Ok(state),
+            Err(ApiError::LedgerExists(_)) => self.ledger(MATERIALIZE_STATE_LEDGER).await,
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record a tracking job so it survives a restart. Idempotent — re-tracking
+    /// the same `(source, target)` overwrites in place (`upsert` retracts then
+    /// asserts), which is also how an interval change is applied.
+    pub async fn persist_materialize_job(&self, job: &PersistedMaterializeJob) -> Result<()> {
+        let state = self.materialize_state_ledger().await?;
+        let node = job_node(job, true)?;
+        self.upsert(state, &node).await?;
+        info!(
+            source = %job.source,
+            target = %job.target,
+            poll_interval_secs = job.poll_interval_secs,
+            "Persisted materialization tracking job"
+        );
+        Ok(())
+    }
+
+    /// Mark a tracking job untracked so a restart does not restore it. Keeps the
+    /// row (with `tracked = false`) rather than retracting it. A job that was
+    /// never persisted is a no-op, not an error.
+    pub async fn forget_materialize_job(&self, source: &str, target: &str) -> Result<()> {
+        if !self.ledger_exists(MATERIALIZE_STATE_LEDGER).await? {
+            return Ok(());
+        }
+        let state = self.ledger(MATERIALIZE_STATE_LEDGER).await?;
+        // Interval is irrelevant once untracked; keep whatever shape the blob
+        // has so the row stays parseable if it is ever re-tracked by hand.
+        let job = PersistedMaterializeJob {
+            source: source.to_string(),
+            target: target.to_string(),
+            poll_interval_secs: 0,
+        };
+        self.upsert(state, &job_node(&job, false)?).await?;
+        info!(source, target, "Untracked materialization job");
+        Ok(())
+    }
+
+    /// Every job the state ledger still vouches for. This is the restore path —
+    /// the worker calls it once at start-up to rebuild its job set.
+    ///
+    /// Returns an empty vec when the state ledger does not exist yet (a server
+    /// that has never tracked anything), which is not an error.
+    pub async fn tracked_materialize_jobs(&self) -> Result<Vec<PersistedMaterializeJob>> {
+        if !self.ledger_exists(MATERIALIZE_STATE_LEDGER).await? {
+            return Ok(Vec::new());
+        }
+        let db = self.db(MATERIALIZE_STATE_LEDGER).await?;
+
+        let mut where_obj = Map::new();
+        where_obj.insert("@id".to_string(), JsonValue::String("?job".to_string()));
+        where_obj.insert(
+            JOB_BLOB_PRED.to_string(),
+            JsonValue::String("?blob".to_string()),
+        );
+        where_obj.insert(
+            JOB_TRACKED_PRED.to_string(),
+            JsonValue::String("true".to_string()),
+        );
+        let query = json!({ "select": ["?blob"], "where": JsonValue::Object(where_obj) });
+
+        let result = self.query(&db, &query).await?;
+        let json = result
+            .to_jsonld(&db.snapshot)
+            .map_err(|e| ApiError::Internal(format!("Failed to format job query: {e}")))?;
+
+        let mut jobs = Vec::new();
+        collect_jobs(&json, &mut jobs);
+        jobs.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));
+        jobs.dedup();
+        Ok(jobs)
+    }
 }
 
 /// The per-(source, target-spec, table) watermark subject IRI. All three segments
@@ -558,6 +675,60 @@ fn watermark_node(
         JsonValue::String(table_name.to_string()),
     );
     JsonValue::Object(node)
+}
+
+/// The per-(source, target-spec) job subject IRI, escaped the same way as
+/// [`watermark_subject`] so the encoding stays injective when a segment itself
+/// contains `:` (every `name:branch` target does).
+fn job_subject(source: &str, target_spec: &str) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('%', "%25").replace(':', "%3A")
+    }
+    format!("{JOB_SUBJECT_PREFIX}{}:{}", esc(source), esc(target_spec))
+}
+
+/// Build the job JSON-LD node: the opaque blob the restore path reads, plus the
+/// identifying triples an operator can query.
+fn job_node(job: &PersistedMaterializeJob, tracked: bool) -> Result<JsonValue> {
+    let blob = serde_json::to_string(job)
+        .map_err(|e| ApiError::Internal(format!("Failed to serialize tracking job: {e}")))?;
+    let mut node = Map::new();
+    node.insert(
+        "@id".to_string(),
+        JsonValue::String(job_subject(&job.source, &job.target)),
+    );
+    node.insert(JOB_BLOB_PRED.to_string(), JsonValue::String(blob));
+    node.insert(
+        JOB_TRACKED_PRED.to_string(),
+        JsonValue::String(tracked.to_string()),
+    );
+    node.insert(
+        WATERMARK_SOURCE_PRED.to_string(),
+        JsonValue::String(job.source.clone()),
+    );
+    node.insert(
+        WATERMARK_TARGET_PRED.to_string(),
+        JsonValue::String(job.target.clone()),
+    );
+    Ok(JsonValue::Object(node))
+}
+
+/// Collect every job blob anywhere in a JSON-LD query result. Tolerant of the
+/// formatter's row nesting for the same reason [`extract_first_i64`] is, and
+/// self-validating: only a string that deserializes into a whole
+/// [`PersistedMaterializeJob`] is taken, so the other selected triples on the
+/// row can never be mistaken for one.
+fn collect_jobs(v: &JsonValue, out: &mut Vec<PersistedMaterializeJob>) {
+    match v {
+        JsonValue::Array(a) => a.iter().for_each(|x| collect_jobs(x, out)),
+        JsonValue::Object(o) => o.values().for_each(|x| collect_jobs(x, out)),
+        JsonValue::String(s) => {
+            if let Ok(job) = serde_json::from_str::<PersistedMaterializeJob>(s) {
+                out.push(job);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Find the first value anywhere in a JSON-LD query result that parses as an

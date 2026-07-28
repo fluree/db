@@ -388,9 +388,11 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
 - `POST {api_base_url}/iceberg/untrack` — stop tracking (leaves materialized data in place).
 - `GET {api_base_url}/iceberg/tracking` — list tracked jobs and worker stats.
 
-The worker runs on write nodes (not peers). Tracked jobs are held in memory, so
-after a restart re-issue `track` — the watermark in the state ledger means it
-resumes incrementally rather than re-reading everything.
+The worker runs on write nodes (not peers). Tracked jobs are **persisted** in the
+`fluree_materialize_state:main` state ledger, next to the watermarks, and restored
+when the worker starts — so a restart resumes tracking on its own, incrementally,
+with no need to re-issue `track`. `untrack` is equally durable: it clears the
+record, so a restart will not resurrect the job.
 
 ### One ledger per partition (templated target)
 

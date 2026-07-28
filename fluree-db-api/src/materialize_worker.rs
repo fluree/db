@@ -14,6 +14,16 @@
 //! and polls only the jobs whose `next_due` has arrived, so jobs on different
 //! timers are independent.
 //!
+//! # Restart
+//!
+//! The job set is **durable**. `track` writes a
+//! [`PersistedMaterializeJob`](crate::PersistedMaterializeJob) into the shared
+//! `fluree_materialize_state:main` ledger — the same one holding the watermarks —
+//! and [`run`](MaterializeTrackingWorker::run) restores it before the first tick,
+//! so a restart resumes tracking without a client re-issuing anything. Combined
+//! with the watermarks, recovery re-reads nothing already materialized. `untrack`
+//! clears the record, so it does not come back either.
+//!
 //! Unlike [`crate::bm25_worker`] (event-driven, single-threaded `Rc`/`RefCell`),
 //! this worker is **polling** and `Send`: it owns an `Arc<Fluree>` and shares its
 //! job set / stop flag / stats behind `Arc<Mutex<…>>`, so it spawns with a plain
@@ -235,9 +245,50 @@ impl MaterializeTrackingWorker {
         self.handle.clone()
     }
 
+    /// Restore the tracked-job set from the shared materialization-state ledger.
+    /// Returns how many jobs were restored.
+    ///
+    /// Called once at the top of [`run`](Self::run) rather than from the server's
+    /// construction path, which gets peer-exclusion for free: peers never spawn
+    /// a worker, so they never restore (and `/iceberg/track` 400s there anyway).
+    ///
+    /// A restored job resumes incrementally — the per-(source, target-spec,
+    /// table) watermarks live in the same ledger and are read by the materialize
+    /// call itself, so recovery re-reads nothing it already materialized. The
+    /// first poll of each job fires one interval from now, matching `track`.
+    async fn restore_jobs(&self) -> usize {
+        let jobs = match self.fluree.tracked_materialize_jobs().await {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "materialize tracking worker: could not restore jobs; \
+                     tracking is empty until a client re-issues track"
+                );
+                return 0;
+            }
+        };
+        for job in &jobs {
+            self.handle.track(
+                &job.source,
+                &job.target,
+                Some(Duration::from_secs(job.poll_interval_secs)),
+            );
+        }
+        if !jobs.is_empty() {
+            info!(
+                restored = jobs.len(),
+                "materialize tracking worker restored persisted jobs"
+            );
+        }
+        jobs.len()
+    }
+
     /// Run the poll loop until [`MaterializeWorkerHandle::stop`] is requested.
     /// Spawn this with `tokio::spawn(worker.run())`.
     pub async fn run(self) {
+        self.restore_jobs().await;
+
         // Wake on a fine base granularity and poll whichever jobs are due; each
         // job's own interval decides how often it actually runs. Cap the tick at
         // 1s so a newly-added short-interval job (and a stop request) are noticed

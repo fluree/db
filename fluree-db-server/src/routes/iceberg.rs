@@ -383,6 +383,20 @@ async fn iceberg_track_local(state: Arc<AppState>, request: Request) -> Result<i
         req.poll_interval_secs.map(std::time::Duration::from_secs),
     );
 
+    // Persist the job so a restart restores it instead of silently stopping
+    // materialization until a client re-issues this call. Written after the
+    // in-memory registration and before the first sync, so the durable record
+    // and the running worker never disagree in the direction that loses work.
+    state
+        .fluree
+        .persist_materialize_job(&fluree_db_api::PersistedMaterializeJob {
+            source: req.source.clone(),
+            target: req.target.clone(),
+            poll_interval_secs: interval.as_secs(),
+        })
+        .await
+        .map_err(ServerError::Api)?;
+
     // Immediate first sync so the target is populated without waiting a cycle.
     let result = state
         .fluree
@@ -436,6 +450,13 @@ async fn iceberg_untrack_local(
         ServerError::bad_request("materialization tracking worker is not running on this node")
     })?;
     let removed = worker.untrack(&req.source, &req.target);
+
+    // Durable too, or a restart would resurrect the job.
+    state
+        .fluree
+        .forget_materialize_job(&req.source, &req.target)
+        .await
+        .map_err(ServerError::Api)?;
 
     Ok((
         StatusCode::OK,

@@ -218,6 +218,6 @@ pub use provider::FlureeIndexProvider;
 pub use r2rml::FlureeR2rmlProvider;
 
 #[cfg(feature = "iceberg")]
-pub use r2rml_materialize::MaterializeResult;
+pub use r2rml_materialize::{MaterializeResult, PersistedMaterializeJob};
 
 // Helper functions are used internally by bm25.rs via direct module path

@@ -2971,7 +2971,7 @@ Register a `source → target` materialization job with the in-process tracking 
 
 **Response:** `{ "source", "target", "tracked": true, "poll_interval_secs": 300, "tracked_jobs": 1, "initial": { …materialize response… } }`
 
-Tracked jobs are held in memory (re-issue `track` after a restart; the watermark in the `fluree_materialize_state:main` state ledger means it resumes incrementally). The worker runs on write nodes only.
+Tracked jobs are persisted in the `fluree_materialize_state:main` state ledger alongside the watermarks and restored when the worker starts, so a restart resumes tracking by itself — incrementally, from the watermark. The worker runs on write nodes only.
 
 ### POST {api_base_url}/iceberg/untrack
 
