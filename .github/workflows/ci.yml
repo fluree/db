@@ -159,10 +159,13 @@ jobs:
     # Cheap per-PR perf gate. Runs the two cheapest benches at tiny/quick and
     # compares against the committed baseline.
     #
-    # Both metrics enforce ONLY when the baseline's runner_class matches this
+    # Both metrics enforce ONLY when the baseline's host_class matches this
     # runner's. It currently does not — the committed baseline is
-    # runner_class=local — so on every PR today both wall-clock TIME and
+    # host_class=local — so on every PR today both wall-clock TIME and
     # PEAK_MEM breaches print as ::warning:: annotations and the job exits 0.
+    # That downgrade is now explicit (`--allow-host-mismatch`) rather than
+    # implicit: comparing absolute numbers across host classes is a refusal by
+    # default, and a job that wants the annotations has to say so.
     #
     # Why not gate on memory now: shared ubuntu-latest runners flap, and a
     # tracking allocator's peak moves with allocator behaviour, page size, and
@@ -184,9 +187,10 @@ jobs:
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
-      # CI-class marker. The committed baseline is runner_class=local, so this
+      # CI-class marker. The committed baseline is host_class=local, so this
       # mismatch is what makes both metrics advisory today.
-      FLUREE_BENCH_RUNNER_CLASS: ci-ubuntu-latest
+      # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
+      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
     steps:
       - name: Free disk space
         run: |
@@ -203,21 +207,28 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Clear stale memory sidecars first: rust-cache persists target/ across
-      # runs, and compare must not merge a mem number from a bench not rerun
-      # this session (review item 10). Then run the two cheap benches (writes
-      # criterion timings + fresh memory sidecars).
+      # Clear stale sidecars first: rust-cache persists target/ across runs, and
+      # compare must not merge a mem number from a bench not rerun this session
+      # (review item 10), nor a corpus block from a run that never read that
+      # corpus. Then run the two cheap benches (writes criterion timings + fresh
+      # sidecars).
       - name: Run cheap benches (tiny, quick)
         run: |
-          rm -rf target/fluree-bench-mem
+          rm -rf target/fluree-bench-mem target/fluree-bench-meta
           cargo bench -p fluree-db-api --bench query_overlay_matrix
           cargo bench -p fluree-db-api --bench query_hot_bsbm
 
       # Compare against the committed baseline. Exit 1 on any breach of a metric
-      # the runner-class match makes enforcing; against a cross-class baseline
-      # (today's state) every breach prints as a ::warning:: annotation and the
-      # step exits 0.
+      # the host-class match makes enforcing, 2 on a refusal to compare.
+      #
+      # --allow-host-mismatch is the phase-1 posture and nothing else: the
+      # committed baseline is host_class=local, this runner is
+      # ci-ubuntu-latest, and without the flag the job would refuse outright.
+      # DROP THIS FLAG once a ci-ubuntu-latest baseline is committed (bench.yml's
+      # bench-capture job) — the flag is what stands between annotations and a
+      # real gate. Phase-share drift enforces either way.
       - name: Compare against committed baseline
         run: |
           cargo run -p fluree-bench-support --bin bench-baseline -- \
-            compare --baseline bench-baselines/guardrails-pre.json
+            compare --baseline bench-baselines/guardrails-pre.json \
+            --allow-host-mismatch
