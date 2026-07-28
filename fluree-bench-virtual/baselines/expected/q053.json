@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q053",
+  "result_hash": "2e082693e255e318c2880d09ca2f0ca2f135d798094abfaa3cca66809c22557b",
+  "rows": 5000,
+  "head_rows": [
+    "CUST-000000003",
+    "CUST-000000047",
+    "CUST-000000255",
+    "CUST-000000263",
+    "CUST-000000313",
+    "CUST-000000348",
+    "CUST-000000498",
+    "CUST-000000578",
+    "CUST-000000709",
+    "CUST-000000960",
+    "CUST-000000979",
+    "CUST-000001038",
+    "CUST-000001076",
+    "CUST-000001401",
+    "CUST-000001439",
+    "CUST-000001519",
+    "CUST-000001614",
+    "CUST-000001633",
+    "CUST-000001671",
+    "CUST-000001713"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q052",
+  "result_hash": "b2655a0455ecee2bff82345155bdc1f31105b4f324a7e2b5524ba86d2d0db91b",
+  "rows": 37,
+  "head_rows": [
+    "add_to_cart",
+    "add_to_cart",
+    "add_to_cart",
+    "checkout",
+    "checkout",
+    "checkout",
+    "checkout",
+    "checkout",
+    "checkout",
+    "checkout",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view",
+    "page_view"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

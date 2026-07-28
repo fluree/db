@@ -43,6 +43,83 @@ pub struct RestCatalogClient {
     pub(crate) config: RestCatalogConfig,
     auth: Arc<dyn SendCatalogAuth>,
     http_client: reqwest::Client,
+    /// Process-wide cap on concurrent catalog requests (a shared `Arc`, so every
+    /// client built via `new` bounds one global pool). Injectable for tests.
+    catalog_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+/// Default cap on concurrent catalog REST requests, process-wide.
+const DEFAULT_CATALOG_CONCURRENCY: usize = 8;
+/// Default max 429/503 retries before the error is surfaced.
+const DEFAULT_CATALOG_MAX_RETRIES: u32 = 4;
+/// Base backoff (doubles per attempt, jittered, capped at [`CATALOG_BACKOFF_CAP_MS`]).
+const CATALOG_BACKOFF_BASE_MS: u64 = 250;
+const CATALOG_BACKOFF_CAP_MS: u64 = 8_000;
+
+/// The process-wide catalog-request semaphore, sized from
+/// `FLUREE_ICEBERG_CATALOG_CONCURRENCY` (default 8) at first use. Returns a clone
+/// of the shared `Arc` so all clients bound one pool.
+fn global_catalog_semaphore() -> Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::env::var("FLUREE_ICEBERG_CATALOG_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_CATALOG_CONCURRENCY);
+        Arc::new(tokio::sync::Semaphore::new(permits))
+    })
+    .clone()
+}
+
+fn max_catalog_retries() -> u32 {
+    std::env::var("FLUREE_ICEBERG_CATALOG_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_CATALOG_MAX_RETRIES)
+}
+
+fn catalog_backoff_base_ms() -> u64 {
+    std::env::var("FLUREE_ICEBERG_CATALOG_BACKOFF_BASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CATALOG_BACKOFF_BASE_MS)
+}
+
+/// A `Retry-After` delta-seconds header as a (capped) `Duration`, if present and
+/// parseable. HTTP-date form is not honored (delta-seconds is what Horizon sends).
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let secs = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(30)))
+}
+
+/// Exponential backoff with full jitter for a 0-based `attempt`.
+fn backoff_delay(attempt: u32) -> Duration {
+    let exp = catalog_backoff_base_ms()
+        .saturating_mul(1u64 << attempt.min(5))
+        .min(CATALOG_BACKOFF_CAP_MS);
+    Duration::from_millis(jitter_ms(exp))
+}
+
+/// Uniform pseudo-random in `[0, cap]` from the clock's sub-second bits — full
+/// jitter without pulling in a RNG dependency.
+fn jitter_ms(cap_ms: u64) -> u64 {
+    if cap_ms == 0 {
+        return 0;
+    }
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    n % (cap_ms + 1)
 }
 
 impl std::fmt::Debug for RestCatalogClient {
@@ -71,7 +148,16 @@ impl RestCatalogClient {
             config,
             auth,
             http_client,
+            catalog_semaphore: global_catalog_semaphore(),
         })
+    }
+
+    /// Override the catalog-request semaphore (tests only), so a bounded-pool test
+    /// isn't at the mercy of the process-wide `OnceLock`'s first-caller init.
+    #[cfg(test)]
+    pub(crate) fn with_catalog_semaphore(mut self, sem: Arc<tokio::sync::Semaphore>) -> Self {
+        self.catalog_semaphore = sem;
+        self
     }
 
     /// Make a GET request to the catalog API.
@@ -95,49 +181,82 @@ impl RestCatalogClient {
         Box::pin(async move {
             let url = format!("{}{}", self.config.uri, path);
 
-            let mut request = self
-                .http_client
-                .get(&url)
-                .header("Accept", "application/json");
+            // Bound concurrent catalog requests process-wide so a fan-out — the
+            // slice-1 prefetch, a wildcard crawl, or a raised scan concurrency —
+            // can't storm Horizon. The permit is held across the 429/503 backoff
+            // below (a throttled request keeps its slot while it waits — that IS
+            // the rate limiting), but released before the 401 recursion so a small
+            // cap can't self-deadlock.
+            let permit = self.catalog_semaphore.acquire().await;
 
-            // Add auth header if available
-            if let Some(auth_header) = self.auth.authorization_header().await? {
-                request = request.header("Authorization", auth_header);
+            let mut attempt: u32 = 0;
+            loop {
+                let mut request = self
+                    .http_client
+                    .get(&url)
+                    .header("Accept", "application/json");
+
+                // Add auth header if available
+                if let Some(auth_header) = self.auth.authorization_header().await? {
+                    request = request.header("Authorization", auth_header);
+                }
+
+                // Add custom headers
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+
+                let response = request.send().await?;
+                let status = response.status();
+
+                if status == reqwest::StatusCode::UNAUTHORIZED && !is_retry {
+                    // Refresh the token and retry once. Release the permit first —
+                    // the recursive call re-acquires it, and holding it across the
+                    // recursion would deadlock a single-permit semaphore.
+                    tracing::debug!("Got 401, refreshing auth token and retrying");
+                    drop(permit);
+                    self.auth.refresh().await?;
+                    return self.request_with_retry(path, headers, true).await;
+                }
+
+                // 429 Too Many Requests / 503 Service Unavailable: honor a
+                // `Retry-After` header when present, else exponential backoff with
+                // full jitter; bounded attempts, then surface the error.
+                if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status == reqwest::StatusCode::SERVICE_UNAVAILABLE)
+                    && attempt < max_catalog_retries()
+                {
+                    let delay = retry_after(&response).unwrap_or_else(|| backoff_delay(attempt));
+                    tracing::debug!(
+                        status = %status,
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        "catalog throttled; backing off"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(IcebergError::TableNotFound(format!(
+                        "Resource not found at {path}: {body}"
+                    )));
+                }
+
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(IcebergError::Catalog(format!(
+                        "Catalog request failed ({status}): {body}"
+                    )));
+                }
+
+                return response
+                    .json()
+                    .await
+                    .map_err(|e| IcebergError::Catalog(format!("Failed to parse response: {e}")));
             }
-
-            // Add custom headers
-            for (name, value) in headers {
-                request = request.header(*name, *value);
-            }
-
-            let response = request.send().await?;
-            let status = response.status();
-
-            if status == reqwest::StatusCode::UNAUTHORIZED && !is_retry {
-                // Try refresh and retry once
-                tracing::debug!("Got 401, refreshing auth token and retrying");
-                self.auth.refresh().await?;
-                return self.request_with_retry(path, headers, true).await;
-            }
-
-            if status == reqwest::StatusCode::NOT_FOUND {
-                let body = response.text().await.unwrap_or_default();
-                return Err(IcebergError::TableNotFound(format!(
-                    "Resource not found at {path}: {body}"
-                )));
-            }
-
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(IcebergError::Catalog(format!(
-                    "Catalog request failed ({status}): {body}"
-                )));
-            }
-
-            response
-                .json()
-                .await
-                .map_err(|e| IcebergError::Catalog(format!("Failed to parse response: {e}")))
         })
     }
 
@@ -404,6 +523,7 @@ mod tests {
             },
             auth: Arc::new(crate::auth::BearerTokenAuth::new("test".to_string())),
             http_client: reqwest::Client::new(),
+            catalog_semaphore: global_catalog_semaphore(),
         };
 
         let table_id = TableIdentifier::new("openflights", "airlines");
@@ -420,11 +540,161 @@ mod tests {
             },
             auth: Arc::new(crate::auth::BearerTokenAuth::new("test".to_string())),
             http_client: reqwest::Client::new(),
+            catalog_semaphore: global_catalog_semaphore(),
         };
 
         let table_id = TableIdentifier::new("db.schema", "events");
         let path = client.table_path(&table_id);
         // Multi-level namespace should use unit separator encoding
         assert_eq!(path, "/v1/namespaces/db%1Fschema/tables/events");
+    }
+
+    // ---- PR-8 slice 3: 429 backoff + catalog-request semaphore ----
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    /// A test client pointed at a wiremock server. Uses a PLAIN reqwest client so
+    /// the loopback mock is reachable (the production `new` hardens against
+    /// loopback for SSRF), and injects `sem` as the catalog semaphore.
+    fn wiremock_client(uri: &str, sem: Arc<tokio::sync::Semaphore>) -> RestCatalogClient {
+        RestCatalogClient {
+            config: RestCatalogConfig {
+                uri: uri.to_string(),
+                ..Default::default()
+            },
+            auth: Arc::new(crate::auth::NoAuth),
+            http_client: reqwest::Client::new(),
+            catalog_semaphore: sem,
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_delta_seconds_and_backoff_is_bounded() {
+        let resp: reqwest::Response = http::Response::builder()
+            .header("Retry-After", "3")
+            .body("")
+            .map(reqwest::Response::from)
+            .unwrap();
+        assert_eq!(retry_after(&resp), Some(Duration::from_secs(3)));
+
+        let no_header: reqwest::Response = http::Response::builder()
+            .body("")
+            .map(reqwest::Response::from)
+            .unwrap();
+        assert_eq!(retry_after(&no_header), None);
+
+        // Backoff never exceeds the cap, at any attempt.
+        for attempt in 0..12 {
+            assert!(backoff_delay(attempt) <= Duration::from_millis(CATALOG_BACKOFF_CAP_MS));
+        }
+    }
+
+    /// Responds 429 (Retry-After: 0) for the first `fail_times` requests, then 200.
+    struct FlakyResponder {
+        calls: Arc<AtomicUsize>,
+        fail_times: usize,
+    }
+    impl Respond for FlakyResponder {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                ResponseTemplate::new(429).insert_header("Retry-After", "0")
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true}))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_on_429_then_succeeds() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .respond_with(FlakyResponder {
+                calls: Arc::clone(&calls),
+                fail_times: 2,
+            })
+            .mount(&server)
+            .await;
+
+        let client = wiremock_client(&server.uri(), Arc::new(tokio::sync::Semaphore::new(4)));
+        let out = client.get("/v1/namespaces", &[]).await;
+        assert!(
+            out.is_ok(),
+            "should succeed after retrying past the 429s: {out:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two 429s + one 200");
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_max_retries_and_surfaces_the_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .mount(&server)
+            .await;
+
+        let client = wiremock_client(&server.uri(), Arc::new(tokio::sync::Semaphore::new(4)));
+        let err = client.get("/v1/namespaces", &[]).await.unwrap_err();
+        match err {
+            IcebergError::Catalog(msg) => assert!(
+                msg.contains("429"),
+                "terminal error names the status: {msg}"
+            ),
+            other => panic!("expected a Catalog error after giving up, got {other:?}"),
+        }
+        // 1 initial attempt + DEFAULT_CATALOG_MAX_RETRIES retries.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1 + DEFAULT_CATALOG_MAX_RETRIES as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn semaphore_bounds_concurrent_catalog_requests() {
+        // Each response is delayed, so with a 2-permit semaphore, 6 requests run in
+        // 3 waves ≈ 3×delay; an unbounded (6-permit) client finishes in ≈1×delay.
+        let delay = Duration::from_millis(120);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(delay)
+                    .set_body_json(serde_json::json!({})),
+            )
+            .mount(&server)
+            .await;
+
+        let fire = |permits: usize| {
+            let uri = server.uri();
+            async move {
+                let client = Arc::new(wiremock_client(
+                    &uri,
+                    Arc::new(tokio::sync::Semaphore::new(permits)),
+                ));
+                let start = Instant::now();
+                let futs = (0..6).map(|_| {
+                    let c = Arc::clone(&client);
+                    async move { c.get("/v1/namespaces", &[]).await }
+                });
+                let results = futures::future::join_all(futs).await;
+                assert!(results.iter().all(std::result::Result::is_ok));
+                start.elapsed()
+            }
+        };
+
+        let bounded = fire(2).await;
+        let unbounded = fire(6).await;
+        assert!(
+            bounded >= delay * 2,
+            "2-permit semaphore should serialize 6 requests into ≥3 waves (got {bounded:?})"
+        );
+        assert!(
+            unbounded < bounded,
+            "6-permit (unbounded here) should be faster than 2-permit (bounded {bounded:?} vs unbounded {unbounded:?})"
+        );
     }
 }

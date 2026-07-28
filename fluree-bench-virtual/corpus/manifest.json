@@ -1,0 +1,1359 @@
+{
+  "corpus_version": 2,
+  "description": "vbench corpus: 54 SPARQL queries (design Q01-Q54) derived from 26 BI questions over the ENTERPRISE_DEMO.DW star schema. Every query runs identically against the native materialized ledger (enterprise-sf01) and, once registered, an R2RML/Iceberg virtual target. See docs/audit/2026-07-virtual-dataset-perf/03-corpus-design.md for the feature x hypothesis coverage matrices and expected-rows derivation.",
+  "queries": [
+    {
+      "id": "q001",
+      "file": "queries/q001_store_directory.rq",
+      "bi_question": "BI-01: List our stores with their channel and store type.",
+      "tags": [
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_STORE"
+      ],
+      "class": "dims-only",
+      "expected_rows": 500,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q002",
+      "file": "queries/q002_store_detail.rq",
+      "bi_question": "BI-02: Show everything we know about a specific store.",
+      "tags": [
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_STORE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        7,
+        9
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": []
+    },
+    {
+      "id": "q003",
+      "file": "queries/q003_distinct_regions.rq",
+      "bi_question": "BI-03: Which regions do we operate in?",
+      "tags": [
+        "distinct",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        3,
+        12
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q004",
+      "file": "queries/q004_cities_in_region.rq",
+      "bi_question": "BI-03: Which cities do we cover in a given region?",
+      "tags": [
+        "filter_string",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        25000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": []
+    },
+    {
+      "id": "q005",
+      "file": "queries/q005_supplier_scorecard.rq",
+      "bi_question": "BI-04: Rank suppliers by rating, with the region they sit in.",
+      "tags": [
+        "join",
+        "fk_chain",
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_SUPPLIER",
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "dims-only",
+      "expected_rows": 20,
+      "order_sensitive": "by_keys",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q006",
+      "file": "queries/q006_enterprise_accounts.rq",
+      "bi_question": "BI-05: Which enterprise accounts have annual revenue over $10M?",
+      "tags": [
+        "filter_string",
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_ACCOUNT"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        0,
+        15000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q007",
+      "file": "queries/q007_accounts_by_industry.rq",
+      "bi_question": "BI-05: How are our accounts distributed across industries?",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_ACCOUNT"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        3,
+        40
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q008",
+      "file": "queries/q008_revenue_by_region.rq",
+      "bi_question": "BI-06: What is total order revenue by customer region?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_CUSTOMER",
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        3,
+        12
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q009",
+      "file": "queries/q009_revenue_by_region_having.rq",
+      "bi_question": "BI-06: Which regions generate more than $5M in order revenue?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "having",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_CUSTOMER",
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        12
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q010",
+      "file": "queries/q010_revenue_by_quarter.rq",
+      "bi_question": "BI-07: What is order revenue by fiscal year and quarter?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "order_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_DATE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        4,
+        120
+      ],
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q011",
+      "file": "queries/q011_orders_in_quarter.rq",
+      "bi_question": "BI-07: Which orders fell in the first quarter of 2024?",
+      "tags": [
+        "filter_date",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        180000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q012",
+      "file": "queries/q012_top_products_by_units.rq",
+      "bi_question": "BI-08: What are the top 10 products by units sold?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "order_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER_LINE",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 10,
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q013",
+      "file": "queries/q013_products_above_avg_units.rq",
+      "bi_question": "BI-08: Which products sell above the average units-per-product?",
+      "tags": [
+        "subquery",
+        "aggregate",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER_LINE",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        37500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
+    },
+    {
+      "id": "q014",
+      "file": "queries/q014_channel_mix.rq",
+      "bi_question": "BI-09: What is order volume and revenue by channel?",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        2,
+        12
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q015",
+      "file": "queries/q015_shipment_sla.rq",
+      "bi_question": "BI-10: What is the shipment status and cost for each order?",
+      "tags": [
+        "join",
+        "fk_chain",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_SHIPMENT",
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        180000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q016",
+      "file": "queries/q016_orders_optional_shipment.rq",
+      "bi_question": "BI-10: List orders with their shipment status where one exists.",
+      "tags": [
+        "optional",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "FACT_SHIPMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        200000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q017",
+      "file": "queries/q017_orders_never_shipped.rq",
+      "bi_question": "BI-10: Which orders were never shipped?",
+      "tags": [
+        "negation",
+        "join"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "FACT_SHIPMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        180000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q018",
+      "file": "queries/q018_large_payments_by_tender.rq",
+      "bi_question": "BI-11: What are large payments (over $4000) by tender type?",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_PAYMENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        12
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q019",
+      "file": "queries/q019_gl_large_debits.rq",
+      "bi_question": "BI-12: Which GL journal debits exceed $1M?",
+      "tags": [
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        250000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q020",
+      "file": "queries/q020_gl_posting_window.rq",
+      "bi_question": "BI-12: Which GL entries posted in Q1 2024?",
+      "tags": [
+        "filter_date",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        250000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q021",
+      "file": "queries/q021_gl_account_code_range.rq",
+      "bi_question": "BI-12: Which GL entries fall in account-code band 40000-49999?",
+      "tags": [
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        250000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q022",
+      "file": "queries/q022_current_customers_by_segment.rq",
+      "bi_question": "BI-13: How are current customers distributed across segments?",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        2,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q023",
+      "file": "queries/q023_all_customers_by_segment.rq",
+      "bi_question": "BI-13: Customers by segment WITHOUT the SCD current-version filter (the trap).",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        2,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q024",
+      "file": "queries/q024_current_customers_birthyear.rq",
+      "bi_question": "BI-13: How many current customers were born in the 1980s?",
+      "tags": [
+        "filter_range",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        0,
+        300000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q025",
+      "file": "queries/q025_category_csat_having.rq",
+      "bi_question": "BI-14: Which product categories have average CSAT below 3?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "having",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_SUPPORT_TICKET",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        40
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q026",
+      "file": "queries/q026_resolution_by_priority.rq",
+      "bi_question": "BI-14: What is the average resolution time by ticket priority?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_SUPPORT_TICKET"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        2,
+        10
+      ],
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q027",
+      "file": "queries/q027_web_events_by_type_device.rq",
+      "bi_question": "BI-15: What are web event counts by type and device?",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        2,
+        60
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q028",
+      "file": "queries/q028_purchase_events_products.rq",
+      "bi_question": "BI-15: Which products drew purchase events?",
+      "tags": [
+        "filter_string",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q029",
+      "file": "queries/q029_purchase_or_cart_events.rq",
+      "bi_question": "BI-15: Show purchase-or-add-to-cart events.",
+      "tags": [
+        "union",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 100,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q030",
+      "file": "queries/q030_web_events_in_month.rq",
+      "bi_question": "BI-15: Which web events happened in June 2024?",
+      "tags": [
+        "filter_date",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q031",
+      "file": "queries/q031_inventory_below_reorder.rq",
+      "bi_question": "BI-16: Which products are below their reorder point (stockout risk)?",
+      "tags": [
+        "filter_range",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_INVENTORY_SNAPSHOT",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        300000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q032",
+      "file": "queries/q032_onhand_by_store.rq",
+      "bi_question": "BI-16: What is total on-hand inventory by store?",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_INVENTORY_SNAPSHOT",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q033",
+      "file": "queries/q033_employee_managers.rq",
+      "bi_question": "BI-17: Who is each employee's manager?",
+      "tags": [
+        "join",
+        "fk_chain",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_EMPLOYEE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": []
+    },
+    {
+      "id": "q034",
+      "file": "queries/q034_manager_chain_path.rq",
+      "bi_question": "BI-17: Who is in each employee's full management chain?",
+      "tags": [
+        "property_path",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_EMPLOYEE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        5000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
+    },
+    {
+      "id": "q035",
+      "file": "queries/q035_grandmanager_path.rq",
+      "bi_question": "BI-17: Who is each employee's manager-of-manager?",
+      "tags": [
+        "property_path",
+        "join"
+      ],
+      "tables": [
+        "DIM_EMPLOYEE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q036",
+      "file": "queries/q036_count_orders.rq",
+      "bi_question": "BI-18: How many orders are there?",
+      "tags": [
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q037",
+      "file": "queries/q037_count_web_events.rq",
+      "bi_question": "BI-18: How many web events are there?",
+      "tags": [
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q038",
+      "file": "queries/q038_count_current_customers.rq",
+      "bi_question": "BI-18: How many current customers are there?",
+      "tags": [
+        "count",
+        "aggregate",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": []
+    },
+    {
+      "id": "q039",
+      "file": "queries/q039_count_gl_entries.rq",
+      "bi_question": "BI-18: How many GL journal entries are there?",
+      "tags": [
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q040",
+      "file": "queries/q040_store_revenue_values.rq",
+      "bi_question": "BI-19: What is order revenue for three specific stores (VALUES form)?",
+      "tags": [
+        "values",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        180000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q041",
+      "file": "queries/q041_store_revenue_filter.rq",
+      "bi_question": "BI-19: Same three-store revenue, expressed as an IRI-equality FILTER.",
+      "tags": [
+        "filter_iri",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        180000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q042",
+      "file": "queries/q042_store_detail_union.rq",
+      "bi_question": "BI-19: Show details for three specific stores (bound-subject UNION).",
+      "tags": [
+        "union",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_STORE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        18,
+        30
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q043",
+      "file": "queries/q043_langtag_object_error.rq",
+      "bi_question": "BI-20: Find a customer by a language-tagged name (a query an LLM might emit).",
+      "tags": [
+        "bgp_star",
+        "filter_string"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": 0,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": []
+    },
+    {
+      "id": "q044",
+      "file": "queries/q044_customtype_object_error.rq",
+      "bi_question": "BI-20: Find a GL entry by a custom-datatype debit literal.",
+      "tags": [
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_GL_JOURNAL"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 0,
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": []
+    },
+    {
+      "id": "q045",
+      "file": "queries/q045_orders_limit.rq",
+      "bi_question": "BI-21: Show me 10 orders.",
+      "tags": [
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 10,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q046",
+      "file": "queries/q046_orders_top_by_total.rq",
+      "bi_question": "BI-21: Show me the 10 biggest orders.",
+      "tags": [
+        "order_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": 10,
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q047",
+      "file": "queries/q047_distinct_channels_limit.rq",
+      "bi_question": "BI-21: What order channels exist (first five)?",
+      "tags": [
+        "distinct",
+        "bgp_star"
+      ],
+      "tables": [
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        5
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q048",
+      "file": "queries/q048_construct_order_region.rq",
+      "bi_question": "BI-22: Build a flattened order->customer-region graph.",
+      "tags": [
+        "construct",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_CUSTOMER",
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q049",
+      "file": "queries/q049_construct_customer_region.rq",
+      "bi_question": "BI-22: Emit current-customer -> region edges.",
+      "tags": [
+        "construct",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "DIM_CUSTOMER",
+        "DIM_GEOGRAPHY"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        5000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q050",
+      "file": "queries/q050_products_optional_supplier.rq",
+      "bi_question": "BI-23: List current products with their supplier rating where known.",
+      "tags": [
+        "optional",
+        "join",
+        "fk_chain",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_PRODUCT",
+        "DIM_SUPPLIER"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        37500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q051",
+      "file": "queries/q051_stores_above_avg_orders.rq",
+      "bi_question": "BI-24: Which stores handle more orders than the store average?",
+      "tags": [
+        "subquery",
+        "aggregate",
+        "group_by",
+        "join"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
+    },
+    {
+      "id": "q052",
+      "file": "queries/q052_web_events_values_products.rq",
+      "bi_question": "BI-25: Which event types hit a watch-list of products (VALUES form)?",
+      "tags": [
+        "values",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_WEB_EVENT",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        1000000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q053",
+      "file": "queries/q053_customers_without_orders.rq",
+      "bi_question": "BI-25: Which current customers have never placed an order?",
+      "tags": [
+        "negation",
+        "join",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER",
+        "FACT_ORDER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        0,
+        300000
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q054",
+      "file": "queries/q054_employees_at_store.rq",
+      "bi_question": "BI-26: Which employees are assigned to a specific store (IRI-equality form)?",
+      "tags": [
+        "filter_iri",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_EMPLOYEE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        0,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [
+        "smoke"
+      ]
+    },
+    {
+      "id": "q055",
+      "file": "queries/q055_wildcard_peek.rq",
+      "bi_question": "BI-explore-1: Let me see what's in here.",
+      "tags": [
+        "wildcard",
+        "exploration"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": 5,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q056",
+      "file": "queries/q056_triple_count.rq",
+      "bi_question": "BI-explore-2: How big is this dataset (total triples)?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 300,
+      "subsets": []
+    },
+    {
+      "id": "q057",
+      "file": "queries/q057_distinct_predicates.rq",
+      "bi_question": "BI-explore-3: What properties exist in this dataset?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "distinct"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        100
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q058",
+      "file": "queries/q058_class_census.rq",
+      "bi_question": "BI-explore-4: How many of each kind of thing are there?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        30
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q059",
+      "file": "queries/q059_predicate_histogram.rq",
+      "bi_question": "BI-explore-5: Which fields dominate the data?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate",
+        "group_by",
+        "order_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        10
+      ],
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
+    }
+  ]
+}

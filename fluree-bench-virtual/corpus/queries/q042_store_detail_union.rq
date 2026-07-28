@@ -1,0 +1,9 @@
+# q042 store_detail_union
+# Intent: Bound-subject UNION; H8 positive control (prefix-prune on virtual).
+# BI lineage (BI-19): "Show details for three specific stores (bound-subject UNION)."
+# Predicates verified against enterprise.ttl — subject template edw/store/{STORE_KEY}.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?p ?o
+WHERE { { <http://data.fluree.dev/edw/store/1> ?p ?o . }
+         UNION { <http://data.fluree.dev/edw/store/2> ?p ?o . }
+         UNION { <http://data.fluree.dev/edw/store/3> ?p ?o . } }

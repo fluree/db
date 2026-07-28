@@ -1,0 +1,10 @@
+# q020 gl_posting_window
+# Intent: Date-range FILTER on GL (H4 date-positive control; prunes on virtual).
+# BI lineage (BI-12): "Which GL entries posted in Q1 2024?"
+# Predicates verified against enterprise.ttl — FactGlJournal: debitAmount, postingDate.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?deb ?pd
+WHERE { ?j a edw:GlJournalEntry ; edw:debitAmount ?deb ; edw:postingDate ?pd .
+        FILTER(?pd >= "2024-01-01"^^<http://www.w3.org/2001/XMLSchema#date>
+            && ?pd <  "2024-04-01"^^<http://www.w3.org/2001/XMLSchema#date>) }
+LIMIT 5000

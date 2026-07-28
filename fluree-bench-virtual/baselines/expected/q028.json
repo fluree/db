@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q028",
+  "result_hash": "57a334a7a4f5688cac20422b78663517161f6ad61206ce91f44ead885d94c9b8",
+  "rows": 5000,
+  "head_rows": [
+    "Product 10",
+    "Product 1000",
+    "Product 10004",
+    "Product 10015",
+    "Product 10019",
+    "Product 10020",
+    "Product 10025",
+    "Product 10027",
+    "Product 10028",
+    "Product 10036",
+    "Product 10036",
+    "Product 10038",
+    "Product 1004",
+    "Product 10043",
+    "Product 10050",
+    "Product 10053",
+    "Product 10054",
+    "Product 10060",
+    "Product 1007",
+    "Product 10072"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

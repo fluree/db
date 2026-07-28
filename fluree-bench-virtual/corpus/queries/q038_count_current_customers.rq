@@ -1,0 +1,6 @@
+# q038 count_current_customers
+# Intent: COUNT(*) over a dimension with the SCD current filter (H5 dims-only control).
+# BI lineage (BI-18): "How many current customers are there?"
+# Predicates verified against enterprise.ttl — class edw:Customer, isCurrent.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n) WHERE { ?s a edw:Customer ; edw:isCurrent true . }

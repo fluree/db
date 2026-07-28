@@ -1285,6 +1285,13 @@ impl Batch {
         &self.schema
     }
 
+    /// Clone the schema's `Arc` (cheap — the schema is tiny). Lets a caller build
+    /// a new batch that shares this batch's schema, e.g. concatenating several
+    /// same-schema batches into one.
+    pub fn schema_arc(&self) -> Arc<[VarId]> {
+        Arc::clone(&self.schema)
+    }
+
     /// Get binding by VarId (linear scan over schema; schema is typically tiny)
     ///
     /// Returns None if VarId is not in schema or row is out of bounds.

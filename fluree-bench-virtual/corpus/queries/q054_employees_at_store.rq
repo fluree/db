@@ -1,0 +1,8 @@
+# q054 employees_at_store
+# Intent: filter_iri dims-only control: object-IRI equality is operator-only (no prefix-prune) on virtual.
+# BI lineage (BI-26): "Which employees are assigned to a specific store (IRI-equality form)?"
+# Predicates verified against enterprise.ttl — DimEmployee: name, store(->DimStore).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?en
+WHERE { ?e a edw:Employee ; edw:name ?en ; edw:store ?st .
+         FILTER(?st = <http://data.fluree.dev/edw/store/1>) }

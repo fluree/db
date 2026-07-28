@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q048",
+  "result_hash": "78d1464a9c91f92f5b1ac79127d3e8e472dc17d3bd6c5c46473d834e31c644e8",
+  "rows": 5000,
+  "head_rows": [
+    "{\"@id\":\"http://data.fluree.dev/edw/order/1\",\"edw:custRegion\":[\"Region-4\"],\"edw:orderTotal\":[1602.82]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/10\",\"edw:custRegion\":[\"Region-9\"],\"edw:orderTotal\":[916.02]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100\",\"edw:custRegion\":[\"Region-6\"],\"edw:orderTotal\":[2288.11]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/1000\",\"edw:custRegion\":[\"Region-3\"],\"edw:orderTotal\":[2412.44]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/10000\",\"edw:custRegion\":[\"Region-4\"],\"edw:orderTotal\":[2750.74]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100000\",\"edw:custRegion\":[\"Region-7\"],\"edw:orderTotal\":[2398.21]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100001\",\"edw:custRegion\":[\"Region-6\"],\"edw:orderTotal\":[1548.23]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100002\",\"edw:custRegion\":[\"Region-5\"],\"edw:orderTotal\":[933.9]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100003\",\"edw:custRegion\":[\"Region-4\"],\"edw:orderTotal\":[4175.36]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100004\",\"edw:custRegion\":[\"Region-7\"],\"edw:orderTotal\":[2266.23]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100005\",\"edw:custRegion\":[\"Region-2\"],\"edw:orderTotal\":[678.94]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100006\",\"edw:custRegion\":[\"Region-4\"],\"edw:orderTotal\":[642.04]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100007\",\"edw:custRegion\":[\"Region-9\"],\"edw:orderTotal\":[4131.4]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100008\",\"edw:custRegion\":[\"Region-9\"],\"edw:orderTotal\":[1657.8]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100009\",\"edw:custRegion\":[\"Region-5\"],\"edw:orderTotal\":[3531.39]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/10001\",\"edw:custRegion\":[\"Region-6\"],\"edw:orderTotal\":[2505.11]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100010\",\"edw:custRegion\":[\"Region-9\"],\"edw:orderTotal\":[822.25]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100011\",\"edw:custRegion\":[\"Region-1\"],\"edw:orderTotal\":[3429.45]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100012\",\"edw:custRegion\":[\"Region-9\"],\"edw:orderTotal\":[3450.82]}",
+    "{\"@id\":\"http://data.fluree.dev/edw/order/100013\",\"edw:custRegion\":[\"Region-1\"],\"edw:orderTotal\":[1460.47]}"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

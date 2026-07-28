@@ -1,0 +1,8 @@
+{
+  "id": "virtual-sf01",
+  "kind": "virtual",
+  "fluree_home": "/Users/ajohnson/vbench/.fluree",
+  "alias": "enterprise-sf01-v",
+  "description": "Virtual R2RML/Iceberg graph source over Snowflake-managed ENTERPRISE_DEMO.DW_SF01 (SF=0.1, seed 0.42 — byte-identical source parquet to native-sf01, loaded 2026-07-10). Scale-matched counterpart of native-sf01: result hashes are directly comparable. Mapping: targets/enterprise-sf01-mapping.ttl (enterprise.ttl with DW.->DW_SF01. table swap). Auth: VBENCH_PAT (ICEBERG_READER, expires 2026-10-08).",
+  "status": "ready"
+}

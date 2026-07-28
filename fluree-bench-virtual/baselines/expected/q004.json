@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q004",
+  "result_hash": "99123c52f919234375bbcf7cfa45960d70e32109d4a91cccfbf76cc69aadb58f",
+  "rows": 2789,
+  "head_rows": [
+    "City-1",
+    "City-1",
+    "City-1",
+    "City-10",
+    "City-10",
+    "City-10",
+    "City-10",
+    "City-100",
+    "City-100",
+    "City-100",
+    "City-101",
+    "City-101",
+    "City-102",
+    "City-102",
+    "City-103",
+    "City-104",
+    "City-104",
+    "City-105",
+    "City-105",
+    "City-105"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

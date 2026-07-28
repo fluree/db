@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "query_id": "q003",
+  "result_hash": "3988d23168e7c36d40ea73b477d5035e76779164c3901e21bc42a06f99b7504d",
+  "rows": 9,
+  "head_rows": [
+    "Region-1",
+    "Region-2",
+    "Region-3",
+    "Region-4",
+    "Region-5",
+    "Region-6",
+    "Region-7",
+    "Region-8",
+    "Region-9"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

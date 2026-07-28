@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "query_id": "q002",
+  "result_hash": "d65ea385a2773f48982ee5eaf9f37b0dcc80d36e2b4f3d35f2d4164ab5d21b25",
+  "rows": 8,
+  "head_rows": [
+    "2023-06-27\u001f<edw:openDate>",
+    "<edw:Store>\u001f<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    "<http://data.fluree.dev/edw/employee/604>\u001f<edw:regionManager>",
+    "<http://data.fluree.dev/edw/geography/3603>\u001f<edw:geography>",
+    "Retail\u001f<edw:channel>",
+    "STORE-00001\u001f<edw:storeId>",
+    "Store 1\u001f<edw:name>",
+    "Warehouse\u001f<edw:storeType>"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

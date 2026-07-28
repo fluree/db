@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q050",
+  "result_hash": "373c16256315075c5822e759b9794d3e31b396f6ddb2d2695af023d1a496969e",
+  "rows": 30000,
+  "head_rows": [
+    "Product 1\u001f3.56000000000e0",
+    "Product 10\u001f2.21000000000e0",
+    "Product 100\u001f2.72000000000e0",
+    "Product 1000\u001f3.26000000000e0",
+    "Product 10000\u001f3.12000000000e0",
+    "Product 10001\u001f3.60000000000e0",
+    "Product 10002\u001f2.60000000000e0",
+    "Product 10003\u001f4.08000000000e0",
+    "Product 10004\u001f3.77000000000e0",
+    "Product 10005\u001f3.19000000000e0",
+    "Product 10006\u001f2.47000000000e0",
+    "Product 10007\u001f2.11000000000e0",
+    "Product 10008\u001f4.99000000000e0",
+    "Product 10009\u001f3.17000000000e0",
+    "Product 1001\u001f3.39000000000e0",
+    "Product 10010\u001f4.12000000000e0",
+    "Product 10011\u001f3.45000000000e0",
+    "Product 10012\u001f3.06000000000e0",
+    "Product 10013\u001f2.32000000000e0",
+    "Product 10014\u001f4.45000000000e0"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

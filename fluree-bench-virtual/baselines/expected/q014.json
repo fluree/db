@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "query_id": "q014",
+  "result_hash": "2d8a57f35bec45d909edb01d0ebfc01d5138db31c8b238407d01f7ca066dfa5b",
+  "rows": 4,
+  "head_rows": [
+    "Mobile\u001f35539\u001f8.88140980700e7",
+    "Phone\u001f35942\u001f9.00533441900e7",
+    "Store\u001f36167\u001f9.04297042500e7",
+    "Web\u001f72352\u001f1.81132938710e8"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

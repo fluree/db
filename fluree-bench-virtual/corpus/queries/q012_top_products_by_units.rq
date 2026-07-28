@@ -1,0 +1,12 @@
+# q012 top_products_by_units
+# Intent: Fact->dim rollup with top-k and an SCD isCurrent filter.
+# BI lineage (BI-08): "What are the top 10 products by units sold?"
+# Predicates verified against enterprise.ttl — FactOrderLine: quantity, product; DimProduct: name, isCurrent.
+# Determinism: ORDER BY + LIMIT top-k with a unique tiebreaker appended to the sort key so the selected rows (and the result hash) are exact across engines; perf shape unchanged (still top-k over a full scan, H2 intact).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?pn (SUM(?qty) AS ?u)
+WHERE { ?ol a edw:OrderLine ; edw:quantity ?qty ; edw:product ?p .
+        ?p edw:name ?pn ; edw:isCurrent true . }
+GROUP BY ?pn
+ORDER BY DESC(?u) ?pn
+LIMIT 10

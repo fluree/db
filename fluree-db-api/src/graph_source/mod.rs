@@ -115,6 +115,12 @@ mod vector;
 mod catalog_session;
 
 #[cfg(feature = "iceberg")]
+mod disk_catalog_cache;
+
+#[cfg(feature = "iceberg")]
+mod lazy_storage;
+
+#[cfg(feature = "iceberg")]
 pub(crate) mod crawl;
 
 #[cfg(feature = "iceberg")]

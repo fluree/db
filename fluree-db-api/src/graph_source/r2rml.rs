@@ -5,34 +5,69 @@
 //!
 //! This module is only available with the `iceberg` feature.
 
+use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
 use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
+use fluree_db_iceberg::error::IcebergError;
 use fluree_db_iceberg::{
-    catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient},
+    catalog::{
+        LoadTableResponse, RestCatalogClient, RestCatalogConfig, SendCatalogClient, TableIdentifier,
+    },
+    config::IoConfig,
     io::{ColumnBatch, S3IcebergStorage, SendIcebergStorage, SendParquetReader},
     metadata::TableMetadata,
-    scan::{ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner},
+    scan::{
+        topk::{batch_sort_values, plan_topk_read, TopKBound},
+        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
+    },
+    stats::{
+        aggregate_column_stats, send_read_snapshot_data_files, send_snapshot_has_delete_manifests,
+    },
     IcebergGsConfig,
 };
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanValue,
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
+    ScanValue,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
 use std::sync::Arc;
 use tracing::{debug, info, warn, Instrument};
 
+/// Max files a scan-side top-k (PR-5) reads SEQUENTIALLY (bound-ordered, with
+/// early-stop) before conceding the prune is ineffective and handing the rest to
+/// the normal bounded-parallel reader. Caps the worst case (adversarial layout /
+/// all files tie at the bound / a heap that never fills) so the topk path can
+/// never be slower than the parallel path it replaces. The win case (q046) reads
+/// ~10-15 files and stops well under this.
+const TOPK_SEQUENTIAL_CAP: usize = 128;
+
 /// How many data files to read concurrently. Defaults to
-/// `min(available_parallelism, files, 8)`; override with
+/// `min(available_parallelism, files, 32)`; override with
 /// `FLUREE_ICEBERG_SCAN_CONCURRENCY` (a positive integer; not capped, so callers
-/// can raise it for high-latency remote object stores). Bounded to keep memory
-/// and S3 request fan-out in check.
+/// can raise it further for high-latency remote object stores).
+///
+/// PR-2 Lever B raised the ceiling from 8 to 32. The per-file decode cost is
+/// fixed S3 round-trip latency, not CPU (see
+/// `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`), so more
+/// in-flight reads is close to pure win on the thousands-of-tiny-files fact-table
+/// shape; the sweep showed wall still improving to c=32 with only mild per-file
+/// contention creep past ~c=16, hence 32 as the ceiling. Raising the ceiling
+/// never lowers the previous default on any core count (`clamp(1, 32) >=
+/// clamp(1, 8)` pointwise; a 2-core host still runs 2), but the memory trade is
+/// real: in-flight buffer bytes are `O(concurrency)` file decodes (each <=32MB
+/// whole-file / <=64MB sparse-buffer), and the default now scales with cores up
+/// to 32 where it was previously capped at 8 regardless of cores — up to 4x the
+/// prior in-flight bytes on a >=32-core host. The sweep data and the
+/// tiny-file fact-table shape justify the trade; the env override is the
+/// pressure valve in both directions — raise it to reach the ceiling on a
+/// low-core host, lower it on a memory-tight one.
 fn iceberg_scan_concurrency(num_files: usize) -> usize {
     if let Some(n) = std::env::var("FLUREE_ICEBERG_SCAN_CONCURRENCY")
         .ok()
@@ -44,7 +79,7 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
     let cpus = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4);
-    cpus.min(num_files.max(1)).clamp(1, 8)
+    cpus.min(num_files.max(1)).clamp(1, 32)
 }
 
 /// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
@@ -68,6 +103,51 @@ fn config_fingerprint(config: &str) -> u64 {
 /// this in one place guarantees the two keys never drift.
 pub(crate) fn rest_client_cache_key(graph_source_id: &str, config: &str) -> String {
     format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
+}
+
+/// Whether numeric (double / decimal) FILTER pushdown — including the integer →
+/// scale-0-decimal coercion against a decimal column — is enabled (PR-7). Mirrors
+/// the query-crate `FLUREE_ICEBERG_NUMERIC_STATS` switch (the two crates can't
+/// share the `pub(crate)` symbol); read once, cached for the process. Off restores
+/// the pre-PR-7 behavior: an integer literal against a decimal column pushes as
+/// `Int64`, which the decimal bound compare declines → no prune (full revert).
+pub(crate) fn iceberg_numeric_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_NUMERIC_STATS") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// The Iceberg pushdown literal for an integer scan value against a column of
+/// `type_str`. Against a `decimal(p,s)` column with `numeric_stats` on, the
+/// integer is pushed as an EXACT scale-0 decimal (comparable to the column's
+/// decimal bounds — `decimal_cmp` normalizes the scale gap); with it off it stays
+/// `Int64` (which the decimal bound compare declines → no prune), preserving the
+/// switch's revert guarantee. This is what lets an integer FILTER (`?deb >
+/// 1000000`) prune an `xsd:decimal` column (q019 / H4). An `int`-typed column
+/// narrows to `Int32`, skipping (`None`) an out-of-range literal rather than
+/// wrapping. `None` = skip the push (the operator still enforces).
+fn int_pushdown_literal(
+    n: i64,
+    type_str: Option<&str>,
+    numeric_stats: bool,
+) -> Option<LiteralValue> {
+    match type_str {
+        Some("int") => i32::try_from(n).ok().map(LiteralValue::Int32),
+        Some(t) if t.starts_with("decimal") && numeric_stats => Some(LiteralValue::Decimal {
+            unscaled: i128::from(n),
+            // precision is cosmetic for pruning (`decimal_cmp` ignores it); an i64
+            // is ≤19 digits, so the decimal128 max always covers it.
+            precision: 38,
+            scale: 0,
+        }),
+        _ => Some(LiteralValue::Int64(n)),
+    }
 }
 
 /// Translate resolved scan filters into an Iceberg pushdown `Expression` for
@@ -103,18 +183,64 @@ fn build_iceberg_filter(
                 Some("date") => LiteralValue::Date(*d),
                 _ => continue,
             },
-            // Iceberg `int` is 32-bit, `long` 64-bit. For an `int` column a
-            // literal outside i32 range must NOT be truncated with `as` (it would
-            // wrap and could prune files the residual filter keeps); skip the
-            // pushdown for that predicate instead.
-            ScanValue::Int(n) => match field.type_string() {
-                Some("int") => match i32::try_from(*n) {
-                    Ok(v) => LiteralValue::Int32(v),
-                    Err(_) => continue,
-                },
-                _ => LiteralValue::Int64(*n),
-            },
+            // Iceberg `int` is 32-bit, `long` 64-bit; against a `decimal` column an
+            // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
+            // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
+            // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
+            ScanValue::Int(n) => {
+                match int_pushdown_literal(*n, field.type_string(), iceberg_numeric_stats_enabled())
+                {
+                    Some(v) => v,
+                    None => continue,
+                }
+            }
             ScanValue::Str(s) => LiteralValue::String(s.clone()),
+            // xsd:double / xsd:float FILTER value. Push only against a physically
+            // `double` column (exact f64 bounds); a `float` column would need an
+            // f64→f32 narrowing that can round the literal and over-prune a range,
+            // so skip it — the in-engine FILTER still applies.
+            ScanValue::Double(d) => match field.type_string() {
+                Some("double") => LiteralValue::Float64(*d),
+                // A binary float → decimal coercion is not exact in general, so a
+                // double literal is NOT pushed against a decimal column (keep is
+                // correct; the in-engine FILTER enforces). Breadcrumb per the
+                // decline-observably ruling.
+                Some(t) if t.starts_with("decimal") => {
+                    debug!(
+                        column = %f.column,
+                        "double literal vs decimal column: pushdown declined (inexact float→decimal); in-engine FILTER enforces"
+                    );
+                    continue;
+                }
+                _ => continue,
+            },
+            // xsd:decimal FILTER value. Push only against a `decimal(...)` column;
+            // the literal keeps its own scale and the bound compare normalizes it
+            // against the column's scale. Row-group stats prune only when the
+            // column is FLBA-encoded (see `prunable_stats`); file-level manifest
+            // bounds prune regardless.
+            ScanValue::Decimal {
+                unscaled,
+                precision,
+                scale,
+            } => match field.type_string() {
+                Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
+                    unscaled: *unscaled,
+                    precision: *precision,
+                    scale: *scale,
+                },
+                // A decimal literal against an integer column has no exact
+                // cross-type bound compare, so it is NOT pushed (keep is correct).
+                // Breadcrumb per the decline-observably ruling.
+                Some("int" | "long") => {
+                    debug!(
+                        column = %f.column,
+                        "decimal literal vs integer column: pushdown declined (no exact cross-type bound compare); in-engine FILTER enforces"
+                    );
+                    continue;
+                }
+                _ => continue,
+            },
             // A reversed subject-template key: coerce the raw string to the
             // column's physical type. A key that parses as an integer pushes as an
             // integer literal against an `int`/`long`/`decimal` column — including
@@ -647,6 +773,12 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     }
 }
 
+/// Bounded concurrency for warming per-table catalog contexts in
+/// [`FlureeR2rmlProvider::prefetch_tables`] (PR-8 slice 1). Matches the
+/// generate-path preview fan-out (`0ade90c59`); the catalog-request semaphore
+/// (PR-8 slice 3) is the global Horizon-QPS bound, this is the per-query width.
+const CATALOG_PREFETCH_CONCURRENCY: usize = 8;
+
 #[async_trait]
 impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// Scan an Iceberg table, streaming column batches as data files are read.
@@ -661,6 +793,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         // Time the whole scan SETUP (loadTable + planning) as one span; it closes
@@ -674,25 +807,380 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             table_name,
             projection_len = projection.len()
         );
-        self.scan_table_inner(graph_source_id, table_name, projection, filters, _as_of_t)
-            .instrument(span)
-            .await
+        self.scan_table_inner(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            _as_of_t,
+        )
+        .instrument(span)
+        .await
     }
-}
 
-impl FlureeR2rmlProvider<'_> {
-    /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
-    /// trait method can wrap the setup in an `r2rml.scan_table` timing span via
-    /// `.instrument()` (the codebase's established pattern for timing an async body
-    /// without holding a span guard across an `.await`).
-    async fn scan_table_inner(
+    /// The table's exact live row count from the pinned Iceberg manifest — **only
+    /// when it provably equals a full-scan `COUNT(*)`** (see the trait contract).
+    ///
+    /// Resolves the SAME per-query pinned table context the scan uses (via
+    /// [`Self::load_table_context`], sharing `self.session`), so a `COUNT` and a
+    /// scan in one query read one Iceberg snapshot. It then reads that snapshot's
+    /// manifest-list + manifest Avro (never a Parquet/data file), and returns the
+    /// `record_count` sum only if [`sound_manifest_row_count`] proves it equals a
+    /// full scan: no delete manifests, and every `non_null_col` provably zero-null.
+    /// Otherwise `Ok(None)` and the caller falls back to the scan.
+    async fn table_row_count(
         &self,
         graph_source_id: &str,
         table_name: &str,
-        projection: &[String],
-        filters: &[ScanFilter],
+        non_null_cols: &[String],
         _as_of_t: Option<i64>,
-    ) -> QueryResult<ColumnBatchStream> {
+    ) -> QueryResult<Option<u64>> {
+        // Time the manifest-only read as one span (the same `.instrument` split as
+        // `scan_table` / `scan_table_inner`). `fired` records answered (true) vs
+        // declined-to-scan (false). The name is allowlisted in
+        // `fluree-bench-virtual::spans`, so the vbench pathway counters show the
+        // shortcut directly instead of inferring it from `files_selected=0` plus
+        // scan-span absence.
+        let span = tracing::debug_span!(
+            "r2rml.count_manifest",
+            graph_source_id,
+            table_name,
+            fired = tracing::field::Empty
+        );
+        self.table_row_count_inner(graph_source_id, table_name, non_null_cols, _as_of_t)
+            .instrument(span)
+            .await
+    }
+
+    /// Warm the per-query catalog session pin + cross-query caches for a set of
+    /// tables concurrently (PR-8 slice 1). Best-effort and side-effect-only: each
+    /// `load_table_context` populates `self.session` + the moka caches, so the
+    /// query's following *serial* scans resolve from the pin and skip the
+    /// `loadTable` GET. Resolution errors are intentionally swallowed — the real
+    /// scan re-resolves and surfaces them — so a warm failure degrades to today's
+    /// serial GET, never a changed result.
+    async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        // Dedup, preserving first-seen order, AND skip tables already resolved
+        // (with unexpired creds) in this query's session pin — re-warming a
+        // pinned table would issue a wasted `loadTable` GET. Collect OWNED names:
+        // a `Vec<&str>` here makes the `buffered` fan-out closure take a borrowed
+        // argument, which trips rustc's "FnOnce is not general enough" HRTB check.
+        let mut seen = std::collections::HashSet::new();
+        let mut to_warm: Vec<String> = Vec::new();
+        for t in table_names {
+            if seen.insert(t.as_str()) && !self.is_table_pinned(graph_source_id, t) {
+                to_warm.push(t.clone());
+            }
+        }
+
+        // Engagement + measurement span (allowlisted as `r2rml.prefetch`): its
+        // presence proves the prefetch path ran, and `warmed`/`requested` show the
+        // fan-out width vs how many were skipped as already-pinned. Emitted even
+        // for a no-op fan-out so "ran but skipped" is distinguishable from
+        // "never ran".
+        let span = tracing::debug_span!(
+            "r2rml.prefetch",
+            requested = table_names.len(),
+            warmed = to_warm.len(),
+        );
+        if to_warm.len() < 2 {
+            // Nothing to overlap. Enter/drop the span (no `.await` under it) so a
+            // no-op prefetch is still visible in the counters.
+            let _entered = span.entered();
+            return;
+        }
+        // `buffered` polls these futures COOPERATIVELY on one task (no spawn), and
+        // the REST-client build inside `load_table_context` is synchronous, so the
+        // first future polled builds + caches the process-wide client before any
+        // other future resumes past its (async) nameservice lookup — every later
+        // table then reuses that one client and its cached OAuth token. Verified
+        // live: a cold 3-table fan-out does exactly ONE `iceberg.oauth_token`
+        // exchange, not one per table. (If the client build ever becomes async,
+        // this dedup breaks and a serial first-table warm would be needed.)
+        //
+        // The `buffered` width here is the per-query fan-out ceiling; the true
+        // bound on concurrent catalog QPS is the process-wide catalog-request
+        // semaphore (PR-8 slice 3, `rest.rs`), which every `loadTable` GET this
+        // fan-out issues must acquire — so the prefetch cannot defeat the 429
+        // protection it runs ahead of, and a lower `FLUREE_ICEBERG_CATALOG_CONCURRENCY`
+        // transparently throttles it.
+        futures::stream::iter(to_warm)
+            .map(|table| async move {
+                let _ = self.load_table_context(graph_source_id, &table).await;
+            })
+            .buffered(CATALOG_PREFETCH_CONCURRENCY)
+            .for_each(|()| async {})
+            .instrument(span)
+            .await;
+    }
+}
+
+/// Resolve `loadTable` (the REST catalog GET, honoring the query pin + the
+/// cross-query cache) and build the vended-credential S3 storage — the SAME
+/// session-pin path the eager scan used before the lazy split (PR-8 loadTable-
+/// metadata cache, `21-loadtable-metadata-cache.md`).
+///
+/// Takes OWNED handles (Arcs + owned config) so it can be called BOTH eagerly and
+/// from the deferred [`LazyS3Storage`] builder — which must be `'static`, because
+/// the Parquet reads `Arc::clone` the storage into `tokio::spawn` (in
+/// `fluree-db-iceberg/src/io/send_parquet.rs`) and the provider holds `fluree: &'a`
+/// (a borrow that cannot cross the spawn). A future refactor that narrows this back
+/// to `&'a` will not fail here — it surfaces as a `'static`-bound lifetime error at
+/// that spawn site, so the ownership is load-bearing, not incidental. This runs ONLY when
+/// a real S3 read is needed: its `r2rml.load_table` span, and the REST client's
+/// first-use OAuth token exchange, are exactly what the deterministic cache gate
+/// proves absent (`load_table.n=0` AND `oauth_token.n=0`) on a fully disk-cached
+/// query. No duplicate ladder — this IS the ladder both paths share.
+async fn resolve_rest_load_and_storage(
+    catalog: Arc<RestCatalogClient>,
+    cache: Arc<R2rmlCache>,
+    session: Arc<super::catalog_session::IcebergCatalogSession>,
+    table_id: TableIdentifier,
+    io: IoConfig,
+    lt_key: String,
+) -> QueryResult<(Arc<S3IcebergStorage>, LoadTableResponse)> {
+    // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
+    // the cross-query cache (skips the ~1–3s GET), then a real REST load.
+    let load_response = if let Some(cached) = session.cached_load_table(&lt_key) {
+        cached
+    } else {
+        let pinned = session.pinned_metadata_location(&lt_key);
+        let cross_query = if pinned.is_none() {
+            cache.get_rest_load_table(&lt_key)
+        } else {
+            None
+        };
+        let mut resp = if let Some(cq) = cross_query {
+            cq.to_response()
+        } else {
+            // The cold REST/OAuth catalog round-trip — the `r2rml.load_table` span
+            // the cache gate proves absent when disk-warm.
+            let actual = catalog
+                .load_table(&table_id, io.vended_credentials)
+                .instrument(tracing::debug_span!(
+                    "r2rml.load_table",
+                    namespace = %table_id.namespace,
+                    table = %table_id.table,
+                ))
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to load table from catalog: {e}"))
+                })?;
+            cache.put_rest_load_table(
+                lt_key.clone(),
+                Arc::new(super::catalog_session::CachedLoadTable::from_response(
+                    &actual,
+                )),
+            );
+            let mut r = actual;
+            if let Some(ref pinned_loc) = pinned {
+                if *pinned_loc != r.metadata_location {
+                    r.metadata_location = pinned_loc.clone();
+                }
+            }
+            r
+        };
+        session.store_load_table(lt_key.clone(), &resp);
+        if let Some(pinned_loc) = session.pinned_metadata_location(&lt_key) {
+            resp.metadata_location = pinned_loc;
+        }
+        resp
+    };
+
+    // (2) Build (or reuse the query session's) S3 storage from the vended creds.
+    let storage = if let Some(cached) = session.cached_storage(&lt_key) {
+        cached
+    } else {
+        let built = if let Some(ref credentials) = load_response.credentials {
+            S3IcebergStorage::from_vended_credentials(
+                credentials,
+                io.s3_region.as_deref(),
+                io.s3_endpoint.as_deref(),
+                io.s3_path_style,
+            )
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
+        } else {
+            S3IcebergStorage::from_default_chain(
+                io.s3_region.as_deref(),
+                io.s3_endpoint.as_deref(),
+                io.s3_path_style,
+            )
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
+        };
+        let built = Arc::new(built);
+        session.store_storage(lt_key.clone(), Arc::clone(&built));
+        built
+    };
+
+    Ok((storage, load_response))
+}
+
+/// Decide whether a cached scan-file selection may be SERVED, or must be treated
+/// as a cache MISS and recomputed via a fresh `plan_scan` (audit F-AUD-1,
+/// cache-arm follow-up).
+///
+/// A cached entry whose source snapshot carried merge-on-read delete manifests is
+/// NEVER served: the cached file list enumerates only live data files and does
+/// not apply the deletes, so serving it would silently return deleted rows. There
+/// is no merge-on-read guard at this rung, so this is a plain fall-through to a
+/// re-plan (never an override re-check); when the guard lands, this decision point
+/// is where the guarded re-check goes. Applied identically at BOTH scan-file cache
+/// hit arms (in-memory and disk) so the flag can re-refuse regardless of tier.
+fn servable_scan_files(entry: Option<Arc<CachedScanFiles>>) -> Option<Arc<CachedScanFiles>> {
+    entry.filter(|c| !c.has_delete_manifests)
+}
+
+impl FlureeR2rmlProvider<'_> {
+    /// Body of [`R2rmlTableProvider::table_row_count`], split out so the trait
+    /// method can wrap it in the `r2rml.count_manifest` timing span via
+    /// `.instrument()` (the same pattern as [`Self::scan_table_inner`]).
+    async fn table_row_count_inner(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        non_null_cols: &[String],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<u64>> {
+        // Same pinned context as the scan: one Iceberg snapshot per query (the
+        // shared `self.session` pin), so a count and a scan cannot disagree.
+        // GREP: r2rml-as-of-t — `as_of_t` is ignored here exactly as the scan path
+        // ignores it (matching breadcrumb in `scan_table_inner`); if time-travel
+        // semantics ever land on the scan, this method MUST follow, or a COUNT and
+        // a scan in one query could answer from different snapshots.
+        let (storage, metadata, metadata_location) =
+            self.load_table_context(graph_source_id, table_name).await?;
+
+        // The count must equal a full scan of THIS snapshot — the one the scan
+        // planner reads from the same pinned metadata. No current snapshot (an
+        // empty table) or no current schema: decline and let the scan handle it (an
+        // empty scan folds to 0; a missing schema surfaces the scan's own error).
+        let (Some(snapshot), Some(schema)) =
+            (metadata.current_snapshot(), metadata.current_schema())
+        else {
+            return Ok(None);
+        };
+
+        // Manifest-only read (never a Parquet/data file): the live data files, and
+        // whether the snapshot carries merge-on-read delete manifests.
+        //
+        // PR-8 slice 2: this manifest read (the COUNT(*) path's, ~450ms cold) is
+        // keyed by the content-addressed `metadata_location`, so persist it to the
+        // disk catalog cache and serve it from there on a warm-catalog cold
+        // process (no S3 read, no `r2rml.count_manifest_read` span).
+        //
+        // Measurement sub-span (PR-8 cold decomposition): the COUNT(*) path's
+        // manifest-list + manifest read (the scan path's equivalent is
+        // `iceberg.scan_plan`). For a bare `COUNT(*)` (q036) this plus
+        // `r2rml.load_table` + `r2rml.read_metadata` accounts for the entire cold
+        // wall — no data file is read. Allowlisted in `fluree-bench-virtual::spans`.
+        let catalog_cache = self.catalog_disk_cache();
+        let (data_files, has_delete_manifests) = if let Some(hit) =
+            catalog_cache.get_count_stats(&metadata_location)
+        {
+            debug!(table_name = %table_name, "COUNT(*) manifest stats disk-cache hit");
+            hit
+        } else {
+            let (data_files, _manifests_read, has_delete_manifests) =
+                send_read_snapshot_data_files(storage.as_ref(), snapshot)
+                    .instrument(tracing::debug_span!(
+                        "r2rml.count_manifest_read",
+                        table_name
+                    ))
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read manifests for row count of '{table_name}': {e}"
+                        ))
+                    })?;
+            catalog_cache.put_count_stats(&metadata_location, &data_files, has_delete_manifests);
+            (data_files, has_delete_manifests)
+        };
+
+        let count =
+            sound_manifest_row_count(schema, &data_files, has_delete_manifests, non_null_cols);
+        // Recorded on the `r2rml.count_manifest` span wrapping this body.
+        tracing::Span::current().record("fired", count.is_some());
+        match count {
+            Some(n) => debug!(
+                table_name = %table_name,
+                count = n,
+                non_null_cols = non_null_cols.len(),
+                "COUNT(*) manifest shortcut: answered from manifest record_count sum"
+            ),
+            None => debug!(
+                table_name = %table_name,
+                has_delete_manifests,
+                "COUNT(*) manifest shortcut declined; falling back to scan"
+            ),
+        }
+        Ok(count)
+    }
+
+    /// Whether `table_name` is already resolved (with unexpired credentials) in
+    /// this query's session pin, so [`R2rmlTableProvider::prefetch_tables`] can
+    /// skip re-warming it. A name that fails to parse is reported as NOT pinned so
+    /// prefetch still attempts it and the real scan surfaces any error.
+    fn is_table_pinned(&self, graph_source_id: &str, table_name: &str) -> bool {
+        use fluree_db_iceberg::catalog::parse_table_identifier;
+        let Ok(id) = parse_table_identifier(table_name) else {
+            return false;
+        };
+        let key = super::catalog_session::IcebergCatalogSession::load_table_key(
+            graph_source_id,
+            &id.namespace,
+            &id.table,
+        );
+        self.session.is_pinned(&key)
+    }
+
+    /// The persistent on-disk catalog cache (PR-8 slice 2), rooted in a dedicated
+    /// dir sibling to this instance's Parquet/binary artifact cache so the cold
+    /// benchmark protocol can clear data while keeping catalog persistence. Cheap
+    /// to build per call (a `create_dir_all` that no-ops once the dir exists).
+    fn catalog_disk_cache(&self) -> super::disk_catalog_cache::DiskCatalogCache {
+        let artifact_dir = self.fluree.binary_store_cache_dir();
+        super::disk_catalog_cache::DiskCatalogCache::for_dir(
+            &super::disk_catalog_cache::catalog_cache_dir(&artifact_dir),
+        )
+    }
+
+    /// Resolve a graph source down to its pinned Iceberg table context: the S3
+    /// storage, the (metadata-location-pinned) [`TableMetadata`], and that metadata
+    /// location. Shared by [`Self::scan_table_inner`] and
+    /// [`R2rmlTableProvider::table_row_count`] so a `COUNT` and a scan in the same
+    /// query read ONE Iceberg snapshot — the whole `loadTable` resolution (the
+    /// per-query snapshot pin in [`super::catalog_session::IcebergCatalogSession`]
+    /// plus the cross-query / metadata caches) runs here, through the shared
+    /// `self.session`, exactly as the scan did before this was extracted. It
+    /// excludes the scan-only concerns — the "Starting Iceberg table scan" log and
+    /// the Parquet disk cache — which stay in `scan_table_inner`.
+    /// Warm the in-memory + disk metadata caches for `metadata_location` WITHOUT
+    /// any S3 read — the in-memory moka first, then the persistent slice-2 disk
+    /// cache (warming the moka layer on a disk hit). `None` when neither has it (a
+    /// real S3 read would be required, which the caller does via `storage`). Used
+    /// by the pointer rung to serve metadata with zero storage.
+    async fn metadata_from_caches(&self, metadata_location: &str) -> Option<Arc<TableMetadata>> {
+        let cache = self.fluree.r2rml_cache();
+        if let Some(m) = cache.get_metadata(metadata_location).await {
+            return Some(m);
+        }
+        if let Some(m) = self.catalog_disk_cache().get_metadata(metadata_location) {
+            cache
+                .put_metadata(metadata_location.to_string(), Arc::clone(&m))
+                .await;
+            return Some(m);
+        }
+        None
+    }
+
+    async fn load_table_context(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<(Arc<LazyS3Storage<'static>>, Arc<TableMetadata>, String)> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -718,13 +1206,6 @@ impl FlureeR2rmlProvider<'_> {
             ))
         })?;
 
-        info!(
-            graph_source_id = %graph_source_id,
-            table_name = %table_name,
-            projection = ?projection,
-            "Starting Iceberg table scan"
-        );
-
         // Branch on catalog mode: REST vs Direct
         use fluree_db_iceberg::config::CatalogConfig;
         use fluree_db_iceberg::SendDirectCatalogClient;
@@ -742,6 +1223,112 @@ impl FlureeR2rmlProvider<'_> {
                 QueryError::Internal(format!("Failed to parse table identifier: {e}"))
             })?
         };
+
+        // PR-8 loadTable-metadata cache: before building storage, try to resolve
+        // this table WITHOUT the ~1–3s loadTable REST GET. The persisted pointer
+        // (credential-free) gives the `metadata_location`; slice-2 gives the parsed
+        // metadata — both with zero S3. When they hit, storage construction (and
+        // thus the GET + its OAuth token exchange) is DEFERRED behind a
+        // `LazyS3Storage` and never forced if every Parquet file is also disk-
+        // cached → the deterministic gate's `load_table.n=0` AND `oauth_token.n=0`.
+        // REST only; Direct mode has its own metadata-location cache.
+        let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+            graph_source_id,
+            &table_id.namespace,
+            &table_id.table,
+        );
+        let disk = self.catalog_disk_cache();
+        if let CatalogConfig::Rest {
+            uri,
+            warehouse,
+            auth,
+            ..
+        } = &iceberg_config.catalog
+        {
+            // A snapshot pin from an EARLIER touch of this table THIS query wins
+            // unconditionally over the disk pointer (correlated re-loads must read
+            // ONE snapshot). Only when unpinned do we consult the disk pointer.
+            // `None` = a latest-snapshot read. GREP: r2rml-as-of-t — when Iceberg
+            // snapshot time-travel lands, the requested snapshot's `timestamp_ms`
+            // MUST be threaded here as `min_snapshot_ms` so bounded staleness can
+            // never downgrade a time-travel request (the guard + hermetic already
+            // exist in `disk_catalog_cache::pointer_is_usable`).
+            let candidate = self
+                .session
+                .pinned_metadata_location(&lt_key)
+                .or_else(|| disk.get_metadata_location(&lt_key, None));
+            if let Some(loc) = candidate {
+                if let Some(md) = self.metadata_from_caches(&loc).await {
+                    // Pin the location BEFORE serving: a later touch whose disk
+                    // pointer has since expired (TTL boundary mid-query) then still
+                    // resolves THIS snapshot via `pinned_metadata_location` — the
+                    // eager path reloads only credentials and re-pins here. Without
+                    // this, the never-forced metadata path could read two snapshots
+                    // in one query (the pin contract, `catalog_session.rs`).
+                    self.session
+                        .pin_metadata_location(lt_key.clone(), loc.clone());
+                    // Build/get the process-wide REST client. Client construction
+                    // does NO network; the OAuth token exchange rides the first
+                    // catalog op (the loadTable GET, deferred) — a property ENFORCED
+                    // by the cache gate's `oauth_token.n=0`, which fails forever if
+                    // construction ever starts doing the token exchange.
+                    let cache = self.fluree.r2rml_cache();
+                    let client_fp = rest_client_cache_key(graph_source_id, &record.config);
+                    let catalog = match cache.rest_client(&client_fp) {
+                        Some(c) => c,
+                        None => {
+                            let auth_provider = auth.create_provider_arc().map_err(|e| {
+                                QueryError::Internal(format!("Failed to create auth provider: {e}"))
+                            })?;
+                            let client = Arc::new(
+                                RestCatalogClient::new(
+                                    RestCatalogConfig {
+                                        uri: uri.clone(),
+                                        warehouse: warehouse.clone(),
+                                        ..Default::default()
+                                    },
+                                    auth_provider,
+                                )
+                                .map_err(|e| {
+                                    QueryError::Internal(format!(
+                                        "Failed to create catalog client: {e}"
+                                    ))
+                                })?,
+                            );
+                            cache.put_rest_client(client_fp, Arc::clone(&client));
+                            client
+                        }
+                    };
+                    // Owned captures for the `'static` deferred builder (the
+                    // provider's `fluree: &'a` borrow can't cross the Parquet
+                    // `tokio::spawn`). The builder runs the SAME session-pin ladder
+                    // as the eager path (`resolve_rest_load_and_storage`), deferred.
+                    let cache = Arc::clone(cache);
+                    let session = Arc::clone(&self.session);
+                    let io = iceberg_config.io.clone();
+                    let table_id = table_id.clone();
+                    let lt_key_b = lt_key.clone();
+                    let builder: super::lazy_storage::StorageBuilder<'static, S3IcebergStorage> =
+                        Arc::new(move || {
+                            let catalog = Arc::clone(&catalog);
+                            let cache = Arc::clone(&cache);
+                            let session = Arc::clone(&session);
+                            let io = io.clone();
+                            let table_id = table_id.clone();
+                            let lt_key = lt_key_b.clone();
+                            Box::pin(async move {
+                                resolve_rest_load_and_storage(
+                                    catalog, cache, session, table_id, io, lt_key,
+                                )
+                                .await
+                                .map(|(storage, _)| storage)
+                                .map_err(|e| IcebergError::Catalog(e.to_string()))
+                            })
+                        });
+                    return Ok((Arc::new(LazyS3Storage::deferred(builder)), md, loc));
+                }
+            }
+        }
 
         // Resolve metadata location and create storage based on catalog mode
         let (load_response, storage) = match &iceberg_config.catalog {
@@ -873,43 +1460,60 @@ impl FlureeR2rmlProvider<'_> {
                 // GCS-backed tables (S3-interop endpoint) are read through this
                 // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
                 // GCS HTTP/2 range-read bug cannot occur.
-                let storage = if let Some(ref credentials) = load_response.credentials {
-                    info!(
-                        region = ?iceberg_config.io.s3_region,
-                        endpoint = ?iceberg_config.io.s3_endpoint,
-                        "Using vended credentials from catalog"
-                    );
-                    // Thread the io overrides so a catalog that omits the region (or where
-                    // we want an operator-configured endpoint/path-style) still resolves
-                    // correctly. Precedence inside the call: vended > these overrides > SDK.
-                    S3IcebergStorage::from_vended_credentials(
-                        credentials,
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
+                //
+                // Reuse the query session's cached S3 client for this table when
+                // one is present: constructing it (`aws_config` load + S3 client +
+                // HTTP client) is not free, and a correlated join — or the slice-1
+                // prefetch→scan — resolves the same table repeatedly. Any fresh
+                // loadTable above dropped the entry via `store_load_table`, so a hit
+                // here always corresponds to the current pinned credentials.
+                let storage = if let Some(cached) = self.session.cached_storage(&lt_key) {
+                    debug!(namespace = %table_id.namespace, table = %table_id.table,
+                        "S3 storage client reused (query-scoped)");
+                    cached
                 } else {
-                    info!(
-                        region = ?iceberg_config.io.s3_region,
-                        endpoint = ?iceberg_config.io.s3_endpoint,
-                        "Using ambient AWS credentials"
-                    );
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
+                    let built = if let Some(ref credentials) = load_response.credentials {
+                        info!(
+                            region = ?iceberg_config.io.s3_region,
+                            endpoint = ?iceberg_config.io.s3_endpoint,
+                            "Using vended credentials from catalog"
+                        );
+                        // Thread the io overrides so a catalog that omits the region (or where
+                        // we want an operator-configured endpoint/path-style) still resolves
+                        // correctly. Precedence inside the call: vended > these overrides > SDK.
+                        S3IcebergStorage::from_vended_credentials(
+                            credentials,
+                            iceberg_config.io.s3_region.as_deref(),
+                            iceberg_config.io.s3_endpoint.as_deref(),
+                            iceberg_config.io.s3_path_style,
+                        )
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                        })?
+                    } else {
+                        info!(
+                            region = ?iceberg_config.io.s3_region,
+                            endpoint = ?iceberg_config.io.s3_endpoint,
+                            "Using ambient AWS credentials"
+                        );
+                        S3IcebergStorage::from_default_chain(
+                            iceberg_config.io.s3_region.as_deref(),
+                            iceberg_config.io.s3_endpoint.as_deref(),
+                            iceberg_config.io.s3_path_style,
+                        )
+                        .await
+                        .map_err(|e| {
+                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
+                        })?
+                    };
+                    let built = Arc::new(built);
+                    self.session
+                        .store_storage(lt_key.clone(), Arc::clone(&built));
+                    built
                 };
 
-                (load_response, Arc::new(storage))
+                (load_response, storage)
             }
             CatalogConfig::Direct { table_location } => {
                 info!(
@@ -981,12 +1585,6 @@ impl FlureeR2rmlProvider<'_> {
             }
         };
 
-        // Shared on-disk cache for data files (one global byte budget, deduped
-        // per directory). Threaded into the Parquet readers, which apply a
-        // whole-file-vs-range policy per file based on how much each query reads.
-        let cache_dir = self.fluree.binary_store_cache_dir();
-        let disk_cache = fluree_db_iceberg::DiskArtifactCache::for_dir(&cache_dir);
-
         // Check cache for table metadata
         let cache = self.fluree.r2rml_cache();
         let metadata_location = &load_response.metadata_location;
@@ -997,17 +1595,43 @@ impl FlureeR2rmlProvider<'_> {
         } else {
             debug!(metadata_location = %metadata_location, "Table metadata cache miss");
 
-            let metadata_bytes = storage
-                .as_ref()
-                .read(metadata_location)
-                .await
-                .map_err(|e| QueryError::Internal(format!("Failed to read table metadata: {e}")))?;
-
-            let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
-                QueryError::Internal(format!("Failed to parse table metadata: {e}"))
-            })?;
-
-            let metadata = Arc::new(parsed);
+            // PR-8 slice 2: on the in-memory miss, try the persistent disk catalog
+            // cache before hitting S3. `metadata_location` is content-addressed, so
+            // a hit is always current for that snapshot. A cold process with a warm
+            // catalog dir serves the parsed metadata from local disk (no S3 GET,
+            // no `r2rml.read_metadata` span).
+            let catalog_cache = self.catalog_disk_cache();
+            let metadata = if let Some(disk) = catalog_cache.get_metadata(metadata_location) {
+                debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
+                disk
+            } else {
+                // Measurement sub-span (PR-8 cold decomposition): isolate the
+                // metadata-JSON S3 GET + parse — the `load_table_context` component
+                // between the loadTable REST GET (`r2rml.load_table`) and the
+                // manifest read (`iceberg.scan_plan` / `r2rml.count_manifest_read`).
+                // Allowlisted in `fluree-bench-virtual::spans`.
+                let metadata = async {
+                    let metadata_bytes =
+                        storage
+                            .as_ref()
+                            .read(metadata_location)
+                            .await
+                            .map_err(|e| {
+                                QueryError::Internal(format!("Failed to read table metadata: {e}"))
+                            })?;
+                    let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                        QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+                    })?;
+                    Ok::<_, QueryError>(Arc::new(parsed))
+                }
+                .instrument(tracing::debug_span!(
+                    "r2rml.read_metadata",
+                    metadata_location = %metadata_location,
+                ))
+                .await?;
+                catalog_cache.put_metadata(metadata_location, metadata.as_ref());
+                metadata
+            };
             cache
                 .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
                 .await;
@@ -1020,6 +1644,66 @@ impl FlureeR2rmlProvider<'_> {
 
             metadata
         };
+        // Persist the credential-free pointer so the NEXT process resolves this
+        // table's `metadata_location` without a loadTable GET. `snapshot_ms` feeds
+        // the as_of_t rider (grep r2rml-as-of-t). The eager `storage` is already
+        // built (a pointer/metadata miss forced the GET), so it wraps in `ready`.
+        disk.put_metadata_location(
+            &lt_key,
+            &load_response.metadata_location,
+            metadata
+                .current_snapshot()
+                .map(|s| s.timestamp_ms)
+                .unwrap_or(0),
+        );
+        Ok((
+            Arc::new(LazyS3Storage::ready(storage)),
+            metadata,
+            load_response.metadata_location.clone(),
+        ))
+    }
+
+    /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
+    /// trait method can wrap the setup in an `r2rml.scan_table` timing span via
+    /// `.instrument()` (the codebase's established pattern for timing an async body
+    /// without holding a span guard across an `.await`). The shared `loadTable`
+    /// resolution (and its per-query snapshot pin) lives in
+    /// [`Self::load_table_context`]; this adds the scan-only concerns — the
+    /// scan-start log and the Parquet disk cache — and the streaming scan plan.
+    async fn scan_table_inner(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        // GREP: r2rml-as-of-t — time-travel is not implemented for Iceberg scans;
+        // `_as_of_t` is deliberately ignored. If as-of semantics ever land here,
+        // `table_row_count_inner` MUST honor them identically (matching breadcrumb
+        // there): a COUNT and a scan in one query must read the same snapshot.
+        info!(
+            graph_source_id = %graph_source_id,
+            table_name = %table_name,
+            projection = ?projection,
+            "Starting Iceberg table scan"
+        );
+
+        // Resolve the pinned table context (S3 storage + the snapshot-pinned
+        // metadata) shared with the COUNT(*) manifest shortcut, so a count and a
+        // scan in one query read the same pinned Iceberg snapshot.
+        let (storage, metadata, metadata_location) =
+            self.load_table_context(graph_source_id, table_name).await?;
+
+        // Shared on-disk cache for data files (one global byte budget, deduped per
+        // directory). Threaded into the Parquet readers, which apply a
+        // whole-file-vs-range policy per file based on how much each query reads.
+        // Scan-only: the COUNT shortcut reads no data files, so it never builds it.
+        let cache_dir = self.fluree.binary_store_cache_dir();
+        let disk_cache = fluree_db_iceberg::DiskArtifactCache::for_dir(&cache_dir);
+
+        let cache = self.fluree.r2rml_cache();
 
         let schema = metadata
             .current_schema()
@@ -1066,82 +1750,144 @@ impl FlureeR2rmlProvider<'_> {
         // The scan-files cache is keyed only by metadata location, so it is
         // bypassed when a pushdown filter is present (different filter → a
         // different pruned file set).
-        let (tasks, files_selected, files_pruned, estimated_row_count) =
-            if let Some(filter) = &filter_expr {
-                let scan_config = ScanConfig::new()
-                    .with_projection(projected_field_ids.clone())
-                    .with_filter(filter.clone());
-                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-                let plan = planner
-                    .plan_scan()
+        let (tasks, files_selected, files_pruned, estimated_row_count) = if let Some(filter) =
+            &filter_expr
+        {
+            let scan_config = ScanConfig::new()
+                .with_projection(projected_field_ids.clone())
+                .with_filter(filter.clone());
+            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+            let plan = planner
+                .plan_scan()
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+            (
+                plan.tasks,
+                plan.files_selected,
+                plan.files_pruned,
+                plan.estimated_row_count,
+            )
+        } else if let Some(cached) =
+            servable_scan_files(cache.get_scan_files(&metadata_location).await)
+        {
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = cached.data_files.len(),
+                "Iceberg scan-files cache hit"
+            );
+
+            let tasks = cached
+                .data_files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    FileScanTask::for_whole_file_with_schema(
+                        data_file,
+                        projected_field_ids.clone(),
+                        None,
+                        Arc::clone(&schema_arc),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            (
+                tasks,
+                cached.files_selected,
+                cached.files_pruned,
+                cached.estimated_row_count,
+            )
+        } else if let Some(disk) =
+            servable_scan_files(self.catalog_disk_cache().get_scan_files(&metadata_location))
+        {
+            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
+            // cache has this snapshot's (unfiltered) file list — a warm-catalog
+            // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
+            // tasks from the file list exactly as the in-memory-hit arm does, and
+            // populate the in-memory cache for the rest of the process.
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = disk.data_files.len(),
+                "Iceberg scan-files disk-cache hit"
+            );
+            cache
+                .put_scan_files(metadata_location.clone(), Arc::clone(&disk))
+                .await;
+            let tasks = disk
+                .data_files
+                .iter()
+                .cloned()
+                .map(|data_file| {
+                    FileScanTask::for_whole_file_with_schema(
+                        data_file,
+                        projected_field_ids.clone(),
+                        None,
+                        Arc::clone(&schema_arc),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                tasks,
+                disk.files_selected,
+                disk.files_pruned,
+                disk.estimated_row_count,
+            )
+        } else {
+            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
+
+            // Create scan configuration with projection for the first plan.
+            let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
+            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+            let plan = planner
+                .plan_scan()
+                .await
+                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+
+            // Stamp whether this snapshot carries merge-on-read delete manifests so
+            // a later cache hit (in-memory or disk) can re-refuse a delete-omitting
+            // file list instead of serving it (audit F-AUD-1). Detected from the
+            // manifest LIST only — one read, mirroring the COUNT(*) path's delete
+            // signal — rather than re-reading the data manifests `plan_scan` already
+            // read. `plan_scan` on this rung has no merge-on-read guard, so a
+            // delete-bearing table is planned unguarded here; the flag ensures its
+            // cached selection is never SERVED (a hit re-plans instead). No current
+            // snapshot (an empty table) trivially has no deletes.
+            let has_delete_manifests = match metadata.current_snapshot() {
+                Some(snapshot) => send_snapshot_has_delete_manifests(storage.as_ref(), snapshot)
                     .await
-                    .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
-                (
-                    plan.tasks,
-                    plan.files_selected,
-                    plan.files_pruned,
-                    plan.estimated_row_count,
-                )
-            } else if let Some(cached) = cache.get_scan_files(metadata_location).await {
-                debug!(
-                    metadata_location = %metadata_location,
-                    cached_files = cached.data_files.len(),
-                    "Iceberg scan-files cache hit"
-                );
-
-                let tasks = cached
-                    .data_files
-                    .iter()
-                    .cloned()
-                    .map(|data_file| {
-                        FileScanTask::for_whole_file_with_schema(
-                            data_file,
-                            projected_field_ids.clone(),
-                            None,
-                            Arc::clone(&schema_arc),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-
-                (
-                    tasks,
-                    cached.files_selected,
-                    cached.files_pruned,
-                    cached.estimated_row_count,
-                )
-            } else {
-                debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
-
-                // Create scan configuration with projection for the first plan.
-                let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
-                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-                let plan = planner
-                    .plan_scan()
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
-
-                let cached = Arc::new(CachedScanFiles {
-                    data_files: Arc::new(
-                        plan.tasks
-                            .iter()
-                            .map(|task| task.data_file.clone())
-                            .collect(),
-                    ),
-                    estimated_row_count: plan.estimated_row_count,
-                    files_selected: plan.files_selected,
-                    files_pruned: plan.files_pruned,
-                });
-                cache
-                    .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
-                    .await;
-
-                (
-                    plan.tasks,
-                    cached.files_selected,
-                    cached.files_pruned,
-                    cached.estimated_row_count,
-                )
+                    .map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read manifest list for delete detection: {e}"
+                        ))
+                    })?,
+                None => false,
             };
+
+            let cached = Arc::new(CachedScanFiles {
+                data_files: Arc::new(
+                    plan.tasks
+                        .iter()
+                        .map(|task| task.data_file.clone())
+                        .collect(),
+                ),
+                estimated_row_count: plan.estimated_row_count,
+                files_selected: plan.files_selected,
+                files_pruned: plan.files_pruned,
+                has_delete_manifests,
+            });
+            cache
+                .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
+                .await;
+            // Persist to the disk catalog cache (content-addressed, immutable).
+            self.catalog_disk_cache()
+                .put_scan_files(&metadata_location, &cached);
+
+            (
+                plan.tasks,
+                cached.files_selected,
+                cached.files_pruned,
+                cached.estimated_row_count,
+            )
+        };
 
         info!(
             files_selected,
@@ -1161,6 +1907,161 @@ impl FlureeR2rmlProvider<'_> {
         // resident — the consumer (R2rmlScanOperator) materializes and aggregates
         // incrementally instead of the whole table being collected here.
         let footers = cache.parquet_footers();
+
+        // PR-5 scan-side top-k. When a resolvable single-column DESC directive is
+        // present, read files in `upper_bound(sort_col)`-DESC order with a running
+        // k-th bound and stop once no unread file can beat it — streaming a strict
+        // SUPERSET of the top-k (the `SortOperator` above is authoritative). The
+        // pruned subset MUST bypass the operator's scan cache (handled by its
+        // `cacheable` guard gaining `&& topk.is_none()`); the disk *artifact* cache
+        // is keyed by file path+size with whole-file entries, so a pruned subset
+        // never poisons it. Falls through to the parallel path if the sort column
+        // is unresolvable. Sequential reads are bounded by `TOPK_SEQUENTIAL_CAP`:
+        // if the prune is ineffective (adversarial layout / all files tie at the
+        // bound / a heap that can't fill), the remaining files are handed to the
+        // normal parallel reader so the topk path can never be slower than it.
+        if let Some(tk) = topk {
+            if let Some(field) = schema.field_by_name(&tk.sort_column) {
+                let sort_field_id = field.id;
+                let sort_type = field.type_string().map(str::to_string);
+                let order = plan_topk_read(
+                    tasks.iter().map(|t| &t.data_file),
+                    sort_field_id,
+                    sort_type.as_deref(),
+                );
+
+                let mut bound = TopKBound::new(tk.k);
+                let mut collected: Vec<ColumnBatch> = Vec::new();
+                let mut tail: Vec<FileScanTask> = Vec::new();
+                let mut reads = 0usize;
+                for pos in 0..order.len() {
+                    if pos >= TOPK_SEQUENTIAL_CAP {
+                        // Prune ineffective after the cap — finish in parallel so
+                        // the topk path is never slower than the full parallel scan.
+                        tail = order[pos..]
+                            .iter()
+                            .map(|(orig, _)| tasks[*orig].clone())
+                            .collect();
+                        break;
+                    }
+                    let (orig, _) = order[pos];
+                    let read_span = tracing::debug_span!(
+                        "iceberg.parquet_read",
+                        path = %tasks[orig].data_file.file_path,
+                        file_size = tasks[orig].data_file.file_size_in_bytes,
+                    );
+                    let batches = SendParquetReader::with_caches(
+                        storage.as_ref(),
+                        footers.as_ref(),
+                        &disk_cache,
+                        &cache_dir,
+                    )
+                    .read_task(&tasks[orig])
+                    .instrument(read_span)
+                    .await
+                    .map_err(|e| {
+                        QueryError::Internal(format!(
+                            "Failed to read Parquet file '{}': {e}",
+                            tasks[orig].data_file.file_path
+                        ))
+                    })?;
+                    // SOUNDNESS INVARIANT: the heap is fed the sort values of the
+                    // rows this scan EMITS — which are the QUALIFYING result rows
+                    // (post any pushed row filter). The directive is declined
+                    // upstream (`resolve_topk_directive`) whenever a RESIDUAL filter
+                    // the operator enforces after this scan is present, because
+                    // feeding pre-filter values would ride the k-th bound too high
+                    // and prune files whose qualifying rows belong in the true
+                    // top-k. Never feed a superset of the qualifying rows here.
+                    for b in &batches {
+                        bound.observe_all(batch_sort_values(b, sort_field_id));
+                    }
+                    collected.extend(batches);
+                    reads += 1;
+                    // Stop iff the heap is full and the NEXT (highest-remaining)
+                    // file's upper_bound is strictly below the k-th (over-keep on
+                    // ties; a no-bound next → never stops). See `TopKBound::can_stop`.
+                    if let Some((_, next_upper)) = order.get(pos + 1) {
+                        if bound.can_stop(next_upper.as_ref()) {
+                            break;
+                        }
+                    }
+                }
+
+                // Report the topk file selection through the SAME span the bench
+                // harness sums (`iceberg.scan_plan`) — the planner's span does not
+                // fire on this path, so without this the `files_selected` /
+                // `files_pruned` counters would read 0. `files_selected` is the
+                // files actually read (the sequential prefix plus any parallel
+                // tail); the rest were provably unable to beat the k-th bound.
+                let files_selected = reads + tail.len();
+                let files_pruned = order.len().saturating_sub(files_selected);
+                tracing::debug_span!(
+                    "iceberg.scan_plan",
+                    files_selected = files_selected as u64,
+                    files_pruned = files_pruned as u64,
+                )
+                .in_scope(|| {});
+                debug!(
+                    files_selected,
+                    files_pruned,
+                    total_files = order.len(),
+                    k = tk.k,
+                    "scan-side top-k prune"
+                );
+                let prefix = futures::stream::iter(collected.into_iter().map(Ok));
+                if tail.is_empty() {
+                    return Ok(Box::pin(prefix));
+                }
+                // Parallel fallback tail (same bounded-parallel read as the normal
+                // path). The bound still holds; we just stop paying sequentiality.
+                let concurrency = iceberg_scan_concurrency(tail.len());
+                let tail_stream =
+                    futures::stream::iter(tail)
+                        .map(move |task| {
+                            let storage = Arc::clone(&storage);
+                            let footers = Arc::clone(&footers);
+                            let disk_cache = Arc::clone(&disk_cache);
+                            let cache_dir = cache_dir.clone();
+                            let read_span = tracing::debug_span!(
+                                "iceberg.parquet_read",
+                                path = %task.data_file.file_path,
+                                file_size = task.data_file.file_size_in_bytes,
+                            );
+                            async move {
+                                tokio::spawn(async move {
+                                    let reader = SendParquetReader::with_caches(
+                                        storage.as_ref(),
+                                        footers.as_ref(),
+                                        &disk_cache,
+                                        &cache_dir,
+                                    );
+                                    reader.read_task(&task).instrument(read_span).await.map_err(
+                                        |e| {
+                                            QueryError::Internal(format!(
+                                                "Failed to read Parquet file '{}': {e}",
+                                                task.data_file.file_path
+                                            ))
+                                        },
+                                    )
+                                })
+                                .await
+                                .map_err(|e| {
+                                    QueryError::Internal(format!("Parquet read worker failed: {e}"))
+                                })?
+                            }
+                        })
+                        .buffer_unordered(concurrency)
+                        .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+                            Ok(batches) => futures::stream::iter(
+                                batches.into_iter().map(Ok).collect::<Vec<_>>(),
+                            ),
+                            Err(e) => futures::stream::iter(vec![Err(e)]),
+                        });
+                return Ok(Box::pin(prefix.chain(tail_stream)));
+            }
+        }
+
         let concurrency = iceberg_scan_concurrency(tasks.len());
         debug!(
             files = tasks.len(),
@@ -1227,6 +2128,56 @@ fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
 }
 
+/// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
+/// answer to a bare `COUNT(*)`, and if so return it. Pure over the manifest read
+/// result (no I/O), so the soundness gates are unit-tested directly against
+/// hand-built [`fluree_db_iceberg::DataFile`]s.
+///
+/// Returns `Some(n)` only when both hold:
+/// 1. the snapshot has **no delete manifests** — a merge-on-read position/equality
+///    delete would make the `record_count` sum an over-count; and
+/// 2. **every** `non_null_col` is provably zero-null from the manifest stats.
+///    `aggregate_column_stats`' coverage gate makes `null_count` `Some(0)` only
+///    when EVERY data file reported a null count for the column and they sum to
+///    zero; an absent or partially-covered stat is `None` (unknown) and a positive
+///    count is `Some(n>0)` — both decline. An unknown null count is **never**
+///    treated as zero. A column absent from the schema is likewise unproven.
+/// 3. the per-file `record_count`s are well-formed — a negative per-file count,
+///    or a sum that would overflow `u64` (both only possible in a corrupt
+///    manifest), declines rather than serving a wrapped/bogus "exact" count.
+///
+/// An empty `non_null_cols` is a constant-subject mapping (a row is produced for
+/// every table row), so the count is sound with no null proof required.
+fn sound_manifest_row_count(
+    schema: &fluree_db_iceberg::metadata::Schema,
+    data_files: &[fluree_db_iceberg::DataFile],
+    has_delete_manifests: bool,
+    non_null_cols: &[String],
+) -> Option<u64> {
+    if has_delete_manifests {
+        return None;
+    }
+    let agg = aggregate_column_stats(data_files, schema);
+    for col in non_null_cols {
+        let field = schema.field_by_name(col)?;
+        match agg.columns.get(&field.id).and_then(|c| c.null_count) {
+            Some(0) => {}
+            _ => return None,
+        }
+    }
+    // `record_count` is non-negative in real Iceberg metadata; a corrupt manifest
+    // must decline rather than feed a bogus "exact" count. Re-summed here with
+    // per-file checked u64 arithmetic instead of trusting `agg.row_count`, whose
+    // plain i64 sum saturates on corrupt input and cannot distinguish a per-file
+    // negative from a smaller valid total: a negative per-file count, or a sum
+    // that would overflow `u64`, declines.
+    let mut total: u64 = 0;
+    for df in data_files {
+        total = total.checked_add(u64::try_from(df.record_count).ok()?)?;
+    }
+    Some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1254,6 +2205,8 @@ mod tests {
                 field(3, "dec_key", json!("decimal(38,0)")),
                 field(4, "str_key", json!("string")),
                 field(5, "date_key", json!("date")),
+                field(6, "double_key", json!("double")),
+                field(7, "float_key", json!("float")),
             ],
         }
     }
@@ -1318,6 +2271,108 @@ mod tests {
     }
 
     #[test]
+    fn double_pushed_only_against_double_column() {
+        let s = key_schema();
+        let dbl = |col: &str| ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Lt,
+            value: ScanValue::Double(9.99),
+        };
+        // Physically-`double`: pushes as an exact f64 bound.
+        assert!(matches!(
+            only_literal(&[dbl("double_key")], &s),
+            Some(LiteralValue::Float64(v)) if v == 9.99
+        ));
+        // Physically-`float`: skipped (an f64→f32 narrowing could round the
+        // literal and over-prune a range).
+        assert!(build_iceberg_filter(&[dbl("float_key")], &s).is_none());
+        // Non-numeric column: skipped.
+        assert!(build_iceberg_filter(&[dbl("str_key")], &s).is_none());
+    }
+
+    #[test]
+    fn int_literal_coerces_to_scale0_decimal_only_when_numeric_stats_on() {
+        // On: an integer against a decimal column → EXACT scale-0 decimal (prunable).
+        assert!(matches!(
+            int_pushdown_literal(1_000_000, Some("decimal(38,2)"), true),
+            Some(LiteralValue::Decimal {
+                unscaled: 1_000_000,
+                scale: 0,
+                ..
+            })
+        ));
+        // Off (revert guarantee): stays Int64 → the decimal bound compare declines
+        // → no prune, exactly the pre-PR-7 behavior.
+        assert!(matches!(
+            int_pushdown_literal(1_000_000, Some("decimal(38,2)"), false),
+            Some(LiteralValue::Int64(1_000_000))
+        ));
+        // An `int` column narrows to Int32; an out-of-range literal skips (no wrap).
+        assert!(matches!(
+            int_pushdown_literal(5, Some("int"), true),
+            Some(LiteralValue::Int32(5))
+        ));
+        assert!(int_pushdown_literal(i64::from(i32::MAX) + 1, Some("int"), true).is_none());
+        // `long` / other columns: Int64 unchanged, on or off.
+        assert!(matches!(
+            int_pushdown_literal(5, Some("long"), true),
+            Some(LiteralValue::Int64(5))
+        ));
+        assert!(matches!(
+            int_pushdown_literal(5, Some("long"), false),
+            Some(LiteralValue::Int64(5))
+        ));
+    }
+
+    #[test]
+    fn int_scalar_against_decimal_column_pushes_scale0_decimal() {
+        // End-to-end through build_iceberg_filter with the default (on) switch: an
+        // integer FILTER literal on a decimal column becomes a scale-0 decimal.
+        let s = key_schema();
+        let f = ScanFilter {
+            column: "dec_key".to_string(),
+            op: ScanCmpOp::Gt,
+            value: ScanValue::Int(1_000_000),
+        };
+        assert!(matches!(
+            only_literal(&[f], &s),
+            Some(LiteralValue::Decimal {
+                unscaled: 1_000_000,
+                scale: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decimal_pushed_only_against_decimal_column_preserving_literal_scale() {
+        let s = key_schema();
+        // The `ScanValue::Decimal` carries the LITERAL's scale (9.99 → scale 2);
+        // the column is decimal(38,0). The bridge preserves the literal scale —
+        // the bound compare normalizes across the column/literal scale gap.
+        let dec = |col: &str| ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Lt,
+            value: ScanValue::Decimal {
+                unscaled: 999,
+                precision: 3,
+                scale: 2,
+            },
+        };
+        assert!(matches!(
+            only_literal(&[dec("dec_key")], &s),
+            Some(LiteralValue::Decimal {
+                unscaled: 999,
+                scale: 2,
+                ..
+            })
+        ));
+        // Non-decimal columns: skipped (no cross-type bound compare exists).
+        assert!(build_iceberg_filter(&[dec("long_key")], &s).is_none());
+        assert!(build_iceberg_filter(&[dec("str_key")], &s).is_none());
+    }
+
+    #[test]
     fn template_key_skips_unsupported_or_unparseable() {
         let s = key_schema();
         // Date physical type is not pushed yet (needs a live decimal/date check).
@@ -1327,5 +2382,182 @@ mod tests {
         assert!(build_iceberg_filter(&[key_filter("dec_key", "5.5")], &s).is_none());
         // Unknown column → skip.
         assert!(build_iceberg_filter(&[key_filter("nope", "5")], &s).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // COUNT(*) manifest shortcut soundness (`sound_manifest_row_count`).
+    // The decision core is pure over the manifest read result, so the gates
+    // are exercised directly against hand-built DataFiles (the same fixture
+    // style as `fluree_db_iceberg::stats` tests).
+    // ------------------------------------------------------------------
+
+    use fluree_db_iceberg::manifest::{DataFile, FileFormat, PartitionData};
+    use std::collections::HashMap;
+
+    fn count_schema() -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![1],
+            fields: vec![
+                field(1, "SALE_KEY", json!("long")),
+                field(2, "AMOUNT", json!("decimal(18,2)")),
+            ],
+        }
+    }
+
+    /// A data file with `record_count` rows. `null_value_counts` = `Some(pairs)`
+    /// makes the file report those per-field null counts; `None` makes it report
+    /// no null counts at all (to simulate absent/partial coverage).
+    fn count_data_file(record_count: i64, null_value_counts: Option<&[(i32, i64)]>) -> DataFile {
+        DataFile {
+            file_path: "s3://b/t/data/f.parquet".to_string(),
+            file_format: FileFormat::Parquet,
+            record_count,
+            file_size_in_bytes: 1000,
+            partition: PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: null_value_counts
+                .map(|pairs| pairs.iter().copied().collect::<HashMap<i32, i64>>()),
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        }
+    }
+
+    #[test]
+    fn count_shortcut_clean_table_returns_exact_count() {
+        let schema = count_schema();
+        // Two files; every required column reports zero nulls in EVERY file (full
+        // coverage), so the record_count sum equals a full-scan COUNT.
+        let files = vec![
+            count_data_file(100, Some(&[(1, 0), (2, 0)])),
+            count_data_file(200, Some(&[(1, 0), (2, 0)])),
+        ];
+        let cols = vec!["SALE_KEY".to_string(), "AMOUNT".to_string()];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &cols),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn count_shortcut_declines_with_delete_manifests() {
+        let schema = count_schema();
+        let files = vec![count_data_file(300, Some(&[(1, 0), (2, 0)]))];
+        // A merge-on-read delete manifest makes record_count an over-count.
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, true, &["SALE_KEY".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn count_shortcut_declines_nullable_column() {
+        let schema = count_schema();
+        // AMOUNT carries 5 nulls; a COUNT requiring AMOUNT non-null must not adopt
+        // the manifest total (which counts those rows).
+        let files = vec![count_data_file(300, Some(&[(1, 0), (2, 5)]))];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["AMOUNT".to_string()]),
+            None
+        );
+        // Same table, but only the provably zero-null key is required → sound.
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["SALE_KEY".to_string()]),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn count_shortcut_declines_when_null_stats_absent() {
+        let schema = count_schema();
+        // Two files, but only one reports a null count for the key: partial
+        // coverage → aggregate_column_stats yields null_count None (unknown),
+        // which must NOT be read as zero.
+        let files = vec![
+            count_data_file(100, Some(&[(1, 0)])),
+            count_data_file(200, None),
+        ];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["SALE_KEY".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn count_shortcut_constant_subject_needs_no_null_proof() {
+        // Empty non_null_cols = constant-subject mapping: a row exists for every
+        // table row, so the count is sound with no per-column null proof — even
+        // when NO file reports any null stats.
+        let schema = count_schema();
+        let files = vec![count_data_file(100, None), count_data_file(200, None)];
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &[]),
+            Some(300)
+        );
+        // A delete manifest still declines, even for a constant subject.
+        assert_eq!(sound_manifest_row_count(&schema, &files, true, &[]), None);
+    }
+
+    #[test]
+    fn count_shortcut_declines_corrupt_record_counts() {
+        let schema = count_schema();
+        // A negative per-file record_count (corrupt manifest) declines — even
+        // though the SUM (10 - 5 = 5) is positive and a sign check on the
+        // aggregate alone would have served it as an "exact" count.
+        let files = vec![count_data_file(10, None), count_data_file(-5, None)];
+        assert_eq!(sound_manifest_row_count(&schema, &files, false, &[]), None);
+
+        // Per-file counts whose total overflows u64 decline (three i64::MAX
+        // files: the wrapped i64 sum would land positive at ~2^63-3, so a plain
+        // sign check on the aggregate would happily pass it).
+        let files = vec![
+            count_data_file(i64::MAX, None),
+            count_data_file(i64::MAX, None),
+            count_data_file(i64::MAX, None),
+        ];
+        assert_eq!(sound_manifest_row_count(&schema, &files, false, &[]), None);
+    }
+
+    #[test]
+    fn count_shortcut_declines_unknown_column() {
+        let schema = count_schema();
+        let files = vec![count_data_file(300, Some(&[(1, 0), (2, 0)]))];
+        // A required column absent from the schema cannot be proven non-null.
+        assert_eq!(
+            sound_manifest_row_count(&schema, &files, false, &["NOPE".to_string()]),
+            None
+        );
+    }
+
+    fn cached_scan_files(has_delete_manifests: bool) -> Arc<CachedScanFiles> {
+        Arc::new(CachedScanFiles {
+            data_files: Arc::new(vec![]),
+            estimated_row_count: 0,
+            files_selected: 0,
+            files_pruned: 0,
+            has_delete_manifests,
+        })
+    }
+
+    #[test]
+    fn scan_files_with_delete_manifests_is_not_served() {
+        // Both scan-file cache hit arms (in-memory + disk) route the fetched entry
+        // through `servable_scan_files`. An entry whose source snapshot carried
+        // merge-on-read delete manifests must be a MISS (recomputed via plan_scan),
+        // never served, because the cached file list omits the deletes (F-AUD-1).
+        assert!(
+            servable_scan_files(Some(cached_scan_files(true))).is_none(),
+            "a delete-bearing cached entry must not be served (both arms)"
+        );
+        // A clean entry is served normally; an absent entry stays a miss.
+        assert!(
+            servable_scan_files(Some(cached_scan_files(false))).is_some(),
+            "a delete-free cached entry is served normally"
+        );
+        assert!(servable_scan_files(None).is_none());
     }
 }
