@@ -186,6 +186,88 @@ async fn generic_duration_bound_object_count_after_reindex() {
     );
 }
 
+/// The V6 count fast path (`value_to_otype_okey_simple`) also encodes the
+/// inline duration subtypes. A bound `xsd:yearMonthDuration` COUNT keys on
+/// `encode_year_month_dur(months)`, so it must count exactly the subjects
+/// whose (canonicalized) value matches — regardless of the bound lexical form.
+/// (`P14M` and `P1Y2M` both parse to 14 months and key identically.)
+#[tokio::test]
+async fn year_month_duration_bound_object_count_after_reindex() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "duration-index:ym-count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:a", "ex:ym": {"@value": "P14M", "@type": "xsd:yearMonthDuration"}},
+            {"@id": "ex:b", "ex:ym": {"@value": "P14M", "@type": "xsd:yearMonthDuration"}},
+            {"@id": "ex:c", "ex:ym": {"@value": "P25M", "@type": "xsd:yearMonthDuration"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let indexed = reindex_and_load(&fluree, ledger_id).await;
+
+    // Bind the canonical form (P1Y2M) to prove the key is value-based, not
+    // lexical: it must still match the P14M-inserted rows.
+    let q = r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT (COUNT(?s) AS ?n)
+        WHERE { ?s ex:ym "P1Y2M"^^xsd:yearMonthDuration }
+    "#;
+    let rows = support::query_sparql(&fluree, &indexed, q)
+        .await
+        .expect("sparql count should succeed")
+        .to_jsonld(&indexed.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([[2]])),
+        "bound yearMonthDuration COUNT must count the two matching subjects, got {rows}"
+    );
+}
+
+/// V6 count fast path for the `xsd:dayTimeDuration` subtype arm: keys on
+/// `encode_day_time_dur(micros)`, counting exactly the matching subjects.
+#[tokio::test]
+async fn day_time_duration_bound_object_count_after_reindex() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "duration-index:dt-count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let insert = json!({
+        "@context": ctx(),
+        "@graph": [
+            {"@id": "ex:a", "ex:dt": {"@value": "PT36H", "@type": "xsd:dayTimeDuration"}},
+            {"@id": "ex:b", "ex:dt": {"@value": "PT36H", "@type": "xsd:dayTimeDuration"}},
+            {"@id": "ex:c", "ex:dt": {"@value": "PT10H", "@type": "xsd:dayTimeDuration"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.expect("insert");
+
+    let indexed = reindex_and_load(&fluree, ledger_id).await;
+
+    // Bind the canonical form (P1DT12H) of the inserted PT36H.
+    let q = r#"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT (COUNT(?s) AS ?n)
+        WHERE { ?s ex:dt "P1DT12H"^^xsd:dayTimeDuration }
+    "#;
+    let rows = support::query_sparql(&fluree, &indexed, q)
+        .await
+        .expect("sparql count should succeed")
+        .to_jsonld(&indexed.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([[2]])),
+        "bound dayTimeDuration COUNT must count the two matching subjects, got {rows}"
+    );
+}
+
 /// Non-canonical lexical input: the novelty read preserves the original
 /// form, while the indexed read returns the canonical form the resolver
 /// interned — the value-based-storage design shared by all temporal types,
