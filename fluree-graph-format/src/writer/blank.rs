@@ -11,7 +11,7 @@
 //! them would break `fluree export | fluree rdf convert`, so they pass
 //! through.
 
-use crate::chars::is_blank_node_label;
+use fluree_graph_ir::chars::is_blank_node_label;
 use fluree_graph_ir::SinkError;
 
 /// Labels that pass through [`BlankNodeLabels::Relabel`] untouched.
@@ -61,7 +61,7 @@ pub enum BlankNodeLabels {
     /// nodes arriving as `term_blank(None)` are the same case and get the same
     /// treatment.
     ///
-    /// The test is the whole [`BLANK_NODE_LABEL`](crate::chars::is_blank_node_label)
+    /// The test is the whole [`BLANK_NODE_LABEL`](fluree_graph_ir::chars::is_blank_node_label)
     /// production, not an approximation of it. A first-character-only check
     /// let `_:ab.` through, and a reader handed that does not fail — it lexes
     /// `_:ab` and takes the `.` as the statement terminator, silently

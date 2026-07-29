@@ -6,8 +6,8 @@
 //! exporter compact IRIs the same way, rather than drifting into two
 //! near-identical implementations.
 
-use crate::chars::{is_pn_local, is_pn_prefix};
 use crate::escape::write_escaped_iri;
+use fluree_graph_ir::chars::{is_pn_local, is_pn_prefix};
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
@@ -92,7 +92,7 @@ impl PrefixMap {
     pub fn compact(&self, iri: &str) -> Option<String> {
         for (prefix, ns) in &self.entries {
             if let Some(local) = iri.strip_prefix(ns.as_str()) {
-                if is_pn_local(local) {
+                if is_emittable_local(local) {
                     return Some(format!("{prefix}:{local}"));
                 }
             }
@@ -114,6 +114,22 @@ impl PrefixMap {
     fn resort(&mut self) {
         self.entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     }
+}
+
+/// Whether this writer will emit `local` as a prefixed name's local part.
+///
+/// Narrower than the grammar by exactly one character. `PN_LOCAL` admits `:`
+/// in every position, so `ex:has:colon` is a legal prefixed name and
+/// [`is_pn_local`] says so — but accepting it here would change which IRIs
+/// this compacts, and therefore what `fluree export` emits, for no correctness
+/// gain. The other narrowings in this file exist because the wider behavior
+/// produced *invalid* output; this one would only produce *different* output,
+/// which is a product decision rather than a bug fix.
+///
+/// So it is deliberately not widened, and left as a decision to make on its
+/// own: dropping the `:` clause here is the whole change.
+fn is_emittable_local(local: &str) -> bool {
+    is_pn_local(local) && !local.contains(':')
 }
 
 /// Write `@prefix` declarations to a Turtle/TriG writer.
@@ -213,6 +229,20 @@ mod tests {
     /// `-` is in `PN_CHARS` but not `PN_CHARS_U`, so it cannot start a local
     /// name. Compacting `…/-dash` to `ex:-dash` emitted a prefixed name no
     /// parser reads.
+    /// The one place this writer is narrower than the grammar, pinned so the
+    /// carve-out cannot be lost by accident. `is_pn_local` says yes; this
+    /// writer says no, on purpose — see `is_emittable_local`.
+    #[test]
+    fn compaction_declines_a_colon_the_grammar_would_allow() {
+        let pm = ctx_map();
+        assert!(
+            is_pn_local("has:colon"),
+            "the grammar admits ':' — this is a writer policy, not a syntax rule"
+        );
+        assert_eq!(pm.compact("http://example.org/has:colon"), None);
+        assert_eq!(pm.compact("http://example.org/:leading"), None);
+    }
+
     #[test]
     fn compaction_declines_a_local_name_starting_with_a_hyphen() {
         let pm = ctx_map();

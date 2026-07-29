@@ -42,6 +42,7 @@
 //! graph.sort();
 //! ```
 
+pub mod chars;
 mod dataset;
 mod dataset_sink;
 pub mod datatype;

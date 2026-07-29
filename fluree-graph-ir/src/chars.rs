@@ -15,6 +15,15 @@
 //! and the drift is invisible until something downstream cannot parse what we
 //! wrote — so there is one transcription, and both sides use it.
 //!
+//! They live in the IR crate rather than in either the parser or the
+//! formatters because it is the one both already depend on. Putting them in
+//! `fluree-graph-format` would have made the *parser* depend on the
+//! *formatters*, which is backwards however well it happens to build.
+//!
+//! These describe the grammar, not any writer's policy. A writer may choose
+//! to emit less than the grammar allows — `fluree-graph-format`'s prefix
+//! compaction does — but that choice belongs with the writer, not here.
+//!
 //! The whole-token predicates ([`is_blank_node_label`], [`is_pn_local`],
 //! [`is_pn_prefix`]) deliberately omit `PLX` — the percent- and
 //! backslash-escape forms. They are used to answer "may this be emitted

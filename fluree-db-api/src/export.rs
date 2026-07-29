@@ -1577,14 +1577,11 @@ mod tests {
         // A '-' cannot START a local name, though it is legal later.
         assert_eq!(pm.compact("http://example.org/-dash"), None);
 
-        // A colon CAN: `PN_LOCAL` admits ':' in every position, so
-        // `ex:has:colon` is a legal prefixed name and export now emits it
-        // rather than the full IRI. Compaction is checked against the shared
-        // grammar predicates now, not an ASCII approximation of them.
-        assert_eq!(
-            pm.compact("http://example.org/has:colon").as_deref(),
-            Some("ex:has:colon")
-        );
+        // A colon is legal in `PN_LOCAL`, but the writer deliberately does
+        // not emit one: widening compaction would change export's output for
+        // no correctness gain. Recorded as a separate decision rather than
+        // taken as a side effect — see `is_emittable_local`.
+        assert_eq!(pm.compact("http://example.org/has:colon"), None);
     }
 
     #[test]

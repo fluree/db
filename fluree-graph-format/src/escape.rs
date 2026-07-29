@@ -8,7 +8,7 @@
 //! Turtle, TriG, N-Triples and N-Quads share one escaping grammar for string
 //! literals and one for IRIs, so one implementation serves all four.
 
-use crate::chars::is_iri_char;
+use fluree_graph_ir::chars::is_iri_char;
 use std::io::{self, Write};
 
 /// Write an N-Triples-escaped string to `w` (without the surrounding quotes).
