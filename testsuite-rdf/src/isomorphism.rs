@@ -13,6 +13,15 @@
 //!    the common case into a sort-and-compare.
 //! 3. **O(1) injectivity.** The bijection is tracked with a reverse map
 //!    instead of a linear scan over the forward map's values.
+//! 4. **Case-insensitive language tags.** RDF 1.1 §3.3 makes a literal's
+//!    language tag case-insensitive for term equality — `"chat"@FR` and
+//!    `"chat"@fr` are the SAME term. The IR's `Term` compares tags
+//!    case-sensitively, so the checker lowercases them on the way in. This
+//!    happens in the CHECKER ONLY: the IR is untouched, because the parser's
+//!    job is to preserve what the document said and only the comparison needs
+//!    the equivalence. A gold `.nt` file may legitimately spell a tag in a
+//!    different case than the `.ttl` it is checked against, and that must not
+//!    be a failure.
 
 use std::collections::{HashMap, HashSet};
 
@@ -66,14 +75,41 @@ pub fn are_graphs_isomorphic(expected: &[Triple], actual: &[Triple]) -> bool {
 /// graphs that denote the same RDF must not differ by it. Under
 /// [`fluree_graph_turtle::CollectionStyle::Spine`] nothing sets it anyway, so
 /// this only matters if the informational default-mode run ever compares.
+///
+/// Language tags are lowercased here (RDF 1.1 §3.3) — see the module docs.
+/// Doing it during normalization rather than in `terms_match` is what makes it
+/// apply to the ground-triple set comparison too, which uses plain `Term`
+/// equality.
 fn normalize(triples: &[Triple]) -> Vec<Triple> {
     let mut out: Vec<Triple> = triples
         .iter()
-        .map(|t| Triple::new(t.s.clone(), t.p.clone(), t.o.clone()))
+        .map(|t| {
+            Triple::new(
+                fold_language(&t.s),
+                fold_language(&t.p),
+                fold_language(&t.o),
+            )
+        })
         .collect();
     out.sort();
     out.dedup();
     out
+}
+
+/// Lowercase a literal's language tag; every other term is returned as-is.
+fn fold_language(term: &Term) -> Term {
+    match term {
+        Term::Literal {
+            value,
+            datatype,
+            language: Some(tag),
+        } => Term::Literal {
+            value: value.clone(),
+            datatype: datatype.clone(),
+            language: Some(tag.to_lowercase().into()),
+        },
+        other => other.clone(),
+    }
 }
 
 fn has_blank(t: &Triple) -> bool {
@@ -286,6 +322,116 @@ mod tests {
             ]
         };
         assert!(are_graphs_isomorphic(&mk("a"), &mk("z")));
+    }
+
+    /// The classic refutation: a 2-cycle between two blank nodes and two
+    /// self-loops have the same triple count, the same blank-node count and
+    /// the same per-node degree, but are not isomorphic. A checker that
+    /// matched on counts alone would pass this.
+    #[test]
+    fn a_two_cycle_is_not_two_self_loops() {
+        let two_cycle = vec![
+            t(blank("a"), iri("http://p"), blank("b")),
+            t(blank("b"), iri("http://p"), blank("a")),
+        ];
+        let two_self_loops = vec![
+            t(blank("x"), iri("http://p"), blank("x")),
+            t(blank("y"), iri("http://p"), blank("y")),
+        ];
+        assert!(!are_graphs_isomorphic(&two_cycle, &two_self_loops));
+        assert!(!are_graphs_isomorphic(&two_self_loops, &two_cycle));
+    }
+
+    /// Disconnected blank components must be matched across components, not
+    /// just within the one the search happens to start in.
+    #[test]
+    fn disconnected_blank_components_are_matched() {
+        let a = vec![
+            t(blank("a1"), iri("http://p"), blank("a2")),
+            t(blank("b1"), iri("http://q"), blank("b2")),
+        ];
+        // Same two components, relabeled AND listed in the opposite order.
+        let b = vec![
+            t(blank("z1"), iri("http://q"), blank("z2")),
+            t(blank("y1"), iri("http://p"), blank("y2")),
+        ];
+        assert!(are_graphs_isomorphic(&a, &b));
+    }
+
+    /// Two components that are individually the right shape but attached to
+    /// the wrong predicates must still be refused.
+    #[test]
+    fn disconnected_components_must_match_the_right_partner() {
+        let a = vec![
+            t(blank("a1"), iri("http://p"), blank("a2")),
+            t(blank("b1"), iri("http://q"), blank("b2")),
+        ];
+        let b = vec![
+            t(blank("z1"), iri("http://p"), blank("z2")),
+            t(blank("y1"), iri("http://p"), blank("y2")),
+        ];
+        assert!(!are_graphs_isomorphic(&a, &b));
+    }
+
+    /// RDF 1.1 §3.3: language tags are case-insensitive for term equality.
+    #[test]
+    fn language_tags_compare_case_insensitively() {
+        let lower = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "fr"),
+        )];
+        let upper = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "FR"),
+        )];
+        let mixed = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "fr-CA"),
+        )];
+        let mixed_other = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "FR-ca"),
+        )];
+
+        assert!(are_graphs_isomorphic(&lower, &upper));
+        assert!(are_graphs_isomorphic(&mixed, &mixed_other));
+    }
+
+    /// Case-folding the tag must not fold DIFFERENT tags together, and must
+    /// not touch the literal's value.
+    #[test]
+    fn language_tag_folding_does_not_erase_real_differences() {
+        let fr = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "fr"),
+        )];
+        let en = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "en"),
+        )];
+        let fr_ca = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("chat", "fr-CA"),
+        )];
+        let cased_value = vec![t(
+            iri("http://a"),
+            iri("http://p"),
+            Term::lang_string("CHAT", "fr"),
+        )];
+
+        assert!(!are_graphs_isomorphic(&fr, &en));
+        assert!(!are_graphs_isomorphic(&fr, &fr_ca));
+        assert!(
+            !are_graphs_isomorphic(&fr, &cased_value),
+            "the literal VALUE stays case-sensitive; only the tag folds"
+        );
     }
 
     #[test]
