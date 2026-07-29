@@ -177,6 +177,17 @@ impl<W: Write> GraphSink for AnyWriter<W> {
         dispatch!(self, w => w.emit_quad(s, p, o, g))
     }
 
+    fn emit_quad_list_item(
+        &mut self,
+        s: TermId,
+        p: TermId,
+        o: TermId,
+        index: i32,
+        g: TermId,
+    ) -> SinkResult {
+        dispatch!(self, w => w.emit_quad_list_item(s, p, o, index, g))
+    }
+
     fn supports_reified_triples(&self) -> bool {
         dispatch!(self, w => w.supports_reified_triples())
     }

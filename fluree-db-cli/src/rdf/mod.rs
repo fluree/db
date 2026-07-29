@@ -168,6 +168,17 @@ impl GraphSink for DiscardSink {
         Ok(())
     }
 
+    fn emit_quad_list_item(
+        &mut self,
+        _s: TermId,
+        _p: TermId,
+        _o: TermId,
+        _index: i32,
+        _g: TermId,
+    ) -> SinkResult {
+        Ok(())
+    }
+
     /// Same reasoning for RDF 1.2 reifiers, which the Turtle parser emits
     /// today for asserting forms — refusing them would make `check` reject
     /// documents the parser actually accepts.

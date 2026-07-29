@@ -391,6 +391,22 @@ macro_rules! block_sink_common {
             self.0.refuse_list_item()
         }
 
+        /// Same refusal as the triple form, for the same reason: the problem
+        /// is the indexed item, not the graph it names. Overridden
+        /// explicitly rather than left to the trait default, because these
+        /// writers DO claim quad support, and a reader of this impl should
+        /// see the refusal beside the capability rather than infer it.
+        fn emit_quad_list_item(
+            &mut self,
+            _subject: TermId,
+            _predicate: TermId,
+            _object: TermId,
+            _index: i32,
+            _graph: TermId,
+        ) -> SinkResult {
+            self.0.refuse_list_item()
+        }
+
         fn end_statement(&mut self) {
             self.0.commit_statement();
         }

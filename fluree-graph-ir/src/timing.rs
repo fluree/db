@@ -808,6 +808,18 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
         self.forward(|s| s.emit_quad(subject, predicate, object, graph))
     }
 
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        self.counts.quads += 1;
+        self.forward(|s| s.emit_quad_list_item(subject, predicate, object, index, graph))
+    }
+
     fn supports_reified_triples(&self) -> bool {
         self.inner.supports_reified_triples()
     }
