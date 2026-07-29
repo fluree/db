@@ -13,7 +13,7 @@
 //! parity diff, or (later chunks) an ingest-sink adapter that streams the
 //! triples into the native import pipeline.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -230,6 +230,34 @@ impl TripleObserver for ImportSinkObserver<'_, '_> {
     }
 }
 
+/// A [`TripleObserver`] that interns each materialized triple DIRECTLY into an
+/// open [`ImportSink`] as the enumerator emits it (O3a) — no intermediate
+/// owned-triple buffer and no second intern pass — while accumulating a byte
+/// estimate the producer worker uses to cut byte-budgeted chunks at batch
+/// boundaries. This replaces the buffer-then-re-intern `ChunkingObserver` on the
+/// hot produce path; a term is now allocated by the enumerator and interned into
+/// the sink dictionary exactly once.
+struct InterningObserver<'a, 'ns> {
+    sink: &'a mut ImportSink<'ns>,
+    bytes: &'a mut usize,
+}
+
+impl TripleObserver for InterningObserver<'_, '_> {
+    fn observe(
+        &mut self,
+        subject: &RdfTerm,
+        predicate: &str,
+        object: &RdfTerm,
+    ) -> Result<(), R2rmlError> {
+        let s = intern_term(self.sink, subject);
+        let p = self.sink.term_iri(predicate);
+        let o = intern_term(self.sink, object);
+        self.sink.emit_triple(s, p, o);
+        *self.bytes += triple_weight(subject, predicate, object);
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chunk production: materialized triples → ParsedChunk (native import chunks)
 // ---------------------------------------------------------------------------
@@ -342,56 +370,6 @@ fn triple_weight(subject: &RdfTerm, predicate: &str, object: &RdfTerm) -> usize 
         }
     }
     term_weight(subject) + predicate.len() + term_weight(object) + 16
-}
-
-/// A [`TripleObserver`] that buffers materialized triples and cuts them into
-/// byte-budgeted chunks. Completed chunks queue up; the driver drains the queue
-/// and encodes each. Sizing is by BYTES derived from the memory budget (NOT a
-/// fixed row count) — the machine-safety directive's chunk-size knob.
-struct ChunkingObserver {
-    buffer: Vec<OwnedTriple>,
-    buffer_bytes: usize,
-    threshold_bytes: usize,
-    completed: VecDeque<Vec<OwnedTriple>>,
-}
-
-impl ChunkingObserver {
-    fn new(threshold_bytes: usize) -> Self {
-        Self {
-            buffer: Vec::new(),
-            buffer_bytes: 0,
-            threshold_bytes: threshold_bytes.max(1),
-            completed: VecDeque::new(),
-        }
-    }
-
-    /// The final, sub-threshold buffer, if any (flushed after the last batch).
-    fn take_final(&mut self) -> Option<Vec<OwnedTriple>> {
-        if self.buffer.is_empty() {
-            None
-        } else {
-            self.buffer_bytes = 0;
-            Some(std::mem::take(&mut self.buffer))
-        }
-    }
-}
-
-impl TripleObserver for ChunkingObserver {
-    fn observe(
-        &mut self,
-        subject: &RdfTerm,
-        predicate: &str,
-        object: &RdfTerm,
-    ) -> Result<(), R2rmlError> {
-        self.buffer_bytes += triple_weight(subject, predicate, object);
-        self.buffer
-            .push((subject.clone(), predicate.to_string(), object.clone()));
-        if self.buffer_bytes >= self.threshold_bytes {
-            self.completed.push_back(std::mem::take(&mut self.buffer));
-            self.buffer_bytes = 0;
-        }
-        Ok(())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -775,46 +753,91 @@ pub async fn drive_virtual_import(
             .name("virtual-materializer-worker".into())
             .spawn(
                 move || -> std::result::Result<(MaterializeStats, u128), String> {
-                    let wctx = VirtualChunkContext {
-                        shared_alloc: &shared_alloc,
-                        ledger_id: &ledger,
-                        compress,
-                        spool_dir: &spool_dir,
-                        spool_config: spool_config.as_ref(),
-                    };
-                    let mut chunker = ChunkingObserver::new(chunk_size_bytes);
                     let mut stats = MaterializeStats::default();
                     let mut encode_ms: u128 = 0;
-                    let mut encode_send =
-                        |triples: &[OwnedTriple]| -> std::result::Result<bool, String> {
-                            let idx = next_idx.fetch_add(1, Ordering::SeqCst);
-                            let t = (idx + 1) as i64;
-                            let enc = std::time::Instant::now();
-                            let parsed = build_virtual_chunk(triples, &wctx, t, idx, None)
-                                .map_err(|e| e.to_string())?;
-                            encode_ms += enc.elapsed().as_millis();
-                            // Err => the consumer dropped the receiver; stop early.
-                            Ok(worker_tx.send(Ok((idx, parsed))).is_ok())
-                        };
-                    loop {
-                        let (tm_iri, batch) = match work_rx.lock().unwrap().recv() {
+
+                    'chunks: loop {
+                        // Secure the first batch of a chunk BEFORE claiming an idx,
+                        // so an idx is never wasted on an empty chunk (a gap would
+                        // stall the in-order consumer forever).
+                        let first = match work_rx.lock().unwrap().recv() {
                             Ok(item) => item,
-                            Err(_) => break, // driver closed the work channel
+                            Err(_) => break 'chunks, // driver closed the work channel
                         };
-                        let Some(tm) = mapping.triples_maps.get(&tm_iri) else {
-                            continue;
-                        };
-                        emit_batch(tm, &batch, &parents, &mut chunker, &mut stats)
-                            .map_err(|e| e.to_string())?;
-                        while let Some(triples) = chunker.completed.pop_front() {
-                            if !encode_send(&triples)? {
-                                return Ok((stats, encode_ms));
+                        let idx = next_idx.fetch_add(1, Ordering::SeqCst);
+                        let t = (idx + 1) as i64;
+                        let enc = std::time::Instant::now();
+
+                        // Fresh per-chunk sink. O3a: each batch's triples are
+                        // interned DIRECTLY into this sink as they are enumerated —
+                        // no intermediate OwnedTriple buffer, no second intern pass —
+                        // and the chunk is cut on the running byte estimate at batch
+                        // boundaries (one batch of overshoot at most).
+                        let mut worker_cache = WorkerCache::new(Arc::clone(&shared_alloc));
+                        let mut sink = ImportSink::new_cached(
+                            &mut worker_cache,
+                            t,
+                            format!("{ledger}-{t}"),
+                            compress,
+                        )
+                        .map_err(|e| format!("import sink create: {e}"))?;
+                        if let Some(cfg) = spool_config.as_ref() {
+                            let spool_path = spool_dir.join(format!("chunk_{idx}.spool"));
+                            let spool_ctx = SpoolContext::new(spool_path, idx, 0, cfg)
+                                .map_err(|e| format!("spool create: {e}"))?;
+                            sink.set_spool_context(spool_ctx);
+                        }
+
+                        let mut est: usize = 0;
+                        let mut ended = false;
+                        let mut item = Some(first);
+                        loop {
+                            let (tm_iri, batch) = match item.take() {
+                                Some(i) => i,
+                                None => match work_rx.lock().unwrap().recv() {
+                                    Ok(i) => i,
+                                    Err(_) => {
+                                        ended = true;
+                                        break;
+                                    }
+                                },
+                            };
+                            if let Some(tm) = mapping.triples_maps.get(&tm_iri) {
+                                let mut obs = InterningObserver {
+                                    sink: &mut sink,
+                                    bytes: &mut est,
+                                };
+                                emit_batch(tm, &batch, &parents, &mut obs, &mut stats)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            if est >= chunk_size_bytes {
+                                break;
                             }
                         }
-                    }
-                    // Flush this worker's trailing sub-threshold buffer (never stamped).
-                    if let Some(triples) = chunker.take_final() {
-                        let _ = encode_send(&triples)?;
+
+                        // Finish + ship this chunk (always non-empty: it holds
+                        // `first`). Mirror build_virtual_chunk's finalize.
+                        let (writer, prefix_map, spool_ctx) =
+                            sink.finish().map_err(|e| format!("flake encode: {e}"))?;
+                        let op_count = writer.op_count();
+                        let new_codes = worker_cache.into_new_codes();
+                        let spool_result = spool_ctx.map(SpoolContext::finish_buffered);
+                        let parsed = ParsedChunk {
+                            writer,
+                            op_count,
+                            new_codes,
+                            prefix_map,
+                            spool_result,
+                            txn_meta: Vec::new(),
+                        };
+                        encode_ms += enc.elapsed().as_millis();
+                        // Err => the consumer dropped the receiver; stop early.
+                        if worker_tx.send(Ok((idx, parsed))).is_err() {
+                            return Ok((stats, encode_ms));
+                        }
+                        if ended {
+                            break 'chunks;
+                        }
                     }
                     Ok((stats, encode_ms))
                 },
@@ -873,8 +896,7 @@ pub async fn drive_virtual_import(
             }
             Ok(Err(e)) => worker_err = worker_err.or(Some(e)),
             Err(_) => {
-                worker_err =
-                    worker_err.or(Some("materialize worker thread panicked".to_string()));
+                worker_err = worker_err.or(Some("materialize worker thread panicked".to_string()));
             }
         }
     }
@@ -1898,32 +1920,6 @@ mod tests {
             literal_sink_args(Some(&dtc)),
             (fluree_vocab::xsd::DECIMAL, None),
             "an explicit datatype must reach term_literal so the value types correctly"
-        );
-    }
-
-    #[test]
-    fn chunker_cuts_by_byte_budget_and_conserves_triples() {
-        use super::ChunkingObserver;
-        use fluree_db_r2rml::materialize::TripleObserver;
-        use fluree_db_r2rml::RdfTerm;
-
-        // A tiny byte budget forces multiple chunk cuts.
-        let mut chunker = ChunkingObserver::new(40);
-        let s = RdfTerm::iri("http://ex.org/subject");
-        let o = RdfTerm::iri("http://ex.org/object");
-        for _ in 0..5 {
-            chunker.observe(&s, "http://ex.org/p", &o).unwrap();
-        }
-        assert!(
-            !chunker.completed.is_empty(),
-            "a tiny byte budget must cut at least one chunk"
-        );
-        let completed: usize = chunker.completed.iter().map(Vec::len).sum();
-        let remainder = chunker.take_final().map(|v| v.len()).unwrap_or(0);
-        assert_eq!(
-            completed + remainder,
-            5,
-            "every observed triple must land in exactly one chunk (completed or final)"
         );
     }
 
