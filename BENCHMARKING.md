@@ -317,11 +317,24 @@ whose numbers are meant to gate should set `FLUREE_BENCH_HOST_CLASS` explicitly
 
 Two ways to reach phase 2:
 
-1. **Committed CI-class baseline (implemented).** Run `bench.yml`'s
-   `workflow_dispatch` `bench-capture` job with `capture_samples: 5`, download
-   the artifact, commit it, and remove `--allow-host-mismatch` from `ci.yml`'s
-   compare step. Its `host_class=ci-ubuntu-latest` matches CI and its noise floor
-   absorbs runner flap, so both metrics enforce.
+1. **Committed CI-class baseline (implemented).** Note the **filename change** —
+   the capture job writes `guardrails-pre-ci.json`, but both compare jobs read
+   `guardrails-pre.json`. Committing the artifact under its own name leaves CI
+   reading the old `host_class=local` file, which without
+   `--allow-host-mismatch` refuses every run. So:
+
+   ```bash
+   # 1. Run bench.yml's workflow_dispatch `bench-capture` job with
+   #    capture_samples: 5, and download the artifact.
+   # 2. REPLACE the committed baseline — do not add it alongside:
+   mv guardrails-pre-ci.json bench-baselines/guardrails-pre.json
+   # 3. Drop `--allow-host-mismatch` from ci.yml's and bench.yml's compare steps.
+   ```
+
+   The replaced file's `host_class=ci-ubuntu-latest` then matches CI and its
+   noise floor absorbs runner flap, so both metrics enforce. (Keeping the
+   `-ci` suffix instead would work only if you also repoint every
+   `--baseline` path; one rename is the smaller change.)
 2. **Same-runner interleaved base-vs-HEAD (documented future option).** Measure
    merge-base and HEAD in the *same* job on the *same* runner and compare those,
    instead of any committed cross-machine file — the only design that survives
