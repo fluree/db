@@ -8,6 +8,7 @@
 //! Turtle, TriG, N-Triples and N-Quads share one escaping grammar for string
 //! literals and one for IRIs, so one implementation serves all four.
 
+use crate::chars::is_iri_char;
 use std::io::{self, Write};
 
 /// Write an N-Triples-escaped string to `w` (without the surrounding quotes).
@@ -114,10 +115,11 @@ fn uchar(cp: u32) -> [u8; 6] {
 
 /// Whether `ch` must be written as a `UCHAR` to appear inside `<…>`.
 ///
-/// The whole forbidden set is ASCII, which is what lets [`uchar`] be
-/// four-digit only.
+/// The inverse of the lexer's own [`is_iri_char`], so what a writer escapes
+/// and what a reader accepts are one decision. The whole forbidden set is
+/// ASCII, which is what lets [`uchar`] be four-digit only.
 fn is_forbidden_in_iriref(ch: char) -> bool {
-    ch as u32 <= 0x20 || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+    !is_iri_char(ch)
 }
 
 /// Write `"lexical"^^<datatype_iri>`.

@@ -11,6 +11,7 @@
 //! them would break `fluree export | fluree rdf convert`, so they pass
 //! through.
 
+use crate::chars::is_blank_node_label;
 use fluree_graph_ir::SinkError;
 
 /// Labels that pass through [`BlankNodeLabels::Relabel`] untouched.
@@ -48,15 +49,23 @@ pub enum BlankNodeLabels {
     /// Two classes of label reach a writer, and only one of them was ever
     /// written by a user.
     ///
-    /// A label that cannot lex as a `BLANK_NODE_LABEL` is necessarily an
-    /// *internal* mint: no document could contain it, because no parser would
-    /// accept it. The IR's own anonymous nodes are exactly this — `-b{N}`,
-    /// deliberately unlexable so that in-memory they cannot collide with a
-    /// user's label. Preserving one is not possible (the output would be a
-    /// document no parser reads) and not meaningful (a user never chose it),
-    /// so it is relabelled into the reserved namespace below. Anonymous nodes
-    /// arriving as `term_blank(None)` are the same case and get the same
+    /// A label that is not a `BLANK_NODE_LABEL` is necessarily an *internal*
+    /// mint or an externally-sourced identifier: no Turtle document could
+    /// contain it, because no parser would have accepted it. The IR's own
+    /// anonymous nodes are one example — `-b{N}`, deliberately unlexable so
+    /// that in-memory they cannot collide with a user's label — and R2RML,
+    /// JSON-LD and skolem sources supply the rest. Preserving one is not
+    /// possible (the output would be a document no parser reads, or worse, one
+    /// that reads as something else) and not meaningful (a user never chose
+    /// it), so it is relabelled into the reserved namespace below. Anonymous
+    /// nodes arriving as `term_blank(None)` are the same case and get the same
     /// treatment.
+    ///
+    /// The test is the whole [`BLANK_NODE_LABEL`](crate::chars::is_blank_node_label)
+    /// production, not an approximation of it. A first-character-only check
+    /// let `_:ab.` through, and a reader handed that does not fail — it lexes
+    /// `_:ab` and takes the `.` as the statement terminator, silently
+    /// renaming the node.
     ///
     /// A label that *does* lex was written by a user, and is emitted
     /// unchanged. The single exception is one already inside the reserved
@@ -112,7 +121,7 @@ impl BlankLabeler {
                          with a minted node. Drop --preserve-bnode-labels to relabel instead."
                     )));
                 }
-                if unlexable_first_char(input).is_some() {
+                if !is_blank_node_label(input) {
                     // Not a user's label — no document can contain one that
                     // will not lex. It is an internal mint, so it is minted
                     // afresh into the reserved namespace rather than refused:
@@ -146,24 +155,6 @@ impl BlankLabeler {
         self.counter += 1;
         format!("{PRESERVE_MINT}{}", self.counter).into()
     }
-}
-
-/// The first character of `label`, when it plainly cannot start a Turtle
-/// `BLANK_NODE_LABEL`.
-///
-/// `BLANK_NODE_LABEL ::= '_:' (PN_CHARS_U | [0-9]) …`. The check is
-/// deliberately conservative: it rejects only ASCII characters that are
-/// certainly outside `PN_CHARS_U | [0-9]`, and lets every non-ASCII character
-/// through rather than re-implementing the grammar's Unicode ranges and
-/// refusing labels that are in fact legal.
-///
-/// The case this actually catches is the IR's own anonymous mints, which are
-/// `-b{N}`: a leading `-` keeps them from colliding with user labels *in
-/// memory*, and is exactly what cannot be serialized.
-fn unlexable_first_char(label: &str) -> Option<char> {
-    let first = label.chars().next()?;
-    let lexable = !first.is_ascii() || first.is_ascii_alphanumeric() || first == '_';
-    (!lexable).then_some(first)
 }
 
 #[cfg(test)]
@@ -246,7 +237,7 @@ mod tests {
         let mut l = BlankLabeler::new(BlankNodeLabels::Preserve);
         let first = l.labelled("-b1").unwrap().to_string();
         assert!(first.starts_with(PRESERVE_MINT), "{first}");
-        assert!(unlexable_first_char(&first).is_none(), "{first}");
+        assert!(is_blank_node_label(&first), "{first}");
 
         // A second internal mint gets its own label. (Stability per input
         // label is the caller's job — `WriterTerms` keys the map — and is
@@ -276,7 +267,7 @@ mod tests {
             }
             for label in &emitted {
                 assert!(
-                    unlexable_first_char(label).is_none(),
+                    is_blank_node_label(label),
                     "{mode:?} emitted an unserializable label {label:?}"
                 );
             }
@@ -289,15 +280,41 @@ mod tests {
         }
     }
 
+    /// Preserve mode relabels every label the shared production rejects —
+    /// not just the ones whose FIRST character is wrong. A first-character
+    /// check waved through `ab.` (silently renamed on re-read), the empty
+    /// label, embedded spaces and quotes, and every non-ASCII character
+    /// outside PN_CHARS_BASE.
     #[test]
-    fn the_first_char_check_only_rejects_certain_ascii() {
-        assert_eq!(unlexable_first_char("-x"), Some('-'));
-        assert_eq!(unlexable_first_char(".x"), Some('.'));
-        assert_eq!(unlexable_first_char(""), None);
-        assert_eq!(unlexable_first_char("b0"), None);
-        assert_eq!(unlexable_first_char("0b"), None);
-        assert_eq!(unlexable_first_char("_x"), None);
-        // Non-ASCII is let through rather than second-guessed.
-        assert_eq!(unlexable_first_char("ünïcødé"), None);
+    fn preserve_mode_relabels_every_label_the_production_rejects() {
+        let cases = [
+            "-b1",       // the IR's internal mint
+            "ab.",       // trailing '.': lexes as `_:ab` plus a terminator
+            "",          // the empty label
+            "a b",       // space
+            "a\"b",      // quote
+            "a\\b",      // backslash
+            "a\nb",      // newline
+            "a#b",       // starts a comment
+            "a,b",       // comma
+            "a;b",       // semicolon
+            "\u{D7}x",   // MULTIPLICATION SIGN — a PN_CHARS_BASE gap
+            "\u{B7}x",   // MIDDLE DOT — PN_CHARS but illegal first
+            "\u{300}x",  // COMBINING GRAVE — same
+            "\u{FFFE}x", // past FDF0-FFFD
+        ];
+        let mut l = BlankLabeler::new(BlankNodeLabels::Preserve);
+        for input in cases {
+            let out = l.labelled(input).expect("relabelled, not refused");
+            assert!(
+                out.starts_with(PRESERVE_MINT),
+                "{input:?} was emitted verbatim as {out:?}"
+            );
+            assert!(is_blank_node_label(&out), "{out:?} is not emittable");
+        }
+
+        // And a legal label is still preserved exactly.
+        assert_eq!(&*l.labelled("a.b").unwrap(), "a.b");
+        assert_eq!(&*l.labelled("\u{C0}x").unwrap(), "\u{C0}x");
     }
 }

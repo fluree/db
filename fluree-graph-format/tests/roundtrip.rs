@@ -516,6 +516,74 @@ fn preserve_mode_keeps_every_label_and_still_round_trips() {
     }
 }
 
+/// Drive one blank-node label through preserve mode and report what came back
+/// out, as the *label a reader sees*.
+///
+/// Verbatim, not up to isomorphism: preserve mode promises exact labels, so an
+/// isomorphism check would hide a rename — which is the failure this is
+/// looking for. Adopted from the reviewer's w1/w2 probes.
+fn preserve_label_round_trip(label: &str) -> Vec<String> {
+    let config = WriterConfig::new().with_blank_labels(BlankNodeLabels::Preserve);
+    let mut buf = Vec::new();
+    {
+        let mut w = NTriplesWriter::with_config(&mut buf, &config);
+        let s = w.term_blank(Some(label));
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_iri("http://ex/o");
+        w.emit_triple(s, p, o).expect("emitted");
+        w.end_statement();
+        w.finish().expect("finished");
+    }
+    let written = String::from_utf8(buf).unwrap();
+    let parsed = parse_conformant(&written);
+    assert_eq!(parsed.len(), 1, "one statement in, one out: {written:?}");
+    blank_labels(&parsed).into_iter().collect()
+}
+
+/// Every label preserve mode emits must read back as *itself*.
+///
+/// The failure this catches is not a crash. `_:ab.` parses fine — as `_:ab`
+/// followed by the statement terminator — so the node is silently renamed and
+/// the document still loads. Same class as the `a\b` literal corruption:
+/// checking "did it parse" would pass.
+#[test]
+fn preserve_mode_never_emits_a_label_that_reads_back_as_something_else() {
+    // Labels the shared production accepts: out exactly as they went in.
+    for legal in ["b1", "a.b", "x-y", "_under", "0lead", "\u{C0}accented"] {
+        assert_eq!(
+            preserve_label_round_trip(legal),
+            vec![legal.to_string()],
+            "{legal:?} must survive verbatim"
+        );
+    }
+
+    // Labels it does not: relabelled into the reserved namespace, and the
+    // *emitted* label round-trips. Never emitted raw, never renamed by the
+    // reader behind our back.
+    for illegal in [
+        "ab.",       // trailing '.' — the silent-rename case
+        "",          // the empty label
+        "a b",       // space
+        "a\"b",      // quote
+        "a\\b",      // backslash
+        "a#b",       // starts a comment
+        "a,b",       // comma
+        "-b1",       // the IR's internal mint
+        "\u{D7}x",   // MULTIPLICATION SIGN — a PN_CHARS_BASE gap
+        "\u{B7}x",   // MIDDLE DOT — PN_CHARS but illegal first
+        "\u{300}x",  // COMBINING GRAVE — same
+        "\u{FFFE}x", // past FDF0-FFFD
+    ] {
+        let out = preserve_label_round_trip(illegal);
+        assert_eq!(out.len(), 1, "{illegal:?} -> {out:?}");
+        assert!(
+            out[0].starts_with("fdbw-"),
+            "{illegal:?} was emitted as {:?} rather than relabelled",
+            out[0]
+        );
+    }
+}
+
 /// The internal-mint case, end to end: the IR's own anonymous labels are
 /// `-b{N}` and cannot be serialized, so preserve mode must relabel them rather
 /// than refuse the document or emit something no parser reads. A hand-fed

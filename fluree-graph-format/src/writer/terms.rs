@@ -261,7 +261,15 @@ mod tests {
 
         let document = format!("<http://ex/s> <http://ex/p> {object} .");
         let mut sink = GraphCollectorSink::new();
-        fluree_graph_turtle::parse(&document, &mut sink).ok()?;
+        // Conformant mode, not the ingest default: the ingest default
+        // canonicalizes numeric literals, so a numeric added to the hostile
+        // set below would silently stop testing what this means to test.
+        fluree_graph_turtle::parse_with_options(
+            &document,
+            &mut sink,
+            fluree_graph_turtle::ParserOptions::conformant(),
+        )
+        .ok()?;
         match &sink.into_graph().iter().next().expect("one triple").o {
             Term::Literal { value, .. } => Some(value.lexical()),
             other => panic!("expected a literal, got {other:?}"),

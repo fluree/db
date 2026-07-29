@@ -6,6 +6,7 @@
 //! exporter compact IRIs the same way, rather than drifting into two
 //! near-identical implementations.
 
+use crate::chars::{is_pn_local, is_pn_prefix};
 use crate::escape::write_escaped_iri;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -76,7 +77,7 @@ impl PrefixMap {
     /// legal prefix. Dropping costs nothing but verbosity.
     pub fn insert(&mut self, prefix: impl Into<String>, namespace_iri: impl Into<String>) {
         let prefix = prefix.into();
-        if !is_valid_pname_ns(&prefix) {
+        if !is_pn_prefix(&prefix) {
             return;
         }
         self.entries.retain(|(p, _)| p != &prefix);
@@ -91,7 +92,7 @@ impl PrefixMap {
     pub fn compact(&self, iri: &str) -> Option<String> {
         for (prefix, ns) in &self.entries {
             if let Some(local) = iri.strip_prefix(ns.as_str()) {
-                if is_valid_pname_local(local) {
+                if is_pn_local(local) {
                     return Some(format!("{prefix}:{local}"));
                 }
             }
@@ -113,66 +114,6 @@ impl PrefixMap {
     fn resort(&mut self) {
         self.entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
     }
-}
-
-/// Check if `local` is a valid Turtle `PN_LOCAL` (simplified).
-///
-/// ```text
-/// PN_LOCAL ::= (PN_CHARS_U | ':' | [0-9] | PLX) ((PN_CHARS | '.' | ':' | PLX)* (PN_CHARS | ':' | PLX))?
-/// ```
-///
-/// Two things the position-blind version of this check got wrong, both of
-/// which emitted prefixed names no parser accepts:
-///
-/// - `-` is in `PN_CHARS` but **not** in `PN_CHARS_U`, so it may appear
-///   anywhere except first. `ex:-dash` is not a legal `PNAME_LN`.
-/// - `.` may not be first or last, which was already handled.
-///
-/// Conservative in the other direction — the real grammar allows far more,
-/// including `PLX` escapes and wide Unicode ranges — which is the safe way to
-/// be wrong: declining to compact costs verbosity, compacting wrongly costs
-/// validity.
-fn is_valid_pname_local(local: &str) -> bool {
-    let Some(first) = local.chars().next() else {
-        return true; // a bare `ex:` is a legal PNAME_LN
-    };
-    // First character: PN_CHARS_U | [0-9] — note the absence of '-'. The
-    // grammar also admits ':' and PLX here, and this does not: widening the
-    // accepted set would change which IRIs compact, which is a separate
-    // decision from fixing a position.
-    if !(first.is_ascii_alphanumeric() || first == '_') {
-        return false;
-    }
-    if local.ends_with('.') {
-        return false;
-    }
-    local
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-}
-
-/// Check if `prefix` is a valid Turtle `PNAME_NS` (simplified).
-///
-/// ```text
-/// PNAME_NS   ::= PN_PREFIX? ':'
-/// PN_PREFIX  ::= PN_CHARS_BASE ((PN_CHARS | '.')* PN_CHARS)?
-/// ```
-///
-/// So the empty prefix is legal (`@prefix : <…>`), the first character must be
-/// a letter — not `_`, not a digit, not `-` — and `.` may not be last.
-fn is_valid_pname_ns(prefix: &str) -> bool {
-    let Some(first) = prefix.chars().next() else {
-        return true; // `@prefix : <…> .`
-    };
-    if !first.is_ascii_alphabetic() {
-        return false;
-    }
-    if prefix.ends_with('.') {
-        return false;
-    }
-    prefix
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Write `@prefix` declarations to a Turtle/TriG writer.
@@ -354,7 +295,11 @@ mod tests {
                                    {pname} <http://ex/p> <http://ex/o> ."
                 );
                 let mut sink = fluree_graph_ir::GraphCollectorSink::new();
-                let parsed = fluree_graph_turtle::parse(&doc, &mut sink);
+                let parsed = fluree_graph_turtle::parse_with_options(
+                    &doc,
+                    &mut sink,
+                    fluree_graph_turtle::ParserOptions::conformant(),
+                );
                 assert!(
                     parsed.is_ok(),
                     "compacted {iri:?} to {pname:?}, which does not parse: {parsed:?}"

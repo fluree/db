@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 fluree-graph-ir = { path = "../fluree-graph-ir" }
+# For the shared Turtle character-class predicates (`lex::chars`), so the
+# parser and the writers cannot drift on what the grammar admits.
+fluree-graph-format = { path = "../fluree-graph-format" }
 fluree-vocab = { path = "../fluree-vocab" }
 winnow = { workspace = true }
 thiserror = { workspace = true }
