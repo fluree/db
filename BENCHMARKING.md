@@ -187,9 +187,12 @@ captured at the branch's **merge-base** (see `bench-baselines/README.md`).
 **Compare** — after a change, rerun the benches and compare:
 
 ```bash
+# --allow-host-mismatch is required against the committed baseline, which is
+# host_class=local; without it compare refuses (exit 2) rather than compare
+# absolute numbers across machines. Drop it once you have a same-class baseline.
 cargo run -p fluree-bench-support --bin bench-baseline -- \
-    compare --baseline bench-baselines/guardrails-pre.json \
-    [--only <substr>] [--share-drift-pp 5] [--allow-host-mismatch] [--advisory]
+    compare --baseline bench-baselines/guardrails-pre.json --allow-host-mismatch \
+    [--only <substr>] [--share-drift-pp 5] [--advisory]
 ```
 
 Each scenario present in both runs is checked against `baseline × (1 +
@@ -208,12 +211,30 @@ share.
 — exit 2, no verdict — unless `--allow-host-mismatch` downgrades them to
 `::warning::` annotations. `--advisory` forces the downgrade even on a match.
 
+> **No bench emits phases yet.** The `meta` sidecar and everything below about
+> phases is Tier-1 scaffolding for the `fluree rdf` conversion lane: the schema,
+> the recorder, and the gate are in place, but no bench in the workspace calls
+> `meta::record_scenario` today, so no phase or corpus row appears in any current
+> report. The share gate goes live with the first producer. Corpus identity is in
+> the same state — the refusal rules are real, they simply have nothing to check
+> until a bench declares what it read.
+
 **Share drift always enforces**, because a share is a ratio within a single run:
 the machine cancels. Only share *growth* gates; shares sum to 100, so gating both
 directions would fail a clean improvement twice, once for the phase that got
 better and once for its complement. This is the metric that catches the
 regression an aggregate number hides — a scenario 2% slower overall whose parse
 share moved 60% → 75% has a parse regression masked by a write improvement.
+
+**A phase that appears or disappears is gated on its share alone.** Comparing
+only same-named phases is how a regression hides: move work into a phase the
+baseline never had and the old phase's share *falls*, reading as an improvement,
+while the new phase carrying the cost produces no row. So a phase new in the
+current run breaches when it claims more than the drift threshold, and a phase
+that has vanished from the current run breaches when it *used to* claim more than
+the threshold — work that large did not evaporate, it moved somewhere unmeasured.
+Such rows are marked `(NEW)` / `(VANISHED)` and carry no `phase_time` row, since
+there is no ratio to report against a missing side.
 
 **A corpus mismatch is always a refusal, with no override.** Benches that read an
 input record its SHA-256, byte length, element count, input/output syntax, and
@@ -244,10 +265,25 @@ done
 ```
 
 With ≥ 5 samples the baseline records a median and a MAD, the gate compares
-medians instead of single-run means, and each budget widens to
-`max(budget_pct, 3 × MAD / median)`. The floor only ever *widens* an envelope: a
-quiet scenario keeps its declared budget. MAD rather than standard deviation
-because one outlier run is the common failure here and barely moves it.
+medians instead of single-run means, and the wall-clock budget widens to
+`max(budget_pct, 3 × MAD / median)`. MAD rather than standard deviation because
+one outlier run is the common failure here and barely moves it.
+
+Three bounds on that, each of which exists because dropping it inverts the gate:
+
+- **Widening only.** A budget tighter than the measured noise can only produce
+  false alarms; a quiet scenario keeps its declared budget.
+- **Wall-clock only.** The floor applies to `time` and `phase_time`, never to
+  `peak_mem`. A tracking allocator's peak is near-deterministic for a given
+  workload, so widening the memory budget by a *timing* MAD would let a real
+  allocation regression through on the strength of a noisy clock.
+- **Baseline only.** The current run's own spread never widens its own budget.
+  Otherwise the worse a run behaves, the more it is forgiven.
+
+`capture --accumulate` refuses to pool samples across host classes or across
+corpora. Blending two populations into one median and MAD destroys the evidence
+that they were ever different, and the accumulated file inherits the fresh run's
+provenance — so there would be nothing left for a later `compare` to catch.
 
 ### Why the gate has two phases
 
