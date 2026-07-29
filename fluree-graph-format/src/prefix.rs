@@ -282,7 +282,11 @@ mod tests {
         );
 
         pm.insert("ex", "http://example.org/deep/other/");
-        assert_eq!(pm.iter().count(), 2, "redeclaration replaces, never appends");
+        assert_eq!(
+            pm.iter().count(),
+            2,
+            "redeclaration replaces, never appends"
+        );
         assert_eq!(
             pm.compact("http://example.org/deep/other/x").as_deref(),
             Some("ex:x"),

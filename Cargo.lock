@@ -3318,6 +3318,7 @@ name = "fluree-graph-format"
 version = "4.1.4"
 dependencies = [
  "fluree-graph-ir",
+ "fluree-graph-turtle",
  "fluree-vocab",
  "pretty_assertions",
  "serde",

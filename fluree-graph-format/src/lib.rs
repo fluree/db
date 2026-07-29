@@ -31,6 +31,7 @@ mod escape;
 mod jsonld;
 mod policy;
 mod prefix;
+pub mod writer;
 
 pub use escape::{
     escape_iri_into, write_escaped_iri, write_escaped_ntriples_string, write_typed_literal,
@@ -39,4 +40,8 @@ pub use jsonld::{format_jsonld, JsonLdFormatConfig};
 pub use policy::{BlankNodePolicy, ContextPolicy, TypeHandling};
 pub use prefix::{
     write_prefix_declarations, write_turtle_iri, write_turtle_iri_or_bnode, PrefixMap,
+};
+pub use writer::{
+    BlankNodeLabels, JsonLdWriter, NQuadsWriter, NTriplesWriter, TrigWriter, TurtleWriter,
+    WriterConfig, WriterStats,
 };

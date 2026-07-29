@@ -108,7 +108,10 @@ async fn seeded_ledger(dir: &std::path::Path) -> (fluree_db_api::Fluree, String)
         .build()
         .expect("build file-backed fluree");
     let ledger_id = "export/golden:main";
-    let ledger = fluree.create_ledger(ledger_id).await.expect("create ledger");
+    let ledger = fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
     fluree
         .insert(ledger, &fixture())
         .await
