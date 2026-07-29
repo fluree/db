@@ -147,6 +147,19 @@ fn parse_conformant(input: &str) -> Vec<Triple> {
     sink.into_graph().triples().to_vec()
 }
 
+/// [`to_ntriples`] with term validation off, for the fixtures whose input is
+/// deliberately not conformant RDF — see [`parse_for_comparison`].
+fn to_ntriples_unvalidated(input: &str, config: &WriterConfig) -> String {
+    let mut buf = Vec::new();
+    {
+        let mut w = NTriplesWriter::with_config(&mut buf, config);
+        let options = ParserOptions::conformant().with_validation(false);
+        parse_with_options(input, &mut w, options).expect("parse");
+        w.finish().expect("finish");
+    }
+    String::from_utf8(buf).expect("UTF-8")
+}
+
 fn to_ntriples(input: &str, config: &WriterConfig) -> String {
     let mut buf = Vec::new();
     {
@@ -238,8 +251,30 @@ fn write_subject_iri(subject: &str) -> String {
     String::from_utf8(buf).unwrap()
 }
 
+/// Re-read writer output for comparison, with term validation OFF.
+///
+/// The writers must faithfully reproduce terms handed to them, and a term can
+/// come from a *store* rather than a document — `export.rs` has always been
+/// able to emit an IRI the RDF grammar forbids, because the binary index
+/// never promised to hold only grammatical ones. Those outputs are not
+/// conformant RDF and are not meant to be; what is under test is that the
+/// writer's bytes read back as the SAME term.
+///
+/// So validation is off here on purpose. Leaving it on would fail the writer
+/// for its input's sins, and would make these tests silently stop covering
+/// the escaping they exist to pin. Conformance is covered where it belongs:
+/// `fluree-graph-turtle`'s term-validation tests and the W3C suites.
+fn parse_for_comparison(document: &str) -> Vec<Triple> {
+    let mut sink = GraphCollectorSink::new();
+    let options = ParserOptions::conformant().with_validation(false);
+    parse_with_options(document, &mut sink, options)
+        .unwrap_or_else(|e| panic!("re-parse failed: {e}\n{document}"));
+    sink.finish().unwrap();
+    sink.into_graph().triples().to_vec()
+}
+
 fn subjects_of(document: &str) -> Vec<String> {
-    parse_conformant(document)
+    parse_for_comparison(document)
         .iter()
         .filter_map(|t| t.s.as_iri().map(str::to_string))
         .collect()
@@ -288,9 +323,17 @@ fn distinct_iris_never_merge_on_the_way_out() {
     );
 }
 
-/// Our own parser accepts `UCHAR` inside `IRIREF`, so a document that uses one
-/// is legal input — and must survive the writer unchanged. Adopted from the
-/// reviewer's j1/j2 probes.
+/// Our own lexer accepts `UCHAR` inside `IRIREF`, so a document that uses one
+/// lexes — and the IRI it denotes must survive the writer unchanged. Adopted
+/// from the reviewer's j1/j2 probes.
+///
+/// Note what these two escapes expand to: a space and a `<`, neither legal in
+/// an IRI. Since H-8 that makes the document invalid RDF, and a *validating*
+/// parse rejects it (`turtle-eval-bad-01` / `-02`; the sibling test below
+/// pins that). The property here is the writer's, and survives the
+/// distinction: whatever term reaches a writer — from a document the parser
+/// blessed, or from a store that never asked — must come out reading as the
+/// same term. Hence the unvalidated re-parse.
 #[test]
 fn a_uchar_sourced_iri_round_trips_unchanged() {
     let doc = "<http://ex/a\\u0020b> <http://ex/p> <http://ex/o> .\n\
@@ -302,8 +345,28 @@ fn a_uchar_sourced_iri_round_trips_unchanged() {
         "input parses"
     );
 
-    let written = to_ntriples(doc, &WriterConfig::default());
+    let written = to_ntriples_unvalidated(doc, &WriterConfig::default());
     assert_eq!(subjects_of(&written), before, "the writer changed the IRI");
+}
+
+/// The other half: a `UCHAR` expanding to a character `IRIREF` forbids makes
+/// the document invalid, and the parser says so before a writer ever sees it.
+///
+/// This is why the writers never have to decide what to do with an IRI holding
+/// a space — under conformant options such a term cannot reach them. Both
+/// fixtures are W3C negative-eval tests verbatim.
+#[test]
+fn a_uchar_expanding_to_a_forbidden_character_never_reaches_the_writer() {
+    for escape in ["\\u0020", "\\u003C", "\\u003E"] {
+        let doc = format!("<http://ex/a{escape}b> <http://ex/p> <http://ex/o> .\n");
+        let mut sink = GraphCollectorSink::new();
+        let err = parse_with_options(&doc, &mut sink, ParserOptions::conformant())
+            .expect_err("an IRI that is not an IRI must not parse");
+        assert!(
+            err.to_string().contains("not allowed in an IRI"),
+            "{escape}: {err}"
+        );
+    }
 }
 
 /// Characters above U+009F are legal in `IRIREF` and must be written through

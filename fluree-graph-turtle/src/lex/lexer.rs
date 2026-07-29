@@ -43,6 +43,7 @@ impl<'a> Lexer<'a> {
         crate::error::check_input_len(self.input.len())?;
         let mut tokens = Vec::new();
         let mut input = LocatingSlice::new(self.input);
+        skip_leading_bom(&mut input);
 
         loop {
             // Skip whitespace and comments
@@ -85,10 +86,9 @@ pub struct StreamingLexer<'a> {
 impl<'a> StreamingLexer<'a> {
     /// Create a new streaming lexer for the given input.
     pub fn new(source: &'a str) -> Self {
-        Self {
-            source,
-            input: LocatingSlice::new(source),
-        }
+        let mut input = LocatingSlice::new(source);
+        skip_leading_bom(&mut input);
+        Self { source, input }
     }
 
     /// Get the next token. Returns an EOF token at end of input.
@@ -147,6 +147,25 @@ fn make_lex_error(source: &str, position: usize, input: &Input<'_>) -> TurtleErr
         position,
         message: format!("{headline}\n{}", index.caret_block(line, col)),
     }
+}
+
+/// Consume a byte-order mark at the very start of the input.
+///
+/// A UTF-8 BOM is U+FEFF, which is not whitespace and not a token start, so
+/// without this a BOM-prefixed document dies on its first character with
+/// "unexpected character" — and Windows editors emit them routinely. riot and
+/// every other production reader tolerate a leading one, so we do too.
+///
+/// Consumed rather than stripped: the parser slices token spans out of the
+/// ORIGINAL source by absolute byte offset, so removing the three bytes up
+/// front would shift every span. Advancing the locating slice past them keeps
+/// offsets true, which is also what keeps diagnostics pointing at the right
+/// column on line 1.
+///
+/// Start of input only. A U+FEFF anywhere else is a zero-width no-break
+/// space — a real character in the document, and a real lexical error.
+fn skip_leading_bom(input: &mut Input<'_>) {
+    let _: ModalResult<Option<char>, ContextError> = opt('\u{FEFF}').parse_next(input);
 }
 
 /// Skip whitespace and comments.

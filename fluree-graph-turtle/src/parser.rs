@@ -375,13 +375,62 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     // Term caching helpers
     // =========================================================================
 
+    /// Check that a **resolved** IRI is an RDF term, when validation is on.
+    ///
+    /// Runs after escape expansion and base resolution, because that is where
+    /// the problem lives: `<http://ex/ >` is legal Turtle *source* whose
+    /// value is not an IRI (`turtle-eval-bad-01`).
+    ///
+    /// `position` is the IRI token's own start, not the offset of the
+    /// offending character. Escape expansion and resolution both change the
+    /// string's length, so an index into the resolved value maps back to
+    /// nothing in particular; the token start is the honest, checkable
+    /// position, and the message names the character.
+    ///
+    /// Off by default — one predictable branch on the ingest hot path.
+    #[inline]
+    fn check_iri(&self, iri: &str, position: u32) -> Result<()> {
+        if !self.options.validate {
+            return Ok(());
+        }
+        match fluree_vocab::iri::iri_violation(iri) {
+            None => Ok(()),
+            Some(violation) => Err(TurtleError::parse(
+                position as usize,
+                format!("{violation} (<{iri}>)"),
+            )),
+        }
+    }
+
+    /// Check that a language tag is well-formed, when validation is on.
+    ///
+    /// Deliberately here and not in the lexer: `@BASE` must keep lexing as a
+    /// LangTag token so the parser can reject it in *directive* position
+    /// (Turtle's `@`-directives are case-sensitive). A lexer-level check
+    /// would turn that into a lexical error and change what the parser sees.
+    #[inline]
+    fn check_lang(&self, tag: &str, position: u32) -> Result<()> {
+        if !self.options.validate {
+            return Ok(());
+        }
+        match fluree_vocab::lang::language_tag_violation(tag) {
+            None => Ok(()),
+            Some(violation) => Err(TurtleError::parse(
+                position as usize,
+                format!("{violation} (@{tag})"),
+            )),
+        }
+    }
+
     /// Resolve an IRI string and look up / register as a term.
     #[inline]
-    fn resolve_iri_term(&mut self, iri: &str) -> Result<TermId> {
+    fn resolve_iri_term(&mut self, iri: &str, position: u32) -> Result<TermId> {
         if self.base.is_none() && is_absolute_iri(iri) {
+            self.check_iri(iri, position)?;
             Ok(self.sink_term_iri(iri))
         } else {
             let resolved = self.resolve_iri(iri)?;
+            self.check_iri(&resolved, position)?;
             Ok(self.sink_term_iri(&resolved))
         }
     }
@@ -412,6 +461,12 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         } else {
             self.expand_prefixed_name(prefix, local)?
         };
+        // The expanded name is where a bad prefix NAMESPACE surfaces: the
+        // `@prefix` directive itself declares a string, and only concatenating
+        // it with a local name produces the IRI a term claims to be. Checked
+        // on the cache-miss path only, which is sound because the same span
+        // text expands to the same IRI — see the cache's own key contract.
+        self.check_iri(&iri, start)?;
         let id = self.sink_term_iri(&iri);
         // Cache with span text as key — avoids allocation on cache hits
         let span = self.span_text(start, end);
@@ -924,11 +979,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1002,11 +1060,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1093,11 +1154,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1269,11 +1333,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let value =
                     &self.input[(str_start as usize + quote_len)..(str_end as usize - quote_len)];
                 let lang = self.lang_content(ls, le);
+                self.check_lang(lang, ls)?;
                 Ok(self.sink_term_literal(value, Datatype::rdf_lang_string(), Some(lang)))
             }
             TokenKind::DoubleCaret => {
+                let dt = self.current().start;
                 self.advance()?;
                 let datatype_iri = self.parse_datatype_iri()?;
+                self.check_iri(&datatype_iri, dt)?;
                 let value =
                     &self.input[(str_start as usize + quote_len)..(str_end as usize - quote_len)];
                 let datatype = Datatype::from_iri(&datatype_iri);
@@ -1295,11 +1362,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let le = self.current().end;
                 self.advance()?;
                 let lang = self.lang_content(ls, le);
+                self.check_lang(lang, ls)?;
                 Ok(self.sink_term_literal(value, Datatype::rdf_lang_string(), Some(lang)))
             }
             TokenKind::DoubleCaret => {
+                let dt = self.current().start;
                 self.advance()?;
                 let datatype_iri = self.parse_datatype_iri()?;
+                self.check_iri(&datatype_iri, dt)?;
                 let datatype = Datatype::from_iri(&datatype_iri);
                 Ok(self.sink_term_literal(value, datatype, None))
             }
@@ -1308,6 +1378,9 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     }
 
     /// Parse a datatype IRI after ^^.
+    ///
+    /// Returns the resolved string; the CALLER validates it, because only the
+    /// caller still holds the `^^` position to blame.
     fn parse_datatype_iri(&mut self) -> Result<String> {
         match self.current().kind.clone() {
             TokenKind::Iri => {
@@ -1524,11 +1597,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1589,11 +1665,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;

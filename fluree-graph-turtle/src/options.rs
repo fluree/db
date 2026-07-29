@@ -106,6 +106,21 @@ pub struct ParserOptions {
     pub numerics: NumericStyle,
     /// Which grammar to accept.
     pub dialect: Dialect,
+    /// Whether to check that the terms a document denotes are RDF terms —
+    /// IRIs that are IRIs after escape expansion and base resolution, and
+    /// well-formed language tags.
+    ///
+    /// Off by default, and that is the load-bearing part. The grammar checks
+    /// happen in the lexer regardless; what this adds is a scan of every
+    /// resolved IRI and every language tag, which ingest does not need — it
+    /// consumes documents this database wrote — and which sits directly on
+    /// the bulk-import hot path. A conversion tool has the opposite need:
+    /// it must not emit a document asserting a term that is not a term.
+    ///
+    /// [`ParserOptions::conformant`] turns it on, so "conformant" means
+    /// conformant, and the benchmark cell that compares against a validating
+    /// reader validates too.
+    pub validate: bool,
 }
 
 impl ParserOptions {
@@ -115,13 +130,15 @@ impl ParserOptions {
         Self::default()
     }
 
-    /// Faithful-RDF preset: spine collections and preserved numeric
-    /// lexical forms — what a syntax-conformant reader/converter wants.
+    /// Faithful-RDF preset: spine collections, preserved numeric lexical
+    /// forms, and term validation — what a syntax-conformant
+    /// reader/converter wants.
     pub fn conformant() -> Self {
         Self {
             collections: CollectionStyle::Spine,
             numerics: NumericStyle::PreserveLexical,
             dialect: Dialect::Turtle,
+            validate: true,
         }
     }
 
@@ -142,6 +159,12 @@ impl ParserOptions {
         self.dialect = dialect;
         self
     }
+
+    /// Turn term validation on or off.
+    pub fn with_validation(mut self, validate: bool) -> Self {
+        self.validate = validate;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -156,16 +179,34 @@ mod tests {
         assert_eq!(o, ParserOptions::new());
     }
 
+    /// The ingest contract in one assertion. Validation costs a scan of every
+    /// resolved IRI, and bulk import runs on this default — if it ever flips,
+    /// the import path silently takes that cost.
     #[test]
-    fn conformant_preset_opts_into_both() {
+    fn validation_is_off_by_default() {
+        assert!(!ParserOptions::default().validate);
+        assert!(!ParserOptions::new().validate);
+        // And the other knobs do not drag it along.
+        assert!(
+            !ParserOptions::new()
+                .with_collections(CollectionStyle::Spine)
+                .with_numerics(NumericStyle::PreserveLexical)
+                .validate
+        );
+    }
+
+    #[test]
+    fn conformant_preset_opts_into_all_three() {
         let o = ParserOptions::conformant();
         assert_eq!(o.collections, CollectionStyle::Spine);
         assert_eq!(o.numerics, NumericStyle::PreserveLexical);
+        assert!(o.validate, "conformant must mean conformant");
         assert_eq!(
             o,
             ParserOptions::new()
                 .with_collections(CollectionStyle::Spine)
                 .with_numerics(NumericStyle::PreserveLexical)
+                .with_validation(true)
         );
     }
 }
