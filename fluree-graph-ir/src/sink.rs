@@ -424,6 +424,29 @@ impl GraphCollectorSink {
         id
     }
 
+    /// Debug-only invariant: every slot the current statement is about to
+    /// retire still holds a literal.
+    ///
+    /// `literal_slots` may only ever contain slots minted by
+    /// [`Self::add_literal_term`]. If an IRI or blank term is found in one,
+    /// something has routed a session-scoped term through the literal lane,
+    /// and retiring the slot would hand a producer-cached id to the next
+    /// literal — corrupting the graph silently and in a way that still looks
+    /// well-formed. Fail loudly in debug builds instead; compiled out of
+    /// release.
+    fn debug_assert_retiring_slots_are_literals(&self) {
+        if cfg!(debug_assertions) {
+            for &slot in &self.literal_slots[..self.literal_cursor] {
+                debug_assert!(
+                    matches!(self.terms[slot as usize], Term::Literal { .. }),
+                    "retiring non-literal slot {slot}: {:?} — literal_slots is polluted, \
+                     recycling it would clobber a producer-cached term id",
+                    self.terms[slot as usize]
+                );
+            }
+        }
+    }
+
     /// Add a literal term, reusing a slot retired by [`GraphSink::end_statement`]
     /// when one is available.
     ///
@@ -519,6 +542,7 @@ impl GraphSink for GraphCollectorSink {
     /// `emit_*` has already cloned every term it needed into the graph, and
     /// because producers only cache IRI and blank ids across statements.
     fn end_statement(&mut self) {
+        self.debug_assert_retiring_slots_are_literals();
         self.literal_cursor = 0;
         self.statement_mark = self.graph.len();
     }
@@ -527,6 +551,8 @@ impl GraphSink for GraphCollectorSink {
     /// failed mid-emit contributes nothing. Its literal slots are retired
     /// exactly as a successful statement's are.
     fn abort_statement(&mut self) {
+        // Same retirement, same invariant.
+        self.debug_assert_retiring_slots_are_literals();
         self.graph.truncate(self.statement_mark);
         self.literal_cursor = 0;
     }
