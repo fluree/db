@@ -33,6 +33,7 @@ pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
         &loaded.text,
         loaded.resolved.syntax,
         common.base.as_deref(),
+        rdf::verb_options(common.nocheck),
         &mut timings,
     )?;
     let wall = timings.wall();

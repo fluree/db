@@ -632,11 +632,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri)
+                self.resolve_iri_term(iri, s)
             }
             TokenKind::IriEscaped(iri) => {
+                // Captured BEFORE `advance`: with one token of lookahead,
+                // afterwards `current()` is the NEXT statement's token.
+                let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri)
+                self.resolve_iri_term(&iri, s)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;

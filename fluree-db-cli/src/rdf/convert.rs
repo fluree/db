@@ -102,6 +102,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         loaded.resolved.syntax,
         common.base.as_deref(),
         writer,
+        rdf::verb_options(common.nocheck),
         &mut timings,
     );
     let stats = run.sink.stats();
@@ -422,6 +423,7 @@ fn emit_profile(
         bytes_on_wire: loaded.bytes_on_wire,
         bytes_decoded: loaded.text.len() as u64,
         sha256: (!common.no_hash).then(|| crate::rdf::profile::sha256_hex(&loaded.text)),
+        validate: !common.nocheck,
     };
     ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink).emit(format)?;
     Ok(())

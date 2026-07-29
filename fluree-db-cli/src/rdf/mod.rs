@@ -268,6 +268,20 @@ pub struct ParseOutcome {
     pub error: Option<TurtleError>,
 }
 
+/// Parser options for every `fluree rdf` verb.
+///
+/// One function so the verbs cannot drift: `check`, `count` and `convert` must
+/// describe the same parse, and the only knob a user turns is `--nocheck`.
+///
+/// Validation is ON unless asked otherwise. These verbs exist to tell a user
+/// something true about a document — whether it is valid, how many statements
+/// it holds, what it says in another syntax — and all three answers are wrong
+/// if a term that is not an RDF term is counted, blessed, or written back out.
+/// `--nocheck` is the disclosed fast path, not the default.
+pub fn verb_options(nocheck: bool) -> ParserOptions {
+    ParserOptions::conformant().with_validation(!nocheck)
+}
+
 /// Parse a Turtle-family document, timing and counting it.
 ///
 /// Uses [`ParserOptions::conformant`], not the ingest default: these verbs
@@ -280,9 +294,10 @@ pub fn parse_document(
     text: &str,
     syntax: RdfSyntax,
     base: Option<&str>,
+    options: ParserOptions,
     timings: &mut PhaseTimings,
 ) -> CliResult<ParseOutcome> {
-    let run = parse_into(text, syntax, base, DiscardSink::new(), timings);
+    let run = parse_into(text, syntax, base, DiscardSink::new(), options, timings);
     // A sink failure is the pipeline's problem, not the document's — a broken
     // pipe or a full disk must not be reported as a syntax error. The discard
     // sink has none, but the shared path can.
@@ -330,18 +345,25 @@ pub struct ParseRun<S> {
 ///
 /// # Conformant options are not optional here
 ///
-/// [`ParserOptions::conformant`], never the ingest default. These verbs report
-/// on and reproduce the RDF a document denotes, so collections must arrive as
-/// the `rdf:first`/`rdf:rest` spine W3C says they are and numeric literals
-/// must keep the lexical form they were written with. Under the ingest options
-/// a collection arrives as indexed list items instead — which `count` would
-/// under-report, and which every writer refuses outright, because an indexed
-/// list item is a Fluree storage shape with no RDF serialization.
+/// `options` is built by [`verb_options`], which starts from
+/// [`ParserOptions::conformant`] and never the ingest default. These verbs
+/// report on and reproduce the RDF a document denotes, so collections must
+/// arrive as the `rdf:first`/`rdf:rest` spine W3C says they are and numeric
+/// literals must keep the lexical form they were written with. Under the
+/// ingest options a collection arrives as indexed list items instead — which
+/// `count` would under-report, and which every writer refuses outright,
+/// because an indexed list item is a Fluree storage shape with no RDF
+/// serialization.
+///
+/// The one thing a caller may vary is term validation (`--nocheck`), and it
+/// travels as part of `options` precisely so all three verbs vary it the same
+/// way or not at all.
 pub fn parse_into<S: GraphSink>(
     text: &str,
     syntax: RdfSyntax,
     base: Option<&str>,
     sink: S,
+    options: ParserOptions,
     timings: &mut PhaseTimings,
 ) -> ParseRun<S> {
     // Seeding the sampler from the corpus keeps repeat profiles of one input
@@ -376,14 +398,14 @@ pub fn parse_into<S: GraphSink>(
             &mut sink,
             &[],
             base,
-            ParserOptions::conformant().with_dialect(fluree_graph_turtle::Dialect::TriG),
+            options.with_dialect(fluree_graph_turtle::Dialect::TriG),
         ),
         _ => fluree_graph_turtle::parse_with_prefixes_base_options(
             text,
             &mut sink,
             &[],
             base,
-            ParserOptions::conformant(),
+            options,
         ),
     };
     // `finish` is the owner's call, and the owner is here. The writers latch
@@ -430,6 +452,7 @@ pub fn report_run(
             // Hashing happens here, after `wall` was taken — see the
             // `wall_ns` docs for what the measured window covers.
             sha256: (!common.no_hash).then(|| profile::sha256_hex(&loaded.text)),
+            validate: !common.nocheck,
         };
         profile::ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink)
             .emit(format)?;
@@ -455,7 +478,14 @@ mod tests {
     use super::*;
 
     fn parse(doc: &str) -> ParseOutcome {
-        parse_document(doc, RdfSyntax::Turtle, None, &mut PhaseTimings::start()).unwrap()
+        parse_document(
+            doc,
+            RdfSyntax::Turtle,
+            None,
+            verb_options(false),
+            &mut PhaseTimings::start(),
+        )
+        .unwrap()
     }
 
     fn args_with(input: Option<&str>, profile: Option<profile::ProfileFormat>) -> RdfCommonArgs {
@@ -466,6 +496,7 @@ mod tests {
             time: false,
             profile,
             no_hash: false,
+            nocheck: false,
         }
     }
 
@@ -584,6 +615,7 @@ mod tests {
             "<a> <b> <c> .\n",
             RdfSyntax::Turtle,
             Some("http://example.org/"),
+            verb_options(false),
             &mut timings,
         )
         .unwrap();
@@ -599,7 +631,14 @@ mod tests {
     fn parsing_charges_its_time_to_the_parse_phase_only() {
         let mut timings = PhaseTimings::start();
         let doc = "<http://e/s> <http://e/p> \"o\" .\n".repeat(200);
-        parse_document(&doc, RdfSyntax::Turtle, None, &mut timings).unwrap();
+        parse_document(
+            &doc,
+            RdfSyntax::Turtle,
+            None,
+            verb_options(false),
+            &mut timings,
+        )
+        .unwrap();
         assert!(timings.elapsed(Phase::Parse) > Duration::ZERO);
         assert_eq!(timings.elapsed(Phase::Read), Duration::ZERO);
         assert_eq!(timings.elapsed(Phase::Decompress), Duration::ZERO);

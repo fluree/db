@@ -57,6 +57,14 @@ pub struct RunContext {
     pub bytes_decoded: u64,
     /// SHA-256 of the *decoded* document, or `None` under `--no-hash`.
     pub sha256: Option<String>,
+    /// Whether terms were validated (false under `--nocheck`).
+    ///
+    /// In the report because a `--nocheck` run and a validating run are not
+    /// comparable measurements, and a number that does not say which it was
+    /// invites exactly the comparison that flatters us. Every other RDF tool
+    /// worth benchmarking against validates by default, so an unlabelled
+    /// `--nocheck` figure would be a faster answer to an easier question.
+    pub validate: bool,
 }
 
 #[derive(Serialize)]
@@ -293,6 +301,9 @@ pub struct ProfileReport {
     /// there is no checkout to ask.
     git_sha: String,
     verb: &'static str,
+    /// Whether term validation ran. `false` marks a `--nocheck` run,
+    /// whose timings are NOT comparable with a validating tool's.
+    validated: bool,
     host: HostInfo,
     corpus: CorpusInfo,
     /// The measured window: from the first byte of input handling to the end
@@ -377,6 +388,7 @@ impl ProfileReport {
             tool_version: env!("CARGO_PKG_VERSION"),
             git_sha: git_sha(),
             verb: ctx.verb,
+            validated: ctx.validate,
             host: HostInfo {
                 os: std::env::consts::OS,
                 arch: std::env::consts::ARCH,
@@ -647,6 +659,7 @@ mod tests {
             bytes_on_wire: 4096,
             bytes_decoded: 4096,
             sha256: Some("abc123".to_string()),
+            validate: true,
         }
     }
 

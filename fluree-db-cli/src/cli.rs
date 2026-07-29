@@ -2827,6 +2827,19 @@ pub struct RdfCommonArgs {
     /// over the input; leave it out when the timing is what matters.
     #[arg(long)]
     pub no_hash: bool,
+
+    /// Skip term validation: do not check that IRIs are IRIs after escape
+    /// expansion and base resolution, or that language tags are well-formed.
+    ///
+    /// Faster, and unsound. Grammar errors are still caught — this only turns
+    /// off the checks that decide whether the terms a well-formed document
+    /// *denotes* are RDF terms, so `<http://ex/ >` is accepted and
+    /// written back out as an IRI containing a space, which is not one.
+    /// Reach for it when you already trust the input and are measuring, not
+    /// when you are converting something you were sent. Benchmark runs that
+    /// use it are labelled in `--profile` output for exactly that reason.
+    #[arg(long)]
+    pub nocheck: bool,
 }
 
 /// How blank-node labels reach converted output.

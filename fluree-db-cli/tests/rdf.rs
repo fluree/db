@@ -2151,3 +2151,135 @@ fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
         .code(EXIT_USAGE)
         .stderr(predicate::str::contains("extension"));
 }
+
+// =============================================================================
+// Term validation and `--nocheck` (H-8)
+// =============================================================================
+
+/// A document whose terms are not RDF terms: it LEXES — ` ` is legal
+/// source — and denotes an IRI containing a space. `turtle-eval-bad-01`.
+const BAD_TERM_TURTLE: &str = concat!(
+    "<http://example.org/s> <http://example.org/p> \"ok\" .\n",
+    "<http://example.org/\\u0020> <http://example.org/p> <http://example.org/o> .\n"
+);
+
+/// `"string"@1` — a language tag that is not one. `turtle-syntax-bad-lang-01`.
+const BAD_LANG_TURTLE: &str = "<http://example.org/s> <http://example.org/p> \"string\"@1 .\n";
+
+#[test]
+fn check_rejects_a_document_whose_terms_are_not_terms() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "bad-term.ttl", BAD_TERM_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        // Located like any other diagnostic: the statement is on line 2.
+        .stderr(predicate::str::contains("bad-term.ttl:2:1"))
+        .stderr(predicate::str::contains("not allowed in an IRI"))
+        .stderr(predicate::str::contains("^"));
+}
+
+#[test]
+fn check_rejects_a_malformed_language_tag() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "bad-lang.ttl", BAD_LANG_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("must be letters"));
+}
+
+/// `--nocheck` is the disclosed fast path: the same document passes, because
+/// the grammar was never the problem.
+#[test]
+fn nocheck_accepts_what_validation_rejects() {
+    let tmp = TempDir::new().unwrap();
+    for (name, content) in [("t.ttl", BAD_TERM_TURTLE), ("l.ttl", BAD_LANG_TURTLE)] {
+        let path = fixture(&tmp, name, content);
+        rdf_cmd()
+            .args(["rdf", "check", "--nocheck"])
+            .arg(&path)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("no syntax errors"));
+    }
+}
+
+/// `--nocheck` must not become a way to launder a syntax error into a pass.
+/// It turns off term validation only; the grammar is still the grammar.
+#[test]
+fn nocheck_does_not_disable_syntax_checking() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check", "--nocheck"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("broken.ttl:3:16"));
+}
+
+#[test]
+fn count_validates_by_default_and_nocheck_opts_out() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "bad-term.ttl", BAD_TERM_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "count"])
+        .arg(&path)
+        .assert()
+        .failure();
+    rdf_cmd()
+        .args(["rdf", "count", "--nocheck"])
+        .arg(&path)
+        .assert()
+        .success();
+}
+
+/// A `--nocheck` measurement is not comparable with a validating tool's, so
+/// the profile says which it was. An unlabelled number is a faster answer to
+/// an easier question.
+#[test]
+fn the_profile_reports_whether_terms_were_validated() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+
+    let out = rdf_cmd()
+        .args(["rdf", "count", "--profile=json"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["validated"], serde_json::json!(true));
+
+    let out = rdf_cmd()
+        .args(["rdf", "count", "--profile=json", "--nocheck"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["validated"], serde_json::json!(false));
+}
+
+/// A BOM-prefixed document is ordinary input, not an error. Windows editors
+/// emit them and riot eats them.
+#[test]
+fn a_byte_order_mark_does_not_break_the_verbs() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "bom.ttl", &format!("\u{FEFF}{VALID_TURTLE}"));
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no syntax errors"));
+}
