@@ -364,6 +364,102 @@ fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
         .stderr(predicate::str::contains("turtle, ntriples"));
 }
 
+/// The writers fold only CONSECUTIVE same-subject runs ("blocks" tier), so a
+/// subject that recurs non-consecutively is written as a SECOND block for the
+/// same subject. That output has to read back — and until there were real
+/// quad readers, nothing checked that the writers and readers agreed on it
+/// (the L-8 gap, closing from both sides here).
+#[test]
+fn repeated_subject_blocks_round_trip_through_the_new_readers() {
+    let tmp = TempDir::new().unwrap();
+    // `:a` recurs non-consecutively in BOTH the default graph and the named
+    // one, which is what produces repeated blocks on the way out.
+    let src = fixture(
+        &tmp,
+        "rep.trig",
+        "@prefix : <http://ex/> .\n\
+         :a :p 1 .\n\
+         :b :q 2 .\n\
+         :a :r 3 .\n\
+         GRAPH :g { :a :s 4 . :b :t 5 . :a :u 6 }\n",
+    );
+
+    let written = tmp.path().join("written.trig");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&written)
+        .assert()
+        .success();
+
+    // The writer really did emit `:a` twice per graph, or this test is
+    // exercising nothing.
+    let trig = std::fs::read_to_string(&written).unwrap();
+    assert!(
+        trig.matches("\n:a\n").count() >= 2,
+        "expected repeated default-graph blocks for :a, got:\n{trig}"
+    );
+
+    // Now read THAT back through the TriG reader and out as N-Quads.
+    let quads = tmp.path().join("rep.nq");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&written)
+        .arg("-o")
+        .arg(&quads)
+        .assert()
+        .success();
+
+    let nq = std::fs::read_to_string(&quads).unwrap();
+    let mut lines: Vec<&str> = nq.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines.sort_unstable();
+    assert_eq!(lines.len(), 6, "every statement must survive:\n{nq}");
+
+    // Both `:a` blocks survived, in the right graphs.
+    assert!(nq.contains("<http://ex/a> <http://ex/p> \"1\"^^"), "{nq}");
+    assert!(nq.contains("<http://ex/a> <http://ex/r> \"3\"^^"), "{nq}");
+    assert!(
+        nq.contains("<http://ex/a> <http://ex/u> \"6\"^^<http://www.w3.org/2001/XMLSchema#integer> <http://ex/g> ."),
+        "the second named-graph block for :a must keep its graph:\n{nq}"
+    );
+
+    // And back to TriG through the N-Quads reader: a fixpoint in CONTENT.
+    // Not in bytes — the first TriG carried a prefix from the source and the
+    // N-Quads intermediate has none, so the second writes full IRIs. Prefixes
+    // are presentation, not statements.
+    let again = tmp.path().join("again.trig");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&quads)
+        .arg("-o")
+        .arg(&again)
+        .assert()
+        .success();
+
+    let back = tmp.path().join("back.nq");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&again)
+        .arg("-o")
+        .arg(&back)
+        .assert()
+        .success();
+
+    let mut round2: Vec<String> = std::fs::read_to_string(&back)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    round2.sort();
+    let round1: Vec<String> = lines.iter().map(|l| (*l).to_string()).collect();
+    assert_eq!(
+        round1, round2,
+        "trig -> nq -> trig -> nq must be a fixpoint"
+    );
+}
+
 /// The quad round trip, end to end through the binary: TriG in, N-Quads out,
 /// TriG back. Both directions are REAL readers now — before this the `.nq`
 /// leg could only be hand-fed, so nothing proved the two formats agreed.

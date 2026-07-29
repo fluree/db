@@ -736,23 +736,18 @@ fn parse_string_long_single(input: &mut Input<'_>) -> ModalResult<TokenKind> {
 
 fn parse_escape_char(input: &mut Input<'_>) -> ModalResult<char> {
     let c: char = any.parse_next(input)?;
+    // The ECHAR rows come from the shared table in fluree-graph-ir; only the
+    // two payload-carrying escapes are scanned here.
+    if let Some(ch) = fluree_graph_ir::chars::simple_escape(c) {
+        return Ok(ch);
+    }
     match c {
-        't' => Ok('\t'),
-        'b' => Ok('\x08'),
-        'n' => Ok('\n'),
-        'r' => Ok('\r'),
-        'f' => Ok('\x0C'),
-        '"' => Ok('"'),
-        '\'' => Ok('\''),
-        '\\' => Ok('\\'),
         'u' => {
             let hex: &str = take_while(4..=4, AsChar::is_hex_digit).parse_next(input)?;
             if hex.len() != 4 {
                 return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
             }
-            let code = u32::from_str_radix(hex, 16)
-                .map_err(|_| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
-            char::from_u32(code)
+            fluree_graph_ir::chars::unicode_escape_value(hex)
                 .ok_or_else(|| winnow::error::ErrMode::Backtrack(ContextError::new()))
         }
         'U' => {
@@ -760,9 +755,7 @@ fn parse_escape_char(input: &mut Input<'_>) -> ModalResult<char> {
             if hex.len() != 8 {
                 return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
             }
-            let code = u32::from_str_radix(hex, 16)
-                .map_err(|_| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
-            char::from_u32(code)
+            fluree_graph_ir::chars::unicode_escape_value(hex)
                 .ok_or_else(|| winnow::error::ErrMode::Backtrack(ContextError::new()))
         }
         _ => Err(winnow::error::ErrMode::Backtrack(ContextError::new())),

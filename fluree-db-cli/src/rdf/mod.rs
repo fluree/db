@@ -360,6 +360,14 @@ pub fn parse_into<S: GraphSink>(
     // and N-Quads have no base and no relative IRIs, so there is nothing for
     // it to apply to. A `--base` passed alongside one of them is inert, not
     // silently mis-applied.
+    //
+    // `.nt` goes through the STRICT reader, not the Turtle parser — the
+    // riot-parity answer, and a deliberate behavior change: a `.nt` file
+    // containing a directive, a prefixed name, a bare number or a
+    // long-quoted string used to be accepted (all of it is valid Turtle)
+    // and is now rejected (none of it is valid N-Triples). That is the
+    // point of `fluree rdf check` on an N-Triples file; accepting it
+    // would make the verb agree with no other tool in the field.
     let result = match syntax {
         RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(text, &mut sink),
         RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(text, &mut sink),

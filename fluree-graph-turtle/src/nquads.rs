@@ -21,7 +21,7 @@
 //! differ by that one production, unlike Turtle-vs-N-Triples which differ
 //! nearly everywhere.
 
-use fluree_graph_ir::chars::{is_pn_chars, is_pn_chars_u};
+use fluree_graph_ir::chars::{is_pn_chars, is_pn_chars_u, simple_escape, unicode_escape_value};
 use fluree_graph_ir::{Datatype, GraphSink, TermId};
 use fluree_vocab::iri::is_absolute_iri;
 
@@ -305,9 +305,7 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
             return Err(self.err("truncated unicode escape"));
         }
         let hex = &self.input[start..start + width];
-        let code = u32::from_str_radix(hex, 16)
-            .map_err(|_| self.err(format!("`{hex}` is not a hex escape")))?;
-        let ch = char::from_u32(code)
+        let ch = unicode_escape_value(hex)
             .ok_or_else(|| self.err(format!("\\u{hex} is not a Unicode scalar value")))?;
         self.pos += width;
         Ok(ch)
@@ -400,26 +398,18 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
                     let Some(esc) = self.peek() else {
                         return Err(self.err("truncated escape"));
                     };
-                    let ch = match esc {
-                        b't' => '\t',
-                        b'b' => '\u{0008}',
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b'f' => '\u{000C}',
-                        b'"' => '"',
-                        b'\'' => '\'',
-                        b'\\' => '\\',
-                        b'u' | b'U' => {
-                            let ch = self.unicode_escape()?;
-                            out.push(ch);
-                            continue;
-                        }
-                        other => {
-                            return Err(self.err(format!(
-                                "`\\{}` is not a valid string escape",
-                                other as char
-                            )))
-                        }
+                    if matches!(esc, b'u' | b'U') {
+                        let ch = self.unicode_escape()?;
+                        out.push(ch);
+                        continue;
+                    }
+                    // ECHAR is one grammar row shared by every RDF text
+                    // syntax; the table lives in fluree-graph-ir so this
+                    // reader and the Turtle lexer cannot drift apart.
+                    let Some(ch) = simple_escape(esc as char) else {
+                        return Err(
+                            self.err(format!("`\\{}` is not a valid string escape", esc as char))
+                        );
                     };
                     self.pos += 1;
                     out.push(ch);
