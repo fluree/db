@@ -1133,15 +1133,20 @@ pub enum Commands {
     /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
     /// `--max-performance` on a cleared machine to auto-size to the host.
     ///
+    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool (O1) — that
+    /// many threads render + encode table batches concurrently (it also bounds the
+    /// concurrent snapshot pins and FK pre-index scans, O5). Default 2 (co-resident).
+    ///
     /// BUDGET MODEL: `--memory-budget-mb` now scales the chunk size for sub-2GB
     /// budgets too (previously any budget below ~2GB underflowed to a fixed 128MB
     /// chunk regardless — O6); below 2GB the chunk is ~budget×0.6 / working-set,
-    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 plus
-    /// the FK parent index. That parent index — held resident for the whole build —
-    /// is now CHARGED against the budget (up to ~50% of it) and the build FAILS
-    /// LOUD if it would overflow, rather than silently OOM the host. Verify is
-    /// memory-bounded in both modes (O2): peak is O(sampled subjects) for `quick`
-    /// and O(one external-sort run) for `full`.
+    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 (one
+    /// chunk buffer + encoding sink per worker) plus the FK parent index. That
+    /// parent index — held resident for the whole build — is now CHARGED against the
+    /// budget (up to ~50% of it) and the build FAILS LOUD if it would overflow,
+    /// rather than silently OOM the host. Verify is memory-bounded in both modes
+    /// (O2): peak is O(sampled subjects) for `quick` and O(one external-sort run)
+    /// for `full`.
     Materialize {
         /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
         graph_source: String,

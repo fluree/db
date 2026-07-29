@@ -2499,6 +2499,7 @@ dependencies = [
  "fluree-db-spatial",
  "fluree-db-storage-aws",
  "fluree-db-storage-ipfs",
+ "fluree-db-tabular",
  "fluree-db-transact",
  "fluree-graph-format",
  "fluree-graph-ir",

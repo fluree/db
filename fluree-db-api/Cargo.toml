@@ -60,6 +60,7 @@ fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
+fluree-db-tabular = { path = "../fluree-db-tabular" }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
 fluree-db-storage-ipfs = { path = "../fluree-db-storage-ipfs", optional = true }
 fluree-search-protocol = { path = "../fluree-search-protocol" }

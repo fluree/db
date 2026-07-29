@@ -76,7 +76,10 @@ mod inner {
     // -----------------------------------------------------------------------
 
     /// Configuration for creating a [`SpoolContext`] — bundles all shared
-    /// allocators needed by the parallel import pipeline.
+    /// allocators needed by the parallel import pipeline. All fields are `Arc`, so
+    /// `Clone` is cheap (a handle bump) — the materialize worker pool hands each
+    /// worker its own clone.
+    #[derive(Clone)]
     pub struct SpoolConfig {
         /// Shared predicate allocator (global IDs, no remap).
         pub predicate_alloc: Arc<SharedDictAllocator>,

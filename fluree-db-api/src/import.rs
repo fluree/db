@@ -4054,6 +4054,10 @@ where
                     spool_dir: &spool_dir,
                     spool_config: Some(&spool_config),
                 };
+                // The driver + its worker pool send chunks on this cloned sender;
+                // keep the outer `result_tx` in this closure so a build error can
+                // still be surfaced to the consumer AFTER the driver drops its copy.
+                let drive_tx = result_tx.clone();
                 let outcome = runtime.block_on(crate::materialize::drive_virtual_import(
                     &*vs.provider,
                     &vs.graph_source_id,
@@ -4061,7 +4065,7 @@ where
                     producer_parallelism,
                     memory_budget_bytes,
                     &ctx,
-                    |idx, parsed| result_tx.send(Ok((idx, parsed))).is_ok(),
+                    drive_tx,
                 ));
                 if let Err(e) = outcome {
                     let _ = result_tx.send(Err(e.to_string()));

@@ -633,27 +633,59 @@ async fn pin_all_tables(
     Ok(())
 }
 
-/// Stream a virtual R2RML source through the whole-graph enumerator, encoding
-/// byte-budgeted [`ParsedChunk`]s and handing each to `emit_chunk(idx, chunk)`
-/// in contiguous `idx` order (`t = idx + 1`). `emit_chunk` returns `false` when
-/// the downstream consumer has gone away, ending the drive early. Dims-first,
-/// with the same pre-index pass as the in-memory driver; the chunk byte budget
-/// (`chunk_size_bytes`) derives from the import memory budget.
-pub async fn drive_virtual_import<F>(
+/// Sum one worker's [`MaterializeStats`] into the running total (O1 aggregation).
+fn merge_stats(acc: &mut MaterializeStats, other: MaterializeStats) {
+    acc.subjects += other.subjects;
+    acc.type_triples += other.type_triples;
+    acc.data_triples += other.data_triples;
+    acc.ref_triples += other.ref_triples;
+    acc.ref_dangling += other.ref_dangling;
+    acc.null_objects += other.null_objects;
+    for (k, v) in other.per_tm {
+        *acc.per_tm.entry(k).or_default() += v;
+    }
+    for (k, v) in other.ref_edges {
+        *acc.ref_edges.entry(k).or_default() += v;
+    }
+}
+
+/// One completed chunk's `(idx, ParsedChunk)` or a stringified build error — the
+/// item type of the producer→consumer result channel (Send + Clone sender).
+type ChunkResult = std::result::Result<(usize, ParsedChunk), String>;
+
+/// Stream a virtual R2RML source through the whole-graph enumerator with a
+/// PARALLEL produce side (O1), encoding byte-budgeted [`ParsedChunk`]s and sending
+/// each on `result_tx` as `(idx, chunk)`. `idx` is a globally-unique, contiguous
+/// sequence from a shared atomic; the downstream `commit_parsed_chunks_in_order`
+/// consumer reorders by `idx`, so chunks may arrive out of order. The final chunk
+/// (highest `idx`, committed last → the twin's head) carries the completion stamp.
+///
+/// Parallelism model (bounded by `parallelism`, the knob that previously only
+/// sized the result channel): after Pass-1 fully pre-indexes every FK parent, the
+/// [`ParentIndexSet`] is READ-ONLY, so `parallelism` sync worker threads each
+/// render + intern + encode batches into their OWN private chunker/sink. This
+/// driver scans each table (async) and dispatches its batches to the workers over
+/// a bounded channel; a blocking send on this dedicated producer thread is natural
+/// backpressure. Peak produce memory = `parallelism` × (one chunk buffer + one
+/// encoding sink) — the SAME N×chunk model the text import path lives under; no new
+/// knob. The r2rml scan futures are !Send, but each worker drives only SYNC
+/// render/encode (the async scans stay on this driver), so no Send bound is needed.
+pub async fn drive_virtual_import(
     provider: &dyn R2rmlBuildProvider,
     graph_source_id: &str,
     chunk_size_bytes: usize,
     parallelism: usize,
     memory_budget_bytes: usize,
     ctx: &VirtualChunkContext<'_>,
-    mut emit_chunk: F,
-) -> Result<MaterializeStats, MaterializeError>
-where
-    F: FnMut(usize, ParsedChunk) -> bool,
-{
-    let mapping = provider.compiled_mapping(graph_source_id, None).await?;
+    result_tx: std::sync::mpsc::SyncSender<ChunkResult>,
+) -> Result<MaterializeStats, MaterializeError> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let mapping = Arc::new(provider.compiled_mapping(graph_source_id, None).await?);
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
+    let workers = parallelism.max(1);
     // The FK parent index is fully resident for the whole build and was outside
     // any budget (O6). Charge it against a fraction of the import budget and fail
     // loud if it overflows. `0` (no budget known) disables the guard.
@@ -662,26 +694,31 @@ where
     // Pin-all pre-pass — pin every table's snapshot before emission so the
     // watermark is complete and cross-table skew is bounded to seconds (§17(a)).
     let pin_start = std::time::Instant::now();
-    pin_all_tables(provider, graph_source_id, &mapping, parallelism).await?;
+    pin_all_tables(provider, graph_source_id, &mapping, workers).await?;
     tracing::info!(
         pin_ms = pin_start.elapsed().as_millis() as u64,
         "materialize.phase pin_all_tables"
     );
 
-    // Pass 1 — pre-index cyclic / self-referential parents (no triples emitted).
-    // Scan the pre-index tables CONCURRENTLY, bounded by `parallelism` (O5): each
-    // table indexes into its OWN partial parent index, and the partials merge back
-    // once all scans complete. Parent IRIs are disjoint across pre-index tables, so
-    // the merge is a union. Peak extra memory = parallelism × (one batch + one
-    // table's partial index); the partials sum to the final index (resident
-    // regardless of ordering). A2 measured ~217s of strictly-serial cold-S3
-    // fact-table fetch here — the concurrency overlaps that round-trip.
-    let preindex: Vec<&String> = materialization.preindex.iter().collect();
-    if !preindex.is_empty() {
+    // Pass 1 — pre-index EVERY FK parent (not just cyclic/self-referential), so the
+    // ParentIndexSet is COMPLETE and READ-ONLY before Pass-2 (O1 requires this: a
+    // child may emit on any worker in any order, so its parent must already be
+    // indexed). Acyclic dim parents that used to be indexed lazily during their own
+    // emit scan are therefore scanned twice (index + emit) — the double-read on
+    // (usually small) dimensions is the cost O1 accepts for produce parallelism;
+    // eliminating it is the deferred O5(c). Scans run concurrently (O5): each table
+    // indexes into its OWN partial index (disjoint parent IRIs), merged back after.
+    let all_parents: Vec<String> = mapping
+        .triples_maps
+        .keys()
+        .filter(|iri| parents.is_parent(iri))
+        .cloned()
+        .collect();
+    if !all_parents.is_empty() {
         let parents_ref = &parents;
         let mapping_ref = &mapping;
         let results: Vec<Result<Option<ParentIndexSet>, MaterializeError>> =
-            futures::stream::iter(preindex.into_iter().map(move |tm_iri| async move {
+            futures::stream::iter(all_parents.iter().map(move |tm_iri| async move {
                 let Some(tm) = mapping_ref.triples_maps.get(tm_iri) else {
                     return Ok::<Option<ParentIndexSet>, MaterializeError>(None);
                 };
@@ -698,7 +735,7 @@ where
                 }
                 Ok(Some(partial))
             }))
-            .buffer_unordered(parallelism.max(1))
+            .buffer_unordered(workers)
             .collect()
             .await;
         for res in results {
@@ -708,17 +745,91 @@ where
         }
         check_parent_index_budget(&parents, parent_index_budget)?;
     }
+    // Read-only for the rest of the build — shared by the worker pool.
+    let parents = Arc::new(parents);
 
-    // Pass 2 — emit into the byte-budgeted chunker; encode + ship completed
-    // chunks as they close. A one-chunk lookahead (`pending`) holds the most
-    // recently closed group back, so the LAST group can carry the completion
-    // stamp — the stamp lands on the final commit without an extra 0-op commit.
-    let mut stats = MaterializeStats::default();
-    let mut chunker = ChunkingObserver::new(chunk_size_bytes);
-    let mut next_idx = 0usize;
-    let mut pending: Option<Vec<OwnedTriple>> = None;
-    let mut encode_ms: u128 = 0;
+    // Pass 2 — parallel produce. Spawn `workers` sync render/encode threads fed by
+    // this driver's scans over a bounded work channel; each worker owns a private
+    // chunker + encoding sink and pulls a globally-unique chunk `idx` from a shared
+    // atomic as each chunk closes.
+    let next_idx = Arc::new(AtomicUsize::new(0));
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<(
+        String,
+        fluree_db_tabular::ColumnBatch,
+    )>(workers.saturating_mul(2).max(1));
+    let work_rx = Arc::new(Mutex::new(work_rx));
 
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let work_rx = Arc::clone(&work_rx);
+        let worker_tx = result_tx.clone();
+        let parents = Arc::clone(&parents);
+        let mapping = Arc::clone(&mapping);
+        let next_idx = Arc::clone(&next_idx);
+        let shared_alloc = Arc::clone(ctx.shared_alloc);
+        let ledger = ctx.ledger_id.to_string();
+        let spool_dir = ctx.spool_dir.to_path_buf();
+        let spool_config = ctx.spool_config.cloned();
+        let compress = ctx.compress;
+        let handle = std::thread::Builder::new()
+            .name("virtual-materializer-worker".into())
+            .spawn(
+                move || -> std::result::Result<(MaterializeStats, u128), String> {
+                    let wctx = VirtualChunkContext {
+                        shared_alloc: &shared_alloc,
+                        ledger_id: &ledger,
+                        compress,
+                        spool_dir: &spool_dir,
+                        spool_config: spool_config.as_ref(),
+                    };
+                    let mut chunker = ChunkingObserver::new(chunk_size_bytes);
+                    let mut stats = MaterializeStats::default();
+                    let mut encode_ms: u128 = 0;
+                    let mut encode_send =
+                        |triples: &[OwnedTriple]| -> std::result::Result<bool, String> {
+                            let idx = next_idx.fetch_add(1, Ordering::SeqCst);
+                            let t = (idx + 1) as i64;
+                            let enc = std::time::Instant::now();
+                            let parsed = build_virtual_chunk(triples, &wctx, t, idx, None)
+                                .map_err(|e| e.to_string())?;
+                            encode_ms += enc.elapsed().as_millis();
+                            // Err => the consumer dropped the receiver; stop early.
+                            Ok(worker_tx.send(Ok((idx, parsed))).is_ok())
+                        };
+                    loop {
+                        let (tm_iri, batch) = match work_rx.lock().unwrap().recv() {
+                            Ok(item) => item,
+                            Err(_) => break, // driver closed the work channel
+                        };
+                        let Some(tm) = mapping.triples_maps.get(&tm_iri) else {
+                            continue;
+                        };
+                        emit_batch(tm, &batch, &parents, &mut chunker, &mut stats)
+                            .map_err(|e| e.to_string())?;
+                        while let Some(triples) = chunker.completed.pop_front() {
+                            if !encode_send(&triples)? {
+                                return Ok((stats, encode_ms));
+                            }
+                        }
+                    }
+                    // Flush this worker's trailing sub-threshold buffer (never stamped).
+                    if let Some(triples) = chunker.take_final() {
+                        let _ = encode_send(&triples)?;
+                    }
+                    Ok((stats, encode_ms))
+                },
+            )
+            .map_err(|e| {
+                MaterializeError::from(R2rmlError::Materialization(format!(
+                    "spawn materialize worker: {e}"
+                )))
+            })?;
+        handles.push(handle);
+    }
+
+    // Driver: scan each table (async) and dispatch its batches to the worker pool.
+    // A blocking send on this dedicated producer thread is natural backpressure; if
+    // the workers have all gone (consumer dropped), the send errs and we stop.
     for tm_iri in &materialization.emit_order {
         let Some(tm) = mapping.triples_maps.get(tm_iri) else {
             continue;
@@ -727,49 +838,54 @@ where
             .table_name()
             .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
         let projection = scan_projection(tm, &parents);
-        let lazy_index = !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
         let table_start = std::time::Instant::now();
-        let triples_before = stats.total_triples();
         let mut stream = provider
             .scan_table(graph_source_id, table, &projection, &[], None, None)
             .await?;
+        let mut consumer_gone = false;
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            if lazy_index {
-                parents.index_batch(tm, &batch)?;
-            }
-            emit_batch(tm, &batch, &parents, &mut chunker, &mut stats)?;
-            while let Some(triples) = chunker.completed.pop_front() {
-                // Hold the newest group; flush the previously held group (if any)
-                // as a non-final chunk, keeping the last group for the stamp.
-                if let Some(prev) = pending.replace(triples) {
-                    let t = (next_idx + 1) as i64;
-                    let enc = std::time::Instant::now();
-                    let parsed = build_virtual_chunk(&prev, ctx, t, next_idx, None)?;
-                    encode_ms += enc.elapsed().as_millis();
-                    if !emit_chunk(next_idx, parsed) {
-                        return Ok(stats);
-                    }
-                    next_idx += 1;
-                }
+            if work_tx.send((tm_iri.clone(), batch)).is_err() {
+                consumer_gone = true;
+                break;
             }
         }
         tracing::info!(
             table = %table,
-            scan_emit_ms = table_start.elapsed().as_millis() as u64,
-            triples = stats.total_triples() - triples_before,
-            "materialize.phase table_scan_emit"
+            scan_ms = table_start.elapsed().as_millis() as u64,
+            "materialize.phase table_scan"
         );
-        // A lazily-indexed dimension grew the resident parent index during its own
-        // emit scan — recheck the budget (O6).
-        if lazy_index {
-            check_parent_index_budget(&parents, parent_index_budget)?;
+        if consumer_gone {
+            break;
         }
     }
+    drop(work_tx); // signal workers: no more batches
 
-    // Assemble the twin's completion stamp now that every table is pinned and
-    // scanned (fail-loud on an empty watermark for a non-empty table set). Chunk D
-    // persists it into the FINAL commit's txn_meta.
+    // Join workers, aggregating stats + encode time; surface the first worker error.
+    let mut total_stats = MaterializeStats::default();
+    let mut total_encode_ms: u128 = 0;
+    let mut worker_err: Option<String> = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok((stats, enc))) => {
+                merge_stats(&mut total_stats, stats);
+                total_encode_ms += enc;
+            }
+            Ok(Err(e)) => worker_err = worker_err.or(Some(e)),
+            Err(_) => {
+                worker_err =
+                    worker_err.or(Some("materialize worker thread panicked".to_string()));
+            }
+        }
+    }
+    if let Some(e) = worker_err {
+        return Err(MaterializeError::from(R2rmlError::Materialization(e)));
+    }
+
+    // Assemble + ship the completion stamp on the FINAL chunk (highest idx →
+    // committed last → the twin's head; a head-walk finds the stamp iff the build
+    // completed, §17(a)). With parallel workers the stamp always rides its own
+    // final commit (0-triple + stamp) — the already-supported empty-stamp shape.
     let stamp = build_watermark_stamp(provider, graph_source_id, &mapping)?;
     tracing::info!(
         builder_version = %stamp.builder_version,
@@ -777,39 +893,20 @@ where
         watermark_tables = stamp.tables.len(),
         "materialize completion stamp assembled"
     );
-
-    // Fold the trailing sub-threshold buffer into the lookahead as the final
-    // group (so it, not a held earlier group, carries the stamp).
-    if let Some(triples) = chunker.take_final() {
-        if let Some(prev) = pending.replace(triples) {
-            let t = (next_idx + 1) as i64;
-            let enc = std::time::Instant::now();
-            let parsed = build_virtual_chunk(&prev, ctx, t, next_idx, None)?;
-            encode_ms += enc.elapsed().as_millis();
-            if !emit_chunk(next_idx, parsed) {
-                return Ok(stats);
-            }
-            next_idx += 1;
-        }
-    }
-
-    // FINAL commit — carries the completion stamp. Normally the last held group;
-    // an empty stamp-only commit only for a graph that produced no triples. Being
-    // the last commit, a head-walk finds the stamp iff the build completed (§17(a)).
-    let final_triples = pending.unwrap_or_default();
-    let t = (next_idx + 1) as i64;
-    let enc = std::time::Instant::now();
-    let parsed = build_virtual_chunk(&final_triples, ctx, t, next_idx, Some(&stamp))?;
-    encode_ms += enc.elapsed().as_millis();
-    emit_chunk(next_idx, parsed);
+    let idx = next_idx.fetch_add(1, Ordering::SeqCst);
+    let t = (idx + 1) as i64;
+    let parsed = build_virtual_chunk(&[], ctx, t, idx, Some(&stamp))?;
+    let _ = result_tx.send(Ok((idx, parsed)));
+    drop(result_tx);
 
     tracing::info!(
-        encode_ms = encode_ms as u64,
-        chunks = next_idx + 1,
-        total_triples = stats.total_triples(),
+        encode_ms = total_encode_ms as u64,
+        workers,
+        chunks = idx + 1,
+        total_triples = total_stats.total_triples(),
         "materialize.phase encode_total"
     );
-    Ok(stats)
+    Ok(total_stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -1706,7 +1803,10 @@ fn is_numeric_datatype(dt: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::literal_sink_args;
+    use fluree_db_transact::import::ParsedChunk;
     use fluree_vocab::UnresolvedDatatypeConstraint as Dtc;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn mapping_hash_is_deterministic_and_change_sensitive() {
@@ -1968,5 +2068,285 @@ mod tests {
         let (m2, e2) = super::diff_sorted_files(&src, &src).unwrap();
         assert_eq!((m2, e2), (0, 0), "identical inputs diff to zero");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- O1 parallel produce: p=1 vs p=2 differential (hermetic) ---
+
+    /// In-memory build provider serving a fixed mapping + batches (no Iceberg /
+    /// catalog), so `drive_virtual_import` can be driven hermetically at different
+    /// parallelisms and the outputs compared.
+    #[derive(Debug)]
+    struct MockBuildProvider {
+        mapping: Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>,
+        batches: HashMap<String, Vec<fluree_db_tabular::ColumnBatch>>,
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_query::r2rml::R2rmlProvider for MockBuildProvider {
+        async fn has_r2rml_mapping(&self, _graph_source_id: &str) -> bool {
+            true
+        }
+        async fn compiled_mapping(
+            &self,
+            _graph_source_id: &str,
+            _as_of_t: Option<i64>,
+        ) -> fluree_db_query::error::Result<Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>>
+        {
+            Ok(Arc::clone(&self.mapping))
+        }
+        fn build_watermark(
+            &self,
+            _graph_source_id: &str,
+        ) -> HashMap<String, fluree_db_query::r2rml::TableWatermark> {
+            // Non-empty so the completion-stamp guard passes (one pin per table).
+            self.batches
+                .keys()
+                .map(|t| {
+                    (
+                        t.clone(),
+                        fluree_db_query::r2rml::TableWatermark {
+                            metadata_location: format!("mock://{t}/metadata.json"),
+                            snapshot_id: Some(1),
+                            sequence_number: Some(1),
+                        },
+                    )
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_query::r2rml::R2rmlTableProvider for MockBuildProvider {
+        async fn scan_table(
+            &self,
+            _graph_source_id: &str,
+            table_name: &str,
+            _projection: &[String],
+            _filters: &[fluree_db_query::r2rml::ScanFilter],
+            _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
+            _as_of_t: Option<i64>,
+        ) -> fluree_db_query::error::Result<fluree_db_query::r2rml::ColumnBatchStream> {
+            let batches: Vec<fluree_db_query::error::Result<fluree_db_tabular::ColumnBatch>> = self
+                .batches
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Ok)
+                .collect();
+            Ok(Box::pin(futures::stream::iter(batches)))
+        }
+    }
+
+    /// A small star-schema fixture (Customer parent + Order child via a
+    /// RefObjectMap), split into multiple batches so a parallel run distributes
+    /// work across workers.
+    fn star_fixture() -> MockBuildProvider {
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            SubjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, Column, FieldInfo, FieldType};
+
+        fn field(name: &str, ty: FieldType, id: i32) -> FieldInfo {
+            FieldInfo {
+                name: name.to_string(),
+                field_type: ty,
+                nullable: true,
+                field_id: id,
+            }
+        }
+        fn s(v: &str) -> Option<String> {
+            Some(v.to_string())
+        }
+
+        let mut customer = TriplesMap::new("<#Customer>", "cust");
+        customer.subject_map =
+            SubjectMap::template("http://ex/c/{c_key}").with_class("http://ex/Customer");
+        customer.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/name"),
+            object_map: ObjectMap::column("name"),
+        }];
+
+        let mut order = TriplesMap::new("<#Order>", "ord");
+        order.subject_map =
+            SubjectMap::template("http://ex/o/{o_key}").with_class("http://ex/Order");
+        order.predicate_object_maps = vec![
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/amount"),
+                object_map: ObjectMap::column_typed(
+                    "amount",
+                    "http://www.w3.org/2001/XMLSchema#decimal",
+                ),
+            },
+            PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/placedBy"),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                    "<#Customer>",
+                    "cust_key",
+                    "c_key",
+                )),
+            },
+        ];
+
+        let cust_schema = std::sync::Arc::new(BatchSchema::new(vec![
+            field("c_key", FieldType::Int64, 1),
+            field("name", FieldType::String, 2),
+        ]));
+        let cust_batch = fluree_db_tabular::ColumnBatch::new(
+            cust_schema,
+            vec![
+                Column::Int64(vec![Some(10), Some(20), Some(30), Some(40)]),
+                Column::String(vec![s("Acme"), s("Globex"), s("Initech"), s("Umbrella")]),
+            ],
+        )
+        .unwrap();
+
+        let ord_schema = std::sync::Arc::new(BatchSchema::new(vec![
+            field("o_key", FieldType::Int64, 1),
+            field("amount", FieldType::String, 2),
+            field("cust_key", FieldType::Int64, 3),
+        ]));
+        let ord_batch = |keys: &[i64], amts: &[&str], custs: &[i64]| {
+            fluree_db_tabular::ColumnBatch::new(
+                ord_schema.clone(),
+                vec![
+                    Column::Int64(keys.iter().map(|k| Some(*k)).collect()),
+                    Column::String(amts.iter().map(|a| s(a)).collect()),
+                    Column::Int64(custs.iter().map(|c| Some(*c)).collect()),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut batches = HashMap::new();
+        batches.insert("cust".to_string(), vec![cust_batch]);
+        // Two batches for the child, so a parallel run has multiple work items.
+        batches.insert(
+            "ord".to_string(),
+            vec![
+                ord_batch(
+                    &[1, 2, 3, 4],
+                    &["9.99", "5.00", "1.00", "2.50"],
+                    &[10, 20, 30, 40],
+                ),
+                ord_batch(
+                    &[5, 6, 7, 8],
+                    &["3.14", "2.72", "1.41", "1.61"],
+                    &[10, 20, 30, 99],
+                ),
+            ],
+        );
+
+        MockBuildProvider {
+            mapping: Arc::new(CompiledR2rmlMapping::new(vec![customer, order])),
+            batches,
+        }
+    }
+
+    /// Drive one build at `parallelism`, returning the aggregate stats and every
+    /// emitted `(idx, ParsedChunk)`.
+    fn run_build(
+        provider: &MockBuildProvider,
+        parallelism: usize,
+    ) -> (super::MaterializeStats, Vec<(usize, ParsedChunk)>) {
+        use fluree_db_transact::namespace::{NamespaceRegistry, SharedNamespaceAllocator};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let shared_alloc = Arc::new(SharedNamespaceAllocator::from_registry(
+            &NamespaceRegistry::new(),
+        ));
+        let spool_dir = std::env::temp_dir().join(format!(
+            "fluree-o1-test-{}-{}",
+            std::process::id(),
+            parallelism
+        ));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<super::ChunkResult>(parallelism.max(1));
+        let drain = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            while let Ok(msg) = rx.recv() {
+                out.push(msg.expect("no build error in the mock"));
+            }
+            out
+        });
+
+        let stats = rt.block_on(async {
+            let ctx = super::VirtualChunkContext {
+                shared_alloc: &shared_alloc,
+                ledger_id: "mock-twin",
+                compress: false,
+                spool_dir: &spool_dir,
+                spool_config: None, // encode-only (no spool sidecars) for the test
+            };
+            super::drive_virtual_import(
+                provider,
+                "mock-gs",
+                64, // tiny chunk budget → many chunks
+                parallelism,
+                0, // parent-index budget guard disabled
+                &ctx,
+                tx,
+            )
+            .await
+            .expect("build succeeds")
+        });
+
+        let chunks = drain.join().unwrap();
+        let _ = std::fs::remove_dir_all(&spool_dir);
+        (stats, chunks)
+    }
+
+    #[test]
+    fn parallel_produce_matches_serial_and_stamps_once() {
+        let provider = star_fixture();
+        let (stats1, chunks1) = run_build(&provider, 1);
+        let (stats2, chunks2) = run_build(&provider, 2);
+
+        // 1) Identical enumeration regardless of parallelism (the triples emitted
+        //    are the same; only chunk boundaries/order differ).
+        assert_eq!(stats1, stats2, "p=1 and p=2 must emit identical stats");
+        assert!(stats1.total_triples() > 0, "the fixture must emit triples");
+
+        // 2) No triple lost or duplicated: total encoded ops match across runs.
+        let ops =
+            |cs: &[(usize, ParsedChunk)]| cs.iter().map(|(_, c)| c.op_count as u64).sum::<u64>();
+        assert_eq!(
+            ops(&chunks1),
+            ops(&chunks2),
+            "total op_count must match p=1 vs p=2"
+        );
+
+        // 3) Chunk indices are unique and contiguous 0..N in each run (the shared
+        //    atomic invariant the reordering consumer relies on).
+        for (label, chunks) in [("p1", &chunks1), ("p2", &chunks2)] {
+            let mut idxs: Vec<usize> = chunks.iter().map(|(i, _)| *i).collect();
+            idxs.sort_unstable();
+            let expected: Vec<usize> = (0..chunks.len()).collect();
+            assert_eq!(
+                idxs, expected,
+                "{label}: idx must be unique + contiguous 0..N"
+            );
+
+            // 4) Exactly ONE chunk carries the completion stamp, and it is the
+            //    highest idx (committed last → the twin's head).
+            let stamped: Vec<usize> = chunks
+                .iter()
+                .filter(|(_, c)| super::read_stamp(&c.txn_meta).is_some())
+                .map(|(i, _)| *i)
+                .collect();
+            assert_eq!(stamped.len(), 1, "{label}: exactly one stamped final chunk");
+            assert_eq!(
+                stamped[0],
+                chunks.len() - 1,
+                "{label}: the stamp must ride the highest (final) idx"
+            );
+        }
     }
 }
