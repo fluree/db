@@ -94,19 +94,23 @@ $ fluree rdf count corpus.ttl --profile
   ┌──────────┬──────────────┬──────────────┐
   │ phase    │           ms │       % wall │
   ├──────────┼──────────────┼──────────────┤
-  │ read     │         1.73 │         0.07 │
-  │ parse    │      2481.16 │        99.81 │
+  │ read     │         2.24 │         0.53 │
+  │ parse    │       422.99 │        99.46 │
   └──────────┴──────────────┴──────────────┘
 
-  count corpus.ttl · turtle · 5.38 MiB · macos-aarch64
-  wall 2.49s (input → parse; excludes startup and fingerprinting) · 3.1ms unattributed
-  240000 triples · 96.5K/s · 120001 grammar statements · peak RSS 58.05 MiB
-  sink: below the measurement floor — across 720004 calls its per-event cost is
-  under 79.9ms, which is where the clock's own 26.6ms stops being separable from it
-  profiler cost 0.009% of wall (11481 clock reads @ 37ns/pair)
+  count corpus.ttl · turtle · 20.40 MiB · macos-aarch64
+  wall 425.3ms (input → parse; excludes startup and fingerprinting) · 75μs unattributed
+  960000 triples · 2.26M/s · 480001 grammar statements · peak RSS 39.36 MiB
+  sink: below the measurement floor — under 96ns per call across 2400104 calls,
+  which is where the clock's own 32ns/call stops being separable from it
+  profiler cost 0.144% of wall (38289 clock reads @ 32ns/pair)
+  UNTRUSTED sink: its extrapolated clock artifact is 18.1% of wall — the sink
+  figure is not a baseline; read, decompress and parse are unaffected
 ```
 
-Four things in that report are worth understanding.
+That is a **release build** — a debug binary is roughly 20× slower and would
+calibrate expectations badly. Four things in the report are worth
+understanding.
 
 **The sink usually cannot be measured, and says so.** Timing every sink call
 would take two clock reads per event, and on these verbs a clock read costs
@@ -131,27 +135,45 @@ to the end of parsing: it excludes process startup, and it excludes the
 SHA-256 fingerprint, which is computed after the clock stops. Pass
 `--no-hash` to skip that pass entirely.
 
-**The profiler prices its own instrument.** It measures what a clock read
-costs on this host and reports two figures: what the reads it actually took
-cost the run, and what the clock artifact carried by a *scaled* sink estimate
-would come to. If either exceeds 2% of wall the report is marked `UNTRUSTED`,
-and the line says which one — an artifact-driven warning leaves the read,
-decompress and parse phases perfectly sound.
+**The profiler prices its own instrument, and gives two verdicts.** It
+measures what a clock read costs on this host, then reports both what the
+reads it actually took cost the run (`measured_overhead_pct` → `phases_trusted`)
+and what the clock artifact carried by a *scaled* sink estimate would come to
+(`estimator_artifact_pct` → `sink_trusted`). Either exceeding 2% of wall
+prints an `UNTRUSTED` line naming that half. They are separate because the
+second is false on essentially every `count` — a discard sink's artifact is a
+large share of a fast parse — and one combined flag that is always false is a
+flag nobody reads. **A regression gate should key on `phases_trusted`.**
 
-`--profile=json` emits the same run as one JSON document on stderr. Beyond the
-phase array it carries the tool version and the git SHA it was built from, the
-host class, thread count and peak RSS, the corpus fingerprint, event counts,
-rates, a `sink` block (including `body_ns: null` when unresolved), and the
-self-calibration block. The `schema` field is `fluree.rdf.profile.v1`.
+**The sink estimate assumes a cooperating corpus.** The sampling schedule is a
+deterministic function of the input, which is what makes two profiles of the
+same corpus comparable — and also means someone who chooses the input can work
+out which statements get timed and put the expensive work elsewhere. It
+defends against the periodic structure that occurs naturally, not against a
+corpus built to hide from it. `sink.relative_std_error_pct` bounds ordinary
+sampling error; nothing here bounds a deliberate one.
+
+`--profile=json` emits the same run as one JSON document on stderr, with
+`schema` set to `fluree.rdf.profile.v1`:
 
 ```bash
 fluree rdf count dump.ttl --profile=json --no-hash 2> run.json
 ```
 
-Set `FLUREE_BENCH_HOST_CLASS` to name the machine class for baseline
-comparison; it defaults to `{os}-{arch}`, which does not distinguish two
-different cloud instance types. Absolute timings may only be diffed between
-runs whose `host_class` matches.
+| Field | Meaning |
+|---|---|
+| `git_sha` | Commit the **binary was built from** — `git rev-parse` beside the executable, not in the working directory, so running it from another checkout cannot misattribute a baseline. `"unknown"` outside a checkout. |
+| `host.host_class` | Comparability class; `FLUREE_BENCH_HOST_CLASS` or `{os}-{arch}`. Absolute timings may only be diffed between runs whose class matches — `{os}-{arch}` alone does not tell two cloud instance types apart. |
+| `host.peak_rss_bytes` | Peak RSS, normalized across platforms. |
+| `sink.body_ns` | Estimated per-event sink cost, or `null` when unresolvable. Never `0` for "unknown". |
+| `sink.floor_ns_per_call` | The per-call cost the sink would have to exceed to be visible. |
+| `sink.relative_std_error_pct` | Sampling error of the estimate; `null` under two samples. |
+| `self_calibration.phases_trusted` | Whether the phase breakdown is baseline-grade. **Gate on this one.** |
+| `self_calibration.sink_trusted` | Whether the sink estimate is baseline-grade. Usually false for `count`. |
+
+The `sink` block is separate from `phases` because its most common honest
+answer — "this could not be measured" — is not a duration, and an unresolved
+sink gets no phase row at all rather than a zero one.
 
 ## Memory
 
@@ -160,17 +182,23 @@ but not by a fixed multiple, because most of the excess is the parser's IRI
 cache, and that grows with the number of *distinct* IRIs rather than with
 bytes.
 
-Measured on this CLI over a 20 MiB Turtle corpus:
+Release build, macOS/aarch64, 480k statements per corpus:
 
-| Corpus shape | Peak RSS / input bytes |
-|---|---|
-| Every subject distinct | ~6.2× |
-| 100 subjects, reused | ~2.4× |
+| Corpus | Input | Peak RSS | Ratio |
+|---|---|---|---|
+| `distinct.ttl` — every subject a fresh IRI | 22.2 MiB | 148.7 MiB | 6.7× |
+| `reused.ttl` — 100 subjects, reused | 20.4 MiB | 39.3 MiB | 1.9× |
 
-Plus a fixed ~25 MiB for the binary and runtime. At the 4 GiB input cap that
-is roughly 10–25 GB depending on shape, which is worth knowing before pointing
-this at a large dump on a small machine. Streaming and chunked reading land
-with the parallel conversion pipeline; until then, split large inputs.
+Both fixtures come from `scripts/rdf-rss-fixture.py`, so the figures
+reproduce; expect them to move with IRI length and with corpus shape, which is
+the point of quoting a range rather than a constant. At the 4 GiB input cap
+this implies roughly 8–27 GB depending on shape, which is worth knowing before
+pointing the tool at a large dump on a small machine. Streaming and chunked
+reading land with the parallel conversion pipeline; until then, split large
+inputs.
+
+`--profile=json` reports `host.peak_rss_bytes` for the run in hand, normalized
+across the Darwin-bytes / Linux-kilobytes split in `ru_maxrss`.
 
 ## Exit codes
 
