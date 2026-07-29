@@ -14,7 +14,7 @@
 //! triples into the native import pipeline.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -24,7 +24,7 @@ use fluree_db_core::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider, TableWatermark};
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, TriplesMap};
 use fluree_db_r2rml::materialize::{
-    emit_batch, plan, MaterializeStats, NTriplesCollector, ParentIndexSet, TripleObserver,
+    emit_batch, plan, render_term, MaterializeStats, ParentIndexSet, TripleObserver,
 };
 use fluree_db_r2rml::{R2rmlError, RdfTerm};
 use fluree_db_transact::import::ParsedChunk;
@@ -791,20 +791,19 @@ impl ParityReport {
 const SAMPLE_SUBJECTS_PER_CLASS: usize = 3;
 
 /// Verify a built native twin against its virtual R2RML source at the pinned
-/// snapshots (DEC-003 §8). The virtual side is the Chunk-A enumerator (the
-/// oracle the twin was built from); the twin side is a native wildcard query.
-/// Both are rendered to the SAME N-Triples form and compared:
+/// snapshots (DEC-003 §8). Both verify modes are MEMORY-BOUNDED: neither ever
+/// holds the whole graph resident (the O2 fix — the previous implementation
+/// double-buffered every source triple into a `BTreeSet` AND read the entire twin
+/// into another, ~26.8 GB footprint at 6.1M triples and a certain OOM at 35M even
+/// in Quick mode). The virtual side is the same Chunk-A enumerator the twin was
+/// built from (so a quick pass catches ingest/index corruption but shares the
+/// enumerator's blind spot — run `--verify full` for the whole-graph diff).
 ///
-/// - **Class counts (always-on):** the `rdf:type` → class triple count per class
-///   must match. Catches the realistic builder-bug classes (dropped batches,
-///   double writes, missed tables).
-/// - **Per-property counts:** skipped-with-note here — the manifest-sound
-///   non-nullable fast path (DEC-003 §5) is a real-Iceberg optimization, not run
-///   over the enumeration oracle.
-/// - **Stratified sample (`Quick`, always-on):** the full triple set of the first
-///   [`SAMPLE_SUBJECTS_PER_CLASS`] subjects of each class must match — a value-
-///   level node compare that surfaces any systematic transform bug.
-/// - **Full diff (`Full`):** every source triple is in the twin and vice-versa.
+/// - [`VerifyMode::Quick`] — peak RSS is O(sampled subjects): class counts come
+///   from a single streamed source pass + bounded twin COUNT queries, and the
+///   per-subject sample pulls only a seeded window of subjects on each side.
+/// - [`VerifyMode::Full`] — spools BOTH sides to disk, external-sorts them under a
+///   bounded working set, and streams a k-way diff; peak RSS is O(one sort run).
 ///
 /// Returns the report; the caller decides whether to announce or drop the twin.
 pub async fn verify_twin<P>(
@@ -817,67 +816,15 @@ pub async fn verify_twin<P>(
 where
     P: R2rmlProvider + R2rmlTableProvider,
 {
-    // Virtual oracle: enumerate the source into N-Triples (the twin was built
-    // from this exact enumeration, so it is the ground truth to diff against).
-    // Both sides are numeric-canonicalized so a value-preserving typed-literal
-    // normalization (e.g. a stored `xsd:decimal` re-rendering "5.00" as "5") is
-    // not misreported as a divergence.
-    let mut collector = NTriplesCollector::default();
-    let oracle_start = std::time::Instant::now();
-    materialize_graph(provider, graph_source_id, &mut collector).await?;
-    let source: BTreeSet<String> = collector
-        .sorted_unique()
-        .into_iter()
-        .map(|t| canonicalize_numeric_nt(&t))
-        .collect();
-    tracing::info!(
-        verify_oracle_ms = oracle_start.elapsed().as_millis() as u64,
-        source_triples = source.len(),
-        "materialize.phase verify_source_oracle"
-    );
-
-    // Twin side: read every default-graph triple back and render identically.
-    let twin_start = std::time::Instant::now();
-    let twin: BTreeSet<String> = read_twin_ntriples(fluree, ledger)
-        .await?
-        .into_iter()
-        .map(|t| canonicalize_numeric_nt(&t))
-        .collect();
-    tracing::info!(
-        verify_twin_read_ms = twin_start.elapsed().as_millis() as u64,
-        twin_triples = twin.len(),
-        "materialize.phase verify_twin_read"
-    );
-
-    let mapping = provider.compiled_mapping(graph_source_id, None).await?;
-    let classes: BTreeSet<String> = mapping
-        .triples_maps
-        .values()
-        .flat_map(|tm| tm.subject_map.classes.iter().cloned())
-        .collect();
-
-    let mut checks = Vec::new();
-
-    // Class counts — always on.
-    for class in &classes {
-        let suffix = format!("<{}> <{class}> .", fluree_vocab::rdf::TYPE);
-        let source_count = source.iter().filter(|t| t.ends_with(&suffix)).count() as u64;
-        let twin_count = twin.iter().filter(|t| t.ends_with(&suffix)).count() as u64;
-        checks.push(ParityCheck {
-            name: format!("count:{class}"),
-            outcome: if source_count == twin_count {
-                CheckOutcome::Match
-            } else {
-                CheckOutcome::Mismatch {
-                    source: source_count,
-                    twin: twin_count,
-                }
-            },
-        });
+    match mode {
+        VerifyMode::Quick => verify_twin_quick(fluree, ledger, provider, graph_source_id).await,
+        VerifyMode::Full => verify_twin_full(fluree, ledger, provider, graph_source_id).await,
     }
+}
 
-    // Per-property counts — skipped-with-note (manifest-sound fast path only).
-    checks.push(ParityCheck {
+/// The `per-property-counts` skipped-with-note check (shared by both modes).
+fn per_property_skipped() -> ParityCheck {
+    ParityCheck {
         name: "per-property-counts".to_string(),
         outcome: CheckOutcome::Skipped {
             reason: "manifest-sound non-nullable per-property counts are the \
@@ -885,64 +832,636 @@ where
                      enumeration oracle"
                 .to_string(),
         },
-    });
+    }
+}
 
-    match mode {
-        VerifyMode::Full => {
-            let missing_in_twin = source.difference(&twin).count();
-            let extra_in_twin = twin.difference(&source).count();
-            checks.push(ParityCheck {
-                name: "full-triple-diff".to_string(),
-                outcome: if missing_in_twin == 0 && extra_in_twin == 0 {
-                    CheckOutcome::Match
-                } else {
-                    CheckOutcome::TripleDiff {
-                        missing_in_twin,
-                        extra_in_twin,
-                    }
-                },
-            });
+/// The class set a mapping declares.
+fn mapping_classes(mapping: &CompiledR2rmlMapping) -> BTreeSet<String> {
+    mapping
+        .triples_maps
+        .values()
+        .flat_map(|tm| tm.subject_map.classes.iter().cloned())
+        .collect()
+}
+
+/// Quick parity gate (default). Memory-bounded to O(sampled subjects):
+///
+/// 1. **Twin side (bounded queries):** per class, a `COUNT` and a seeded window of
+///    [`SAMPLE_SUBJECTS_PER_CLASS`] sample subjects; each sampled subject's full
+///    triple set is pulled with a bound-subject query. Never the whole twin.
+/// 2. **Source side (one streamed pass):** the enumerator streams through
+///    [`SampleAndCountObserver`], which counts per-class `rdf:type` triples and
+///    retains full triple sets ONLY for the sampled subjects — everything else is
+///    dropped as it streams, so peak RSS is O(sampled subjects), not O(graph).
+/// 3. **Compare:** class counts (source-vs-twin) + each sampled subject's triple
+///    set, both numeric-value-canonicalized so a lexical re-encoding of a numeric
+///    (E-notation vs plain, `"5.00"` vs `"5"`) is not misreported (the decimal
+///    false-reject A2 caught).
+async fn verify_twin_quick<P>(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    provider: &P,
+    graph_source_id: &str,
+) -> Result<ParityReport, MaterializeError>
+where
+    P: R2rmlProvider + R2rmlTableProvider,
+{
+    let mapping = provider.compiled_mapping(graph_source_id, None).await?;
+    let classes = mapping_classes(&mapping);
+    // Same deterministic seed the build stamped, so the sampled window is
+    // reproducible and auditable across an independent re-verify.
+    let seed = sample_seed_from_hash(&mapping_hash(&mapping));
+
+    // 1) Twin side — bounded per class.
+    let twin_read_start = std::time::Instant::now();
+    let mut twin_class_count: BTreeMap<String, u64> = BTreeMap::new();
+    let mut wanted: BTreeSet<String> = BTreeSet::new();
+    let mut twin_samples: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for class in &classes {
+        let count = twin_count_class(fluree, ledger, class).await?;
+        twin_class_count.insert(class.clone(), count);
+        let offset = seeded_offset(seed, count, SAMPLE_SUBJECTS_PER_CLASS);
+        let subjects =
+            twin_sample_subject_iris(fluree, ledger, class, SAMPLE_SUBJECTS_PER_CLASS, offset)
+                .await?;
+        for subject_iri in subjects {
+            let token = format!("<{subject_iri}>");
+            let triples = twin_subject_triples(fluree, ledger, &subject_iri).await?;
+            wanted.insert(token.clone());
+            twin_samples.insert(token, triples);
         }
-        VerifyMode::Quick => {
-            // The same deterministic seed the build recorded in the stamp, so the
-            // sampled subjects are reproducible and auditable.
-            let seed = sample_seed_from_hash(&mapping_hash(&mapping));
-            checks.extend(sample_checks(&source, &twin, &classes, seed));
-        }
+    }
+    tracing::info!(
+        verify_twin_read_ms = twin_read_start.elapsed().as_millis() as u64,
+        sampled_subjects = wanted.len(),
+        "materialize.phase verify_twin_read"
+    );
+
+    // 2) Source side — one streamed pass, O(sampled subjects) resident.
+    let oracle_start = std::time::Instant::now();
+    let mut observer = SampleAndCountObserver::new(wanted);
+    materialize_graph(provider, graph_source_id, &mut observer).await?;
+    tracing::info!(
+        verify_oracle_ms = oracle_start.elapsed().as_millis() as u64,
+        classes = observer.class_counts.len(),
+        "materialize.phase verify_source_oracle"
+    );
+
+    // 3) Compare.
+    let mut checks = Vec::new();
+    for class in &classes {
+        let source = observer.class_counts.get(class).copied().unwrap_or(0);
+        let twin = twin_class_count.get(class).copied().unwrap_or(0);
+        checks.push(ParityCheck {
+            name: format!("count:{class}"),
+            outcome: if source == twin {
+                CheckOutcome::Match
+            } else {
+                CheckOutcome::Mismatch { source, twin }
+            },
+        });
+    }
+    checks.push(per_property_skipped());
+    for (token, twin_triples) in &twin_samples {
+        let src = observer.retained.get(token).cloned().unwrap_or_default();
+        checks.push(ParityCheck {
+            name: format!("sample:{token}"),
+            outcome: if &src == twin_triples {
+                CheckOutcome::Match
+            } else {
+                CheckOutcome::TripleDiff {
+                    missing_in_twin: src.difference(twin_triples).count(),
+                    extra_in_twin: twin_triples.difference(&src).count(),
+                }
+            },
+        });
     }
 
     let passed = checks.iter().all(|c| c.outcome.passed());
     Ok(ParityReport { passed, checks })
 }
 
-/// Read every default-graph triple of a native twin back as N-Triples rendered
-/// identically to the enumerator's [`fluree_db_r2rml::materialize::render_term`],
-/// so the two sides diff exactly. The txn_meta stamp lives in the `#txn-meta`
-/// graph, so a default-graph wildcard never mixes it into the comparison.
-async fn read_twin_ntriples(
+/// Full parity gate (`--verify full`). Memory-bounded via external merge-sort:
+/// both sides are spooled to on-disk N-Triples (the source streamed through the
+/// enumerator, the twin paged through bounded wildcard queries), each canonicalized
+/// as it is written; the two files are external-sorted under a bounded working set
+/// ([`SORT_RUN_LINES`] lines per run) and a streaming k-way diff counts the
+/// symmetric difference. Peak RSS is O(one sort run), never O(graph) — this
+/// replaces the old whole-graph double-buffer that OOMed at scale.
+async fn verify_twin_full<P>(
     fluree: &crate::Fluree,
     ledger: &crate::LedgerState,
+    provider: &P,
+    graph_source_id: &str,
+) -> Result<ParityReport, MaterializeError>
+where
+    P: R2rmlProvider + R2rmlTableProvider,
+{
+    let mapping = provider.compiled_mapping(graph_source_id, None).await?;
+    let classes = mapping_classes(&mapping);
+
+    let dir = std::env::temp_dir().join(format!(
+        "fluree-verify-{}-{}",
+        sanitize_tmp(graph_source_id),
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| R2rmlError::Materialization(format!("verify tmp dir: {e}")))?;
+    let _guard = TmpDirGuard(dir.clone());
+
+    // Source side → disk (streamed, canonicalized, per-class counts collected).
+    let oracle_start = std::time::Instant::now();
+    let source_raw = dir.join("source.nt");
+    let mut writer = FileWritingObserver::create(&source_raw)?;
+    materialize_graph(provider, graph_source_id, &mut writer).await?;
+    let source_class_count = writer.finish()?;
+    tracing::info!(
+        verify_oracle_ms = oracle_start.elapsed().as_millis() as u64,
+        "materialize.phase verify_source_oracle"
+    );
+
+    // Twin side → disk (paged wildcard, canonicalized) with per-class counts.
+    let twin_start = std::time::Instant::now();
+    let twin_raw = dir.join("twin.nt");
+    let twin_class_count =
+        spool_twin_ntriples(fluree, ledger, &classes, &twin_raw, &source_class_count).await?;
+    tracing::info!(
+        verify_twin_read_ms = twin_start.elapsed().as_millis() as u64,
+        "materialize.phase verify_twin_read"
+    );
+
+    // External-sort both sides and stream a k-way diff (bounded).
+    let source_sorted = external_sort_lines(&source_raw, &dir, "source")?;
+    let twin_sorted = external_sort_lines(&twin_raw, &dir, "twin")?;
+    let (missing_in_twin, extra_in_twin) = diff_sorted_files(&source_sorted, &twin_sorted)?;
+
+    let mut checks = Vec::new();
+    for class in &classes {
+        let source = source_class_count.get(class).copied().unwrap_or(0);
+        let twin = twin_class_count.get(class).copied().unwrap_or(0);
+        checks.push(ParityCheck {
+            name: format!("count:{class}"),
+            outcome: if source == twin {
+                CheckOutcome::Match
+            } else {
+                CheckOutcome::Mismatch { source, twin }
+            },
+        });
+    }
+    checks.push(per_property_skipped());
+    checks.push(ParityCheck {
+        name: "full-triple-diff".to_string(),
+        outcome: if missing_in_twin == 0 && extra_in_twin == 0 {
+            CheckOutcome::Match
+        } else {
+            CheckOutcome::TripleDiff {
+                missing_in_twin,
+                extra_in_twin,
+            }
+        },
+    });
+
+    let passed = checks.iter().all(|c| c.outcome.passed());
+    Ok(ParityReport { passed, checks })
+}
+
+/// A [`TripleObserver`] used by the Quick gate: it counts per-class `rdf:type`
+/// triples and retains the full (canonicalized) triple set ONLY for a fixed set of
+/// wanted subject tokens. Everything else is dropped as it streams, so a whole-
+/// graph source pass costs O(sampled subjects) resident — the O2 fix.
+struct SampleAndCountObserver {
+    /// N-Triples subject tokens (e.g. `<http://ex/3>`) to retain triples for.
+    wanted: BTreeSet<String>,
+    /// Per-class `rdf:type` triple counts (class IRI → count).
+    class_counts: BTreeMap<String, u64>,
+    /// Retained canonicalized N-Triples, grouped by wanted subject token.
+    retained: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl SampleAndCountObserver {
+    fn new(wanted: BTreeSet<String>) -> Self {
+        Self {
+            wanted,
+            class_counts: BTreeMap::new(),
+            retained: BTreeMap::new(),
+        }
+    }
+}
+
+impl TripleObserver for SampleAndCountObserver {
+    fn observe(
+        &mut self,
+        subject: &RdfTerm,
+        predicate: &str,
+        object: &RdfTerm,
+    ) -> Result<(), R2rmlError> {
+        if predicate == fluree_vocab::rdf::TYPE {
+            if let RdfTerm::Iri(class) = object {
+                *self.class_counts.entry(class.clone()).or_default() += 1;
+            }
+        }
+        if !self.wanted.is_empty() {
+            let token = render_term(subject);
+            if self.wanted.contains(&token) {
+                let line = canonicalize_numeric_nt(&format!(
+                    "{token} <{predicate}> {} .",
+                    render_term(object)
+                ));
+                self.retained.entry(token).or_default().insert(line);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Count of instances of one class in the twin (bounded `COUNT` query). A
+/// no-match class returns 0 (SPARQL COUNT with no GROUP BY yields one row).
+async fn twin_count_class(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    class: &str,
+) -> Result<u64, MaterializeError> {
+    let q = format!(
+        "SELECT (COUNT(?s) AS ?n) WHERE {{ ?s <{}> <{class}> }}",
+        fluree_vocab::rdf::TYPE
+    );
+    let bindings = twin_query_bindings(fluree, ledger, &q).await?;
+    Ok(bindings
+        .first()
+        .and_then(|b| b["n"]["value"].as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0))
+}
+
+/// A seeded window of up to `k` IRI subjects of one class from the twin, in a
+/// deterministic order (`ORDER BY ?s LIMIT k OFFSET off`). Blank-node subjects are
+/// skipped (they cannot be round-tripped through a bound-subject query); the class
+/// COUNT still covers their cardinality.
+async fn twin_sample_subject_iris(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    class: &str,
+    k: usize,
+    offset: u64,
+) -> Result<Vec<String>, MaterializeError> {
+    let q = format!(
+        "SELECT ?s WHERE {{ ?s <{}> <{class}> }} ORDER BY ?s LIMIT {k} OFFSET {offset}",
+        fluree_vocab::rdf::TYPE
+    );
+    let bindings = twin_query_bindings(fluree, ledger, &q).await?;
+    Ok(bindings
+        .iter()
+        .filter(|b| b["s"]["type"].as_str() == Some("uri"))
+        .filter_map(|b| b["s"]["value"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// The full (canonicalized) triple set of one subject in the twin (bound-subject
+/// wildcard). Rendered with the SAME [`term_to_ntriples`] the source side uses, so
+/// the two sides diff byte-identically after numeric canonicalization.
+async fn twin_subject_triples(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    subject_iri: &str,
 ) -> Result<BTreeSet<String>, MaterializeError> {
+    let q = format!("SELECT ?p ?o WHERE {{ <{subject_iri}> ?p ?o }}");
+    let bindings = twin_query_bindings(fluree, ledger, &q).await?;
+    let mut set = BTreeSet::new();
+    for b in &bindings {
+        let p = b["p"]["value"].as_str().unwrap_or_default();
+        let o = term_to_ntriples(&b["o"]);
+        set.insert(canonicalize_numeric_nt(&format!(
+            "<{subject_iri}> <{p}> {o} ."
+        )));
+    }
+    Ok(set)
+}
+
+/// Run a SPARQL query against the twin and return its `results.bindings` array.
+async fn twin_query_bindings(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    sparql: &str,
+) -> Result<Vec<serde_json::Value>, MaterializeError> {
     let db = crate::GraphDb::from_ledger_state(ledger);
     let result = fluree
-        .query(&db, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .query(&db, sparql)
         .await
-        .map_err(|e| R2rmlError::Materialization(format!("twin wildcard query: {e}")))?;
+        .map_err(|e| R2rmlError::Materialization(format!("twin query: {e}")))?;
     let json = result
         .to_sparql_json(&ledger.snapshot)
         .map_err(|e| R2rmlError::Materialization(format!("twin sparql-json: {e}")))?;
+    Ok(json["results"]["bindings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
 
-    let mut set = BTreeSet::new();
-    let bindings = json["results"]["bindings"].as_array().ok_or_else(|| {
-        R2rmlError::Materialization("twin query result missing bindings".to_string())
-    })?;
-    for b in bindings {
-        let s = term_to_ntriples(&b["s"]);
-        let p = b["p"]["value"].as_str().unwrap_or_default();
-        let o = term_to_ntriples(&b["o"]);
-        set.insert(format!("{s} <{p}> {o} ."));
+/// Seeded starting offset for a `k`-subject sample of a class of `count` members:
+/// a deterministic window position derived from the stamp seed, so the sample is
+/// spread across the class (not always the lexicographic head) yet reproducible.
+fn seeded_offset(seed: u64, count: u64, k: usize) -> u64 {
+    let k = k as u64;
+    if count > k {
+        seed % (count - k)
+    } else {
+        0
     }
-    Ok(set)
+}
+
+// ---------------------------------------------------------------------------
+// Full-mode spooling + bounded external sort (peak RSS = O(one sort run))
+// ---------------------------------------------------------------------------
+
+/// Lines held in memory per external-sort run before spilling a sorted run to
+/// disk. Bounds the sort's working set; a larger value trades RAM for fewer runs.
+const SORT_RUN_LINES: usize = 1_000_000;
+
+/// A [`TripleObserver`] that streams canonicalized N-Triples to a file while
+/// tallying per-class `rdf:type` counts. Peak RSS is O(1) — nothing is retained.
+struct FileWritingObserver {
+    writer: std::io::BufWriter<std::fs::File>,
+    class_counts: BTreeMap<String, u64>,
+}
+
+impl FileWritingObserver {
+    fn create(path: &Path) -> Result<Self, MaterializeError> {
+        let file = std::fs::File::create(path)
+            .map_err(|e| R2rmlError::Materialization(format!("verify spool create: {e}")))?;
+        Ok(Self {
+            writer: std::io::BufWriter::new(file),
+            class_counts: BTreeMap::new(),
+        })
+    }
+
+    fn finish(mut self) -> Result<BTreeMap<String, u64>, MaterializeError> {
+        use std::io::Write as _;
+        self.writer
+            .flush()
+            .map_err(|e| R2rmlError::Materialization(format!("verify spool flush: {e}")))?;
+        Ok(self.class_counts)
+    }
+}
+
+impl TripleObserver for FileWritingObserver {
+    fn observe(
+        &mut self,
+        subject: &RdfTerm,
+        predicate: &str,
+        object: &RdfTerm,
+    ) -> Result<(), R2rmlError> {
+        use std::io::Write as _;
+        if predicate == fluree_vocab::rdf::TYPE {
+            if let RdfTerm::Iri(class) = object {
+                *self.class_counts.entry(class.clone()).or_default() += 1;
+            }
+        }
+        let line = canonicalize_numeric_nt(&format!(
+            "{} <{predicate}> {} .",
+            render_term(subject),
+            render_term(object)
+        ));
+        writeln!(self.writer, "{line}")
+            .map_err(|e| R2rmlError::Materialization(format!("verify spool write: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Page the whole twin to disk as canonicalized N-Triples using bounded wildcard
+/// queries (`ORDER BY ?s ?p ?o LIMIT N OFFSET M`) and tally per-class counts.
+/// Each page holds at most one window of bindings resident. `classes` seeds the
+/// count map so classes with zero twin instances still report (a dropped-table
+/// mismatch surfaces as source>0, twin=0).
+async fn spool_twin_ntriples(
+    fluree: &crate::Fluree,
+    ledger: &crate::LedgerState,
+    classes: &BTreeSet<String>,
+    path: &Path,
+    _source_class_count: &BTreeMap<String, u64>,
+) -> Result<BTreeMap<String, u64>, MaterializeError> {
+    use std::io::Write as _;
+    const PAGE: usize = 200_000;
+    let file = std::fs::File::create(path)
+        .map_err(|e| R2rmlError::Materialization(format!("twin spool create: {e}")))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let mut class_count: BTreeMap<String, u64> = classes.iter().map(|c| (c.clone(), 0)).collect();
+    let type_p = format!("<{}>", fluree_vocab::rdf::TYPE);
+    let mut offset = 0usize;
+    loop {
+        let q = format!(
+            "SELECT ?s ?p ?o WHERE {{ ?s ?p ?o }} ORDER BY ?s ?p ?o LIMIT {PAGE} OFFSET {offset}"
+        );
+        let bindings = twin_query_bindings(fluree, ledger, &q).await?;
+        if bindings.is_empty() {
+            break;
+        }
+        let page_len = bindings.len();
+        for b in &bindings {
+            let s = term_to_ntriples(&b["s"]);
+            let p = b["p"]["value"].as_str().unwrap_or_default();
+            let o = term_to_ntriples(&b["o"]);
+            if format!("<{p}>") == type_p {
+                if let Some(class) = b["o"]["value"].as_str() {
+                    if let Some(n) = class_count.get_mut(class) {
+                        *n += 1;
+                    }
+                }
+            }
+            let line = canonicalize_numeric_nt(&format!("{s} <{p}> {o} ."));
+            writeln!(writer, "{line}")
+                .map_err(|e| R2rmlError::Materialization(format!("twin spool write: {e}")))?;
+        }
+        offset += page_len;
+        if page_len < PAGE {
+            break;
+        }
+    }
+    writer
+        .flush()
+        .map_err(|e| R2rmlError::Materialization(format!("twin spool flush: {e}")))?;
+    Ok(class_count)
+}
+
+/// External merge-sort a file of lines with de-duplication (an RDF graph is a set),
+/// bounded to [`SORT_RUN_LINES`] lines resident per run. Writes sorted, de-duped
+/// runs to `dir` then k-way merges them into `<tag>.sorted`, returning its path.
+fn external_sort_lines(input: &Path, dir: &Path, tag: &str) -> Result<PathBuf, MaterializeError> {
+    use std::io::{BufRead, BufReader, BufWriter, Write as _};
+
+    let file = std::fs::File::open(input)
+        .map_err(|e| R2rmlError::Materialization(format!("sort open {tag}: {e}")))?;
+    let mut reader = BufReader::new(file);
+    let mut runs: Vec<PathBuf> = Vec::new();
+    let mut buf: Vec<String> = Vec::with_capacity(SORT_RUN_LINES.min(4096));
+    let mut line = String::new();
+
+    let flush_run = |buf: &mut Vec<String>,
+                     runs: &mut Vec<PathBuf>|
+     -> Result<(), MaterializeError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        buf.sort_unstable();
+        buf.dedup();
+        let run_path = dir.join(format!("{tag}.run{}", runs.len()));
+        let mut w = BufWriter::new(
+            std::fs::File::create(&run_path)
+                .map_err(|e| R2rmlError::Materialization(format!("sort run create {tag}: {e}")))?,
+        );
+        for l in buf.iter() {
+            writeln!(w, "{l}")
+                .map_err(|e| R2rmlError::Materialization(format!("sort run write {tag}: {e}")))?;
+        }
+        w.flush()
+            .map_err(|e| R2rmlError::Materialization(format!("sort run flush {tag}: {e}")))?;
+        buf.clear();
+        runs.push(run_path);
+        Ok(())
+    };
+
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| R2rmlError::Materialization(format!("sort read {tag}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        buf.push(line.trim_end_matches('\n').to_string());
+        if buf.len() >= SORT_RUN_LINES {
+            flush_run(&mut buf, &mut runs)?;
+        }
+    }
+    flush_run(&mut buf, &mut runs)?;
+
+    let out = dir.join(format!("{tag}.sorted"));
+    kway_merge_dedup(&runs, &out, tag)?;
+    Ok(out)
+}
+
+/// k-way merge sorted, de-duped runs into one sorted, de-duped file. Holds one
+/// front line per run resident (O(runs)); the run count is bounded by input size /
+/// [`SORT_RUN_LINES`].
+fn kway_merge_dedup(runs: &[PathBuf], out: &Path, tag: &str) -> Result<(), MaterializeError> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    use std::io::{BufRead, BufReader, BufWriter, Write as _};
+
+    let mut readers: Vec<BufReader<std::fs::File>> = Vec::with_capacity(runs.len());
+    for r in runs {
+        readers.push(BufReader::new(std::fs::File::open(r).map_err(|e| {
+            R2rmlError::Materialization(format!("merge open {tag}: {e}"))
+        })?));
+    }
+    // Heap of (line, reader_idx); pop the smallest, dedup, refill from that reader.
+    let mut heap: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    let read_next = |r: &mut BufReader<std::fs::File>| -> Result<Option<String>, MaterializeError> {
+        let mut l = String::new();
+        let n = r
+            .read_line(&mut l)
+            .map_err(|e| R2rmlError::Materialization(format!("merge read {tag}: {e}")))?;
+        Ok(if n == 0 {
+            None
+        } else {
+            Some(l.trim_end_matches('\n').to_string())
+        })
+    };
+    for (idx, r) in readers.iter_mut().enumerate() {
+        if let Some(l) = read_next(r)? {
+            heap.push(Reverse((l, idx)));
+        }
+    }
+    let mut w = BufWriter::new(
+        std::fs::File::create(out)
+            .map_err(|e| R2rmlError::Materialization(format!("merge create {tag}: {e}")))?,
+    );
+    let mut last: Option<String> = None;
+    while let Some(Reverse((l, idx))) = heap.pop() {
+        if last.as_deref() != Some(l.as_str()) {
+            writeln!(w, "{l}")
+                .map_err(|e| R2rmlError::Materialization(format!("merge write {tag}: {e}")))?;
+            last = Some(l.clone());
+        }
+        if let Some(next) = read_next(&mut readers[idx])? {
+            heap.push(Reverse((next, idx)));
+        }
+    }
+    w.flush()
+        .map_err(|e| R2rmlError::Materialization(format!("merge flush {tag}: {e}")))?;
+    Ok(())
+}
+
+/// Stream a symmetric diff of two sorted, de-duped line files, returning
+/// `(missing_in_twin, extra_in_twin)`. O(1) resident (one front line per side).
+fn diff_sorted_files(source: &Path, twin: &Path) -> Result<(usize, usize), MaterializeError> {
+    use std::cmp::Ordering;
+    use std::io::{BufRead, BufReader};
+
+    let mut a = BufReader::new(
+        std::fs::File::open(source)
+            .map_err(|e| R2rmlError::Materialization(format!("diff open source: {e}")))?,
+    );
+    let mut b = BufReader::new(
+        std::fs::File::open(twin)
+            .map_err(|e| R2rmlError::Materialization(format!("diff open twin: {e}")))?,
+    );
+    let next = |r: &mut BufReader<std::fs::File>| -> Result<Option<String>, MaterializeError> {
+        let mut l = String::new();
+        let n = r
+            .read_line(&mut l)
+            .map_err(|e| R2rmlError::Materialization(format!("diff read: {e}")))?;
+        Ok(if n == 0 {
+            None
+        } else {
+            Some(l.trim_end_matches('\n').to_string())
+        })
+    };
+    let (mut missing, mut extra) = (0usize, 0usize);
+    let mut sa = next(&mut a)?;
+    let mut sb = next(&mut b)?;
+    loop {
+        match (&sa, &sb) {
+            (Some(x), Some(y)) => match x.cmp(y) {
+                Ordering::Equal => {
+                    sa = next(&mut a)?;
+                    sb = next(&mut b)?;
+                }
+                Ordering::Less => {
+                    missing += 1; // in source, not twin
+                    sa = next(&mut a)?;
+                }
+                Ordering::Greater => {
+                    extra += 1; // in twin, not source
+                    sb = next(&mut b)?;
+                }
+            },
+            (Some(_), None) => {
+                missing += 1;
+                sa = next(&mut a)?;
+            }
+            (None, Some(_)) => {
+                extra += 1;
+                sb = next(&mut b)?;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok((missing, extra))
+}
+
+/// A filesystem-safe fragment of a graph-source id for a temp path.
+fn sanitize_tmp(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Best-effort cleanup of the verify temp dir on scope exit (including on error).
+struct TmpDirGuard(PathBuf);
+impl Drop for TmpDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Render one SPARQL-JSON result term to the N-Triples form the enumerator emits.
@@ -1010,19 +1529,54 @@ fn canonicalize_numeric_nt(triple: &str) -> String {
     }
     let lex = &obj[1..caret];
     let dt = &obj[caret + 4..obj.len() - 1];
+    let local = dt.rsplit(['#', '/']).next().unwrap_or(dt);
     if !is_numeric_datatype(dt) {
         return triple.to_string();
     }
-    format!("{s} {p} \"{}\"^^<{dt}> .", normalize_numeric_lexical(lex))
+    format!(
+        "{s} {p} \"{}\"^^<{dt}> .",
+        normalize_numeric_lexical(lex, local)
+    )
 }
 
-/// Drop insignificant trailing fractional zeros from a decimal lexical form
-/// (`"5.00"` → `"5"`, `"9.90"` → `"9.9"`). Integers and scientific-notation
-/// forms pass through unchanged (their canonical forms are already stable).
-fn normalize_numeric_lexical(lex: &str) -> String {
-    if lex.contains(['e', 'E']) {
-        return lex.to_string();
+/// Value-canonical lexical form of a numeric literal, so two lexically-different
+/// but value-equal encodings compare equal. THE decimal false-reject A2 caught:
+/// Fluree stores `xsd:double` in XSD E-notation (`"-1.5521762E1"`) while the verify
+/// oracle re-renders the raw Arrow `Float64` via `f64::to_string()` in plain form
+/// (`"-15.521762"`) — the OLD trim passed E-notation through unchanged, so a correct
+/// twin was dropped (`term.rs:512` receipt). Fix: for `double`/`float`, parse to
+/// `f64` and re-render Rust's shortest round-trip form (never E-notation), so both
+/// encodings collapse to it. `decimal` and the integer family use EXACT lexical
+/// canonicalization (no float round-trip, so arbitrary-precision decimals are never
+/// compared lossily): strip a leading `+` and an insignificant fractional tail.
+/// Applied to BOTH sides.
+fn normalize_numeric_lexical(lex: &str, dt_local: &str) -> String {
+    match dt_local {
+        "double" | "float" => match lex.trim().parse::<f64>() {
+            // NaN/Inf render as-is; only finite values get the canonical form.
+            Ok(f) if f.is_finite() => canonical_f64(f),
+            _ => lex.to_string(),
+        },
+        _ => trim_decimal_lexical(lex),
     }
+}
+
+/// Rust's `Display` for `f64` never uses scientific notation, so it is a stable
+/// canonical form both `"1.5E1"` and `"15"` collapse to. `-0.0` is normalized to
+/// `"0"` so the two zero signs compare equal.
+fn canonical_f64(f: f64) -> String {
+    if f == 0.0 {
+        "0".to_string()
+    } else {
+        format!("{f}")
+    }
+}
+
+/// Exact lexical canonicalization for decimal / integer forms: strip a leading `+`
+/// and drop insignificant trailing fractional zeros (`"5.00"` → `"5"`,
+/// `"9.90"` → `"9.9"`). No float round-trip, so precision is preserved.
+fn trim_decimal_lexical(lex: &str) -> String {
+    let lex = lex.strip_prefix('+').unwrap_or(lex);
     match lex.split_once('.') {
         Some((int, frac)) => {
             let frac = frac.trim_end_matches('0');
@@ -1058,76 +1612,6 @@ fn is_numeric_datatype(dt: &str) -> bool {
             | "unsignedShort"
             | "unsignedByte"
     )
-}
-
-/// The N-Triples subject token (everything up to the first space).
-fn nt_subject(triple: &str) -> &str {
-    triple.split_once(' ').map(|(s, _)| s).unwrap_or(triple)
-}
-
-/// Group N-Triples by subject token.
-fn group_by_subject(triples: &BTreeSet<String>) -> BTreeMap<&str, BTreeSet<&str>> {
-    let mut by_subject: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for t in triples {
-        by_subject.entry(nt_subject(t)).or_default().insert(t);
-    }
-    by_subject
-}
-
-/// Deterministic per-subject sort key from a seed — spreads the sample across a
-/// class instead of always taking the lexicographic head (a systematic bug in
-/// tail subjects would otherwise never be sampled). Rotating the seed selects a
-/// different subset, so repeated verifies widen coverage.
-fn seeded_subject_key(seed: u64, subject: &str) -> u64 {
-    // FNV-1a mixed with the seed — dependency-free and stable across platforms.
-    let mut h = seed ^ 0x9e37_79b9_7f4a_7c15;
-    for b in subject.bytes() {
-        h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
-
-/// Stratified sample: for each class, fully compare the triple set of
-/// [`SAMPLE_SUBJECTS_PER_CLASS`] subjects — chosen by a `seed`-mixed hash so the
-/// sample is spread across the class and reproducible (the seed is in the stamp)
-/// — between source and twin. A systematic value/edge bug appears in every
-/// sample by construction.
-fn sample_checks(
-    source: &BTreeSet<String>,
-    twin: &BTreeSet<String>,
-    classes: &BTreeSet<String>,
-    seed: u64,
-) -> Vec<ParityCheck> {
-    let source_by_subject = group_by_subject(source);
-    let twin_by_subject = group_by_subject(twin);
-    let mut checks = Vec::new();
-    for class in classes {
-        let type_suffix = format!("<{}> <{class}> .", fluree_vocab::rdf::TYPE);
-        let mut subjects: Vec<&str> = source_by_subject
-            .iter()
-            .filter(|(_, triples)| triples.iter().any(|t| t.ends_with(&type_suffix)))
-            .map(|(s, _)| *s)
-            .collect();
-        subjects.sort_by_key(|s| seeded_subject_key(seed, s));
-        subjects.truncate(SAMPLE_SUBJECTS_PER_CLASS);
-        for subject in subjects {
-            let src = source_by_subject.get(subject).cloned().unwrap_or_default();
-            let tw = twin_by_subject.get(subject).cloned().unwrap_or_default();
-            let outcome = if src == tw {
-                CheckOutcome::Match
-            } else {
-                CheckOutcome::TripleDiff {
-                    missing_in_twin: src.difference(&tw).count(),
-                    extra_in_twin: tw.difference(&src).count(),
-                }
-            };
-            checks.push(ParityCheck {
-                name: format!("sample:{subject}"),
-                outcome,
-            });
-        }
-    }
-    checks
 }
 
 #[cfg(test)]
@@ -1252,5 +1736,124 @@ mod tests {
             5,
             "every observed triple must land in exactly one chunk (completed or final)"
         );
+    }
+
+    // --- O2 verify: decimal/double value-canonicalization (the A2 false-reject) ---
+
+    #[test]
+    fn double_enotation_and_plain_canonicalize_equal() {
+        // THE A2 receipt: Fluree stores xsd:double as E-notation; the enumerator
+        // oracle renders the raw Arrow Float64 as plain. A correct twin must NOT be
+        // rejected because the two encodings differ lexically.
+        let dt = "http://www.w3.org/2001/XMLSchema#double";
+        let enot = super::canonicalize_numeric_nt(&format!(
+            "<http://ex/geography/3683> <http://ex/latitude> \"-1.5521762E1\"^^<{dt}> ."
+        ));
+        let plain = super::canonicalize_numeric_nt(&format!(
+            "<http://ex/geography/3683> <http://ex/latitude> \"-15.521762\"^^<{dt}> ."
+        ));
+        assert_eq!(
+            enot, plain,
+            "E-notation and plain double must canonicalize equal"
+        );
+
+        let big_enot = super::canonicalize_numeric_nt(&format!(
+            "<http://ex/account/1269> <http://ex/rev> \"2.8897281511E8\"^^<{dt}> ."
+        ));
+        // 2.8897281511E8 == 288972815.11 (the plain form the enumerator renders).
+        let big_plain = super::canonicalize_numeric_nt(&format!(
+            "<http://ex/account/1269> <http://ex/rev> \"288972815.11\"^^<{dt}> ."
+        ));
+        assert_eq!(
+            big_enot, big_plain,
+            "large-magnitude double forms must agree"
+        );
+    }
+
+    #[test]
+    fn decimal_trailing_zeros_canonicalize_equal() {
+        let dt = "http://www.w3.org/2001/XMLSchema#decimal";
+        let a = super::canonicalize_numeric_nt(&format!("<s> <p> \"5.00\"^^<{dt}> ."));
+        let b = super::canonicalize_numeric_nt(&format!("<s> <p> \"5\"^^<{dt}> ."));
+        assert_eq!(a, b, "'5.00' and '5' decimals must canonicalize equal");
+        let c = super::canonicalize_numeric_nt(&format!("<s> <p> \"9.90\"^^<{dt}> ."));
+        let d = super::canonicalize_numeric_nt(&format!("<s> <p> \"9.9\"^^<{dt}> ."));
+        assert_eq!(c, d, "'9.90' and '9.9' decimals must canonicalize equal");
+    }
+
+    #[test]
+    fn decimal_canonicalization_preserves_precision() {
+        // A decimal with more digits than f64 can hold must NOT be routed through
+        // the float round-trip (that path is double/float only), so two genuinely
+        // different high-precision decimals stay distinct.
+        let dt = "http://www.w3.org/2001/XMLSchema#decimal";
+        let a =
+            super::canonicalize_numeric_nt(&format!("<s> <p> \"123456789012345678.1\"^^<{dt}> ."));
+        let b =
+            super::canonicalize_numeric_nt(&format!("<s> <p> \"123456789012345678.2\"^^<{dt}> ."));
+        assert_ne!(a, b, "distinct high-precision decimals must not collapse");
+    }
+
+    #[test]
+    fn non_numeric_and_plain_literals_pass_through() {
+        let s = "<s> <p> \"hello world\" .";
+        assert_eq!(
+            super::canonicalize_numeric_nt(s),
+            s,
+            "plain literal untouched"
+        );
+        let dated = "<s> <p> \"2020-01-01\"^^<http://www.w3.org/2001/XMLSchema#date> .";
+        assert_eq!(
+            super::canonicalize_numeric_nt(dated),
+            dated,
+            "date untouched"
+        );
+        let iri = "<s> <p> <http://ex/o> .";
+        assert_eq!(
+            super::canonicalize_numeric_nt(iri),
+            iri,
+            "IRI object untouched"
+        );
+    }
+
+    #[test]
+    fn seeded_offset_is_in_bounds() {
+        // Never offsets past the last full window; count<=k always starts at 0.
+        assert_eq!(super::seeded_offset(999, 2, 3), 0, "count<=k → offset 0");
+        for seed in [0u64, 1, 7, 12345, u64::MAX] {
+            let off = super::seeded_offset(seed, 100, 3);
+            assert!(off <= 97, "offset {off} must leave room for k subjects");
+        }
+    }
+
+    // --- O2 verify: bounded external sort + streaming diff ---
+
+    #[test]
+    fn external_sort_sorts_and_dedups() {
+        let dir = std::env::temp_dir().join(format!("fluree-sort-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.nt");
+        std::fs::write(&input, "c\na\nb\na\nc\n").unwrap();
+        let out = super::external_sort_lines(&input, &dir, "t").unwrap();
+        let sorted = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(sorted, "a\nb\nc\n", "sorted, de-duplicated");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_sorted_files_counts_symmetric_difference() {
+        let dir = std::env::temp_dir().join(format!("fluree-diff-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // source has a,b,c,d ; twin has b,c,e → missing_in_twin {a,d}=2, extra {e}=1.
+        let src = dir.join("s.nt");
+        let twin = dir.join("t.nt");
+        std::fs::write(&src, "a\nb\nc\nd\n").unwrap();
+        std::fs::write(&twin, "b\nc\ne\n").unwrap();
+        let (missing, extra) = super::diff_sorted_files(&src, &twin).unwrap();
+        assert_eq!((missing, extra), (2, 1), "symmetric difference counted");
+        // Identical files → zero diff.
+        let (m2, e2) = super::diff_sorted_files(&src, &src).unwrap();
+        assert_eq!((m2, e2), (0, 0), "identical inputs diff to zero");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
