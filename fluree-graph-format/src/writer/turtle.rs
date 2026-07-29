@@ -155,7 +155,7 @@ impl<W: Write> BlockCore<W> {
         }
 
         let target_graph: Option<Term> = graph.map(|g| self.terms.get(g).clone());
-        if quad_capable && self.working.graph != Some(target_graph.clone()) {
+        if quad_capable && self.working.graph.as_ref() != Some(&target_graph) {
             self.enter_graph(target_graph)?;
         }
 
