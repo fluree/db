@@ -693,6 +693,22 @@ mod tests {
         assert!(!sink.supports_reified_triples());
     }
 
+    /// The probe is what routes a producer between the two sinks, so the
+    /// split has to stay exactly where it is. Now that both sinks share a
+    /// term table, this is also the guard against the collector quietly
+    /// inheriting quad support it cannot honor: it has no named graph to put
+    /// a quad in, and answering `true` would send producers straight into the
+    /// trait default's refusal.
+    #[test]
+    fn the_quad_capability_split_is_the_only_difference_the_probe_reports() {
+        assert!(!GraphCollectorSink::new().supports_quads());
+        assert!(crate::DatasetCollectorSink::new().supports_quads());
+
+        // And neither claims reification — the capabilities are independent.
+        assert!(!GraphCollectorSink::new().supports_reified_triples());
+        assert!(!crate::DatasetCollectorSink::new().supports_reified_triples());
+    }
+
     /// Symmetric with quads: a sink that claims the capability but never
     /// overrides the method must be refused, not silently ignored. A dropped
     /// reification is data loss.

@@ -169,6 +169,20 @@ impl GraphSink for DatasetCollectorSink {
         Ok(())
     }
 
+    /// Append an indexed list element to the default graph.
+    ///
+    /// The protocol has no quad form of this event, so "the default graph" is
+    /// the only thing an `emit_list_item` can currently mean — it is not a
+    /// routing choice this sink makes. A producer that wants a Fluree-style
+    /// indexed collection *inside a named graph* has no way to say so today
+    /// and would silently land it here.
+    ///
+    /// That is a gap in the protocol, not in this sink, and it is narrow:
+    /// under the spine collection style a collection is ordinary triples and
+    /// goes through [`GraphSink::emit_quad`] like anything else. It bites
+    /// only the indexed style, which exists for Fluree ingest. Whether the
+    /// trait grows a quad form belongs to whoever owns the protocol; until
+    /// then this behavior is pinned by test so it cannot change unnoticed.
     fn emit_list_item(
         &mut self,
         subject: TermId,
@@ -336,6 +350,95 @@ mod tests {
                 expected("b", Some("http://ex/g2")),
             ]
         );
+    }
+
+    /// A TriG document's event shape: directives, statements outside any
+    /// block, a `<g> { … }` block holding several statements, then more
+    /// statements back outside it. No TriG parser exists in the light crates
+    /// yet, so the sequence is hand-fed in the order such a parser would
+    /// produce it.
+    #[test]
+    fn a_trig_shaped_event_sequence_lands_where_the_document_says() {
+        let mut sink = DatasetCollectorSink::new();
+        sink.on_base("http://example.org/");
+        sink.on_prefix("ex", "http://example.org/");
+
+        // ex:a ex:p "outside-1" .
+        quad(&mut sink, "http://ex/a", "http://ex/p", "outside-1", None).unwrap();
+
+        // ex:g { ex:b ex:p "inside-1" . ex:c ex:p "inside-2" . }
+        quad(
+            &mut sink,
+            "http://ex/b",
+            "http://ex/p",
+            "inside-1",
+            Some("http://ex/g"),
+        )
+        .unwrap();
+        quad(
+            &mut sink,
+            "http://ex/c",
+            "http://ex/p",
+            "inside-2",
+            Some("http://ex/g"),
+        )
+        .unwrap();
+
+        // ex:d ex:p "outside-2" .
+        quad(&mut sink, "http://ex/d", "http://ex/p", "outside-2", None).unwrap();
+        sink.finish().unwrap();
+
+        let dataset = sink.into_dataset();
+        assert_eq!(dataset.base(), Some("http://example.org/"));
+        assert_eq!(
+            dataset.prefixes().get("ex"),
+            Some(&"http://example.org/".to_string()),
+            "directives are document-scoped, not per-graph"
+        );
+
+        assert_eq!(
+            dataset.default_graph().len(),
+            2,
+            "the two outside the block"
+        );
+        let inside = dataset
+            .named_graph(&Term::iri("http://ex/g"))
+            .expect("the block's graph");
+        assert_eq!(inside.len(), 2);
+        assert_eq!(inside.base, None, "no directives leaked into the block");
+
+        // Re-entering the default graph after the block appends, and does not
+        // start a second default graph.
+        let subjects: Vec<&str> = dataset
+            .default_graph()
+            .iter()
+            .filter_map(|t| t.s.as_iri())
+            .collect();
+        assert_eq!(subjects, vec!["http://ex/a", "http://ex/d"]);
+    }
+
+    #[test]
+    fn list_items_land_in_the_default_graph_because_the_protocol_has_no_quad_form() {
+        // Pinning the gap documented on `emit_list_item`: there is no way for
+        // a producer to put an indexed collection in a named graph, so this
+        // is the only meaning the event has. If the protocol grows a quad
+        // form, this test is the thing that should fail.
+        let mut sink = DatasetCollectorSink::new();
+        let s = sink.term_iri("http://ex/s");
+        let p = sink.term_iri("http://ex/p");
+        let o = sink.term_literal("first", Datatype::xsd_string(), None);
+        sink.emit_list_item(s, p, o, 0).unwrap();
+        sink.end_statement();
+
+        let dataset = sink.into_dataset();
+        assert_eq!(dataset.named_graph_count(), 0);
+        assert_eq!(dataset.default_graph().len(), 1);
+        assert!(dataset
+            .default_graph()
+            .iter()
+            .next()
+            .unwrap()
+            .is_list_element());
     }
 
     #[test]
