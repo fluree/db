@@ -34,13 +34,17 @@
 pub mod adapter;
 pub mod error;
 pub mod lex;
+pub mod options;
 pub mod parser;
 pub mod splitter;
 
 pub use adapter::graph_to_transaction_json;
 pub use error::{Result, TurtleError};
 pub use lex::{tokenize, Lexer, StreamingLexer, Token, TokenKind};
-pub use parser::{parse, parse_with_prefixes_base};
+pub use options::{CollectionStyle, NumericStyle, ParserOptions};
+pub use parser::{
+    parse, parse_with_options, parse_with_prefixes_base, parse_with_prefixes_base_options,
+};
 
 use fluree_graph_ir::GraphCollectorSink;
 use serde_json::Value as JsonValue;

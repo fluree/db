@@ -13,6 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::error::{Result, TurtleError};
 use crate::lex::{StreamingLexer, Token, TokenKind};
+use crate::options::{CollectionStyle, NumericStyle, ParserOptions};
 
 /// RDF well-known IRIs (imported from vocab crate)
 const RDF_TYPE: &str = rdf::TYPE;
@@ -65,11 +66,22 @@ pub struct Parser<'a, 'input, S> {
     /// [`crate::error::MAX_NESTING_DEPTH`] so adversarial nesting errors
     /// instead of overflowing the stack.
     nesting_depth: u32,
+    /// Conformance knobs; [`ParserOptions::default`] is the ingest shape.
+    options: ParserOptions,
 }
 
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
-    /// Create a new parser.
+    /// Create a new parser with the default (ingest) options.
     pub fn new(input: &'input str, sink: &'a mut S) -> Result<Self> {
+        Self::with_options(input, sink, ParserOptions::default())
+    }
+
+    /// Create a new parser with explicit conformance options.
+    pub fn with_options(
+        input: &'input str,
+        sink: &'a mut S,
+        options: ParserOptions,
+    ) -> Result<Self> {
         crate::error::check_input_len(input.len())?;
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
@@ -103,6 +115,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             base: None,
             annotation_depth: 0,
             nesting_depth: 0,
+            options,
         })
     }
 
@@ -632,19 +645,25 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse an object list (comma-separated objects).
     ///
-    /// Collections in object position are emitted as indexed list items via
-    /// `emit_list_item()` instead of rdf:first/rdf:rest linked lists.
+    /// Under [`CollectionStyle::IndexedItems`] (the default), collections in
+    /// object position are emitted as indexed list items via
+    /// `emit_list_item()` instead of rdf:first/rdf:rest linked lists, and an
+    /// object-position `()` emits nothing. Under [`CollectionStyle::Spine`]
+    /// both fall through to the ordinary object path, which already builds a
+    /// spine for `( … )` and resolves `()` to `rdf:nil` — so the two
+    /// positions share one code path and one grammar.
     ///
     /// Each object may carry an RDF 1.2 annotation tail (`~ reifier` and/or
     /// `{| … |}` blocks) — see [`Self::parse_annotation_tail`].
     fn parse_object_list(&mut self, subject: TermId, predicate: TermId) -> Result<()> {
+        let indexed_lists = self.options.collections == CollectionStyle::IndexedItems;
         loop {
             match self.current().kind {
-                TokenKind::LParen => {
+                TokenKind::LParen if indexed_lists => {
                     self.parse_collection_as_list(subject, predicate)?;
                     self.reject_annotation_on_collection()?;
                 }
-                TokenKind::Nil => {
+                TokenKind::Nil if indexed_lists => {
                     self.advance()?;
                     self.reject_annotation_on_collection()?;
                 }
@@ -755,10 +774,27 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.advance()?;
                 self.parse_string_suffix_escaped(&value)
             }
-            TokenKind::Integer(n) => {
-                self.advance()?;
-                Ok(self.sink_term_literal_value(LiteralValue::Integer(n), Datatype::xsd_integer()))
-            }
+            // Branch on the option BEFORE touching the span: the default arm
+            // must stay exactly the work it did before options existed, since
+            // this is the ingest hot path.
+            TokenKind::Integer(n) => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self
+                        .sink_term_literal_value(LiteralValue::Integer(n), Datatype::xsd_integer()))
+                }
+                // PreserveLexical routes through the typed-string lane, the
+                // same one `IntegerOverflow` and `Decimal` already use, so
+                // `+1` / `01` / `1` stay distinguishable instead of all
+                // collapsing to `Integer(1)`.
+                NumericStyle::PreserveLexical => {
+                    let s = self.current().start;
+                    let e = self.current().end;
+                    let text = self.decimal_content(s, e);
+                    self.advance()?;
+                    Ok(self.sink_term_literal(text, Datatype::xsd_integer(), None))
+                }
+            },
             TokenKind::IntegerOverflow => {
                 // Beyond i64: keep the lexical so downstream promotes to BigInt.
                 let s = self.current().start;
@@ -774,10 +810,22 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.advance()?;
                 Ok(self.sink_term_literal(text, Datatype::xsd_decimal(), None))
             }
-            TokenKind::Double(n) => {
-                self.advance()?;
-                Ok(self.sink_term_literal_value(LiteralValue::Double(n), Datatype::xsd_double()))
-            }
+            TokenKind::Double(n) => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self
+                        .sink_term_literal_value(LiteralValue::Double(n), Datatype::xsd_double()))
+                }
+                // `1e0`, `1.0e0`, and `1.0E0` are three spellings of one
+                // value; canonicalizing keeps only the value.
+                NumericStyle::PreserveLexical => {
+                    let s = self.current().start;
+                    let e = self.current().end;
+                    let text = self.decimal_content(s, e);
+                    self.advance()?;
+                    Ok(self.sink_term_literal(text, Datatype::xsd_double(), None))
+                }
+            },
             TokenKind::KwTrue => {
                 self.advance()?;
                 Ok(self
@@ -1259,9 +1307,24 @@ fn unescape_pn_local(local: &str) -> String {
     result
 }
 
-/// Parse a Turtle document into GraphSink events.
+/// Parse a Turtle document into GraphSink events, with the ingest-shaped
+/// [`ParserOptions::default`].
 pub fn parse<S: GraphSink>(input: &str, sink: &mut S) -> Result<()> {
     Parser::new(input, sink)?.parse()
+}
+
+/// Parse a Turtle document into GraphSink events under explicit
+/// [`ParserOptions`].
+///
+/// [`parse`] is this with [`ParserOptions::default`]; use
+/// [`ParserOptions::conformant`] for the faithful-RDF shape (spine
+/// collections, preserved numeric lexical forms).
+pub fn parse_with_options<S: GraphSink>(
+    input: &str,
+    sink: &mut S,
+    options: ParserOptions,
+) -> Result<()> {
+    Parser::with_options(input, sink, options)?.parse()
 }
 
 /// Parse Turtle input with a pre-seeded prefix map and optional base IRI.
@@ -1282,7 +1345,22 @@ pub fn parse_with_prefixes_base<S: GraphSink>(
     prefixes: &[(String, String)],
     base: Option<&str>,
 ) -> Result<()> {
-    let mut parser = Parser::new(input, sink)?;
+    parse_with_prefixes_base_options(input, sink, prefixes, base, ParserOptions::default())
+}
+
+/// [`parse_with_prefixes_base`] under explicit [`ParserOptions`].
+///
+/// This is the full entry point — every other `parse*` function is this one
+/// with something defaulted — so the chunked reader paths, which need the
+/// pre-seeded prelude, can opt into conformance options too.
+pub fn parse_with_prefixes_base_options<S: GraphSink>(
+    input: &str,
+    sink: &mut S,
+    prefixes: &[(String, String)],
+    base: Option<&str>,
+    options: ParserOptions,
+) -> Result<()> {
+    let mut parser = Parser::with_options(input, sink, options)?;
     if let Some(base) = base {
         parser.base = Some(base.to_string());
     }
@@ -2157,6 +2235,469 @@ mod tests {
                 ("http://example.org/c".to_string(), "three".to_string()),
             ]
         );
+    }
+
+    // =========================================================================
+    // ParserOptions — collection + numeric conformance
+    // =========================================================================
+    //
+    // Two shapes out of one grammar: the DEFAULT is Fluree's ingest shape and
+    // is pinned bit-for-bit by the pre-existing tests above (`test_collection`,
+    // `test_empty_collection`, `test_integer_literal`) plus the explicit
+    // default-mode tests here; `ParserOptions::conformant()` is the RDF the
+    // document actually denotes, which is what the W3C Turtle suite tests.
+
+    const EX: &str = "http://example.org/";
+
+    fn parse_conformant(input: &str) -> Graph {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(input, &mut sink, ParserOptions::conformant())
+            .expect("conformant parse");
+        sink.into_graph()
+    }
+
+    fn parse_spine(input: &str) -> Graph {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(
+            input,
+            &mut sink,
+            ParserOptions::new().with_collections(CollectionStyle::Spine),
+        )
+        .expect("spine parse");
+        sink.into_graph()
+    }
+
+    /// Every triple as `(subject, predicate, object)` in `Term`'s N-Triples-ish
+    /// display form.
+    fn rendered(graph: &Graph) -> Vec<(String, String, String)> {
+        graph
+            .iter()
+            .map(|t| (t.s.to_string(), t.p.to_string(), t.o.to_string()))
+            .collect()
+    }
+
+    /// Follow an `rdf:first`/`rdf:rest` spine from `head`, returning each
+    /// item's rendered form. Panics if the chain is not well-formed, which is
+    /// the point: a partial spine must not read as a short list.
+    fn walk_spine(graph: &Graph, head: &Term) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut node = head.clone();
+        loop {
+            if matches!(&node, Term::Iri(iri) if iri.as_ref() == RDF_NIL) {
+                return items;
+            }
+            let first = graph
+                .iter()
+                .find(|t| t.s == node && matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST))
+                .unwrap_or_else(|| panic!("no rdf:first for {node}"));
+            items.push(first.o.to_string());
+            let rest = graph
+                .iter()
+                .find(|t| t.s == node && matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_REST))
+                .unwrap_or_else(|| panic!("no rdf:rest for {node}"));
+            node = rest.o.clone();
+        }
+    }
+
+    /// The object of the single `ex:s ex:p ?o` triple.
+    fn object_of_p(graph: &Graph) -> Term {
+        let matches: Vec<_> = graph
+            .iter()
+            .filter(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == format!("{EX}p")))
+            .collect();
+        assert_eq!(matches.len(), 1, "expected exactly one ex:p triple");
+        matches[0].o.clone()
+    }
+
+    // -- Spine mode ---------------------------------------------------------
+
+    /// W3C `turtle-syntax-*` shape: a one-item object collection denotes
+    /// three triples. The default mode emits one `emit_list_item` event for
+    /// the same input.
+    #[test]
+    fn spine_object_collection_of_one_emits_three_triples() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:o ) ."));
+        assert_eq!(graph.len(), 3, "{:#?}", rendered(&graph));
+
+        let head = object_of_p(&graph);
+        assert!(head.is_blank(), "collection head must be a blank node");
+        assert_eq!(walk_spine(&graph, &head), vec![format!("<{EX}o>")]);
+        assert!(
+            graph.iter().all(|t| !t.is_list_element()),
+            "spine mode must not emit indexed list items"
+        );
+    }
+
+    #[test]
+    fn spine_object_collection_of_two_chains_through_a_second_node() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:a ex:b ) ."));
+        // 2 items x (first + rest) + the ex:p edge.
+        assert_eq!(graph.len(), 5, "{:#?}", rendered(&graph));
+
+        let head = object_of_p(&graph);
+        assert_eq!(
+            walk_spine(&graph, &head),
+            vec![format!("<{EX}a>"), format!("<{EX}b>")]
+        );
+    }
+
+    /// The silent-triple-loss bug: `()` in object position emitted NOTHING.
+    /// In spine mode it denotes `rdf:nil`, as RDF says.
+    #[test]
+    fn spine_empty_object_collection_is_rdf_nil() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p () ."));
+        assert_eq!(
+            rendered(&graph),
+            vec![(
+                format!("<{EX}s>"),
+                format!("<{EX}p>"),
+                format!("<{RDF_NIL}>")
+            )]
+        );
+    }
+
+    /// Subject position already emitted a spine before this change; the point
+    /// of `Spine` is that both positions now share the one code path.
+    #[test]
+    fn spine_subject_and_object_collections_agree() {
+        let subject_side = parse_spine(&format!("@prefix ex: <{EX}> .\n( ex:a ) ex:p ex:o ."));
+        let object_side = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:a ) ."));
+        // Same shape either way: 1 first + 1 rest + 1 edge.
+        assert_eq!(subject_side.len(), 3);
+        assert_eq!(object_side.len(), 3);
+
+        let spine_of = |g: &Graph| {
+            let head = g
+                .iter()
+                .find(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST))
+                .map(|t| t.s.clone())
+                .expect("a spine node");
+            walk_spine(g, &head)
+        };
+        assert_eq!(spine_of(&subject_side), vec![format!("<{EX}a>")]);
+        assert_eq!(spine_of(&object_side), vec![format!("<{EX}a>")]);
+    }
+
+    #[test]
+    fn spine_nested_collections_nest_their_spines() {
+        let graph = parse_spine(&format!(
+            "@prefix ex: <{EX}> .\nex:s ex:p ( ( ex:a ) ex:b ) ."
+        ));
+        // outer: 2 nodes x 2 + inner: 1 node x 2 + the ex:p edge.
+        assert_eq!(graph.len(), 7, "{:#?}", rendered(&graph));
+
+        let outer = object_of_p(&graph);
+        let outer_items = walk_spine(&graph, &outer);
+        assert_eq!(outer_items.len(), 2);
+        assert_eq!(outer_items[1], format!("<{EX}b>"));
+
+        let inner_head = graph
+            .iter()
+            .find(|t| {
+                matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST)
+                    && t.s == outer
+                    && t.o.is_blank()
+            })
+            .map(|t| t.o.clone())
+            .expect("inner collection head");
+        assert_eq!(walk_spine(&graph, &inner_head), vec![format!("<{EX}a>")]);
+    }
+
+    /// An empty collection nested inside a collection is `rdf:nil` as an item.
+    #[test]
+    fn spine_nested_empty_collection_is_a_nil_item() {
+        let graph = parse_spine(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( () ) ."));
+        assert_eq!(graph.len(), 3, "{:#?}", rendered(&graph));
+        let head = object_of_p(&graph);
+        assert_eq!(walk_spine(&graph, &head), vec![format!("<{RDF_NIL}>")]);
+    }
+
+    /// In `IndexedItems` a collection object has no single term to reify, so
+    /// annotations on it are refused. In `Spine` it has one — the head — so
+    /// the refusal does not apply.
+    #[test]
+    fn spine_mode_admits_annotations_on_collections() {
+        let mut sink = StarSink::default();
+        parse_with_options(
+            &format!("{P}:s :p ( :a ) {{| :q :z |}} ."),
+            &mut sink,
+            ParserOptions::new().with_collections(CollectionStyle::Spine),
+        )
+        .expect("a spine collection has a head term to reify");
+        assert_eq!(sink.reified.len(), 1);
+
+        // Same input, default mode: still refused.
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:s :p ( :a ) {{| :q :z |}} ."), &mut sink)
+            .expect_err("indexed items leave nothing to reify");
+        assert!(err.to_string().contains("collection objects"), "{err}");
+    }
+
+    // -- Default (IndexedItems) mode ----------------------------------------
+
+    /// The default shape, pinned explicitly: one indexed event per item, no
+    /// spine triples at all.
+    #[test]
+    fn default_object_collection_stays_indexed_with_no_spine() {
+        let graph =
+            parse_to_graph(&format!("@prefix ex: <{EX}> .\nex:s ex:p ( ex:a ex:b ) .")).unwrap();
+        assert_eq!(graph.len(), 2);
+        assert!(graph.iter().all(fluree_graph_ir::Triple::is_list_element));
+        assert!(
+            !graph
+                .iter()
+                .any(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST
+                    || p.as_ref() == RDF_REST)),
+            "default mode must not emit a spine"
+        );
+    }
+
+    /// Documented (lossy) default: an object-position `()` emits nothing.
+    /// Changing this is exactly what `Spine` is for.
+    #[test]
+    fn default_empty_object_collection_still_emits_nothing() {
+        let graph = parse_to_graph(&format!("@prefix ex: <{EX}> .\nex:s ex:p () .")).unwrap();
+        assert_eq!(graph.len(), 0);
+    }
+
+    /// Subject-position collections emitted a spine before this change and
+    /// still do in the default mode — the change is scoped to object position.
+    #[test]
+    fn default_subject_collection_still_emits_a_spine() {
+        let graph = parse_to_graph(&format!("@prefix ex: <{EX}> .\n( ex:a ) ex:p ex:o .")).unwrap();
+        assert_eq!(graph.len(), 3);
+        assert!(graph
+            .iter()
+            .any(|t| matches!(&t.p, Term::Iri(p) if p.as_ref() == RDF_FIRST)));
+    }
+
+    // -- Numerics -----------------------------------------------------------
+
+    /// `+1`, `01`, `1e0`, `1.0e0` are distinct lexical forms of two values.
+    /// Canonicalizing makes them unrepresentable; several W3C files depend on
+    /// them surviving.
+    #[test]
+    fn preserve_lexical_keeps_the_source_spelling_of_numerics() {
+        let cases = [
+            ("+1", "http://www.w3.org/2001/XMLSchema#integer"),
+            ("01", "http://www.w3.org/2001/XMLSchema#integer"),
+            ("-0", "http://www.w3.org/2001/XMLSchema#integer"),
+            ("1e0", "http://www.w3.org/2001/XMLSchema#double"),
+            ("1.0e0", "http://www.w3.org/2001/XMLSchema#double"),
+            ("1.0E0", "http://www.w3.org/2001/XMLSchema#double"),
+            ("+1.0e-1", "http://www.w3.org/2001/XMLSchema#double"),
+        ];
+        for (lexical, datatype) in cases {
+            let graph = parse_conformant(&format!("@prefix ex: <{EX}> .\nex:s ex:p {lexical} ."));
+            assert_eq!(graph.len(), 1, "{lexical}");
+            let triple = graph.iter().next().unwrap();
+            match &triple.o {
+                Term::Literal {
+                    value, datatype: d, ..
+                } => {
+                    assert_eq!(value.lexical(), lexical, "lexical form of {lexical}");
+                    assert_eq!(d.as_iri(), datatype, "datatype of {lexical}");
+                }
+                other => panic!("expected literal for {lexical}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The default: the value survives, the spelling does not.
+    #[test]
+    fn canonicalize_is_the_default_and_discards_the_spelling() {
+        let graph =
+            parse_to_graph(&format!("@prefix ex: <{EX}> .\nex:s ex:p +1 ; ex:q 1e0 .")).unwrap();
+        let mut objects: Vec<_> = graph.iter().map(|t| t.o.clone()).collect();
+        objects.sort();
+        assert!(
+            objects.iter().any(|o| matches!(
+                o,
+                Term::Literal {
+                    value: LiteralValue::Integer(1),
+                    ..
+                }
+            )),
+            "+1 must canonicalize to Integer(1): {objects:?}"
+        );
+        assert!(
+            objects.iter().any(|o| matches!(
+                o,
+                Term::Literal { value: LiteralValue::Double(d), .. } if *d == 1.0
+            )),
+            "1e0 must canonicalize to Double(1.0): {objects:?}"
+        );
+    }
+
+    /// Decimals and i64-overflowing integers already preserved their lexical
+    /// form; `PreserveLexical` extends that lane rather than adding a second
+    /// one, so these must be identical under both modes.
+    #[test]
+    fn decimal_and_bigint_lexicals_are_mode_independent() {
+        let doc =
+            format!("@prefix ex: <{EX}> .\nex:s ex:p 1.50 ; ex:q 123456789012345678901234567890 .");
+        let render = |g: &Graph| {
+            let mut r = rendered(g);
+            r.sort();
+            r
+        };
+        assert_eq!(
+            render(&parse_to_graph(&doc).unwrap()),
+            render(&parse_conformant(&doc))
+        );
+        let graph = parse_conformant(&doc);
+        let lexicals: Vec<String> = graph
+            .iter()
+            .map(|t| match &t.o {
+                Term::Literal { value, .. } => value.lexical(),
+                other => panic!("expected literal, got {other:?}"),
+            })
+            .collect();
+        assert!(lexicals.contains(&"1.50".to_string()), "{lexicals:?}");
+        assert!(
+            lexicals.contains(&"123456789012345678901234567890".to_string()),
+            "{lexicals:?}"
+        );
+    }
+
+    /// Booleans, strings, typed and language-tagged literals are untouched by
+    /// `NumericStyle` — the knob is numerics only.
+    #[test]
+    fn non_numeric_literals_are_identical_under_both_modes() {
+        let doc = format!(
+            r#"@prefix ex: <{EX}> .
+               @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+               ex:s ex:a true ; ex:b "plain" ; ex:c "tagged"@en ;
+                    ex:d "2000-01-01"^^xsd:date ."#
+        );
+        let render = |g: &Graph| {
+            let mut r = rendered(g);
+            r.sort();
+            r
+        };
+        assert_eq!(
+            render(&parse_to_graph(&doc).unwrap()),
+            render(&parse_conformant(&doc))
+        );
+    }
+
+    // -- Default-mode pinning across the whole surface ----------------------
+
+    /// One document exercising every construct the options touch, asserted
+    /// triple-for-triple in the DEFAULT mode. This is the regression guard
+    /// for "existing callers are unchanged": if adding options moved anything
+    /// on the ingest path, it moves here.
+    #[test]
+    fn default_mode_output_is_pinned_triple_for_triple() {
+        let doc = format!(
+            r#"@prefix ex: <{EX}> .
+               ex:s ex:int 30 ; ex:dbl 1.5e3 ; ex:dec 2.25 ; ex:list ( ex:a ex:b ) ;
+                    ex:empty () ; ex:str "v" ."#
+        );
+        let mut got = rendered(&parse_to_graph(&doc).unwrap());
+        got.sort();
+
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let mut want = vec![
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}int>"),
+                format!("\"30\"^^<{xsd}integer>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}dbl>"),
+                format!("\"1.5E3\"^^<{xsd}double>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}dec>"),
+                format!("\"2.25\"^^<{xsd}decimal>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}list>"),
+                format!("<{EX}a>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}list>"),
+                format!("<{EX}b>"),
+            ),
+            (
+                format!("<{EX}s>"),
+                format!("<{EX}str>"),
+                "\"v\"".to_string(),
+            ),
+        ];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    /// And the same document under `conformant()`, so the two shapes are
+    /// visibly different in exactly the intended places.
+    #[test]
+    fn conformant_mode_differs_only_in_collections_and_numerics() {
+        let doc = format!(
+            r#"@prefix ex: <{EX}> .
+               ex:s ex:int 30 ; ex:dbl 1.5e3 ; ex:list ( ex:a ) ; ex:empty () ;
+                    ex:str "v" ."#
+        );
+        let graph = parse_conformant(&doc);
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        let rows = rendered(&graph);
+
+        // Numerics keep their spelling.
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}int>"),
+            format!("\"30\"^^<{xsd}integer>")
+        )));
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}dbl>"),
+            format!("\"1.5e3\"^^<{xsd}double>")
+        )));
+        // `()` is rdf:nil rather than nothing.
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}empty>"),
+            format!("<{RDF_NIL}>")
+        )));
+        // Non-numeric, non-collection terms are untouched.
+        assert!(rows.contains(&(
+            format!("<{EX}s>"),
+            format!("<{EX}str>"),
+            "\"v\"".to_string()
+        )));
+        // 4 scalar edges + 1 collection edge + 2 spine triples.
+        assert_eq!(graph.len(), 7, "{rows:#?}");
+    }
+
+    /// Options ride through the pre-seeded-prelude entry point too — that is
+    /// the one the chunked/parallel readers use.
+    #[test]
+    fn options_apply_on_the_prefixes_base_entry_point() {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base_options(
+            "ex:s ex:p ( ex:a ) .",
+            &mut sink,
+            &[("ex".to_string(), EX.to_string())],
+            None,
+            ParserOptions::conformant(),
+        )
+        .expect("prelude-seeded conformant parse");
+        assert_eq!(sink.into_graph().len(), 3);
+
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base(
+            "ex:s ex:p ( ex:a ) .",
+            &mut sink,
+            &[("ex".to_string(), EX.to_string())],
+            None,
+        )
+        .expect("prelude-seeded default parse");
+        assert_eq!(sink.into_graph().len(), 1, "default entry point unchanged");
     }
 
     // =========================================================================
