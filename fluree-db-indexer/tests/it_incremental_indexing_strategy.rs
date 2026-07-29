@@ -93,6 +93,8 @@ fn incremental_branch_only_fetches_and_rewrites_touched_leaves() {
         &branch_bytes,
         &novelty,
         &novelty_ops,
+        &[],
+        &[],
         &config,
         &fetch_leaf,
         &fetch_sidecar,

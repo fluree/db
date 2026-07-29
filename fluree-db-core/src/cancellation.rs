@@ -65,9 +65,12 @@ impl fmt::Display for QueryCancellationReason {
 struct QueryCancellationInner {
     reason: AtomicU8,
     /// Bytes of retained query memory recorded via [`QueryCancellation::record_alloc`].
-    /// A monotonic, deliberately-conservative high-water accumulator: callers record
-    /// where a retained buffer grows, so the total tracks a query's live post-scan
-    /// memory across all its operators.
+    /// A deliberately-conservative accumulator: callers record where a retained buffer
+    /// grows, so the total tracks a query's live post-scan memory across all its
+    /// operators. Mostly grows (persistent join/aggregate builds, retained lookups);
+    /// an allocation with a PROVABLE drop point (a scan window handed off and dropped)
+    /// may be paired with [`QueryCancellation::release`], so this is a high-water of
+    /// *live* accounted memory, not a monotonic all-time sum.
     allocated: AtomicUsize,
     /// Optional per-query memory ceiling in bytes (`NO_MEMORY_LIMIT` = unset). Stored
     /// as an opaque number — this crate never compares or enforces it; the query
@@ -152,12 +155,34 @@ impl QueryCancellation {
     /// Record `bytes` of retained query memory into the shared counter. Callers record
     /// at the points where a retained buffer (a hash-join build table, a GROUP BY map,
     /// a fused dim-map) grows, so the counter tracks the query's live post-scan memory.
-    /// Monotonic and intentionally conservative — over-counting can only trip the guard
-    /// on a query already near its ceiling. No-op on a disabled handle.
+    /// Intentionally conservative — over-counting can only trip the guard on a query
+    /// already near its ceiling. Persistent allocations are never released; an
+    /// allocation with a provable drop point is paired with [`release`](Self::release).
+    /// No-op on a disabled handle.
     #[inline]
     pub fn record_alloc(&self, bytes: usize) {
         if let Some(inner) = &self.inner {
             inner.allocated.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Release `bytes` previously recorded via [`record_alloc`](Self::record_alloc),
+    /// for an allocation whose drop point the caller can prove — e.g. a scan window
+    /// that has been handed off downstream and is about to drop, so a streaming scan
+    /// of N sequentially-freed windows accounts only the resident one rather than
+    /// their all-time sum. Saturating, so a double- or over-release can never
+    /// underflow the counter. It is a CALLER INVARIANT that `release` is paired only
+    /// with a matching non-persistent `record_alloc`: persistent buffers (join /
+    /// aggregate builds, retained lookups) must never be released, or the guard would
+    /// under-count live memory. No-op on a disabled handle.
+    #[inline]
+    pub fn release(&self, bytes: usize) {
+        if let Some(inner) = &self.inner {
+            let _ = inner
+                .allocated
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(bytes))
+                });
         }
     }
 
@@ -259,6 +284,34 @@ mod tests {
         // The counter lives on the shared Arc, so both handles observe the total.
         assert_eq!(cancellation.allocated_bytes(), 150);
         assert_eq!(derived.allocated_bytes(), 150);
+    }
+
+    #[test]
+    fn release_subtracts_and_saturates_at_zero() {
+        let cancellation = QueryCancellation::new();
+        let derived = cancellation.clone();
+
+        cancellation.record_alloc(1000);
+        // A provable-drop allocation is released — the counter tracks LIVE memory, so
+        // charging then releasing nets zero (a streaming scan's per-window pattern).
+        cancellation.release(400);
+        assert_eq!(cancellation.allocated_bytes(), 600);
+        assert_eq!(
+            derived.allocated_bytes(),
+            600,
+            "release is shared across clones"
+        );
+
+        // Over-release saturates at zero rather than underflowing.
+        derived.release(10_000);
+        assert_eq!(cancellation.allocated_bytes(), 0);
+    }
+
+    #[test]
+    fn disabled_handle_release_is_a_noop() {
+        let cancellation = QueryCancellation::disabled();
+        cancellation.release(1 << 20);
+        assert_eq!(cancellation.allocated_bytes(), 0);
     }
 
     #[test]

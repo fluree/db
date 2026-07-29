@@ -46,6 +46,7 @@ pub mod csv_import;
 pub mod cypher_import;
 pub(crate) mod cypher_lang;
 mod cypher_procedures;
+pub mod cypher_seq;
 pub mod cypher_txn;
 pub mod cypher_write;
 pub mod dataset;
@@ -61,6 +62,7 @@ pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
 pub mod import;
+pub mod import_source;
 mod indexer_attachment_provider;
 mod indexer_fulltext_provider;
 mod inline_ontology;
@@ -1958,6 +1960,22 @@ impl FlureeBuilder {
         self
     }
 
+    /// Inject a secret resolver used to hydrate `ConfigValue::SecretRef` auth
+    /// references in Iceberg graph sources built by this builder. It is forwarded
+    /// to the finalized `Fluree`. Most hosts inject per-request via
+    /// [`Fluree::with_secret_resolver`] instead; use this for a build-time default.
+    ///
+    /// Gated on `iceberg` ONLY (not `native`): the no-native BYO-IAM `SecretRef`
+    /// surface this exists for must be available on solo's per-lambda fast path.
+    #[cfg(feature = "iceberg")]
+    pub fn with_secret_resolver(
+        mut self,
+        resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
+    ) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
     /// Build a file-backed Fluree instance
     ///
     /// Returns an error if storage_path is not set.
@@ -1968,19 +1986,6 @@ impl FlureeBuilder {
     /// spawned on the tokio runtime, so `build()` must be called within a
     /// tokio context.
     #[cfg(feature = "native")]
-    /// Inject a secret resolver used to hydrate `ConfigValue::SecretRef` auth
-    /// references in Iceberg graph sources built by this builder. It is forwarded
-    /// to the finalized `Fluree`. Most hosts inject per-request via
-    /// [`Fluree::with_secret_resolver`] instead; use this for a build-time default.
-    #[cfg(feature = "iceberg")]
-    pub fn with_secret_resolver(
-        mut self,
-        resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
-    ) -> Self {
-        self.secret_resolver = Some(resolver);
-        self
-    }
-
     pub fn build(mut self) -> Result<Fluree> {
         let path = self
             .storage_path
@@ -3694,6 +3699,34 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<(TransactResult, Option<serde_json::Value>)> {
+        // Multi-clause statements: the sequential driver stages clause-by-
+        // clause into one commit and answers a trailing RETURN from its final
+        // row table (so the created-entity-only RETURN planner below must not
+        // see them).
+        //
+        // Unwrapped probes: this method carries no policy (see the
+        // `transact_cypher_with_params` doc) — correct precisely because
+        // there is nothing to enforce.
+        if let Ok(ast) = crate::query::helpers::substituted_cypher_ast(cypher, params) {
+            if let Some(sq) = crate::cypher_seq::detect_sequential(&ast) {
+                let ledger_id = ledger.ledger_id().to_string();
+                let index_config = crate::server_defaults::default_index_config();
+                let outcome = self
+                    .stage_cypher_sequential(
+                        ledger,
+                        &sq,
+                        &ledger_id,
+                        None,
+                        Some(&index_config),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+                return self.commit_sequential_outcome(outcome, &index_config).await;
+            }
+        }
+
         // Plan the RETURN from the same parse+substitution the write plan
         // uses; a Some plan needs a caller-known skolem id so the created
         // Sids are reconstructible post-commit.
@@ -3727,6 +3760,13 @@ impl Fluree {
                 let probe = GraphDb::from_ledger_state(&ledger);
                 self.resolve_conditional_cypher(&cw, probe, ledger.ledger_id(), &ledger.snapshot)
                     .await?
+            }
+            crate::cypher_write::WritePlan::Sequential(_) => {
+                // Handled by the early detect_sequential branch above; the
+                // same AST cannot classify differently here.
+                return Err(ApiError::internal(
+                    "sequential Cypher write reached the single-statement path",
+                ));
             }
         };
         let mut builder = self.stage_owned(ledger).txn(resolved.primary);
@@ -3770,6 +3810,14 @@ impl Fluree {
         skolem_txn_id: Option<String>,
     ) -> Result<crate::cypher_write::WritePlan> {
         let ast = crate::query::helpers::substituted_cypher_ast(cypher, params)?;
+
+        // Multi-clause statements route to the sequential driver FIRST — it
+        // answers a trailing RETURN itself (full read surface off the final
+        // row table), so the created-entity-only RETURN validation below must
+        // not reject it.
+        if let Some(sq) = crate::cypher_seq::detect_sequential(&ast) {
+            return Ok(crate::cypher_write::WritePlan::Sequential(Box::new(sq)));
+        }
 
         // Validate a trailing RETURN up front (lowering ignores it): the v1
         // surface is bare created-entity variables, and it never combines with
@@ -4105,6 +4153,22 @@ impl Fluree {
         ledger_id: &str,
         snapshot: &fluree_db_core::LedgerSnapshot,
     ) -> Result<fluree_db_transact::ir::Txn> {
+        self.lower_cypher_ast_to_txn_seeded(ast, ledger_id, snapshot, Vec::new())
+            .await
+    }
+
+    /// [`Self::lower_cypher_ast_to_txn`] with externally-seeded variables:
+    /// the sequential write driver lowers each clause's sub-statement with the
+    /// row table's columns declared bound, then appends the row block itself
+    /// (an `UnresolvedPattern::Values` of `PreBound` bindings) to the returned
+    /// `Txn`'s `where_patterns`.
+    pub(crate) async fn lower_cypher_ast_to_txn_seeded(
+        &self,
+        ast: &fluree_db_cypher::CypherAst,
+        ledger_id: &str,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+        seeded_vars: Vec<String>,
+    ) -> Result<fluree_db_transact::ir::Txn> {
         // Pull @vocab and term overrides out of the ledger's default context so
         // write Cypher resolves bare identifiers the same way `query_cypher`
         // does. `Ok(None)` (no default_context configured) and
@@ -4119,8 +4183,11 @@ impl Fluree {
         };
         let (vocab, overrides) =
             crate::query::helpers::extract_cypher_iri_mapping(default_context.as_ref());
-        let cypher_opts =
-            fluree_db_transact::lower_cypher_update::CypherLowerOpts { vocab, overrides };
+        let cypher_opts = fluree_db_transact::lower_cypher_update::CypherLowerOpts {
+            vocab,
+            overrides,
+            seeded_vars,
+        };
 
         let mut ns = NamespaceRegistry::from_db(snapshot);
         Ok(

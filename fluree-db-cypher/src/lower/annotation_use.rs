@@ -152,6 +152,7 @@ fn scan_expr(e: &Expr, out: &mut HashSet<String>) {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             scan_expr(l, out);
             scan_expr(r, out);
@@ -242,6 +243,7 @@ fn collect_vars(e: &Expr, out: &mut HashSet<String>) {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             collect_vars(l, out);
             collect_vars(r, out);

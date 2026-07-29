@@ -61,6 +61,11 @@ pub enum UnresolvedValue {
         /// Datatype IRI or language tag constraint
         dtc: Option<UnresolvedDatatypeConstraint>,
     },
+    /// An already-resolved binding, passed through resolution verbatim.
+    /// Never produced by any parser — the Cypher sequential write driver
+    /// seeds row tables (bindings extracted from a prior query result)
+    /// back into a `Txn`'s WHERE through this variant, losslessly.
+    PreBound(crate::binding::Binding),
 }
 
 /// Unresolved term - before IRI encoding

@@ -306,9 +306,29 @@ MATCH (n:Person) RETURN n.name LIMIT 10
 - **Limitations over remote** (the CLI errors with a pointer to `--direct` for
   local execution): the server renders cypher-json only — the other `--format`
   shapes (`json`/`typed-json`/`csv`/`tsv`) are built client-side on the local
-  path and are not negotiated remotely — and the endpoint has no `--at`
-  time-travel handling for Cypher. `--explain`, `--bench`, and `--track*` are
-  not supported for Cypher on any transport.
+  path and are not negotiated remotely — and the endpoints have no `--at`
+  time-travel handling for Cypher. `--bench` and `--track*` are not supported
+  for Cypher on any transport.
+
+**Remote Cypher explain (`fluree query --cypher --explain --remote`)** POSTs
+to the **ledger-scoped** explain endpoint with the same Cypher content type:
+
+```
+POST {api_base_url}/explain/{ledger}
+Content-Type: application/cypher
+
+MATCH (n:Person {id: 7}) RETURN n
+```
+
+- The body is sent **verbatim** — raw Cypher or a `{cypher, params}` envelope.
+  The server extracts the envelope and substitutes `$param` references before
+  lowering, so the reported plan matches what `/query/{ledger}` would execute.
+- The response is a JSON plan document (`{"query": ..., "plan": ...}`), the
+  same shape as SPARQL/JSON-LD explain.
+- Only the ledger-scoped endpoint accepts Cypher; the connection-scoped
+  `POST /explain` returns 400 for Cypher (no ledger to resolve).
+- Bearer ledger scope (`can_read`) and `Fluree-Min-T` apply as on the query
+  path. `--at` is rejected for remote Cypher explain (use `--direct`).
 
 ### `fluree load` (CSV → batched upserts), `fluree update --format cypher`
 
@@ -1767,6 +1787,17 @@ The Fluree server ships a reference backend (enable with `FLUREE_IMPORT_PRESIGN_
 | CLI negotiation + single/multipart upload + poll | `fluree-db-cli/src/commands/create.rs::run_remote_flpack_negotiated`, `fluree-db-cli/src/remote_client.rs` |
 
 > A production server fronting real object storage persists job state externally (DB / object tags) rather than in process, and mints presigned URLs against its bucket. The contract above is what the CLI depends on; the staging mechanism is the server's choice.
+
+### Source uploads (server-side bulk import)
+
+The same handshake optionally accepts **raw source data** — the formats `fluree create --from` ingests locally — and runs the chunked bulk-import pipeline on `complete` instead of a `.flpack` restore. This backs `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` (single files only; the CLI refuses directories with a pointer to publish/`.flpack`).
+
+- **Discovery:** add `"source-upload"` to `import.modes` and advertise `import.source_formats` (the reference server lists `ttl/nt/nq/trig/jsonld/json/jsonl/ndjson` — each optionally `.gz`/`.zst` — plus `csv/cypher/cyp/cql`). The CLI checks `source-upload` before attempting; absent it, `--remote --from <non-flpack>` errors with a `.flpack` fallback hint.
+- **Mint:** `"source_kind": "source"` (default `"flpack"`) plus `"filename"` (its extension drives format detection; the staged object must keep it). CSV/Cypher uploads may also send `"edge_properties": "annotated"|"plain"|"nary"` and `"base_iri"`; the CLI forwards its corresponding create flags. Reject unsupported extensions, option values, and missing filenames with `400`.
+- **Complete:** run the bulk-import pipeline over the staged file (converting CSV/Cypher to JSON-LD shards first) in the same async worker slot as a restore. On success, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`.
+- **Raft caveat:** the pipeline publishes nameservice heads directly and repeatedly, outside any replicated write log — do not offer `source-upload` on consensus-replicated deployments (the reference server omits the mode and 400s the mint).
+
+Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::run_remote_source_import`.
 
 ## Storage Proxy Contract
 

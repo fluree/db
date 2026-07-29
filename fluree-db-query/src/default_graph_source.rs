@@ -132,11 +132,17 @@ impl DefaultGraphSourceOperator {
             if let Some(shape) =
                 crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
             {
-                // Resolve the relationship predicate to a concrete Sid
-                // (Cypher lowers it to an IRI). If it can't be encoded for
-                // this snapshot the predicate has no data here — fall back
-                // to the generic chain rather than guess.
-                if let Some(p_sid) = resolve_pred_sid(&shape.p_pred, ctx) {
+                // Resolve the relationship predicate: a typed relationship
+                // is a concrete IRI/Sid (encode for this snapshot — if it
+                // can't be encoded the predicate has no data here, fall
+                // back to the generic chain rather than guess); an untyped
+                // `-[p]->` is a variable the base scan binds per row.
+                let p_pos = match &shape.p_pred {
+                    Ref::Var(v) => Some(crate::annotation_edge_probe::EdgePos::Var(*v)),
+                    pred => resolve_pred_sid(pred, ctx)
+                        .map(crate::annotation_edge_probe::EdgePos::Const),
+                };
+                if let Some(p_pos) = p_pos {
                     // Base edge plans normally (visibility + policy), seeded
                     // by the whole child stream.
                     let base = build_where_operators_seeded(
@@ -151,7 +157,7 @@ impl DefaultGraphSourceOperator {
                             base,
                             shape.ann_var,
                             shape.s_pos,
-                            p_sid,
+                            p_pos,
                             shape.o_pos,
                         ),
                     );

@@ -50,6 +50,13 @@ pub enum Tag {
     /// The naive first-touch "profile a new dataset" family (q055+): wildcard
     /// peek, triple count, schema discovery, class census, predicate histogram.
     Exploration,
+    /// The Solo "browse / View Instances" family (q079+): select-map subgraph
+    /// crawls (`{"select": {"?s": ["*"]}}` / `{"<iri>": [...]}`) that return
+    /// JSON-LD node documents with native-parity shapes — the browse-parity work
+    /// package (Clusters A/B, E1). Distinct from `Exploration` (SPARQL profiling
+    /// of an unknown dataset) and `Wildcard` (the `?s ?p ?o` triple pattern): a
+    /// Browse member exercises the node-document hydration/serialization path.
+    Browse,
 }
 
 /// A per-target-kind expected terminal outcome. Defaults to [`Self::Ok`], so a
@@ -338,20 +345,33 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            68,
+            87,
             "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
              4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
              q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
              1 E1 shared-predicate member (q064 Product-by-category) + \
              1 E2 join+flag member (q065 orders-by-current-customer-segment) + \
              2 W4-2 mixed fact+dim group-key members (q066 COUNT, q067 COUNT+intSUM) + \
-             1 W4-1b folded-crawl sentinel (q068 orderline detail crawl)"
+             1 W4-1b folded-crawl sentinel (q068 orderline detail crawl) + \
+             6 PR-COVERAGE scan-side members promoted from the A3 probe battery \
+             (q069 FILTER-IN/F-AUD-5, q070 scalar-VALUES/F-AUD-5, q071 ASC-top-k/F-AUD-6, \
+             q072 timestamp-prune/F-AUD-11, q073 OPTIONAL-budget/F-AUD-7, q074 its control) + \
+             3 PR-COVERAGE fold-side members (q075 ungrouped MIN/MAX + q076 grouped MIN/MAX \
+             for item 9/F-AUD-8, q077 multi-constraint COUNT for item 9b/the q038 class) + \
+             1 F1 direct-path member (q078 Graph-path multi-constraint COUNT, the q077 twin, \
+             closing the q038 ungrouped/direct-path fusion gap) + \
+             7 browse-parity members (q079 class-page crawl/Cluster A, q080 subject-detail \
+             + q081 @type + q082 property-list select-maps/Cluster B, q083 property-scoped \
+             listing/E1, q084 filtered page, q085 inbound-edge count/works-today shape 9) + \
+             2 FAMILY-C filter-over-join members (q086 open-tickets-by-segment fact-side \
+             inequality FILTER = deployed DNF Q1, q087 below-reorder-by-category fact-side \
+             var-to-var FILTER + COUNT/2×AVG = deployed DNF Q2)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));
         assert!(
-            (12..=18).contains(&smoke.len()),
-            "smoke is a ~12-15 query cover, got {}",
+            (12..=19).contains(&smoke.len()),
+            "smoke is a ~12-16 query cover, got {}",
             smoke.len()
         );
         // `validate()` already guarantees smoke covers every tag; assert the
@@ -364,9 +384,9 @@ mod tests {
             .collect();
         assert_eq!(
             smoke_tags.len(),
-            23,
-            "smoke must exercise all 23 feature tags \
-             (20 design + wildcard + exploration + mixed_group_keys)"
+            24,
+            "smoke must exercise all 24 feature tags \
+             (20 design + wildcard + exploration + mixed_group_keys + browse)"
         );
     }
 
@@ -455,6 +475,17 @@ mod tests {
             // unordered (p,o) set of the key-constrained subject's crawl —
             // rows-only for the same LIMIT-nondeterminism reason.
             "q068",
+            // PR-COVERAGE scan-side members whose LIMIT truncates an UNORDERED set
+            // (no ORDER BY / no unique tiebreaker): q072 timestamp-range LIMIT 5000,
+            // q073 OPTIONAL-budget LIMIT 50, q074 its plain-LIMIT control. (q071 ASC
+            // top-k stays Full — its `ORDER BY ASC(?tot) ?oid` tiebreaks uniquely.)
+            "q072", "q073", "q074",
+            // Browse-parity variable-subject crawls whose LIMIT truncates an
+            // UNORDERED subject set (native and virtual pick different-but-valid
+            // pages): q079 class page, q083 property-scoped listing (E1), q084
+            // filtered page. The constant-IRI select-maps (q080/q081/q082) and the
+            // COUNT (q085) are single-result/deterministic, so they stay Full.
+            "q079", "q083", "q084",
         ]
         .into_iter()
         .collect();

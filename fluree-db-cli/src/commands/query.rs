@@ -1377,11 +1377,6 @@ async fn run_cypher_query(
     policy: &PolicyArgs,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
-    if explain {
-        return Err(CliError::Usage(
-            "--explain is not yet supported for Cypher queries".to_string(),
-        ));
-    }
     if bench {
         return Err(CliError::Usage(
             "--bench is not yet supported for Cypher queries".to_string(),
@@ -1418,6 +1413,7 @@ async fn run_cypher_query(
                 &remote_name,
                 content,
                 output_format,
+                explain,
                 at,
                 policy,
                 dirs,
@@ -1443,6 +1439,18 @@ async fn run_cypher_query(
     // Accept either raw Cypher or a `{"cypher": "...", "params": {...}}`
     // envelope (the latter carries parameters).
     let (cypher, params) = fluree_db_api::extract_cypher_envelope(content);
+
+    if explain {
+        let timer = Instant::now();
+        let resp = fluree
+            .explain_cypher(&view, &cypher, params.as_ref())
+            .await?;
+        let elapsed = timer.elapsed();
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        eprintln!("(explain, {})", format_duration(elapsed));
+        return Ok(());
+    }
+
     let timer = Instant::now();
     let result = fluree
         .query_cypher_with_params(&view, &cypher, params.as_ref())
@@ -1514,10 +1522,29 @@ async fn run_remote_cypher_query(
     remote_name: &str,
     content: &str,
     output_format: OutputFormatKind,
+    explain: bool,
     at: Option<&str>,
     policy: &PolicyArgs,
     dirs: &FlureeDir,
 ) -> CliResult<()> {
+    // The remote Cypher endpoints have no time-travel handling; local does.
+    if at.is_some() {
+        return Err(CliError::Usage(
+            "--at is not supported for Cypher over a remote server; retry with --direct."
+                .to_string(),
+        ));
+    }
+    if explain {
+        // The body is sent verbatim (raw Cypher or a `{cypher, params}`
+        // envelope); the server's /explain handler extracts it.
+        let timer = Instant::now();
+        let resp = client.explain_cypher(remote_alias, content).await?;
+        let elapsed = timer.elapsed();
+        context::persist_refreshed_tokens(&client, remote_name, dirs).await;
+        println!("{}", serde_json::to_string_pretty(&resp)?);
+        eprintln!("(explain, {})", format_duration(elapsed));
+        return Ok(());
+    }
     // Only cypher-json-producing formats have a remote equivalent: the default
     // global `--format table` and explicit `--format cypher-json`. RDF JSON-LD,
     // typed-json, and delimited (csv/tsv) are rendered client-side on the local
@@ -1532,14 +1559,6 @@ async fn run_remote_cypher_query(
              Use --format cypher-json, or retry with --direct for local rendering."
         )));
     }
-    // The remote Cypher endpoint has no time-travel handling; local execution does.
-    if at.is_some() {
-        return Err(CliError::Usage(
-            "--at is not supported for Cypher over a remote server; retry with --direct."
-                .to_string(),
-        ));
-    }
-
     // Attach policy flags so headers + body opts ride through on the request.
     let client = client.with_policy(policy.clone());
 

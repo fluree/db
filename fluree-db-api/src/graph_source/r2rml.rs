@@ -164,6 +164,23 @@ fn build_iceberg_filter(
         let Some(field) = schema.field_by_name(&f.column) else {
             continue;
         };
+        // Item 7 (F-AUD-5): a set-membership filter builds `Expression::In` — the
+        // backend keeps a file iff ANY member could lie in its column bounds
+        // (pruning.rs). It is pushed whole or not at all: if a single member
+        // cannot be represented against this physical column, the WHOLE `In` is
+        // dropped (a partial `In` could prune a file a missing member's rows need).
+        if f.op == ScanCmpOp::In {
+            if let ScanValue::Set(members) = &f.value {
+                if let Some(values) = set_members_to_literals(field.type_string(), members) {
+                    comparisons.push(Expression::In {
+                        field_id: field.id,
+                        column: f.column.clone(),
+                        values,
+                    });
+                }
+            }
+            continue;
+        }
         let op = match f.op {
             ScanCmpOp::Eq => ComparisonOp::Eq,
             ScanCmpOp::NotEq => ComparisonOp::NotEq,
@@ -171,98 +188,11 @@ fn build_iceberg_filter(
             ScanCmpOp::LtEq => ComparisonOp::LtEq,
             ScanCmpOp::Gt => ComparisonOp::Gt,
             ScanCmpOp::GtEq => ComparisonOp::GtEq,
+            // Handled above; `In` never reaches the scalar `ComparisonOp` mapping.
+            ScanCmpOp::In => continue,
         };
-        let value = match &f.value {
-            ScanValue::Bool(b) => LiteralValue::Boolean(*b),
-            // Push a Date literal only against a physically-`date` column. The
-            // Arrow reader applies it as an exact row filter (casting the column
-            // to text), but the operator enforces with a lenient `Date::parse`
-            // that also accepts `"2024-01-15Z"` / offset forms. On a physically
-            // string column the operator would keep such a row while the row
-            // filter drops it — so gate the pushdown to keep it a strict subset.
-            ScanValue::Date(d) => match field.type_string() {
-                Some("date") => LiteralValue::Date(*d),
-                _ => continue,
-            },
-            // Iceberg `int` is 32-bit, `long` 64-bit; against a `decimal` column an
-            // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
-            // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
-            // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
-            ScanValue::Int(n) => {
-                match int_pushdown_literal(*n, field.type_string(), iceberg_numeric_stats_enabled())
-                {
-                    Some(v) => v,
-                    None => continue,
-                }
-            }
-            ScanValue::Str(s) => LiteralValue::String(s.clone()),
-            // xsd:double / xsd:float FILTER value. Push only against a physically
-            // `double` column (exact f64 bounds); a `float` column would need an
-            // f64→f32 narrowing that can round the literal and over-prune a range,
-            // so skip it — the in-engine FILTER still applies.
-            ScanValue::Double(d) => match field.type_string() {
-                Some("double") => LiteralValue::Float64(*d),
-                // A binary float → decimal coercion is not exact in general, so a
-                // double literal is NOT pushed against a decimal column (keep is
-                // correct; the in-engine FILTER enforces). Breadcrumb per the
-                // decline-observably ruling.
-                Some(t) if t.starts_with("decimal") => {
-                    debug!(
-                        column = %f.column,
-                        "double literal vs decimal column: pushdown declined (inexact float→decimal); in-engine FILTER enforces"
-                    );
-                    continue;
-                }
-                _ => continue,
-            },
-            // xsd:decimal FILTER value. Push only against a `decimal(...)` column;
-            // the literal keeps its own scale and the bound compare normalizes it
-            // against the column's scale. Row-group stats prune only when the
-            // column is FLBA-encoded (see `prunable_stats`); file-level manifest
-            // bounds prune regardless.
-            ScanValue::Decimal {
-                unscaled,
-                precision,
-                scale,
-            } => match field.type_string() {
-                Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
-                    unscaled: *unscaled,
-                    precision: *precision,
-                    scale: *scale,
-                },
-                // A decimal literal against an integer column has no exact
-                // cross-type bound compare, so it is NOT pushed (keep is correct).
-                // Breadcrumb per the decline-observably ruling.
-                Some("int" | "long") => {
-                    debug!(
-                        column = %f.column,
-                        "decimal literal vs integer column: pushdown declined (no exact cross-type bound compare); in-engine FILTER enforces"
-                    );
-                    continue;
-                }
-                _ => continue,
-            },
-            // A reversed subject-template key: coerce the raw string to the
-            // column's physical type. A key that parses as an integer pushes as an
-            // integer literal against an `int`/`long`/`decimal` column — including
-            // a `decimal` of any scale (the Arrow reader casts the integer to the
-            // column's decimal type; row-group stats conservatively skip
-            // decimals). A `string` column pushes the raw string. A key that is
-            // not integer-valued, or any other physical type
-            // (float/date/timestamp/boolean), skips the pushdown — the operator
-            // still enforces the subject equality either way.
-            ScanValue::TemplateKey(s) => match field.type_string() {
-                Some("int") => match s.parse::<i32>() {
-                    Ok(v) => LiteralValue::Int32(v),
-                    Err(_) => continue,
-                },
-                Some(t) if t == "long" || t.starts_with("decimal") => match s.parse::<i64>() {
-                    Ok(v) => LiteralValue::Int64(v),
-                    Err(_) => continue,
-                },
-                Some("string") => LiteralValue::String(s.clone()),
-                _ => continue,
-            },
+        let Some(value) = scan_value_to_literal(field.type_string(), &f.value) else {
+            continue;
         };
         comparisons.push(Expression::Comparison {
             field_id: field.id,
@@ -276,6 +206,142 @@ fn build_iceberg_filter(
         1 => comparisons.into_iter().next(),
         _ => Some(Expression::And(comparisons)),
     }
+}
+
+/// Map each member of an `IN` set to an Iceberg [`LiteralValue`] against the
+/// column's physical type, or `None` if ANY member cannot be represented — a
+/// partial `IN` could prune a file that a dropped member's rows live in, which
+/// the in-engine FILTER could then never recover. Reuses the exact scalar
+/// conversion the single-value pushdown uses, so member soundness is identical.
+fn set_members_to_literals(
+    field_type: Option<&str>,
+    members: &[ScanValue],
+) -> Option<Vec<LiteralValue>> {
+    let mut out = Vec::with_capacity(members.len());
+    for m in members {
+        out.push(scan_value_to_literal(field_type, m)?);
+    }
+    Some(out)
+}
+
+/// Translate one scalar [`ScanValue`] to an Iceberg pushdown [`LiteralValue`]
+/// against a column of the given physical type, or `None` to skip the push
+/// (leaving the in-engine FILTER as the authority). Shared by the single-value
+/// `Comparison` path and the set-membership `In` path.
+fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<LiteralValue> {
+    Some(match value {
+        ScanValue::Bool(b) => LiteralValue::Boolean(*b),
+        // Push a Date literal only against a physically-`date` column. The
+        // Arrow reader applies it as an exact row filter (casting the column
+        // to text), but the operator enforces with a lenient `Date::parse`
+        // that also accepts `"2024-01-15Z"` / offset forms. On a physically
+        // string column the operator would keep such a row while the row
+        // filter drops it — so gate the pushdown to keep it a strict subset.
+        ScanValue::Date(d) => match field_type {
+            Some("date") => LiteralValue::Date(*d),
+            _ => return None,
+        },
+        // Iceberg `int` is 32-bit, `long` 64-bit; against a `decimal` column an
+        // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
+        // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
+        // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
+        ScanValue::Int(n) => {
+            match int_pushdown_literal(*n, field_type, iceberg_numeric_stats_enabled()) {
+                Some(v) => v,
+                None => return None,
+            }
+        }
+        ScanValue::Str(s) => LiteralValue::String(s.clone()),
+        // xsd:double / xsd:float FILTER value. Push only against a physically
+        // `double` column (exact f64 bounds); a `float` column would need an
+        // f64→f32 narrowing that can round the literal and over-prune a range,
+        // so skip it — the in-engine FILTER still applies.
+        ScanValue::Double(d) => match field_type {
+            Some("double") => LiteralValue::Float64(*d),
+            // A binary float → decimal coercion is not exact in general, so a
+            // double literal is NOT pushed against a decimal column (keep is
+            // correct; the in-engine FILTER enforces). Breadcrumb per the
+            // decline-observably ruling.
+            Some(t) if t.starts_with("decimal") => {
+                debug!(
+                    field_type = ?field_type,
+                    "double literal vs decimal column: pushdown declined (inexact float→decimal); in-engine FILTER enforces"
+                );
+                return None;
+            }
+            _ => return None,
+        },
+        // xsd:decimal FILTER value. Push only against a `decimal(...)` column;
+        // the literal keeps its own scale and the bound compare normalizes it
+        // against the column's scale. Row-group stats prune only when the
+        // column is FLBA-encoded (see `prunable_stats`); file-level manifest
+        // bounds prune regardless.
+        ScanValue::Decimal {
+            unscaled,
+            precision,
+            scale,
+        } => match field_type {
+            Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
+                unscaled: *unscaled,
+                precision: *precision,
+                scale: *scale,
+            },
+            // A decimal literal against an integer column has no exact
+            // cross-type bound compare, so it is NOT pushed (keep is correct).
+            // Breadcrumb per the decline-observably ruling.
+            Some("int" | "long") => {
+                debug!(
+                    field_type = ?field_type,
+                    "decimal literal vs integer column: pushdown declined (no exact cross-type bound compare); in-engine FILTER enforces"
+                );
+                return None;
+            }
+            _ => return None,
+        },
+        // A reversed subject-template key: coerce the raw string to the
+        // column's physical type. A key that parses as an integer pushes as an
+        // integer literal against an `int`/`long`/`decimal` column — including
+        // a `decimal` of any scale (the Arrow reader casts the integer to the
+        // column's decimal type; row-group stats conservatively skip
+        // decimals). A `string` column pushes the raw string. A key that is
+        // not integer-valued, or any other physical type
+        // (float/date/timestamp/boolean), skips the pushdown — the operator
+        // still enforces the subject equality either way.
+        ScanValue::TemplateKey(s) => match field_type {
+            Some("int") => match s.parse::<i32>() {
+                Ok(v) => LiteralValue::Int32(v),
+                Err(_) => return None,
+            },
+            Some(t) if t == "long" || t.starts_with("decimal") => match s.parse::<i64>() {
+                Ok(v) => LiteralValue::Int64(v),
+                Err(_) => return None,
+            },
+            Some("string") => LiteralValue::String(s.clone()),
+            _ => return None,
+        },
+        // Item 10 (F-AUD-11): a dateTime pushes to MANIFEST-level pruning, and only
+        // when the literal's frame matches the column's timestamp type — a tz-aware
+        // (UTC) literal against `timestamptz`, a naive (wall-clock) literal against
+        // `timestamp`. Any other pairing (frame mismatch or non-timestamp column)
+        // declines: the micros would not be comparable to the file's decoded bounds,
+        // and pushing anyway could over-prune. The in-engine FILTER stays authority.
+        ScanValue::Timestamp { micros, tz } => match (field_type, tz) {
+            (Some("timestamptz"), true) => LiteralValue::TimestampTz(*micros),
+            (Some("timestamp"), false) => LiteralValue::Timestamp(*micros),
+            _ => {
+                debug!(
+                    field_type = ?field_type,
+                    tz_aware = tz,
+                    "dateTime pushdown declined: literal frame does not match the column's timestamp type; in-engine FILTER enforces"
+                );
+                return None;
+            }
+        },
+        // A set is never a scalar literal — the `In` path handles it member by
+        // member (each member IS a scalar `ScanValue`, so this is unreachable for
+        // a well-formed filter; declining defensively is never wrong).
+        ScanValue::Set(_) => return None,
+    })
 }
 
 // =============================================================================
@@ -1845,6 +1911,9 @@ impl FlureeR2rmlProvider<'_> {
                 plan.estimated_row_count,
             )
         } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
+            // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
+            // without calling the guarded plan_scan, so re-check the delete flag.
+            guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
             debug!(
                 metadata_location = %metadata_location,
                 cached_files = cached.data_files.len(),
@@ -1872,6 +1941,13 @@ impl FlureeR2rmlProvider<'_> {
                 cached.estimated_row_count,
             )
         } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&metadata_location) {
+            // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
+            // scan-files entry survives restarts, so a delete-bearing list cached
+            // under the override by an earlier process must be re-checked before it
+            // is served or promoted into the in-memory cache. Pre-guard (v2) entries
+            // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
+            // entry written under the override.
+            guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
             // PR-8 slice 2: in-memory miss, but the persistent disk catalog
             // cache has this snapshot's (unfiltered) file list — a warm-catalog
             // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
@@ -1925,6 +2001,7 @@ impl FlureeR2rmlProvider<'_> {
                 estimated_row_count: plan.estimated_row_count,
                 files_selected: plan.files_selected,
                 files_pruned: plan.files_pruned,
+                has_delete_manifests: plan.has_delete_manifests,
             });
             cache
                 .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
@@ -1960,10 +2037,11 @@ impl FlureeR2rmlProvider<'_> {
         // incrementally instead of the whole table being collected here.
         let footers = cache.parquet_footers();
 
-        // PR-5 scan-side top-k. When a resolvable single-column DESC directive is
-        // present, read files in `upper_bound(sort_col)`-DESC order with a running
-        // k-th bound and stop once no unread file can beat it — streaming a strict
-        // SUPERSET of the top-k (the `SortOperator` above is authoritative). The
+        // PR-5 / item 8 scan-side top-k. When a resolvable single-column directive
+        // is present, read files best-first (DESC by `upper_bound`, ASC by
+        // `lower_bound`) with a running k-th bound and stop once no unread file can
+        // beat it — streaming a strict SUPERSET of the top-k (the `SortOperator`
+        // above is authoritative). ASC is admitted only for a required column. The
         // pruned subset MUST bypass the operator's scan cache (handled by its
         // `cacheable` guard gaining `&& topk.is_none()`); the disk *artifact* cache
         // is keyed by file path+size with whole-file entries, so a pruned subset
@@ -1973,16 +2051,26 @@ impl FlureeR2rmlProvider<'_> {
         // bound / a heap that can't fill), the remaining files are handed to the
         // normal parallel reader so the topk path can never be slower than it.
         if let Some(tk) = topk {
-            if let Some(field) = schema.field_by_name(&tk.sort_column) {
+            // Item 8 (F-AUD-6): ASC top-k is SOUND ONLY for a REQUIRED (non-nullable)
+            // column — SPARQL orders unbound values FIRST under ASC, so a nullable
+            // column could hold an unread NULL row that belongs ahead of the top-k.
+            // DESC is sound for any column (unbound sorts last). A declined directive
+            // simply falls through to the normal parallel scan below (ignoring a
+            // top-k is always correct — the `SortOperator` above is authoritative).
+            let admitted = schema
+                .field_by_name(&tk.sort_column)
+                .filter(|field| !tk.ascending || field.required);
+            if let Some(field) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
                 let order = plan_topk_read(
                     tasks.iter().map(|t| &t.data_file),
                     sort_field_id,
                     sort_type.as_deref(),
+                    tk.ascending,
                 );
 
-                let mut bound = TopKBound::new(tk.k);
+                let mut bound = TopKBound::new(tk.k, tk.ascending);
                 let mut collected: Vec<ColumnBatch> = Vec::new();
                 let mut tail: Vec<FileScanTask> = Vec::new();
                 let mut reads = 0usize;
@@ -2033,11 +2121,12 @@ impl FlureeR2rmlProvider<'_> {
                     }
                     collected.extend(batches);
                     reads += 1;
-                    // Stop iff the heap is full and the NEXT (highest-remaining)
-                    // file's upper_bound is strictly below the k-th (over-keep on
-                    // ties; a no-bound next → never stops). See `TopKBound::can_stop`.
-                    if let Some((_, next_upper)) = order.get(pos + 1) {
-                        if bound.can_stop(next_upper.as_ref()) {
+                    // Stop iff the heap is full and the NEXT (best-remaining) file's
+                    // bound is strictly WORSE than the k-th (below it for DESC, above
+                    // it for ASC; over-keep on ties; a no-bound next → never stops).
+                    // See `TopKBound::can_stop`.
+                    if let Some((_, next_bound)) = order.get(pos + 1) {
+                        if bound.can_stop(next_bound.as_ref()) {
                             break;
                         }
                     }
@@ -2197,6 +2286,23 @@ impl FlureeR2rmlProvider<'_> {
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
 fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
+}
+
+/// Re-apply the fail-closed merge-on-read guard (audit F-AUD-1) to a cached
+/// scan-files selection. A scan-files cache HIT (in-memory or persistent disk)
+/// rebuilds tasks WITHOUT calling the guarded `plan_scan`, so a delete-bearing
+/// file list — which is only ever cacheable when the guard was overridden at plan
+/// time — must be re-checked here in case the override is now off. Cheap: the flag
+/// rides on the cache entry, no manifest re-read. Shared by both hit arms so the
+/// check cannot drift between them.
+fn guard_cached_scan_files(has_delete_manifests: bool, metadata_location: &str) -> QueryResult<()> {
+    let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
+    fluree_db_iceberg::ensure_no_delete_manifests(
+        usize::from(has_delete_manifests),
+        metadata_location,
+        allow_mor,
+    )
+    .map_err(|e| storage_query_error("Refusing cached Iceberg scan", e))
 }
 
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
@@ -2395,6 +2501,25 @@ mod tests {
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
 
+    /// F-AUD-1 cache-arm follow-up: the shared guard both scan-files hit arms call
+    /// must refuse a delete-bearing cached entry (guard active by default in the
+    /// test env) and pass a delete-free one — so a cache HIT can never silently
+    /// serve a merge-on-read file list around the plan-time guard.
+    #[test]
+    fn cached_scan_files_guard_refuses_delete_bearing_entry() {
+        assert!(
+            guard_cached_scan_files(false, "s3://b/t/metadata/00001.json").is_ok(),
+            "a delete-free cached entry is served"
+        );
+        let err = guard_cached_scan_files(true, "s3://b/dw.fact_orders/metadata/00007.json")
+            .expect_err("a delete-bearing cached entry must be refused with the guard active");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("FLUREE_ICEBERG_ALLOW_MOR_DELETES"),
+            "the refusal names the override switch: {msg}"
+        );
+    }
+
     fn field(id: i32, name: &str, ty: serde_json::Value) -> SchemaField {
         SchemaField {
             id,
@@ -2498,6 +2623,129 @@ mod tests {
         assert!(build_iceberg_filter(&[dbl("float_key")], &s).is_none());
         // Non-numeric column: skipped.
         assert!(build_iceberg_filter(&[dbl("str_key")], &s).is_none());
+    }
+
+    fn in_filter(col: &str, values: Vec<ScanValue>) -> ScanFilter {
+        ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::In,
+            value: ScanValue::Set(values),
+        }
+    }
+
+    #[test]
+    fn in_set_builds_expression_in_over_scalar_members() {
+        // Item 7: a set filter lowers to `Expression::In` with one literal per
+        // member, resolved against the column's physical type.
+        let s = key_schema();
+        let f = in_filter(
+            "str_key",
+            vec![
+                ScanValue::Str("a".into()),
+                ScanValue::Str("b".into()),
+                ScanValue::Str("c".into()),
+            ],
+        );
+        match build_iceberg_filter(&[f], &s) {
+            Some(Expression::In { column, values, .. }) => {
+                assert_eq!(column, "str_key");
+                assert_eq!(
+                    values,
+                    vec![
+                        LiteralValue::String("a".into()),
+                        LiteralValue::String("b".into()),
+                        LiteralValue::String("c".into()),
+                    ]
+                );
+            }
+            other => panic!("expected Expression::In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_set_over_int_column_coerces_each_member() {
+        let s = key_schema();
+        let f = in_filter(
+            "int_key",
+            vec![ScanValue::Int(1), ScanValue::Int(2), ScanValue::Int(3)],
+        );
+        match build_iceberg_filter(&[f], &s) {
+            Some(Expression::In { values, .. }) => assert_eq!(
+                values,
+                vec![
+                    LiteralValue::Int32(1),
+                    LiteralValue::Int32(2),
+                    LiteralValue::Int32(3)
+                ]
+            ),
+            other => panic!("expected Expression::In, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_set_declines_whole_when_any_member_cannot_push() {
+        // A Date member against a physically-`string` column can't push; the WHOLE
+        // In is dropped — a partial In could prune a file the Date member's rows
+        // live in, and the in-engine FILTER could never recover them.
+        let s = key_schema();
+        let f = in_filter(
+            "str_key",
+            vec![ScanValue::Str("a".into()), ScanValue::Date(19_737)],
+        );
+        assert!(build_iceberg_filter(&[f], &s).is_none());
+    }
+
+    #[test]
+    fn in_set_on_unknown_column_is_skipped() {
+        let s = key_schema();
+        let f = in_filter("nope", vec![ScanValue::Int(1)]);
+        assert!(build_iceberg_filter(&[f], &s).is_none());
+    }
+
+    fn ts_schema() -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: vec![
+                field(1, "ts_ntz", json!("timestamp")),
+                field(2, "ts_tz", json!("timestamptz")),
+            ],
+        }
+    }
+
+    fn ts_filter(col: &str, micros: i64, tz: bool) -> ScanFilter {
+        ScanFilter {
+            column: col.to_string(),
+            op: ScanCmpOp::Gt,
+            value: ScanValue::Timestamp { micros, tz },
+        }
+    }
+
+    #[test]
+    fn timestamp_pushdown_is_frame_matched() {
+        // Item 10: a tz-AWARE (UTC) literal pushes only against a `timestamptz`
+        // column; a NAIVE (wall-clock) literal only against a `timestamp` column.
+        let s = ts_schema();
+        assert!(matches!(
+            only_literal(&[ts_filter("ts_tz", 1_717_200_000_000_000, true)], &s),
+            Some(LiteralValue::TimestampTz(1_717_200_000_000_000))
+        ));
+        assert!(matches!(
+            only_literal(&[ts_filter("ts_ntz", 42, false)], &s),
+            Some(LiteralValue::Timestamp(42))
+        ));
+        // Frame mismatch declines (the micros would not be comparable to the file
+        // bounds): a tz-aware literal on a `timestamp` column, or vice versa.
+        assert!(build_iceberg_filter(&[ts_filter("ts_ntz", 42, true)], &s).is_none());
+        assert!(build_iceberg_filter(&[ts_filter("ts_tz", 42, false)], &s).is_none());
+    }
+
+    #[test]
+    fn timestamp_pushdown_declines_non_timestamp_column() {
+        // A dateTime literal against a non-timestamp column never pushes.
+        let s = key_schema();
+        assert!(build_iceberg_filter(&[ts_filter("int_key", 42, false)], &s).is_none());
+        assert!(build_iceberg_filter(&[ts_filter("str_key", 42, true)], &s).is_none());
     }
 
     #[test]

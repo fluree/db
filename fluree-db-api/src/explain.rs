@@ -707,12 +707,13 @@ pub async fn explain_cypher(
     snapshot: &fluree_db_core::LedgerSnapshot,
     cypher: &str,
     default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_cypher::ParamMap>,
 ) -> Result<JsonValue> {
     let (vars, parsed) = crate::query::helpers::parse_cypher_to_ir(
         cypher,
         snapshot,
         default_context,
-        None,
+        params,
         None,
         None,
     )?;

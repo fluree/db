@@ -389,12 +389,14 @@ impl<'a, S: IcebergStorage> ParquetReader<'a, S> {
             "Range-reading Parquet file"
         );
 
-        // Fetch all ranges (could be parallelized with bounded concurrency)
-        let mut range_data: Vec<(u64, Bytes)> = Vec::with_capacity(coalesced.len());
-        for (start, end) in &coalesced {
-            let data = self.storage.read_range(path, *start..*end).await?;
-            range_data.push((*start, data));
-        }
+        // Item 12 (B1-AppD): fetch the coalesced ranges via `read_ranges` — bounded
+        // concurrent GETs on S3 (order-preserving), sequential on other backends.
+        // The bytes come back in the SAME order as the input ranges, so pair each
+        // back to its start offset for the sparse-buffer assembler.
+        let range_reqs: Vec<std::ops::Range<u64>> = coalesced.iter().map(|(s, e)| *s..*e).collect();
+        let range_bytes = self.storage.read_ranges(path, range_reqs).await?;
+        let range_data: Vec<(u64, Bytes)> =
+            coalesced.iter().map(|(s, _)| *s).zip(range_bytes).collect();
 
         // Assemble into sparse buffer
         let sparse_buffer = assemble_sparse_buffer(file_size as usize, range_data);

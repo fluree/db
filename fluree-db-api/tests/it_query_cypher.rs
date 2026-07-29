@@ -7800,6 +7800,7 @@ async fn cypher_explain_reports_sid_encoded_plan() {
         &db.snapshot,
         "MATCH (n:Person {id: 7}) RETURN n",
         db.default_context.as_ref(),
+        None,
     )
     .await
     .expect("explain");
@@ -7818,6 +7819,49 @@ async fn cypher_explain_reports_sid_encoded_plan() {
         physical.contains("0:id"),
         "bare `id` not SID-encoded under namespace 0: {explain}"
     );
+}
+
+#[tokio::test]
+async fn cypher_explain_substitutes_params_like_execution() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:explain-params");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "alice",
+                "@type": "Person",
+                "id": 7,
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    // UNWIND $param is rejected without substitution, so a successful explain
+    // proves the params rode through the same pre-lowering as execution.
+    let params: fluree_db_cypher::ParamMap =
+        serde_json::from_value(json!({"ids": [7, 8]})).expect("params");
+    let explain = fluree
+        .explain_cypher(
+            &db,
+            "UNWIND $ids AS i MATCH (n:Person {id: i}) RETURN n",
+            Some(&params),
+        )
+        .await
+        .expect("explain with params");
+    assert!(explain.get("plan").is_some(), "{explain}");
+
+    let err = fluree
+        .explain_cypher(
+            &db,
+            "UNWIND $ids AS i MATCH (n:Person {id: i}) RETURN n",
+            None,
+        )
+        .await
+        .expect_err("param without substitution must fail lowering");
+    assert!(err.to_string().contains("param"), "unexpected error: {err}");
 }
 
 #[tokio::test]
@@ -8318,6 +8362,78 @@ async fn cypher_vocab_context_resolves_bare_names_to_rdf_iris() {
         node.iri.as_ref(),
         "http://example.org/alice",
         "hydrated identity keeps the full IRI in RDF-compat mode"
+    );
+}
+
+#[tokio::test]
+async fn cypher_labels_and_type_compact_like_db_labels() {
+    // labels()/type() follow the db.labels() naming rule: strip the
+    // configured `@vocab` prefix, otherwise return the FULL IRI so it
+    // round-trips (no blind last-#/segment stripping — a relationship
+    // typed `http://other.example/kb#order` must not come back "order").
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:label-naming");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex": "http://example.org/", "kb": "http://other.example/kb#"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": ["ex:Person", "kb:Indexed"],
+                        "ex:name": "Alice",
+                        "kb:order": {"@id": "ex:bob"}
+                    },
+                    {"@id": "ex:bob", "@type": "ex:Person"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+
+    let vocab_db = graphdb_from_ledger(&committed.ledger)
+        .with_default_context(Some(json!({"@vocab": "http://example.org/"})));
+
+    // labels(): the vocab class compacts to a bare name; the foreign class
+    // stays a full IRI.
+    let cj = fluree
+        .query_cypher(
+            &vocab_db,
+            r#"MATCH (n:Person {name: "Alice"}) UNWIND labels(n) AS l RETURN l ORDER BY l"#,
+        )
+        .await
+        .expect("labels query")
+        .to_cypher_json_async(vocab_db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let labels: Vec<_> = cj["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"][0].clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![json!("Person"), json!("http://other.example/kb#Indexed")],
+        "vocab label compacts, foreign label keeps the full IRI: {cj}"
+    );
+
+    // type(): the foreign relationship IRI round-trips whole.
+    let cj = fluree
+        .query_cypher(
+            &vocab_db,
+            r#"MATCH (:Person {name: "Alice"})-[p]->(:Person) RETURN type(p) AS t"#,
+        )
+        .await
+        .expect("type query")
+        .to_cypher_json_async(vocab_db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(
+        cj["results"][0]["data"][0]["row"][0],
+        json!("http://other.example/kb#order"),
+        "type(p) must return the full foreign IRI: {cj}"
     );
 }
 
@@ -9458,5 +9574,145 @@ async fn transact_cypher_unwind_batch_node_merge_on_create_on_match() {
         rows,
         json!([["1", "matched"], ["2", "created"]]),
         "existing id 1 took ON MATCH; new id 2 took ON CREATE: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_regex_match_is_full_string() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:regex");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "a", "@type": "Person", "name": "Alice"},
+                    {"@id": "b", "@type": "Person", "name": "Alina"},
+                    {"@id": "c", "@type": "Person", "name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let names = |cj: serde_json::Value| -> Vec<serde_json::Value> {
+        cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"][0].clone())
+            .collect()
+    };
+
+    // Prefix wildcard: both Ali* names, nothing else.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "Ali.*" RETURN n.name AS name ORDER BY name"#,
+        )
+        .await
+        .expect("regex query")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), vec![json!("Alice"), json!("Alina")]);
+
+    // Neo4j semantics: `=~` matches the WHOLE string, so a substring
+    // pattern without wildcards matches nothing.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "li" RETURN n.name AS name"#,
+        )
+        .await
+        .expect("substring regex")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), Vec::<serde_json::Value>::new());
+
+    // Anchoring must wrap the alternation as a group: `Alice|Bob` means
+    // full-string Alice or full-string Bob — not `Alice|^Bob$`-style leakage.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "Alice|Bob" RETURN n.name AS name ORDER BY name"#,
+        )
+        .await
+        .expect("alternation regex")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), vec![json!("Alice"), json!("Bob")]);
+
+    // Case-insensitive inline flag rides through to the engine.
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (n:Person) WHERE n.name =~ "(?i)alice" RETURN n.name AS name"#,
+        )
+        .await
+        .expect("inline-flag regex")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    assert_eq!(names(cj), vec![json!("Alice")]);
+}
+
+#[tokio::test]
+async fn cypher_untyped_rel_var_on_reified_edges_batched_probe() {
+    // Value-only relationship binding over a ledger that mixes reified
+    // (annotated) and plain edges. Exercises the batched annotation
+    // optional probe: per row the reifier must bind when one exists
+    // (parallel annotations fan out) and the synthesized relationship
+    // value must fill in when none does — same rows as the per-row path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:reified-relvar");
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {
+                        "@id": "a",
+                        "@type": "Node",
+                        "knows": {"@id": "b", "@annotation": {"w": 1}}
+                    },
+                    {
+                        "@id": "b",
+                        "@type": "Node",
+                        "likes": {"@id": "c"}
+                    },
+                    {"@id": "c", "@type": "Node"}
+                ],
+                "opts": {"lpgEdgeLifecycle": true}
+            }),
+        )
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+
+    let cj = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (s:Node)-[p]->(o:Node) RETURN type(p) AS t ORDER BY t"#,
+        )
+        .await
+        .expect("rel var over mixed edges")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    let types: Vec<_> = cj["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"][0].clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec![json!("knows"), json!("likes")],
+        "one row per edge, reified and plain alike: {cj}"
     );
 }

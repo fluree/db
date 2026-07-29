@@ -49,12 +49,59 @@ pub fn query_memory_budget_bytes() -> usize {
     })
 }
 
-/// R3-B: conservative per-binding byte estimate for the approximate memory-budget
-/// accounting (a `Binding` is a small enum, occasionally with a heap `String`;
-/// over-counting is safe — a too-tight budget only aborts a query already near OOM).
-pub const BINDING_EST_BYTES: usize = 64;
+/// R3-B: per-binding byte estimate for the approximate memory-budget accounting.
+/// Derived from the true stack size of a [`Binding`](crate::binding::Binding)
+/// (`size_of::<Binding>()` = 88 bytes, documented at `binding.rs:14-17`) rather
+/// than a hand-picked number, so it can never silently under-count the stack
+/// footprint the way the previous `64` did (a 27% under-count of the 88-byte enum).
+///
+/// This still under-counts the HEAP a binding owns: an IRI-bearing row
+/// (`Binding::Iri(Arc<str>)`, `IriMatch { iri: Arc<str>, ledger_alias: Arc<str> }`,
+/// or a `Lit` with a `String` value) carries ~50-70 bytes of `Arc<str>` payload
+/// the stack size does not see, so a wide R2RML/Iceberg crawl of IRI rows is still
+/// counted at roughly 1/2.2 of its true resident bytes. Over-counting is safe (a
+/// too-tight budget only aborts a query already near OOM); this constant deliberately
+/// stays a floor. A heap-aware per-binding estimate is a documented follow-up.
+pub const BINDING_EST_BYTES: usize = std::mem::size_of::<crate::binding::Binding>();
+/// F-AUD-3 site D: compile-time guard. The estimate must never drop below the
+/// true `Binding` stack size — refusing any future edit that pins a smaller magic
+/// number (the very regression the `64` was). Trivially holds while it is DEFINED
+/// as `size_of`, and bites the moment someone changes that.
+const _: () = assert!(BINDING_EST_BYTES >= std::mem::size_of::<crate::binding::Binding>());
 /// R3-B: conservative per-group overhead estimate (key bindings + aggregate state).
+/// A flat estimate — like [`BINDING_EST_BYTES`] it ignores per-group heap (e.g. a
+/// `GROUP_CONCAT`/`Collect` accumulator), the same documented conservatism.
 pub const GROUP_EST_BYTES: usize = 128;
+
+/// F-AUD-3 site C: divisor applied to the process memory budget to derive a
+/// per-query ceiling, read from `FLUREE_QUERY_BUDGET_SHARE_DIV`. Default `1` (and
+/// any unparseable/zero value floors to `1`), which makes the per-query ceiling
+/// equal to the full budget — byte-for-byte today's behavior. Set it to the
+/// deployment's expected max query concurrency (e.g. a Lambda's reserved
+/// concurrency) so N concurrent queries share the budget instead of each
+/// comparing its own counter against the FULL budget (the over-admission V2 §3
+/// describes: two queries each accounting 5 GB both read "under 8 GB" while the
+/// node sits at 10 GB). See [`per_query_memory_ceiling`].
+///
+/// This is the sound, minimal static form. A dynamic divisor equal to the ACTUAL
+/// live concurrency (so a lone query keeps the full budget) needs a process-wide
+/// active-*top-level*-query count — which only the server request boundary
+/// (`fluree-db-server/src/query_control.rs`) can measure without miscounting
+/// nested policy/reasoning/sub-queries that re-enter the engine. Deferred there.
+pub fn query_budget_share_div() -> usize {
+    std::env::var("FLUREE_QUERY_BUDGET_SHARE_DIV")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// F-AUD-3 site C: the per-query memory ceiling = `full_budget / share_div`, with
+/// `share_div` floored at 1. `share_div == 1` returns the full budget unchanged.
+/// Pure so the division is unit-testable without touching the environment.
+pub fn per_query_memory_ceiling(full_budget: usize, share_div: usize) -> usize {
+    full_budget / share_div.max(1)
+}
 
 /// Best-effort container/system memory limit (cgroup v2 → cgroup v1 →
 /// `/proc/meminfo`). `None` where none is readable (e.g. macOS dev), where the
@@ -207,6 +254,11 @@ pub struct ExecutionContext<'a> {
     /// `false`. Surfaced through `opts.includeSystemFacts: true` on
     /// JSON-LD queries.
     pub include_system_facts: bool,
+    /// `@vocab` prefix a Cypher query was lowered against (from
+    /// `Query::cypher_vocab`). Used by `labels()`/`type()`/`keys()`
+    /// evaluation to compact IRIs the way `db.labels()` does: strip the
+    /// vocab prefix, otherwise return the full IRI.
+    pub cypher_vocab: Option<Arc<str>>,
     /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
     /// IRI template over the FK join columns is rendered directly from the child
     /// row's FK columns, skipping the parent-table scan and its referential
@@ -379,6 +431,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -434,6 +487,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -493,6 +547,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -541,6 +596,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -588,6 +644,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -637,6 +694,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -757,6 +815,16 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn record_alloc(&self, bytes: usize) {
         self.cancellation.record_alloc(bytes);
+    }
+
+    /// Release `bytes` previously recorded via [`record_alloc`](Self::record_alloc)
+    /// for an allocation with a provable drop point (e.g. a materialized scan window
+    /// that has been emitted and is about to drop). Saturating. Only valid for
+    /// non-persistent allocations — persistent join/aggregate/lookup buffers must
+    /// never be released. See [`QueryCancellation::release`].
+    #[inline]
+    pub fn release(&self, bytes: usize) {
+        self.cancellation.release(bytes);
     }
 
     /// Retained query memory recorded so far via [`record_alloc`](Self::record_alloc).
@@ -1190,6 +1258,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1248,6 +1317,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1302,6 +1372,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
@@ -1579,5 +1650,90 @@ impl WellKnownDatatypes {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::binding::Binding;
+    use crate::error::QueryError;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+
+    /// F-AUD-3 site D: the per-binding estimate must never be below the true stack
+    /// size of a `Binding` (the 64→88 fix). Deriving it from `size_of` makes the
+    /// `>=` hold by construction; the equality canary documents the 88-byte size
+    /// (binding.rs:14-17) and fails loudly if the enum grows so the estimate is
+    /// re-examined for the heap it still omits.
+    #[test]
+    fn binding_est_bytes_is_at_least_binding_stack_size() {
+        // Derived from the type, so it equals the stack size and can never silently
+        // under-count it the way the previous hardcoded 64 did. The 88 canary
+        // documents binding.rs:14-17 and fails loudly if the enum grows (prompting a
+        // re-look at the heap the estimate still omits). The `>= size_of` invariant
+        // itself is a compile-time `const _` assertion next to the constant.
+        assert_eq!(BINDING_EST_BYTES, std::mem::size_of::<Binding>());
+        assert_eq!(
+            std::mem::size_of::<Binding>(),
+            88,
+            "binding.rs:14-17 documents size_of::<Binding>() == 88"
+        );
+    }
+
+    /// F-AUD-3 site C: the ceiling divides the full budget and floors the divisor
+    /// at 1, so `div == 1` (the default) is byte-for-byte the full budget.
+    #[test]
+    fn per_query_ceiling_divides_and_floors() {
+        let full = 8usize << 30; // 8 GiB
+        assert_eq!(
+            per_query_memory_ceiling(full, 1),
+            full,
+            "div=1 → full budget"
+        );
+        assert_eq!(
+            per_query_memory_ceiling(full, 4),
+            2usize << 30,
+            "div=4 → quarter"
+        );
+        assert_eq!(per_query_memory_ceiling(full, 0), full, "div=0 floors to 1");
+    }
+
+    /// F-AUD-3 site C: two concurrent queries pinned to a shared (divided) ceiling
+    /// each trip at their divided budget — neither can consume the full budget the
+    /// way today's undivided per-query counter allows (V2 §3 over-admission).
+    #[test]
+    fn shared_ceiling_trips_each_query_at_its_divided_budget() {
+        let full = 8usize << 30;
+        let ceiling = per_query_memory_ceiling(full, 2); // 4 GiB each
+        assert_eq!(ceiling, 4usize << 30);
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        // Two independent queries, each pinned to the divided ceiling as the runner
+        // attach point does under FLUREE_QUERY_BUDGET_SHARE_DIV=2.
+        for _ in 0..2 {
+            let cancel = QueryCancellation::new();
+            cancel.set_memory_limit(ceiling);
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+            // Recording just over the DIVIDED ceiling trips, though it is well under
+            // the full 8 GiB budget an undivided query would compare against.
+            ctx.record_alloc(ceiling + 1);
+            match ctx.checkpoint() {
+                Err(QueryError::MemoryBudgetExceeded {
+                    used_bytes,
+                    budget_bytes,
+                }) => {
+                    assert_eq!(
+                        budget_bytes, ceiling,
+                        "enforced ceiling is the divided budget"
+                    );
+                    assert_eq!(used_bytes, ceiling + 1);
+                }
+                other => {
+                    panic!("expected MemoryBudgetExceeded at the divided ceiling, got {other:?}")
+                }
+            }
+        }
     }
 }

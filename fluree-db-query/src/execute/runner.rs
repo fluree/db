@@ -679,6 +679,9 @@ pub struct ContextConfig<'a, 'b> {
     /// for Fluree-system predicates. Surfaced via
     /// `opts.includeSystemFacts: true` on JSON-LD queries.
     pub include_system_facts: bool,
+    /// `@vocab` prefix a Cypher query was lowered against (from
+    /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
+    pub cypher_vocab: Option<Arc<str>>,
     /// When true, the injected true-wildcard crawl scan renders R2RML
     /// `RefObjectMap` objects by templating the parent IRI from the child row's
     /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
@@ -826,6 +829,19 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx = ctx.with_tracker(tracker.clone());
     }
     if let Some(cancellation) = config.cancellation {
+        // F-AUD-3 site C: give this query its share of the process memory budget
+        // instead of letting it (and every concurrent query) compare its own counter
+        // against the FULL budget. `FLUREE_QUERY_BUDGET_SHARE_DIV` (default 1) is the
+        // divisor; div==1 pins nothing, so the checkpoint falls back to the full
+        // process budget exactly as before. An explicit ceiling already pinned by the
+        // embedder wins (never clobbered). See `context::per_query_memory_ceiling`.
+        let div = crate::context::query_budget_share_div();
+        if div > 1 && cancellation.memory_limit().is_none() {
+            let full = crate::context::query_memory_budget_bytes();
+            if full != 0 {
+                cancellation.set_memory_limit(crate::context::per_query_memory_ceiling(full, div));
+            }
+        }
         ctx = ctx.with_cancellation(cancellation);
     }
     if let Some(enforcer) = config.policy_enforcer {
@@ -845,6 +861,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     if config.strict_bind_errors {
         ctx = ctx.with_strict_bind_errors();
+    }
+    if let Some(vocab) = config.cypher_vocab.clone() {
+        ctx.cypher_vocab = Some(vocab);
     }
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);

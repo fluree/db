@@ -371,6 +371,13 @@ fn stat_bounds(
             };
             (s.min_opt().and_then(to_str), s.max_opt().and_then(to_str))
         }
+        // Item 10 (F-AUD-11): NO `TypedValue::Timestamp`/`TimestampTz` arm — a
+        // timestamp column is a Parquet INT64 whose logical UNIT (milli/micro/nano)
+        // is ambiguous from the row-group `Statistics` alone (A1 §4), so decoding the
+        // raw i64 stat as micros could over-prune. Timestamp pruning is therefore
+        // MANIFEST-LEVEL ONLY (Iceberg `value_codec` decodes the unit unambiguously
+        // from the schema type; see `can_contain_comparison`). Falling through to
+        // `(None, None)` keeps every row group for a timestamp predicate.
         _ => (None, None),
     }
 }
@@ -507,11 +514,13 @@ fn evaluate_comparison(
                 .get(i)
                 .and_then(|v| *v)
                 .is_some_and(|v| compare_op(v, *lit, op)),
-            (Column::Timestamp(vals) | Column::TimestampTz(vals), LiteralValue::Timestamp(lit)) => {
-                vals.get(i)
-                    .and_then(|v| *v)
-                    .is_some_and(|v| compare_op(v, *lit, op))
-            }
+            (
+                Column::Timestamp(vals) | Column::TimestampTz(vals),
+                LiteralValue::Timestamp(lit) | LiteralValue::TimestampTz(lit),
+            ) => vals
+                .get(i)
+                .and_then(|v| *v)
+                .is_some_and(|v| compare_op(v, *lit, op)),
             _ => false, // Type mismatch
         };
 
@@ -594,6 +603,69 @@ mod tests {
                 doc: None,
             }],
         }
+    }
+
+    fn create_timestamptz_schema() -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: vec![crate::metadata::SchemaField {
+                id: 1,
+                name: "ts".to_string(),
+                required: true,
+                field_type: serde_json::json!("timestamptz"),
+                doc: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn timestamptz_manifest_pruning_by_micros_bounds() {
+        // Item 10 (F-AUD-11): a `timestamptz` FILTER prunes at the MANIFEST level —
+        // Iceberg decodes the file's micros bounds unambiguously from the schema
+        // type. File holds ts micros in [1000, 2000].
+        let schema = create_timestamptz_schema();
+        let data_file = create_test_data_file(1000, 2000);
+        let cmp = |op, micros| Expression::Comparison {
+            field_id: 1,
+            column: "ts".to_string(),
+            op,
+            value: LiteralValue::TimestampTz(micros),
+        };
+        // ts > 2000 (at/above upper) → prune; ts > 1500 (in range) → keep.
+        assert!(!can_contain_file(
+            &cmp(ComparisonOp::Gt, 2000),
+            &data_file,
+            &schema
+        ));
+        assert!(can_contain_file(
+            &cmp(ComparisonOp::Gt, 1500),
+            &data_file,
+            &schema
+        ));
+        // ts < 1000 (at/below lower) → prune; ts < 1500 (in range) → keep.
+        assert!(!can_contain_file(
+            &cmp(ComparisonOp::Lt, 1000),
+            &data_file,
+            &schema
+        ));
+        assert!(can_contain_file(
+            &cmp(ComparisonOp::Lt, 1500),
+            &data_file,
+            &schema
+        ));
+
+        // Defense in depth: a `Timestamp` (naive-frame) literal against this
+        // `timestamptz` column is a TypedValue mismatch → the compare is
+        // incomparable → the file is KEPT (never over-pruned). The build-time
+        // frame match prevents this pairing from ever being emitted.
+        let ntz_lit = Expression::Comparison {
+            field_id: 1,
+            column: "ts".to_string(),
+            op: ComparisonOp::Gt,
+            value: LiteralValue::Timestamp(9_000),
+        };
+        assert!(can_contain_file(&ntz_lit, &data_file, &schema));
     }
 
     #[test]
@@ -798,6 +870,38 @@ mod tests {
         // A field the query does not map is conservative — keep the row group.
         let unmapped = HashMap::from([(2i32, 0usize)]);
         assert!(row_group_can_contain(&ge, meta.row_group(0), &unmapped));
+    }
+
+    #[test]
+    fn row_group_pruning_in_set_keeps_iff_any_member_in_bounds() {
+        // Item 7 (F-AUD-5): `Expression::In` keeps a row group iff ANY member could
+        // lie within its column bounds — the same superset guarantee the file-level
+        // prune gives. rg0 = [0..4], rg1 = [100..104].
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(two_row_group_parquet()).unwrap();
+        let meta = reader.metadata();
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let in_set = |vs: &[i64]| Expression::In {
+            field_id: 1,
+            column: "v".to_string(),
+            values: vs.iter().map(|v| LiteralValue::Int64(*v)).collect(),
+        };
+
+        // {2, 200}: 2 ∈ rg0 → keep rg0; neither ∈ [100,104] → prune rg1.
+        let a = in_set(&[2, 200]);
+        assert!(row_group_can_contain(&a, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(&a, meta.row_group(1), &field_to_col));
+
+        // {2, 102}: a member lands in each row group → keep both.
+        let b = in_set(&[2, 102]);
+        assert!(row_group_can_contain(&b, meta.row_group(0), &field_to_col));
+        assert!(row_group_can_contain(&b, meta.row_group(1), &field_to_col));
+
+        // {500, 600}: no member in either range → prune both.
+        let c = in_set(&[500, 600]);
+        assert!(!row_group_can_contain(&c, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(&c, meta.row_group(1), &field_to_col));
     }
 
     /// Two row groups with disjoint UTF-8 string ranges, for `ByteArray`-stats
