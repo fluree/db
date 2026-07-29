@@ -40,6 +40,12 @@ pub mod rdft {
         "http://www.w3.org/ns/rdftest#TestNTriplesPositiveSyntax";
     pub const NTRIPLES_NEGATIVE_SYNTAX: &str =
         "http://www.w3.org/ns/rdftest#TestNTriplesNegativeSyntax";
+    // N-Quads
+    pub const NQUADS_POSITIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestNQuadsPositiveSyntax";
+    pub const NQUADS_NEGATIVE_SYNTAX: &str =
+        "http://www.w3.org/ns/rdftest#TestNQuadsNegativeSyntax";
+
     // TriG
     pub const TRIG_POSITIVE_SYNTAX: &str = "http://www.w3.org/ns/rdftest#TestTrigPositiveSyntax";
     pub const TRIG_NEGATIVE_SYNTAX: &str = "http://www.w3.org/ns/rdftest#TestTrigNegativeSyntax";

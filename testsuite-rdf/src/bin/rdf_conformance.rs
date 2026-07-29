@@ -16,7 +16,8 @@ use anyhow::Result;
 use testsuite_rdf::{
     files::rdf_tests_submodule_sha,
     report::{captured_at, git_sha, working_tree_is_dirty, Conformance, DENOMINATOR_POLICY},
-    run_suite, ParseMode, RDF11_NTRIPLES, RDF11_TURTLE, RDF12_NTRIPLES, RDF12_TURTLE,
+    run_suite, ParseMode, RDF11_NQUADS, RDF11_NTRIPLES, RDF11_TRIG, RDF11_TURTLE, RDF12_NTRIPLES,
+    RDF12_TURTLE,
 };
 
 fn main() -> Result<()> {
@@ -27,6 +28,8 @@ fn main() -> Result<()> {
     let suites = [
         (RDF11_TURTLE, ParseMode::Conformant),
         (RDF11_NTRIPLES, ParseMode::Conformant),
+        (RDF11_NQUADS, ParseMode::Conformant),
+        (RDF11_TRIG, ParseMode::Conformant),
         (RDF11_TURTLE, ParseMode::IngestDefault),
         (RDF11_NTRIPLES, ParseMode::IngestDefault),
         (RDF12_TURTLE, ParseMode::Conformant),

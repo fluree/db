@@ -112,6 +112,14 @@ pub const RDF11_NTRIPLES: Suite = Suite {
     expected_total: 70,
 };
 
+/// RDF 1.1 N-Quads.
+pub const RDF11_NQUADS: Suite = Suite {
+    format: "nquads",
+    spec: "rdf11",
+    manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-quads/manifest.ttl"],
+    expected_total: 87,
+};
+
 /// RDF 1.1 TriG.
 ///
 /// Syntax tests gate; the 147 eval tests are registered pending an N-Quads
