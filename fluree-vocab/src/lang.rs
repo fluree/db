@@ -30,12 +30,25 @@
 
 /// Why a string is not a well-formed language tag.
 ///
-/// Indices are byte offsets into the tag, which is ASCII whenever it is
-/// well-formed and may not be when it is not — so they are byte offsets, not
-/// character counts. The tag excludes the leading `@`.
+/// Indices are byte offsets into the tag, not character counts. The tag
+/// excludes the leading `@`.
+///
+/// Which of these a given caller can actually see depends on its lexer, and
+/// Turtle's is NARROWER than this grammar in characters — its `take_while`
+/// admits only `[a-zA-Z0-9-]`, and is wider only in SHAPE (digits first,
+/// leading, trailing or doubled `-`). From Turtle, therefore, only
+/// [`Self::NonAlphabeticPrimary`] and [`Self::EmptySubtag`] are reachable;
+/// `@en_GB`, an accented tag and a bare `@` are lexical errors that never
+/// arrive here. The other two variants exist because this is a shared
+/// predicate and a looser reader — N-Triples has its own — can reach them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LangTagViolation {
-    /// The tag is empty (`"x"@`).
+    /// The tag is empty.
+    ///
+    /// Not reachable from Turtle: `"x"@` is a lexical error, because the
+    /// lexer requires at least one tag character before it will produce a
+    /// `LangTag` token at all. Kept for callers whose lexer hands over an
+    /// empty tag rather than refusing it.
     Empty,
     /// The primary subtag holds something other than a letter.
     ///
@@ -53,6 +66,10 @@ pub enum LangTagViolation {
         index: usize,
     },
     /// A subtag after the first holds something other than a letter or digit.
+    ///
+    /// Also not reachable from Turtle, for the same reason as
+    /// [`Self::Empty`]: the lexer admits only `[a-zA-Z0-9-]`, so `@en_GB`
+    /// never becomes a tag.
     NonAlphanumericSubtag {
         /// Byte offset of the offending character within the tag.
         index: usize,
@@ -226,8 +243,9 @@ mod tests {
 
     #[test]
     fn offsets_point_at_the_offending_byte() {
-        // Non-ASCII input is possible (the lexer is more permissive than the
-        // grammar), so offsets are BYTES and must not panic or mislead.
+        // No Turtle document can deliver a non-ASCII tag — the lexer stops
+        // at `[a-zA-Z0-9-]` — but this is a shared predicate and offsets are
+        // BYTES, so a looser caller must not make it panic or mislead.
         let v = language_tag_violation("é");
         assert_eq!(
             v,

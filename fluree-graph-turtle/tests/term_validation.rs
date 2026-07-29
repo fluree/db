@@ -444,16 +444,36 @@ fn a_control_character_cannot_damage_the_diagnostic_that_reports_it() {
     }
 }
 
-/// Same guard on the language-tag path, whose lexer is looser than its grammar.
+/// A language-tag diagnostic is one line, and no Turtle document can make it
+/// otherwise.
+///
+/// Renamed from a claim it did not support. It is NOT the language-tag twin of
+/// the IRI escaping test above, because the Turtle lexer cannot deliver a
+/// control character to the tag path at all: its scan admits only
+/// `[a-zA-Z0-9-]`, which is NARROWER than the grammar in characters and wider
+/// only in shape. `@en_GB`, an accented tag and a bare `@` are lexical errors.
+///
+/// So what this pins is the reachable case — a tag that lexes and then fails
+/// the grammar — staying single-line and control-free. The escape on that path
+/// is kept for the shared predicate and future readers, not for this test.
 #[test]
-fn a_language_tag_diagnostic_is_escaped_too() {
-    // `@e` followed by a control character does not lex as one token, so reach
-    // the tag path with something the lexer does accept but the grammar does
-    // not, and assert the message is single-line regardless.
-    let doc = "<http://ex/s> <http://ex/p> \"v\"@1 .";
-    let message = expect_rejected(doc, validating()).to_string();
-    assert!(!message.contains('\u{0}'), "{message:?}");
-    assert_eq!(message.lines().count(), 1, "{message:?}");
+fn a_reachable_language_tag_diagnostic_stays_single_line() {
+    for tag in ["1", "e1", "en-", "-en", "en--gb"] {
+        let doc = format!("<http://ex/s> <http://ex/p> \"v\"@{tag} .");
+        let message = expect_rejected(&doc, validating()).to_string();
+        assert!(!message.contains('\u{0}'), "@{tag}: {message:?}");
+        assert_eq!(message.lines().count(), 1, "@{tag}: {message:?}");
+    }
+
+    // And the characters that would need escaping never get that far.
+    for tag in ["en_GB", "en.GB", "\u{e9}"] {
+        let doc = format!("<http://ex/s> <http://ex/p> \"v\"@{tag} .");
+        let err = expect_rejected(&doc, validating());
+        assert!(
+            matches!(err, TurtleError::Lexer { .. }),
+            "@{tag} should be a LEXICAL error, not a tag violation: {err:?}"
+        );
+    }
 }
 
 // =============================================================================
@@ -464,10 +484,18 @@ fn a_language_tag_diagnostic_is_escaped_too() {
 /// the lexer already scanned that span with `is_iri_char`, and the branch has
 /// established absoluteness, so nothing is left to check.
 ///
-/// This is the behavioral guard on that skip. For lexed IRIs with no base,
-/// validating and unvalidated parses must agree on EVERY document — if the skip
-/// were ever unsound, some document would be accepted here and rejected with
-/// the scan restored.
+/// Read this as a SMOKE TEST, not as the guard. While `is_iri_char` and the
+/// forbidden set remain complements, no document exists that this could
+/// distinguish — so it cannot fail while the skip is sound, and it would not
+/// have caught the skip being wrong for a subtler reason either.
+///
+/// The two things actually holding the skip up are elsewhere: the
+/// all-codepoints differential in `fluree-graph-format`
+/// (`iriref_set_differential`), which fails if the two classes ever drift, and
+/// the inertness of the branch itself — no resolution has happened, so there is
+/// no composed string for a scan to have an opinion about. What this file adds
+/// is the observation that the fixtures below, which include the boundary cases
+/// (U+007F, non-ASCII), do in fact behave the same both ways.
 #[test]
 fn with_no_base_lexed_iris_behave_identically_validated_or_not() {
     for doc in [

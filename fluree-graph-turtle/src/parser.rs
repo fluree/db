@@ -404,6 +404,24 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// position, and the message names the character.
     ///
     /// Off by default — one predictable branch on the ingest hot path.
+    ///
+    /// # Placement: parser-side, per resolution — and why that matters later
+    ///
+    /// This runs *before* [`Self::sink_term_iri`], so it fires once per
+    /// resolved occurrence. `sink_term_iri` sits behind `iri_term_cache`,
+    /// which dedupes by resolved IRI: the same IRI appearing a thousand times
+    /// reaches the sink once. So moving validation sink-side would silently
+    /// change error MULTIPLICITY from per-occurrence to per-unique-term.
+    ///
+    /// It is moot today, because the parser fails fast — the first violation
+    /// ends the parse, verified: three copies of the same bad IRI produce one
+    /// error, at the first one's offset. The question becomes live only if
+    /// `--continue-on-error` lands AND validation moves behind that cache, at
+    /// which point a document repeating one bad IRI a thousand times would
+    /// report it once and a user counting diagnostics would under-count.
+    /// Whoever implements continue-on-error should keep the check on this side
+    /// of the cache, or decide deliberately that per-unique-term is what they
+    /// want.
     #[inline]
     fn check_iri(&self, iri: &str, position: u32) -> Result<()> {
         if !self.options.validate {
@@ -450,9 +468,19 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         }
         match fluree_vocab::lang::language_tag_violation(tag) {
             None => Ok(()),
-            // Escaped for the same reason as `check_iri`'s: the lexer accepts
-            // more in a `LangTag` token than the grammar allows, so whatever
-            // reaches here is by construction something unusual.
+            // Escaped, though nothing reachable through the Turtle lexer today
+            // needs it — and the earlier justification here had this backwards.
+            // The lexer's `take_while` admits only `[a-zA-Z0-9-]`, which is
+            // NARROWER than the grammar in characters and wider only in SHAPE
+            // (digits first, leading/trailing/doubled `-`). So a control
+            // character cannot reach this arm; `@en_GB`, `@é` and `@` are all
+            // lexical errors.
+            //
+            // Kept anyway: `escape_debug` on a short, already-ASCII string is
+            // free, `language_tag_violation` is a shared predicate whose other
+            // callers have their own lexers, and M2's separate N-Triples
+            // reader may well be looser here. Unreachable through the Turtle
+            // lexer today, kept for the shared predicate and future readers.
             Some(violation) => Err(TurtleError::parse(
                 position as usize,
                 format!("{violation} (@{})", tag.escape_debug()),
