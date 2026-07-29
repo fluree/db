@@ -2314,16 +2314,73 @@ mod tests {
     // Blank-node namespace disjointness
     // =========================================================================
 
+    /// Count the DISTINCT blank-node identities in a graph.
+    fn distinct_blanks(graph: &Graph) -> Vec<String> {
+        let mut labels: Vec<String> = graph
+            .iter()
+            .flat_map(|t| [&t.s, &t.o])
+            .filter_map(|t| match t {
+                Term::BlankNode(b) => Some(b.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
+
     /// User-written labels and parser-minted anonymous nodes must never
     /// collide. An isomorphism check structurally CANNOT catch this: merged
     /// nodes are isomorphic to themselves, so the merged graph looks
     /// well-formed. Only counting distinct identities finds it.
     ///
-    /// Spine mode makes it systematic — every collection mints spine nodes —
-    /// but `[ … ]` and reifiers hit the same mint, so this guards all of them.
+    /// Both mint sites are covered, because they fail independently:
+    /// Spine-mode collections (systematic — every collection mints spine
+    /// nodes) and `[ … ]` property lists (which mint in EVERY mode, so a
+    /// spine-only test would pass while the bracket path stayed broken).
     #[test]
     fn minted_blanks_never_collide_with_user_written_labels() {
-        // `_:b1`/`_:b2` are exactly what a naive `b{N}` counter mints.
+        // Site 1: Spine collection. `( ex:a ex:b )` mints two spine nodes,
+        // which a `b{N}` counter would name `b1`/`b2` — exactly the labels
+        // this document already uses. Four distinct RDF nodes must stay four.
+        let spine_doc = r#"
+            @prefix ex: <http://example.org/> .
+            _:b1 ex:p "user-one" .
+            _:b2 ex:p "user-two" .
+            ex:s ex:list ( ex:a ex:b ) .
+        "#;
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(spine_doc, &mut sink, ParserOptions::conformant()).expect("spine parse");
+        let graph = sink.into_graph();
+        let blanks = distinct_blanks(&graph);
+        assert_eq!(
+            blanks.len(),
+            4,
+            "2 user labels + 2 spine nodes = 4 distinct nodes, got {blanks:?}"
+        );
+
+        // Site 2: blank-node property list, in the DEFAULT mode — `[ … ]`
+        // mints regardless of collection style, so this path is not covered
+        // by the spine case above. Two distinct nodes must stay two.
+        let bracket_doc = r#"
+            @prefix ex: <http://example.org/> .
+            _:b1 ex:p "user-one" .
+            ex:t ex:has [ ex:q "anon" ] .
+        "#;
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(bracket_doc, &mut sink, ParserOptions::default())
+            .expect("default parse");
+        let graph = sink.into_graph();
+        let blanks = distinct_blanks(&graph);
+        assert_eq!(
+            blanks.len(),
+            2,
+            "1 user label + 1 bracket node = 2 distinct nodes, got {blanks:?}"
+        );
+
+        // And in both modes: each user label owns exactly its own triple, and
+        // no minted label can lex as a user label — which is what makes the
+        // disjointness structural rather than lucky.
         let doc = r#"
             @prefix ex: <http://example.org/> .
             _:b1 ex:p "user-one" .
@@ -2331,7 +2388,6 @@ mod tests {
             ex:s ex:list ( ex:a ex:b ) .
             ex:t ex:has [ ex:q "anon" ] .
         "#;
-
         for (mode, options) in [
             ("spine", ParserOptions::conformant()),
             ("default", ParserOptions::default()),
@@ -2340,7 +2396,6 @@ mod tests {
             parse_with_options(doc, &mut sink, options).expect("parses");
             let graph = sink.into_graph();
 
-            // Each user label must own exactly the one triple written for it.
             for (label, object) in [("b1", "user-one"), ("b2", "user-two")] {
                 let owned: Vec<String> = graph
                     .iter()
@@ -2356,18 +2411,10 @@ mod tests {
                 assert!(owned[0].contains(object), "[{mode}] {owned:?}");
             }
 
-            // And no minted label may be lexable as a user label, which is
-            // what makes the disjointness structural rather than lucky.
-            let minted: Vec<String> = graph
-                .iter()
-                .flat_map(|t| [&t.s, &t.o])
-                .filter_map(|t| match t {
-                    Term::BlankNode(b) => Some(b.as_str().to_string()),
-                    _ => None,
-                })
-                .filter(|l| l != "b1" && l != "b2")
-                .collect();
-            for label in &minted {
+            for label in distinct_blanks(&graph) {
+                if label == "b1" || label == "b2" {
+                    continue;
+                }
                 assert!(
                     label.starts_with('-'),
                     "[{mode}] minted label {label} can lex as BLANK_NODE_LABEL and so can collide"
