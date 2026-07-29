@@ -143,6 +143,14 @@ jobs:
       - name: Capture cheap subset (CI-class)
         run: |
           samples="${{ github.event.inputs.capture_samples || '1' }}"
+          # `seq 1 0` runs zero passes, so a 0 (or any non-number) would produce
+          # no baseline at all while the job still reported success. Fail loudly
+          # instead — a capture job that captures nothing is worse than one that
+          # errors, because the artifact step would then upload nothing quietly.
+          if ! [[ "$samples" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::capture_samples must be a positive integer, got '$samples'"
+            exit 1
+          fi
           rm -f bench-baselines/guardrails-pre-ci.json
           for pass in $(seq 1 "$samples"); do
             echo "::group::capture pass $pass/$samples"
@@ -162,3 +170,6 @@ jobs:
         with:
           name: guardrails-pre-ci-baseline
           path: bench-baselines/guardrails-pre-ci.json
+          # Default is `warn`, which lets the job go green having produced no
+          # artifact — the exact silent success this job exists to avoid.
+          if-no-files-found: error
