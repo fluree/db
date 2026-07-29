@@ -1237,6 +1237,24 @@ pub fn reorder_patterns(
         .flatten()
         .collect();
 
+    // Anchor vars for the seed race: subquery-producer outputs plus every
+    // VALUES/UNWIND var. A constant row set is a guaranteed producer with
+    // EXACT cardinality, so a disconnected `rdf:type <C>` class anchor must
+    // not out-seed it on the strength of a fallback class estimate — at
+    // 72k nodes the `ClassNotInStats` sqrt heuristic reads ~20k, so a
+    // 21k-row UNWIND suddenly lost the seed to the class scan and was
+    // deferred to a final 21k-row filter over the whole expanded stream
+    // (~1.3s at 18k uris → ~712s at 21k, the KB reindex cliff). Feeding the
+    // VALUES vars into the anchor set lets the existing class-anchor
+    // demotion fire at seed time; genuinely class-only queries keep their
+    // seed via the demotion's non-empty-pool fallback.
+    let mut seed_anchor_vars: HashSet<VarId> = subquery_output_vars.clone();
+    for p in patterns {
+        if let Pattern::Values { vars, .. } = p {
+            seed_anchor_vars.extend(vars.iter().copied());
+        }
+    }
+
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
     let mut reducers: Vec<RankedPattern> = Vec::new();
@@ -1374,7 +1392,7 @@ pub fn reorder_patterns(
                 &mut bound_vars,
                 stats,
                 &mut result,
-                &subquery_output_vars,
+                &seed_anchor_vars,
             )
             || try_place_expander(&mut expanders, &mut bound_vars, stats, &mut result);
 
@@ -3824,6 +3842,44 @@ mod tests {
             matches!(&ordered[0], Pattern::Triple(tp)
                 if matches!(&tp.p, Ref::Sid(s) if s.name.as_ref() == "HAS_MEMBER")),
             "concrete base edge must seed before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn values_seed_beats_disconnected_class_anchor() {
+        // A VALUES/UNWIND row set is a guaranteed producer with EXACT
+        // cardinality; a disconnected `rdf:type <C>` class anchor whose
+        // (fallback) estimate happens to undercut the VALUES row count must
+        // not steal the seed — deferring the VALUES (the join keys!) to a
+        // final filter turned a 21k-row UNWIND into a ~712s scan cliff.
+        let (uri, s) = (VarId(0), VarId(1));
+        let values = Pattern::Values {
+            vars: vec![uri],
+            rows: (0..2000)
+                .map(|i| {
+                    vec![crate::binding::Binding::lit(
+                        FlakeValue::Long(i),
+                        Sid::new(2, "long"),
+                    )]
+                })
+                .collect(),
+        };
+        let lookup = Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Sid(Sid::new(100, "value")),
+            Term::Var(uri),
+        ));
+        // Stats-less class estimate = DEFAULT_BOUND_OBJECT_SELECTIVITY
+        // (1000) < 2000 VALUES rows — the pre-fix seed winner.
+        let class = Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri(std::sync::Arc::from(fluree_vocab::rdf::TYPE)),
+            Term::Sid(Sid::new(100, "Indexed")),
+        ));
+        let ordered = reorder_patterns(&[class, lookup, values], None, &HashSet::new());
+        assert!(
+            matches!(ordered[0], Pattern::Values { .. }),
+            "the exact-cardinality VALUES must seed, not the class anchor: {ordered:?}"
         );
     }
 

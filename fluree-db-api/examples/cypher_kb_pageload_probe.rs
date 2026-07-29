@@ -210,6 +210,7 @@ async fn main() {
     if std::env::var("PROBE_EXPLAIN").is_ok() {
         for (label, q) in [
             ("by_uris", by_uris),
+            ("by_uris_no_p", by_uris_no_p),
             (
                 "bisect_b",
                 "UNWIND $uris as uri MATCH (s:INDEXED {value: uri})-[p]->(o:INDEXED) \
@@ -230,6 +231,10 @@ async fn main() {
             eprintln!(
                 "PLAN {label}: {}",
                 serde_json::to_string(&plan["plan"]["physical"]).unwrap_or_default()
+            );
+            eprintln!(
+                "ORDER {label}: {}",
+                serde_json::to_string(&plan["plan"]["logical"]).unwrap_or_default()
             );
         }
     }
