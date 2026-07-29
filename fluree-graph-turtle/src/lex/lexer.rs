@@ -299,7 +299,13 @@ fn parse_at_directive(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     let word: &str =
         take_while(1.., |c: char| c.is_ascii_alphanumeric() || c == '-').parse_next(input)?;
 
-    match word.to_lowercase().as_str() {
+    // Turtle's `@`-directives are case-SENSITIVE: the grammar spells them
+    // '@prefix' and '@base' as literal terminals, so `@BASE` is not a
+    // directive (it lexes as a language tag, which the parser then rejects in
+    // directive position). The SPARQL-style `PREFIX`/`BASE` forms in
+    // `parse_prefixed_name_or_keyword` are the case-INSENSITIVE ones — the
+    // two spellings genuinely differ.
+    match word {
         "prefix" => Ok(TokenKind::KwPrefix),
         "base" => Ok(TokenKind::KwBase),
         _ => Ok(TokenKind::LangTag),
@@ -382,14 +388,21 @@ fn parse_prefixed_name_or_keyword(input: &mut Input<'_>) -> ModalResult<TokenKin
             None => Ok(TokenKind::PrefixedNameNs),
         }
     } else {
-        // Check if it's a keyword
+        // Check if it's a keyword.
+        //
+        // `a`, `true` and `false` are literal terminals in the Turtle
+        // grammar and stay case-SENSITIVE. The SPARQL-style directives are
+        // not: Turtle 1.1 §6.4 defines them by reference to the SPARQL
+        // grammar, whose keywords are case-insensitive, so `base`, `Base`
+        // and `PreFIX` are all directives. (The `@`-prefixed spellings in
+        // `parse_at_directive` are the case-sensitive ones.)
         match word.as_str() {
             "a" => Ok(TokenKind::KwA),
             "true" => Ok(TokenKind::KwTrue),
             "false" => Ok(TokenKind::KwFalse),
-            "PREFIX" => Ok(TokenKind::KwSparqlPrefix),
-            "BASE" => Ok(TokenKind::KwSparqlBase),
             "GRAPH" => Ok(TokenKind::KwGraph),
+            w if w.eq_ignore_ascii_case("PREFIX") => Ok(TokenKind::KwSparqlPrefix),
+            w if w.eq_ignore_ascii_case("BASE") => Ok(TokenKind::KwSparqlBase),
             _ => {
                 input.reset(&start);
                 Err(winnow::error::ErrMode::Backtrack(ContextError::new()))
@@ -1058,6 +1071,58 @@ mod tests {
         assert_eq!(tok("@base"), vec![TokenKind::KwBase]);
         assert_eq!(tok("PREFIX"), vec![TokenKind::KwSparqlPrefix]);
         assert_eq!(tok("BASE"), vec![TokenKind::KwSparqlBase]);
+    }
+
+    /// The two directive spellings have different case rules, and the lexer
+    /// had both backwards. W3C: `turtle-syntax-base-04`,
+    /// `turtle-syntax-prefix-02`, `turtle-syntax-bad-base-02`.
+    #[test]
+    fn test_sparql_style_directives_are_case_insensitive() {
+        for spelling in ["BASE", "base", "Base", "BaSe"] {
+            assert_eq!(
+                tok(spelling),
+                vec![TokenKind::KwSparqlBase],
+                "{spelling} must lex as a SPARQL-style BASE"
+            );
+        }
+        for spelling in ["PREFIX", "prefix", "PreFIX", "Prefix"] {
+            assert_eq!(
+                tok(spelling),
+                vec![TokenKind::KwSparqlPrefix],
+                "{spelling} must lex as a SPARQL-style PREFIX"
+            );
+        }
+    }
+
+    /// `@`-directives are literal terminals — only lowercase is a directive.
+    /// `@BASE` lexes as a language tag, which the parser rejects in directive
+    /// position.
+    #[test]
+    fn test_at_directives_are_case_sensitive() {
+        assert_eq!(tok("@prefix"), vec![TokenKind::KwPrefix]);
+        assert_eq!(tok("@base"), vec![TokenKind::KwBase]);
+        for spelling in ["@BASE", "@Base", "@PREFIX", "@PreFIX"] {
+            assert_eq!(
+                tok(spelling),
+                vec![TokenKind::LangTag],
+                "{spelling} must NOT lex as a directive"
+            );
+        }
+    }
+
+    /// The Turtle keywords keep their case sensitivity — widening the
+    /// directives must not widen these.
+    #[test]
+    fn test_turtle_keywords_stay_case_sensitive() {
+        assert_eq!(tok("true"), vec![TokenKind::KwTrue]);
+        assert_eq!(tok("false"), vec![TokenKind::KwFalse]);
+        assert_eq!(tok("a"), vec![TokenKind::KwA]);
+        for not_a_keyword in ["TRUE", "True", "FALSE", "A"] {
+            assert!(
+                tokenize(not_a_keyword).is_err(),
+                "{not_a_keyword} must not lex as a keyword"
+            );
+        }
     }
 
     /// PN_LOCAL takes dots as ordinary interior characters — including runs

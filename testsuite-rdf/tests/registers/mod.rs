@@ -54,17 +54,8 @@ pub const RDF11_TURTLE: &[&str] = &[
     // removed with the fix.
     // A2 (PN_LOCAL interior dots) — FIXED, entry removed with the fix.
     // A3 (relative @base resolution) — FIXED, entry removed with the fix.
-    // ---------------------------------------------------------------------
-    // B. PARSER BUG — directive keyword case. Turtle has two directive
-    // spellings with DIFFERENT case rules: `@base`/`@prefix` are lowercase
-    // only, while the SPARQL-style `BASE`/`PREFIX` (no `@`) are
-    // case-insensitive. The parser has it backwards in both directions: it
-    // rejects `base <...>` and `PreFIX : <...>` (valid), and accepts
-    // `@BASE <...>` (invalid). One localized fix clears all three. (3)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-base-04",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-prefix-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-bad-base-02",
+    // B (directive keyword case, both directions) — FIXED, entries removed
+    // with the fix.
     // ---------------------------------------------------------------------
     // C. TERM VALIDATION NOT IMPLEMENTED — the H-8 workstream ("IRI
     // validation ships in the light crates"), not yet landed. The parser
