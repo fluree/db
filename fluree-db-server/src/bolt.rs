@@ -478,7 +478,11 @@ async fn handle_begin(
     }
     match state
         .fluree
-        .begin_cypher_transaction(ledger_id, session_governance(auth))
+        .begin_cypher_transaction(
+            ledger_id,
+            session_governance(auth),
+            fluree_db_api::TrackingOptions::default(),
+        )
         .await
     {
         Ok(txn) => {
@@ -505,7 +509,9 @@ async fn handle_commit(
         );
     }
     match state.fluree.commit_cypher_transaction(txn).await {
-        Ok(t) => session.commit_succeeded(Some(format!("fluree:t:{t}"))),
+        Ok(result) => {
+            session.commit_succeeded(Some(format!("fluree:t:{}", result.receipt.t)))
+        }
         Err(fluree_db_api::ApiError::Transact(
             fluree_db_api::TransactError::CommitConflict { expected_t, head_t },
         )) => session.commit_failed(

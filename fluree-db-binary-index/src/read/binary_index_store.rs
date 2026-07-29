@@ -988,8 +988,21 @@ impl BinaryIndexStore {
                 fluree_db_core::temporal::DayTimeDuration::from_micros(key.decode_day_time_dur()),
             ))),
             DecodeKind::Duration => {
-                // Compound duration — not yet fully supported in V5 either.
-                Ok(FlakeValue::Null)
+                // Generic duration: o_key is the string-dictionary id of the
+                // canonical lexical form (see the resolver's DurationStr arm).
+                let s = self.resolve_string_value(o_key as u32).map_err(|e| {
+                    tracing::debug!(
+                        g_id,
+                        str_id = o_key as u32,
+                        error = %e,
+                        "binary index failed to resolve duration lexical value"
+                    );
+                    e
+                })?;
+                match fluree_db_core::temporal::Duration::parse(&s) {
+                    Ok(d) => Ok(FlakeValue::Duration(Box::new(d))),
+                    Err(_) => Ok(FlakeValue::String(s)),
+                }
             }
             DecodeKind::GeoPoint => Ok(FlakeValue::GeoPoint(fluree_db_core::GeoPointBits(o_key))),
             DecodeKind::BlankNode => {
@@ -2270,6 +2283,18 @@ impl BinaryGraphView {
                             return Ok(FlakeValue::Json(s));
                         }
                     }
+                    DecodeKind::Duration => {
+                        // Generic durations are string-dict-backed; an overlay
+                        // row can carry a novelty string id (the canonical
+                        // lexical interned by an unrelated novelty string),
+                        // which the store's base-only resolve cannot see.
+                        if let Some(s) = self.resolve_novel_string(dn, o_key as u32) {
+                            return Ok(match fluree_db_core::temporal::Duration::parse(&s) {
+                                Ok(d) => FlakeValue::Duration(Box::new(d)),
+                                Err(_) => FlakeValue::String(s),
+                            });
+                        }
+                    }
                     _ => {} // Non-dict types: straight to store
                 }
             }
@@ -2278,7 +2303,10 @@ impl BinaryGraphView {
         // encoded) and we didn't already satisfy it from novelty above.
         if matches!(
             kind,
-            DecodeKind::IriRef | DecodeKind::StringDict | DecodeKind::JsonArena
+            DecodeKind::IriRef
+                | DecodeKind::StringDict
+                | DecodeKind::JsonArena
+                | DecodeKind::Duration
         ) {
             self.charge_dict_touch()?;
         }

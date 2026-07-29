@@ -134,6 +134,7 @@ num-bigdecimal = { package = "bigdecimal", version = "0.4" }
 ed25519-dalek = "2.1"
 criterion = { version = "0.5", features = ["async_tokio"] }
 fluree-bench-support = { path = "../fluree-bench-support" }
+fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 
@@ -185,6 +186,12 @@ path = "tests/grp_reasoning.rs"
 name = "grp_transact"
 path = "tests/grp_transact.rs"
 
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# fast-path routing, so it must not share a process with either.
+[[test]]
+name = "it_count_datatype_pin"
+path = "tests/it_count_datatype_pin.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
@@ -198,12 +205,20 @@ name = "it_multi_graph_property_path"
 path = "tests/it_multi_graph_property_path.rs"
 
 [[test]]
+name = "it_cypher_seq_writes"
+path = "tests/it_cypher_seq_writes.rs"
+
+[[test]]
 name = "it_query_cypher"
 path = "tests/it_query_cypher.rs"
 
 [[test]]
 name = "it_query_cypher_fullscan"
 path = "tests/it_query_cypher_fullscan.rs"
+
+[[test]]
+name = "it_wga_gate_verify"
+path = "tests/it_wga_gate_verify.rs"
 
 [[test]]
 name = "it_policy_cypher"
@@ -326,6 +341,10 @@ harness = false
 
 [[bench]]
 name = "query_hot_bsbm"
+harness = false
+
+[[bench]]
+name = "query_overlay_matrix"
 harness = false
 
 [[bench]]

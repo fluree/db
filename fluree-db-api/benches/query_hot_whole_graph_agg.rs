@@ -154,7 +154,20 @@ async fn setup_indexed(n_nodes: usize) -> (tempfile::TempDir, Fluree, GraphDb, u
         .reindex(&alias, ReindexOptions::default())
         .await
         .expect("reindex");
-    let db = fluree.db(&alias).await.expect("indexed GraphDb");
+
+    // The scenarios query with BARE Cypher identifiers (`MATCH (n:Person)`,
+    // `n.age`), which resolve through the queried view's default-context
+    // `@vocab`. That is NOT the per-transaction inline `@context` used at
+    // write time, and `db()` does not copy any ledger default context onto the
+    // view (see `GraphDb::with_default_context`). The data is serialized under
+    // `http://example.org/`, so the view must advertise that same `@vocab` or
+    // every class-anchored / property query resolves the bare name to
+    // namespace 0 and matches zero nodes (folds fire, but over an empty set).
+    let db = fluree
+        .db(&alias)
+        .await
+        .expect("indexed GraphDb")
+        .with_default_context(Some(json!({"@vocab": "http://example.org/"})));
 
     (db_dir, fluree, db, total_nodes)
 }

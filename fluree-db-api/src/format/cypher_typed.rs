@@ -285,7 +285,7 @@ fn binding_cell<'a>(
                 Ok(CypherCell::Relationship(Box::new(CypherRelationship {
                     start_iri,
                     end_iri,
-                    type_name: cypher_name_from_iri(&type_iri).into(),
+                    type_name: hydrator.name(&type_iri).into(),
                     reifier_iri,
                     properties,
                 })))
@@ -449,6 +449,10 @@ struct NodeHydrator<'a> {
     /// p_id → Cypher property key for the batched lane (None = system
     /// predicate, hidden).
     key_names_by_pid: HashMap<u32, Option<Arc<str>>>,
+    /// The ledger context's `@vocab`, when configured — the prefix
+    /// [`cypher_name_from_iri`] strips so rendered names match
+    /// `labels()`/`type()` evaluation and `db.labels()`.
+    vocab: Option<String>,
 }
 
 /// Concurrent subject fetches in flight during [`NodeHydrator::prefetch`].
@@ -486,7 +490,14 @@ impl<'a> NodeHydrator<'a> {
             key_names: HashMap::new(),
             label_names: HashMap::new(),
             key_names_by_pid: HashMap::new(),
+            vocab: crate::query::helpers::extract_cypher_iri_mapping(view.default_context.as_ref())
+                .0,
         }
+    }
+
+    /// The Cypher-visible name for an IRI under this view's `@vocab`.
+    fn name(&self, iri: &str) -> String {
+        cypher_name_from_iri(iri, self.vocab.as_deref())
     }
 
     /// Run one subject batch's raw-SPOT fetch through the view policy — the
@@ -526,7 +537,7 @@ impl<'a> NodeHydrator<'a> {
         let name = if p_iri.starts_with(FLUREE_SYSTEM_NS) {
             None
         } else {
-            Some(Arc::from(cypher_name_from_iri(&p_iri).as_str()))
+            Some(Arc::from(self.name(&p_iri).as_str()))
         };
         self.key_names.insert(pred.clone(), name.clone());
         Ok(name)
@@ -541,7 +552,7 @@ impl<'a> NodeHydrator<'a> {
             None
         } else {
             let class_iri = self.compactor.decode_sid(class_sid)?;
-            Some(Arc::from(cypher_name_from_iri(&class_iri).as_str()))
+            Some(Arc::from(self.name(&class_iri).as_str()))
         };
         self.label_names.insert(class_sid.clone(), name.clone());
         Ok(name)
@@ -712,7 +723,7 @@ impl<'a> NodeHydrator<'a> {
         Ok(Some(CypherRelationship {
             start_iri: self.compactor.decode_sid_shared(&start)?,
             end_iri: self.compactor.decode_sid_shared(&end)?,
-            type_name: cypher_name_from_iri(&type_iri).into(),
+            type_name: self.name(&type_iri).into(),
             reifier_iri: Some(node.iri),
             properties: node.properties,
         }))
@@ -790,7 +801,7 @@ impl<'a> NodeHydrator<'a> {
         }
         let name = match store.resolve_predicate_iri(p_id) {
             Some(iri) if iri.starts_with(FLUREE_SYSTEM_NS) => None,
-            Some(iri) => Some(Arc::from(cypher_name_from_iri(iri).as_str())),
+            Some(iri) => Some(Arc::from(self.name(iri).as_str())),
             None => None,
         };
         self.key_names_by_pid.insert(p_id, name.clone());
@@ -936,7 +947,7 @@ impl<'a> NodeHydrator<'a> {
                 CypherCell::Relationship(Box::new(CypherRelationship {
                     start_iri,
                     end_iri,
-                    type_name: cypher_name_from_iri(&type_iri).into(),
+                    type_name: self.name(&type_iri).into(),
                     reifier_iri: Some(self.compactor.decode_sid_shared(sid)?),
                     properties,
                 }))
@@ -1060,7 +1071,7 @@ impl<'a> NodeHydrator<'a> {
             let rel = CypherRelationship {
                 start_iri,
                 end_iri,
-                type_name: cypher_name_from_iri(&type_iri).into(),
+                type_name: self.name(&type_iri).into(),
                 reifier_iri: None,
                 properties: Vec::new(),
             };

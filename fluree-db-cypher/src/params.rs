@@ -533,11 +533,39 @@ fn expand_unwind_match(ast: &mut CypherAst, params: &ParamMap) -> Result<(), Par
     // visible to the next row's guard); a vectorized batch is, so dedup by
     // the MERGE identity key here — last row per key wins — to converge on
     // the same end state sequential execution would reach.
+    //
+    // Only for statements that stay on the single-`Txn` / conditional
+    // paths: the key comes from the FIRST node MERGE, so collapsing rows by
+    // it would drop legitimate rows of a multi-clause chain
+    // (`MERGE (a {id: row.src}) MERGE (b {id: row.dst}) …` — two rows
+    // sharing `src` but differing in `dst` are distinct work). Statements
+    // the sequential write driver takes own in-batch duplicate-key
+    // semantics themselves (first row per key creates, later rows match),
+    // so this must mirror the driver's routing exactly: it takes (a) any
+    // write list beyond the `[MERGE, SET…]` family, and (b) a node MERGE
+    // whose (post-desugar) reads include a plain clause besides this
+    // UNWIND. The upsert idiom `MERGE (n {id: row.id}) SET …` — a MERGE
+    // with trailing SETs and no other reads — keeps its conditional-path
+    // dedup.
     let identity_fields = {
         let Statement::Update(u) = &ast.statement else {
             unreachable!("checked above");
         };
-        merge_identity_fields(u, &alias)
+        let merge_set_shape = matches!(
+            u.write_clauses.as_slice(),
+            [WriteClause::Merge(_), rest @ ..]
+                if rest.iter().all(|w| matches!(w, WriteClause::Set(_)))
+        );
+        let other_plain_reads = u
+            .read_clauses
+            .iter()
+            .enumerate()
+            .any(|(i, c)| i != unwind_idx && !matches!(c, ReadClause::InlineRows { .. }));
+        if merge_set_shape && !other_plain_reads {
+            merge_identity_fields(u, &alias)
+        } else {
+            Vec::new()
+        }
     };
     let elems = dedup_rows_by_merge_identity(elems, &identity_fields);
     let elems = &elems;
@@ -826,6 +854,7 @@ fn collect_alias_in_expr(e: &Expr, alias: &str, fields: &mut Vec<String>, bare: 
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             collect_alias_in_expr(l, alias, fields, bare);
             collect_alias_in_expr(r, alias, fields, bare);
@@ -1067,6 +1096,7 @@ fn rewrite_alias_in_expr_to_var<F: Fn(&str) -> String>(
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             rewrite_alias_in_expr_to_var(l, alias, col_var, bare_var);
             rewrite_alias_in_expr_to_var(r, alias, col_var, bare_var);
@@ -1238,6 +1268,7 @@ fn replace_alias_in_expr(
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             replace_alias_in_expr(l, alias, elem, pname)?;
             replace_alias_in_expr(r, alias, elem, pname)
@@ -1585,6 +1616,7 @@ fn subst_expr(e: &mut Expr, p: &ParamMap) -> Result<(), ParamError> {
         | Expr::StartsWith(l, r, _)
         | Expr::EndsWith(l, r, _)
         | Expr::Contains(l, r, _)
+        | Expr::RegexMatch(l, r, _)
         | Expr::Index(l, r, _) => {
             subst_expr(l, p)?;
             subst_expr(r, p)

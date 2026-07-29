@@ -24,7 +24,9 @@ use fluree_db_binary_index::format::run_record_v2::{
 use fluree_db_core::ContentId;
 use rayon::prelude::*;
 
-use super::incremental_leaf::{update_leaf, LeafUpdateInput, LeafUpdateOutput, NewLeafBlob};
+use super::incremental_leaf::{
+    update_leaf, LeafUpdateInput, LeafUpdateOutput, NewLeafBlob, StreamSlices,
+};
 
 /// Minimum number of *touched* leaves before fanning the per-leaf CoW out across
 /// the shared rayon pool. Below this the per-leaf zstd re-encode is cheap enough
@@ -107,10 +109,13 @@ pub struct BranchUpdateMeta {
 ///
 /// Leaves are processed sequentially. The caller is responsible for prefetching
 /// touched leaves if parallelism is desired.
+#[allow(clippy::too_many_arguments)]
 pub fn update_branch<F, G>(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
+    superseded: &[RunRecordV2],
+    superseded_ops: &[u8],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -128,6 +133,8 @@ where
         existing_branch_bytes,
         novelty,
         novelty_ops,
+        superseded,
+        superseded_ops,
         config,
         fetch_leaf,
         fetch_sidecar,
@@ -159,6 +166,8 @@ pub fn update_branch_streaming<F, G, S>(
     existing_branch_bytes: &[u8],
     novelty: &[RunRecordV2],
     novelty_ops: &[u8],
+    superseded: &[RunRecordV2],
+    superseded_ops: &[u8],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -182,8 +191,14 @@ where
     let manifest = read_branch_from_bytes(existing_branch_bytes)?;
     let cmp = cmp_v2_for_order(order);
 
-    // Slice novelty to leaves.
-    let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, &manifest, cmp);
+    let leaf_slices = slice_streams_to_leaves(
+        novelty,
+        novelty_ops,
+        superseded,
+        superseded_ops,
+        &manifest,
+        cmp,
+    );
 
     // Touched leaves: the per-leaf `update_leaf` (decode → merge → zstd re-encode)
     // is the CPU-bound work. On a multi-core box with enough touched leaves we fan
@@ -192,7 +207,7 @@ where
     // we run the byte-identical serial loop. Either path produces leaf_entries /
     // replaced-CID lists / sink emissions in ascending manifest index, so the
     // assembled branch bytes (and CID) are bit-identical to the serial version.
-    let touched_count = novelty_slices.iter().filter(|(n, _)| !n.is_empty()).count();
+    let touched_count = leaf_slices.iter().filter(|s| !s.novelty.is_empty()).count();
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -204,13 +219,44 @@ where
 
     drain_branch(
         &manifest,
-        &novelty_slices,
+        &leaf_slices,
         config,
         fetch_leaf,
         fetch_sidecar,
         mode,
         sink,
     )
+}
+
+/// Slice both streams to leaves as paired [`StreamSlices`], checking the
+/// co-routing invariant where the slices are created.
+fn slice_streams_to_leaves<'a>(
+    novelty: &'a [RunRecordV2],
+    novelty_ops: &'a [u8],
+    superseded: &'a [RunRecordV2],
+    superseded_ops: &'a [u8],
+    manifest: &BranchManifest,
+    cmp: fn(&RunRecordV2, &RunRecordV2) -> std::cmp::Ordering,
+) -> Vec<StreamSlices<'a>> {
+    let novelty_slices = slice_novelty_to_leaves(novelty, novelty_ops, manifest, cmp);
+    let superseded_slices = slice_novelty_to_leaves(superseded, superseded_ops, manifest, cmp);
+    novelty_slices
+        .into_iter()
+        .zip(superseded_slices)
+        .map(|((novelty, novelty_ops), (superseded, superseded_ops))| {
+            debug_assert!(
+                !novelty.is_empty() || superseded.is_empty(),
+                "a leaf without novelty cannot hold superseded events: every \
+                     superseded identity routes with its winner"
+            );
+            StreamSlices {
+                novelty,
+                novelty_ops,
+                superseded,
+                superseded_ops,
+            }
+        })
+        .collect()
 }
 
 /// Which per-leaf CoW drain to run. Split out so tests can force either path and
@@ -227,7 +273,7 @@ enum DrainMode {
 #[allow(clippy::too_many_arguments)]
 fn drain_branch<F, G, S>(
     manifest: &BranchManifest,
-    novelty_slices: &[(&[RunRecordV2], &[u8])],
+    leaf_slices: &[StreamSlices<'_>],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -244,7 +290,7 @@ where
     match mode {
         DrainMode::Serial => update_branch_serial(
             manifest,
-            novelty_slices,
+            leaf_slices,
             config,
             fetch_leaf,
             fetch_sidecar,
@@ -253,7 +299,7 @@ where
         )?,
         DrainMode::Parallel { window } => update_branch_parallel(
             manifest,
-            novelty_slices,
+            leaf_slices,
             config,
             fetch_leaf,
             fetch_sidecar,
@@ -340,12 +386,11 @@ const LEAF_SPLIT_CEILING_FACTOR: usize = 2;
 fn make_leaf_update_input<'a>(
     leaf_bytes: &'a [u8],
     sidecar_bytes: Option<&'a [u8]>,
-    nov_slice: &'a [RunRecordV2],
-    ops_slice: &'a [u8],
+    slices: StreamSlices<'a>,
     config: &BranchUpdateConfig,
 ) -> io::Result<LeafUpdateInput<'a>> {
     let existing_header = decode_leaf_header_v3(leaf_bytes)?;
-    let estimated_rows = (existing_header.total_rows as usize).saturating_add(nov_slice.len());
+    let estimated_rows = (existing_header.total_rows as usize).saturating_add(slices.novelty.len());
     let ceiling = config
         .leaf_target_rows
         .saturating_mul(LEAF_SPLIT_CEILING_FACTOR);
@@ -360,8 +405,10 @@ fn make_leaf_update_input<'a>(
     };
     Ok(LeafUpdateInput {
         leaf_bytes,
-        novelty: nov_slice,
-        novelty_ops: ops_slice,
+        novelty: slices.novelty,
+        novelty_ops: slices.novelty_ops,
+        superseded: slices.superseded,
+        superseded_ops: slices.superseded_ops,
         order: config.order,
         g_id: config.g_id,
         zstd_level: config.zstd_level,
@@ -417,7 +464,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn update_branch_serial<F, G, S>(
     manifest: &BranchManifest,
-    novelty_slices: &[(&[RunRecordV2], &[u8])],
+    leaf_slices: &[StreamSlices<'_>],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -429,9 +476,9 @@ where
     G: Fn(&ContentId) -> io::Result<Option<Vec<u8>>>,
     S: FnMut(NewLeafBlob) -> io::Result<()>,
 {
-    for (i, (nov_slice, ops_slice)) in novelty_slices.iter().enumerate() {
+    for (i, slices) in leaf_slices.iter().enumerate() {
         let existing = &manifest.leaves[i];
-        if nov_slice.is_empty() {
+        if slices.novelty.is_empty() {
             acc.leaf_entries.push(existing.clone());
             continue;
         }
@@ -441,13 +488,7 @@ where
             Some(cid) => fetch_sidecar(cid)?,
             None => None,
         };
-        let input = make_leaf_update_input(
-            &leaf_bytes,
-            sidecar_bytes.as_deref(),
-            nov_slice,
-            ops_slice,
-            config,
-        )?;
+        let input = make_leaf_update_input(&leaf_bytes, sidecar_bytes.as_deref(), *slices, config)?;
         let output = update_leaf(&input)?;
         drain_touched_output(config.order, existing, output, acc, sink)?;
     }
@@ -461,8 +502,7 @@ struct LeafWorkUnit<'a> {
     manifest_index: usize,
     leaf_bytes: Vec<u8>,
     sidecar_bytes: Option<Vec<u8>>,
-    nov_slice: &'a [RunRecordV2],
-    ops_slice: &'a [u8],
+    slices: StreamSlices<'a>,
 }
 
 /// Windowed parallel per-leaf CoW. Iterates the novelty slices in manifest order
@@ -485,7 +525,7 @@ struct LeafWorkUnit<'a> {
 #[allow(clippy::too_many_arguments)]
 fn update_branch_parallel<F, G, S>(
     manifest: &BranchManifest,
-    novelty_slices: &[(&[RunRecordV2], &[u8])],
+    leaf_slices: &[StreamSlices<'_>],
     config: &BranchUpdateConfig,
     fetch_leaf: &F,
     fetch_sidecar: &G,
@@ -500,7 +540,7 @@ where
 {
     let window = window.max(1);
     let span = tracing::Span::current();
-    let n = novelty_slices.len();
+    let n = leaf_slices.len();
     let mut i = 0;
 
     while i < n {
@@ -511,12 +551,12 @@ where
         // only. Untouched leaves are handled in the post-pass to keep a single
         // ascending push order.
         let mut units: Vec<LeafWorkUnit<'_>> = Vec::with_capacity(window_end - i);
-        for (offset, ((nov_slice, ops_slice), existing)) in novelty_slices[i..window_end]
+        for (offset, (slices, existing)) in leaf_slices[i..window_end]
             .iter()
             .zip(&manifest.leaves[i..window_end])
             .enumerate()
         {
-            if nov_slice.is_empty() {
+            if slices.novelty.is_empty() {
                 continue;
             }
             let leaf_bytes = fetch_leaf(&existing.leaf_cid)?;
@@ -528,8 +568,7 @@ where
                 manifest_index: i + offset,
                 leaf_bytes,
                 sidecar_bytes,
-                nov_slice,
-                ops_slice,
+                slices: *slices,
             });
         }
 
@@ -543,8 +582,7 @@ where
                 let input = make_leaf_update_input(
                     &unit.leaf_bytes,
                     unit.sidecar_bytes.as_deref(),
-                    unit.nov_slice,
-                    unit.ops_slice,
+                    unit.slices,
                     config,
                 )?;
                 let output = update_leaf(&input)?;
@@ -701,7 +739,7 @@ mod parity_tests {
     ) -> (BranchUpdateMeta, Vec<NewLeafBlob>) {
         let manifest = read_branch_from_bytes(branch_bytes).unwrap();
         let cmp = cmp_v2_for_order(config.order);
-        let slices = slice_novelty_to_leaves(novelty, ops, &manifest, cmp);
+        let slices = slice_streams_to_leaves(novelty, ops, &[], &[], &manifest, cmp);
         let mut blobs: Vec<NewLeafBlob> = Vec::new();
         let meta = drain_branch(
             &manifest,

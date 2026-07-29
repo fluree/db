@@ -6,8 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Library only. No bins, no benches in this crate — see <workspace>/BENCHMARKING.md
-# for the chassis design and per-crate `benches/` for the actual benches.
+# Library + one small CLI (`bench-baseline`, capture/compare). No benches in
+# this crate — see <workspace>/BENCHMARKING.md and per-crate `benches/`.
+
+[[bin]]
+name = "bench-baseline"
+path = "src/bin/bench_baseline.rs"
 
 [features]
 default = []

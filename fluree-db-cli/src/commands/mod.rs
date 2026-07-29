@@ -25,6 +25,7 @@ pub mod log;
 pub mod materialize;
 pub mod mcp;
 pub mod memory;
+pub mod model;
 pub mod multi_query;
 pub mod prefix;
 pub mod query;

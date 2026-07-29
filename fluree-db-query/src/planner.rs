@@ -227,6 +227,27 @@ pub(crate) fn estimate_triple_row_count(
                     return 0.0;
                 }
             }
+            // Structural selectivities for the `f:reifies*` edge-annotation
+            // encoding, which stats never cover (system predicates). A bound
+            // reifiesSubject/reifiesObject object pins one edge endpoint —
+            // matches ≈ that node's degree. A bound reifiesPredicate object
+            // matches every annotation sharing the relationship type —
+            // nearly the whole sidecar. Left to the generic default all
+            // three tie, and the expanded annotation chain can drive from
+            // reifiesPredicate: per driving row it enumerates ~(sidecar /
+            // #types) candidate reifiers and existence-checks each, which
+            // turned a 21k-row Cypher UNWIND over reified edges into
+            // minutes of CPU.
+            if let Ref::Sid(p) = &pattern.p {
+                if p.namespace_code == fluree_vocab::namespaces::FLUREE_DB {
+                    use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
+                    match p.name.as_ref() {
+                        REIFIES_SUBJECT | REIFIES_OBJECT => return MODERATELY_SELECTIVE,
+                        REIFIES_PREDICATE => return DEFAULT_PROPERTY_SCAN_SELECTIVITY,
+                        _ => {}
+                    }
+                }
+            }
             DEFAULT_BOUND_OBJECT_SELECTIVITY
         }
 

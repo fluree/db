@@ -345,7 +345,7 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            85,
+            87,
             "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
              4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
              q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
@@ -362,7 +362,10 @@ mod tests {
              closing the q038 ungrouped/direct-path fusion gap) + \
              7 browse-parity members (q079 class-page crawl/Cluster A, q080 subject-detail \
              + q081 @type + q082 property-list select-maps/Cluster B, q083 property-scoped \
-             listing/E1, q084 filtered page, q085 inbound-edge count/works-today shape 9)"
+             listing/E1, q084 filtered page, q085 inbound-edge count/works-today shape 9) + \
+             2 FAMILY-C filter-over-join members (q086 open-tickets-by-segment fact-side \
+             inequality FILTER = deployed DNF Q1, q087 below-reorder-by-category fact-side \
+             var-to-var FILTER + COUNT/2×AVG = deployed DNF Q2)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));

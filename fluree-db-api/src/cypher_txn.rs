@@ -42,8 +42,11 @@
 use crate::cypher_write::{self, WritePlan};
 use crate::error::ApiError;
 use crate::view::GraphDb;
-use crate::{Fluree, GovernanceOptions, Result, Tracker};
-use fluree_db_core::ContentId;
+use crate::{
+    CommitReceipt, Fluree, GovernanceOptions, IndexingStatus, Result, Tracker, TrackingOptions,
+    TransactResultRef,
+};
+use fluree_db_core::{ContentId, ContentKind};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, RefKind, RefValue};
 use fluree_db_transact::{CommitOpts, TransactError};
@@ -64,12 +67,19 @@ pub struct CypherTransaction {
     /// Session identity + policy inputs pinned at BEGIN; governs every
     /// statement staged in this transaction.
     governance: GovernanceOptions,
+    /// Shared fuel/time/policy accumulator pinned at BEGIN. Every statement
+    /// (and every clause of a sequential statement) stages under this same
+    /// tracker, so its tally at COMMIT is the sum across the whole
+    /// transaction. Disabled when no tracking was requested.
+    tracker: Tracker,
 }
 
 struct PendingCommit {
     commit_id: ContentId,
     bytes: Vec<u8>,
     t: i64,
+    /// Flakes in this pending commit; summed into the commit receipt.
+    flake_count: usize,
 }
 
 /// Per-statement outcome of a write inside a transaction.
@@ -105,10 +115,14 @@ impl Fluree {
     /// Open an interactive Cypher transaction pinned to the ledger's
     /// current cached head. `governance` (the session's authenticated
     /// identity and policy inputs) governs every statement staged in it.
+    /// `tracking` selects fuel/time/policy accounting; the resulting tally
+    /// accumulates across every statement and surfaces in the commit result
+    /// (pass [`TrackingOptions::default()`] to opt out).
     pub async fn begin_cypher_transaction(
         &self,
         ledger_id: &str,
         governance: GovernanceOptions,
+        tracking: TrackingOptions,
     ) -> Result<CypherTransaction> {
         let handle = self.ledger_cached(ledger_id).await?;
         let state = handle.snapshot().await.to_ledger_state();
@@ -123,6 +137,7 @@ impl Fluree {
             state,
             pending: Vec::new(),
             governance,
+            tracker: Tracker::new(tracking),
         })
     }
 
@@ -145,6 +160,16 @@ impl Fluree {
         query: &str,
         params: Option<&crate::CypherParamMap>,
     ) -> Result<CypherTxnWriteOutcome> {
+        // Multi-clause statements: the sequential driver stages against the
+        // transaction's private state (probes see earlier statements), and
+        // answers a trailing RETURN from its final row table. Detected before
+        // the created-entity RETURN planner, which would reject its RETURN.
+        if let Ok(ast) = crate::query::helpers::substituted_cypher_ast(query, params) {
+            if let Some(sq) = crate::cypher_seq::detect_sequential(&ast) {
+                return self.cypher_transaction_write_sequential(txn, &sq).await;
+            }
+        }
+
         let return_plan = cypher_write::plan_write_return_source(query, params)?;
         let skolem_txn_id = return_plan
             .as_ref()
@@ -175,6 +200,12 @@ impl Fluree {
                 self.resolve_conditional_cypher(&cw, probe, &txn.ledger_id, &txn.state.snapshot)
                     .await?
             }
+            WritePlan::Sequential(_) => {
+                // Handled by the early detect_sequential branch above.
+                return Err(ApiError::internal(
+                    "sequential Cypher write reached the single-statement path",
+                ));
+            }
         };
 
         // Built against the private state so earlier statements in this
@@ -192,7 +223,10 @@ impl Fluree {
         .await?;
 
         let index_config = crate::server_defaults::default_index_config();
-        let tracker = Tracker::disabled();
+        // Shared transaction tracker: fuel from this statement accumulates
+        // into the tally reported at COMMIT. Cheap Arc clone so the `&mut txn`
+        // borrow below is unencumbered.
+        let tracker = txn.tracker.clone();
         let stage_result = if let Some(followup) = resolved.followup {
             // Per-row relationship MERGE … ON MATCH SET: stage both branches into
             // this statement's single pending commit.
@@ -215,6 +249,86 @@ impl Fluree {
             )
             .await?
         };
+
+        let flake_count = self
+            .pend_stage_result(txn, stage_result, &index_config)
+            .await?;
+        let return_table = match (&return_plan, &skolem_txn_id) {
+            (Some(plan), Some(skolem)) => {
+                Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
+            }
+            _ => None,
+        };
+        Ok(CypherTxnWriteOutcome {
+            flake_count,
+            return_table,
+        })
+    }
+
+    /// The sequential-driver arm of [`Self::cypher_transaction_write`]:
+    /// stage the multi-clause statement against the transaction's private
+    /// state, pend the merged commit, and answer its RETURN as typed rows.
+    async fn cypher_transaction_write_sequential(
+        &self,
+        txn: &mut CypherTransaction,
+        plan: &crate::cypher_seq::SequentialCypherWrite,
+    ) -> Result<CypherTxnWriteOutcome> {
+        let policy = crate::build_transact_policy_context(
+            self,
+            &txn.state.snapshot,
+            txn.state.novelty.as_ref(),
+            Some(txn.state.novelty.as_ref()),
+            txn.state.t(),
+            &txn.governance,
+        )
+        .await?;
+
+        let index_config = crate::server_defaults::default_index_config();
+        // Shared transaction tracker: every clause of this sequential statement
+        // charges the same accumulator, so its fuel sums across clauses.
+        let tracker = txn.tracker.clone();
+        let ledger_id = txn.ledger_id.clone();
+        let outcome = self
+            .stage_cypher_sequential(
+                txn.state.clone(),
+                plan,
+                &ledger_id,
+                Some(&txn.governance),
+                Some(&index_config),
+                policy.as_ref(),
+                Some(&tracker),
+                None,
+            )
+            .await?;
+
+        let flake_count = self
+            .pend_stage_result(txn, outcome.stage_result, &index_config)
+            .await?;
+        let return_table = match outcome.return_result {
+            Some(qr) => {
+                let view = self.cypher_transaction_view(txn).await?;
+                Some(qr.to_cypher_typed_table(&view).await.map_err(|e| {
+                    ApiError::internal(format!("sequential write RETURN formatting: {e}"))
+                })?)
+            }
+            None => None,
+        };
+        Ok(CypherTxnWriteOutcome {
+            flake_count,
+            return_table,
+        })
+    }
+
+    /// Shared tail of a transaction-scoped write statement: build a pending
+    /// commit from a staged result and advance the private state. A
+    /// zero-effect statement (Cypher's zero-updates success) advances nothing
+    /// and pends nothing. Returns the statement's flake count.
+    async fn pend_stage_result(
+        &self,
+        txn: &mut CypherTransaction,
+        stage_result: crate::StageResult,
+        index_config: &fluree_db_ledger::IndexConfig,
+    ) -> Result<usize> {
         let crate::StageResult {
             view,
             ns_registry,
@@ -222,21 +336,10 @@ impl Fluree {
             graph_delta,
         } = stage_result;
 
-        // Zero-effect statement (`MATCH … SET` matching nothing): Cypher
-        // semantics succeed with zero updates; nothing to commit.
         if !view.has_staged() {
             let (base, _flakes) = view.into_parts();
             txn.state = base;
-            let return_table = match (&return_plan, &skolem_txn_id) {
-                (Some(plan), Some(skolem)) => {
-                    Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
-                }
-                _ => None,
-            };
-            return Ok(CypherTxnWriteOutcome {
-                flake_count: 0,
-                return_table,
-            });
+            return Ok(0);
         }
 
         let mut commit_opts = CommitOpts::default()
@@ -268,7 +371,7 @@ impl Fluree {
             ns_registry,
             expected_head_ref,
             None,
-            &index_config,
+            index_config,
             commit_opts,
         )
         .await
@@ -286,19 +389,10 @@ impl Fluree {
             commit_id,
             bytes,
             t: receipt.t,
+            flake_count: receipt.flake_count,
         });
         txn.state = next_state;
-
-        let return_table = match (&return_plan, &skolem_txn_id) {
-            (Some(plan), Some(skolem)) => {
-                Some(cypher_write::write_return_typed_rows(plan, skolem, &txn.state).await?)
-            }
-            _ => None,
-        };
-        Ok(CypherTxnWriteOutcome {
-            flake_count: receipt.flake_count,
-            return_table,
-        })
+        Ok(receipt.flake_count)
     }
 
     /// Publish the transaction atomically. Verifies under the ledger write
@@ -306,11 +400,48 @@ impl Fluree {
     /// whole transaction with [`TransactError::CommitConflict`] (map it to
     /// a driver-retryable transient error). On success all pending commit
     /// blobs are written and the head ref advances once, base → final
-    /// commit. Returns the final committed `t` (the base `t` for an
-    /// all-reads transaction).
-    pub async fn commit_cypher_transaction(&self, txn: CypherTransaction) -> Result<i64> {
+    /// commit.
+    ///
+    /// Returns a [`TransactResultRef`] with the same shape the autocommit
+    /// path yields, so callers map one result type:
+    /// - `receipt` — final commit id + `t`, and the flake count summed across
+    ///   every staged statement;
+    /// - `indexing` — post-commit reindex signals (`needed`, `novelty_size`);
+    /// - `tally` — accumulated fuel/time/policy across the whole transaction
+    ///   (`None` when tracking was not requested at `begin`);
+    /// - `cypher_return` — always `None` here; per-statement `RETURN` rows are
+    ///   already delivered by [`CypherTxnWriteOutcome::return_table`].
+    ///
+    /// An all-reads (or all-no-op) transaction publishes nothing and reports
+    /// the same no-op receipt the autocommit paths return: the empty-content
+    /// commit id and the base `t` (legitimately `0` on a ledger registered by
+    /// `create_ledger`, which writes no genesis commit).
+    pub async fn commit_cypher_transaction(
+        &self,
+        txn: CypherTransaction,
+    ) -> Result<TransactResultRef> {
+        let index_config = crate::server_defaults::default_index_config();
         if txn.pending.is_empty() {
-            return Ok(txn.base_t);
+            // Nothing published, head unchanged — mirror the autocommit no-op
+            // receipt exactly. A `create_ledger` ledger has a nameservice
+            // record but no genesis commit, so `base_head` is legitimately
+            // `None` here; that must stay a successful no-op, not an error.
+            return Ok(TransactResultRef {
+                receipt: CommitReceipt {
+                    commit_id: ContentId::new(ContentKind::Commit, &[]),
+                    t: txn.base_t,
+                    flake_count: 0,
+                },
+                indexing: IndexingStatus {
+                    enabled: self.indexing_mode.is_enabled(),
+                    needed: false,
+                    novelty_size: txn.state.novelty_size(),
+                    index_t: txn.state.index_t(),
+                    commit_t: txn.base_t,
+                },
+                tally: txn.tracker.tally(),
+                cypher_return: None,
+            });
         }
         let handle = self.ledger_cached(&txn.ledger_id).await?;
         let guard = handle.lock_for_write().await;
@@ -361,11 +492,46 @@ impl Fluree {
             }
         }
 
-        let index_config = crate::server_defaults::default_index_config();
-        let needs_reindex = txn.state.should_reindex(&index_config);
         let final_t = last.t;
+        let commit_id = last.commit_id.clone();
+        // Total flakes across every staged statement — the single-commit
+        // accounting the transactor expects for a multi-statement transaction.
+        let flake_count = txn.pending.iter().map(|p| p.flake_count).sum();
+
+        // Capture indexing signals + tally before `txn.state` is moved into
+        // finalize_commit (which triggers background reindex when needed).
+        let needs_reindex = txn.state.should_reindex(&index_config);
+        let indexing = self.cypher_txn_indexing_status(&txn.state, &index_config, final_t);
+        let tally = txn.tracker.tally();
+
         self.finalize_commit(guard, txn.state, final_t, needs_reindex)
             .await?;
-        Ok(final_t)
+        Ok(TransactResultRef {
+            receipt: CommitReceipt {
+                commit_id,
+                t: final_t,
+                flake_count,
+            },
+            indexing,
+            tally,
+            cypher_return: None,
+        })
+    }
+
+    /// Build the post-commit [`IndexingStatus`] for a Cypher transaction,
+    /// mirroring the autocommit path's `finalize_owned_commit`.
+    fn cypher_txn_indexing_status(
+        &self,
+        state: &LedgerState,
+        index_config: &fluree_db_ledger::IndexConfig,
+        commit_t: i64,
+    ) -> IndexingStatus {
+        IndexingStatus {
+            enabled: self.indexing_mode.is_enabled() && self.defaults_indexing_enabled(),
+            needed: state.should_reindex(index_config),
+            novelty_size: state.novelty_size(),
+            index_t: state.index_t(),
+            commit_t,
+        }
     }
 }

@@ -12,6 +12,18 @@ use crate::span::SourceSpan;
 /// also bounds the depth of every downstream walker (lowering, param
 /// substitution). 256 is far beyond any real query yet leaves ample stack
 /// headroom even with the ~12-frame precedence chain per level.
+///
+/// This counter is not directly comparable to the 128 used by the SPARQL,
+/// JSON-LD, and Turtle front-ends: the constants differ but the effective
+/// user-visible ceilings agree. One level of expression nesting routes through
+/// two unconditional guards here — `parse_or` and `parse_not` both call
+/// `enter_recursion` on every level (`parse_not` guards before it even checks
+/// for a `NOT` token) — so the counter ticks ~twice per user-visible level, and
+/// 256 counter-units ≈ 128 nesting levels. SPARQL, by contrast, increments once
+/// per level (a bare parenthesis skips its unary guard), so its 128 is also
+/// ~128 levels. The bound is a per-parser stack-safety limit sized to each
+/// parser's own guard cadence; align the raw numbers only by first equalizing
+/// that cadence, or the user-facing limits will diverge.
 const MAX_PARSE_DEPTH: u32 = 256;
 
 pub struct TokenStream {

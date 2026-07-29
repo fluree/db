@@ -377,6 +377,17 @@ impl Operator for UnionOperator {
                 // count (1) here, not the forwarding site. That classification is the
                 // load-bearing contract; it lives in the trait doc, so this lever
                 // stays sound only as long as the doc's absorb list does.
+                //
+                // One operator is neither pure-forward nor pure-absorb in that
+                // taxonomy: `GraphOperator` ABSORBS w.r.t. its own `self.child` but
+                // threads the budget into the per-parent-batch CORRELATED INNER
+                // subplan (`graph.rs`), a route the absorb-list framing above does
+                // not name. A union inside a `GRAPH` scope therefore receives a
+                // budget by that path. It stays sound because each parent batch
+                // rebuilds the inner tree with a FRESH budget and every inner row
+                // flows up to the same downstream LIMIT — so the buffered rows are
+                // still a valid k-subset — but that is a second, subtler argument
+                // than count (1) above, so verify it there when touching `graph.rs`.
                 if self
                     .row_budget
                     .is_some_and(|b| self.pending_output_rows >= b)

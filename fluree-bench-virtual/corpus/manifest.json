@@ -1,5 +1,5 @@
 {
-  "corpus_version": 4,
+  "corpus_version": 5,
   "description": "vbench corpus: 54 SPARQL queries (design Q01-Q54) derived from 26 BI questions over the ENTERPRISE_DEMO.DW star schema. Every query runs identically against the native materialized ledger (enterprise-sf01) and, once registered, an R2RML/Iceberg virtual target. See docs/audit/2026-07-virtual-dataset-perf/03-corpus-design.md for the feature x hypothesis coverage matrices and expected-rows derivation.",
   "queries": [
     {
@@ -1500,7 +1500,7 @@
     {
       "id": "q066",
       "file": "queries/q066_shipments_by_year_and_method_dataset.rq",
-      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys — shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
+      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys \u2014 shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
       "tags": [
         "aggregate",
         "count",
@@ -1528,7 +1528,7 @@
     {
       "id": "q067",
       "file": "queries/q067_tickets_by_year_and_priority_dataset.rq",
-      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM — priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
+      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM \u2014 priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
       "tags": [
         "aggregate",
         "count",
@@ -1554,7 +1554,7 @@
     {
       "id": "q068",
       "file": "queries/q068_orderline_detail_crawl_dataset.rq",
-      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage — the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
+      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage \u2014 the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
       "tags": [
         "wildcard",
         "exploration"
@@ -1578,7 +1578,7 @@
     {
       "id": "q069",
       "file": "queries/q069_filter_in_fkref_dataset.rq",
-      "bi_question": "Coverage (item 7 / F-AUD-5): FILTER(?fk IN (...)) over an FK-ref var — parity member; FK-IRI IN-prune is a documented follow-on (scalar prune shown by q070).",
+      "bi_question": "Coverage (item 7 / F-AUD-5): FILTER(?fk IN (...)) over an FK-ref var \u2014 parity member; FK-IRI IN-prune is a documented follow-on (scalar prune shown by q070).",
       "tags": [
         "filter_iri",
         "join",
@@ -1602,7 +1602,7 @@
     {
       "id": "q070",
       "file": "queries/q070_scalar_values_glaccount_dataset.rq",
-      "bi_question": "Coverage (item 7 / F-AUD-5): single-var VALUES over a scalar column (glAccountName) lowers to Iceberg Expression::In → files_pruned>0. Literals match no value → 0 rows (clean prune-to-zero + parity).",
+      "bi_question": "Coverage (item 7 / F-AUD-5): single-var VALUES over a scalar column (glAccountName) lowers to Iceberg Expression::In \u2192 files_pruned>0. Literals match no value \u2192 0 rows (clean prune-to-zero + parity).",
       "tags": [
         "values",
         "aggregate",
@@ -1624,7 +1624,7 @@
     {
       "id": "q071",
       "file": "queries/q071_asc_topk_order_total_dataset.rq",
-      "bi_question": "Coverage (item 8 / F-AUD-6): ASC ORDER BY … LIMIT over a required scalar column admits scan-side ASC top-k (unique tiebreaker → deterministic, Full-hash).",
+      "bi_question": "Coverage (item 8 / F-AUD-6): ASC ORDER BY \u2026 LIMIT over a required scalar column admits scan-side ASC top-k (unique tiebreaker \u2192 deterministic, Full-hash).",
       "tags": [
         "order_by",
         "bgp_star"
@@ -1645,7 +1645,7 @@
     {
       "id": "q072",
       "file": "queries/q072_timestamp_range_webevent_dataset.rq",
-      "bi_question": "Coverage (item 10 / F-AUD-11): xsd:dateTime range FILTER over EVENT_TS pushes to MANIFEST-level pruning under frame-match (UTC literal ↔ timestamptz column).",
+      "bi_question": "Coverage (item 10 / F-AUD-11): xsd:dateTime range FILTER over EVENT_TS pushes to MANIFEST-level pruning under frame-match (UTC literal \u2194 timestamptz column).",
       "tags": [
         "filter_date",
         "filter_range",
@@ -1668,7 +1668,7 @@
     {
       "id": "q073",
       "file": "queries/q073_optional_budget_order_customer_dataset.rq",
-      "bi_question": "Coverage (item 11 / F-AUD-7): a LIMIT above an OPTIONAL forwards the row budget to the required side (closes probe-04’s 68,828× read amplification). Control: q074.",
+      "bi_question": "Coverage (item 11 / F-AUD-7): a LIMIT above an OPTIONAL forwards the row budget to the required side (closes probe-04\u2019s 68,828\u00d7 read amplification). Control: q074.",
       "tags": [
         "optional",
         "join",
@@ -1693,7 +1693,7 @@
     {
       "id": "q074",
       "file": "queries/q074_limit_budget_control_dataset.rq",
-      "bi_question": "Coverage (item 11 control): the same LIMIT shape WITHOUT the OPTIONAL — the budget already forwards into the scan; the q073-vs-q074 delta is the OPTIONAL cliff item 11 closes.",
+      "bi_question": "Coverage (item 11 control): the same LIMIT shape WITHOUT the OPTIONAL \u2014 the budget already forwards into the scan; the q073-vs-q074 delta is the OPTIONAL cliff item 11 closes.",
       "tags": [
         "bgp_star"
       ],
@@ -1714,7 +1714,7 @@
     {
       "id": "q075",
       "file": "queries/q075_minmax_order_total_dataset.rq",
-      "bi_question": "Coverage (item 9 / F-AUD-8): ungrouped MIN/MAX over a numeric fact column (orderTotal) — folded from the scanned column with byte-parity to agg_min/agg_max, previously a full FACT_ORDER materialize.",
+      "bi_question": "Coverage (item 9 / F-AUD-8): ungrouped MIN/MAX over a numeric fact column (orderTotal) \u2014 folded from the scanned column with byte-parity to agg_min/agg_max, previously a full FACT_ORDER materialize.",
       "tags": [
         "aggregate",
         "bgp_star"
@@ -1732,7 +1732,7 @@
     {
       "id": "q076",
       "file": "queries/q076_minmax_order_total_by_channel_dataset.rq",
-      "bi_question": "Coverage (item 9 / F-AUD-8): GROUPED MIN/MAX over a numeric fact column keyed by a fact-inline column (orderChannel) — one MinMax accumulator per group in the fused single-table fold.",
+      "bi_question": "Coverage (item 9 / F-AUD-8): GROUPED MIN/MAX over a numeric fact column keyed by a fact-inline column (orderChannel) \u2014 one MinMax accumulator per group in the fused single-table fold.",
       "tags": [
         "aggregate",
         "group_by",
@@ -1751,7 +1751,7 @@
     {
       "id": "q077",
       "file": "queries/q077_count_current_enterprise_customers_dataset.rq",
-      "bi_question": "Coverage (item 9b / the q038 class, multi-constraint): COUNT with TWO folded constant-object constraints (isCurrent true AND segment=Enterprise) — the fused fold applies both (oracle 50038 = q022's Enterprise row); dropping either over-counts.",
+      "bi_question": "Coverage (item 9b / the q038 class, multi-constraint): COUNT with TWO folded constant-object constraints (isCurrent true AND segment=Enterprise) \u2014 the fused fold applies both (oracle 50038 = q022's Enterprise row); dropping either over-counts.",
       "tags": [
         "count",
         "aggregate",
@@ -1770,7 +1770,7 @@
     {
       "id": "q078",
       "file": "queries/q078_count_current_enterprise_customers_graph.rq",
-      "bi_question": "Coverage (F1 / F-AUD-8, the q038 class, DIRECT/Graph-path multi-constraint): the graph-source-direct (no FROM) twin of q077 — an ungrouped COUNT with TWO folded constant-object constraints (isCurrent true AND segment=Enterprise). Closes the q038 ungrouped/direct-path fusion gap: combine_constrained_class_scan recombines the rewrite's class+const split so the fused fold applies both (oracle 50038 = q022's Enterprise row); dropping either over-counts.",
+      "bi_question": "Coverage (F1 / F-AUD-8, the q038 class, DIRECT/Graph-path multi-constraint): the graph-source-direct (no FROM) twin of q077 \u2014 an ungrouped COUNT with TWO folded constant-object constraints (isCurrent true AND segment=Enterprise). Closes the q038 ungrouped/direct-path fusion gap: combine_constrained_class_scan recombines the rewrite's class+const split so the fused fold applies both (oracle 50038 = q022's Enterprise row); dropping either over-counts.",
       "tags": [
         "count",
         "aggregate",
@@ -1788,7 +1788,7 @@
     {
       "id": "q079",
       "file": "queries/q079_customer_class_page_crawl.jsonld",
-      "bi_question": "Browse (Cluster A): a View-Instances class page — a variable-subject select-map crawl over edw:Customer, limit 20. Exercises the un-forked crawl node-document formatter end-to-end (FK refs as {\"@id\"} node references, booleans as real bools, typed-json honored). RowsOnly: the LIMIT truncates the unordered 300k-customer set (the FK-ref shape is verified in the live subset).",
+      "bi_question": "Browse (Cluster A): a View-Instances class page \u2014 a variable-subject select-map crawl over edw:Customer, limit 20. Exercises the un-forked crawl node-document formatter end-to-end (FK refs as {\"@id\"} node references, booleans as real bools, typed-json honored). RowsOnly: the LIMIT truncates the unordered 300k-customer set (the FK-ref shape is verified in the live subset).",
       "tags": [
         "browse",
         "wildcard"
@@ -1806,7 +1806,7 @@
     {
       "id": "q080",
       "file": "queries/q080_customer_detail_crawl.jsonld",
-      "bi_question": "Browse (Cluster B, D4): a subject-detail select-map with a constant-IRI root and no where — the deployed 'detail is empty' bug (empty {\"@id\"} stub) at 733cb2c8e. Cluster B routes it onto the bound-subject wildcard scan (pruned to DIM_CUSTOMER) to hydrate the full node document. Single subject = deterministic, hash-gated Full.",
+      "bi_question": "Browse (Cluster B, D4): a subject-detail select-map with a constant-IRI root and no where \u2014 the deployed 'detail is empty' bug (empty {\"@id\"} stub) at 733cb2c8e. Cluster B routes it onto the bound-subject wildcard scan (pruned to DIM_CUSTOMER) to hydrate the full node document. Single subject = deterministic, hash-gated Full.",
       "tags": [
         "browse",
         "wildcard"
@@ -1825,7 +1825,7 @@
     {
       "id": "q081",
       "file": "queries/q081_customer_type_lookup_crawl.jsonld",
-      "bi_question": "Browse (Cluster B, D4): the [\"@type\"] select-map form (shape 7) over a constant-IRI root — returns @id + @type only for the bound subject (was the [{}] stub at 733cb2c8e). Deterministic, hash-gated Full.",
+      "bi_question": "Browse (Cluster B, D4): the [\"@type\"] select-map form (shape 7) over a constant-IRI root \u2014 returns @id + @type only for the bound subject (was the [{}] stub at 733cb2c8e). Deterministic, hash-gated Full.",
       "tags": [
         "browse"
       ],
@@ -1841,7 +1841,7 @@
     {
       "id": "q082",
       "file": "queries/q082_customer_property_list_crawl.jsonld",
-      "bi_question": "Browse (Cluster B, D4): the forward-predicate-list select-map form — projects ONLY the requested predicates (edw:name, edw:segment) for the bound subject, via one bound-subject wildcard scan filtered at assembly (an absent requested predicate is omitted, never dropping the subject). Deterministic, hash-gated Full.",
+      "bi_question": "Browse (Cluster B, D4): the forward-predicate-list select-map form \u2014 projects ONLY the requested predicates (edw:name, edw:segment) for the bound subject, via one bound-subject wildcard scan filtered at assembly (an absent requested predicate is omitted, never dropping the subject). Deterministic, hash-gated Full.",
       "tags": [
         "browse"
       ],
@@ -1857,7 +1857,7 @@
     {
       "id": "q083",
       "file": "queries/q083_customer_by_segment_crawl.jsonld",
-      "bi_question": "Browse (E1, D7): a property-scoped listing crawl — variable subject bound by a PROPERTY (edw:segment), limit 10. DNF'd (>90s) at 733cb2c8e (the LIMIT budget never reached the property-var full-source wildcard scan). E1 reorders the wildcard to the budgeted correlated outer so it terminates. RowsOnly: the LIMIT truncates the unordered set.",
+      "bi_question": "Browse (E1, D7): a property-scoped listing crawl \u2014 variable subject bound by a PROPERTY (edw:segment), limit 10. DNF'd (>90s) at 733cb2c8e (the LIMIT budget never reached the property-var full-source wildcard scan). E1 reorders the wildcard to the budgeted correlated outer so it terminates. RowsOnly: the LIMIT truncates the unordered set.",
       "tags": [
         "browse",
         "wildcard"
@@ -1875,7 +1875,7 @@
     {
       "id": "q084",
       "file": "queries/q084_enterprise_customer_page_crawl.jsonld",
-      "bi_question": "Browse: a FILTERED View-Instances page (shape 4, array-where) — binds ?s to Enterprise-segment customers (const-object folded onto the crawl wildcard as a pruning star_constraint), limit 20. RowsOnly: the LIMIT truncates the unordered 50038-row Enterprise set.",
+      "bi_question": "Browse: a FILTERED View-Instances page (shape 4, array-where) \u2014 binds ?s to Enterprise-segment customers (const-object folded onto the crawl wildcard as a pruning star_constraint), limit 20. RowsOnly: the LIMIT truncates the unordered 50038-row Enterprise set.",
       "tags": [
         "browse",
         "wildcard"
@@ -1893,7 +1893,7 @@
     {
       "id": "q085",
       "file": "queries/q085_customer_inbound_edge_count.rq",
-      "bi_question": "Browse: the Referenced-By count for a KNOWN inbound predicate (shape 9) — a constant-predicate + bound-IRI object COUNT that already runs today (contradicting the handoff's 2a all-inbound-refused claim). Pins the works-today contract: the count of fact rows whose edw:customer references customer/1. Deterministic, hash-gated Full.",
+      "bi_question": "Browse: the Referenced-By count for a KNOWN inbound predicate (shape 9) \u2014 a constant-predicate + bound-IRI object COUNT that already runs today (contradicting the handoff's 2a all-inbound-refused claim). Pins the works-today contract: the count of fact rows whose edw:customer references customer/1. Deterministic, hash-gated Full.",
       "tags": [
         "browse",
         "count"
@@ -1906,6 +1906,50 @@
       ],
       "class": "fact-touching",
       "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q086",
+      "file": "queries/q086_open_tickets_by_segment.rq",
+      "bi_question": "FAMILY-C (deployed DNF Q1): how many open (non-Closed) support tickets per customer segment? fact(SupportTicket)->dim(Customer) join, GROUP BY segment, COUNT, with a fact-side inequality FILTER(?status != \"Closed\"). Before FAMILY-C the join-path filter guard declined and materialized (~10.3s virtual SF0.1; DNF at deployed scale); the widening admits the residual into the fused fold. Deterministic grouped result, Full hash-gated (native oracle == virtual).",
+      "tags": [
+        "filter_string",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_SUPPORT_TICKET",
+        "DIM_CUSTOMER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        10
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q087",
+      "file": "queries/q087_below_reorder_by_category.rq",
+      "bi_question": "FAMILY-C (deployed DNF Q2): how many below-reorder inventory snapshots per product category, with avg on-hand and avg reorder? fact(InventorySnapshot)->dim(Product) join, GROUP BY category, COUNT + two AVG folds, with a fact-side VAR-TO-VAR FILTER(?onHand < ?reorder) (stats-unprunable). Before FAMILY-C the join-path filter guard declined and materialized (~5.0s virtual SF0.1; DNF at deployed cold scale); the widening admits the residual, resolve_agg_folds folds both AVGs. Deterministic grouped result, Full hash-gated.",
+      "tags": [
+        "filter_range",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_INVENTORY_SNAPSHOT",
+        "DIM_PRODUCT"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        60
+      ],
       "order_sensitive": "none",
       "timeout_s": 180,
       "subsets": []

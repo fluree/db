@@ -1408,7 +1408,7 @@ pub(crate) struct TriplePlanContext<'a> {
     var_counts: &'a HashMap<VarId, usize>,
     protected_vars: &'a HashSet<VarId>,
     group_by: &'a [VarId],
-    distinct_query: bool,
+    where_dedup_safe: bool,
     planning: &'a PlanningContext,
     stats: Option<&'a StatsView>,
 }
@@ -1488,7 +1488,7 @@ fn build_sequential_join_block(
             live.into_iter().collect::<Vec<VarId>>()
         });
 
-        let pruned_vars: Option<HashSet<VarId>> = if ctx.distinct_query {
+        let pruned_vars: Option<HashSet<VarId>> = if ctx.where_dedup_safe {
             live_vars.as_ref().map(|live| {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 vars_after
@@ -1527,12 +1527,12 @@ fn build_sequential_join_block(
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
-            operator = if ctx.distinct_query && pruned_vars.as_ref().is_some_and(|s| !s.is_empty())
-            {
-                Some(Box::new(DistinctOperator::new(child)))
-            } else {
-                Some(child)
-            };
+            operator =
+                if ctx.where_dedup_safe && pruned_vars.as_ref().is_some_and(|s| !s.is_empty()) {
+                    Some(Box::new(DistinctOperator::new(child)))
+                } else {
+                    Some(child)
+                };
         }
     }
 
@@ -1579,12 +1579,20 @@ pub fn build_where_operators(
 ///
 /// `needed_vars` are the variables that must survive the WHERE stage (because they
 /// are used by GROUP BY, aggregates, HAVING, ORDER BY, projection, etc.).
+///
+/// `where_dedup_safe` asserts that downstream cannot observe WHERE-output row
+/// multiplicity (a non-grouped `SELECT DISTINCT`, or a grouping phase whose
+/// aggregates are all duplicate-insensitive — the caller owns that analysis;
+/// see `build_operator_tree_inner`). When set, the join chain collapses
+/// duplicate rows with a `DistinctOperator` at every step where projection
+/// trimming dropped a dead variable, preventing duplicate multiplicity from
+/// compounding through deep existential chains.
 pub fn build_where_operators_with_needed(
     patterns: &[Pattern],
     stats: Option<Arc<StatsView>>,
     needed_vars: &HashSet<VarId>,
     group_by: &[VarId],
-    distinct_query: bool,
+    where_dedup_safe: bool,
     required_where_vars: Option<&[VarId]>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
@@ -1594,7 +1602,7 @@ pub fn build_where_operators_with_needed(
         stats,
         needed_vars,
         group_by,
-        distinct_query,
+        where_dedup_safe,
         required_where_vars,
         planning,
     )
@@ -1798,7 +1806,7 @@ pub fn build_where_operators_seeded_with_needed(
     stats: Option<Arc<StatsView>>,
     needed_vars: &HashSet<VarId>,
     group_by: &[VarId],
-    distinct_query: bool,
+    where_dedup_safe: bool,
     required_where_vars: Option<&[VarId]>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
@@ -1949,7 +1957,7 @@ pub fn build_where_operators_seeded_with_needed(
                         var_counts: &var_counts,
                         protected_vars: &protected_vars,
                         group_by,
-                        distinct_query,
+                        where_dedup_safe,
                         planning,
                         stats: stats.as_deref(),
                     };
@@ -2157,7 +2165,7 @@ pub fn build_where_operators_seeded_with_needed(
                         var_counts: &var_counts,
                         protected_vars: &protected_vars,
                         group_by,
-                        distinct_query,
+                        where_dedup_safe,
                         planning,
                         stats: stats.as_deref(),
                     };
@@ -2261,6 +2269,27 @@ pub fn build_where_operators_seeded_with_needed(
                             i += 1;
                             continue;
                         }
+                    }
+
+                    // Value-only edge-annotation probe (a Cypher relationship
+                    // binding): answer the whole batch with three set-wise
+                    // reifies scans + hash lookups instead of per-row chains.
+                    if let Some(builder) = crate::optional::AnnotationValueOptionalBuilder::try_new(
+                        required_schema.clone(),
+                        inner_patterns.clone(),
+                        stats.clone(),
+                        *planning,
+                    ) {
+                        operator = Some(Box::new(
+                            OptionalOperator::with_builder(
+                                child,
+                                required_schema,
+                                Box::new(builder),
+                            )
+                            .with_out_schema(augmented_ref),
+                        ));
+                        i += 1;
+                        continue;
                     }
 
                     // General path: use PlanTreeOptionalBuilder for multi-pattern or
@@ -2741,9 +2770,10 @@ fn build_sequential_triple_chain(
             &hash_planner,
         ));
 
-        // DISTINCT query optimization: if any variables seen so far are no longer live,
-        // collapse duplicates early to avoid downstream join blowups.
-        if ctx.distinct_query {
+        // Early dedup (sound because downstream is multiplicity-insensitive —
+        // see `where_dedup_safe`): if any variables seen so far are no longer
+        // live, collapse duplicates early to avoid downstream join blowups.
+        if ctx.where_dedup_safe {
             if let Some(live) = live_vars.as_ref() {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
                 let dead = seen_vars
@@ -2891,7 +2921,7 @@ mod tests {
             var_counts: &counts,
             protected_vars: &protected,
             group_by: &[],
-            distinct_query: false,
+            where_dedup_safe: false,
             planning: &crate::temporal_mode::PlanningContext::current(),
             stats: None,
         };

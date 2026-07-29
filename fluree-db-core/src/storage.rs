@@ -956,12 +956,21 @@ pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
     ledger_id_to_path_prefix(ledger_id).unwrap_or_else(|_| ledger_id.replace(':', "/"))
 }
 
+/// Leading path segment under which graph-source artifacts (snapshots and
+/// mappings) are stored. Unlike every other content kind, these addresses do
+/// NOT begin with the owning id — they begin with this literal segment and
+/// carry the graph_source_id after it. Shared between the forward direction
+/// ([`content_path`]) and reverse parsers (e.g. the remote-mount proxy
+/// storage) so the two cannot drift.
+pub const GRAPH_SOURCES_PATH_SEGMENT: &str = "graph-sources";
+
 /// Build a storage path for content-addressed data.
 ///
 /// This determines the directory structure for different content types:
 /// - Commits: `{ledger_id}/commit/{hash}.fcv2`
 /// - Index roots: `{ledger_id}/index/roots/{hash}.fir6`
-/// - Graph sources: `graph-sources/{ledger_id}/snapshots/{hash}.gssnap`
+/// - Graph sources: `graph-sources/{graph_source_id}/snapshots/{hash}.gssnap`
+///   (note: keyed by graph_source_id, not a ledger id)
 /// - etc.
 pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
     let prefix = ledger_id_prefix_for_path(ledger_id);
@@ -984,14 +993,14 @@ pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> Strin
         ContentKind::LedgerConfig => format!("{prefix}/config/{hash_hex}.json"),
         ContentKind::StatsSketch => format!("{prefix}/index/stats/{hash_hex}.hll"),
         ContentKind::GraphSourceSnapshot => {
-            format!("graph-sources/{prefix}/snapshots/{hash_hex}.gssnap")
+            format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/snapshots/{hash_hex}.gssnap")
         }
         ContentKind::SpatialIndex => format!("{prefix}/index/spatial/{hash_hex}.bin"),
         ContentKind::HistorySidecar => {
             format!("{prefix}/index/objects/history/{hash_hex}.fhs1")
         }
         ContentKind::GraphSourceMapping => {
-            format!("graph-sources/{prefix}/mapping/{hash_hex}.ttl")
+            format!("{GRAPH_SOURCES_PATH_SEGMENT}/{prefix}/mapping/{hash_hex}.ttl")
         }
         // Forward-compatibility: unknown kinds go to a generic blob directory
         #[allow(unreachable_patterns)]

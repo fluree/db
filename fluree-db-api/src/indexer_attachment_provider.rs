@@ -90,7 +90,25 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
         // a reloaded one (post-index tail only), so we fall back to
         // Augment so the indexer merges with the base arena's
         // events.
-        let result = manager.try_running_attachment_events(ledger_id).await?;
+        let result = match manager.try_running_attachment_events(ledger_id).await {
+            Some(result) => result,
+            None => {
+                // The ledger isn't resident in the manager — the norm for a
+                // write-only ingest flow (committed, never read) when the
+                // background indexer picks it up. Without events this pass
+                // would run with "delta unknown", defensively drop the
+                // arena, and stamp `had_annotation_arena` — permanently
+                // blocking every later seal (the post-index reload has an
+                // empty attachment overlay and `Augment` coverage, and the
+                // sticky bit blocks the bootstrap scan). A *transient*
+                // load (never cached — cache insertion from here disturbs
+                // the running handle's novelty bookkeeping) replays the
+                // un-indexed commits, so a first-ever build sees the
+                // complete event history (`Authoritative` at
+                // snapshot.t == 0).
+                manager.transient_attachment_events(ledger_id).await?
+            }
+        };
 
         // Bulk-import seal path. After `fluree create --import`, the
         // `f:reifies*` flakes live in the **base index**, not in the

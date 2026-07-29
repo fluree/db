@@ -238,10 +238,13 @@ mod inner {
         let blob_bytes = result.bytes.len();
 
         // 5. Store
+        // `.instrument` (not a held `EnteredSpan`) across the await: an entered
+        // span guard is !Send and must never live across a suspension point.
         let write_res = {
-            let _span = tracing::debug_span!("import_store", t = new_t, blob_bytes).entered();
+            use tracing::Instrument as _;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
                 .await?
         };
 
@@ -388,10 +391,13 @@ mod inner {
         let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
         let blob_bytes = result.bytes.len();
 
+        // `.instrument` (not a held `EnteredSpan`) across the await: an entered
+        // span guard is !Send and must never live across a suspension point.
         let write_res = {
-            let _span = tracing::debug_span!("import_store", t = new_t, blob_bytes).entered();
+            use tracing::Instrument as _;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!("import_store", t = new_t, blob_bytes))
                 .await?
         };
 
@@ -671,10 +677,17 @@ mod inner {
         let blob_bytes = result.bytes.len();
 
         // 8. Store
+        // `.instrument` (not a held `EnteredSpan`) across the await — see
+        // `import_commit`'s store step.
         let write_res = {
-            let _span = tracing::debug_span!("import_trig_store", t = new_t, blob_bytes).entered();
+            use tracing::Instrument as _;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .instrument(tracing::debug_span!(
+                    "import_trig_store",
+                    t = new_t,
+                    blob_bytes
+                ))
                 .await?
         };
 
@@ -1120,67 +1133,73 @@ mod inner {
     {
         let new_t = state.t + 1;
 
-        let _span = tracing::debug_span!("finalize_parsed_chunk", t = new_t).entered();
+        // `.instrument` (not a held `EnteredSpan`): the body awaits the blob
+        // store, and an entered span guard is !Send across suspension points.
+        let span = tracing::debug_span!("finalize_parsed_chunk", t = new_t);
+        use tracing::Instrument as _;
+        async move {
+            // Merge published namespaces into serial registry to keep it in sync
+            // (needed for TriG serial paths and the final namespace snapshot).
+            for (code, prefix) in &ns_delta {
+                state.ns_registry.ensure_code(*code, prefix).map_err(|e| {
+                    TransactError::FlakeGeneration(format!("namespace code conflict: {e}"))
+                })?;
+            }
+            // Merge turtle prefix short names into session state
+            state.prefix_map.extend(parsed.prefix_map);
 
-        // Merge published namespaces into serial registry to keep it in sync
-        // (needed for TriG serial paths and the final namespace snapshot).
-        for (code, prefix) in &ns_delta {
-            state.ns_registry.ensure_code(*code, prefix).map_err(|e| {
-                TransactError::FlakeGeneration(format!("namespace code conflict: {e}"))
-            })?;
+            state.cumulative_flakes += parsed.op_count as u64;
+
+            // Persist split mode in genesis commit (first chunk, no previous ref).
+            let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
+
+            let envelope = CodecEnvelope {
+                t: new_t,
+                parents: state.parent.clone().into_iter().collect(),
+                namespace_delta: ns_delta,
+                txn: None,
+                time: Some(state.import_time.clone()),
+
+                txn_signature: None,
+                // Empty for every text-import chunk (unchanged behavior); the
+                // materialize builder sets it on the final commit to carry the twin's
+                // completion stamp. The predicate namespace codes were interned through
+                // this chunk's sink, so they are already in `ns_delta` above.
+                txn_meta: parsed.txn_meta,
+                graph_delta: HashMap::new(),
+                ns_split_mode,
+            };
+
+            let result = parsed.writer.finish(&envelope)?;
+            let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
+            let blob_bytes = result.bytes.len();
+
+            let write_res = storage
+                .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
+                .await?;
+
+            tracing::debug!(
+                t = new_t,
+                flakes = parsed.op_count,
+                blob_bytes,
+                address = %write_res.address,
+                "parsed chunk finalized and stored"
+            );
+
+            state.t = new_t;
+            state.parent = Some(commit_cid.clone());
+
+            Ok(ImportCommitResult {
+                commit_id: commit_cid,
+                t: new_t,
+                flake_count: parsed.op_count,
+                blob_bytes,
+                commit_blob: result.bytes,
+                spool_result: parsed.spool_result,
+            })
         }
-        // Merge turtle prefix short names into session state
-        state.prefix_map.extend(parsed.prefix_map);
-
-        state.cumulative_flakes += parsed.op_count as u64;
-
-        // Persist split mode in genesis commit (first chunk, no previous ref).
-        let ns_split_mode = genesis_split_mode(state, state.ns_registry.split_mode());
-
-        let envelope = CodecEnvelope {
-            t: new_t,
-            parents: state.parent.clone().into_iter().collect(),
-            namespace_delta: ns_delta,
-            txn: None,
-            time: Some(state.import_time.clone()),
-
-            txn_signature: None,
-            // Empty for every text-import chunk (unchanged behavior); the
-            // materialize builder sets it on the final commit to carry the twin's
-            // completion stamp. The predicate namespace codes were interned through
-            // this chunk's sink, so they are already in `ns_delta` above.
-            txn_meta: parsed.txn_meta,
-            graph_delta: HashMap::new(),
-            ns_split_mode,
-        };
-
-        let result = parsed.writer.finish(&envelope)?;
-        let commit_cid = ContentId::new(ContentKind::Commit, &result.bytes);
-        let blob_bytes = result.bytes.len();
-
-        let write_res = storage
-            .content_write_bytes(ContentKind::Commit, ledger_id, &result.bytes)
-            .await?;
-
-        tracing::debug!(
-            t = new_t,
-            flakes = parsed.op_count,
-            blob_bytes,
-            address = %write_res.address,
-            "parsed chunk finalized and stored"
-        );
-
-        state.t = new_t;
-        state.parent = Some(commit_cid.clone());
-
-        Ok(ImportCommitResult {
-            commit_id: commit_cid,
-            t: new_t,
-            flake_count: parsed.op_count,
-            blob_bytes,
-            commit_blob: result.bytes,
-            spool_result: parsed.spool_result,
-        })
+        .instrument(span)
+        .await
     }
 }
 
