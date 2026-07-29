@@ -175,10 +175,14 @@ fn validation_runs_after_base_resolution() {
 /// 3. a relative `@base` or `@prefix` value — resolved against the base in
 ///    force, so what reaches a term is absolute.
 ///
-/// The predicate stays complete anyway. It is a shared vocab-level check, unit
-/// tested there, and M2's strict N-Triples reader is where it earns its keep:
-/// N-Triples has no base at all, and `nt-syntax-bad-uri-06..09` — still
-/// registered under cause E — are exactly relative-IRI tests.
+/// The predicate stays complete anyway, and it is a *shared vocab-level*
+/// check, unit tested there rather than here. Its justification is the strict
+/// N-Triples reader, which M2 built as a SEPARATE reader rather than as a
+/// profile on this parser — so it carries no base machinery at all, and none
+/// of the three guards above exists on that path. A relative IRI reaches its
+/// term check directly, which is what `nt-syntax-bad-uri-06..09` (registered
+/// under cause E) require. The conclusion holds; the mechanism is a different
+/// reader, not this one gaining a mode.
 #[test]
 fn the_not_absolute_check_is_guarded_upstream_in_turtle() {
     // 1. No base.
@@ -363,4 +367,137 @@ fn a_byte_order_mark_anywhere_else_is_still_an_error() {
         matches!(err, TurtleError::Lexer { .. }),
         "expected a lexical error, got {err:?}"
     );
+}
+
+// =============================================================================
+// Directive values (review F5)
+// =============================================================================
+
+/// A directive's own value is validated, not only the terms built from it.
+///
+/// The case that forces this: a document declares a namespace that is not an
+/// IRI and then never uses the prefix. Waiting for an expansion means nothing
+/// is ever checked and `fluree rdf check` answers "valid RDF" — which it is
+/// not. `@base` matters more still, because a bad base is not inert: every
+/// relative reference in the document resolves against it.
+#[test]
+fn a_directive_declaring_a_non_iri_is_rejected_even_if_never_used() {
+    let unused_prefix = "@prefix e: <http://ex/\\u0020> .\n\
+                         <http://ex/s> <http://ex/p> <http://ex/o> .";
+    let err = expect_rejected(unused_prefix, validating());
+    assert!(err.to_string().contains("not allowed in an IRI"), "{err}");
+    assert!(
+        run(unused_prefix, conformant_unvalidated()).is_ok(),
+        "unvalidated keeps today's behavior"
+    );
+
+    let bad_base = "@base <http://ex/\\u0020> .\n\
+                    <http://ex/s> <http://ex/p> <http://ex/o> .";
+    let err = expect_rejected(bad_base, validating());
+    assert!(err.to_string().contains("not allowed in an IRI"), "{err}");
+    assert!(run(bad_base, conformant_unvalidated()).is_ok());
+}
+
+/// The diagnostic blames the directive's own value, not a term downstream of it.
+#[test]
+fn a_bad_directive_is_located_at_the_directive() {
+    let doc = "<http://ex/s> <http://ex/p> \"ok\" .\n@base <http://ex/\\u0020> .";
+    let err = expect_rejected(doc, validating());
+    let index = LineIndex::new(doc);
+    let d = err.to_diagnostic(&index);
+    assert_eq!(d.line, 2, "the directive is on line 2: {d}");
+    assert!(
+        doc[d.byte_span.0 as usize..].starts_with("<http://ex/\\u0020>"),
+        "the offset must land on the directive's IRI token"
+    );
+}
+
+// =============================================================================
+// The diagnostic must survive its own subject matter (review F2)
+// =============================================================================
+
+/// An offending character is by definition one an IRI may not hold, and the two
+/// worst cases damage the report rather than the data: an expanded newline ends
+/// the message's first line — truncating it wherever a caller reads a headline
+/// — and an expanded NUL makes captured stderr binary, at which point `grep`
+/// answers "no match" for text that is right there. This session hit exactly
+/// that trap twice in committed source, so the message escapes.
+#[test]
+fn a_control_character_cannot_damage_the_diagnostic_that_reports_it() {
+    for (escape, rendered) in [("\\u000A", "\\n"), ("\\u0000", "\\0"), ("\\u000D", "\\r")] {
+        let doc = format!("<http://ex/a{escape}b> <http://ex/p> <http://ex/o> .");
+        let err = expect_rejected(&doc, validating());
+        let message = err.to_string();
+
+        assert!(
+            !message.contains('\n') || message.lines().count() == 1,
+            "{escape}: a raw newline truncates the report: {message:?}"
+        );
+        assert!(
+            !message.contains('\u{0}'),
+            "{escape}: a raw NUL makes captured output binary: {message:?}"
+        );
+        assert!(
+            message.contains(rendered),
+            "{escape}: the character should appear escaped as {rendered}: {message}"
+        );
+    }
+}
+
+/// Same guard on the language-tag path, whose lexer is looser than its grammar.
+#[test]
+fn a_language_tag_diagnostic_is_escaped_too() {
+    // `@e` followed by a control character does not lex as one token, so reach
+    // the tag path with something the lexer does accept but the grammar does
+    // not, and assert the message is single-line regardless.
+    let doc = "<http://ex/s> <http://ex/p> \"v\"@1 .";
+    let message = expect_rejected(doc, validating()).to_string();
+    assert!(!message.contains('\u{0}'), "{message:?}");
+    assert_eq!(message.lines().count(), 1, "{message:?}");
+}
+
+// =============================================================================
+// The base-less skip stays sound (review's optional perf item)
+// =============================================================================
+
+/// With no base, a verbatim `<...>` token skips the character scan entirely:
+/// the lexer already scanned that span with `is_iri_char`, and the branch has
+/// established absoluteness, so nothing is left to check.
+///
+/// This is the behavioral guard on that skip. For lexed IRIs with no base,
+/// validating and unvalidated parses must agree on EVERY document — if the skip
+/// were ever unsound, some document would be accepted here and rejected with
+/// the scan restored.
+#[test]
+fn with_no_base_lexed_iris_behave_identically_validated_or_not() {
+    for doc in [
+        "<http://ex/s> <http://ex/p> <http://ex/o> .",
+        "<http://ex/s> <http://ex/p> \"v\"^^<http://ex/d> .",
+        "<urn:uuid:1> <http://ex/p> <mailto:a@b.c> .",
+        // Non-ASCII is legal in an IRI and must not be mistaken for suspect.
+        "<http://ex/\u{e9}> <http://ex/p> <http://ex/\u{4e2d}\u{6587}> .",
+        // U+007F is legal in IRIREF — the boundary the forbidden set stops at.
+        "<http://ex/\u{7f}> <http://ex/p> <http://ex/o> .",
+    ] {
+        let mut validated = GraphCollectorSink::new();
+        let a = parse_with_prefixes_base_options(doc, &mut validated, &[], None, validating());
+        let mut plain = GraphCollectorSink::new();
+        let b =
+            parse_with_prefixes_base_options(doc, &mut plain, &[], None, conformant_unvalidated());
+        assert_eq!(a.is_ok(), b.is_ok(), "disagreed on {doc:?}");
+        assert!(a.is_ok(), "{doc:?} should parse: {a:?}");
+    }
+}
+
+/// And the skip must NOT extend to escaped tokens — that is the whole
+/// `turtle-eval-bad` class, and it has no base either.
+#[test]
+fn with_no_base_escaped_iris_are_still_checked() {
+    for escape in ["\\u0020", "\\u003C", "\\u003E"] {
+        let doc = format!("<http://ex/a{escape}b> <http://ex/p> <http://ex/o> .");
+        let mut sink = GraphCollectorSink::new();
+        let err = parse_with_prefixes_base_options(&doc, &mut sink, &[], None, validating())
+            .expect_err("an escaped forbidden character must be caught with no base");
+        assert!(err.to_string().contains("not allowed in an IRI"), "{err}");
+    }
 }

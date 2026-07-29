@@ -22,6 +22,22 @@ const RDF_REST: &str = rdf::REST;
 const RDF_NIL: &str = rdf::NIL;
 
 /// Turtle parser state.
+/// Where an IRI token's text came from, which decides what still needs
+/// checking after it.
+///
+/// The distinction is not cosmetic: it is the difference between a string the
+/// lexer has already scanned character by character and one it assembled from
+/// escapes and never looked at again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IriSource {
+    /// A verbatim `<...>` span. Every character satisfied `is_iri_char`, so
+    /// none of them is in the IRIREF exclusion set.
+    Lexed,
+    /// Text produced by expanding `\uXXXX` escapes. What the escapes denote
+    /// was never scanned, and is where a non-IRI hides.
+    Escaped,
+}
+
 pub struct Parser<'a, 'input, S> {
     /// Source input for span extraction.
     input: &'input str,
@@ -395,16 +411,35 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         }
         match fluree_vocab::iri::iri_violation(iri) {
             None => Ok(()),
+            // `escape_debug`, not the raw IRI. The offending character is by
+            // definition one an IRI may not hold, and the two worst are the
+            // ones that damage the report itself: an expanded newline ends
+            // the diagnostic's first line, truncating it wherever a caller
+            // reads a headline, and an expanded NUL makes captured stderr
+            // binary — at which point `grep` answers "no match" for text
+            // that is right there. This session has already been bitten by
+            // exactly that, twice, in committed source.
             Some(violation) => Err(TurtleError::parse(
                 position as usize,
-                format!("{violation} (<{iri}>)"),
+                format!("{violation} (<{}>)", iri.escape_debug()),
             )),
         }
     }
 
     /// Check that a language tag is well-formed, when validation is on.
     ///
-    /// Deliberately here and not in the lexer: `@BASE` must keep lexing as a
+    /// KNOWN LIMITATION, deliberately not fixed: `"x"@base` and `"x"@prefix`
+    /// are well-formed `LANGTAG`s that this parser rejects. The lexer decides
+    /// `@base`/`@prefix` are directive keywords before anything knows a string
+    /// literal precedes them, so those two tags never reach here as tags at
+    /// all. No W3C test covers either — `base` and `prefix` are not registered
+    /// language subtags, so no conformance suite asks for them — and fixing it
+    /// means giving the lexer the parser's context, which is a real
+    /// restructuring for a case no document has. Recorded rather than
+    /// silently carried.
+    ///
+    /// Language-tag validation is otherwise here and not in the lexer for a
+    /// related reason: `@BASE` must keep lexing as a
     /// LangTag token so the parser can reject it in *directive* position
     /// (Turtle's `@`-directives are case-sensitive). A lexer-level check
     /// would turn that into a lexical error and change what the parser sees.
@@ -415,21 +450,42 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         }
         match fluree_vocab::lang::language_tag_violation(tag) {
             None => Ok(()),
+            // Escaped for the same reason as `check_iri`'s: the lexer accepts
+            // more in a `LangTag` token than the grammar allows, so whatever
+            // reaches here is by construction something unusual.
             Some(violation) => Err(TurtleError::parse(
                 position as usize,
-                format!("{violation} (@{tag})"),
+                format!("{violation} (@{})", tag.escape_debug()),
             )),
         }
     }
 
     /// Resolve an IRI string and look up / register as a term.
     #[inline]
-    fn resolve_iri_term(&mut self, iri: &str, position: u32) -> Result<TermId> {
+    fn resolve_iri_term(&mut self, iri: &str, position: u32, source: IriSource) -> Result<TermId> {
         if self.base.is_none() && is_absolute_iri(iri) {
-            self.check_iri(iri, position)?;
+            // Nothing was resolved, so this is the token's own text. What is
+            // left to check depends entirely on where that text came from.
+            match source {
+                // Nothing. The lexer scanned this span with `is_iri_char`,
+                // which is the exact complement of the forbidden set — pinned
+                // at every codepoint by `fluree-graph-format`'s
+                // `iriref_set_differential`, which is what licenses this skip
+                // and what will fail if the two ever drift. And the branch
+                // condition just established absoluteness. So for the
+                // commonest term in any document, a validating parse costs
+                // what an unvalidated one costs.
+                IriSource::Lexed => {}
+                // Expanded from `\uXXXX`, and the expansion is exactly what no
+                // scan has ever seen — `turtle-eval-bad-01/02/03`.
+                IriSource::Escaped => self.check_iri(iri, position)?,
+            }
             Ok(self.sink_term_iri(iri))
         } else {
             let resolved = self.resolve_iri(iri)?;
+            // Resolution composed a new string out of the reference and the
+            // base. Neither the lexer's scan nor the branch above says
+            // anything about the result, whatever the source was.
             self.check_iri(&resolved, position)?;
             Ok(self.sink_term_iri(&resolved))
         }
@@ -463,9 +519,21 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         };
         // The expanded name is where a bad prefix NAMESPACE surfaces: the
         // `@prefix` directive itself declares a string, and only concatenating
-        // it with a local name produces the IRI a term claims to be. Checked
-        // on the cache-miss path only, which is sound because the same span
-        // text expands to the same IRI — see the cache's own key contract.
+        // it with a local name produces the IRI a term claims to be.
+        //
+        // Checked on the cache-miss path only. That is sound ONLY ONCE a
+        // prefix rebinding clears this cache — which it does not do on this
+        // branch. `prefixed_term_cache` is keyed by span text, and nothing
+        // here invalidates it when `@prefix e:` is redeclared, so today a
+        // second `e:x` returns the first one's term and never reaches this
+        // check. The dependency, not a soundness claim: the fix is
+        // `fix/turtle-prefix-redefinition` (main-targeted), and validation is
+        // correct on the cache-miss path either way — what the rebinding bug
+        // costs is that the miss never happens.
+        //
+        // The test that pins the two together — a rebinding to a namespace
+        // that makes the expansion a non-IRI — belongs at wave-3 integration,
+        // where both branches meet. Neither branch alone can host it.
         self.check_iri(&iri, start)?;
         let id = self.sink_term_iri(&iri);
         // Cache with span text as key — avoids allocation on cache hits
@@ -767,6 +835,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.advance()?;
 
         // Get namespace IRI
+        let namespace_start = self.current().start;
         let namespace = match self.current().kind.clone() {
             TokenKind::Iri => {
                 let s = self.current().start;
@@ -783,6 +852,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
         };
         self.advance()?;
+
+        // Validate the DIRECTIVE's own value, not only the names built from
+        // it. Waiting for an expansion means a document that declares a
+        // non-IRI namespace and then never uses the prefix passes `check`
+        // clean — and `check`'s answer is "this document is valid RDF", which
+        // it is not. A namespace is also not merely a string: it is the
+        // scheme-and-authority half of every term the prefix will ever make.
+        self.check_iri(&namespace, namespace_start)?;
 
         // Register prefix
         self.sink_on_prefix(&prefix, &namespace);
@@ -889,6 +966,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.advance()?; // consume @base or BASE
 
         // Get base IRI
+        let base_start = self.current().start;
         let base_iri = match self.current().kind.clone() {
             TokenKind::Iri => {
                 let s = self.current().start;
@@ -923,6 +1001,13 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         // as specified for an input that cannot occur once the base is
         // guaranteed absolute — which is what this line guarantees.
         let base_iri = self.resolve_iri(&base_iri)?;
+
+        // Same reason as the prefix namespace: `check` must not bless a
+        // document that declares a base which is not an IRI. This one matters
+        // more, because a bad base does not sit inertly — every relative
+        // reference in the rest of the document resolves against it, so one
+        // unchecked directive silently poisons every term downstream of it.
+        self.check_iri(&base_iri, base_start)?;
 
         // Set base
         self.sink_on_base(&base_iri);
@@ -982,14 +1067,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri, s)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
                 // Captured BEFORE `advance`: with one token of lookahead,
                 // afterwards `current()` is the NEXT statement's token.
                 let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri, s)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1063,14 +1148,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri, s)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
                 // Captured BEFORE `advance`: with one token of lookahead,
                 // afterwards `current()` is the NEXT statement's token.
                 let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri, s)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1157,14 +1242,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri, s)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
                 // Captured BEFORE `advance`: with one token of lookahead,
                 // afterwards `current()` is the NEXT statement's token.
                 let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri, s)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1600,14 +1685,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri, s)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
                 // Captured BEFORE `advance`: with one token of lookahead,
                 // afterwards `current()` is the NEXT statement's token.
                 let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri, s)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
@@ -1668,14 +1753,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 let e = self.current().end;
                 let iri = self.iri_content(s, e);
                 self.advance()?;
-                self.resolve_iri_term(iri, s)
+                self.resolve_iri_term(iri, s, IriSource::Lexed)
             }
             TokenKind::IriEscaped(iri) => {
                 // Captured BEFORE `advance`: with one token of lookahead,
                 // afterwards `current()` is the NEXT statement's token.
                 let s = self.current().start;
                 self.advance()?;
-                self.resolve_iri_term(&iri, s)
+                self.resolve_iri_term(&iri, s, IriSource::Escaped)
             }
             TokenKind::PrefixedName | TokenKind::PrefixedNameNs => {
                 let s = self.current().start;
