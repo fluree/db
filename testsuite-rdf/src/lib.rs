@@ -62,6 +62,10 @@ pub struct SuiteRun {
     pub entries: Vec<TestEntry>,
     /// Human-readable failure descriptions, in discovery order.
     pub failures: Vec<String>,
+    /// Problems with the register itself (entries naming no discovered test).
+    /// Kept out of `failures` so the report's count identity holds — see the
+    /// note in `run_suite`.
+    pub register_errors: Vec<String>,
 }
 
 /// Descriptor for one gated or informational suite.
@@ -78,6 +82,18 @@ pub struct Suite {
     /// Naming the RDF 1.2-only sub-manifests keeps each number about one
     /// spec.
     pub manifests: &'static [&'static str],
+    /// Exactly how many tests this suite must discover.
+    ///
+    /// A pass RATE cannot notice a shrinking denominator: drop half the
+    /// manifest and the survivors still score 100%. The zero-test guard only
+    /// catches total loss, and the realistic failure is PARTIAL — a spine
+    /// walk that stops early, a manifest restructure, a half-initialized
+    /// submodule. So the count is pinned exactly.
+    ///
+    /// It doubles as the submodule-drift tripwire. When rdf-tests legitimately
+    /// updates, this assert is what fails, and its message says to re-count
+    /// and update the number in the same commit that moves the submodule.
+    pub expected_total: usize,
 }
 
 /// RDF 1.1 Turtle.
@@ -85,6 +101,7 @@ pub const RDF11_TURTLE: Suite = Suite {
     format: "turtle",
     spec: "rdf11",
     manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl"],
+    expected_total: 313,
 };
 
 /// RDF 1.1 N-Triples.
@@ -92,6 +109,7 @@ pub const RDF11_NTRIPLES: Suite = Suite {
     format: "ntriples",
     spec: "rdf11",
     manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-n-triples/manifest.ttl"],
+    expected_total: 70,
 };
 
 /// RDF 1.2 Turtle — informational (asserting subset only), RDF 1.2 tests only.
@@ -102,6 +120,7 @@ pub const RDF12_TURTLE: Suite = Suite {
         "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval/manifest.ttl",
         "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax/manifest.ttl",
     ],
+    expected_total: 96,
 };
 
 /// RDF 1.2 N-Triples — informational (asserting subset only), RDF 1.2 tests
@@ -117,6 +136,7 @@ pub const RDF12_NTRIPLES: Suite = Suite {
         "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/c14n/manifest.ttl",
         "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-n-triples/syntax/manifest.ttl",
     ],
+    expected_total: 70,
 };
 
 /// Whether a (suite, mode) pair gates CI. See the module docs.
@@ -133,6 +153,11 @@ pub fn run_suite(suite: &Suite, mode: ParseMode, register: &[&str]) -> Result<Su
 
     let mut entries = Vec::new();
     let mut failures = Vec::new();
+    // Register-integrity problems are NOT test outcomes: nothing ran, so
+    // folding them into `failed` would break the report's
+    // total = passed + failed + ignored identity precisely when a run is
+    // already failing. They are tracked apart and surfaced apart.
+    let mut register_errors: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let (mut passed, mut ignored, mut total) = (0usize, 0usize, 0usize);
 
@@ -187,11 +212,28 @@ pub fn run_suite(suite: &Suite, mode: ParseMode, register: &[&str]) -> Result<Su
         );
     }
 
+    // The partial-loss guard. See `Suite::expected_total`.
+    if total != suite.expected_total {
+        bail!(
+            "{} {} discovered {total} tests, expected exactly {}.\n\
+             If the rdf-tests submodule was updated on purpose, re-count the \
+             suite and update `expected_total` for {} {} in the SAME commit \
+             that moves the submodule. Otherwise coverage was silently lost \
+             (partial manifest walk, half-initialized submodule): {}",
+            suite.spec,
+            suite.format,
+            suite.expected_total,
+            suite.spec,
+            suite.format,
+            suite.manifests.join(", ")
+        );
+    }
+
     // A register entry matching no discovered test (typo, upstream rename,
     // withdrawn test) would otherwise live forever, overstating the register.
     for entry in register {
         if !seen.contains(*entry) {
-            failures.push(format!(
+            register_errors.push(format!(
                 "register entry matches no test discovered in this suite — \
                  remove or correct it: {entry}"
             ));
@@ -215,6 +257,7 @@ pub fn run_suite(suite: &Suite, mode: ParseMode, register: &[&str]) -> Result<Su
         summary,
         entries,
         failures,
+        register_errors,
     })
 }
 
@@ -238,18 +281,38 @@ pub fn check_testsuite(suite: &Suite, mode: ParseMode, register: &[&str]) -> Res
         s.spec, s.format, s.mode, s.total, s.passed, s.ignored, s.failed, s.pass_rate
     );
 
+    debug_assert_eq!(
+        s.total,
+        s.passed + s.failed + s.ignored,
+        "report counts must satisfy total = passed + failed + ignored"
+    );
+
     if let Ok(path) = std::env::var("W3C_RDF_REPORT_JSON") {
         report::write_json_report(&path, s, &run.entries)?;
     }
 
-    if !run.failures.is_empty() {
+    if !run.failures.is_empty() || !run.register_errors.is_empty() {
+        let mut sections = Vec::new();
+        if !run.failures.is_empty() {
+            sections.push(format!(
+                "{} failing test(s):\n\n{}",
+                run.failures.len(),
+                run.failures.join("\n\n")
+            ));
+        }
+        if !run.register_errors.is_empty() {
+            sections.push(format!(
+                "{} register problem(s) (not test failures — nothing ran):\n\n{}",
+                run.register_errors.len(),
+                run.register_errors.join("\n\n")
+            ));
+        }
         bail!(
-            "{} failing test(s) in {} {} [{}]:\n\n{}",
-            run.failures.len(),
+            "{} {} [{}]:\n\n{}",
             s.spec,
             s.format,
             s.mode,
-            run.failures.join("\n\n")
+            sections.join("\n\n")
         );
     }
 
@@ -333,10 +396,53 @@ mod tests {
             format: "turtle",
             spec: "rdf11",
             manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/IRI_subject.ttl"],
+            expected_total: 313,
         };
         let err = run_suite(&empty, ParseMode::Conformant, &[])
             .expect_err("a manifest with no entries must not report green");
         assert!(format!("{err:#}").contains("ZERO tests"));
+    }
+
+    /// A suite that discovers the wrong NUMBER of tests must fail, even when
+    /// every test it did discover passed. A pass rate cannot see its own
+    /// denominator shrink.
+    #[test]
+    fn a_partial_manifest_walk_fails_even_when_everything_passes() {
+        let short = Suite {
+            expected_total: RDF11_TURTLE.expected_total + 1,
+            ..RDF11_TURTLE
+        };
+        let err = run_suite(&short, ParseMode::Conformant, &[])
+            .expect_err("a wrong discovery count must fail the suite");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("discovered 313 tests, expected exactly 314"));
+        // The message has to say what to do when the submodule moved legitimately.
+        assert!(msg.contains("SAME commit"));
+    }
+
+    /// A dangling register entry is a register problem, not a test failure:
+    /// it must be reported, but it must not be counted in `failed`, or the
+    /// report's total = passed + failed + ignored identity breaks exactly
+    /// when a run is already failing.
+    #[test]
+    fn a_dangling_register_entry_does_not_inflate_the_failure_count() {
+        let bogus =
+            ["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#no_such_test"];
+        let run = run_suite(&RDF11_TURTLE, ParseMode::Conformant, &bogus).unwrap();
+
+        assert_eq!(run.register_errors.len(), 1);
+        assert!(run.register_errors[0].contains("matches no test discovered"));
+        assert!(
+            !run.failures.iter().any(|f| f.contains("no_such_test")),
+            "register problems must stay out of the failure list"
+        );
+
+        let s = &run.summary;
+        assert_eq!(
+            s.total,
+            s.passed + s.failed + s.ignored,
+            "count identity must hold even with a dangling register entry"
+        );
     }
 
     /// Only RDF 1.1 in conformant mode may be quoted as conformance.
