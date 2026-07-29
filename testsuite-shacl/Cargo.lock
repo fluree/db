@@ -1162,6 +1162,7 @@ dependencies = [
 name = "fluree-graph-turtle"
 version = "4.1.4"
 dependencies = [
+ "fluree-graph-format",
  "fluree-graph-ir",
  "fluree-vocab",
  "rustc-hash",
