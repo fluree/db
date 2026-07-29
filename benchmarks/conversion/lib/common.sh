@@ -12,6 +12,18 @@
 # shellcheck disable=SC2034
 set -euo pipefail
 
+# Every measurement in this harness depends on EPOCHREALTIME's decimal
+# separator being '.', because the microsecond value is obtained by STRIPPING
+# that separator. Under a comma-decimal locale (de_DE, fr_FR, most of Europe)
+# the strip is a no-op, awk then parses "1785358343,127180" as 1785358343, and
+# every cell reports 0.000000 seconds with status ok. Verified: a 300ms sleep
+# measures as "0,000000 s" under LC_ALL=de_DE.UTF-8.
+#
+# C locale also makes `sort` and `diff` byte-ordered, which the cross-tool
+# comparison wants anyway.
+export LC_ALL=C
+export LC_NUMERIC=C
+
 BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$BENCH_ROOT/../.." && pwd)"
 TOOLS_DIR="$BENCH_ROOT/.tools"
@@ -46,6 +58,19 @@ require_bash() {
   macOS ships bash 3.2 as /bin/bash; install a current one (brew install bash)
   and run the harness under it."
 	fi
+}
+
+# Defence in depth for the locale fix above: assert the property the clock
+# arithmetic actually relies on, rather than trusting that the export upstream
+# is still there.
+require_dot_decimal_clock() {
+	case "${EPOCHREALTIME:-}" in
+	*.*) return 0 ;;
+	"") die "EPOCHREALTIME is empty — bash 5 is required for the measurement clock." ;;
+	*) die "EPOCHREALTIME uses a non-'.' decimal separator (${EPOCHREALTIME}).
+  The microsecond value is derived by stripping that separator, so every timing
+  would silently read 0.000000s. Run under LC_ALL=C." ;;
+	esac
 }
 
 require_cmd() {
@@ -195,6 +220,33 @@ tool_arch_class() {
 _arch_class_of_file() {
 	local bin="$1" archs host
 	host="$(host_arch)"
+
+	# Linux (including the publication locus) has no lipo. Without this branch
+	# every real binary there falls through to `unknown`, which the renderer
+	# treats as not-confirmed-native — a permanent disqualification banner on
+	# the one host the arch check exists to bless.
+	if ! command -v lipo >/dev/null 2>&1; then
+		local elf
+		elf="$(file -b "$bin" 2>/dev/null || true)"
+		case "$elf" in
+		*ELF*x86-64* | *ELF*x86_64*)
+			if [ "$host" = "x86_64" ]; then printf 'native-x86_64'; else printf 'foreign-x86_64'; fi
+			;;
+		*ELF*aarch64*)
+			if [ "$host" = "aarch64" ] || [ "$host" = "arm64" ]; then
+				printf 'native-arm64'
+			else
+				printf 'foreign-arm64'
+			fi
+			;;
+		*script*) : ;; # fall through to the script handling below
+		*)
+			printf 'unknown'
+			return
+			;;
+		esac
+		case "$elf" in *ELF*) return ;; esac
+	fi
 
 	if archs="$(lipo -archs "$bin" 2>/dev/null)"; then
 		local count

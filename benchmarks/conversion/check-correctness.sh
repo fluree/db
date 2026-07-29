@@ -56,7 +56,21 @@ for cell in "$RUN_DIR"/*.json; do
 		failures=$((failures + 1))
 		continue
 	fi
-	got="$(jq -r '.out_statements' "$cell")"
+	# Recount the output FILE rather than trusting the runner's own bookkeeping:
+	# validate bytes, not a number the producer wrote about itself.
+	out_file="$RUN_DIR/$name.out.nt"
+	if [ ! -f "$out_file" ]; then
+		printf '  %-30s output file MISSING\n' "$name" >&2
+		failures=$((failures + 1))
+		continue
+	fi
+	got="$(grep -cve '^[[:space:]]*$' -e '^[[:space:]]*#' "$out_file" || true)"
+	claimed="$(jq -r '.out_statements' "$cell")"
+	if [ "$got" != "$claimed" ]; then
+		printf '  %-30s BOOKKEEPING MISMATCH: record says %s, file has %s\n' \
+			"$name" "$claimed" "$got" >&2
+		failures=$((failures + 1))
+	fi
 	want="$(jq -r '.expected_statements // "null"' "$cell")"
 	if [ "$want" = "null" ]; then
 		printf '  %-30s %s statements (no ground truth for this corpus)\n' "$name" "$got" >&2
@@ -95,7 +109,17 @@ for out in "${outputs[@]}"; do
 	norm="$normalized_dir/$base.norm.nt"
 	# The normalizer reports on stderr how many blank-node statements it left
 	# out of the level-1 comparison; level 2 owns those.
-	exempt_of["$base"]="$("$HARNESS" normalize "$out" 2>"$normalized_dir/$base.exempt" >"$norm"; cat "$normalized_dir/$base.exempt")"
+	# An unreadable or malformed cell is an I/O failure, not a content
+	# disagreement. Swallowing normalize's status here would have produced an
+	# empty normalized file and reported it downstream as a DIFFER — a wrong
+	# diagnosis of a real problem.
+	if ! "$HARNESS" normalize "$out" 2>"$normalized_dir/$base.exempt" >"$norm"; then
+		printf '  %-30s normalize FAILED: %s\n' "$base" \
+			"$(head -1 "$normalized_dir/$base.exempt")" >&2
+		failures=$((failures + 1))
+		continue
+	fi
+	exempt_of["$base"]="$(cat "$normalized_dir/$base.exempt")"
 	by_syntax["$syntax"]="${by_syntax[$syntax]:-} $norm"
 done
 

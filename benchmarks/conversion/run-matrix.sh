@@ -23,6 +23,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
 require_bash 5 "EPOCHREALTIME (the measurement clock) is a bash 5 builtin"
+require_dot_decimal_clock
 require_cmd jq
 ensure_dirs
 

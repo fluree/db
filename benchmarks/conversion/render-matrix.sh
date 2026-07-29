@@ -10,6 +10,8 @@ set -euo pipefail
 # shellcheck source=lib/common.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
+require_bash 5
+
 require_cmd jq
 
 RUN_DIR="${1:-}"
