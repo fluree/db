@@ -1564,6 +1564,287 @@ GRAPH <http://example.org/graphs/g2> {
 }
 
 // ============================================================================
+// Turtle blank-node label scoping across CHUNK boundaries
+//
+// Same contract as the TriG test above, applied to the chunked bulk-import
+// path: bulk import cuts one Turtle document into many chunks (one commit
+// each), so a labeled blank node must still resolve to ONE subject across all
+// of them, and must stay distinct between input files.
+// ============================================================================
+
+/// Build a Turtle document large enough to be split across import chunks, with
+/// `_:shared` referenced in the FIRST statement and again in the LAST.
+///
+/// `marker` distinguishes documents; the filler is sized so a 1 MB chunk cannot
+/// hold the whole file.
+fn multi_chunk_ttl(marker: &str, filler_triples: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(filler_triples * 128 + 256);
+    s.push_str("@prefix ex: <http://example.org/> .\n");
+    s.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    let _ = writeln!(s, "_:shared schema:name \"{marker}\" .");
+    for i in 0..filler_triples {
+        let _ = writeln!(
+            s,
+            "ex:{marker}-filler{i} schema:description \"padding that pushes the two _:shared statements into different import chunks\" ."
+        );
+    }
+    let _ = writeln!(s, "_:shared schema:jobTitle \"{marker}\" .");
+    s
+}
+
+/// Like [`multi_chunk_ttl`], but the first and last statements each contain an
+/// ANONYMOUS blank node (`[ … ]`) rather than a labeled one.
+///
+/// Both land at the same ordinal within their respective chunks (the filler
+/// mints none), which is exactly the case where a per-chunk mint counter under
+/// a document-shared skolem base collides.
+fn multi_chunk_anon_ttl(filler_triples: usize) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(filler_triples * 128 + 256);
+    s.push_str("@prefix ex: <http://example.org/> .\n");
+    s.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    s.push_str("ex:doc ex:first [ schema:name \"anon-first\" ] .\n");
+    for i in 0..filler_triples {
+        let _ = writeln!(
+            s,
+            "ex:anon-filler{i} schema:description \"padding that pushes the two anonymous nodes into different import chunks\" ."
+        );
+    }
+    s.push_str("ex:doc ex:last [ schema:name \"anon-last\" ] .\n");
+    s
+}
+
+/// Resolve the single subject carrying `predicate` = `marker`.
+async fn sole_subject_for(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    predicate: &str,
+    marker: &str,
+) -> String {
+    let qr = support::query_jsonld(
+        fluree,
+        ledger,
+        &json!({"select": ["?s"], "where": {"@id": "?s", predicate: marker}}),
+    )
+    .await
+    .expect("subject query");
+    let rows = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let subjects: Vec<String> = rows
+        .as_array()
+        .expect("array result")
+        .iter()
+        .filter_map(|r| match r {
+            serde_json::Value::Array(cols) => cols[0].as_str(),
+            other => other.as_str(),
+        })
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        subjects.len(),
+        1,
+        "expected exactly one subject for {predicate} = {marker}: {rows}"
+    );
+    let subject = subjects.into_iter().next().unwrap();
+    assert!(
+        subject.starts_with("_:fdb-"),
+        "expected a skolemized blank node, got {subject}"
+    );
+    subject
+}
+
+// Regression: `parse_chunk` used to derive the skolemization key from the
+// per-chunk commit `t`, so `_:shared` in chunk 0 and `_:shared` in chunk 1 of
+// ONE file became two different subjects — the chunked-Turtle sibling of the
+// TriG bug fixed in #1432. Runs with 2 parse threads: the two occurrences are
+// skolemized on different workers with no shared state between them.
+#[tokio::test]
+async fn import_ttl_blank_label_scoped_across_chunks() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    // ~1.5 MB against a 1 MB chunk size — at least two chunks.
+    let ttl = multi_chunk_ttl("solo", 12_000);
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "big.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-bnode-chunks:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import should succeed");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+
+    let ledger = fluree
+        .ledger("test/ttl-bnode-chunks:main")
+        .await
+        .expect("load ledger");
+
+    let first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "solo").await;
+    let last = sole_subject_for(&fluree, &ledger, "http://schema.org/jobTitle", "solo").await;
+    assert_eq!(
+        first, last,
+        "a labeled blank node is scoped to its document, not to the chunk it lands in"
+    );
+}
+
+// The counterpart constraint, and the one a document-scoped skolem base can
+// easily break: ANONYMOUS nodes carry no label to unify on, so two of them must
+// stay distinct even when they sit at the same ordinal in different chunks of
+// one document. The mint counter is per-sink (per chunk), so it only separates
+// them if the minted label also carries something chunk-unique.
+#[tokio::test]
+async fn import_ttl_anonymous_nodes_distinct_across_chunks() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = multi_chunk_anon_ttl(12_000);
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "anon.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-anon-chunks:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import should succeed");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+
+    let ledger = fluree
+        .ledger("test/ttl-anon-chunks:main")
+        .await
+        .expect("load ledger");
+
+    let first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "anon-first").await;
+    let last = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "anon-last").await;
+    assert_ne!(
+        first, last,
+        "two anonymous nodes are two nodes, however the chunker happens to cut the file"
+    );
+}
+
+// The other half of the contract: chunk boundaries must not merge labels
+// ACROSS files. Two multi-chunk files in one directory take the local-rechunk
+// arm, so each is sub-split *and* interleaved with the other in the same
+// import session.
+#[tokio::test]
+async fn import_ttl_blank_labels_distinct_across_files() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    write_ttl(data_dir.path(), "a.ttl", &multi_chunk_ttl("alpha", 12_000));
+    write_ttl(data_dir.path(), "b.ttl", &multi_chunk_ttl("beta", 12_000));
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let result = fluree
+        .create("test/ttl-bnode-files:main")
+        .import(data_dir.path())
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory import should succeed");
+    assert!(
+        result.t > 2,
+        "test is vacuous unless both files were split: {} chunk(s)",
+        result.t
+    );
+
+    let ledger = fluree
+        .ledger("test/ttl-bnode-files:main")
+        .await
+        .expect("load ledger");
+
+    let alpha_first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "alpha").await;
+    let alpha_last =
+        sole_subject_for(&fluree, &ledger, "http://schema.org/jobTitle", "alpha").await;
+    let beta_first = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "beta").await;
+    let beta_last = sole_subject_for(&fluree, &ledger, "http://schema.org/jobTitle", "beta").await;
+
+    assert_eq!(
+        alpha_first, alpha_last,
+        "a.ttl's label spans its own chunks"
+    );
+    assert_eq!(beta_first, beta_last, "b.ttl's label spans its own chunks");
+    assert_ne!(
+        alpha_first, beta_first,
+        "the same label in two files denotes two different nodes"
+    );
+}
+
+// Small files never reach the splitter, but they can be *coalesced* into one
+// chunk — which would merge their labels just as wrongly. `coalesce_unsafe`
+// refuses to coalesce any file containing `_:`; this pins that guarantee.
+#[tokio::test]
+async fn import_ttl_blank_labels_distinct_across_small_files() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let doc = |marker: &str| {
+        format!("@prefix schema: <http://schema.org/> .\n\n_:shared schema:name \"{marker}\" .\n")
+    };
+    write_ttl(data_dir.path(), "a.ttl", &doc("small-a"));
+    write_ttl(data_dir.path(), "b.ttl", &doc("small-b"));
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/ttl-bnode-small:main")
+        .import(data_dir.path())
+        .threads(1)
+        // Coalescing only engages above this threshold, and the default (64)
+        // would leave two files well under it — the test would pass without
+        // ever reaching the code path it exists to cover.
+        .coalesce_small_files_threshold(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("directory import should succeed");
+
+    let ledger = fluree
+        .ledger("test/ttl-bnode-small:main")
+        .await
+        .expect("load ledger");
+
+    let a = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "small-a").await;
+    let b = sole_subject_for(&fluree, &ledger, "http://schema.org/name", "small-b").await;
+    assert_ne!(a, b, "each file is its own document");
+}
+
+// ============================================================================
 // N-Quads (.nq) import
 //
 // N-Quads is converted to TriG and dispatched through the named-graph-aware
@@ -2072,20 +2353,35 @@ async fn import_directory_blank_nodes_not_coalesced() {
         &ledger,
         &json!({
             "@context": {"schema": "http://schema.org/"},
-            "select": ["?name"],
-            "where": {"schema:name": "?name"}
+            "select": ["?s", "?name"],
+            "where": {"@id": "?s", "schema:name": "?name"}
         }),
     )
     .await
     .expect("query names");
-    let names = extract_sorted_strings(&qr.to_jsonld(&ledger.snapshot).unwrap());
+    let rows = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let rows = rows.as_array().expect("array result");
+
+    // Distinct SUBJECTS is the assertion that actually pins `coalesce_unsafe`.
+    // Counting names does not: if two files' `_:b1` merged, the merged subject
+    // would simply carry both names and the name count would be unchanged.
+    let subjects: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[0].as_str()))
+        .collect();
     assert_eq!(
-        names.len(),
+        subjects.len(),
         N,
         "every file's blank node must stay distinct (no cross-file merge)"
     );
-    assert!(names.contains(&"blank-0".to_string()));
-    assert!(names.contains(&"blank-79".to_string()));
+
+    let names: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .filter_map(|r| r.as_array().and_then(|row| row[1].as_str()))
+        .collect();
+    assert_eq!(names.len(), N, "no name may be lost");
+    assert!(names.contains("blank-0"));
+    assert!(names.contains("blank-79"));
 }
 
 /// `coalesce_small_files_threshold(0)` disables coalescing: every small file

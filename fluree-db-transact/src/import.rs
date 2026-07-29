@@ -141,7 +141,10 @@ mod inner {
         S: ContentAddressedWrite,
     {
         let new_t = state.t + 1;
-        let txn_id = format!("{ledger_id}-{new_t}");
+        // One serial commit == one whole document, so the commit ordinal is
+        // a valid document scope here. See `skolem_base` for why the chunked
+        // parallel path cannot use it.
+        let skolem_base = format!("{ledger_id}-{new_t}");
 
         // 1. Create ImportSink + parse TTL
         let ns_codes_before = state.ns_registry.code_count();
@@ -162,7 +165,7 @@ mod inner {
             None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
         };
         let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
-        let mut sink = ImportSink::new_cached(&mut worker_cache, new_t, txn_id, compress)
+        let mut sink = ImportSink::new_cached(&mut worker_cache, new_t, skolem_base, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -300,7 +303,10 @@ mod inner {
         }
 
         let new_t = state.t + 1;
-        let txn_id = format!("{ledger_id}-{new_t}");
+        // One serial commit == one whole document, so the commit ordinal is
+        // a valid document scope here. See `skolem_base` for why the chunked
+        // parallel path cannot use it.
+        let skolem_base = format!("{ledger_id}-{new_t}");
 
         let ns_codes_before = state.ns_registry.code_count();
         let _parse_span = tracing::debug_span!(
@@ -317,7 +323,7 @@ mod inner {
             None => Arc::new(SharedNamespaceAllocator::from_registry(&state.ns_registry)),
         };
         let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
-        let mut sink = ImportSink::new_cached(&mut worker_cache, new_t, txn_id, compress)
+        let mut sink = ImportSink::new_cached(&mut worker_cache, new_t, skolem_base, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -455,7 +461,10 @@ mod inner {
         S: ContentAddressedWrite,
     {
         let new_t = state.t + 1;
-        let txn_id = format!("{ledger_id}-{new_t}");
+        // One serial commit == one whole document, so the commit ordinal is
+        // a valid document scope here. See `skolem_base` for why the chunked
+        // parallel path cannot use it.
+        let skolem_base = format!("{ledger_id}-{new_t}");
 
         // 1. Parse TriG to extract GRAPH blocks
         let phase1 = parse_trig_phase1(trig)?;
@@ -500,7 +509,7 @@ mod inner {
         };
         let mut worker_cache = WorkerCache::new(Arc::clone(&shared_ns));
         let mut sink =
-            ImportSink::new_cached(&mut worker_cache, new_t, txn_id.clone(), compress)
+            ImportSink::new_cached(&mut worker_cache, new_t, skolem_base.clone(), compress)
                 .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -565,17 +574,17 @@ mod inner {
                     TransactError::Parse("named graph triple missing subject".to_string())
                 })?;
 
-                let s = expand_term(subject, &block.prefixes, &mut worker_cache, &txn_id)?;
+                let s = expand_term(subject, &block.prefixes, &mut worker_cache, &skolem_base)?;
                 let p = expand_term(
                     &triple.predicate,
                     &block.prefixes,
                     &mut worker_cache,
-                    &txn_id,
+                    &skolem_base,
                 )?;
 
                 for obj in &triple.objects {
                     let (o, dt, lang) =
-                        expand_object(obj, &block.prefixes, &mut worker_cache, &txn_id)?;
+                        expand_object(obj, &block.prefixes, &mut worker_cache, &skolem_base)?;
 
                     // Spool the named-graph flake under its g_id (so it enters
                     // the index), then encode it into the commit blob.
@@ -720,7 +729,7 @@ mod inner {
     /// the spool's prefix lookups see codes the moment they're allocated (see
     /// the comment in `import_trig_commit`).
     ///
-    /// Blank-node labels are skolemized with the same `{txn_id}-{label}` key
+    /// Blank-node labels are skolemized with the same `{skolem_base}-{label}` key
     /// as `ImportSink::skolemize`, so a label shared between the default graph
     /// and a named-graph block of one TriG document resolves to one node
     /// (TriG scopes labels to the whole document), while the same label in a
@@ -729,12 +738,12 @@ mod inner {
         term: &RawTerm,
         prefixes: &rustc_hash::FxHashMap<String, String>,
         ns: &mut WorkerCache,
-        txn_id: &str,
+        skolem_base: &str,
     ) -> Result<Sid> {
         match term {
             RawTerm::Iri(iri) => {
                 if let Some(local) = iri.strip_prefix("_:") {
-                    Ok(ns.blank_node_sid(&format!("{txn_id}-{local}")))
+                    Ok(ns.blank_node_sid(&format!("{skolem_base}-{local}")))
                 } else {
                     Ok(ns.sid_for_iri(iri))
                 }
@@ -754,13 +763,13 @@ mod inner {
         obj: &RawObject,
         prefixes: &rustc_hash::FxHashMap<String, String>,
         ns: &mut WorkerCache,
-        txn_id: &str,
+        skolem_base: &str,
     ) -> Result<(FlakeValue, Sid, Option<String>)> {
         match obj {
             RawObject::Iri(iri) => {
                 // Blank labels use the ImportSink skolem key; see expand_term.
                 let sid = if let Some(local) = iri.strip_prefix("_:") {
-                    ns.blank_node_sid(&format!("{txn_id}-{local}"))
+                    ns.blank_node_sid(&format!("{skolem_base}-{local}"))
                 } else {
                     ns.sid_for_iri(iri)
                 };
@@ -842,13 +851,33 @@ mod inner {
         pub txn_meta: Vec<TxnMetaEntry>,
     }
 
+    /// Blank-node skolemization key for one import *document*.
+    ///
+    /// RDF scopes blank-node labels to the document that contains them, so
+    /// `_:x` must resolve to one subject everywhere in a document and to a
+    /// different subject in the next one. Bulk import cuts a document into many
+    /// chunks — each its own commit — so the commit `t` is the wrong key: it
+    /// splits one document's labels across chunk boundaries.
+    ///
+    /// `doc_scope` is therefore supplied by the caller, which is the only layer
+    /// that knows which chunks came from which source file. It must be stable
+    /// across every chunk of a document and distinct between documents. No
+    /// cross-worker coordination is needed: `blank_node_sid` is a pure function
+    /// of the key, so two threads parsing chunk 1 and chunk 7 independently
+    /// derive the same Sid for the same label.
+    fn skolem_base(ledger_id: &str, doc_scope: &str) -> String {
+        format!("{ledger_id}-{doc_scope}")
+    }
+
     /// Parse a TTL chunk into a `StreamingCommitWriter`. Thread-safe.
     ///
     /// Uses a [`WorkerCache`] backed by the shared allocator for lock-free
     /// namespace lookups. New prefix allocations are tracked in the worker's
     /// `new_codes` set for commit-order publication by the serial finalizer.
     ///
-    /// The `t` value is pre-assigned by the caller (chunk_index + 1).
+    /// The `t` value is pre-assigned by the caller (chunk_index + 1);
+    /// `doc_scope` identifies the source document this chunk was cut from (see
+    /// [`skolem_base`]).
     ///
     /// If `spool_dir` is `Some`, a spool file is written alongside the commit
     /// blob for Phase A validation of the spool format.
@@ -858,17 +887,18 @@ mod inner {
         alloc: &Arc<SharedNamespaceAllocator>,
         t: i64,
         ledger_id: &str,
+        doc_scope: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
     ) -> Result<ParsedChunk> {
-        let txn_id = format!("{ledger_id}-{t}");
+        let skolem_base = skolem_base(ledger_id, doc_scope);
 
         let _parse_span = tracing::debug_span!("parse_chunk", t, ttl_bytes = ttl.len(),).entered();
 
         let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
-        let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, compress)
+        let mut sink = ImportSink::new_cached(&mut worker_cache, t, skolem_base, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -905,6 +935,9 @@ mod inner {
     /// Like `parse_chunk`, but does not require the prefix block text to be
     /// prepended onto `ttl`. Uses a [`WorkerCache`] for lock-free lookups.
     ///
+    /// `doc_scope` carries the same document-scoping contract as in
+    /// [`parse_chunk`] — see [`skolem_base`].
+    ///
     /// If `spool_dir` is `Some`, a spool file is written alongside the commit
     /// blob for Phase A validation of the spool format.
     #[allow(clippy::too_many_arguments)]
@@ -914,12 +947,13 @@ mod inner {
         prelude: &TurtlePrelude,
         t: i64,
         ledger_id: &str,
+        doc_scope: &str,
         compress: bool,
         spool_dir: Option<&std::path::Path>,
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
     ) -> Result<ParsedChunk> {
-        let txn_id = format!("{ledger_id}-{t}");
+        let skolem_base = skolem_base(ledger_id, doc_scope);
         let _parse_span = tracing::debug_span!("parse_chunk", t, ttl_bytes = ttl.len(),).entered();
 
         let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
@@ -929,7 +963,7 @@ mod inner {
             worker_cache.get_or_allocate(ns_iri);
         }
 
-        let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, compress)
+        let mut sink = ImportSink::new_cached(&mut worker_cache, t, skolem_base, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {
@@ -1035,13 +1069,21 @@ mod inner {
         spool_config: Option<&crate::import_sink::SpoolConfig>,
         chunk_idx: usize,
     ) -> Result<ParsedChunk> {
-        let txn_id = format!("{ledger_id}-{t}");
+        // Chunk-scoped, matching the behavior before document scoping existed.
+        // For the `Files` and remote arms that is also document-scoped, because
+        // one chunk is one whole `.jsonld` file. It is NOT for the ndjson
+        // stream, where `NdjsonReader` packs many lines into one synthetic
+        // `@graph` document: labels there merge across lines within a chunk and
+        // split across chunks. That predates document scoping and is left alone
+        // deliberately — deciding whether an ndjson line is its own RDF
+        // document is a JSON-LD question, not a Turtle-chunking one.
+        let skolem_base = format!("{ledger_id}-{t}");
 
         let _parse_span =
             tracing::debug_span!("parse_jsonld_chunk", t, jsonld_bytes = jsonld.len(),).entered();
 
         let mut worker_cache = WorkerCache::new(Arc::clone(alloc));
-        let mut sink = ImportSink::new_cached(&mut worker_cache, t, txn_id, compress)
+        let mut sink = ImportSink::new_cached(&mut worker_cache, t, skolem_base, compress)
             .map_err(|e| TransactError::Parse(format!("failed to create import sink: {e}")))?;
 
         if let Some((dir, config)) = spool_dir.zip(spool_config) {

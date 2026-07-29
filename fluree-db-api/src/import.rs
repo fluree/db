@@ -707,8 +707,32 @@ pub(crate) enum RemoteFormat {
     Ndjson,
 }
 
-/// `(chunk_index, raw_bytes)` payload sent from the remote producer to parser workers.
-type RemoteChunk = (usize, Vec<u8>);
+/// `(chunk_index, doc_index, raw_bytes)` payload sent from a chunk producer to
+/// the parser workers.
+///
+/// `doc_index` names the **source document** the bytes were cut from. RDF
+/// scopes blank-node labels to a document, and only the producer knows how
+/// chunks map onto input files — a large file is sub-split into many chunks,
+/// several small files can share one chunk. Workers turn it into the parser's
+/// `doc_scope` so `_:x` unifies across every chunk of one file and stays
+/// distinct between files. Producers that emit exactly one whole document per
+/// chunk set it equal to `chunk_index`.
+type RemoteChunk = (usize, usize, Vec<u8>);
+
+/// Document index used by the single-file streaming arm.
+///
+/// [`ChunkSource::Streaming`] always reads exactly one local file, so every
+/// chunk it emits belongs to the same document.
+const STREAMING_DOC_IDX: usize = 0;
+
+/// Render a document index as a parser `doc_scope` key.
+///
+/// The `d` prefix keeps these keys disjoint from the commit-ordinal keys used
+/// by the serial TriG/JSON-LD paths, so no two documents in one import can
+/// collide on a skolemization base.
+fn doc_scope(doc_idx: usize) -> String {
+    format!("d{doc_idx}")
+}
 
 type RemoteChunkRx = Arc<std::sync::Mutex<std::sync::mpsc::Receiver<RemoteChunk>>>;
 
@@ -1397,10 +1421,10 @@ fn spawn_remote_producer(
     let in_flight = in_flight.max(1);
 
     // tokio mpsc — async producer side.
-    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(in_flight);
+    let (tokio_tx, mut tokio_rx) = tokio::sync::mpsc::channel::<RemoteChunk>(in_flight);
     // std mpsc — sync worker side. Capacity 2 (small handoff buffer; tokio
     // channel is the real backpressure knob).
-    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(2);
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(2);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
     // Producer task — async on tokio.
@@ -1425,7 +1449,8 @@ fn spawn_remote_producer(
                     "remote object size differs from listing metadata"
                 );
             }
-            if tokio_tx.send((idx, bytes)).await.is_err() {
+            // One remote object == one whole document, so doc_index == idx.
+            if tokio_tx.send((idx, idx, bytes)).await.is_err() {
                 // Bridge dropped — pipeline aborted upstream. Exit cleanly.
                 let _ = error_tx.send(None);
                 return;
@@ -1576,7 +1601,7 @@ fn spawn_chained_ndjson_producer(
     estimated_count: usize,
 ) -> RemoteChunkProducer {
     let in_flight = in_flight.max(1);
-    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(in_flight);
+    let (std_tx, std_rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(in_flight);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
     // A dedicated std thread: each NdjsonReader spawns its own reader thread,
@@ -1613,7 +1638,9 @@ fn spawn_chained_ndjson_producer(
                 loop {
                     match reader.recv_chunk() {
                         Ok(Some((_local_idx, bytes))) => {
-                            if std_tx.send((global_idx, bytes)).is_err() {
+                            // Each ndjson chunk is rewritten into a standalone
+                            // JSON-LD document, so doc_index == global_idx.
+                            if std_tx.send((global_idx, global_idx, bytes)).is_err() {
                                 // Consumer aborted upstream — exit cleanly.
                                 let _ = error_tx.send(None);
                                 return;
@@ -1838,9 +1865,15 @@ fn should_stream_split(path: &Path, on_disk: u64, chunk_size_bytes: u64) -> bool
 }
 
 /// Background rechunk loop for a local directory of plain Turtle/N-Triples
-/// files. Walks `files` in order, emitting contiguous `(idx, bytes)` chunks:
-/// large files are sub-split at statement boundaries; small files are read
-/// whole and (when `coalesce_enabled`) concatenated up to ~`chunk_size`.
+/// files. Walks `files` in order, emitting contiguous `(idx, doc, bytes)`
+/// chunks: large files are sub-split at statement boundaries; small files are
+/// read whole and (when `coalesce_enabled`) concatenated up to ~`chunk_size`.
+///
+/// Every chunk carries the index of the file it came from, so the parse workers
+/// can scope blank-node labels to their source document (see [`RemoteChunk`]).
+/// A coalesced payload reports its *first* file — sound because
+/// [`coalesce_unsafe`] refuses to coalesce any file containing a `_:` label, so
+/// a coalesced payload has no labeled blank nodes to scope.
 ///
 /// Returns `Ok(())` on completion **or** on a closed receiver (consumer aborted
 /// upstream — not this producer's error). Returns `Err` only for an actual
@@ -1850,18 +1883,20 @@ fn local_rechunk_loop(
     sizes: &[u64],
     chunk_size_bytes: u64,
     coalesce_enabled: bool,
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
 ) -> std::result::Result<(), ImportError> {
     let mut next_idx = 0usize;
-    // Accumulated self-contained TTL text for coalesced small files.
+    // Accumulated self-contained TTL text for coalesced small files, and the
+    // index of the first file that contributed to it.
     let mut buf: Vec<u8> = Vec::new();
+    let mut buf_doc = 0usize;
 
     macro_rules! emit {
-        ($payload:expr) => {{
+        ($doc:expr, $payload:expr) => {{
             let payload = $payload;
             let payload_len = payload.len();
             let send_start = Instant::now();
-            if tx.send((next_idx, payload)).is_err() {
+            if tx.send((next_idx, $doc, payload)).is_err() {
                 // Consumer dropped the receiver — pipeline aborted upstream.
                 return Ok(());
             }
@@ -1893,7 +1928,7 @@ fn local_rechunk_loop(
             // at statement boundaries. ----
             // Flush any pending coalesce buffer first to preserve ordering.
             if !buf.is_empty() {
-                emit!(std::mem::take(&mut buf));
+                emit!(buf_doc, std::mem::take(&mut buf));
             }
 
             let mut reader = if matches!(comp, Compression::None) {
@@ -1949,7 +1984,9 @@ fn local_rechunk_loop(
                                 "local rechunk built split-file payload"
                             );
                         }
-                        emit!(payload);
+                        // Every sub-chunk of this file shares its document
+                        // scope — that is the whole point of `doc`.
+                        emit!(fi, payload);
                     }
                     Ok(None) => break,
                     Err(e) => {
@@ -1989,20 +2026,22 @@ fn local_rechunk_loop(
             if !coalesce_enabled || coalesce_unsafe(&bytes) {
                 // Emit standalone (flush any pending buffer first).
                 if !buf.is_empty() {
-                    emit!(std::mem::take(&mut buf));
+                    emit!(buf_doc, std::mem::take(&mut buf));
                 }
-                emit!(bytes);
+                emit!(fi, bytes);
             } else {
                 // Coalesce: flush first if adding would overflow the target.
                 if !buf.is_empty() && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes {
-                    emit!(std::mem::take(&mut buf));
+                    emit!(buf_doc, std::mem::take(&mut buf));
                 }
-                if !buf.is_empty() {
+                if buf.is_empty() {
+                    buf_doc = fi;
+                } else {
                     buf.push(b'\n');
                 }
                 buf.extend_from_slice(&bytes);
                 if buf.len() as u64 >= chunk_size_bytes {
-                    emit!(std::mem::take(&mut buf));
+                    emit!(buf_doc, std::mem::take(&mut buf));
                 }
             }
         }
@@ -2013,7 +2052,7 @@ fn local_rechunk_loop(
         let payload = std::mem::take(&mut buf);
         let payload_len = payload.len();
         let send_start = Instant::now();
-        if tx.send((next_idx, payload)).is_err() {
+        if tx.send((next_idx, buf_doc, payload)).is_err() {
             // Consumer dropped the receiver — pipeline aborted upstream.
             return Ok(());
         }
@@ -2174,14 +2213,15 @@ fn process_local_rechunk_job(
 }
 
 fn emit_local_rechunk_payload(
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
     next_idx: &mut usize,
+    doc_idx: usize,
     payload: Vec<u8>,
 ) -> bool {
     let payload_len = payload.len();
     let chunk_idx = *next_idx;
     let send_start = Instant::now();
-    if tx.send((chunk_idx, payload)).is_err() {
+    if tx.send((chunk_idx, doc_idx, payload)).is_err() {
         // Consumer dropped the receiver — pipeline aborted upstream.
         return false;
     }
@@ -2209,7 +2249,7 @@ fn local_rechunk_loop_parallel(
     sizes: Vec<u64>,
     chunk_size_bytes: u64,
     coalesce_enabled: bool,
-    tx: &std::sync::mpsc::SyncSender<(usize, Vec<u8>)>,
+    tx: &std::sync::mpsc::SyncSender<RemoteChunk>,
     rechunk_threads: usize,
 ) -> std::result::Result<(), ImportError> {
     let worker_count = rechunk_threads.min(files.len()).max(1);
@@ -2276,7 +2316,11 @@ fn local_rechunk_loop_parallel(
     let mut result: std::result::Result<(), ImportError> = Ok(());
     let mut output_open = true;
     let mut next_idx = 0usize;
+    // Coalesce buffer plus the index of the first file that contributed to it,
+    // so a flushed payload reports the document it started in (see
+    // `local_rechunk_loop` for why that is sound for coalesced payloads).
     let mut buf: Vec<u8> = Vec::new();
+    let mut buf_doc = 0usize;
 
     while let Some((file_idx, event_rx)) = event_rxs.pop_front() {
         loop {
@@ -2298,12 +2342,14 @@ fn local_rechunk_loop_parallel(
                     if output_open && result.is_ok() {
                         if !buf.is_empty() {
                             let pending = std::mem::take(&mut buf);
-                            if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                            if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending) {
                                 output_open = false;
                                 buf.clear();
                             }
                         }
-                        if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, payload) {
+                        if output_open
+                            && !emit_local_rechunk_payload(tx, &mut next_idx, file_idx, payload)
+                        {
                             output_open = false;
                             buf.clear();
                         }
@@ -2317,12 +2363,14 @@ fn local_rechunk_loop_parallel(
                         if !coalesce_enabled || unsafe_to_coalesce {
                             if !buf.is_empty() {
                                 let pending = std::mem::take(&mut buf);
-                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending)
+                                {
                                     output_open = false;
                                     buf.clear();
                                 }
                             }
-                            if output_open && !emit_local_rechunk_payload(tx, &mut next_idx, bytes)
+                            if output_open
+                                && !emit_local_rechunk_payload(tx, &mut next_idx, file_idx, bytes)
                             {
                                 output_open = false;
                                 buf.clear();
@@ -2332,19 +2380,27 @@ fn local_rechunk_loop_parallel(
                                 && (buf.len() + 1 + bytes.len()) as u64 > chunk_size_bytes
                             {
                                 let pending = std::mem::take(&mut buf);
-                                if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending)
+                                {
                                     output_open = false;
                                     buf.clear();
                                 }
                             }
                             if output_open {
-                                if !buf.is_empty() {
+                                if buf.is_empty() {
+                                    buf_doc = file_idx;
+                                } else {
                                     buf.push(b'\n');
                                 }
                                 buf.extend_from_slice(&bytes);
                                 if buf.len() as u64 >= chunk_size_bytes {
                                     let pending = std::mem::take(&mut buf);
-                                    if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+                                    if !emit_local_rechunk_payload(
+                                        tx,
+                                        &mut next_idx,
+                                        buf_doc,
+                                        pending,
+                                    ) {
                                         output_open = false;
                                         buf.clear();
                                     }
@@ -2382,7 +2438,7 @@ fn local_rechunk_loop_parallel(
 
     if output_open && result.is_ok() && !buf.is_empty() {
         let pending = std::mem::take(&mut buf);
-        if !emit_local_rechunk_payload(tx, &mut next_idx, pending) {
+        if !emit_local_rechunk_payload(tx, &mut next_idx, buf_doc, pending) {
             return Ok(());
         }
     }
@@ -2435,7 +2491,7 @@ fn spawn_local_producer(
         "local directory rechunk producer"
     );
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, Vec<u8>)>(channel_capacity);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<RemoteChunk>(channel_capacity);
     let (error_tx, error_rx) = tokio::sync::oneshot::channel::<Option<ImportError>>();
 
     let producer_handle = std::thread::Builder::new()
@@ -3806,12 +3862,18 @@ where
         spool_config: &'a Arc<SpoolConfig>,
     }
 
+    /// `doc` is the index of the source document this chunk was cut from; it
+    /// scopes blank-node labels (see [`RemoteChunk`]). It is deliberately a
+    /// separate argument from `idx`/`t`: the two coincide only when a chunk is
+    /// a whole document.
     fn parse_ttl_chunk(
         ttl: &str,
         ctx: &ParseChunkContext<'_>,
         t: i64,
         idx: usize,
+        doc: usize,
     ) -> std::result::Result<ParsedChunk, String> {
+        let scope = doc_scope(doc);
         let parsed = if let Some(prelude) = ctx.prelude {
             parse_chunk_with_prelude(
                 ttl,
@@ -3819,6 +3881,7 @@ where
                 prelude,
                 t,
                 ctx.ledger,
+                &scope,
                 ctx.compress,
                 Some(ctx.spool_dir),
                 Some(ctx.spool_config),
@@ -3830,6 +3893,7 @@ where
                 ctx.shared_alloc,
                 t,
                 ctx.ledger,
+                &scope,
                 ctx.compress,
                 Some(ctx.spool_dir),
                 Some(ctx.spool_config),
@@ -3941,7 +4005,9 @@ where
                             starts_with = &ttl[..ttl.len().min(200)],
                             "about to parse chunk"
                         );
-                        match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                        // This arm streams a SINGLE local file, so every chunk
+                        // belongs to document 0 and shares one label scope.
+                        match parse_ttl_chunk(&ttl, &ctx, t, idx, STREAMING_DOC_IDX) {
                             Ok(parsed) => {
                                 if result_tx.send(Ok((idx, parsed))).is_err() {
                                     break;
@@ -4194,7 +4260,7 @@ where
                     };
                     loop {
                         let recv_start = Instant::now();
-                        let (idx, raw_bytes) = match work_rx.lock().unwrap().recv() {
+                        let (idx, doc, raw_bytes) = match work_rx.lock().unwrap().recv() {
                             Ok(payload) => payload,
                             Err(_) => break, // Bridge dropped — channel closed.
                         };
@@ -4220,7 +4286,7 @@ where
 
                         let t = (idx + 1) as i64;
                         let parse_start = Instant::now();
-                        match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                        match parse_ttl_chunk(&ttl, &ctx, t, idx, doc) {
                             Ok(parsed) => {
                                 let parse_ms = parse_start.elapsed().as_millis();
                                 let send_start = Instant::now();
@@ -4345,7 +4411,7 @@ where
                         ImportError::Transact(format!("chunk receive task panicked: {e}"))
                     })?
             };
-            let (idx, raw_bytes) = match payload {
+            let (idx, doc, raw_bytes) = match payload {
                 Ok(payload) => payload,
                 Err(_) => break, // Channel closed — producer thread exited.
             };
@@ -4399,6 +4465,7 @@ where
                         &shared_alloc,
                         t,
                         alias,
+                        &doc_scope(doc),
                         compress,
                         Some(&spool_dir),
                         Some(&spool_config),
@@ -4551,8 +4618,9 @@ where
                                 }
                             };
 
+                            // `Files` reads one whole file per chunk.
                             let t = (idx + 1) as i64;
-                            match parse_ttl_chunk(&ttl, &ctx, t, idx) {
+                            match parse_ttl_chunk(&ttl, &ctx, t, idx, idx) {
                                 Ok(parsed) => {
                                     let _ = permit_tx_ref.send(());
                                     if result_tx.send(Ok((idx, parsed))).is_err() {
@@ -4648,11 +4716,13 @@ where
                             i,
                         )
                     } else {
+                        // `Files` reads one whole file per chunk.
                         parse_chunk(
                             &content,
                             &shared_alloc,
                             t,
                             alias,
+                            &doc_scope(i),
                             compress,
                             Some(&spool_dir),
                             Some(&spool_config),
