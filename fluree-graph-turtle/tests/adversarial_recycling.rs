@@ -12,13 +12,23 @@
 //! another, which per-triple assertions written by the same author who wrote
 //! the recycling are unlikely to anticipate.
 //!
-//! Mutation-checked: making the recycling unsound (recycling IRI slots, which
-//! the parser caches across statements) fails
-//! `hostile_document_default_mode_matches_the_no_recycle_oracle` and
-//! `hostile_document_spine_mode_matches_the_no_recycle_oracle`. Keep it that
-//! way — a differential that cannot fail is worse than no test, and the
-//! single-sink and failed-statement cases below do NOT catch that mutation on
-//! their own.
+//! Mutation-checked, and the limits are part of the record:
+//!
+//! - Recycling IRI slots — which the parser caches across statements — fails
+//!   `hostile_document_default_mode_matches_the_no_recycle_oracle` and
+//!   `hostile_document_spine_mode_matches_the_no_recycle_oracle`. The
+//!   single-sink and failed-statement cases do NOT catch it, so those two are
+//!   load-bearing; don't trim the corpus believing they are redundant.
+//! - Always reusing literal slot 0 escapes this differential entirely. It is
+//!   caught by the `fluree-graph-ir` unit tests instead
+//!   (`literal_slots_are_reused_after_a_statement_ends`,
+//!   `the_term_table_tracks_the_widest_statement_not_the_document`). The
+//!   reason: outside the annotation path the parser emits each literal
+//!   immediately after minting it, so at most one literal id is live at a
+//!   time and slot-0-collapse is observationally equivalent here. This
+//!   differential's power is the aliasing dimension, not statement width — if
+//!   a future producer holds several literal ids at once, that changes and
+//!   this file should grow a case for it.
 
 use fluree_graph_ir::{
     Datatype, Graph, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, TermId,
