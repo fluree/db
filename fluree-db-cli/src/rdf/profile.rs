@@ -484,12 +484,23 @@ impl ProfileReport {
         print_summary("phase", &rows);
 
         eprintln!(
-            "  {} {} · {} · {} · {}",
+            "  {} {} · {} · {} · {}{}",
             self.verb,
             self.corpus.input,
             self.corpus.syntax,
             human_bytes(self.corpus.bytes_decoded),
             self.host.host_class,
+            // The whole argument for putting `validated` in the JSON is that an
+            // unlabelled --nocheck number is a faster answer to an easier
+            // question. A human reading a table is at least as likely to
+            // quote it, so scoping the label to JSON contradicted its own
+            // rationale. Shown only when OFF: the default is validating, and a
+            // line on every ordinary run is noise.
+            if self.validated {
+                String::new()
+            } else {
+                " · NOT VALIDATED (--nocheck)".to_string()
+            },
         );
         eprintln!(
             "  wall {} (input → parse; excludes startup{}) · {} unattributed",
