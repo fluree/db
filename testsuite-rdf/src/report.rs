@@ -66,7 +66,16 @@ impl SuiteReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conformance {
     /// Commit of THIS repo the suites ran against.
+    ///
+    /// Suffixed `-dirty` when the working tree had uncommitted changes, so a
+    /// naive string comparison in the freshness contract FAILS rather than
+    /// silently accepting a number produced from code that is not at that
+    /// commit. [`Conformance::dirty`] carries the same fact for structured
+    /// consumers.
     pub git_sha: String,
+    /// Whether the working tree was dirty when this ran. A conformance number
+    /// from a dirty tree is not reproducible and must not be published.
+    pub dirty: bool,
     /// RFC 3339 capture time.
     pub captured_at: String,
     /// Suite family this document covers.
@@ -136,8 +145,14 @@ pub fn suite_report(
 }
 
 /// Current repo commit, for the conformance artifact.
+///
+/// A `-dirty` suffix is appended when the working tree has uncommitted
+/// changes. The suffix is deliberately part of the SHA STRING and not only a
+/// separate flag: the freshness contract compares this field against a bench
+/// matrix's, and a comparator that does not know about the flag must still
+/// refuse a dirty run rather than accept it.
 pub fn git_sha() -> String {
-    std::process::Command::new("git")
+    let sha = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -146,7 +161,34 @@ pub fn git_sha() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if working_tree_is_dirty() {
+        format!("{sha}-dirty")
+    } else {
+        sha
+    }
+}
+
+/// Whether the working tree has uncommitted changes.
+///
+/// An unreadable git state counts as DIRTY: the point is to refuse to certify
+/// a number we cannot tie to a commit, and "git did not answer" is exactly
+/// that case.
+pub fn working_tree_is_dirty() -> bool {
+    let Some(out) = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+    else {
+        return true;
+    };
+
+    // Untracked-only noise still counts: an untracked file can be a fixture
+    // the run read. Anything git reports means the tree is not the commit.
+    !String::from_utf8_lossy(&out.stdout).trim().is_empty()
 }
 
 /// RFC 3339 timestamp without pulling in a date crate.
@@ -174,6 +216,14 @@ mod tests {
         let r = suite_report("turtle", "rdf11", "conformant", true, "m", 100, 90, 0, 10);
         assert_eq!(r.pass_rate, "90.0%");
         assert_eq!(r.total, r.passed + r.failed + r.ignored);
+    }
+
+    /// A dirty tree must be visible in the SHA string itself, not only in the
+    /// flag, so a comparator that ignores the flag still refuses the run.
+    #[test]
+    fn a_dirty_sha_is_self_describing() {
+        let sha = git_sha();
+        assert_eq!(sha.ends_with("-dirty"), working_tree_is_dirty());
     }
 
     #[test]

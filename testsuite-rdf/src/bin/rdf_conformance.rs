@@ -15,7 +15,7 @@
 use anyhow::Result;
 use testsuite_rdf::{
     files::rdf_tests_submodule_sha,
-    report::{captured_at, git_sha, Conformance, DENOMINATOR_POLICY},
+    report::{captured_at, git_sha, working_tree_is_dirty, Conformance, DENOMINATOR_POLICY},
     run_suite, ParseMode, RDF11_NTRIPLES, RDF11_TURTLE, RDF12_NTRIPLES, RDF12_TURTLE,
 };
 
@@ -54,8 +54,18 @@ fn main() -> Result<()> {
         per_format.push(run.summary);
     }
 
+    let dirty = working_tree_is_dirty();
+    if dirty {
+        eprintln!(
+            "WARNING: working tree is dirty — this conformance run is not \
+             reproducible and must not be published. The recorded git_sha \
+             carries a `-dirty` suffix so the freshness contract refuses it."
+        );
+    }
+
     let doc = Conformance {
         git_sha: git_sha(),
+        dirty,
         captured_at: captured_at(),
         suite: "w3c-rdf-syntax".to_string(),
         rdf_tests_submodule_sha: rdf_tests_submodule_sha(),
