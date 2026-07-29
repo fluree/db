@@ -254,6 +254,89 @@ mod tests {
         );
     }
 
+    /// Read a one-triple document back, returning the object's lexical form,
+    /// or `None` if it does not parse.
+    fn reread_object(object: &str) -> Option<String> {
+        use fluree_graph_ir::GraphCollectorSink;
+
+        let document = format!("<http://ex/s> <http://ex/p> {object} .");
+        let mut sink = GraphCollectorSink::new();
+        fluree_graph_turtle::parse(&document, &mut sink).ok()?;
+        match &sink.into_graph().iter().next().expect("one triple").o {
+            Term::Literal { value, .. } => Some(value.lexical()),
+            other => panic!("expected a literal, got {other:?}"),
+        }
+    }
+
+    /// `Term`'s `Display` is a debugging convenience: it writes lexical forms
+    /// with **no escaping whatsoever**. Nothing in a writer output path may
+    /// use it. Everything goes through [`write_nt_term`]/[`write_ttl_term`],
+    /// which escape.
+    ///
+    /// This is the regression guard. For every hostile literal the two forms
+    /// must differ, and the writer's must read back as the exact value it
+    /// started as.
+    #[test]
+    fn the_writer_escapes_where_display_does_not() {
+        for value in [
+            "a\"b",
+            "a\\b",
+            "a\nb",
+            "line one\nline two\r\nline three",
+            "tab\there",
+            "\"leading and trailing\"",
+            "nul\u{0}inside",
+            "backslash at end\\",
+        ] {
+            let term = Term::string(value);
+            let written = rendered(&term);
+            assert_ne!(
+                written,
+                term.to_string(),
+                "Display matched the writer for {value:?} — if Display ever starts \
+                 escaping, this is the wrong guard"
+            );
+            assert_eq!(
+                reread_object(&written).as_deref(),
+                Some(value),
+                "the writer's own output must read back unchanged: {written}"
+            );
+        }
+    }
+
+    /// *Why* the ban exists, demonstrated rather than asserted.
+    ///
+    /// Two distinct failures, and the second is the dangerous one:
+    ///
+    /// - `a"b` and a literal newline produce documents the parser **rejects**.
+    /// - `a\b` produces `"a\b"`, which the parser **accepts** — as a
+    ///   *backspace*, because `\b` is a valid Turtle `ECHAR`. That is silent
+    ///   corruption, not a crash, and no round-trip test that only checks
+    ///   "did it parse" would catch it.
+    #[test]
+    fn display_output_is_either_unparseable_or_silently_wrong() {
+        for value in ["a\"b", "a\\b", "a\nb", "backslash at end\\"] {
+            let displayed = Term::string(value).to_string();
+            let reread = reread_object(&displayed);
+            assert_ne!(
+                reread.as_deref(),
+                Some(value),
+                "Display round-tripped {value:?} faithfully as {displayed} — the hostile \
+                 set no longer demonstrates why Display is banned from writer paths"
+            );
+        }
+
+        // The corruption case, pinned exactly. The three characters `a \ b`
+        // come back as the two characters `a` U+0008: the backslash became an
+        // escape and *ate the `b`*. Parsed happily, wrong value, no error
+        // anywhere — which is why "did the output parse?" is not a sufficient
+        // check, and why Display is banned rather than merely discouraged.
+        assert_eq!(
+            reread_object(&Term::string("a\\b").to_string()).as_deref(),
+            Some("a\u{8}")
+        );
+    }
+
     #[test]
     fn literal_escaping_covers_quotes_newlines_and_controls() {
         assert_eq!(
