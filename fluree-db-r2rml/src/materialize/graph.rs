@@ -34,6 +34,7 @@
 //! Cyclic and self-referential parents (which cannot be indexed lazily in a
 //! single pass) are fully pre-indexed before the emit pass.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use fluree_db_tabular::ColumnBatch;
@@ -44,7 +45,7 @@ use super::term::{
     materialize_subject_from_batch, RdfTerm,
 };
 use crate::error::{R2rmlError, R2rmlResult};
-use crate::mapping::{CompiledR2rmlMapping, ObjectMap, RefObjectMap, TriplesMap};
+use crate::mapping::{CompiledR2rmlMapping, ObjectMap, PredicateMap, RefObjectMap, TriplesMap};
 
 /// Sink for materialized triples. The subject is always an IRI or blank node;
 /// the object may be any RDF term. Implementations turn triples into whatever
@@ -376,8 +377,12 @@ pub fn emit_batch(
     observer: &mut dyn TripleObserver,
     stats: &mut MaterializeStats,
 ) -> R2rmlResult<()> {
-    // Precompute canonical joins for the RefObjectMap POMs so we don't rebuild
-    // them per row on a large fact table.
+    // Precompute once per batch, not per row (O4):
+    //  - canonical joins for the RefObjectMap POMs;
+    //  - the constant rdf:type object terms (was `RdfTerm::iri(class.clone())` per
+    //    row — a fresh heap clone of every class IRI on every fact/dim row);
+    //  - each POM's constant predicate as a borrow (the overwhelmingly common
+    //    case), so the hot data-triple path avoids the per-row predicate clone.
     let ref_joins: Vec<Option<(Vec<String>, Vec<String>)>> = tm
         .predicate_object_maps
         .iter()
@@ -386,6 +391,23 @@ pub fn emit_batch(
             _ => Ok(None),
         })
         .collect::<R2rmlResult<Vec<_>>>()?;
+    let class_terms: Vec<RdfTerm> = tm
+        .classes()
+        .iter()
+        .map(|c| RdfTerm::iri(c.clone()))
+        .collect();
+    let const_preds: Vec<Option<&str>> = tm
+        .predicate_object_maps
+        .iter()
+        .map(|pom| match &pom.predicate_map {
+            PredicateMap::Constant(iri) => Some(iri.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Fold this TriplesMap's triple total into `per_tm` ONCE at the end (one
+    // `tm.iri` clone per batch, not one per emitted triple).
+    let mut tm_triples: u64 = 0;
 
     for row in 0..batch.num_rows {
         let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
@@ -395,19 +417,20 @@ pub fn emit_batch(
         stats.subjects += 1;
 
         // rdf:type triples, one per declared class.
-        for class in tm.classes() {
-            let object = RdfTerm::iri(class.clone());
-            observer.observe(&subject, fluree_vocab::rdf::TYPE, &object)?;
+        for class_term in &class_terms {
+            observer.observe(&subject, fluree_vocab::rdf::TYPE, class_term)?;
             stats.type_triples += 1;
-            *stats.per_tm.entry(tm.iri.clone()).or_default() += 1;
+            tm_triples += 1;
         }
 
         // Predicate-object maps.
         for (i, pom) in tm.predicate_object_maps.iter().enumerate() {
-            let predicate = match materialize_predicate_from_batch(&pom.predicate_map, batch, row)?
-            {
-                Some(p) => p,
-                None => continue, // null templated/column predicate → no triple
+            let predicate: Cow<str> = match const_preds[i] {
+                Some(iri) => Cow::Borrowed(iri),
+                None => match materialize_predicate_from_batch(&pom.predicate_map, batch, row)? {
+                    Some(p) => Cow::Owned(p),
+                    None => continue, // null templated/column predicate → no triple
+                },
             };
 
             match &pom.object_map {
@@ -425,9 +448,9 @@ pub fn emit_batch(
                             stats.ref_triples += 1;
                             *stats
                                 .ref_edges
-                                .entry((tm.iri.clone(), predicate.clone()))
+                                .entry((tm.iri.clone(), predicate.to_string()))
                                 .or_default() += 1;
-                            *stats.per_tm.entry(tm.iri.clone()).or_default() += 1;
+                            tm_triples += 1;
                         }
                         None => stats.ref_dangling += 1, // dangling/absent parent → no triple
                     }
@@ -436,12 +459,16 @@ pub fn emit_batch(
                     Some(object) => {
                         observer.observe(&subject, &predicate, &object)?;
                         stats.data_triples += 1;
-                        *stats.per_tm.entry(tm.iri.clone()).or_default() += 1;
+                        tm_triples += 1;
                     }
                     None => stats.null_objects += 1, // null object column → no triple
                 },
             }
         }
+    }
+
+    if tm_triples > 0 {
+        *stats.per_tm.entry(tm.iri.clone()).or_default() += tm_triples;
     }
     Ok(())
 }
