@@ -40,7 +40,22 @@ fn rdf_cmd() -> Command {
 }
 
 /// Write `content` into `dir` under `name` and return the path.
+///
+/// Refuses a name that differs from one already in `dir` only by case. On APFS
+/// and NTFS `base.ttl` and `BASE.ttl` are the same file, so a matrix over
+/// `@base`/`@BASE` that names its fixtures after the spelling tests the last
+/// one twice and the first one never — and nothing fails, because the fixture
+/// silently overwrote its sibling. An exact repeat is left alone: rewriting one
+/// fixture is a thing tests do deliberately.
 fn fixture(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+        let existing = entry.file_name().to_string_lossy().into_owned();
+        assert!(
+            existing == name || !existing.eq_ignore_ascii_case(name),
+            "fixture {name:?} differs from {existing:?} only by case, and on a \
+             case-insensitive filesystem they are one file"
+        );
+    }
     let path = dir.path().join(name);
     std::fs::write(&path, content).unwrap();
     path
@@ -1814,6 +1829,100 @@ fn the_bnode_policy_flag_changes_which_labels_come_out() {
         preserved.contains("_:named"),
         "preserve keeps the user's label:\n{preserved}"
     );
+
+    // And the flag has to survive the parallel path, which is where it did not:
+    // workers rename every blank node into the coordination-free scheme, so
+    // `_:named` came out as `_:unamed` — byte-identical to relabel, silently
+    // ignoring the flag. `preserve` now downgrades to serial, so the output is
+    // the serial output, byte for byte, at every width.
+    let big = fixture(
+        &tmp,
+        "over-threshold-blanks.ttl",
+        &over_threshold_blanks("_:named ex:label \"kept\" .\n[] ex:anon \"yes\" .\n"),
+    );
+    let serially = convert_preserving(&big, "1");
+    assert!(
+        serially.contains("_:named"),
+        "the over-threshold fixture lost the label before parallelism entered it"
+    );
+    for threads in ["4", "8"] {
+        assert_eq!(
+            convert_preserving(&big, threads),
+            serially,
+            "--parallelism {threads} --bnode-policy preserve must match serial preserve"
+        );
+    }
+}
+
+/// A document carrying `head`'s blank nodes, over `MIN_PARALLEL_BYTES` so the
+/// parallel path actually engages.
+fn over_threshold_blanks(head: &str) -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    ttl.push_str(head);
+    for i in 0..120_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:name \"person {i}\" ; ex:age {} .\n",
+            i % 90
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate: \
+         the parallel path would not engage and the test would prove nothing",
+        ttl.len()
+    );
+    ttl
+}
+
+fn convert_preserving(path: &Path, threads: &str) -> String {
+    let mut cmd = rdf_cmd();
+    cmd.args(["--parallelism", threads, "rdf", "convert"])
+        .arg(path)
+        .args(["--to", "nt", "--bnode-policy", "preserve"]);
+    stdout_of(&mut cmd)
+}
+
+#[test]
+fn preserving_labels_says_so_in_the_profile() {
+    // A silent downgrade is the defect the reason field exists for: the user
+    // asked for eight workers and got one, and only the profile can say why.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "profiled-blanks.ttl", &over_threshold_blanks(""));
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&out)
+        .args([
+            "--to",
+            "nt",
+            "--bnode-policy",
+            "preserve",
+            "--profile=json",
+            "--no-hash",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(
+        v["host"]["threads_used"], 1,
+        "reason: {}",
+        v["host"]["parallel_reason"]
+    );
+    assert!(
+        v["host"]["parallel_reason"]
+            .as_str()
+            .unwrap()
+            .contains("preserve"),
+        "{}",
+        v["host"]["parallel_reason"]
+    );
 }
 
 #[test]
@@ -2047,6 +2156,27 @@ fn a_refusal_names_its_cause_not_the_latch_and_offers_a_remedy() {
         .stderr(predicate::str::contains("--bnode-policy relabel"))
         // NOT the latch placeholder.
         .stderr(predicate::str::contains("already refused an event").not());
+
+    // The same refusal must survive `--parallelism 8`. It did not: the parallel
+    // path renamed `_:fdbw-1` out of the writer's reserved namespace before the
+    // writer ever saw it, so the collision vanished and the run exited 0 with a
+    // label the user never wrote. `preserve` downgrading to serial is what puts
+    // the refusal back.
+    let big = fixture(
+        &tmp,
+        "over-threshold-collide.ttl",
+        &over_threshold_blanks(
+            "_:fdbw-1 ex:label \"user wrote this\" .\nex:s ex:p [ ex:anon \"a\" ] .\n",
+        ),
+    );
+    rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&big)
+        .args(["--to", "nt", "--bnode-policy", "preserve"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("fdbw-1"))
+        .stderr(predicate::str::contains("--bnode-policy relabel"));
 }
 
 #[test]

@@ -118,7 +118,12 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     let plan = if args.continue_on_error {
         ParallelPlan::serial("--continue-on-error resyncs over the whole document")
     } else {
-        ParallelPlan::decide(args.parallelism, target, loaded.text.len())
+        ParallelPlan::decide(
+            args.parallelism,
+            target,
+            loaded.text.len(),
+            config.blank_labels,
+        )
     };
     if args.continue_on_error {
         return run_recovering(
@@ -565,8 +570,17 @@ impl ParallelPlan {
         }
     }
 
-    /// Decide, from the flag, the output syntax and the input size.
-    pub fn decide(parallelism: usize, target: RdfSyntax, input_len: usize) -> Self {
+    /// Decide, from the flag, the output syntax, the input size and the label
+    /// policy.
+    ///
+    /// The policy is a parameter rather than a check at the call site so a
+    /// second call site cannot be added that forgets it.
+    pub fn decide(
+        parallelism: usize,
+        target: RdfSyntax,
+        input_len: usize,
+        labels: BlankNodeLabels,
+    ) -> Self {
         let requested = match parallelism {
             // 0 is the global flag's "auto".
             0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
@@ -576,6 +590,25 @@ impl ParallelPlan {
             return Self {
                 workers: None,
                 reason: "one worker requested",
+            };
+        }
+        // Ahead of the capability and size checks, because this one is about
+        // correctness rather than benefit. The parallel path renames every
+        // blank node into the coordination-free scheme so workers need no
+        // shared relabeller, which is the opposite of preserving labels: the
+        // user's `_:named` came out as `_:unamed`, byte-identical to relabel
+        // and silently ignoring the flag. Worse, the writer's refusal to
+        // preserve a label inside its own reserved namespace disappeared too,
+        // because the renamed label no longer collides — a run that must exit
+        // 2 exited 0 with labels the user did not write.
+        //
+        // Serial delivers the fidelity the flag asks for, so this downgrades
+        // rather than refusing, exactly as a mid-file directive does. The cost
+        // is speed, not correctness.
+        if labels == BlankNodeLabels::Preserve {
+            return Self {
+                workers: None,
+                reason: "--bnode-policy preserve requires serial label fidelity",
             };
         }
         if !crate::rdf::parallel::can_run_parallel(target) {
@@ -932,6 +965,23 @@ mod tests {
         assert!(err.to_string().contains("not valid JSON"), "{err}");
         let err = load_prefixes(Some("/nonexistent/ctx.json")).unwrap_err();
         assert!(err.to_string().contains("cannot read prefixes"), "{err}");
+    }
+
+    #[test]
+    fn preserving_labels_downgrades_to_serial_whatever_else_allows_parallel() {
+        // Everything else says parallel: eight workers, a line-based syntax, an
+        // input well over the threshold.
+        let big = 64 * 1024 * 1024;
+        let relabel = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Relabel);
+        assert_eq!(relabel.workers, Some(8));
+
+        let preserve = ParallelPlan::decide(8, RdfSyntax::NTriples, big, BlankNodeLabels::Preserve);
+        assert_eq!(preserve.workers, None);
+        assert!(
+            preserve.reason.contains("preserve"),
+            "the profile has to say which flag cost the parallelism: {}",
+            preserve.reason
+        );
     }
 
     #[test]

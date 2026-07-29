@@ -97,7 +97,7 @@ $ fluree rdf convert dump.ttl
 |--------|-------------|
 | `--to <SYNTAX>` | Output syntax. Overrides the `-o` extension |
 | `-o, --output <FILE>` | Write to a file instead of stdout |
-| `--bnode-policy <POLICY>` | `relabel` (default) or `preserve` |
+| `--bnode-policy <POLICY>` | `relabel` (default) or `preserve`. `preserve` converts serially |
 | `--prefixes <JSON\|PATH>` | Prefixes for compaction — inline JSON or a file. Namespaces must be absolute IRIs |
 | `--continue-on-error` | Skip unparseable statements; report each and exit 1 |
 | `--parallelism <N>` | Parse threads (global flag). `1` is the serial path exactly |
@@ -255,6 +255,11 @@ does. What is guaranteed:
 
 `riot` makes no cross-mode byte promise either. If you need byte-stability
 across a change of thread count, pin `--parallelism`.
+
+That labelling is also why `--bnode-policy preserve` converts **serially**,
+whatever `--parallelism` says: the two ask for opposite things, and preserving
+the input's labels is the one the user asked for by name. `--profile` reports it
+as the `parallel_reason`. The cost is speed, not fidelity.
 
 Two smaller consequences worth knowing. In Turtle and TriG output, prefixes are
 declared once — by the first chunk — and a subject whose statements straddle a

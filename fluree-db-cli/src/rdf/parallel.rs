@@ -92,6 +92,11 @@ impl ParallelConfig {
 ///
 /// JSON-LD is the exception, and not for either of those reasons: it is
 /// document-at-once, so there are no fragments to concatenate.
+///
+/// Independent of syntax, `--bnode-policy preserve` also rules the parallel path
+/// out — see [`ParallelPlan::decide`](crate::rdf::convert::ParallelPlan::decide)
+/// — because the label scheme that makes workers independent is precisely what
+/// preserving labels forbids.
 pub fn can_run_parallel(syntax: RdfSyntax) -> bool {
     matches!(
         syntax,

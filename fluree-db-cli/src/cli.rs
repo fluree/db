@@ -2880,7 +2880,8 @@ pub enum RdfAction {
         /// How blank-node labels reach the output. `relabel` (default) mints
         /// fresh labels, as riot and Oxigraph do; `preserve` emits the
         /// input's. Fluree's own `_:fdb-` stable identifiers pass through
-        /// either way.
+        /// either way. `preserve` converts serially, because the parallel
+        /// path's labelling is what makes workers independent.
         #[arg(long, value_enum, default_value_t = BnodePolicyArg::Relabel)]
         bnode_policy: BnodePolicyArg,
 
