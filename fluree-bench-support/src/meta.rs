@@ -139,6 +139,23 @@ impl CorpusInfo {
         self
     }
 
+    /// Reject a corpus block whose hash could not have been written by this
+    /// crate. A malformed `sha256` cannot establish identity — comparing
+    /// against it would assert "same input" on the strength of a field nothing
+    /// validated — so the caller must refuse rather than proceed.
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_well_formed_sha256(&self.sha256) {
+            return Err(format!(
+                "corpus '{}' has a malformed sha256 ({:?}): expected 64 lowercase hex digits, got \
+                 {} character(s). A hash that cannot be parsed cannot establish corpus identity.",
+                self.name,
+                short_hash(&self.sha256),
+                self.sha256.chars().count(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Describe how this corpus differs from `other` in a way that makes the
     /// two measurements incomparable, or `None` when they are the same
     /// measurement. Order the checks cheapest-signal-first so the message names
@@ -344,10 +361,26 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// First 12 hex chars, for report lines. Never used for comparison.
+/// First 12 characters, for report lines. Never used for comparison.
+///
+/// Slices on a CHARACTER boundary, not a byte offset. A baseline file is
+/// untrusted input, so a `sha256` field can hold anything — and this is called
+/// from the refusal path, where a panic would turn a documented exit-2 refusal
+/// into an exit-101 crash. [`CorpusInfo::validate`] rejects such a hash outright;
+/// this is the second line of defence for the report line that names it.
 pub(crate) fn short_hash(hash: &str) -> &str {
-    let end = hash.len().min(12);
-    &hash[..end]
+    match hash.char_indices().nth(12) {
+        Some((byte_idx, _)) => &hash[..byte_idx],
+        None => hash,
+    }
+}
+
+/// A SHA-256 as this crate writes it: exactly 64 lowercase ASCII hex digits.
+fn is_well_formed_sha256(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
@@ -492,6 +525,48 @@ mod tests {
         clear_sidecars(&dir);
         assert!(read_all_sidecars(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bplatz review item 7. `short_hash` sliced at byte 12, which panics when
+    /// byte 12 is not a UTF-8 boundary — turning a documented exit-2 refusal
+    /// into an exit-101 crash on untrusted input.
+    #[test]
+    fn short_hash_never_panics_on_multibyte_input() {
+        for s in [
+            "üüüüüüüüüüüüüüüü",
+            "日本語のハッシュ値です",
+            "",
+            "abc",
+            "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥",
+        ] {
+            let out = short_hash(s);
+            assert!(s.starts_with(out), "{s:?} -> {out:?}");
+            assert!(out.chars().count() <= 12);
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_real_sha256() {
+        assert!(corpus().validate().is_ok());
+        assert_eq!(corpus().sha256.len(), 64);
+    }
+
+    #[test]
+    fn validate_rejects_malformed_hashes() {
+        let cases = [
+            ("", "empty"),
+            ("abc", "too short"),
+            (&"a".repeat(63), "63 chars"),
+            (&"a".repeat(65), "65 chars"),
+            (&"A".repeat(64), "uppercase"),
+            (&"g".repeat(64), "non-hex letter"),
+            (&"ü".repeat(64), "multibyte"),
+        ];
+        for (hash, why) in cases {
+            let mut c = corpus();
+            c.sha256 = hash.to_string();
+            assert!(c.validate().is_err(), "should reject {why}: {hash:?}");
+        }
     }
 
     #[test]
