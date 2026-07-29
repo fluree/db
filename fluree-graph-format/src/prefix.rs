@@ -31,32 +31,34 @@ impl PrefixMap {
 
     /// Build a prefix map from a JSON-LD `@context` object.
     ///
-    /// Expects `{"prefix": "iri", ...}` — ignores entries where the value
-    /// is not a string or the key starts with `@`.
+    /// Expects `{"prefix": "iri", ...}` — ignores entries where the value is
+    /// not a string or the key starts with `@`.
+    ///
+    /// A `@context` is a map of *terms*, only some of which are namespace
+    /// prefixes, so keys that could not be written as a `PNAME_NS` are dropped
+    /// rather than stored — see [`Self::insert`].
     pub fn from_context(ctx: &serde_json::Value) -> Self {
-        let mut entries = Vec::new();
+        let mut map = PrefixMap::new();
         if let Some(obj) = ctx.as_object() {
             for (key, val) in obj {
                 if key.starts_with('@') {
                     continue;
                 }
                 if let Some(iri) = val.as_str() {
-                    entries.push((key.clone(), iri.to_string()));
+                    map.insert(key.clone(), iri.to_string());
                 }
             }
         }
-        let mut map = PrefixMap { entries };
-        map.resort();
         map
     }
 
     /// Build from an explicit map of prefix → IRI.
     pub fn from_map(map: BTreeMap<String, String>) -> Self {
-        let mut map = PrefixMap {
-            entries: map.into_iter().collect(),
-        };
-        map.resort();
-        map
+        let mut out = PrefixMap::new();
+        for (prefix, iri) in map {
+            out.insert(prefix, iri);
+        }
+        out
     }
 
     /// Declare (or redeclare) `prefix` as `namespace_iri`.
@@ -65,8 +67,18 @@ impl PrefixMap {
     /// repeated prefix replaces its previous namespace, matching Turtle, where
     /// a later `@prefix` for the same name shadows the earlier one for every
     /// statement that follows it.
+    ///
+    /// A prefix that cannot be spelled as a Turtle `PNAME_NS` is **dropped**,
+    /// not stored. The map exists to make output shorter; a prefix that cannot
+    /// be written would instead make it invalid, on every IRI it matched. The
+    /// live source of these is a JSON-LD `@context`, whose keys are arbitrary
+    /// strings — `1st`, `has space`, `-x` are all legal there and none is a
+    /// legal prefix. Dropping costs nothing but verbosity.
     pub fn insert(&mut self, prefix: impl Into<String>, namespace_iri: impl Into<String>) {
         let prefix = prefix.into();
+        if !is_valid_pname_ns(&prefix) {
+            return;
+        }
         self.entries.retain(|(p, _)| p != &prefix);
         self.entries.push((prefix, namespace_iri.into()));
         self.resort();
@@ -103,20 +115,62 @@ impl PrefixMap {
     }
 }
 
-/// Check if `local` is a valid Turtle PN_LOCAL (simplified).
+/// Check if `local` is a valid Turtle `PN_LOCAL` (simplified).
 ///
-/// Allows ASCII alphanumeric, `-`, `_`, and `.` (but not leading/trailing `.`).
-/// Conservative — the full Turtle grammar allows more — which is the safe
-/// direction: declining to compact costs verbosity, compacting wrongly costs
+/// ```text
+/// PN_LOCAL ::= (PN_CHARS_U | ':' | [0-9] | PLX) ((PN_CHARS | '.' | ':' | PLX)* (PN_CHARS | ':' | PLX))?
+/// ```
+///
+/// Two things the position-blind version of this check got wrong, both of
+/// which emitted prefixed names no parser accepts:
+///
+/// - `-` is in `PN_CHARS` but **not** in `PN_CHARS_U`, so it may appear
+///   anywhere except first. `ex:-dash` is not a legal `PNAME_LN`.
+/// - `.` may not be first or last, which was already handled.
+///
+/// Conservative in the other direction — the real grammar allows far more,
+/// including `PLX` escapes and wide Unicode ranges — which is the safe way to
+/// be wrong: declining to compact costs verbosity, compacting wrongly costs
 /// validity.
 fn is_valid_pname_local(local: &str) -> bool {
-    if local.is_empty() {
-        return true; // bare prefix like `ex:` is valid
+    let Some(first) = local.chars().next() else {
+        return true; // a bare `ex:` is a legal PNAME_LN
+    };
+    // First character: PN_CHARS_U | [0-9] — note the absence of '-'. The
+    // grammar also admits ':' and PLX here, and this does not: widening the
+    // accepted set would change which IRIs compact, which is a separate
+    // decision from fixing a position.
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
     }
-    if local.starts_with('.') || local.ends_with('.') {
+    if local.ends_with('.') {
         return false;
     }
     local
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Check if `prefix` is a valid Turtle `PNAME_NS` (simplified).
+///
+/// ```text
+/// PNAME_NS   ::= PN_PREFIX? ':'
+/// PN_PREFIX  ::= PN_CHARS_BASE ((PN_CHARS | '.')* PN_CHARS)?
+/// ```
+///
+/// So the empty prefix is legal (`@prefix : <…>`), the first character must be
+/// a letter — not `_`, not a digit, not `-` — and `.` may not be last.
+fn is_valid_pname_ns(prefix: &str) -> bool {
+    let Some(first) = prefix.chars().next() else {
+        return true; // `@prefix : <…> .`
+    };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    if prefix.ends_with('.') {
+        return false;
+    }
+    prefix
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
@@ -213,6 +267,106 @@ mod tests {
             pm.compact("http://example.org/thing").as_deref(),
             Some("ex:thing")
         );
+    }
+
+    /// `-` is in `PN_CHARS` but not `PN_CHARS_U`, so it cannot start a local
+    /// name. Compacting `…/-dash` to `ex:-dash` emitted a prefixed name no
+    /// parser reads.
+    #[test]
+    fn compaction_declines_a_local_name_starting_with_a_hyphen() {
+        let pm = ctx_map();
+        assert_eq!(pm.compact("http://example.org/-dash"), None);
+        assert_eq!(pm.compact("http://example.org/-"), None);
+        assert_eq!(pm.compact("http://example.org/--x"), None);
+        // Non-initially it is fine, which is why the check is positional.
+        assert_eq!(
+            pm.compact("http://example.org/x-dash").as_deref(),
+            Some("ex:x-dash")
+        );
+        assert_eq!(
+            pm.compact("http://example.org/x--").as_deref(),
+            Some("ex:x--")
+        );
+    }
+
+    /// A JSON-LD `@context` is the live source of keys that are not prefixes.
+    /// Storing one produces `1st:thing` or `has space:thing` on every IRI it
+    /// matches — invalid output, and worse than not compacting at all.
+    #[test]
+    fn a_prefix_that_cannot_be_written_is_dropped_not_stored() {
+        let pm = PrefixMap::from_context(&json!({
+            "ok": "http://ok.example/",
+            "": "http://empty.example/",
+            "1st": "http://digit.example/",
+            "-lead": "http://hyphen.example/",
+            "_under": "http://underscore.example/",
+            "has space": "http://space.example/",
+            "trailing.": "http://dot.example/"
+        }));
+        let prefixes: Vec<&str> = pm.iter().map(|(p, _)| p).collect();
+        assert_eq!(prefixes.len(), 2, "{prefixes:?}");
+        assert!(prefixes.contains(&"ok"), "{prefixes:?}");
+        assert!(prefixes.contains(&""), "the empty prefix is legal Turtle");
+
+        // The dropped ones simply do not compact.
+        assert_eq!(pm.compact("http://digit.example/x"), None);
+        assert_eq!(pm.compact("http://space.example/x"), None);
+        // And `insert` refuses them on the same terms.
+        let mut pm = PrefixMap::new();
+        pm.insert("1st", "http://digit.example/");
+        assert!(pm.is_empty());
+    }
+
+    /// Everything a writer can emit must re-read. This walks the whole
+    /// surface: any IRI that compacts must produce a prefixed name our own
+    /// parser accepts.
+    #[test]
+    fn every_compaction_this_map_produces_is_parseable() {
+        let mut pm = PrefixMap::new();
+        pm.insert("ex", "http://example.org/");
+        pm.insert("", "http://empty.example/");
+
+        let locals = [
+            "plain",
+            "with-dash",
+            "x--",
+            "_under",
+            "0digit",
+            "a.b",
+            "x:y",
+            "-lead",
+            "-",
+            ".lead",
+            "trail.",
+            "has space",
+            "a/b",
+            "",
+        ];
+        for local in locals {
+            for ns in ["http://example.org/", "http://empty.example/"] {
+                let iri = format!("{ns}{local}");
+                let Some(pname) = pm.compact(&iri) else {
+                    continue;
+                };
+                let doc = format!(
+                    "@prefix ex: <http://example.org/> .\n\
+                                   @prefix : <http://empty.example/> .\n\
+                                   {pname} <http://ex/p> <http://ex/o> ."
+                );
+                let mut sink = fluree_graph_ir::GraphCollectorSink::new();
+                let parsed = fluree_graph_turtle::parse(&doc, &mut sink);
+                assert!(
+                    parsed.is_ok(),
+                    "compacted {iri:?} to {pname:?}, which does not parse: {parsed:?}"
+                );
+                let graph = sink.into_graph();
+                assert_eq!(
+                    graph.iter().next().expect("one triple").s.as_iri(),
+                    Some(iri.as_str()),
+                    "{pname:?} does not denote {iri:?}"
+                );
+            }
+        }
     }
 
     #[test]
