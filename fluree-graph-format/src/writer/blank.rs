@@ -39,6 +39,15 @@ pub enum BlankNodeLabels {
     /// disjointness holds without a runtime check. In particular an input
     /// document's own `_:b0` is *relabelled* like any other, so it cannot
     /// meet a mint.
+    ///
+    /// # The carve-out is validated too
+    ///
+    /// A `_:fdb-…` label passes through only if it is a legal
+    /// [`BLANK_NODE_LABEL`](fluree_graph_ir::chars::is_blank_node_label). One
+    /// that is not was never a Fluree skolem — those are `fdb-<ulid>` and are
+    /// always legal — so there is no addressability to preserve, and it is
+    /// minted like anything else. The bijection keeps its identity; only its
+    /// name changes.
     #[default]
     Relabel,
 
@@ -110,8 +119,18 @@ impl BlankLabeler {
     pub(crate) fn labelled(&mut self, input: &str) -> Result<Box<str>, SinkError> {
         match self.mode {
             // The addressability carve-out: `_:fdb-…` are identifiers, not
-            // incidental syntax. Stored, not renamed.
-            BlankNodeLabels::Relabel if input.starts_with(CARVE_OUT) => Ok(input.into()),
+            // incidental syntax. Stored, not renamed — but only if they can
+            // actually be written. A `fdb-` label that is not a
+            // `BLANK_NODE_LABEL` is not a Fluree skolem (those are
+            // `fdb-<ulid>`, always legal), so there is no addressability to
+            // preserve and nothing is lost by minting instead. Passing it
+            // through would emit a document no reader accepts, or — for
+            // `fdb-x.` — one that reads it back under a different name.
+            BlankNodeLabels::Relabel
+                if input.starts_with(CARVE_OUT) && is_blank_node_label(input) =>
+            {
+                Ok(input.into())
+            }
             BlankNodeLabels::Relabel => Ok(self.mint()),
             BlankNodeLabels::Preserve => {
                 if input.starts_with(PRESERVE_MINT) {

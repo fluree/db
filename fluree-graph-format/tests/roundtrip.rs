@@ -584,6 +584,115 @@ fn preserve_mode_never_emits_a_label_that_reads_back_as_something_else() {
     }
 }
 
+/// The `_:fdb-` carve-out is the one path that emits an input label verbatim,
+/// and it is in the DEFAULT mode — so it is validated like every other path.
+///
+/// A `fdb-` label that is not a legal `BLANK_NODE_LABEL` was never a Fluree
+/// skolem (those are `fdb-<ulid>`), so there is no addressability to keep and
+/// it is minted instead. Inverted from the reviewer's y3 probe, which
+/// established that six of these seven emitted unusable output.
+#[test]
+fn the_fdb_carve_out_is_validated_like_every_other_path() {
+    for label in [
+        "fdb-01ARZ", // a real skolem: legal, passes through
+        "fdb-a b",   // space
+        "fdb-x.",    // trailing '.' — reads back as a different name
+        "fdb-a(b",   // paren
+        "fdb-a\\b",  // backslash
+        "fdb-a\"b",  // quote
+        "fdb-a#b",   // starts a comment
+    ] {
+        let mut buf = Vec::new();
+        {
+            // Relabel is the default — this is not an opt-in path.
+            let mut w = NTriplesWriter::new(&mut buf);
+            let s = w.term_blank(Some(label));
+            let p = w.term_iri("http://ex/p");
+            let o = w.term_iri("http://ex/o");
+            w.emit_triple(s, p, o).expect("emitted");
+            w.end_statement();
+            w.finish().expect("finished");
+        }
+        let written = String::from_utf8(buf).unwrap();
+        let labels = blank_labels(&parse_conformant(&written));
+        assert_eq!(labels.len(), 1, "{label:?} -> {written:?}");
+        let out = labels.into_iter().next().unwrap();
+
+        if label == "fdb-01ARZ" {
+            assert_eq!(out, label, "a legal skolem must survive verbatim");
+        } else {
+            assert!(
+                out.starts_with('b') && out != label,
+                "{label:?} was emitted as {out:?} rather than minted"
+            );
+        }
+    }
+}
+
+/// One node in, one node out. A label the writer relabels must still be the
+/// SAME node everywhere it appears — the bijection is what makes minting a
+/// rename rather than a loss. Adopted from the reviewer's y1 probe.
+#[test]
+fn a_repeated_illegal_label_keeps_one_identity() {
+    let config = WriterConfig::new().with_blank_labels(BlankNodeLabels::Preserve);
+    let mut buf = Vec::new();
+    {
+        let mut w = NTriplesWriter::with_config(&mut buf, &config);
+        let p = w.term_iri("http://ex/p");
+        // The same illegal label, once as subject and once as object.
+        let a = w.term_blank(Some("a b"));
+        let o = w.term_iri("http://ex/o");
+        w.emit_triple(a, p, o).unwrap();
+        w.end_statement();
+        let a2 = w.term_blank(Some("a b"));
+        let s2 = w.term_iri("http://ex/s");
+        w.emit_triple(s2, p, a2).unwrap();
+        w.end_statement();
+        w.finish().unwrap();
+    }
+    let written = String::from_utf8(buf).unwrap();
+    let labels = blank_labels(&parse_conformant(&written));
+    assert_eq!(labels.len(), 1, "one node split into {labels:?}\n{written}");
+}
+
+/// Distinct labels must stay distinct, whether legal, illegal, or anonymous —
+/// they all draw from one counter, and a collision there fuses two resources.
+/// Adopted from the reviewer's y2 probe.
+#[test]
+fn distinct_illegal_labels_never_merge() {
+    let config = WriterConfig::new().with_blank_labels(BlankNodeLabels::Preserve);
+    let illegal = ["a b", "a(b", "\u{D7}x", "ab.", "-b1", "", "a\\b"];
+    let mut buf = Vec::new();
+    {
+        let mut w = NTriplesWriter::with_config(&mut buf, &config);
+        let p = w.term_iri("http://ex/p");
+        for (i, label) in illegal.iter().enumerate() {
+            let s = w.term_blank(Some(label));
+            let o = w.term_literal(&format!("v{i}"), Datatype::xsd_string(), None);
+            w.emit_triple(s, p, o).unwrap();
+            w.end_statement();
+        }
+        // A legal label and an anonymous node share the same counter.
+        let s = w.term_blank(Some("legal"));
+        let o = w.term_literal("legal", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o).unwrap();
+        w.end_statement();
+        let anon = w.term_blank(None);
+        let o = w.term_literal("anon", Datatype::xsd_string(), None);
+        w.emit_triple(anon, p, o).unwrap();
+        w.end_statement();
+        w.finish().unwrap();
+    }
+    let written = String::from_utf8(buf).unwrap();
+    let labels = blank_labels(&parse_conformant(&written));
+    assert_eq!(
+        labels.len(),
+        illegal.len() + 2,
+        "labels merged: {labels:?}\n{written}"
+    );
+    assert!(labels.contains("legal"), "{labels:?}");
+}
+
 /// The internal-mint case, end to end: the IR's own anonymous labels are
 /// `-b{N}` and cannot be serialized, so preserve mode must relabel them rather
 /// than refuse the document or emit something no parser reads. A hand-fed
