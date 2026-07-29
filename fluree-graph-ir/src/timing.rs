@@ -1222,20 +1222,37 @@ mod tests {
 
         let body = t.body.expect("real work must clear the floor");
         assert!(body > t.floor(), "{body:?} vs floor {:?}", t.floor());
-        // Within 3× of the truth is all a 1-in-127 sample promises.
+
+        // A LOWER bound only, and the asymmetry is the point.
+        //
+        // The estimator extrapolates a mean over ~16 sampled statements. A
+        // mean is not robust to outliers, and the outlier this test actually
+        // meets is the scheduler: run alongside 968 other tests, one sampled
+        // statement gets preempted mid-spin and its 40 µs reads as 10 ms,
+        // which drags the extrapolation orders high. Preemption can only
+        // inflate a wall-clock sample, never deflate it — so an upper bound
+        // here is a bound on machine load, and it flaked exactly that way
+        // before this comment existed.
+        //
+        // What is worth gating is the direction load cannot fake: the
+        // estimator must not LOSE a real cost. Accuracy in the other
+        // direction is verified by the differential probe
+        // (`fluree-graph-turtle/examples/sink_bias_probe.rs`) on a quiet
+        // machine, which is the right place for it.
         let truth = Duration::from_micros(40) * 2_000;
-        let ratio = body.as_secs_f64() / truth.as_secs_f64();
         assert!(
-            (0.33..3.0).contains(&ratio),
-            "estimate {body:?} vs truth {truth:?} (ratio {ratio:.2})"
+            body >= truth / 10,
+            "estimate {body:?} is an order of magnitude under the {truth:?} of \
+             work actually done — the estimator is losing real sink cost"
         );
 
-        // EXACTLY ONE artifact is removed, and the 3× band above is far too
-        // loose to notice if it were two. That matters now that a real writer
-        // clears the floor: a doubled subtraction takes a whole extra
-        // `calls × clock_pair` out of the estimate, which at N-Triples scale
-        // is enough to delete a serialize row worth 30% of wall — with every
-        // other assertion in this file still green.
+        // EXACTLY ONE artifact is removed. This is the real gate, and unlike
+        // the bound above it is algebra over a single measured `clock_pair`
+        // rather than a second timing — so it holds under any load. That
+        // matters now that a real writer clears the floor: a doubled
+        // subtraction takes a whole extra `calls × clock_pair` out of the
+        // estimate, which at N-Triples scale is enough to delete a serialize
+        // row worth 30% of wall, with every other assertion here still green.
         let uncorrected = sink
             .sampled_time
             .as_nanos()
