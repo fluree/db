@@ -1000,11 +1000,12 @@ _:named ex:label "kept" .
 
 /// N-Triples lines, sorted.
 ///
-/// A stronger comparison than isomorphism, and deliberately so: blank-node
-/// relabelling is a bijection assigned in document order, and the blocks-tier
-/// Turtle writer preserves document order, so labels are stable across a
-/// round trip. If that ever stops being true this test should say so rather
-/// than paper over it with a bnode-blind comparison.
+/// Byte equality of these across a round trip is a *stronger* claim than
+/// isomorphism, and it holds only for the shapes named at
+/// [`a_flat_turtle_round_trip_is_byte_identical`]. Blank-node labels are
+/// stable across a round trip exactly when the parser mints them in the same
+/// order the writer emits them, and for nested structures it does not — so
+/// anything nested is compared with [`nt_isomorphic`] instead.
 fn canonical_lines(nt: &str) -> Vec<String> {
     let mut lines: Vec<String> = nt
         .lines()
@@ -1013,6 +1014,154 @@ fn canonical_lines(nt: &str) -> Vec<String> {
         .collect();
     lines.sort();
     lines
+}
+
+/// Split one N-Triples line into its three terms.
+///
+/// Whitespace splitting is wrong the moment a literal contains a space, which
+/// every interesting fixture does.
+fn nt_terms(line: &str) -> Option<[String; 3]> {
+    let bytes: Vec<char> = line.chars().collect();
+    let mut at = 0usize;
+    let mut terms = Vec::with_capacity(3);
+
+    while terms.len() < 3 {
+        while at < bytes.len() && bytes[at].is_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        match bytes.get(at)? {
+            '<' => {
+                while at < bytes.len() && bytes[at] != '>' {
+                    at += 1;
+                }
+                at += 1;
+            }
+            '"' => {
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        '\\' => at += 2,
+                        '"' => break,
+                        _ => at += 1,
+                    }
+                }
+                at += 1;
+                // A datatype or language tag belongs to the same term.
+                if bytes.get(at) == Some(&'^') {
+                    at += 2;
+                    while at < bytes.len() && bytes[at] != '>' {
+                        at += 1;
+                    }
+                    at += 1;
+                } else if bytes.get(at) == Some(&'@') {
+                    while at < bytes.len() && !bytes[at].is_whitespace() {
+                        at += 1;
+                    }
+                }
+            }
+            _ => {
+                while at < bytes.len() && !bytes[at].is_whitespace() {
+                    at += 1;
+                }
+            }
+        }
+        terms.push(bytes[start..at].iter().collect::<String>());
+    }
+    terms.try_into().ok()
+}
+
+/// Whether two N-Triples documents denote the same graph, allowing any
+/// bijective renaming of blank nodes.
+///
+/// The property a converter actually owes: blank-node labels are scoped to the
+/// document that carries them, so a writer may choose its own, and only the
+/// *structure* has to survive. Lifted from the review's rdflib oracle
+/// (`scratchpad/conv/oracle.py`), which compares `to_isomorphic` graphs for
+/// the same reason.
+///
+/// Brute force over the bnode bijection, which is fine for fixtures and
+/// refuses rather than hangs above a bound no fixture should reach.
+fn nt_isomorphic(a: &str, b: &str) -> bool {
+    fn parse(doc: &str) -> (Vec<[String; 3]>, Vec<String>) {
+        let mut triples = Vec::new();
+        let mut blanks: Vec<String> = Vec::new();
+        for line in doc.lines().filter(|l| !l.trim().is_empty()) {
+            let Some(terms) = nt_terms(line) else {
+                continue;
+            };
+            for t in &terms {
+                if t.starts_with("_:") && !blanks.contains(t) {
+                    blanks.push(t.clone());
+                }
+            }
+            triples.push(terms);
+        }
+        (triples, blanks)
+    }
+
+    let (a_triples, a_blanks) = parse(a);
+    let (b_triples, b_blanks) = parse(b);
+    if a_triples.len() != b_triples.len() || a_blanks.len() != b_blanks.len() {
+        return false;
+    }
+    assert!(
+        a_blanks.len() <= 8,
+        "isomorphism here is brute force over {} blank nodes; a fixture that \
+         large needs a real canonicalizer, not a slower loop",
+        a_blanks.len()
+    );
+
+    let ground = |triples: &[[String; 3]], map: &std::collections::HashMap<String, String>| {
+        let mut out: Vec<String> = triples
+            .iter()
+            .map(|t| {
+                t.iter()
+                    .map(|term| map.get(term).unwrap_or(term).clone())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let target = ground(&b_triples, &std::collections::HashMap::new());
+
+    // Every assignment of a's blank labels onto b's.
+    let mut permutation: Vec<usize> = (0..b_blanks.len()).collect();
+    loop {
+        let map: std::collections::HashMap<String, String> = a_blanks
+            .iter()
+            .zip(&permutation)
+            .map(|(from, &to)| (from.clone(), b_blanks[to].clone()))
+            .collect();
+        if ground(&a_triples, &map) == target {
+            return true;
+        }
+        if !next_permutation(&mut permutation) {
+            return false;
+        }
+    }
+}
+
+/// Next lexicographic permutation, or `false` when the last one is reached.
+fn next_permutation(items: &mut [usize]) -> bool {
+    if items.len() < 2 {
+        return false;
+    }
+    let Some(pivot) = (0..items.len() - 1)
+        .rev()
+        .find(|&i| items[i] < items[i + 1])
+    else {
+        return false;
+    };
+    let successor = (pivot + 1..items.len())
+        .rev()
+        .find(|&i| items[i] > items[pivot])
+        .expect("a greater element exists to the right of the pivot");
+    items.swap(pivot, successor);
+    items[pivot + 1..].reverse();
+    true
 }
 
 fn convert_to_string(path: &Path, to: &str) -> String {
@@ -1076,20 +1225,136 @@ fn convert_parses_in_conformant_mode_never_the_ingest_default() {
     assert_eq!(firsts, 2, "one rdf:first per list item:\n{nt}");
 }
 
+/// Shapes whose blank-node labels survive a round trip *byte-identically*.
+///
+/// The property holds when the parser mints blank nodes in the same order the
+/// writer emits them. That is true when no blank node contains another: a flat
+/// collection, a subject that recurs far from its first appearance, a bare
+/// labelled node. It is FALSE as soon as they nest — the parser mints
+/// outermost-first while the writer emits deepest-first, because the inner
+/// node must exist before the triple that references it — so a nested fixture
+/// comes back isomorphic but relabelled.
+///
+/// An earlier version of this test asserted byte equality over a fixture that
+/// happened to be flat and claimed it as a general invariant. It is not, and
+/// `a_nested_round_trip_is_isomorphic_but_not_byte_identical` is the
+/// regression that says so out loud.
+const FLAT_SHAPES: &[(&str, &str)] = &[
+    (
+        "flat collection",
+        "@prefix ex: <http://e/> .\nex:s ex:p ( \"a\" \"b\" \"c\" ) .\n",
+    ),
+    (
+        "bare labelled bnode",
+        "@prefix ex: <http://e/> .\nex:s ex:p _:a .\n_:a ex:q \"v\" .\n",
+    ),
+    (
+        "recurring subject, far apart",
+        "@prefix ex: <http://e/> .\nex:a ex:p \"1\" .\nex:z ex:p \"2\" .\nex:a ex:q \"3\" .\n",
+    ),
+];
+
+/// Nested shapes: isomorphic across a round trip, and NOT byte-identical.
+///
+/// The reviewer's fixtures, kept verbatim — the nested collection is the
+/// one-liner that would have caught the overclaim.
+const NESTED_SHAPES: &[(&str, &str)] = &[
+    (
+        "collection of collections",
+        "@prefix ex: <http://e/> .\nex:s ex:p ( ( \"x\" \"y\" ) ( \"z\" ) ) .\n",
+    ),
+    (
+        "triply nested collection",
+        "@prefix ex: <http://e/> .\nex:s ex:p ( ( ( \"deep\" ) ) ) .\n",
+    ),
+    (
+        "nested anonymous nodes",
+        "@prefix ex: <http://e/> .\nex:s ex:p [ ex:q [ ex:r \"v\" ] ] .\n",
+    ),
+];
+
 #[test]
-fn a_turtle_round_trip_preserves_the_graph() {
+fn a_flat_turtle_round_trip_is_byte_identical() {
+    // Byte equality, for exactly the shapes where it is true. See FLAT_SHAPES
+    // for why it is true there and nowhere else.
+    let tmp = TempDir::new().unwrap();
+    for (name, doc) in FLAT_SHAPES {
+        let path = fixture(&tmp, &format!("{}.ttl", name.replace(' ', "_")), doc);
+        let direct = convert_to_string(&path, "nt");
+        let via = fixture(
+            &tmp,
+            &format!("{}_rt.ttl", name.replace(' ', "_")),
+            &convert_to_string(&path, "ttl"),
+        );
+        let round_tripped = convert_to_string(&via, "nt");
+
+        assert_eq!(
+            canonical_lines(&direct),
+            canonical_lines(&round_tripped),
+            "{name}: ttl → ttl → nt disagrees with ttl → nt"
+        );
+    }
+}
+
+#[test]
+fn a_nested_round_trip_is_isomorphic_but_not_byte_identical() {
+    // The regression for an invariant this suite used to overclaim. Both
+    // halves are asserted: the graph survives (isomorphism, which is all a
+    // converter owes), and the labels do NOT (so nobody reinstates byte
+    // equality here without the test objecting).
+    let tmp = TempDir::new().unwrap();
+    let mut any_relabelled = false;
+
+    for (name, doc) in NESTED_SHAPES {
+        let path = fixture(&tmp, &format!("{}.ttl", name.replace(' ', "_")), doc);
+        let direct = convert_to_string(&path, "nt");
+        let via = fixture(
+            &tmp,
+            &format!("{}_rt.ttl", name.replace(' ', "_")),
+            &convert_to_string(&path, "ttl"),
+        );
+        let round_tripped = convert_to_string(&via, "nt");
+
+        assert!(
+            nt_isomorphic(&direct, &round_tripped),
+            "{name}: the round trip changed the graph, not just the labels\n             direct:\n{direct}\nround-tripped:\n{round_tripped}"
+        );
+        if canonical_lines(&direct) != canonical_lines(&round_tripped) {
+            any_relabelled = true;
+        }
+    }
+
+    assert!(
+        any_relabelled,
+        "no nested shape relabelled — if label order became stable under          nesting, FLAT_SHAPES can be widened and this test retired, but that          is a decision to make deliberately"
+    );
+}
+
+#[test]
+fn the_hostile_fixture_round_trips_isomorphically_through_every_syntax() {
+    // The whole fixture — typed literals, language tags, escapes, collections,
+    // both kinds of blank node — through each text syntax that can hold
+    // triples and back.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "hostile.ttl", HOSTILE_TURTLE);
-
     let direct = convert_to_string(&path, "nt");
-    let via_turtle = fixture(&tmp, "rt.ttl", &convert_to_string(&path, "ttl"));
-    let round_tripped = convert_to_string(&via_turtle, "nt");
 
-    assert_eq!(
-        canonical_lines(&direct),
-        canonical_lines(&round_tripped),
-        "ttl → ttl → nt disagrees with ttl → nt"
-    );
+    for (syntax, ext) in [("ttl", "ttl"), ("nt", "nt"), ("nq", "nq"), ("trig", "trig")] {
+        let via = fixture(
+            &tmp,
+            &format!("via.{ext}"),
+            &convert_to_string(&path, syntax),
+        );
+        // nq/trig are not readable yet, so only re-read what the reader takes.
+        if !matches!(syntax, "ttl" | "nt") {
+            continue;
+        }
+        let back = convert_to_string(&via, "nt");
+        assert!(
+            nt_isomorphic(&direct, &back),
+            "hostile fixture through {syntax} changed the graph:\n{direct}\n---\n{back}"
+        );
+    }
 }
 
 #[test]
@@ -1099,11 +1364,32 @@ fn an_ntriples_round_trip_preserves_the_graph() {
     let once = fixture(&tmp, "once.nt", &convert_to_string(&path, "nt"));
     let twice = convert_to_string(&once, "nt");
 
-    assert_eq!(
-        canonical_lines(&std::fs::read_to_string(&once).unwrap()),
-        canonical_lines(&twice),
+    assert!(
+        nt_isomorphic(&std::fs::read_to_string(&once).unwrap(), &twice),
         "nt → nt is not a fixed point"
     );
+}
+
+#[test]
+fn the_isomorphism_checker_can_tell_graphs_apart() {
+    // A checker that returns true for everything would make every round-trip
+    // test above vacuous.
+    let a = "<http://e/s> <http://e/p> _:x .\n_:x <http://e/q> \"v\" .\n";
+    let relabelled = "<http://e/s> <http://e/p> _:zzz .\n_:zzz <http://e/q> \"v\" .\n";
+    let different = "<http://e/s> <http://e/p> _:x .\n_:x <http://e/q> \"OTHER\" .\n";
+    let merged =
+        "<http://e/s> <http://e/p> _:x .\n_:x <http://e/q> \"v\" .\n_:x <http://e/r> \"w\" .\n";
+
+    assert!(nt_isomorphic(a, relabelled), "relabelling is allowed");
+    assert!(!nt_isomorphic(a, different), "a changed literal is not");
+    assert!(!nt_isomorphic(a, merged), "nor is an extra triple");
+    // Literal terms containing spaces must survive tokenization.
+    let spaced = "<http://e/s> <http://e/p> \"two words\" .\n";
+    assert!(nt_isomorphic(spaced, spaced));
+    assert!(!nt_isomorphic(
+        spaced,
+        "<http://e/s> <http://e/p> \"two  words\" .\n"
+    ));
 }
 
 #[test]
@@ -1412,4 +1698,215 @@ fn convert_needs_no_fluree_directory_either() {
         .args(["--to", "nt"])
         .assert()
         .success();
+}
+
+#[test]
+fn a_prefix_namespace_that_is_not_an_iri_is_refused_before_anything_is_written() {
+    // The blocker this fixes: `--prefixes '{"ok":"not an iri"}'` used to emit
+    // `@prefix ok: <not an iri> .` and exit 0 — a document this
+    // tool's own reader rejects, written by this tool, reported as success.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+
+    // Inline form.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "turtle", "--prefixes", r#"{"ok":"not an iri"}"#])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("not an absolute IRI"))
+        .stderr(predicate::str::contains("'ok'"))
+        .stderr(predicate::str::contains("needs a scheme"))
+        .stdout(predicate::str::is_empty());
+
+    // File form, through a @context wrapper — the shape a user actually has.
+    let ctx = fixture(&tmp, "ctx.json", r#"{"@context":{"bad":"nope"}}"#);
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "turtle"])
+        .arg("--prefixes")
+        .arg(&ctx)
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("not an absolute IRI"))
+        .stderr(predicate::str::contains("'bad'"));
+
+    // And a good namespace still works, so the check is not just "refuse".
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args([
+            "--to",
+            "turtle",
+            "--prefixes",
+            r#"{"ex":"http://example.org/"}"#,
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn a_prefixes_argument_of_the_wrong_json_shape_says_so() {
+    // Not "No such file or directory", which sent the reader looking for a
+    // file called `[1,2]`.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    for (arg, shape) in [
+        ("[1,2]", "an array"),
+        ("42", "a number"),
+        (r#""x""#, "a string"),
+    ] {
+        rdf_cmd()
+            .args(["rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "turtle", "--prefixes", arg])
+            .assert()
+            .code(EXIT_USAGE)
+            .stderr(predicate::str::contains(shape))
+            .stderr(
+                predicate::str::contains("JSON object").or(predicate::str::contains("@context")),
+            );
+    }
+    // A genuinely missing path still reports a missing path.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "turtle", "--prefixes", "/nonexistent/ctx.json"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("cannot read prefixes"));
+}
+
+#[test]
+fn a_refusal_names_its_cause_not_the_latch_and_offers_a_remedy() {
+    // The writers latch — a sink that failed once keeps failing rather than
+    // pretending — but the latched message carries no cause. Reporting
+    // `finish()` before the parse error printed the placeholder instead.
+    let tmp = TempDir::new().unwrap();
+    let collide = fixture(
+        &tmp,
+        "collide.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         _:fdbw-1 ex:label \"user wrote this\" .\n\
+         ex:s ex:p [ ex:anon \"a\" ] .\n",
+    );
+
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&collide)
+        .args(["--to", "nt", "--bnode-policy", "preserve"])
+        .assert()
+        .code(EXIT_USAGE)
+        // The cause: which label, and why it cannot be preserved.
+        .stderr(predicate::str::contains("fdbw-1"))
+        .stderr(predicate::str::contains("reserves"))
+        // The remedy, in this CLI's vocabulary.
+        .stderr(predicate::str::contains("--bnode-policy relabel"))
+        // NOT the latch placeholder.
+        .stderr(predicate::str::contains("already refused an event").not());
+}
+
+#[test]
+fn a_refusal_that_needs_no_input_does_not_truncate_the_output_file() {
+    // `File::create` truncates. A run that was never going to produce output
+    // must not be the thing that empties the file it was pointed at.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    let victim = tmp.path().join("victim.nt");
+    std::fs::write(&victim, "PRE-EXISTING\n").unwrap();
+
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&victim)
+        .args(["--to", "rdfxml"])
+        .assert()
+        .code(EXIT_USAGE);
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "PRE-EXISTING\n",
+        "a refusal that needed no input still destroyed the output file"
+    );
+}
+
+#[test]
+fn profile_json_output_is_not_corrupted_by_the_completion_summary() {
+    // `2> run.json` is the bench lane's idiom. One ✓ line ahead of the
+    // document makes the file unparseable, and only when -o is used, which is
+    // exactly when a bench harness writes to a file.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&out)
+        .args(["--to", "nt", "--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr is not one JSON document ({e}): {}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    assert_eq!(v["verb"], "convert");
+
+    // The human profile still gets its summary, since nothing is parsing it.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&out)
+        .args(["--to", "nt", "--profile", "--no-hash"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("statements →"));
+}
+
+#[test]
+fn a_refusal_blames_the_output_syntax_the_way_it_was_chosen() {
+    // "--to nquads has no pretty form" reads as a lie to someone who never
+    // passed --to.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("--pretty")
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("no --to given"))
+        .stderr(predicate::str::contains("default nquads"));
+
+    // Named explicitly: blame the flag.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nq", "--pretty"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("--to nquads"));
+
+    // From the extension: blame the extension.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(tmp.path().join("out.nq"))
+        .arg("--pretty")
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("extension"));
 }

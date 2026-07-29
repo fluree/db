@@ -1229,6 +1229,26 @@ mod tests {
             (0.33..3.0).contains(&ratio),
             "estimate {body:?} vs truth {truth:?} (ratio {ratio:.2})"
         );
+
+        // EXACTLY ONE artifact is removed, and the 3× band above is far too
+        // loose to notice if it were two. That matters now that a real writer
+        // clears the floor: a doubled subtraction takes a whole extra
+        // `calls × clock_pair` out of the estimate, which at N-Triples scale
+        // is enough to delete a serialize row worth 30% of wall — with every
+        // other assertion in this file still green.
+        let uncorrected = sink
+            .sampled_time
+            .as_nanos()
+            .saturating_mul(u128::from(t.calls))
+            / u128::from(t.sampled_calls);
+        let removed = uncorrected.saturating_sub(body.as_nanos());
+        let artifact = t.artifact.as_nanos();
+        assert!(
+            removed.abs_diff(artifact) < artifact / 2,
+            "subtracted {removed}ns where one artifact is {artifact}ns — off by \
+             {:.2}×, so the correction is not being applied exactly once",
+            removed as f64 / artifact.max(1) as f64
+        );
     }
 
     #[test]
