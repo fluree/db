@@ -126,11 +126,53 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         );
     }
 
-    if let Some(workers) = plan.workers {
+    // Chunk before committing to the parallel path. A mid-file directive makes
+    // a document unchunkable — only the first chunk would carry the
+    // redefinition — but the document itself is perfectly legal Turtle and
+    // must still convert, so this falls back to serial rather than refusing.
+    // Plan §1.4 specifies the fallback; aborting was the wrong reading.
+    let mut plan = plan;
+    let chunked = plan.workers.and_then(|workers| {
+        match fluree_graph_turtle::splitter::chunk_in_memory(
+            &loaded.text,
+            ParallelConfig::for_input(workers, loaded.text.len()).chunk_bytes,
+        ) {
+            Ok(split) => Some((workers, split)),
+            Err(e) => {
+                plan = ParallelPlan::serial(match e {
+                    fluree_graph_turtle::splitter::SplitError::PrefixAfterData { .. } => {
+                        "a directive after the header makes the input unchunkable"
+                    }
+                    _ => "the input could not be split into chunks",
+                });
+                if !quiet {
+                    eprintln!(
+                        "{} {} — converting serially",
+                        "note:".cyan().bold(),
+                        plan.reason
+                    );
+                }
+                None
+            }
+        }
+    });
+
+    if let Some((workers, (prefix_block, ranges))) = chunked {
         // Workers write their own bytes; see `parallel` for the label scheme
         // that makes that sound without a shared relabeller.
         return run_parallel(
-            common, args, &loaded, writer, &clock, target, &config, workers, quiet, timings,
+            common,
+            args,
+            &loaded,
+            writer,
+            &clock,
+            target,
+            &config,
+            workers,
+            quiet,
+            timings,
+            &ranges,
+            &prefix_block,
         );
     }
 
@@ -189,7 +231,16 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     }
 
     if let Some(format) = common.profile {
-        emit_profile(common, &loaded, &run.outcome, &timings, wall, format, plan)?;
+        emit_profile(
+            common,
+            &loaded,
+            &run.outcome,
+            &timings,
+            wall,
+            format,
+            plan,
+            None,
+        )?;
     } else if common.time {
         rdf::count::print_timing(wall, stats.statements, loaded.text.len() as u64);
     }
@@ -225,6 +276,8 @@ fn run_parallel(
     workers: usize,
     quiet: bool,
     mut timings: PhaseTimings,
+    ranges: &[std::ops::Range<usize>],
+    prefix_block: &str,
 ) -> CliResult<()> {
     // The destination was opened through a writer that the parallel path does
     // not use — the workers each build their own. Take the sink back out.
@@ -236,16 +289,30 @@ fn run_parallel(
     };
 
     timings.enter(Phase::Parse);
-    let outcome = crate::rdf::parallel::convert_parallel_bytes(
+    let produced = crate::rdf::parallel::convert_parallel_bytes(
         &loaded.text,
         common.base.as_deref(),
         &mut out,
         target,
         writer_config,
         config,
+        ranges,
+        prefix_block,
     );
     timings.finish();
-    let outcome = outcome?;
+
+    let outcome = match produced {
+        Ok(o) => o,
+        // A closed downstream is how `| head -5` ends. The failure carries its
+        // `io::ErrorKind` precisely so this check does not have to read a
+        // localized message.
+        Err(crate::rdf::parallel::ParallelFailure::Write(e))
+            if e.kind() == std::io::ErrorKind::BrokenPipe =>
+        {
+            return Ok(())
+        }
+        Err(e) => return Err(CliError::Usage(e.to_string())),
+    };
 
     timings.enter(Phase::Write);
     let flushed = out.flush();
@@ -310,6 +377,7 @@ fn run_parallel(
                 workers: Some(workers),
                 reason: "parallel",
             },
+            None,
         )?;
     } else if common.time {
         rdf::count::print_timing(wall, outcome.statements, loaded.text.len() as u64);
@@ -401,8 +469,10 @@ fn run_recovering(
     flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
     finished.map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
 
-    // Every skip, in document order, before the summary.
-    for d in &recovery.skipped {
+    // Every skip, in document order, before the summary — unless stderr is
+    // carrying a JSON document, in which case the count travels inside it.
+    let human_stderr = common.profile != Some(crate::rdf::profile::ProfileFormat::Json);
+    for d in recovery.skipped.iter().filter(|_| human_stderr) {
         let where_ = match (d.line, d.column) {
             (Some(line), Some(column)) => format!("{}:{line}:{column}", loaded.input.display()),
             _ => loaded.input.display(),
@@ -410,7 +480,30 @@ fn run_recovering(
         eprintln!("{} {where_}: {}", "skipped:".yellow().bold(), d.message);
     }
 
-    if common.time {
+    // Recovery is exactly when profiling matters — resync re-parses from each
+    // error, so the cost of a dirty document is the thing a user most wants
+    // attributed. Emitting the diagnostics instead of the profile silently
+    // dropped a flag the user passed.
+    if let Some(format) = common.profile {
+        let reported = rdf::ParseOutcome {
+            counts: fluree_graph_ir::SinkCounts {
+                triples: stats.statements,
+                ..fluree_graph_ir::SinkCounts::default()
+            },
+            sink: unresolved_sink_timing(),
+            error: None,
+        };
+        emit_profile(
+            common,
+            loaded,
+            &reported,
+            &timings,
+            wall,
+            format,
+            ParallelPlan::serial("--continue-on-error resyncs over the whole document"),
+            Some(recovery.skipped.len() as u64),
+        )?;
+    } else if common.time {
         rdf::count::print_timing(wall, stats.statements, loaded.text.len() as u64);
     }
 
@@ -431,6 +524,11 @@ fn run_recovering(
     // riot semantics: skipping is not success. The summary goes to stderr even
     // under --quiet, because the one thing a script must not do is read a
     // partial conversion as a whole one.
+    if common.profile == Some(crate::rdf::profile::ProfileFormat::Json) {
+        // stderr is carrying a JSON document; the skip count is in the exit
+        // code and the diagnostics already went out before it.
+        return Err(exit_document_invalid());
+    }
     eprintln!(
         "{} {} statement(s) skipped, {} written → {}",
         "warning:".yellow().bold(),
@@ -741,6 +839,7 @@ fn emit_profile(
     wall: Duration,
     format: crate::rdf::profile::ProfileFormat,
     plan: ParallelPlan,
+    skipped: Option<u64>,
 ) -> CliResult<()> {
     let ctx = RunContext {
         verb: "convert",
@@ -752,6 +851,7 @@ fn emit_profile(
         bytes_decoded: loaded.text.len() as u64,
         sha256: (!common.no_hash).then(|| crate::rdf::profile::sha256_hex(&loaded.text)),
         validate: !common.nocheck,
+        skipped_statements: skipped,
         threads_used: plan.workers.unwrap_or(1),
         parallel_reason: plan.reason,
     };

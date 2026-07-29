@@ -512,6 +512,7 @@ pub fn report_run(
             validate: !common.nocheck,
             // check and count parse on the calling thread; only convert has a
             // parallel path.
+            skipped_statements: None,
             threads_used: 1,
             parallel_reason: "verb parses on the calling thread",
         };

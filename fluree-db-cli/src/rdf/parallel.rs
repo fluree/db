@@ -426,6 +426,7 @@ pub fn convert_parallel<S: GraphSink>(
 /// output. Out-of-order arrivals wait in a reorder buffer; a worker can always
 /// deposit because the capacity is at least the worker count, so no worker
 /// blocks on a chunk the writer is waiting for.
+#[allow(clippy::too_many_arguments)]
 pub fn convert_parallel_bytes<W: std::io::Write>(
     text: &str,
     base: Option<&str>,
@@ -433,56 +434,69 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
     syntax: RdfSyntax,
     writer_config: &fluree_graph_format::WriterConfig,
     config: ParallelConfig,
-) -> CliResult<ParallelOutcome> {
-    let (prefix_block, ranges) =
-        splitter::chunk_in_memory(text, config.chunk_bytes).map_err(|e| {
-            CliError::Usage(format!("cannot split the input for parallel parsing: {e}"))
-        })?;
+    ranges: &[std::ops::Range<usize>],
+    prefix_block: &str,
+) -> Result<ParallelOutcome, ParallelFailure> {
     let chunk_count = ranges.len();
     let workers = config.workers.min(chunk_count).max(1);
 
     let next = std::sync::atomic::AtomicUsize::new(0);
+    // Set when the destination is gone. Workers check it so they stop parsing
+    // promptly instead of finishing the chunk they are on and every chunk
+    // after it — on a 4 GiB input piped to `head -1` that is the difference
+    // between exiting now and converting the whole file for nobody.
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
     // Capacity >= workers so a worker can always deposit and never blocks
-    // holding a chunk the writer is waiting for.
+    // holding the chunk the writer is waiting for.
     let (tx, rx) = std::sync::mpsc::sync_channel::<ChunkBytes>(workers.max(2));
 
-    let outcome = std::thread::scope(|scope| -> CliResult<ParallelOutcome> {
+    std::thread::scope(|scope| -> Result<ParallelOutcome, ParallelFailure> {
         let next = &next;
-        let ranges = &ranges;
-        let prefix_block = &prefix_block;
+        let shutdown = &shutdown;
 
         for _ in 0..workers {
             let tx = tx.clone();
-            scope.spawn(move || loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(range) = ranges.get(index) else {
-                    break;
-                };
-                let produced = write_chunk(
-                    index,
-                    prefix_block,
-                    &text[range.clone()],
-                    base,
-                    syntax,
-                    writer_config,
-                );
-                if tx.send(produced).is_err() {
-                    break;
+            scope.spawn(move || {
+                loop {
+                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(range) = ranges.get(index) else {
+                        break;
+                    };
+                    let produced = write_chunk(
+                        index,
+                        prefix_block,
+                        &text[range.clone()],
+                        base,
+                        syntax,
+                        writer_config,
+                    );
+                    // A closed receiver is the other half of the same signal:
+                    // the writer is gone, so there is nothing left to do.
+                    if tx.send(produced).is_err() {
+                        break;
+                    }
                 }
             });
         }
         // The scope's own sender must go, or `rx` never sees a disconnect.
         drop(tx);
 
+        // Owned here, and in an `Option`, so the writer can drop it the moment
+        // the destination dies. Leaving it alive is what deadlocked: workers
+        // block in `send` on a full channel, nobody drains, and `scope` joins
+        // them forever at 0% CPU.
+        let mut rx = Some(rx);
         let mut pending: std::collections::BTreeMap<usize, ChunkBytes> =
             std::collections::BTreeMap::new();
         let mut want = 0usize;
         let mut worker_parse_nanos = 0u128;
         let mut first_error = None;
         let mut statements = 0u64;
-
-        let replay_start = std::time::Instant::now();
         let mut wait_nanos = 0u128;
+        let mut write_failure: Option<std::io::Error> = None;
 
         while want < chunk_count {
             if let Some(ready) = pending.remove(&want) {
@@ -491,8 +505,15 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                 if first_error.is_none() {
                     first_error = ready.error;
                 }
-                out.write_all(&ready.bytes)
-                    .map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+                if let Err(e) = out.write_all(&ready.bytes) {
+                    // Terminate the pool before anything else. Setting the flag
+                    // stops workers that have not yet blocked; dropping the
+                    // receiver wakes the ones that have.
+                    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+                    rx = None;
+                    write_failure = Some(e);
+                    break;
+                }
                 want += 1;
                 // A failed chunk ends the document: what follows was parsed
                 // from chunks the failure never reached, and emitting it would
@@ -502,8 +523,12 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                 }
                 continue;
             }
+
+            let Some(receiver) = rx.as_ref() else {
+                break;
+            };
             let waited = std::time::Instant::now();
-            match rx.recv() {
+            match receiver.recv() {
                 Ok(chunk) => {
                     wait_nanos += waited.elapsed().as_nanos();
                     pending.insert(chunk.index, chunk);
@@ -513,16 +538,48 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
             }
         }
 
+        // Whatever is still queued is dropped; the workers holding the rest
+        // see the flag or the closed channel and stop. Dropping here rather
+        // than at the end of the scope keeps the join prompt.
+        drop(rx);
+        drop(pending);
+
+        if let Some(e) = write_failure {
+            return Err(ParallelFailure::Write(e));
+        }
+
         Ok(ParallelOutcome {
             chunks: chunk_count,
             worker_parse_nanos,
-            reassembly_wait_nanos: wait_nanos.max(replay_start.elapsed().as_nanos() / 1_000),
+            reassembly_wait_nanos: wait_nanos,
             error: first_error,
             statements,
         })
-    })?;
+    })
+}
 
-    Ok(outcome)
+/// Why a parallel run could not finish.
+///
+/// The two cases need opposite handling and must not be collapsed: a write
+/// failure may be a closed pipe, which is a *successful* end to
+/// `convert big.ttl | head -5`, while a chunking failure means the input could
+/// not be split. Flattening both into one string is what lost the
+/// `io::ErrorKind` the pipe check needs.
+#[derive(Debug)]
+pub enum ParallelFailure {
+    /// The input could not be split into independently-parseable chunks.
+    Chunking(String),
+    /// Writing to the destination failed. Inspect `kind()` before reporting.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for ParallelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chunking(m) => write!(f, "cannot split the input for parallel parsing: {m}"),
+            Self::Write(e) => write!(f, "cannot write output: {e}"),
+        }
+    }
 }
 
 /// One chunk's bytes, ready to concatenate.

@@ -65,6 +65,13 @@ pub struct RunContext {
     /// worth benchmarking against validates by default, so an unlabelled
     /// `--nocheck` figure would be a faster answer to an easier question.
     pub validate: bool,
+    /// Statements skipped under `--continue-on-error`, when that ran.
+    ///
+    /// Carried here so the machine-readable channel holds the machine-readable
+    /// fact: under `--profile=json` stderr is one JSON document, so the
+    /// per-skip diagnostics cannot also be printed there without making it
+    /// unparseable.
+    pub skipped_statements: Option<u64>,
     /// Threads that parsed. One is the serial path.
     pub threads_used: usize,
     /// Why that thread count — "parallel", or the reason the serial path was
@@ -342,6 +349,9 @@ pub struct ProfileReport {
     /// Whether term validation ran. `false` marks a `--nocheck` run,
     /// whose timings are NOT comparable with a validating tool's.
     validated: bool,
+    /// Statements skipped by `--continue-on-error`. Absent when it did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_statements: Option<u64>,
     host: HostInfo,
     corpus: CorpusInfo,
     /// The measured window: from the first byte of input handling to the end
@@ -429,6 +439,7 @@ impl ProfileReport {
             git_sha: git_sha(),
             verb: ctx.verb,
             validated: ctx.validate,
+            skipped_statements: ctx.skipped_statements,
             host: HostInfo {
                 os: std::env::consts::OS,
                 arch: std::env::consts::ARCH,
@@ -728,6 +739,7 @@ mod tests {
             bytes_decoded: 4096,
             sha256: Some("abc123".to_string()),
             validate: true,
+            skipped_statements: None,
             threads_used: 1,
             parallel_reason: "verb parses on the calling thread",
         }

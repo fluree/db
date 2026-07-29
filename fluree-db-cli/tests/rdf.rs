@@ -2888,3 +2888,227 @@ fn the_profile_records_the_load_average() {
         assert!(load >= 0.0, "{load}");
     }
 }
+
+// ============================================================================
+// dead destinations on the parallel path
+// ============================================================================
+//
+// The serial path's early-termination contract — a closed downstream ends the
+// run quietly with status 0 — has to survive parallelism. It did not: the
+// writer stopped draining on EPIPE while workers stayed blocked on a full
+// bounded channel, and `thread::scope` joined them forever at 0% CPU. Any
+// input over the parallel threshold piped to `head` hung, which is the default
+// path.
+
+/// A corpus over the parallel input threshold, kept as small as possible
+/// because chunking is a full byte scan and these run in a debug build.
+fn over_threshold_corpus() -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..120_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:name \"person {i}\" ; ex:age {} .\n",
+            i % 90
+        ));
+    }
+    ttl
+}
+
+/// Run convert with stdout piped, apply `close`, and report its exit status.
+fn convert_with_dead_reader(
+    input: &Path,
+    threads: &str,
+    close: impl FnOnce(std::process::ChildStdout),
+) -> Option<i32> {
+    use std::process::{Command as StdCommand, Stdio};
+
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"))
+        .args(["--parallelism", threads, "rdf", "convert"])
+        .arg(input)
+        .args(["--to", "nt"])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    close(child.stdout.take().unwrap());
+    child.wait_with_output().unwrap().status.code()
+}
+
+#[test]
+fn a_reader_that_never_reads_ends_a_parallel_run_quietly() {
+    // The harshest case: the pipe is closed before a single byte is consumed.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
+
+    for threads in ["4", "8"] {
+        let code = convert_with_dead_reader(&input, threads, drop);
+        assert_eq!(
+            code,
+            Some(0),
+            "parallelism {threads}: a closed downstream is a normal end, not a failure"
+        );
+    }
+}
+
+#[test]
+fn a_reader_that_takes_one_line_ends_a_parallel_run_quietly() {
+    // `convert big.ttl | head -1`, which is the default path for any input
+    // over the parallel threshold.
+    use std::io::{BufRead, BufReader};
+
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
+
+    for threads in ["4", "8"] {
+        let code = convert_with_dead_reader(&input, threads, |stdout| {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(line.starts_with('<'), "expected a triple, got {line:?}");
+            // Dropping the reader closes the pipe.
+        });
+        assert_eq!(code, Some(0), "parallelism {threads}");
+    }
+}
+
+#[test]
+fn a_reader_that_stops_mid_stream_ends_a_parallel_run_quietly() {
+    // Closing after several chunks' worth, so the failure lands well inside
+    // the reassembly loop rather than on the first write.
+    use std::io::Read;
+
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
+
+    let code = convert_with_dead_reader(&input, "8", |mut stdout| {
+        let mut sink = vec![0u8; 256 * 1024];
+        // Read a bit, then abandon it.
+        let _ = stdout.read(&mut sink);
+    });
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn a_dead_destination_does_not_outlive_its_workers() {
+    // The deadlock signature was a process sitting at 0% CPU forever. This
+    // pins the observable consequence: the run ENDS. Without the shutdown
+    // signal, `thread::scope` joins workers blocked on a full channel and the
+    // test would hang until nextest's kill rather than fail.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
+
+    let started = std::time::Instant::now();
+    let code = convert_with_dead_reader(&input, "8", drop);
+    assert_eq!(code, Some(0));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "the run took {:?} — the pool is not being told to stop",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
+    // §1.4 specifies a fallback, and the document is legal Turtle: only the
+    // CHUNKING is impossible, because a redefinition would reach the first
+    // chunk and nothing after it. Refusing meant a legal document could not be
+    // converted at all.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <http://first.example/> .\n");
+    for i in 0..80_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a longer literal to push this corpus over the parallel threshold {i}\" .\n"
+        ));
+    }
+    ttl.push_str("@prefix ex: <http://second.example/> .\nex:z ex:p \"z\" .\n");
+    let input = fixture(&tmp, "mid.ttl", &ttl);
+    let out = tmp.path().join("out.nt");
+
+    rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("converting serially"));
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(text.lines().count(), 80_001, "every statement converted");
+    assert_eq!(
+        text.matches("second.example").count(),
+        1,
+        "the redefinition must apply to the statement after it"
+    );
+
+    // And the reason is reported rather than implicit.
+    let stderr = rdf_cmd()
+        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(v["host"]["threads_used"], 1);
+    assert!(
+        v["host"]["parallel_reason"]
+            .as_str()
+            .unwrap()
+            .contains("unchunkable"),
+        "{}",
+        v["host"]["parallel_reason"]
+    );
+}
+
+#[test]
+fn continue_on_error_still_emits_the_profile() {
+    // Recovery is exactly when profiling matters — resync re-parses from each
+    // error — and the two flags were mutually exclusive by accident.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
+
+    let stderr = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args([
+            "--to",
+            "nt",
+            "--continue-on-error",
+            "--profile=json",
+            "--no-hash",
+        ])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .get_output()
+        .stderr
+        .clone();
+
+    // stderr is one JSON document: the per-skip diagnostics would make it
+    // unparseable, so the count travels inside it instead.
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap_or_else(|e| {
+        panic!(
+            "stderr is not one JSON document ({e}): {}",
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    assert_eq!(v["verb"], "convert");
+    assert_eq!(v["skipped_statements"], 2);
+
+    // Without --profile the human diagnostics are still there.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("skipped:"))
+        .stderr(predicate::str::contains("2 statement(s) skipped"));
+}
