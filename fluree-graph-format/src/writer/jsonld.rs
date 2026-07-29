@@ -11,7 +11,7 @@
 //! stated plainly rather than implied by the absence of a claim.
 
 use super::terms::WriterTerms;
-use super::{blank::BlankLabeler, Out, WriterConfig, WriterStats};
+use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use crate::jsonld::{format_jsonld, JsonLdFormatConfig};
 use fluree_graph_ir::{
     Datatype, Graph, GraphSink, LiteralValue, SinkError, SinkResult, TermId, Triple,
@@ -38,7 +38,8 @@ pub struct JsonLdWriter<W: Write> {
     /// [`GraphSink::abort_statement`]. A statement may contribute several
     /// triples, so this is not derivable from the statement counter.
     mark: usize,
-    deferred: Option<SinkError>,
+    /// Failures raised where the protocol has no error channel.
+    deferred: Deferred,
     finished: bool,
 }
 
@@ -72,7 +73,7 @@ impl<W: Write> JsonLdWriter<W> {
             config: jsonld,
             statements: 0,
             mark: 0,
-            deferred: None,
+            deferred: Deferred::default(),
             finished: false,
         }
     }
@@ -92,13 +93,6 @@ impl<W: Write> JsonLdWriter<W> {
     /// [`finish`](GraphSink::finish) first, or the document is never written.
     pub fn into_inner(self) -> W {
         self.out.into_inner()
-    }
-
-    fn take_deferred(&mut self) -> SinkResult {
-        match self.deferred.take() {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
     }
 
     fn triple(&self, s: TermId, p: TermId, o: TermId) -> Triple {
@@ -136,7 +130,7 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
     }
 
     fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
-        self.take_deferred()?;
+        self.deferred.check()?;
         let triple = self.triple(subject, predicate, object);
         self.graph.add(triple);
         self.statements += 1;
@@ -157,7 +151,7 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
         object: TermId,
         index: i32,
     ) -> SinkResult {
-        self.take_deferred()?;
+        self.deferred.check()?;
         let Triple { s, p, o, .. } = self.triple(subject, predicate, object);
         self.graph.add_list_item(s, p, o, index);
         self.statements += 1;
@@ -178,7 +172,7 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
     }
 
     fn finish(&mut self) -> SinkResult {
-        self.take_deferred()?;
+        self.deferred.check()?;
         if self.finished {
             return Ok(());
         }

@@ -5,7 +5,7 @@
 //! when the consumer is `sort`, `split`, or another program.
 
 use super::terms::{write_nt_term, WriterTerms};
-use super::{blank::BlankLabeler, Out, WriterConfig, WriterStats};
+use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
 use std::io::Write;
 
@@ -15,8 +15,8 @@ struct LineCore<W: Write> {
     out: Out<W>,
     terms: WriterTerms,
     statements: u64,
-    /// A refusal raised by `term_blank`, which cannot return one itself.
-    deferred: Option<SinkError>,
+    /// Failures raised where the protocol has no error channel.
+    deferred: Deferred,
 }
 
 impl<W: Write> LineCore<W> {
@@ -25,14 +25,7 @@ impl<W: Write> LineCore<W> {
             out: Out::new(writer, config.buffer_statements),
             terms: WriterTerms::new(BlankLabeler::new(config.blank_labels)),
             statements: 0,
-            deferred: None,
-        }
-    }
-
-    fn take_deferred(&mut self) -> SinkResult {
-        match self.deferred.take() {
-            Some(e) => Err(e),
-            None => Ok(()),
+            deferred: Deferred::default(),
         }
     }
 
@@ -43,7 +36,7 @@ impl<W: Write> LineCore<W> {
         object: TermId,
         graph: Option<TermId>,
     ) -> SinkResult {
-        self.take_deferred()?;
+        self.deferred.check()?;
         if let Some(graph) = graph {
             if self.terms.get(graph).is_literal() {
                 return Err(SinkError::rejected(
@@ -131,11 +124,13 @@ macro_rules! line_sink_common {
 
         fn end_statement(&mut self) {
             self.0.terms.end_statement();
-            // A failure here would have to be swallowed — `end_statement`
-            // returns nothing — so it is deliberately deferred to `finish`,
-            // which does report. In practice the only way this fails is a
-            // broken pipe, and the next emission reports that too.
-            let _ = self.0.out.commit_statement();
+            // `end_statement` has no error channel, so a broken pipe hit
+            // while releasing a buffered statement is stashed for the next
+            // emission to raise — which is what keeps early termination
+            // working in buffered mode too.
+            if let Err(e) = self.0.out.commit_statement() {
+                self.0.deferred.set(e.into());
+            }
         }
 
         fn abort_statement(&mut self) {
@@ -358,23 +353,25 @@ mod tests {
         assert_eq!(stats.bytes as usize, buf.len());
     }
 
+    /// A writer whose consumer has gone away — `… | head -5`.
+    struct Closed;
+
+    impl Write for Closed {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A broken pipe has to surface at the emission that hit it, so a
     /// producer stops instead of parsing to EOF against a dead consumer.
     #[test]
     fn a_write_failure_reaches_the_producer() {
-        struct Closed;
-        impl Write for Closed {
-            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "closed",
-                ))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let mut w = NTriplesWriter::new(Closed);
         let s = w.term_iri("http://ex/s");
         let p = w.term_iri("http://ex/p");
@@ -422,6 +419,52 @@ mod tests {
         assert!(out.contains("\"kept\""), "{out}");
         assert!(out.contains("\"after\""), "{out}");
         assert!(!out.contains("\"dropped\""), "{out}");
+    }
+
+    /// Buffered mode moves the failure: nothing reaches the pipe until the
+    /// statement commits, and `end_statement` has no way to report. Early
+    /// termination still has to work, so the failure is stashed and the next
+    /// emission raises it.
+    #[test]
+    fn a_buffered_write_failure_still_stops_the_producer() {
+        let config = WriterConfig::new().with_statement_buffering(true);
+        let mut w = NTriplesWriter::with_config(Closed, &config);
+
+        let s = w.term_iri("http://ex/s");
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_literal("v", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o)
+            .expect("buffered, so nothing failed yet");
+        w.end_statement();
+
+        let o = w.term_literal("v2", Datatype::xsd_string(), None);
+        let err = w
+            .emit_triple(s, p, o)
+            .expect_err("the commit hit a closed pipe");
+        assert!(err.is_broken_pipe(), "{err:?}");
+    }
+
+    /// A producer that ignores a refusal must not get the refused thing
+    /// written on its next attempt.
+    #[test]
+    fn a_refusal_latches_rather_than_clearing_itself() {
+        let mut buf = Vec::new();
+        let config = WriterConfig::new().with_blank_labels(BlankNodeLabels::Preserve);
+        let mut w = NTriplesWriter::with_config(&mut buf, &config);
+
+        let bad = w.term_blank(Some("fdbw-9"));
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_iri("http://ex/o");
+        assert!(w.emit_triple(bad, p, o).is_err());
+
+        let good = w.term_iri("http://ex/s");
+        let err = w
+            .emit_triple(good, p, o)
+            .expect_err("the writer stays refused");
+        assert!(err.to_string().contains("already refused"), "{err}");
+
+        w.finish().unwrap();
+        assert!(buf.is_empty(), "nothing reached the output");
     }
 
     #[test]

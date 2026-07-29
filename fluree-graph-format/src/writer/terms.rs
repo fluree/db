@@ -8,9 +8,10 @@
 //! the term it will emit.
 
 use super::blank::BlankLabeler;
+use super::Deferred;
 use crate::escape::{write_escaped_iri, write_escaped_ntriples_string};
 use crate::prefix::{write_turtle_iri, PrefixMap};
-use fluree_graph_ir::{Datatype, LiteralValue, SinkError, Term, TermId};
+use fluree_graph_ir::{Datatype, LiteralValue, Term, TermId};
 use fluree_vocab::rdf;
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -64,11 +65,7 @@ impl WriterTerms {
     /// still has to return an id, because `term_blank` is infallible: the
     /// refusal is stashed and raised by the next emission, before anything the
     /// bad label would have appeared in reaches the output.
-    pub(crate) fn blank(
-        &mut self,
-        label: Option<&str>,
-        deferred: &mut Option<SinkError>,
-    ) -> TermId {
+    pub(crate) fn blank(&mut self, label: Option<&str>, deferred: &mut Deferred) -> TermId {
         let Some(label) = label else {
             let minted = self.labeler.anonymous();
             return self.push(Term::blank(minted));
@@ -79,11 +76,9 @@ impl WriterTerms {
         let output = match self.labeler.labelled(label) {
             Ok(output) => output.to_string(),
             Err(e) => {
-                // Keep the first refusal — it is the one with the context.
-                if deferred.is_none() {
-                    *deferred = Some(e);
-                }
-                // A placeholder that is never written: the next emit fails.
+                deferred.set(e);
+                // A placeholder that is never written: the next emit fails,
+                // and every emission after it fails too.
                 label.to_string()
             }
         };
@@ -289,7 +284,7 @@ mod tests {
     #[test]
     fn literal_slots_recycle_but_iris_and_blanks_do_not() {
         let mut terms = WriterTerms::new(BlankLabeler::new(BlankNodeLabels::Relabel));
-        let mut deferred = None;
+        let mut deferred = Deferred::default();
 
         let iri = terms.iri("http://example.org/s");
         let blank = terms.blank(Some("x"), &mut deferred);
@@ -311,7 +306,7 @@ mod tests {
             blank,
             "one id per input label"
         );
-        assert!(deferred.is_none());
+        assert!(deferred.check().is_ok());
     }
 
     /// `term_blank` cannot fail, so a refused label is stashed for the next
@@ -320,9 +315,16 @@ mod tests {
     #[test]
     fn a_refused_label_is_stashed_rather_than_swallowed() {
         let mut terms = WriterTerms::new(BlankLabeler::new(BlankNodeLabels::Preserve));
-        let mut deferred = None;
+        let mut deferred = Deferred::default();
         terms.blank(Some("fdbw-1"), &mut deferred);
-        let err = deferred.expect("the refusal must survive term_blank");
+        let err = deferred
+            .check()
+            .expect_err("the refusal must survive term_blank");
         assert!(err.to_string().contains("reserves"), "{err}");
+
+        // And it is sticky: a producer that ignores one refusal does not get
+        // the bad label written on its next attempt.
+        let err = deferred.check().expect_err("the refusal latches");
+        assert!(err.to_string().contains("already refused"), "{err}");
     }
 }

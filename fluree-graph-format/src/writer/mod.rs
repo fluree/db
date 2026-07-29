@@ -39,6 +39,7 @@ mod line;
 mod terms;
 mod turtle;
 
+use fluree_graph_ir::{SinkError, SinkResult};
 use std::io::{self, Write};
 
 pub use blank::BlankNodeLabels;
@@ -126,6 +127,48 @@ pub struct WriterStats {
     pub bytes: u64,
 }
 
+/// A failure raised where the protocol has no error channel, held until an
+/// emission can report it.
+///
+/// Two methods need this. `term_blank` returns a [`TermId`](fluree_graph_ir::TermId)
+/// and cannot refuse a label the writer must not emit; `end_statement` returns
+/// nothing and cannot report a broken pipe hit while flushing a buffered
+/// statement. Both stash here, and the next `emit_*` raises it — before
+/// anything the failure would have corrupted reaches the output.
+///
+/// The failure is *sticky*. The protocol says a sink that has failed once need
+/// not behave sensibly afterwards, but "predictably refuses" is a better
+/// answer than "writes the label it just refused", which is what taking the
+/// error and forgetting it would do to a producer that ignores one result.
+#[derive(Debug, Default)]
+pub(crate) struct Deferred {
+    pending: Option<SinkError>,
+    failed: bool,
+}
+
+impl Deferred {
+    /// Record a failure. The first one wins — it has the context.
+    pub(crate) fn set(&mut self, error: SinkError) {
+        if self.pending.is_none() {
+            self.pending = Some(error);
+        }
+    }
+
+    /// Raise a stashed failure, if there is one, or if there ever was one.
+    pub(crate) fn check(&mut self) -> SinkResult {
+        if let Some(error) = self.pending.take() {
+            self.failed = true;
+            return Err(error);
+        }
+        if self.failed {
+            return Err(SinkError::rejected(
+                "this writer already refused an event; its output is incomplete",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A `Write` that counts, and optionally holds back the statement in flight.
 ///
 /// Every writer in this module sends its bytes through one of these, so the
@@ -163,13 +206,12 @@ impl<W: Write> Out<W> {
         if buffer.is_empty() {
             return Ok(());
         }
-        let staged = std::mem::take(buffer);
+        let mut staged = std::mem::take(buffer);
         self.inner.write_all(&staged)?;
         self.bytes += staged.len() as u64;
-        // Reuse the allocation: statement buffers are all about the same size.
-        let mut staged = staged;
+        // Put the allocation back: statement buffers are all about one size.
         staged.clear();
-        *self.buffer.as_mut().expect("still buffering") = staged;
+        self.buffer = Some(staged);
         Ok(())
     }
 

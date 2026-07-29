@@ -20,7 +20,7 @@
 //! spelling is not.
 
 use super::terms::{write_nt_term, write_ttl_predicate, write_ttl_term, WriterTerms};
-use super::{blank::BlankLabeler, Out, WriterConfig, WriterStats};
+use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use crate::prefix::{write_prefix_declarations, write_turtle_iri, PrefixMap};
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, Term, TermId};
 use std::io::Write;
@@ -56,7 +56,8 @@ struct BlockCore<W: Write> {
     working: Run,
     in_statement: bool,
     statements: u64,
-    deferred: Option<SinkError>,
+    /// Failures raised where the protocol has no error channel.
+    deferred: Deferred,
 }
 
 impl<W: Write> BlockCore<W> {
@@ -70,7 +71,7 @@ impl<W: Write> BlockCore<W> {
             working: Run::default(),
             in_statement: false,
             statements: 0,
-            deferred: None,
+            deferred: Deferred::default(),
         }
     }
 
@@ -131,9 +132,7 @@ impl<W: Write> BlockCore<W> {
         graph: Option<TermId>,
         quad_capable: bool,
     ) -> SinkResult {
-        if let Some(e) = self.deferred.take() {
-            return Err(e);
-        }
+        self.deferred.check()?;
         if let Some(graph) = graph {
             if self.terms.get(graph).is_literal() {
                 return Err(SinkError::rejected(
@@ -240,7 +239,10 @@ impl<W: Write> BlockCore<W> {
             self.in_statement = false;
         }
         self.terms.end_statement();
-        let _ = self.out.commit_statement();
+        // No error channel here; stash for the next emission to raise.
+        if let Err(e) = self.out.commit_statement() {
+            self.deferred.set(e.into());
+        }
     }
 
     /// Roll the statement in flight back.
@@ -307,9 +309,7 @@ macro_rules! block_sink_common {
             // `on_prefix` is infallible in the protocol; a write failure here
             // is raised by the next emission or by `finish`.
             if let Err(e) = self.0.on_prefix(prefix, namespace_iri) {
-                if self.0.deferred.is_none() {
-                    self.0.deferred = Some(e);
-                }
+                self.0.deferred.set(e);
             }
         }
 
