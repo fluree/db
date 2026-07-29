@@ -40,13 +40,24 @@ FLUREE_BENCH_TRACING=1 cargo bench -p fluree-db-api --bench insert_formats
 |---|---|---|---|
 | `FLUREE_BENCH_PROFILE` | `quick` \| `full` | `quick` | sample-count + warmup discipline |
 | `FLUREE_BENCH_SCALE` | `tiny` \| `small` \| `medium` \| `large` | `small` | per-bench input size |
+| `FLUREE_BENCH_HOST_CLASS` | any name | `{os}-{arch}` | comparability class for baseline capture/compare |
+| `FLUREE_BENCH_HOST` | any name | `$HOSTNAME` | host name recorded as provenance |
 | `FLUREE_BENCH_TRACING` | `1` (or unset) | unset | install a stderr tracing subscriber |
 | `FLUREE_BENCH_RUNTIME` | `multi` (or unset) | single-threaded | tokio runtime shape |
 | `RUST_LOG` | tracing-subscriber filter | `info` when `FLUREE_BENCH_TRACING=1` | tracing levels per crate |
 
+Those defaults are what a bare `cargo bench` on a laptop uses. **Both CI jobs
+pin `FLUREE_BENCH_PROFILE=quick` and `FLUREE_BENCH_SCALE=tiny`** — including the
+nightly, which is quick-profile despite the name — so a nightly number is not a
+`full`-profile number. `FLUREE_BENCH_RUNNER_CLASS` is still read as the
+pre-rename spelling of `FLUREE_BENCH_HOST_CLASS`.
+
 ## Current benches
 
-Hand-maintained; add new entries when introducing a bench file.
+Hand-maintained, and reconciled against the `[[bench]]` declarations plus
+`regression-budget.json` — `cargo test -p fluree-bench-support --test
+workspace_reconcile` enforces those two against each other, but nothing enforces
+this table, so it is the one that rots. Add a row when you add a bench file.
 
 | Crate | Bench file | Topic |
 |---|---|---|
@@ -60,6 +71,12 @@ Hand-maintained; add new entries when introducing a bench file.
 | `fluree-db-api` | `reindex_incremental.rs` | Orchestrator's incremental path via `Fluree::trigger_index(...)` over delta novelty |
 | `fluree-db-api` | `novelty_replay.rs` | Cold reload with `without_indexing()` so populate stays in novelty; scaled by commit count |
 | `fluree-db-api` | `query_hot_bsbm.rs` | Warm-cache SPARQL: BSBM-shape Q3/Q5/Q9 against a reindexed ledger |
+| `fluree-db-api` | `query_hot_bsbm_bi.rs` | BSBM Business-Intelligence "bowtie" (BI-1 F2): join-ordering tie-break between two equally-selective anchors |
+| `fluree-db-api` | `query_hot_property_path.rs` | Hot-cache SPARQL property paths, one scenario per execution mode of the operator (`*` closure, sequence, `?`, …) |
+| `fluree-db-api` | `query_hot_whole_graph_agg.rs` | Cypher aggregate folds from `fast_whole_graph_agg` (whole-graph + class scalars, histograms) against a linear-cost pipeline baseline |
+| `fluree-db-api` | `query_overlay_matrix.rs` | The same query shapes at three ledger conditions — base / overlay / novelty — so the columnar+novelty merge lane has coverage |
+| `fluree-db-api` | `annotation_hydration.rs` | `inject_annotations` hydration cost: index scan vs sealed annotation arena |
+| `fluree-db-api` | `annotation_planner.rs` | Planner direction for `f:reifies*` edge-annotation queries: arena-informed row counts vs HLL-only stats |
 | `fluree-db-query` | `vector_math.rs` | SIMD vs scalar dot/L2/cosine micro-bench |
 | `fluree-db-spatial` | `spatial_bench.rs` | S2 covering build + within/intersects/radius latency |
 
@@ -103,12 +120,13 @@ on-demand):
      at runtime (bad SPARQL, broken setup, missing API surface).
 2. **Per-PR compare (`ci.yml` `bench-compare`).** Runs the cheap subset
    (`query_overlay_matrix` + `query_hot_bsbm`) at `tiny`/`quick` and compares
-   against the committed baseline via the `bench-baseline` bin. **Both metrics
-   enforce only when the baseline's `runner_class` matches the runner's; against
-   a cross-class baseline both are advisory** (see
-   [Baselines](#baselines-capture--compare) for why). Today's committed baseline
-   is `runner_class=local`, so on `ubuntu-latest` the job currently annotates and
-   exits 0. The nightly `bench-gate` runs the same compare over a larger sample.
+   against the committed baseline via the `bench-baseline` bin. **Time and peak
+   memory enforce only when the baseline's `host_class` matches the runner's**
+   (see [Baselines](#baselines-capture--compare) for why). Today's committed
+   baseline is `host_class=local` and the runner is `ci-ubuntu-latest`, so the
+   step passes `--allow-host-mismatch` and both metrics annotate rather than
+   gate; **phase-share drift enforces regardless of host class.** The nightly
+   `bench-gate` runs the same compare over a larger sample.
 
    The job costs ~30 minutes, so it is gated on a `bench-paths` job that skips it
    when a PR touches nothing perf-relevant (engine crates, bench crates,
@@ -117,9 +135,12 @@ on-demand):
    run, a false negative lets a regression through.
 
 3. **CI-class capture (`bench.yml` `bench-capture`, `workflow_dispatch`).**
-   Captures the cheap subset on `ubuntu-latest` (`runner_class=ci-ubuntu-latest`)
-   and uploads it as an artifact; committing it lands a CI-class baseline that
-   flips **both** metrics to enforcing, with no code change.
+   Captures the cheap subset on `ubuntu-latest` (`host_class=ci-ubuntu-latest`)
+   and uploads it as an artifact. Committing it plus dropping
+   `--allow-host-mismatch` from the compare step lands a real per-PR gate. The
+   `capture_samples` dispatch input controls how many repeat runs are folded into
+   one median + MAD — use ≥ 5 for a baseline meant to gate, since without a noise
+   estimate the budget has to absorb shared-runner flap on its own.
 
 > **Visibility gap (documented; fix is a follow-up).** The per-PR gate only
 > *compiles* benches — `clippy --all --all-features --all-targets` in `ci.yml`
@@ -150,7 +171,7 @@ reference (`guardrails-pre.json`, …), captured and compared by the
 scheme — it is now a directory plus a bin.)
 
 **Capture** — run the benches, then snapshot criterion's estimates plus the
-memory sidecars into a git-stamped baseline:
+memory and meta sidecars into a git-stamped baseline:
 
 ```bash
 cargo bench -p fluree-db-api --bench query_overlay_matrix
@@ -159,29 +180,74 @@ cargo run -p fluree-bench-support --bin bench-baseline -- \
 ```
 
 The baseline records provenance: `git_sha`, `captured_at`, `profile`, `scale`,
-and — load-bearing for the gate — `runner_class` (env
-`FLUREE_BENCH_RUNNER_CLASS`, default `local`) and `host`. The `"pre"` reference
-for a phase is captured at the branch's **merge-base** (see
-`bench-baselines/README.md`).
+and a `host` block — os, arch, cpu model, physical/logical cores, and,
+load-bearing for the gate, `host.class`. The `"pre"` reference for a phase is
+captured at the branch's **merge-base** (see `bench-baselines/README.md`).
 
 **Compare** — after a change, rerun the benches and compare:
 
 ```bash
 cargo run -p fluree-bench-support --bin bench-baseline -- \
-    compare --baseline bench-baselines/guardrails-pre.json [--only <substr>] [--advisory]
+    compare --baseline bench-baselines/guardrails-pre.json \
+    [--only <substr>] [--share-drift-pp 5] [--allow-host-mismatch] [--advisory]
 ```
 
 Each scenario present in both runs is checked against `baseline × (1 +
-budget_pct/100)` from `regression-budget.json`, for both wall-clock time
-(criterion `mean`) and peak memory (`peak_bytes`). **One rule covers both
-metrics:** they enforce when the baseline's `runner_class` matches the comparing
-runner's, and are **advisory** (`::warning::` annotations, non-gating) when it
-doesn't. `--advisory` forces advisory for both.
+budget_pct/100)` from `regression-budget.json`, for wall-clock time, peak memory
+(`peak_bytes`), and — for benches that record them — per-phase time and per-phase
+share.
 
-| baseline vs runner class | time breach | peak_mem breach | exit |
-| --- | --- | --- | --- |
-| matched | fails the gate | fails the gate | 1 |
-| mismatched | `::warning::` | `::warning::` | 0 |
+| metric | units | gated across host classes? |
+| --- | --- | --- |
+| `time` | ns | no |
+| `peak_mem` | bytes | no |
+| `phase_time` | ns | no |
+| `phase_share` | percentage points | **yes** |
+
+**Absolute metrics enforce only within a host class.** A mismatch is a *refusal*
+— exit 2, no verdict — unless `--allow-host-mismatch` downgrades them to
+`::warning::` annotations. `--advisory` forces the downgrade even on a match.
+
+**Share drift always enforces**, because a share is a ratio within a single run:
+the machine cancels. Only share *growth* gates; shares sum to 100, so gating both
+directions would fail a clean improvement twice, once for the phase that got
+better and once for its complement. This is the metric that catches the
+regression an aggregate number hides — a scenario 2% slower overall whose parse
+share moved 60% → 75% has a parse regression masked by a write improvement.
+
+**A corpus mismatch is always a refusal, with no override.** Benches that read an
+input record its SHA-256, byte length, element count, input/output syntax, and
+thread count; comparing a run over one input against a baseline captured over
+another is the most expensive silent failure this gate can produce, because the
+output is indistinguishable from a real regression.
+
+| condition | outcome | exit |
+| --- | --- | --- |
+| within budget | pass | 0 |
+| enforced breach | fail | 1 |
+| host class differs, no `--allow-host-mismatch` | refuse | 2 |
+| corpus sha256 / syntax / thread count differs | refuse | 2 |
+| baseline `schema_version` newer than the binary | refuse | 2 |
+
+### Noise floors
+
+`ubuntu-latest` flap is not a regression, and criterion's confidence interval
+does not measure it — it describes iterations *within* one run. Accumulate
+several independent runs instead:
+
+```bash
+for i in 1 2 3 4 5; do
+  cargo bench -p fluree-db-api --bench query_overlay_matrix
+  cargo run -p fluree-bench-support --bin bench-baseline -- \
+      capture --label ci-pre --out bench-baselines/ci-pre.json --accumulate
+done
+```
+
+With ≥ 5 samples the baseline records a median and a MAD, the gate compares
+medians instead of single-run means, and each budget widens to
+`max(budget_pct, 3 × MAD / median)`. The floor only ever *widens* an envelope: a
+quiet scenario keeps its declared budget. MAD rather than standard deviation
+because one outlier run is the common failure here and barely moves it.
 
 ### Why the gate has two phases
 
@@ -197,21 +263,29 @@ portable of the two signals in the blocking position.
 
 So the gate runs in two phases:
 
-- **Phase 1 (today).** The committed `guardrails-pre.json` is
-  `runner_class=local`, CI runs as `ci-ubuntu-latest`, the classes don't match,
-  and both metrics annotate without gating. The job still earns its keep: the
-  annotations surface real movement on the PR that caused it, and the compare
-  itself exercises the capture/compare machinery.
-- **Phase 2.** Commit a CI-class baseline and both metrics start gating on the
-  next PR, automatically — the rule reads the baseline's `runner_class`, so
-  there is no code or workflow change to make.
+- **Phase 1 (today).** The committed `guardrails-pre.json` is `host_class=local`,
+  CI runs as `ci-ubuntu-latest`, the classes don't match, and the compare step
+  passes `--allow-host-mismatch` so both absolute metrics annotate without
+  gating. The job still earns its keep: the annotations surface real movement on
+  the PR that caused it, share drift gates for any bench that records phases, and
+  the compare itself exercises the capture/compare machinery.
+- **Phase 2.** Commit a CI-class baseline and drop `--allow-host-mismatch`, and
+  both absolute metrics gate from the next PR on.
+
+A note on `host_class` values. The derived default is `{os}-{arch}`, which is
+deliberately coarse and deliberately not a promise: an M1 and an M4 both derive
+`macos-aarch64` and their absolute numbers are not interchangeable. A class is a
+claim *a human makes* that two machines' numbers may be compared, so any host
+whose numbers are meant to gate should set `FLUREE_BENCH_HOST_CLASS` explicitly
+(`ci-ubuntu-latest`, `bench-m8gd`, …) rather than inherit the default.
 
 Two ways to reach phase 2:
 
 1. **Committed CI-class baseline (implemented).** Run `bench.yml`'s
-   `workflow_dispatch` `bench-capture` job, download the artifact, and commit it
-   — its `runner_class=ci-ubuntu-latest` matches CI, so both metrics enforce
-   automatically.
+   `workflow_dispatch` `bench-capture` job with `capture_samples: 5`, download
+   the artifact, commit it, and remove `--allow-host-mismatch` from `ci.yml`'s
+   compare step. Its `host_class=ci-ubuntu-latest` matches CI and its noise floor
+   absorbs runner flap, so both metrics enforce.
 2. **Same-runner interleaved base-vs-HEAD (documented future option).** Measure
    merge-base and HEAD in the *same* job on the *same* runner and compare those,
    instead of any committed cross-machine file — the only design that survives
@@ -268,10 +342,15 @@ For tracing conventions inside the database itself (where to put
 
 ```
 fluree-bench-support/        # chassis (helpers, generators, templates, fixtures)
+fluree-bench-alloc/          # tracking allocator behind the peak_mem metric
 <crate>/benches/<name>.rs    # one file per bench; criterion harness=false
-regression-budget.json       # per-bench gate at the workspace root
-.github/workflows/ci.yml     # gated bench job (per-PR, lands in bench-5)
-.github/workflows/bench-nightly.yml   # full sweep (lands in bench-nightly PR)
+regression-budget.json       # per-bench, per-scale budgets at the workspace root
+bench-baselines/             # committed reference points (see its README)
+.github/workflows/ci.yml     # bench-paths + bench-compare (per-PR, cheap subset)
+.github/workflows/bench.yml  # bench-gate (nightly) + bench-capture (on demand)
+target/criterion/            # criterion estimates — what `capture` reads
+target/fluree-bench-mem/     # peak/total allocation sidecars
+target/fluree-bench-meta/    # corpus identity + phase timing sidecars
 ```
 
 ## Troubleshooting
