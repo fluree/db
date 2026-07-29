@@ -19,6 +19,11 @@
 //! 4. **Deterministic output** - Call `sort()` before formatting for
 //!    deterministic triple ordering (SPO lexicographic).
 //!
+//! 5. **Quads are additive** - [`Quad`] wraps a [`Triple`] with an optional
+//!    graph term and [`Dataset`] holds a default graph plus named ones, so
+//!    triple-only code keeps working unchanged and named graphs are never
+//!    silently folded into the default graph.
+//!
 //! # Example
 //!
 //! ```
@@ -37,15 +42,19 @@
 //! graph.sort();
 //! ```
 
+mod dataset;
 pub mod datatype;
 mod graph;
+mod quad;
 mod sink;
 mod term;
 mod triple;
 pub mod xsd_double;
 
+pub use dataset::Dataset;
 pub use datatype::Datatype;
 pub use graph::Graph;
+pub use quad::Quad;
 pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;
