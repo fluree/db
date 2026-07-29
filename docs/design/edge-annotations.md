@@ -169,6 +169,16 @@ The expansion does **not** emit an `f:reifiesGraph` constraint triple. Graph cor
 
 Multi-source default-graph datasets (`from: [g1, g2]`) wrap each expanded chain in `Pattern::DefaultGraphSource` so the base-edge match correlates per source — otherwise a base-edge from `g1` would cross-join with annotations from `g2`. `collect_var_stats` walks into `DefaultGraphSource` so bridge variables (e.g. `?ann` shared between the wrapper's inner chain and a sibling external triple) are correctly counted as join vars.
 
+### Read lanes for the expanded chain
+
+`DefaultGraphSourceOperator`'s single-graph delegate (`build_single_graph_delegate`, `fluree-db-query/src/default_graph_source.rs`) recognizes the canonical `[base edge + 3 f:reifies*]` shape (`recognize_annotation_edge`) and picks one of three physical lanes:
+
+1. **Forward-arena probe** (`AnnotationEdgeProbeOperator`) — when a sealed annotation arena exists, the overlay is empty, the query is current-state, and policy is root. One sorted merge-scan of the forward arena per query. Handles untyped (`-[p]->`) relationships: a late-materialized `Binding::EncodedPid` predicate decodes through the store's `p_sid_table`.
+2. **Hash sidecar probe** (`HashAnnotationEdgeProbeOperator`, `fluree-db-query/src/annotation_edge_probe.rs`) — no arena needed (bulk-imported roots ship `annotation_index: None`). Drains the three `f:reifies*` predicates ONCE through ordinary planned scans (overlay-merged, policy-filtered) into hash maps, then answers every base-edge row by `(s, p, o)` lookup. Object keys are representation-normalized `GroupKeyOwned`s, so ref and literal reified objects both match. Taken when the driving stream is large (≥ 256 estimated rows) or unknown; the value-only OPTIONAL lane (`AnnotationValueOptionalBuilder`, `fluree-db-query/src/optional.rs`) shares the same map-building machinery.
+3. **Generic join chain** — everything else. `reorder_patterns` orders the chain; the broad-sidecar demotion (`is_broad_annotation_sidecar`) applies only while a connected non-chain alternative can seed, so an untyped relationship's chain (where `f:reifiesPredicate` joins on the base predicate VAR) still drives from a bound-object `f:reifiesSubject`/`f:reifiesObject` probe (per-row fan ≈ node degree) and never from `f:reifiesPredicate` (fan ≈ sidecar / #relationship-types).
+
+A rel var whose properties are read anywhere (`r.prop`, `properties(r)`, …) lowers to this REQUIRED chain — unreified edges do not match, per Cypher's relationship semantics. Value-only rel vars keep the plain base triple + OPTIONAL probe so unreified edges match with a synthesized relationship value.
+
 ## See also
 
 - [Edge annotations (concept doc)](../concepts/edge-annotations.md) — the user-facing surface.
