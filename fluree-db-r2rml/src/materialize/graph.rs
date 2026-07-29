@@ -283,6 +283,30 @@ impl ParentIndexSet {
         }
     }
 
+    /// Approximate resident byte size of the built parent index — the heap held by
+    /// the key tuples and parent subject terms. Used to charge the (otherwise
+    /// unbudgeted) index against the import memory budget (O6). An estimate, not an
+    /// allocator-exact figure: it sums the string bytes of keys and terms plus a
+    /// fixed per-entry map/heap overhead.
+    pub fn estimated_bytes(&self) -> usize {
+        // Per hash-map entry bookkeeping (bucket + Vec<String> key header + term
+        // enum), a deliberately generous ballpark so the guard trips before, not
+        // after, the true peak.
+        const ENTRY_OVERHEAD: usize = 64;
+        let mut total = 0usize;
+        for col_index in self.index.values() {
+            for (cols, key_to_subject) in col_index {
+                total += cols.iter().map(String::len).sum::<usize>();
+                for (key, subject) in key_to_subject {
+                    total += ENTRY_OVERHEAD;
+                    total += key.iter().map(String::len).sum::<usize>();
+                    total += rdf_term_bytes(subject);
+                }
+            }
+        }
+        total
+    }
+
     /// Record a parent TriplesMap's rows from one batch into the index. A no-op
     /// when `tm` is not a foreign-key parent. Rows with a null subject or a null
     /// join key are skipped (they can never satisfy a join).
@@ -327,6 +351,14 @@ impl ParentIndexSet {
         cols.sort();
         cols.dedup();
         cols
+    }
+}
+
+/// Approximate heap bytes held by an [`RdfTerm`], for parent-index budgeting.
+fn rdf_term_bytes(term: &RdfTerm) -> usize {
+    match term {
+        RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s.len(),
+        RdfTerm::Literal { value, .. } => value.len(),
     }
 }
 
@@ -794,6 +826,17 @@ mod tests {
 
         let cols = vec!["c_key".to_string()];
         assert!(merged.is_parent("<#Customer>"));
+        // The budget estimate (O6) reflects a populated index.
+        let empty = ParentIndexSet::new(&mapping).unwrap();
+        assert_eq!(
+            empty.estimated_bytes(),
+            0,
+            "an empty index estimates 0 bytes"
+        );
+        assert!(
+            merged.estimated_bytes() > 0,
+            "a populated index must estimate a nonzero resident size"
+        );
         assert!(
             merged
                 .lookup("<#Customer>", &cols, &["10".to_string()])

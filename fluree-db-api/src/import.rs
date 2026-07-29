@@ -361,12 +361,25 @@ impl ImportConfig {
         }
         let budget_mb = self.effective_memory_budget_mb();
         let max_inflight = self.effective_max_inflight();
-        // Budget ≈ max_inflight * chunk_size * 2.5 + run_budget + 2GB (fixed overhead)
-        // Solve for chunk_size: (budget - 2048) / (max_inflight * 2.5 + 1)
-        let numerator = budget_mb.saturating_sub(2048) as f64;
         let denominator = max_inflight as f64 * 2.5 + 1.0;
-        let raw = (numerator / denominator).floor() as usize;
-        raw.clamp(128, 768)
+        if budget_mb >= 2048 {
+            // Large budget: subtract the ~2GB fixed overhead (index build, dict
+            // merge, OS cache) and divide the rest across the in-flight working
+            // set, clamped to [128, 768] MB. Unchanged behavior.
+            let numerator = (budget_mb - 2048) as f64;
+            (numerator / denominator).floor().clamp(128.0, 768.0) as usize
+        } else {
+            // Sub-2GB budgets (O6): the flat 2GB overhead term underflowed to 0 and
+            // the 128MB clamp floor then applied REGARDLESS of budget — so a
+            // 512MB-budget import used the same 128MB chunk as a 2GB one, and a
+            // 128MB chunk under a 512MB budget blows the budget once the ~2.5x
+            // parse/inflight expansion is counted. Instead reserve ~40% for run
+            // buffers + index build and divide the rest across the working set;
+            // floor at 16MB (still worth a commit), cap at 128MB (continuous with
+            // the large-budget floor at the 2GB boundary).
+            let working = budget_mb as f64 * 0.6 / denominator;
+            (working.floor() as usize).clamp(16, 128)
+        }
     }
 
     /// Effective parse/worker thread count.
@@ -4002,10 +4015,13 @@ where
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<
             std::result::Result<(usize, ParsedChunk), String>,
         >(num_threads);
-        let chunk_size_bytes = config.effective_chunk_size_mb() as usize * 1024 * 1024;
+        let chunk_size_bytes = config.effective_chunk_size_mb() * 1024 * 1024;
         // The parallelism knob bounds the produce side's concurrent scans (O5:
         // pin-all + Pass-1 pre-index) inside the materializer.
         let producer_parallelism = num_threads.max(1);
+        // Import memory budget in bytes, so the materializer can charge the resident
+        // FK parent index against it and fail loud on overflow (O6).
+        let memory_budget_bytes = config.effective_memory_budget_mb() * 1024 * 1024;
         let shared_alloc = Arc::clone(&shared_alloc);
         let spool_config = Arc::clone(&spool_config);
         let spool_dir = spool_dir.clone();
@@ -4043,6 +4059,7 @@ where
                     &vs.graph_source_id,
                     chunk_size_bytes,
                     producer_parallelism,
+                    memory_budget_bytes,
                     &ctx,
                     |idx, parsed| result_tx.send(Ok((idx, parsed))).is_ok(),
                 ));
@@ -6495,6 +6512,41 @@ mod resource_model_tests {
         assert_eq!(c.effective_parse_threads(), 64);
         // ...and heavy workers follow it.
         assert_eq!(c.effective_heavy_workers(), 64);
+    }
+
+    #[test]
+    fn chunk_size_scales_below_2gb_budget_not_floored_at_128() {
+        // O6: any sub-2GB budget used to underflow the fixed 2GB overhead term to 0
+        // and floor at 128MB REGARDLESS of budget. A 512MB budget must now yield a
+        // chunk WELL below 128MB so peak RAM tracks the budget.
+        let _env = EnvGuard::clear_overrides();
+        let small = cfg(512, 0, 0).effective_chunk_size_mb();
+        assert!(
+            (16..128).contains(&small),
+            "512MB budget must scale the chunk into [16,128), got {small}"
+        );
+        // Monotone-ish: a smaller budget must not produce a LARGER chunk.
+        let tiny = cfg(256, 0, 0).effective_chunk_size_mb();
+        assert!(
+            tiny <= small,
+            "256MB chunk {tiny} must not exceed 512MB chunk {small}"
+        );
+        // Hard floor at 16MB keeps a chunk worth committing.
+        let floor = cfg(64, 0, 0).effective_chunk_size_mb();
+        assert!(floor >= 16, "chunk floors at 16MB, got {floor}");
+    }
+
+    #[test]
+    fn chunk_size_large_budget_behavior_unchanged() {
+        // The >=2GB path is untouched: still [128,768], derived from budget-2048.
+        let _env = EnvGuard::clear_overrides();
+        let big = cfg(8192, 0, 0).effective_chunk_size_mb();
+        assert!(
+            (128..=768).contains(&big),
+            "8GB budget chunk in [128,768], got {big}"
+        );
+        // An explicit chunk size still wins over the derivation.
+        assert_eq!(cfg(512, 200, 0).effective_chunk_size_mb(), 200);
     }
 
     #[test]

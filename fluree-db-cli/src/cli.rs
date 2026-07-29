@@ -1133,12 +1133,15 @@ pub enum Commands {
     /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
     /// `--max-performance` on a cleared machine to auto-size to the host.
     ///
-    /// BUDGET HONESTY: `--memory-budget-mb` is advisory below ~2GB — the import
-    /// pipeline assumes a ~2GB fixed overhead and floors the chunk size at 128MB,
-    /// so a smaller budget mainly lowers parallelism, not peak RAM. Peak RAM is
-    /// roughly 2GB + parallelism × 128MB × 2.5. The foreign-key parent index the
-    /// enumerator holds during the build sits OUTSIDE this budget and grows with
-    /// the largest parent (dimension) table — size the host accordingly.
+    /// BUDGET MODEL: `--memory-budget-mb` now scales the chunk size for sub-2GB
+    /// budgets too (previously any budget below ~2GB underflowed to a fixed 128MB
+    /// chunk regardless — O6); below 2GB the chunk is ~budget×0.6 / working-set,
+    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 plus
+    /// the FK parent index. That parent index — held resident for the whole build —
+    /// is now CHARGED against the budget (up to ~50% of it) and the build FAILS
+    /// LOUD if it would overflow, rather than silently OOM the host. Verify is
+    /// memory-bounded in both modes (O2): peak is O(sampled subjects) for `quick`
+    /// and O(one external-sort run) for `full`.
     Materialize {
         /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
         graph_source: String,

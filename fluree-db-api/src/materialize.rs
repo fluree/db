@@ -55,6 +55,19 @@ pub enum MaterializeError {
          (no table snapshots were captured — did the provider scan the tables?)"
     )]
     EmptyWatermark,
+    /// The resident foreign-key parent index outgrew its share of the import
+    /// memory budget (O6). Fail loud rather than let an unbudgeted structure OOM a
+    /// bounded box — the previous behavior. Raise `--memory-budget-mb` or reduce
+    /// the FK-parent (dimension) key cardinality.
+    #[error(
+        "foreign-key parent index needs ~{estimated_mb} MB but the import memory budget allows \
+         ~{budget_mb} MB for it; raise --memory-budget-mb or reduce the FK-parent (dimension) \
+         key cardinality"
+    )]
+    ParentIndexBudgetExceeded {
+        estimated_mb: usize,
+        budget_mb: usize,
+    },
 }
 
 /// Columns a scan of `tm` must project: the TriplesMap's own referenced columns
@@ -551,6 +564,37 @@ pub fn read_stamp(txn_meta: &[TxnMetaEntry]) -> Option<WatermarkStamp> {
     })
 }
 
+/// Fraction of the import memory budget the FK parent index may occupy before the
+/// build fails loud (O6). The rest of the budget carries the in-flight chunks,
+/// spool buffers, and index-build working set; the parent index is resident for
+/// the WHOLE build, so it gets a conservative half.
+const PARENT_INDEX_BUDGET_FRACTION: f64 = 0.5;
+
+/// The parent-index byte budget derived from the import memory budget. `0` in →
+/// `0` out (guard disabled when the budget is unknown / auto).
+fn parent_index_budget_bytes(memory_budget_bytes: usize) -> usize {
+    (memory_budget_bytes as f64 * PARENT_INDEX_BUDGET_FRACTION) as usize
+}
+
+/// Fail loud (O6) if the resident FK parent index has outgrown its budget share.
+/// A no-op when `budget_bytes == 0` (budget unknown / guard disabled).
+fn check_parent_index_budget(
+    parents: &ParentIndexSet,
+    budget_bytes: usize,
+) -> Result<(), MaterializeError> {
+    if budget_bytes == 0 {
+        return Ok(());
+    }
+    let used = parents.estimated_bytes();
+    if used > budget_bytes {
+        return Err(MaterializeError::ParentIndexBudgetExceeded {
+            estimated_mb: used / (1024 * 1024),
+            budget_mb: budget_bytes / (1024 * 1024),
+        });
+    }
+    Ok(())
+}
+
 /// Pin every table's Iceberg snapshot up front, before emission (DEC-003 §17(a)).
 /// Awaiting `scan_table` runs the `loadTable` + snapshot capture as the table
 /// context resolves; the returned stream is dropped unpolled, so no Parquet data
@@ -600,6 +644,7 @@ pub async fn drive_virtual_import<F>(
     graph_source_id: &str,
     chunk_size_bytes: usize,
     parallelism: usize,
+    memory_budget_bytes: usize,
     ctx: &VirtualChunkContext<'_>,
     mut emit_chunk: F,
 ) -> Result<MaterializeStats, MaterializeError>
@@ -609,6 +654,10 @@ where
     let mapping = provider.compiled_mapping(graph_source_id, None).await?;
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
+    // The FK parent index is fully resident for the whole build and was outside
+    // any budget (O6). Charge it against a fraction of the import budget and fail
+    // loud if it overflows. `0` (no budget known) disables the guard.
+    let parent_index_budget = parent_index_budget_bytes(memory_budget_bytes);
 
     // Pin-all pre-pass — pin every table's snapshot before emission so the
     // watermark is complete and cross-table skew is bounded to seconds (§17(a)).
@@ -657,6 +706,7 @@ where
                 parents.merge_from(partial);
             }
         }
+        check_parent_index_budget(&parents, parent_index_budget)?;
     }
 
     // Pass 2 — emit into the byte-budgeted chunker; encode + ship completed
@@ -710,6 +760,11 @@ where
             triples = stats.total_triples() - triples_before,
             "materialize.phase table_scan_emit"
         );
+        // A lazily-indexed dimension grew the resident parent index during its own
+        // emit scan — recheck the budget (O6).
+        if lazy_index {
+            check_parent_index_budget(&parents, parent_index_budget)?;
+        }
     }
 
     // Assemble the twin's completion stamp now that every table is pinned and
@@ -1858,6 +1913,30 @@ mod tests {
             let off = super::seeded_offset(seed, 100, 3);
             assert!(off <= 97, "offset {off} must leave room for k subjects");
         }
+    }
+
+    // --- O6 budget honesty: FK parent-index accounting ---
+
+    #[test]
+    fn parent_index_budget_is_half_the_import_budget() {
+        assert_eq!(
+            super::parent_index_budget_bytes(0),
+            0,
+            "an unknown/auto budget disables the guard"
+        );
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(super::parent_index_budget_bytes(gib), gib / 2);
+    }
+
+    #[test]
+    fn parent_index_budget_guard_passes_empty_and_disabled() {
+        use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+        use fluree_db_r2rml::materialize::ParentIndexSet;
+        let parents = ParentIndexSet::new(&CompiledR2rmlMapping::default()).unwrap();
+        // budget 0 → guard off.
+        assert!(super::check_parent_index_budget(&parents, 0).is_ok());
+        // empty index (0 bytes) under a positive budget passes.
+        assert!(super::check_parent_index_budget(&parents, 1024).is_ok());
     }
 
     // --- O2 verify: bounded external sort + streaming diff ---
