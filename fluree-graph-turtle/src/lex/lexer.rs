@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use fluree_graph_ir::LineIndex;
 use winnow::ascii::digit1;
 use winnow::combinator::{alt, opt, peek, preceded};
 use winnow::error::ContextError;
@@ -112,60 +113,40 @@ impl<'a> StreamingLexer<'a> {
 }
 
 /// Create a descriptive error message for an invalid token.
+///
+/// The message is a one-line headline followed by the shared caret block
+/// ([`LineIndex::caret_block`]) — the same block a
+/// [`Diagnostic`](fluree_graph_ir::Diagnostic) renders, so a raw lexer error
+/// and a structured diagnostic point at a position identically. The split at
+/// the first newline is load-bearing: [`TurtleError::to_diagnostic`] takes
+/// the headline from it.
+///
+/// The index is built here, on the error path only — a clean parse never
+/// scans the input for line starts.
 fn make_lex_error(source: &str, position: usize, input: &Input<'_>) -> TurtleError {
     let remaining = input.as_ref();
     let bad_char = remaining.chars().next().unwrap_or('?');
-    let (line, col) = lex_line_col(source, position);
-    let line_content = lex_get_line(source, line);
+    let index = LineIndex::new(source);
+    let (line, col) = index.line_col(position);
 
-    let pointer = " ".repeat(col.saturating_sub(1));
-    let message = if bad_char == '"' || bad_char == '\'' {
-        format!(
-            "unterminated string literal at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
-        )
+    let headline = if bad_char == '"' || bad_char == '\'' {
+        format!("unterminated string literal at line {line}, column {col}")
     } else if bad_char == '<' {
-        format!(
-            "invalid or unterminated IRI at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
-        )
+        format!("invalid or unterminated IRI at line {line}, column {col}")
     } else if !bad_char.is_ascii() && !is_pn_chars_base(bad_char) {
         format!(
-            "unexpected character '{}' (U+{:04X}) at line {}, column {}\n  |\n{} | {}\n  | {}^",
+            "unexpected character '{}' (U+{:04X}) at line {line}, column {col}",
             bad_char.escape_unicode(),
             bad_char as u32,
-            line,
-            col,
-            line,
-            line_content,
-            pointer
         )
     } else {
-        format!(
-            "unexpected character '{bad_char}' at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
-        )
+        format!("unexpected character '{bad_char}' at line {line}, column {col}")
     };
 
-    TurtleError::Lexer { position, message }
-}
-
-fn lex_line_col(source: &str, position: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for (i, c) in source.char_indices() {
-        if i >= position {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
+    TurtleError::Lexer {
+        position,
+        message: format!("{headline}\n{}", index.caret_block(line, col)),
     }
-    (line, col)
-}
-
-fn lex_get_line(source: &str, line_num: usize) -> &str {
-    source.lines().nth(line_num.saturating_sub(1)).unwrap_or("")
 }
 
 /// Skip whitespace and comments.
@@ -1387,5 +1368,73 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("line 2"));
         assert!(msg.contains("$"));
+    }
+}
+
+#[cfg(test)]
+mod caret_pin_tests {
+    use super::*;
+
+    /// Byte-for-byte pin on the caret diagnostics the lexer has always
+    /// produced. `make_lex_error` now composes its message from a headline
+    /// plus [`LineIndex::caret_block`] instead of formatting the block
+    /// inline; that refactor is only safe if the rendered bytes are
+    /// unchanged, and this is what says so.
+    ///
+    /// It also pins the structural split the diagnostic adapter depends on:
+    /// the headline is everything before the FIRST newline, the caret block
+    /// is everything after it.
+    #[test]
+    fn lexer_messages_render_exactly_as_before() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "ex:name $ ex:value",
+                "unexpected character '$' at line 1, column 9\n  |\n1 | ex:name $ ex:value\n  |         ^",
+            ),
+            (
+                "ex:name \"unterminated",
+                "unterminated string literal at line 1, column 9\n  |\n1 | ex:name \"unterminated\n  |         ^",
+            ),
+            (
+                "ex:name \"ok\" .\nex:other $ .",
+                "unexpected character '$' at line 2, column 10\n  |\n2 | ex:other $ .\n  |          ^",
+            ),
+            (
+                "<http://example.org/unterminated",
+                "invalid or unterminated IRI at line 1, column 1\n  |\n1 | <http://example.org/unterminated\n  | ^",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let err = tokenize(input).expect_err("input must not lex");
+            let TurtleError::Lexer { message, .. } = &err else {
+                panic!("expected a lexer error for {input:?}, got {err:?}");
+            };
+            assert_eq!(message, expected, "input {input:?}");
+
+            let (headline, block) = message
+                .split_once('\n')
+                .expect("every caret message is a headline then a block");
+            assert!(!headline.contains('\n'));
+            assert!(block.starts_with("  |\n") && block.ends_with('^'));
+        }
+    }
+
+    /// A non-ASCII, non-name character keeps its escaped spelling and its
+    /// code point — and the caret still counts CHARACTERS, so it lands under
+    /// the offending glyph rather than drifting right by its extra bytes.
+    #[test]
+    fn non_ascii_messages_and_caret_columns_are_unchanged() {
+        // Two multi-byte characters precede the offender, so its byte offset
+        // (15) and its column (14) differ — a byte-based column would put the
+        // caret in the wrong place.
+        let err = tokenize("ex:a \"héllö\" § .").expect_err("§ must not lex");
+        let TurtleError::Lexer { message, .. } = &err else {
+            panic!("expected a lexer error, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "unexpected character '\\u{a7}' (U+00A7) at line 1, column 14\n  |\n1 | ex:a \"héllö\" § .\n  |              ^"
+        );
     }
 }
