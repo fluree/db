@@ -86,10 +86,16 @@ fn print_usage() {
          else {{os}}-{{arch}}). A mismatch is a REFUSAL (exit {EXIT_REFUSED}) unless\n  \
          --allow-host-mismatch downgrades those metrics to advisory.\n  \
          phase_share drift enforces regardless of host class — shares are ratios\n  \
-         within one run, so the machine cancels.\n  \
+         within one run, so the machine cancels; a phase that appears or\n  \
+         disappears is gated on its share alone.\n  \
          A corpus mismatch (sha256 / syntax / thread count) is always a refusal:\n  \
          there is no posture in which comparing different inputs is meaningful.\n  \
          --advisory forces every absolute metric advisory.\n\n\
+         --host-class LABELS this host; it does not make it comparable. Use it to\n  \
+         declare a class you genuinely are (CI pinning its runner class), never to\n  \
+         silence a refusal — that turns a refusal into a false ENFORCEMENT against\n  \
+         hardware the baseline never ran on. To compare anyway, use\n  \
+         --allow-host-mismatch.\n\n\
          EXIT CODES\n  \
          0 within budget   {EXIT_BREACH} enforced budget breach   {EXIT_REFUSED} refused to compare\n\n\
          Run the benches first (`cargo bench ...`); this tool reads criterion's\n\
@@ -224,16 +230,15 @@ fn run_capture(args: &[String]) -> ExitCode {
 
     if flags.contains_key("--accumulate") {
         match load_baseline(&out_path) {
-            Ok(prev) => {
-                if prev.host.class != file.host.class {
-                    eprintln!(
-                        "refusing to accumulate: existing baseline host_class '{}' != this run's '{}'",
-                        prev.host.class, file.host.class
-                    );
+            // `accumulate` enforces the host-class and corpus guards itself, so
+            // the CLI has no policy of its own to apply here.
+            Ok(prev) => match accumulate(&prev, &file) {
+                Ok(merged) => file = merged,
+                Err(e) => {
+                    eprintln!("{e}");
                     return ExitCode::from(EXIT_REFUSED);
                 }
-                file = accumulate(&prev, &file);
-            }
+            },
             // First pass of an accumulation loop: nothing to merge yet.
             Err(_) if !out_path.exists() => {}
             Err(e) => {
@@ -426,6 +431,9 @@ fn run_compare(args: &[String]) -> ExitCode {
             "new scenarios (no baseline entry): {}",
             report.new_scenarios.join(", ")
         );
+    }
+    for anomaly in &report.anomalies {
+        println!("::warning::{anomaly}");
     }
 
     let advisories: Vec<_> = report.advisories().collect();

@@ -177,9 +177,15 @@ impl CorpusInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PhaseTiming {
     pub ns: f64,
-    /// `ns / Σns × 100`, computed once at record time by
-    /// [`ScenarioMeta::with_phase_ns`] so the share can never disagree with the
-    /// nanoseconds beside it.
+    /// `ns / Σns × 100` across the scenario's measured phases.
+    ///
+    /// [`ScenarioMeta::with_phase_ns`] computes this from the nanoseconds, so
+    /// anything built through that constructor is self-consistent. That is a
+    /// property of the constructor, **not an invariant of the type**: both
+    /// fields are public, and a `PhaseTiming` deserialized from a baseline file
+    /// is untrusted input that can say whatever the file says. `compare`
+    /// therefore reports a scenario whose shares don't sum to 100% instead of
+    /// assuming they do.
     pub share_pct: f64,
 }
 
@@ -207,24 +213,32 @@ impl ScenarioMeta {
     /// *measured* phases, which is what makes derived-by-subtraction phases
     /// (per the `cypher_phase_profile.rs` model) safe to include.
     ///
+    /// **Merges** into any phases already recorded, and recomputes every share
+    /// over the combined total, so a bench that reports its phases in more than
+    /// one call still ends up with one consistent set. A repeated phase name
+    /// overwrites its previous nanoseconds. Replacing instead of merging would
+    /// silently discard the earlier call's phases while leaving the shares
+    /// looking perfectly well-formed — the failure would be invisible in the
+    /// output.
+    ///
     /// A zero total leaves every share at 0.0 rather than dividing by zero.
     pub fn with_phase_ns<I, S>(mut self, phases: I) -> Self
     where
         I: IntoIterator<Item = (S, f64)>,
         S: Into<String>,
     {
-        let collected: Vec<(String, f64)> = phases
-            .into_iter()
-            .map(|(name, ns)| (name.into(), ns))
-            .collect();
-        let total: f64 = collected.iter().map(|(_, ns)| *ns).sum();
-        self.phases = collected
-            .into_iter()
-            .map(|(name, ns)| {
-                let share_pct = if total > 0.0 { ns / total * 100.0 } else { 0.0 };
-                (name, PhaseTiming { ns, share_pct })
-            })
-            .collect();
+        for (name, ns) in phases {
+            self.phases
+                .insert(name.into(), PhaseTiming { ns, share_pct: 0.0 });
+        }
+        let total: f64 = self.phases.values().map(|p| p.ns).sum();
+        for timing in self.phases.values_mut() {
+            timing.share_pct = if total > 0.0 {
+                timing.ns / total * 100.0
+            } else {
+                0.0
+            };
+        }
         self
     }
 
@@ -418,6 +432,29 @@ mod tests {
         assert_eq!(meta.phases["parse"].share_pct, 75.0);
         let total: f64 = meta.phases.values().map(|p| p.share_pct).sum();
         assert!((total - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn with_phase_ns_merges_and_recomputes_shares_over_the_union() {
+        // A bench that reports phases in two calls must end up with one
+        // consistent set. Replacing would drop `read` while leaving the
+        // remaining shares looking perfectly well-formed — invisible in output.
+        let meta = ScenarioMeta::new()
+            .with_phase_ns([("read", 1.0e9)])
+            .with_phase_ns([("parse", 3.0e9)]);
+        assert_eq!(meta.phases.len(), 2);
+        assert_eq!(meta.phases["read"].share_pct, 25.0);
+        assert_eq!(meta.phases["parse"].share_pct, 75.0);
+    }
+
+    #[test]
+    fn with_phase_ns_overwrites_a_repeated_phase_name() {
+        let meta = ScenarioMeta::new()
+            .with_phase_ns([("parse", 1.0e9), ("write", 1.0e9)])
+            .with_phase_ns([("parse", 3.0e9)]);
+        assert_eq!(meta.phases["parse"].ns, 3.0e9);
+        assert_eq!(meta.phases["parse"].share_pct, 75.0);
+        assert_eq!(meta.phases["write"].share_pct, 25.0);
     }
 
     #[test]

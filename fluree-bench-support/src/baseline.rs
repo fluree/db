@@ -40,7 +40,7 @@
 //!   because the output is indistinguishable from a real regression. There is no
 //!   override.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,10 @@ pub const MIN_NOISE_SAMPLES: u32 = 5;
 /// Host class recorded by schema-1 baselines that predate the host block and
 /// carried no `runner_class` either.
 const LEGACY_DEFAULT_HOST_CLASS: &str = "local";
+
+/// How far a scenario's phase shares may sum from 100% before `compare` says so.
+/// Generous, because this catches hand-assembled data, not rounding.
+const SHARE_SUM_TOLERANCE_PP: f64 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Host
@@ -586,11 +590,50 @@ pub fn capture(
 ///
 /// Scenarios absent from `fresh` keep their prior stats untouched — a subset
 /// rerun tops up only what it measured. Scenarios new in `fresh` start their own
-/// sample series. `prev`'s provenance (label, sha, host) is replaced by
-/// `fresh`'s: the accumulated file describes the run that finished last, and a
-/// host change mid-accumulation is exactly the thing the host gate should catch
-/// on the next compare rather than something to average over.
-pub fn accumulate(prev: &BaselineFile, fresh: &BaselineFile) -> BaselineFile {
+/// sample series.
+///
+/// # Refusals
+///
+/// Accumulation is the one operation that *destroys* the evidence of a mismatch
+/// rather than reporting it: fold a run from another machine, or over another
+/// corpus, into the sample vector and the resulting median and MAD are a blend
+/// of two populations that no later `compare` can unpick. The provenance it
+/// would have been caught by is overwritten in the same breath, because the
+/// accumulated file takes `fresh`'s label, sha, and host.
+///
+/// So both guards live here, in the library, rather than in the CLI that
+/// happens to call it — a bench harness or script calling `accumulate` directly
+/// gets the same protection:
+///
+/// - **host class** must match between `prev` and `fresh`.
+/// - **corpus identity** must match for every scenario present in both,
+///   resolved entry-then-file exactly as [`compare`] resolves it.
+pub fn accumulate(prev: &BaselineFile, fresh: &BaselineFile) -> Result<BaselineFile, String> {
+    if prev.host.class != fresh.host.class {
+        return Err(format!(
+            "refusing to accumulate across host classes: existing baseline is '{}' ({}), this run \
+             is '{}' ({}). Samples from different machines cannot be pooled into one median/MAD.",
+            prev.host.class,
+            prev.host.describe(),
+            fresh.host.class,
+            fresh.host.describe(),
+        ));
+    }
+    for id in prev.entries.keys() {
+        if !fresh.entries.contains_key(id) {
+            continue;
+        }
+        if let (Some(prev_corpus), Some(fresh_corpus)) = (prev.corpus_for(id), fresh.corpus_for(id))
+        {
+            if let Some(detail) = prev_corpus.identity_mismatch(fresh_corpus) {
+                return Err(format!(
+                    "refusing to accumulate across corpora for {id}: {detail}. Samples over \
+                     different inputs cannot be pooled into one median/MAD."
+                ));
+            }
+        }
+    }
+
     let mut out = fresh.clone();
     for (id, prev_entry) in &prev.entries {
         let prior: Vec<f64> = prev_entry
@@ -619,7 +662,7 @@ pub fn accumulate(prev: &BaselineFile, fresh: &BaselineFile) -> BaselineFile {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 pub fn load_baseline(path: &Path) -> Result<BaselineFile, String> {
@@ -682,12 +725,31 @@ impl Metric {
     }
 }
 
+/// Whether a phase exists on both sides of a comparison, or only one.
+///
+/// A phase appearing or disappearing is a change in the *shape* of the
+/// pipeline, and it is invisible to a same-name comparison. Tracking it is what
+/// stops work relocating into an unmeasured phase from reading as an
+/// improvement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhasePresence {
+    #[default]
+    Both,
+    /// New in this run — no baseline counterpart.
+    AddedInCurrent,
+    /// In the baseline but gone from this run.
+    MissingFromCurrent,
+}
+
 #[derive(Debug, Clone)]
 pub struct Comparison {
     pub id: String,
     pub metric: Metric,
     /// Phase name for the per-phase metrics.
     pub phase: Option<String>,
+    /// Whether this phase existed on both sides. Always [`PhasePresence::Both`]
+    /// for whole-scenario metrics.
+    pub presence: PhasePresence,
     pub baseline: f64,
     pub observed: f64,
     /// Percent change for time/memory metrics; **percentage points** of
@@ -703,12 +765,18 @@ pub struct Comparison {
 }
 
 impl Comparison {
-    /// `"<id> [<metric>]"`, with the phase folded in for per-phase rows.
+    /// `"<id> [<metric>]"`, with the phase folded in for per-phase rows and
+    /// one-sided phases marked, since a bare name would hide the shape change.
     pub fn label(&self) -> String {
-        match &self.phase {
-            Some(phase) => format!("{}::{} [{}]", self.id, phase, self.metric.as_str()),
-            None => format!("{} [{}]", self.id, self.metric.as_str()),
-        }
+        let Some(phase) = &self.phase else {
+            return format!("{} [{}]", self.id, self.metric.as_str());
+        };
+        let mark = match self.presence {
+            PhasePresence::Both => "",
+            PhasePresence::AddedInCurrent => " (NEW)",
+            PhasePresence::MissingFromCurrent => " (VANISHED)",
+        };
+        format!("{}::{}{} [{}]", self.id, phase, mark, self.metric.as_str())
     }
 }
 
@@ -788,6 +856,9 @@ pub struct CompareReport {
     /// Comparisons the gate refused to make. Any entry here fails the gate,
     /// distinctly from a budget breach.
     pub fatal: Vec<FatalMismatch>,
+    /// Data that looks wrong but does not invalidate the comparison — reported,
+    /// never gating. Today: phase shares that don't sum to 100%.
+    pub anomalies: Vec<String>,
     /// Why absolute metrics are advisory, when they are.
     pub advisory_reason: Option<String>,
 }
@@ -884,6 +955,136 @@ fn classify_share(baseline_pct: f64, observed_pct: f64, drift_pp: f64) -> (f64, 
     (delta_pp, status)
 }
 
+/// Emit the per-phase rows for one scenario, over the UNION of the two sides'
+/// phase names.
+///
+/// Walking only the baseline's phases is how a regression hides: move work into
+/// a phase the baseline never had and the old phase's share *falls*, which
+/// reads as an improvement, while the new phase — carrying the cost — produces
+/// no row at all. So a one-sided phase is gated on its share alone:
+///
+/// - **new in current**: breach when the phase claims more than the drift
+///   threshold of the run. It has no baseline, so its whole share is drift.
+/// - **gone from current**: breach when it *used* to claim more than the
+///   threshold. Work that large did not evaporate; it moved somewhere, and the
+///   somewhere is not being measured.
+///
+/// Neither one-sided case emits a `phase_time` row: with nothing on one side
+/// there is no ratio to report, and a row reading "ok" against a zero baseline
+/// would be worse than no row.
+fn compare_phases(
+    report: &mut CompareReport,
+    id: &str,
+    base: &BaselineEntry,
+    cur: &BaselineEntry,
+    time_budget_pct: f64,
+    share_drift_pp: f64,
+    advisory: bool,
+) {
+    let names: BTreeSet<&String> = base.phases.keys().chain(cur.phases.keys()).collect();
+    for phase in names {
+        let share_row =
+            |presence, baseline: f64, observed: f64, delta_pp: f64, status| Comparison {
+                id: id.to_string(),
+                metric: Metric::PhaseShare,
+                phase: Some(phase.clone()),
+                presence,
+                baseline,
+                observed,
+                change_pct: delta_pp,
+                budget_pct: share_drift_pp,
+                status,
+                // Shares are ratios within one run, so the machine cancels. This is
+                // the one signal a cross-host comparison keeps, and making it
+                // advisory alongside the absolute metrics would throw away the
+                // entire reason to compare across hosts at all.
+                enforced: true,
+            };
+
+        match (base.phases.get(phase), cur.phases.get(phase)) {
+            (Some(base_phase), Some(cur_phase)) => {
+                let (change_pct, status) = classify(base_phase.ns, cur_phase.ns, time_budget_pct);
+                report.comparisons.push(Comparison {
+                    id: id.to_string(),
+                    metric: Metric::PhaseTime,
+                    phase: Some(phase.clone()),
+                    presence: PhasePresence::Both,
+                    baseline: base_phase.ns,
+                    observed: cur_phase.ns,
+                    change_pct,
+                    budget_pct: time_budget_pct,
+                    status,
+                    enforced: !advisory,
+                });
+                let (delta_pp, status) =
+                    classify_share(base_phase.share_pct, cur_phase.share_pct, share_drift_pp);
+                report.comparisons.push(share_row(
+                    PhasePresence::Both,
+                    base_phase.share_pct,
+                    cur_phase.share_pct,
+                    delta_pp,
+                    status,
+                ));
+            }
+            (None, Some(cur_phase)) => {
+                let status = if cur_phase.share_pct > share_drift_pp {
+                    CompareStatus::Exceeded
+                } else {
+                    CompareStatus::Within
+                };
+                report.comparisons.push(share_row(
+                    PhasePresence::AddedInCurrent,
+                    0.0,
+                    cur_phase.share_pct,
+                    cur_phase.share_pct,
+                    status,
+                ));
+            }
+            (Some(base_phase), None) => {
+                let status = if base_phase.share_pct > share_drift_pp {
+                    CompareStatus::Exceeded
+                } else {
+                    CompareStatus::Within
+                };
+                report.comparisons.push(share_row(
+                    PhasePresence::MissingFromCurrent,
+                    base_phase.share_pct,
+                    0.0,
+                    -base_phase.share_pct,
+                    status,
+                ));
+            }
+            (None, None) => unreachable!("phase name came from one of the two maps"),
+        }
+    }
+}
+
+/// Shares are constructed to sum to 100 across a scenario's measured phases,
+/// but that is a property of [`crate::meta::ScenarioMeta::with_phase_ns`], not
+/// an invariant — the fields are public and a baseline file is untrusted input.
+/// A sum far from 100 means the shares were hand-written or assembled by
+/// something other than the constructor, which makes every drift number on that
+/// scenario suspect. Report it; do not gate on it, since the drift comparison
+/// is still internally consistent and failing here would block on a cosmetic
+/// defect.
+fn note_share_sum_anomaly(
+    report: &mut CompareReport,
+    id: &str,
+    side: &str,
+    phases: &BTreeMap<String, PhaseTiming>,
+) {
+    if phases.is_empty() {
+        return;
+    }
+    let sum: f64 = phases.values().map(|p| p.share_pct).sum();
+    if (sum - 100.0).abs() > SHARE_SUM_TOLERANCE_PP {
+        report.anomalies.push(format!(
+            "{id}: {side} phase shares sum to {sum:.1}%, not 100% — drift numbers for this \
+             scenario are only as trustworthy as the shares they came from"
+        ));
+    }
+}
+
 /// Compare a current capture against a baseline under the given budgets.
 ///
 /// Returns a report rather than a `Result`: a refusal to compare
@@ -923,9 +1124,13 @@ pub fn compare(
                 current.host.class,
                 current.host.describe(),
             ),
-            remedy: "recapture on this host class, set FLUREE_BENCH_HOST_CLASS / --host-class to \
-                     the class the baseline was captured on, or pass --allow-host-mismatch to \
-                     compare share drift only (absolute time and memory become advisory)"
+            // Deliberately does NOT suggest relabelling this host to the
+            // baseline's class. Renaming a machine does not make its numbers
+            // comparable — it converts this refusal into a silent, confident
+            // ENFORCEMENT against a baseline from different hardware, which is
+            // the exact failure the refusal exists to prevent.
+            remedy: "pass --allow-host-mismatch to compare share drift only (absolute time and \
+                     memory become advisory), or recapture the baseline on this host class"
                 .to_string(),
         });
         return report;
@@ -984,83 +1189,69 @@ pub fn compare(
         }
 
         let declared_budget = budget_for_id(budget, id);
-        // A noise floor only ever *widens* the envelope: it is a statement about
-        // how much run-to-run movement this scenario shows on this machine, and
-        // a budget tighter than the noise can only produce false alarms.
-        let noise_floor = base.noise_floor_pct().max(cur.noise_floor_pct());
-        let budget_pct = declared_budget.max(noise_floor);
+        // The noise floor is a WALL-CLOCK statement, and it comes from the
+        // BASELINE only. Two halves, both load-bearing:
+        //
+        // - Wall-clock only. A tracking allocator's peak is near-deterministic
+        //   for a given workload; widening the memory budget by a *timing* MAD
+        //   would let a real allocation regression through on the strength of a
+        //   noisy clock. `time_budget_pct` therefore never reaches peak_mem.
+        // - Baseline only. The floor says "this is how much this scenario
+        //   moves on a quiet machine". Taking the current run's floor too lets
+        //   an erratic run widen its own budget — the worse the run behaves,
+        //   the more it is forgiven, which inverts the gate.
+        //
+        // Within those bounds the floor only ever *widens*: a budget tighter
+        // than the measured noise can only produce false alarms.
+        let time_budget_pct = declared_budget.max(base.noise_floor_pct());
 
         if base.effective_ns() > 0.0 {
             let (change_pct, status) =
-                classify(base.effective_ns(), cur.effective_ns(), budget_pct);
+                classify(base.effective_ns(), cur.effective_ns(), time_budget_pct);
             report.comparisons.push(Comparison {
                 id: id.clone(),
                 metric: Metric::Time,
                 phase: None,
+                presence: PhasePresence::Both,
                 baseline: base.effective_ns(),
                 observed: cur.effective_ns(),
                 change_pct,
-                budget_pct,
+                budget_pct: time_budget_pct,
                 status,
                 enforced: !advisory,
             });
         }
         if let (Some(bm), Some(cm)) = (base.mem, cur.mem) {
             let (change_pct, status) =
-                classify(bm.peak_bytes as f64, cm.peak_bytes as f64, budget_pct);
+                classify(bm.peak_bytes as f64, cm.peak_bytes as f64, declared_budget);
             report.comparisons.push(Comparison {
                 id: id.clone(),
                 metric: Metric::PeakMem,
                 phase: None,
+                presence: PhasePresence::Both,
                 baseline: bm.peak_bytes as f64,
                 observed: cm.peak_bytes as f64,
                 change_pct,
-                budget_pct,
+                // Declared budget, NOT the timing-derived floor.
+                budget_pct: declared_budget,
                 status,
-                // Same rule as time: a tracking allocator's peak is no more
+                // Same host rule as time: a tracking allocator's peak is no more
                 // portable across machine classes than wall clock is.
                 enforced: !advisory,
             });
         }
 
-        for (phase, base_phase) in &base.phases {
-            let Some(cur_phase) = cur.phases.get(phase) else {
-                continue;
-            };
-            let (change_pct, status) = classify(base_phase.ns, cur_phase.ns, budget_pct);
-            report.comparisons.push(Comparison {
-                id: id.clone(),
-                metric: Metric::PhaseTime,
-                phase: Some(phase.clone()),
-                baseline: base_phase.ns,
-                observed: cur_phase.ns,
-                change_pct,
-                budget_pct,
-                status,
-                enforced: !advisory,
-            });
-
-            let (delta_pp, status) = classify_share(
-                base_phase.share_pct,
-                cur_phase.share_pct,
-                opts.share_drift_pp,
-            );
-            report.comparisons.push(Comparison {
-                id: id.clone(),
-                metric: Metric::PhaseShare,
-                phase: Some(phase.clone()),
-                baseline: base_phase.share_pct,
-                observed: cur_phase.share_pct,
-                change_pct: delta_pp,
-                budget_pct: opts.share_drift_pp,
-                status,
-                // Shares are ratios within one run, so the machine cancels.
-                // This is the one signal a cross-host comparison keeps, and
-                // making it advisory alongside the absolute metrics would throw
-                // away the entire reason to compare across hosts at all.
-                enforced: true,
-            });
-        }
+        compare_phases(
+            &mut report,
+            id,
+            base,
+            cur,
+            time_budget_pct,
+            opts.share_drift_pp,
+            advisory,
+        );
+        note_share_sum_anomaly(&mut report, id, "baseline", &base.phases);
+        note_share_sum_anomaly(&mut report, id, "current", &cur.phases);
     }
 
     for id in current.entries.keys() {
@@ -1580,8 +1771,15 @@ mod tests {
             .all(|c| c.status == CompareStatus::Within));
     }
 
+    /// reproA, from review-prbench. The defect this pins: walking only the
+    /// baseline's phases made a doubling regression report as an IMPROVEMENT.
+    ///
+    /// Baseline is one 100%-share `parse` phase. The current run is 2x slower
+    /// overall and has moved 75% of its work into a brand-new `validate` phase.
+    /// Before the fix, `parse` fell 100% → 25% and printed "improved", while
+    /// `validate` — carrying the regression — produced no row at all.
     #[test]
-    fn phases_only_in_one_side_are_skipped() {
+    fn work_moved_into_a_new_phase_is_a_breach_not_an_improvement() {
         let base = file_of(
             "local",
             vec![("g/q1/small", phased(1000.0, &[("parse", 100.0)]))],
@@ -1590,17 +1788,148 @@ mod tests {
             "local",
             vec![(
                 "g/q1/small",
-                phased(1000.0, &[("lex", 50.0), ("parse", 50.0)]),
+                phased(2000.0, &[("parse", 50.0), ("validate", 150.0)]),
             )],
         );
-        let budget = RegressionBudget::empty(5.0);
+        // Wide budget so only the phase rules can fail this.
+        let budget = RegressionBudget::empty(500.0);
         let report = compare(&base, &current, &budget, &opts());
-        // parse: share 100 -> 50 (improved), plus phase_time. lex has no
-        // baseline counterpart and produces nothing.
-        assert!(report
+
+        let validate = report
             .comparisons
             .iter()
-            .all(|c| c.phase.as_deref() != Some("lex")));
+            .find(|c| c.phase.as_deref() == Some("validate"))
+            .expect("a new phase must produce a row");
+        assert_eq!(validate.metric, Metric::PhaseShare);
+        assert_eq!(validate.presence, PhasePresence::AddedInCurrent);
+        assert_eq!(validate.status, CompareStatus::Exceeded);
+        assert!(validate.enforced);
+        assert_eq!(validate.baseline, 0.0);
+        assert_eq!(validate.observed, 75.0);
+        assert!(validate.label().contains("(NEW)"), "{}", validate.label());
+        assert!(!report.passed(), "the gate must fail on the new phase");
+    }
+
+    #[test]
+    fn a_small_new_phase_within_the_drift_threshold_does_not_gate() {
+        // Splitting 2% of the work into its own phase is bookkeeping, not a
+        // regression — the threshold is what separates the two.
+        let base = file_of(
+            "local",
+            vec![("g/q1/small", phased(1000.0, &[("parse", 100.0)]))],
+        );
+        let current = file_of(
+            "local",
+            vec![(
+                "g/q1/small",
+                phased(1000.0, &[("parse", 98.0), ("flush", 2.0)]),
+            )],
+        );
+        let budget = RegressionBudget::empty(500.0);
+        let report = compare(&base, &current, &budget, &opts());
+        assert!(report.passed());
+        let flush = report
+            .comparisons
+            .iter()
+            .find(|c| c.phase.as_deref() == Some("flush"))
+            .unwrap();
+        assert_eq!(flush.presence, PhasePresence::AddedInCurrent);
+        assert_eq!(flush.status, CompareStatus::Within);
+    }
+
+    #[test]
+    fn a_phase_vanishing_from_the_current_run_is_a_breach() {
+        // The mirror hazard: a phase carrying 40% of the baseline is simply
+        // absent now. Under growth-only share gating its -40pp would read as an
+        // improvement, but work that large moved somewhere unmeasured.
+        let base = file_of(
+            "local",
+            vec![(
+                "g/q1/small",
+                phased(1000.0, &[("parse", 60.0), ("write", 40.0)]),
+            )],
+        );
+        let current = file_of(
+            "local",
+            vec![("g/q1/small", phased(1000.0, &[("parse", 100.0)]))],
+        );
+        let budget = RegressionBudget::empty(500.0);
+        let report = compare(&base, &current, &budget, &opts());
+
+        let write = report
+            .comparisons
+            .iter()
+            .find(|c| c.phase.as_deref() == Some("write"))
+            .expect("a vanished phase must produce a row");
+        assert_eq!(write.presence, PhasePresence::MissingFromCurrent);
+        assert_eq!(write.status, CompareStatus::Exceeded);
+        assert_eq!(write.observed, 0.0);
+        assert!((write.change_pct + 40.0).abs() < 1e-9, "-40pp");
+        assert!(write.label().contains("(VANISHED)"));
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn a_tiny_vanished_phase_does_not_gate() {
+        let base = file_of(
+            "local",
+            vec![(
+                "g/q1/small",
+                phased(1000.0, &[("parse", 98.0), ("flush", 2.0)]),
+            )],
+        );
+        let current = file_of(
+            "local",
+            vec![("g/q1/small", phased(1000.0, &[("parse", 100.0)]))],
+        );
+        let budget = RegressionBudget::empty(500.0);
+        assert!(compare(&base, &current, &budget, &opts()).passed());
+    }
+
+    #[test]
+    fn one_sided_phases_emit_no_phase_time_row() {
+        // There is no ratio to report against a missing side, and a row reading
+        // "ok" versus a zero baseline would be worse than no row.
+        let base = file_of(
+            "local",
+            vec![("g/q1/small", phased(1000.0, &[("parse", 100.0)]))],
+        );
+        let current = file_of(
+            "local",
+            vec![(
+                "g/q1/small",
+                phased(1000.0, &[("parse", 50.0), ("lex", 50.0)]),
+            )],
+        );
+        let budget = RegressionBudget::empty(500.0);
+        let report = compare(&base, &current, &budget, &opts());
+        assert!(!report
+            .comparisons
+            .iter()
+            .any(|c| c.phase.as_deref() == Some("lex") && c.metric == Metric::PhaseTime));
+    }
+
+    #[test]
+    fn new_phase_gating_survives_a_cross_host_comparison() {
+        // The whole point of the share metric: absolute numbers are advisory
+        // across hosts, but a pipeline reshaping still has to fail.
+        let base = file_of(
+            "bench-m8gd",
+            vec![("g/q1/small", phased(1000.0, &[("parse", 100.0)]))],
+        );
+        let current = file_of(
+            "macos-aarch64",
+            vec![(
+                "g/q1/small",
+                phased(9000.0, &[("parse", 50.0), ("validate", 150.0)]),
+            )],
+        );
+        let budget = RegressionBudget::empty(500.0);
+        let report = compare(&base, &current, &budget, &allow_mismatch());
+        assert!(!report.passed());
+        assert!(report
+            .breaches()
+            .any(|c| c.phase.as_deref() == Some("validate")));
     }
 
     // -----------------------------------------------------------------------
@@ -1656,17 +1985,90 @@ mod tests {
         assert!(!compare(&base, &current, &budget, &opts()).passed());
     }
 
+    /// Review decision: the floor is BASELINE-ONLY.
+    ///
+    /// Taking the wider of the two floors — which this originally did — lets an
+    /// erratic run widen its own budget, so the worse a run behaves the more it
+    /// is forgiven. That inverts the gate. The baseline is the controlled
+    /// measurement; it alone gets to say how much this scenario moves.
     #[test]
-    fn a_noisy_current_run_widens_the_budget_too() {
-        // The floor is a property of the environment, not of the baseline: a
-        // quiet baseline compared against a run that measured wide must take
-        // the wider of the two floors, or every noisy PR run false-flags.
+    fn a_noisy_current_run_does_not_widen_the_budget() {
         let base = file_of("local", vec![("g/q1/small", entry(1000.0))]);
         let current = current_with(vec![("g/q1/small", noisy(&MAD_10_SAMPLES))]);
         let budget = RegressionBudget::empty(1.0);
         assert_eq!(
             compare(&base, &current, &budget, &opts()).comparisons[0].budget_pct,
-            3.0
+            1.0,
+            "current-side noise must not widen the declared budget"
+        );
+    }
+
+    /// reproC, from review-prbench. A wall-clock MAD was widening the MEMORY
+    /// budget: baseline MAD 100 on a median of 1000 gave a 30% floor, and a
+    /// +25% peak_bytes regression sailed through a 5% memory budget.
+    ///
+    /// A tracking allocator's peak is near-deterministic for a given workload,
+    /// so a noisy clock is no reason at all to forgive it.
+    #[test]
+    fn timing_noise_never_widens_the_memory_budget() {
+        let mut base_entry = mem_entry(1000.0, 1_000_000);
+        base_entry.noise = Some(NoiseStats::from_samples(vec![
+            800.0, 900.0, 1000.0, 1100.0, 1200.0,
+        ]));
+        assert_eq!(base_entry.noise_floor_pct(), 30.0, "MAD 100 / median 1000");
+
+        let base = file_of("local", vec![("g/q1/small", base_entry)]);
+        // Same wall clock, +25% peak memory.
+        let current = current_with(vec![("g/q1/small", mem_entry(1000.0, 1_250_000))]);
+        let budget = RegressionBudget::empty(5.0);
+        let report = compare(&base, &current, &budget, &opts());
+
+        let mem = report
+            .comparisons
+            .iter()
+            .find(|c| c.metric == Metric::PeakMem)
+            .unwrap();
+        assert_eq!(mem.budget_pct, 5.0, "declared budget, not the timing floor");
+        assert_eq!(mem.status, CompareStatus::Exceeded);
+        assert!(!report.passed());
+
+        // The time row still gets the widened envelope — the split is the point.
+        let time = report
+            .comparisons
+            .iter()
+            .find(|c| c.metric == Metric::Time)
+            .unwrap();
+        assert_eq!(time.budget_pct, 30.0);
+    }
+
+    #[test]
+    fn timing_noise_widens_phase_time_but_not_share() {
+        let mut base_entry = phased(1000.0, &[("parse", 600.0), ("write", 400.0)]);
+        base_entry.noise = Some(NoiseStats::from_samples(vec![
+            800.0, 900.0, 1000.0, 1100.0, 1200.0,
+        ]));
+        let base = file_of("local", vec![("g/q1/small", base_entry)]);
+        let current = current_with(vec![(
+            "g/q1/small",
+            phased(1000.0, &[("parse", 600.0), ("write", 400.0)]),
+        )]);
+        let budget = RegressionBudget::empty(5.0);
+        let report = compare(&base, &current, &budget, &opts());
+
+        let phase_time = report
+            .comparisons
+            .iter()
+            .find(|c| c.metric == Metric::PhaseTime)
+            .unwrap();
+        assert_eq!(phase_time.budget_pct, 30.0, "phase ns is wall clock");
+        let share = report
+            .comparisons
+            .iter()
+            .find(|c| c.metric == Metric::PhaseShare)
+            .unwrap();
+        assert_eq!(
+            share.budget_pct, DEFAULT_SHARE_DRIFT_PP,
+            "share drift has its own threshold in pp"
         );
     }
 
@@ -1723,7 +2125,7 @@ mod tests {
         let mut acc = file_of("local", vec![("g/q1/small", entry(1000.0))]);
         for mean in [1010.0, 990.0, 1005.0, 995.0] {
             let fresh = file_of("local", vec![("g/q1/small", entry(mean))]);
-            acc = accumulate(&acc, &fresh);
+            acc = accumulate(&acc, &fresh).unwrap();
         }
         let noise = acc.entries["g/q1/small"].noise.as_ref().unwrap();
         assert_eq!(noise.n, 5, "seed run plus four accumulations");
@@ -1738,10 +2140,150 @@ mod tests {
             vec![("g/q1/small", entry(1000.0)), ("g/q2/small", entry(2000.0))],
         );
         let fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
-        let merged = accumulate(&acc, &fresh);
+        let merged = accumulate(&acc, &fresh).unwrap();
         assert_eq!(merged.entries.len(), 2);
         assert_eq!(merged.entries["g/q2/small"].mean_ns, 2000.0);
         assert!(merged.entries["g/q2/small"].noise.is_none());
+    }
+
+    /// reproB, from review-prbench. Both accumulate guards live in the library,
+    /// not in the CLI that happens to call it — accumulation is the one
+    /// operation that DESTROYS the evidence of a mismatch (two populations
+    /// blended into one median/MAD, with the provenance overwritten in the same
+    /// breath), so a direct caller must not be able to skip them.
+    #[test]
+    fn accumulate_refuses_across_host_classes() {
+        let prev = file_of("bench-m8gd", vec![("g/q1/small", entry(1000.0))]);
+        let fresh = file_of("macos-aarch64", vec![("g/q1/small", entry(1010.0))]);
+        let err = accumulate(&prev, &fresh).unwrap_err();
+        assert!(
+            err.contains("bench-m8gd") && err.contains("macos-aarch64"),
+            "{err}"
+        );
+        assert!(err.contains("host class"), "{err}");
+    }
+
+    #[test]
+    fn accumulate_refuses_across_corpora() {
+        let mut prev_entry = entry(1000.0);
+        prev_entry.corpus = Some(corpus(b"one"));
+        let mut fresh_entry = entry(1010.0);
+        fresh_entry.corpus = Some(corpus(b"two"));
+        let prev = file_of("local", vec![("g/q1/small", prev_entry)]);
+        let fresh = file_of("local", vec![("g/q1/small", fresh_entry)]);
+
+        let err = accumulate(&prev, &fresh).unwrap_err();
+        assert!(err.contains("g/q1/small"), "{err}");
+        assert!(err.contains("sha256"), "{err}");
+    }
+
+    #[test]
+    fn accumulate_refuses_across_file_level_corpora() {
+        let mut prev = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        prev.corpus = Some(corpus(b"one"));
+        let mut fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        fresh.corpus = Some(corpus(b"two"));
+        assert!(accumulate(&prev, &fresh).is_err());
+    }
+
+    #[test]
+    fn accumulate_allows_a_matching_corpus() {
+        let mut prev_entry = entry(1000.0);
+        prev_entry.corpus = Some(corpus(b"same"));
+        let mut fresh_entry = entry(1010.0);
+        fresh_entry.corpus = Some(corpus(b"same"));
+        let prev = file_of("local", vec![("g/q1/small", prev_entry)]);
+        let fresh = file_of("local", vec![("g/q1/small", fresh_entry)]);
+        assert!(accumulate(&prev, &fresh).is_ok());
+    }
+
+    #[test]
+    fn accumulate_ignores_corpora_for_scenarios_not_in_both() {
+        // A subset rerun tops up only what it measured; a scenario absent from
+        // the fresh run has no corpus to disagree about.
+        let mut prev_a = entry(1000.0);
+        prev_a.corpus = Some(corpus(b"one"));
+        let mut prev_b = entry(2000.0);
+        prev_b.corpus = Some(corpus(b"other"));
+        let prev = file_of(
+            "local",
+            vec![("g/q1/small", prev_a), ("g/q2/small", prev_b)],
+        );
+
+        let mut fresh_a = entry(1010.0);
+        fresh_a.corpus = Some(corpus(b"one"));
+        let fresh = file_of("local", vec![("g/q1/small", fresh_a)]);
+        assert!(accumulate(&prev, &fresh).is_ok());
+    }
+
+    /// The remedy must not suggest relabelling this host to the baseline's
+    /// class: that converts a refusal into a confident ENFORCEMENT against
+    /// hardware the baseline never ran on — the exact failure the refusal
+    /// exists to prevent.
+    #[test]
+    fn host_mismatch_remedy_does_not_suggest_relabelling_the_host() {
+        let base = file_of("bench-m8gd", vec![("g/q1/small", entry(1000.0))]);
+        let current = file_of("macos-aarch64", vec![("g/q1/small", entry(1000.0))]);
+        let budget = RegressionBudget::empty(5.0);
+        let remedy = &compare(&base, &current, &budget, &opts()).fatal[0].remedy;
+
+        assert!(remedy.contains("--allow-host-mismatch"), "{remedy}");
+        assert!(
+            !remedy.contains("--host-class") && !remedy.contains("FLUREE_BENCH_HOST_CLASS"),
+            "remedy must not offer relabelling as a fix: {remedy}"
+        );
+    }
+
+    #[test]
+    fn shares_that_do_not_sum_to_100_are_reported_but_do_not_gate() {
+        // Hand-assembled or hand-edited shares: the drift comparison is still
+        // internally consistent, so report rather than fail.
+        let mut skewed = entry(1000.0);
+        skewed.phases = [
+            (
+                "parse".to_string(),
+                PhaseTiming {
+                    ns: 10.0,
+                    share_pct: 30.0,
+                },
+            ),
+            (
+                "write".to_string(),
+                PhaseTiming {
+                    ns: 10.0,
+                    share_pct: 30.0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let base = file_of("local", vec![("g/q1/small", skewed.clone())]);
+        let current = file_of("local", vec![("g/q1/small", skewed)]);
+        let budget = RegressionBudget::empty(5.0);
+
+        let report = compare(&base, &current, &budget, &opts());
+        assert!(report.passed(), "a cosmetic share defect must not gate");
+        assert!(
+            report.anomalies.iter().any(|a| a.contains("60.0%")),
+            "{:?}",
+            report.anomalies
+        );
+    }
+
+    #[test]
+    fn well_formed_shares_produce_no_anomaly() {
+        let base = file_of(
+            "local",
+            vec![(
+                "g/q1/small",
+                phased(1000.0, &[("parse", 600.0), ("write", 400.0)]),
+            )],
+        );
+        let current = base.clone();
+        let budget = RegressionBudget::empty(5.0);
+        assert!(compare(&base, &current, &budget, &opts())
+            .anomalies
+            .is_empty());
     }
 
     // -----------------------------------------------------------------------
