@@ -22,6 +22,13 @@ pub enum TurtleError {
     /// Invalid escape sequence
     #[error("Invalid escape sequence: {0}")]
     InvalidEscape(String),
+
+    /// The sink refused an emitted event, or its downstream writer failed.
+    ///
+    /// Parsing stops at the first such error — a writer sink whose pipe has
+    /// closed must not be handed the rest of the document.
+    #[error("Sink error: {0}")]
+    Sink(#[from] fluree_graph_ir::SinkError),
 }
 
 /// Result type for Turtle operations

@@ -109,7 +109,7 @@ impl TestManifest {
         // each test ID *before* the next `load_manifest()` call (enforced by the
         // `loop` in `Iterator::next`). Cross-manifest test references are not
         // supported by the W3C test suite structure.
-        self.graph = sink.finish();
+        self.graph = sink.into_graph();
 
         // Find the manifest subject (type mf:Manifest or has mf:entries/mf:include)
         let manifest_subject = self.find_manifest_subject(url);

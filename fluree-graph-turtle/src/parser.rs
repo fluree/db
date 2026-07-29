@@ -144,6 +144,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let mut statement_count: u64 = 0;
         while !self.is_at_end() {
             self.parse_statement()?;
+            // Statement terminator: only reached once the statement parsed
+            // and emitted cleanly, so a sink may reclaim statement-scoped
+            // literal term ids / commit statement-scoped buffers here.
+            self.sink.end_statement();
             statement_count += 1;
         }
         span.record("statement_count", statement_count);
@@ -247,9 +251,17 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.sink.term_literal_value(value, datatype)
     }
 
+    /// Emit a triple, mapping a sink refusal into a parse-level error so the
+    /// caller stops immediately (broken-pipe / early-termination semantics).
     #[inline]
-    fn sink_emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
-        self.sink.emit_triple(subject, predicate, object);
+    fn sink_emit_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Result<()> {
+        self.sink.emit_triple(subject, predicate, object)?;
+        Ok(())
     }
 
     #[inline]
@@ -259,8 +271,23 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         predicate: TermId,
         object: TermId,
         index: i32,
-    ) {
-        self.sink.emit_list_item(subject, predicate, object, index);
+    ) -> Result<()> {
+        self.sink
+            .emit_list_item(subject, predicate, object, index)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn sink_emit_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+    ) -> Result<()> {
+        self.sink
+            .emit_reified_triple(subject, predicate, object, reifier)?;
+        Ok(())
     }
 
     // =========================================================================
@@ -623,7 +650,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 }
                 _ => {
                     let object = self.parse_object()?;
-                    self.sink_emit_triple(subject, predicate, object);
+                    self.sink_emit_triple(subject, predicate, object)?;
                     if matches!(
                         self.current().kind,
                         TokenKind::Tilde | TokenKind::AnnotationOpen
@@ -649,7 +676,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             let mut index: i32 = 0;
             while !matches!(p.current().kind, TokenKind::RParen) {
                 let item = p.parse_object()?;
-                p.sink_emit_list_item(subject, predicate, item, index);
+                p.sink_emit_list_item(subject, predicate, item, index)?;
                 index += 1;
             }
             p.expect(&TokenKind::RParen)?;
@@ -903,14 +930,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
             loop {
                 let item = p.parse_object()?;
-                p.sink_emit_triple(current_node, rdf_first, item);
+                p.sink_emit_triple(current_node, rdf_first, item)?;
 
                 if matches!(p.current().kind, TokenKind::RParen) {
-                    p.sink_emit_triple(current_node, rdf_rest, rdf_nil);
+                    p.sink_emit_triple(current_node, rdf_rest, rdf_nil)?;
                     break;
                 }
                 let next_node = p.sink_term_blank(None);
-                p.sink_emit_triple(current_node, rdf_rest, next_node);
+                p.sink_emit_triple(current_node, rdf_rest, next_node)?;
                 current_node = next_node;
             }
 
@@ -1025,9 +1052,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             // base triple, then the reifier attachment (documented divergence
             // from RDF 1.2's non-asserting `<< >>`; see the roadmap's construct
             // inventory).
-            p.sink_emit_triple(subject, predicate, object);
-            p.sink
-                .emit_reified_triple(subject, predicate, object, reifier);
+            p.sink_emit_triple(subject, predicate, object)?;
+            p.sink_emit_reified_triple(subject, predicate, object, reifier)?;
 
             Ok(reifier)
         })
@@ -1156,8 +1182,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     self.check_star_allowed("reifier ('~')")?;
                     self.advance()?;
                     let reifier = self.parse_reifier_term()?;
-                    self.sink
-                        .emit_reified_triple(subject, predicate, object, reifier);
+                    self.sink_emit_reified_triple(subject, predicate, object, reifier)?;
                     pending = Some(reifier);
                 }
                 TokenKind::AnnotationOpen => {
@@ -1167,7 +1192,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         Some(r) => r,
                         None => {
                             let r = self.sink_term_blank(None);
-                            self.sink.emit_reified_triple(subject, predicate, object, r);
+                            self.sink_emit_reified_triple(subject, predicate, object, r)?;
                             r
                         }
                     };
@@ -1278,7 +1303,7 @@ mod tests {
     fn parse_to_graph(input: &str) -> Result<Graph> {
         let mut sink = GraphCollectorSink::new();
         parse(input, &mut sink)?;
-        Ok(sink.finish())
+        Ok(sink.into_graph())
     }
 
     #[test]
@@ -1693,7 +1718,7 @@ mod tests {
         ";
         let mut sink = GraphCollectorSink::new();
         parse(turtle, &mut sink).expect("bare [ ... ] . statement must parse");
-        assert_eq!(sink.finish().len(), 2);
+        assert_eq!(sink.into_graph().len(), 2);
     }
 
     // =========================================================================
@@ -1765,9 +1790,15 @@ mod tests {
         fn term_literal_value(&mut self, value: LiteralValue, _datatype: Datatype) -> TermId {
             self.add(RecTerm::Literal(value.lexical()))
         }
-        fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+        fn emit_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> fluree_graph_ir::SinkResult {
             let t = (self.t(subject), self.t(predicate), self.t(object));
             self.triples.push(t);
+            Ok(())
         }
         fn supports_reified_triples(&self) -> bool {
             true
@@ -1778,7 +1809,7 @@ mod tests {
             predicate: TermId,
             object: TermId,
             reifier: TermId,
-        ) {
+        ) -> fluree_graph_ir::SinkResult {
             let r = (
                 self.t(subject),
                 self.t(predicate),
@@ -1786,6 +1817,7 @@ mod tests {
                 self.t(reifier),
             );
             self.reified.push(r);
+            Ok(())
         }
     }
 
@@ -2086,6 +2118,142 @@ mod tests {
     #[test]
     fn deeply_nested_property_lists_do_not_overflow_the_stack() {
         assert_depth_err(parse_to_graph(&nested_property_lists(100_000)).expect_err("deep"));
+    }
+
+    // =========================================================================
+    // Sink protocol: early termination + statement lifecycle
+    // =========================================================================
+
+    /// A sink that accepts `budget` triples and then fails, standing in for a
+    /// writer whose downstream pipe closed (`fluree rdf convert f.ttl | head`).
+    struct FailingSink {
+        budget: usize,
+        emitted: usize,
+        statements: usize,
+        finished: usize,
+    }
+
+    impl FailingSink {
+        fn new(budget: usize) -> Self {
+            Self {
+                budget,
+                emitted: 0,
+                statements: 0,
+                finished: 0,
+            }
+        }
+    }
+
+    impl GraphSink for FailingSink {
+        fn on_base(&mut self, _base_iri: &str) {}
+        fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {}
+        fn term_iri(&mut self, _iri: &str) -> TermId {
+            TermId::new(0)
+        }
+        fn term_blank(&mut self, _label: Option<&str>) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal(
+            &mut self,
+            _value: &str,
+            _datatype: Datatype,
+            _language: Option<&str>,
+        ) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal_value(&mut self, _value: LiteralValue, _datatype: Datatype) -> TermId {
+            TermId::new(0)
+        }
+        fn emit_triple(
+            &mut self,
+            _subject: TermId,
+            _predicate: TermId,
+            _object: TermId,
+        ) -> fluree_graph_ir::SinkResult {
+            if self.emitted >= self.budget {
+                return Err(fluree_graph_ir::SinkError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream closed",
+                )));
+            }
+            self.emitted += 1;
+            Ok(())
+        }
+        fn end_statement(&mut self) {
+            self.statements += 1;
+        }
+        fn finish(&mut self) -> fluree_graph_ir::SinkResult {
+            self.finished += 1;
+            Ok(())
+        }
+    }
+
+    fn many_statements(n: usize) -> String {
+        let mut doc = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..n {
+            doc.push_str(&format!("ex:s{i} ex:p ex:o{i} .\n"));
+        }
+        doc
+    }
+
+    /// The `| head -5` case: once the sink refuses, parsing stops at that
+    /// statement instead of running to EOF against a dead pipe.
+    #[test]
+    fn sink_failure_terminates_the_parse_immediately() {
+        let mut sink = FailingSink::new(5);
+        let err = parse(&many_statements(10_000), &mut sink)
+            .expect_err("a refusing sink must fail the parse");
+
+        assert!(
+            matches!(&err, TurtleError::Sink(e) if e.is_broken_pipe()),
+            "the sink's error must survive, not be flattened into a generic parse error: {err}"
+        );
+        assert_eq!(sink.emitted, 5, "no emission past the budget");
+        // The `@prefix` directive plus five completed triple statements. The
+        // sixth failed mid-flight and so was never terminated — exactly what
+        // statement-scoped buffering needs.
+        assert_eq!(sink.statements, 6);
+    }
+
+    /// `end_statement` fires once per completed statement, and directives
+    /// count as statements (Turtle grammar: `statement ::= directive |
+    /// triples '.'`).
+    #[test]
+    fn end_statement_fires_once_per_completed_statement() {
+        let mut sink = FailingSink::new(usize::MAX);
+        parse(&many_statements(3), &mut sink).unwrap();
+        // 1 `@prefix` directive + 3 triple statements.
+        assert_eq!(sink.statements, 4);
+        assert_eq!(sink.emitted, 3);
+    }
+
+    /// A multi-triple statement is ONE statement: the boundary is the `.`,
+    /// not the triple, so statement-scoped literal ids stay live across the
+    /// whole predicate-object list.
+    #[test]
+    fn predicate_object_list_is_a_single_statement() {
+        let mut sink = FailingSink::new(usize::MAX);
+        parse(
+            r#"@prefix ex: <http://example.org/> .
+               ex:s ex:p "a", "b" ; ex:q "c" .
+            "#,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.emitted, 3);
+        assert_eq!(sink.statements, 2, "one directive + one triple statement");
+    }
+
+    /// The parser never calls the protocol `finish()`: a sink can be fed by
+    /// many `parse()` calls (one per chunk on the bulk-import path), so
+    /// flushing is the owner's call, not the producer's.
+    #[test]
+    fn the_parser_does_not_call_protocol_finish() {
+        let mut sink = FailingSink::new(usize::MAX);
+        parse(&many_statements(3), &mut sink).unwrap();
+        parse(&many_statements(3), &mut sink).unwrap();
+        assert_eq!(sink.finished, 0);
+        assert_eq!(sink.emitted, 6, "both parses fed the same sink");
     }
 
     /// Siblings at the same level do not accumulate depth: only the nesting

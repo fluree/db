@@ -18,7 +18,7 @@
 //! // Option 1: Parse to GraphSink
 //! let mut sink = GraphCollectorSink::new();
 //! parse(turtle, &mut sink).unwrap();
-//! let graph = sink.finish();
+//! let graph = sink.into_graph();
 //!
 //! // Option 2: Parse directly to transaction JSON
 //! let json = parse_to_json(turtle).unwrap();
@@ -56,7 +56,7 @@ use serde_json::Value as JsonValue;
 pub fn parse_to_json(input: &str) -> Result<JsonValue> {
     let mut sink = GraphCollectorSink::new();
     parse(input, &mut sink)?;
-    let graph = sink.finish();
+    let graph = sink.into_graph();
     Ok(graph_to_transaction_json(&graph))
 }
 

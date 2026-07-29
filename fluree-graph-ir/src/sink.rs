@@ -14,10 +14,65 @@
 use crate::{Datatype, Graph, LiteralValue, Term, Triple};
 use std::collections::HashMap;
 
+/// Error returned by a [`GraphSink`] when it cannot accept an event.
+///
+/// Emission is fallible so a sink that writes somewhere (a file, a socket,
+/// a pipe) can report failure at the point it happens and have the producer
+/// stop immediately. That is what makes `convert big.ttl | head -5` cost five
+/// statements instead of a full parse against a dead pipe.
+///
+/// Producers MUST propagate this error rather than continuing to emit; a sink
+/// that has failed once is not required to behave sensibly afterwards.
+#[derive(Debug, thiserror::Error)]
+pub enum SinkError {
+    /// The sink's downstream writer failed (broken pipe, disk full, …).
+    #[error("sink I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The sink refused the event: an unsupported capability, or an
+    /// invariant the event would violate.
+    #[error("sink rejected event: {0}")]
+    Rejected(String),
+}
+
+impl SinkError {
+    /// Build a [`SinkError::Rejected`] from any message.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::Rejected(message.into())
+    }
+
+    /// Whether this error is a broken pipe.
+    ///
+    /// CLI drivers use this to exit quietly (status 0) when a downstream
+    /// consumer such as `head` closes the pipe, rather than reporting the
+    /// normal, expected shutdown as a conversion failure.
+    pub fn is_broken_pipe(&self) -> bool {
+        matches!(self, Self::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe)
+    }
+}
+
+/// Result alias for [`GraphSink`] emission methods.
+pub type SinkResult = std::result::Result<(), SinkError>;
+
 /// Opaque term identifier for efficient triple emission
 ///
 /// `TermId` is only valid within a single sink session. It allows parsers
 /// to reference terms efficiently without repeated string allocations.
+///
+/// # Lifetime
+///
+/// Term IDs fall into two lifetime classes, and producers must respect the
+/// difference so that sinks are free to reclaim storage (see
+/// [`GraphSink::end_statement`]):
+///
+/// - IDs from [`GraphSink::term_iri`] and [`GraphSink::term_blank`] are valid
+///   for the whole sink session. Parsers cache and reuse them across
+///   statements.
+/// - IDs from [`GraphSink::term_literal`] and
+///   [`GraphSink::term_literal_value`] are **statement-scoped**: valid only
+///   until the next [`GraphSink::end_statement`] call. Literals are minted per
+///   occurrence and never deduplicated, so retaining them across statements is
+///   what makes a long document's term table grow without bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TermId(pub(crate) u32);
 
@@ -41,6 +96,24 @@ impl TermId {
 /// Inspired by the Raphael library's generator pattern, this trait allows
 /// parsers to emit graph events without knowing the concrete sink type.
 ///
+/// # Fallibility
+///
+/// `term_*` methods are infallible: they only intern a term and hand back an
+/// id. `emit_*` methods return [`SinkResult`] because that is where a writing
+/// sink actually touches its output. Producers must propagate emission errors
+/// immediately (riot-style early termination) instead of parsing on against a
+/// sink that has already failed.
+///
+/// # Finishing
+///
+/// [`GraphSink::finish`] is the *protocol* finish: flush and finalize, called
+/// by whoever owns the sink once no more events are coming. It takes
+/// `&mut self` and returns no value, because a sink may be fed by several
+/// producer calls (bulk import parses one sink's worth of events per chunk).
+/// Sinks that also *produce* something — a `Graph`, a `Vec<Flake>`, a commit
+/// writer — expose that separately as a consuming `into_*` method, so that
+/// `finish()` always means "flush", never "give me your contents".
+///
 /// # Example
 ///
 /// ```
@@ -57,10 +130,11 @@ impl TermId {
 /// let alice_name = sink.term_literal("Alice", Datatype::xsd_string(), None);
 ///
 /// // Emit triple
-/// sink.emit_triple(alice, name, alice_name);
+/// sink.emit_triple(alice, name, alice_name).unwrap();
+/// sink.finish().unwrap();
 ///
 /// // Get the resulting graph
-/// let graph = sink.finish();
+/// let graph = sink.into_graph();
 /// assert_eq!(graph.len(), 1);
 /// ```
 pub trait GraphSink {
@@ -98,7 +172,7 @@ pub trait GraphSink {
     fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId;
 
     /// Emit a triple using previously created term IDs
-    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId);
+    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult;
 
     /// Emit a list item (triple with list index)
     ///
@@ -106,11 +180,84 @@ pub trait GraphSink {
     /// List items will be formatted as `{"@list": [...]}` in JSON-LD output.
     ///
     /// Default implementation falls back to `emit_triple` (ignoring index).
-    fn emit_list_item(&mut self, subject: TermId, predicate: TermId, object: TermId, index: i32) {
+    fn emit_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+    ) -> SinkResult {
         // Default: fall back to regular triple (losing index info)
         // Implementations that support lists should override this
         let _ = index;
-        self.emit_triple(subject, predicate, object);
+        self.emit_triple(subject, predicate, object)
+    }
+
+    /// Whether this sink can consume quad events ([`Self::emit_quad`]).
+    ///
+    /// Producers of named-graph syntaxes (N-Quads, TriG, JSON-LD `@graph`)
+    /// MUST check this before emitting any quad and reject the input with a
+    /// clear error when it returns `false`. Defaults to `false`: the IR is
+    /// triple-only today, and *silently* folding named graphs into the
+    /// default graph is a data-loss bug, not a fallback.
+    fn supports_quads(&self) -> bool {
+        false
+    }
+
+    /// Emit a quad: the triple `(subject, predicate, object)` in the named
+    /// graph `graph`.
+    ///
+    /// Only called when [`Self::supports_quads`] returns `true`. Unlike
+    /// [`Self::emit_reified_triple`] — whose producers are all guarded by an
+    /// explicit parser-side capability check — the default body **errors**
+    /// rather than no-ops, because no producer emits quads yet and this
+    /// backstop is what keeps a future quad producer from silently dropping
+    /// graph names against a triple-only sink.
+    fn emit_quad(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        graph: TermId,
+    ) -> SinkResult {
+        let _ = (subject, predicate, object, graph);
+        debug_assert!(
+            self.supports_quads(),
+            "emit_quad called on a sink that does not support quads"
+        );
+        Err(SinkError::rejected(
+            "this sink is triple-only and cannot represent named graphs",
+        ))
+    }
+
+    /// Called by the producer at each statement terminator, after the
+    /// statement has parsed and emitted successfully.
+    ///
+    /// Two uses, both of which need the same boundary:
+    ///
+    /// - **Term lifetime.** Statement-scoped literal ids (see [`TermId`]) are
+    ///   dead after this call, so a sink may reclaim their storage. Without
+    ///   it, one live term-table entry accumulates per literal *occurrence*
+    ///   for the length of the document.
+    /// - **Statement-scoped buffering.** A sink that buffers output per
+    ///   statement (needed for `--continue-on-error`, because triples are
+    ///   emitted during descent, before the terminating `.` proves the
+    ///   statement valid) commits its buffer here. A statement that fails to
+    ///   parse never reaches this call, so it contributes nothing.
+    ///
+    /// Default: no-op.
+    fn end_statement(&mut self) {}
+
+    /// Flush and finalize. Called once by whoever owns the sink, after the
+    /// last producer has finished emitting.
+    ///
+    /// Producers do NOT call this — a single sink may be fed by many producer
+    /// calls (one per chunk on the bulk-import path), and flushing per chunk
+    /// would be wrong for a streaming writer.
+    ///
+    /// Default: no-op, for sinks that hold no external resource.
+    fn finish(&mut self) -> SinkResult {
+        Ok(())
     }
 
     /// Whether this sink can consume RDF 1.2 reified-triple events
@@ -141,19 +288,23 @@ pub trait GraphSink {
     ///   [`Self::emit_triple`] events with `reifier` as the subject.
     ///
     /// Only called when [`Self::supports_reified_triples`] returns `true`;
-    /// the default implementation is a no-op guarded by a debug assert.
+    /// the default implementation is a no-op guarded by a debug assert
+    /// (every producer of these events already refuses the input up-front
+    /// when the capability probe is `false`, so the default body is
+    /// unreachable rather than a silent fallback).
     fn emit_reified_triple(
         &mut self,
         subject: TermId,
         predicate: TermId,
         object: TermId,
         reifier: TermId,
-    ) {
+    ) -> SinkResult {
         let _ = (subject, predicate, object, reifier);
         debug_assert!(
             self.supports_reified_triples(),
             "emit_reified_triple called on a sink that does not support reified triples"
         );
+        Ok(())
     }
 }
 
@@ -193,10 +344,11 @@ impl GraphCollectorSink {
         }
     }
 
-    /// Finish building and return the graph
+    /// Consume the sink and return the collected graph.
     ///
-    /// Consumes the sink.
-    pub fn finish(self) -> Graph {
+    /// This is the sink's *product*, distinct from the protocol's
+    /// [`GraphSink::finish`] (flush/finalize) — see the trait docs.
+    pub fn into_graph(self) -> Graph {
         self.graph
     }
 
@@ -282,18 +434,26 @@ impl GraphSink for GraphCollectorSink {
         self.add_term(term)
     }
 
-    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) {
+    fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
         let s = self.get_term(subject).clone();
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.graph.add(Triple::new(s, p, o));
+        Ok(())
     }
 
-    fn emit_list_item(&mut self, subject: TermId, predicate: TermId, object: TermId, index: i32) {
+    fn emit_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+    ) -> SinkResult {
         let s = self.get_term(subject).clone();
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.graph.add_list_item(s, p, o, index);
+        Ok(())
     }
 }
 
@@ -309,9 +469,9 @@ mod tests {
         let p = sink.term_iri("http://xmlns.com/foaf/0.1/name");
         let o = sink.term_literal("Alice", Datatype::xsd_string(), None);
 
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         assert_eq!(graph.len(), 1);
 
         let triple = graph.iter().next().unwrap();
@@ -345,7 +505,7 @@ mod tests {
         sink.on_base("http://example.org/");
         sink.on_prefix("foaf", "http://xmlns.com/foaf/0.1/");
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
 
         assert_eq!(graph.base, Some("http://example.org/".to_string()));
         assert_eq!(
@@ -362,9 +522,9 @@ mod tests {
         let p = sink.term_iri("http://xmlns.com/foaf/0.1/name");
         let o = sink.term_literal("Alicia", Datatype::rdf_lang_string(), Some("es"));
 
-        sink.emit_triple(s, p, o);
+        sink.emit_triple(s, p, o).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         let triple = graph.iter().next().unwrap();
 
         if let Term::Literal {
@@ -388,18 +548,18 @@ mod tests {
         // Boolean
         let bool_val =
             sink.term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean());
-        sink.emit_triple(s, p, bool_val);
+        sink.emit_triple(s, p, bool_val).unwrap();
 
         // Integer
         let int_val = sink.term_literal_value(LiteralValue::Integer(42), Datatype::xsd_integer());
-        sink.emit_triple(s, p, int_val);
+        sink.emit_triple(s, p, int_val).unwrap();
 
         // Double
         let double_val =
             sink.term_literal_value(LiteralValue::Double(3.13), Datatype::xsd_double());
-        sink.emit_triple(s, p, double_val);
+        sink.emit_triple(s, p, double_val).unwrap();
 
-        let graph = sink.finish();
+        let graph = sink.into_graph();
         assert_eq!(graph.len(), 3);
     }
 
@@ -412,15 +572,15 @@ mod tests {
 
         // Emit list items out of order
         let o2 = sink.term_literal("Charlie", Datatype::xsd_string(), None);
-        sink.emit_list_item(s, p, o2, 2);
+        sink.emit_list_item(s, p, o2, 2).unwrap();
 
         let o0 = sink.term_literal("Alice", Datatype::xsd_string(), None);
-        sink.emit_list_item(s, p, o0, 0);
+        sink.emit_list_item(s, p, o0, 0).unwrap();
 
         let o1 = sink.term_literal("Bob", Datatype::xsd_string(), None);
-        sink.emit_list_item(s, p, o1, 1);
+        sink.emit_list_item(s, p, o1, 1).unwrap();
 
-        let mut graph = sink.finish();
+        let mut graph = sink.into_graph();
         assert_eq!(graph.len(), 3);
 
         // All triples should have list_index
@@ -432,5 +592,107 @@ mod tests {
         graph.sort();
         let indices: Vec<_> = graph.iter().map(|t| t.list_index().unwrap()).collect();
         assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    // =====================================================================
+    // Protocol: capability probes, fallible emission, lifecycle
+    // =====================================================================
+
+    /// A sink that claims quad support but never overrides `emit_quad`.
+    ///
+    /// Exists to reach the trait's default `emit_quad` body past its
+    /// `debug_assert` — that body is the release-build backstop against a
+    /// future quad producer silently folding graph names into the default
+    /// graph, so it must be an error, not a no-op.
+    #[derive(Default)]
+    struct QuadClaimingSink {
+        terms: u32,
+    }
+
+    impl GraphSink for QuadClaimingSink {
+        fn on_base(&mut self, _base_iri: &str) {}
+        fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {}
+        fn term_iri(&mut self, _iri: &str) -> TermId {
+            self.terms += 1;
+            TermId::new(self.terms)
+        }
+        fn term_blank(&mut self, _label: Option<&str>) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal(
+            &mut self,
+            _value: &str,
+            _datatype: Datatype,
+            _language: Option<&str>,
+        ) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal_value(&mut self, _value: LiteralValue, _datatype: Datatype) -> TermId {
+            TermId::new(0)
+        }
+        fn emit_triple(&mut self, _s: TermId, _p: TermId, _o: TermId) -> SinkResult {
+            Ok(())
+        }
+        fn supports_quads(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn triple_only_sinks_do_not_claim_quad_support() {
+        // The capability probe producers of N-Quads/TriG/`@graph` must
+        // consult before emitting.
+        let sink = GraphCollectorSink::new();
+        assert!(!sink.supports_quads());
+        assert!(!sink.supports_reified_triples());
+    }
+
+    #[test]
+    fn default_emit_quad_refuses_instead_of_dropping_the_graph_name() {
+        let mut sink = QuadClaimingSink::default();
+        let g = sink.term_iri("http://example.org/g");
+        let s = sink.term_iri("http://example.org/s");
+        let p = sink.term_iri("http://example.org/p");
+        let o = sink.term_iri("http://example.org/o");
+
+        let err = sink
+            .emit_quad(s, p, o, g)
+            .expect_err("the default quad body must refuse, never silently fall back");
+        assert!(matches!(err, SinkError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("named graphs"), "{err}");
+    }
+
+    #[test]
+    fn protocol_finish_defaults_to_a_no_op_and_leaves_the_product_alone() {
+        // `finish()` flushes; `into_graph()` produces. Calling the former
+        // must not disturb the latter — the two are deliberately separate
+        // methods so `finish()` can never mean "give me your contents".
+        let mut sink = GraphCollectorSink::new();
+        let s = sink.term_iri("http://example.org/s");
+        let p = sink.term_iri("http://example.org/p");
+        let o = sink.term_literal("v", Datatype::xsd_string(), None);
+        sink.emit_triple(s, p, o).unwrap();
+
+        sink.finish().expect("default finish is infallible");
+        sink.finish().expect("and idempotent");
+
+        assert_eq!(sink.into_graph().len(), 1);
+    }
+
+    #[test]
+    fn broken_pipe_is_distinguishable_from_other_sink_failures() {
+        // CLI drivers exit quietly on a closed downstream (`… | head -5`)
+        // but must still report real failures.
+        let pipe = SinkError::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed",
+        ));
+        assert!(pipe.is_broken_pipe());
+
+        let full = SinkError::Io(std::io::Error::other("no space left on device"));
+        assert!(!full.is_broken_pipe());
+
+        let rejected = SinkError::rejected("nope");
+        assert!(!rejected.is_broken_pipe());
     }
 }

@@ -179,7 +179,7 @@ mod inner {
         let (writer, op_count, spool_result, envelope) = {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, chunk_prefix_map, spool_ctx) = sink
-                .finish()
+                .into_parts()
                 .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
             state.prefix_map.extend(chunk_prefix_map);
 
@@ -338,7 +338,7 @@ mod inner {
         let (writer, op_count, spool_result, envelope) = {
             let _span = tracing::debug_span!("import_build_envelope", t = new_t).entered();
             let (writer, _chunk_prefix_map, spool_ctx) = sink
-                .finish()
+                .into_parts()
                 .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
 
             let spool_result = spool_ctx.map(crate::import_sink::SpoolContext::finish_buffered);
@@ -520,7 +520,7 @@ mod inner {
         // root's `named_graphs` routing exactly like default-graph triples.
         // The spool is finished only after the named-graph loop completes.
         let (mut writer, chunk_prefix_map, mut spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         state.prefix_map.extend(chunk_prefix_map);
         let mut op_count = writer.op_count();
@@ -875,7 +875,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -940,7 +940,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, _prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
@@ -1086,7 +1086,7 @@ mod inner {
         drop(_parse_span);
 
         let (writer, prefix_map, spool_ctx) = sink
-            .finish()
+            .into_parts()
             .map_err(|e| TransactError::Parse(format!("flake encode error: {e}")))?;
         let op_count = writer.op_count();
         let new_codes = worker_cache.into_new_codes();
