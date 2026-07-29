@@ -43,15 +43,18 @@
 //! ```
 
 mod dataset;
+mod dataset_sink;
 pub mod datatype;
 mod graph;
 mod quad;
 mod sink;
 mod term;
+mod term_table;
 mod triple;
 pub mod xsd_double;
 
 pub use dataset::Dataset;
+pub use dataset_sink::DatasetCollectorSink;
 pub use datatype::Datatype;
 pub use graph::Graph;
 pub use quad::Quad;
