@@ -319,21 +319,17 @@ pub fn compute_chunk_boundaries(
     let mut reader = BufReader::with_capacity(SCAN_BUF_SIZE, file);
     reader.seek(SeekFrom::Start(data_start))?;
 
-    let mut state = ScanState::Normal;
-    let mut lookahead = Lookahead::default();
+    let mut scanner = BoundaryScanner::new();
     let mut boundaries: Vec<u64> = Vec::new();
     let mut next_target = data_start + chunk_size;
     let mut byte_pos = data_start;
     let mut buf = vec![0u8; SCAN_BUF_SIZE];
-    let mut prefix_check = PrefixCheck::new();
-    let mut prev_byte: Option<u8> = None;
 
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             // EOF — if we have a pending dot, it's a boundary (dot at EOF).
-            if let Some(dot_pos) = lookahead.pending_dot.take() {
-                let boundary_pos = dot_pos + 1;
+            if let Some(boundary_pos) = scanner.finish() {
                 if boundary_pos >= next_target {
                     boundaries.push(boundary_pos);
                 }
@@ -346,88 +342,12 @@ pub fn compute_chunk_boundaries(
         for (i, &b) in chunk.iter().enumerate() {
             let abs_pos = byte_pos + i as u64;
 
-            // Handle pending dot: check if this byte confirms a boundary.
-            if let Some(dot_pos) = lookahead.pending_dot.take() {
-                let next_is_pnchar = is_pnchar_ascii(b);
-                if is_boundary_follower(b)
-                    || !(lookahead.pending_dot_prev_is_pnchar && next_is_pnchar)
-                {
-                    let boundary_pos = dot_pos + 1;
-                    if boundary_pos >= next_target {
-                        boundaries.push(boundary_pos);
-                        next_target = boundary_pos + chunk_size;
-                    }
-                }
-                // The dot was not a boundary — fall through to process `b` normally.
-            }
-
-            // Handle pending CR for CRLF detection.
-            if lookahead.pending_cr {
-                lookahead.pending_cr = false;
-                // \r\n is just one newline — no special action needed beyond
-                // clearing the flag; the \r already triggered comment exit.
-            }
-
-            // Handle pending quotes for triple-quote detection.
-            // Context matters: in Normal state, """ opens a long string;
-            // in a long string state, """ closes it.
-            if lookahead.pending_quotes > 0 {
-                let pq_char = lookahead.pending_quote_char;
-                let pq_count = lookahead.pending_quotes;
-
-                if b == pq_char {
-                    let total = pq_count + 1;
-                    if total >= 3 {
-                        // Triple quote confirmed.
-                        lookahead.pending_quotes = 0;
-                        state = match state {
-                            ScanState::InLongDoubleString | ScanState::InLongSingleString => {
-                                // Closing triple quote — exit to Normal.
-                                ScanState::Normal
-                            }
-                            _ => {
-                                // Opening triple quote — enter long string.
-                                if pq_char == b'"' {
-                                    ScanState::InLongDoubleString
-                                } else {
-                                    ScanState::InLongSingleString
-                                }
-                            }
-                        };
-                        continue;
-                    }
-                    lookahead.pending_quotes = total;
-                    continue;
-                }
-                // Not a triple quote.
-                lookahead.pending_quotes = 0;
-                match state {
-                    ScanState::InLongDoubleString | ScanState::InLongSingleString => {
-                        // Inside long string, saw 1-2 quotes but not 3.
-                        // Stay in long string; fall through to process `b`.
-                    }
-                    _ => {
-                        // Opening short string.
-                        state = if pq_char == b'"' {
-                            ScanState::InShortDoubleString
-                        } else {
-                            ScanState::InShortSingleString
-                        };
-                        // Fall through to process `b` in new state.
-                    }
+            if let Some(boundary_pos) = scanner.feed(b, abs_pos)? {
+                if boundary_pos >= next_target {
+                    boundaries.push(boundary_pos);
+                    next_target = boundary_pos + chunk_size;
                 }
             }
-
-            // Main state machine.
-            state = advance_state(
-                state,
-                b,
-                abs_pos,
-                prev_byte,
-                &mut lookahead,
-                &mut prefix_check,
-            )?;
-            prev_byte = Some(b);
         }
 
         byte_pos += n as u64;
@@ -504,6 +424,130 @@ fn is_noise_only_chunk(buf: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// The byte-level statement-boundary scanner, driven one byte at a time.
+///
+/// Both chunking paths run this and nothing else. That is the point: the
+/// pre-scan path always did, while the streaming path carried a line-based
+/// approximation — split at a line ending in `.`, with an ad-hoc toggle for
+/// triple-quoted strings — and the two disagreed in three ways that all
+/// produced silently wrong output rather than an error:
+///
+/// - A line-final comment ending in `.` looked like a statement terminator,
+///   so a chunk was cut mid-statement and neither half parsed.
+/// - `'''` inside a *short* string toggled the long-string flag. An odd number
+///   of them left it stuck on, and every subsequent boundary was refused —
+///   the rest of the file became one chunk however large it grew.
+/// - Mid-file `@prefix`/`@base` directives were not detected at all. Only
+///   chunk 0 carries them, so every later chunk resolved the redefined prefix
+///   against the header binding and produced wrong IRIs with no error.
+///
+/// One scanner, one set of answers. `feed` returns the position just past a
+/// confirmed statement terminator, which is where a chunk may be cut.
+struct BoundaryScanner {
+    state: ScanState,
+    lookahead: Lookahead,
+    prefix_check: PrefixCheck,
+    prev_byte: Option<u8>,
+}
+
+impl BoundaryScanner {
+    fn new() -> Self {
+        Self {
+            state: ScanState::Normal,
+            lookahead: Lookahead::default(),
+            prefix_check: PrefixCheck::new(),
+            prev_byte: None,
+        }
+    }
+
+    /// Feed one byte at `abs_pos`.
+    ///
+    /// Returns `Some(pos)` when the byte *confirms* the statement terminator
+    /// that preceded it — `pos` is one past that terminator, so a chunk cut
+    /// there contains whole statements. Confirmation is one byte late by
+    /// construction: `.` only ends a statement when what follows it is not a
+    /// name character, which is what keeps `ex:foo.bar` intact.
+    fn feed(&mut self, b: u8, abs_pos: u64) -> Result<Option<u64>, SplitError> {
+        let mut boundary = None;
+
+        if let Some(dot_pos) = self.lookahead.pending_dot.take() {
+            let next_is_pnchar = is_pnchar_ascii(b);
+            if is_boundary_follower(b)
+                || !(self.lookahead.pending_dot_prev_is_pnchar && next_is_pnchar)
+            {
+                boundary = Some(dot_pos + 1);
+            }
+            // Not a boundary: fall through and process `b` normally.
+        }
+
+        if self.lookahead.pending_cr {
+            self.lookahead.pending_cr = false;
+            // \r\n is one newline; the \r already exited any comment.
+        }
+
+        // Triple-quote resolution, which needs the current state to know
+        // whether a run of three opens a long string or closes one.
+        if self.lookahead.pending_quotes > 0 {
+            let pq_char = self.lookahead.pending_quote_char;
+            let pq_count = self.lookahead.pending_quotes;
+
+            if b == pq_char {
+                let total = pq_count + 1;
+                if total >= 3 {
+                    self.lookahead.pending_quotes = 0;
+                    self.state = match self.state {
+                        ScanState::InLongDoubleString | ScanState::InLongSingleString => {
+                            ScanState::Normal
+                        }
+                        _ => {
+                            if pq_char == b'"' {
+                                ScanState::InLongDoubleString
+                            } else {
+                                ScanState::InLongSingleString
+                            }
+                        }
+                    };
+                    self.prev_byte = Some(b);
+                    return Ok(boundary);
+                }
+                self.lookahead.pending_quotes = total;
+                self.prev_byte = Some(b);
+                return Ok(boundary);
+            }
+
+            self.lookahead.pending_quotes = 0;
+            match self.state {
+                ScanState::InLongDoubleString | ScanState::InLongSingleString => {
+                    // One or two quotes inside a long string: still inside it.
+                }
+                _ => {
+                    self.state = if pq_char == b'"' {
+                        ScanState::InShortDoubleString
+                    } else {
+                        ScanState::InShortSingleString
+                    };
+                }
+            }
+        }
+
+        self.state = advance_state(
+            self.state,
+            b,
+            abs_pos,
+            self.prev_byte,
+            &mut self.lookahead,
+            &mut self.prefix_check,
+        )?;
+        self.prev_byte = Some(b);
+        Ok(boundary)
+    }
+
+    /// Flush at EOF: a final `.` with nothing after it is still a terminator.
+    fn finish(&mut self) -> Option<u64> {
+        self.lookahead.pending_dot.take().map(|dot| dot + 1)
+    }
 }
 
 /// Advance the scan state machine by one byte.
@@ -1265,14 +1309,14 @@ fn reader_thread_from_source(
     let mut abs_pos = data_start;
     let mut chunk_idx: usize = 0;
 
-    // Line scanning state (fast path): scan for '\n', and treat a line as a
-    // statement boundary when its trimmed content ends with '.' and it's not
-    // a comment line.
+    // The same byte-level scanner the pre-scan path uses, for the same
+    // answers. See `BoundaryScanner` for the three ways the line-based
+    // approximation this replaces disagreed with it, all of them silent.
+    let mut scanner = BoundaryScanner::new();
+    // How far into `chunk_buf` the scanner has consumed, and the absolute
+    // position of `chunk_buf[0]` so boundaries can be converted back.
     let mut scan_pos: usize = 0;
-    let mut line_start: usize = 0;
-    // Track whether we're inside a triple-quoted string (""" or ''').
-    // A '.' inside a long string must not be treated as a statement boundary.
-    let mut in_long_string = false;
+    let mut chunk_base = data_start;
 
     // Progress reporting throttle (every ~64 MB).
     let progress_interval = 64 * 1024 * 1024u64;
@@ -1326,93 +1370,51 @@ fn reader_thread_from_source(
             next_progress = abs_pos + progress_interval;
         }
 
-        // Scan newly appended bytes for line boundaries.
+        // Feed newly appended bytes to the scanner, cutting a chunk at the
+        // first confirmed statement boundary at or past the target size.
         while scan_pos < chunk_buf.len() {
-            // Find next newline.
-            let rel = match chunk_buf[scan_pos..].iter().position(|&b| b == b'\n') {
-                Some(p) => p,
-                None => break,
+            let b = chunk_buf[scan_pos];
+            let abs_pos = chunk_base + scan_pos as u64;
+            scan_pos += 1;
+
+            let Some(boundary_abs) = scanner.feed(b, abs_pos)? else {
+                continue;
             };
-            let nl_pos = scan_pos + rel;
-
-            // Content end (handle CRLF).
-            let content_end = if nl_pos > 0 && chunk_buf[nl_pos - 1] == b'\r' {
-                nl_pos - 1
-            } else {
-                nl_pos
-            };
-
-            // Trim trailing spaces/tabs.
-            let mut end = content_end;
-            while end > line_start && matches!(chunk_buf[end - 1], b' ' | b'\t') {
-                end -= 1;
-            }
-
-            // Skip leading spaces/tabs and check for comment line.
-            let mut first = line_start;
-            while first < end && matches!(chunk_buf[first], b' ' | b'\t') {
-                first += 1;
-            }
-            let is_comment = first < end && chunk_buf[first] == b'#';
-
-            // Track triple-quoted strings (""" / ''') so we don't treat a '.'
-            // inside a multiline literal as a statement boundary.
-            {
-                let line = &chunk_buf[first..content_end];
-                let mut i = 0;
-                while i + 2 < line.len() {
-                    if (line[i] == b'"' && line[i + 1] == b'"' && line[i + 2] == b'"')
-                        || (line[i] == b'\'' && line[i + 1] == b'\'' && line[i + 2] == b'\'')
-                    {
-                        in_long_string = !in_long_string;
-                        i += 3;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-
-            // Boundary if: over target AND line ends with '.' AND not inside
-            // a comment or a triple-quoted string literal.
-            if !is_comment
-                && !in_long_string
-                && (chunk_buf.len() as u64) >= chunk_size_bytes
-                && end > line_start
-                && chunk_buf[end - 1] == b'.'
-            {
-                // Ensure namespace preflight is published before emitting chunk 0.
-                if chunk_idx == 0 && ns_preflight.get().is_none() {
-                    ns_detector.finish(&ns_preflight);
-                }
-                let boundary = nl_pos + 1; // include newline
-                let remainder = chunk_buf[boundary..].to_vec();
-                chunk_buf.truncate(boundary);
-
-                tracing::debug!(
-                    chunk = chunk_idx,
-                    size_mb = chunk_buf.len() as f64 / (1024.0 * 1024.0),
-                    remainder_bytes = remainder.len(),
-                    "chunk emitted"
-                );
-
-                if tx
-                    .send((chunk_idx, std::mem::take(&mut chunk_buf)))
-                    .is_err()
-                {
-                    return Ok(chunk_idx);
-                }
-                chunk_idx += 1;
-
-                // Start new chunk with remainder.
-                chunk_buf = remainder;
-                scan_pos = 0;
-                line_start = 0;
+            // `boundary_abs` is one past the terminator, in absolute terms.
+            let boundary = (boundary_abs - chunk_base) as usize;
+            if (boundary as u64) < chunk_size_bytes {
                 continue;
             }
 
-            // Advance to next line.
-            scan_pos = nl_pos + 1;
-            line_start = scan_pos;
+            // Publish namespace preflight before chunk 0 leaves.
+            if chunk_idx == 0 && ns_preflight.get().is_none() {
+                ns_detector.finish(&ns_preflight);
+            }
+
+            let remainder = chunk_buf[boundary..].to_vec();
+            chunk_buf.truncate(boundary);
+
+            tracing::debug!(
+                chunk = chunk_idx,
+                size_mb = chunk_buf.len() as f64 / (1024.0 * 1024.0),
+                remainder_bytes = remainder.len(),
+                "chunk emitted"
+            );
+
+            if tx
+                .send((chunk_idx, std::mem::take(&mut chunk_buf)))
+                .is_err()
+            {
+                return Ok(chunk_idx);
+            }
+            chunk_idx += 1;
+
+            // The remainder becomes the next chunk; the scanner keeps its
+            // state (it is mid-document, not mid-statement) and only the
+            // buffer-relative offsets rebase.
+            chunk_base = boundary_abs;
+            chunk_buf = remainder;
+            scan_pos = 0;
         }
 
         // Overshoot protection if we can’t find a boundary line for a long time.
@@ -2262,11 +2264,12 @@ ex:bob ex:name "Bob" .
 
     #[test]
     fn test_streaming_splits_without_newlines() {
-        // Streaming splitter uses a line-based boundary check: only split at
-        // lines ending with '.'.
+        // Splits on long lines with no blank lines between statements.
         //
-        // We still validate it can split on long lines with no blank lines,
-        // but we require newlines to exist for boundary detection.
+        // The comment this replaces said newlines were REQUIRED, because the
+        // streaming path used to find boundaries by looking for them. It now
+        // runs the byte-level scanner, so a newline is incidental; see
+        // `streaming_splits_a_document_with_no_newlines_at_all`.
         let ttl = "\
 @prefix ex: <http://example.org/> .\n\
 ex:alice ex:name \"Alice\" .\n\
@@ -2284,6 +2287,124 @@ ex:carol ex:name \"Carol\" .\n";
         let actual = reader.join().unwrap();
         assert_eq!(count, actual);
         assert!(count >= 2, "expected multiple chunks, got {count}");
+    }
+
+    // ---- Streaming boundary defects (plan §1.4) ----
+    //
+    // These three are written against the line-based scanner and FAIL on it.
+    // Each is a way the streaming path splits a chunk somewhere the byte-level
+    // pre-scan would not, and each produces a chunk that is not valid Turtle
+    // or silently wrong IRIs.
+
+    /// Collect every streaming chunk as text, or the error the reader raised.
+    fn stream_chunks(ttl: &str, chunk_size: u64) -> Result<Vec<String>, SplitError> {
+        let f = write_temp(ttl);
+        let mut reader = StreamingTurtleReader::new(f.path(), chunk_size, 4, None)?;
+        let mut out = Vec::new();
+        while let Some((_idx, text)) = recv_as_text(&reader) {
+            out.push(text);
+        }
+        reader.join()?;
+        Ok(out)
+    }
+
+    #[test]
+    fn streaming_does_not_split_on_a_period_inside_a_line_final_comment() {
+        // The line ends with '.' — but the '.' is inside a comment, and the
+        // statement is still open. A line-based check sees "ends with '.'" and
+        // splits mid-statement, producing two unparseable halves.
+        let ttl = "@prefix ex: <http://example.org/> .\n\
+                   ex:alice ex:name \"Alice\" ; # see RFC 3986 sec. 5.1.1.\n\
+                   ex:age 30 .\n\
+                   ex:bob ex:name \"Bob\" .\n";
+
+        let chunks = stream_chunks(ttl, 40).expect("reader must not fail");
+        for (i, text) in chunks.iter().enumerate() {
+            crate::parse_to_json(text)
+                .unwrap_or_else(|e| panic!("chunk {i} is not valid Turtle: {e}\n{text}"));
+        }
+    }
+
+    #[test]
+    fn streaming_does_not_mistake_quotes_inside_a_short_string_for_a_long_one() {
+        // An ODD number of `'''` inside a short double-quoted literal. The
+        // line scanner toggles a long-string flag on each occurrence, so an
+        // odd count leaves it stuck on and every boundary after this point is
+        // refused — the rest of the file becomes one chunk however large it
+        // grows. (An even count self-cancels, which is why the parity matters
+        // and why this fixture spells it out.)
+        let ttl = "@prefix ex: <http://example.org/> .\n\
+                   ex:a ex:quote \"three apostrophes: ''' and done\" .\n\
+                   ex:b ex:name \"B\" .\n\
+                   ex:c ex:name \"C\" .\n\
+                   ex:d ex:name \"D\" .\n";
+
+        let chunks = stream_chunks(ttl, 40).expect("reader must not fail");
+        assert!(
+            chunks.len() >= 2,
+            "the flag stuck: got {} chunk(s)",
+            chunks.len()
+        );
+        for (i, text) in chunks.iter().enumerate() {
+            crate::parse_to_json(text)
+                .unwrap_or_else(|e| panic!("chunk {i} is not valid Turtle: {e}\n{text}"));
+        }
+    }
+
+    #[test]
+    fn streaming_refuses_a_mid_file_directive_instead_of_producing_wrong_iris() {
+        // A mid-file @prefix redefinition. Only chunk 0 carries it; every later
+        // chunk gets the HEADER's binding prepended, so `ex:x` silently resolves
+        // to the wrong namespace. The pre-scan path raises PrefixAfterData; the
+        // streaming path did not look.
+        let ttl = "@prefix ex: <http://first.example/> .\n\
+                   ex:a ex:p \"1\" .\n\
+                   ex:b ex:p \"2\" .\n\
+                   @prefix ex: <http://second.example/> .\n\
+                   ex:c ex:p \"3\" .\n\
+                   ex:d ex:p \"4\" .\n";
+
+        match stream_chunks(ttl, 40) {
+            Err(SplitError::PrefixAfterData { .. }) => {}
+            Err(other) => panic!("wrong error: {other}"),
+            Ok(chunks) => panic!(
+                "a mid-file directive was accepted; later chunks resolve ex: to the \
+                 header binding and are silently wrong. Chunks:\n{}",
+                chunks.join("\n---\n")
+            ),
+        }
+    }
+
+    #[test]
+    fn streaming_splits_a_document_with_no_newlines_at_all() {
+        // Turtle does not require newlines, and a generated dump often has
+        // none. The line-based scanner could not split such a file at all: it
+        // searched for '\n' and, finding none, accumulated the whole document
+        // into one chunk. The byte-level scanner splits on the terminator.
+        let mut ttl = String::from("@prefix ex: <http://example.org/> . ");
+        for i in 0..60 {
+            ttl.push_str(&format!("ex:s{i} ex:p \"v{i}\" . "));
+        }
+        assert_eq!(
+            ttl.matches('\n').count(),
+            0,
+            "fixture must have no newlines"
+        );
+
+        let chunks = stream_chunks(&ttl, 100).expect("reader must not fail");
+        assert!(
+            chunks.len() >= 2,
+            "no newline meant no split: got {} chunk(s)",
+            chunks.len()
+        );
+
+        let mut total = 0usize;
+        for (i, text) in chunks.iter().enumerate() {
+            let json = crate::parse_to_json(text)
+                .unwrap_or_else(|e| panic!("chunk {i} is not valid Turtle: {e}\n{text}"));
+            total += json.as_array().map_or(0, Vec::len);
+        }
+        assert_eq!(total, 60, "every statement must survive the split");
     }
 
     #[test]
