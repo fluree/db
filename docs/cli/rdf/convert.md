@@ -25,10 +25,28 @@ NDJSON, which is deferred — so the whole graph is held in memory and nothing
 reaches the output until the input is exhausted. Two consequences worth
 planning around:
 
-- **Memory scales with the document.** Measured on a 9.6 MiB Turtle corpus
-  (200k statements, one distinct subject each): peak RSS 871 MiB for JSON-LD
+- **Memory scales with the document.** Measured on a 9.6 MiB Turtle corpus of
+  200k statements, one distinct subject each: peak RSS 871 MiB for JSON-LD
   against 81 MiB for N-Triples — **~96× the input, against ~9×**. On a large
   dump that is the difference between a conversion and an OOM.
+
+  Reproduce it with the corpus `scripts/rdf-rss-fixture.py` already generates
+  for the [peak-RSS table](README.md#memory) — `distinct.ttl` is the same
+  shape, scaled up — and read the figure back out of the profile:
+
+  ```bash
+  python3 scripts/rdf-rss-fixture.py /tmp
+  for to in nt jsonld; do
+    fluree rdf convert /tmp/distinct.ttl --to $to -o /tmp/out.$to \
+      --profile=json --no-hash 2>&1 >/dev/null \
+      | jq -r "\"$to: \(.host.peak_rss_bytes) bytes RSS for \(.corpus.bytes_decoded) in\""
+  done
+  ```
+
+  On that 22 MiB fixture a release build reports `nt: 197 MiB … = 9x` and
+  `jsonld: 2100 MiB … = 95x`. Expect the **ratio** to reproduce rather than
+  the absolute numbers — peak RSS moves with allocator, platform and build
+  profile, and every figure here is a release build on macOS/aarch64.
 - **No early exit.** `convert big.ttl --to jsonld | head -5` parses the entire
   input before writing anything, so it costs a full conversion. The pipe trick
   only works for the streaming syntaxes.
@@ -180,15 +198,33 @@ error: --prefixes: namespace for 'ok' is not an absolute IRI: 'not an iri'
 | `1` | The input document did not parse |
 | `2` | The invocation or destination was wrong: no such file, unwritable path, a syntax with no writer |
 
-A document that fails partway through leaves a **partial** conversion on the
-output, and the error says so — bytes already written cannot be recalled:
+### What a failure does to `-o`
+
+Two cases, and the difference is when the problem becomes knowable.
+
+A refusal that needs **no input at all** — an output syntax with no writer, a
+malformed `--prefixes` namespace, `--pretty` — is raised before the destination
+is opened, so the file `-o` names is left exactly as it was. That is the only
+promise available here, and it is deliberately narrow.
+
+Anything discovered **mid-stream** — a parse error, or a writer refusing an
+event — happens after `-o` was created and after bytes were written to it.
+Those bytes cannot be recalled: `-o` has already been truncated and now holds a
+prefix of the conversion. A streaming converter cannot honestly promise
+otherwise; writing to a temporary file and renaming on success would trade
+that away for double the disk and no streaming to the final path.
+
+The error says which you got:
 
 ```console
-$ fluree rdf convert broken.ttl --to nt > out.nt
+$ fluree rdf convert broken.ttl --to nt -o out.nt
 error: broken.ttl:3:16: unexpected character '?'
   wrote 1 statement(s) before the document stopped parsing — the output is a
   prefix of the conversion, not the whole of it
 ```
+
+The same applies to a blank-node collision under `--bnode-policy preserve`:
+the refusal arrives mid-parse, so `-o` is already partial when it does.
 
 `--continue-on-error`, which would skip the bad statement and carry on, needs
 statement-scoped output buffering to be correct (a Turtle statement emits
