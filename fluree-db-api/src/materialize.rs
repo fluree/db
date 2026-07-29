@@ -558,10 +558,16 @@ pub fn read_stamp(txn_meta: &[TxnMetaEntry]) -> Option<WatermarkStamp> {
 /// snapshot skew from the whole build duration to this window — and the emit-pass
 /// scans reuse the pins (session first-writer-wins), so it adds no duplicate
 /// `loadTable` GETs.
+///
+/// The pins run CONCURRENTLY, bounded by `parallelism` (O5): each pin is one
+/// `loadTable` round-trip, and the serial loop paid that latency per table in
+/// series (A2: ~1.85s/GET × 16 tables ≈ 30s of pure round-trip). Concurrency is
+/// capped by the knob, so peak in-flight requests stay bounded.
 async fn pin_all_tables(
     provider: &dyn R2rmlBuildProvider,
     graph_source_id: &str,
     mapping: &CompiledR2rmlMapping,
+    parallelism: usize,
 ) -> Result<(), MaterializeError> {
     let mut tables: Vec<&str> = mapping
         .triples_maps
@@ -570,10 +576,15 @@ async fn pin_all_tables(
         .collect();
     tables.sort_unstable();
     tables.dedup();
-    for table in tables {
-        let _ = provider
+    let mut pins = futures::stream::iter(tables.into_iter().map(|table| async move {
+        provider
             .scan_table(graph_source_id, table, &[], &[], None, None)
-            .await?;
+            .await
+            .map(|_| ())
+    }))
+    .buffer_unordered(parallelism.max(1));
+    while let Some(res) = pins.next().await {
+        res?;
     }
     Ok(())
 }
@@ -588,6 +599,7 @@ pub async fn drive_virtual_import<F>(
     provider: &dyn R2rmlBuildProvider,
     graph_source_id: &str,
     chunk_size_bytes: usize,
+    parallelism: usize,
     ctx: &VirtualChunkContext<'_>,
     mut emit_chunk: F,
 ) -> Result<MaterializeStats, MaterializeError>
@@ -601,27 +613,49 @@ where
     // Pin-all pre-pass — pin every table's snapshot before emission so the
     // watermark is complete and cross-table skew is bounded to seconds (§17(a)).
     let pin_start = std::time::Instant::now();
-    pin_all_tables(provider, graph_source_id, &mapping).await?;
+    pin_all_tables(provider, graph_source_id, &mapping, parallelism).await?;
     tracing::info!(
         pin_ms = pin_start.elapsed().as_millis() as u64,
         "materialize.phase pin_all_tables"
     );
 
     // Pass 1 — pre-index cyclic / self-referential parents (no triples emitted).
-    for tm_iri in &materialization.preindex {
-        let Some(tm) = mapping.triples_maps.get(tm_iri) else {
-            continue;
-        };
-        let table = tm
-            .table_name()
-            .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
-        let projection = scan_projection(tm, &parents);
-        let mut stream = provider
-            .scan_table(graph_source_id, table, &projection, &[], None, None)
-            .await?;
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            parents.index_batch(tm, &batch)?;
+    // Scan the pre-index tables CONCURRENTLY, bounded by `parallelism` (O5): each
+    // table indexes into its OWN partial parent index, and the partials merge back
+    // once all scans complete. Parent IRIs are disjoint across pre-index tables, so
+    // the merge is a union. Peak extra memory = parallelism × (one batch + one
+    // table's partial index); the partials sum to the final index (resident
+    // regardless of ordering). A2 measured ~217s of strictly-serial cold-S3
+    // fact-table fetch here — the concurrency overlaps that round-trip.
+    let preindex: Vec<&String> = materialization.preindex.iter().collect();
+    if !preindex.is_empty() {
+        let parents_ref = &parents;
+        let mapping_ref = &mapping;
+        let results: Vec<Result<Option<ParentIndexSet>, MaterializeError>> =
+            futures::stream::iter(preindex.into_iter().map(move |tm_iri| async move {
+                let Some(tm) = mapping_ref.triples_maps.get(tm_iri) else {
+                    return Ok::<Option<ParentIndexSet>, MaterializeError>(None);
+                };
+                let table = tm
+                    .table_name()
+                    .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
+                let mut partial = parents_ref.split_empty();
+                let projection = scan_projection(tm, &partial);
+                let mut stream = provider
+                    .scan_table(graph_source_id, table, &projection, &[], None, None)
+                    .await?;
+                while let Some(batch) = stream.next().await {
+                    partial.index_batch(tm, &batch?)?;
+                }
+                Ok(Some(partial))
+            }))
+            .buffer_unordered(parallelism.max(1))
+            .collect()
+            .await;
+        for res in results {
+            if let Some(partial) = res? {
+                parents.merge_from(partial);
+            }
         }
     }
 

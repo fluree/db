@@ -4003,6 +4003,9 @@ where
             std::result::Result<(usize, ParsedChunk), String>,
         >(num_threads);
         let chunk_size_bytes = config.effective_chunk_size_mb() as usize * 1024 * 1024;
+        // The parallelism knob bounds the produce side's concurrent scans (O5:
+        // pin-all + Pass-1 pre-index) inside the materializer.
+        let producer_parallelism = num_threads.max(1);
         let shared_alloc = Arc::clone(&shared_alloc);
         let spool_config = Arc::clone(&spool_config);
         let spool_dir = spool_dir.clone();
@@ -4039,6 +4042,7 @@ where
                     &*vs.provider,
                     &vs.graph_source_id,
                     chunk_size_bytes,
+                    producer_parallelism,
                     &ctx,
                     |idx, parsed| result_tx.send(Ok((idx, parsed))).is_ok(),
                 ));

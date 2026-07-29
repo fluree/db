@@ -260,6 +260,29 @@ impl ParentIndexSet {
         self.needed.contains_key(tm_iri)
     }
 
+    /// A sibling index set with the SAME required parent-column plan (`needed`) but
+    /// an EMPTY built index. Lets one parent table be pre-indexed in isolation —
+    /// used by the concurrent Pass-1 pre-index, where each table scans into its own
+    /// partial index and the partials are merged back with [`merge_from`].
+    pub fn split_empty(&self) -> Self {
+        Self {
+            needed: self.needed.clone(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Fold another index set's built indexes into this one (union per parent, per
+    /// canonical column set, per key). Pre-indexed parent tables have disjoint
+    /// parent IRIs, but the merge is a full union so it stays correct regardless.
+    pub fn merge_from(&mut self, other: Self) {
+        for (parent, col_index) in other.index {
+            let entry = self.index.entry(parent).or_default();
+            for (cols, key_to_subject) in col_index {
+                entry.entry(cols).or_default().extend(key_to_subject);
+            }
+        }
+    }
+
     /// Record a parent TriplesMap's rows from one batch into the index. A no-op
     /// when `tm` is not a foreign-key parent. Rows with a null subject or a null
     /// join key are skipped (they can never satisfy a join).
@@ -735,6 +758,59 @@ mod tests {
         assert!(
             cust < ord,
             "parent Customer must precede child Order: {order:?}"
+        );
+    }
+
+    #[test]
+    fn split_empty_and_merge_from_union_parent_indexes() {
+        // The concurrent Pass-1 (O5) indexes each parent table into its own partial
+        // index (`split_empty`) and merges them back (`merge_from`). Two partials
+        // each holding a disjoint slice of the same parent must union on merge.
+        let mapping = star_mapping();
+        let base = ParentIndexSet::new(&mapping).unwrap();
+        let cust = dim_customer_tm();
+
+        let mut p1 = base.split_empty();
+        p1.index_batch(&cust, &customer_batch()).unwrap(); // keys 10, 20
+
+        let schema = Arc::new(BatchSchema::new(vec![
+            field("c_key", FieldType::Int64, false, 1),
+            field("name", FieldType::String, true, 2),
+        ]));
+        let batch2 = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Int64(vec![Some(30)]),
+                Column::String(vec![s("Globex")]),
+            ],
+        )
+        .unwrap();
+        let mut p2 = base.split_empty();
+        p2.index_batch(&cust, &batch2).unwrap(); // key 30
+
+        let mut merged = base; // empty index; needed carries the plan
+        merged.merge_from(p1);
+        merged.merge_from(p2);
+
+        let cols = vec!["c_key".to_string()];
+        assert!(merged.is_parent("<#Customer>"));
+        assert!(
+            merged
+                .lookup("<#Customer>", &cols, &["10".to_string()])
+                .is_some(),
+            "key 10 from partial 1 must survive the merge"
+        );
+        assert!(
+            merged
+                .lookup("<#Customer>", &cols, &["30".to_string()])
+                .is_some(),
+            "key 30 from partial 2 must survive the merge"
+        );
+        assert!(
+            merged
+                .lookup("<#Customer>", &cols, &["99".to_string()])
+                .is_none(),
+            "an unindexed key must not resolve"
         );
     }
 
