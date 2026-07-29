@@ -185,8 +185,11 @@ pub struct BinaryScanOperator {
     store: Option<Arc<BinaryIndexStore>>,
     g_id: GraphId,
     cursor: Option<BinaryCursor>,
-    /// Pre-computed p_id → Sid (all predicates, done once at open).
-    p_sids: Vec<Sid>,
+    /// Persisted p_id → Sid table, shared from the store's per-instance cache.
+    p_sids: Arc<[Sid]>,
+    /// Novelty-only predicate overrides keyed by ephemeral p_id, populated
+    /// during overlay translation (ephemeral ids sit above the persisted range).
+    p_sids_ephemeral: HashMap<u32, Sid>,
     /// Cached s_id → Sid for amortized IRI resolution.
     sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
@@ -723,7 +726,8 @@ impl BinaryScanOperator {
             store: None,
             g_id: 0,
             cursor: None,
-            p_sids: Vec::new(),
+            p_sids: Vec::new().into(),
+            p_sids_ephemeral: HashMap::new(),
             sid_cache: HashMap::new(),
             p_is_var,
             include_system_facts: false,
@@ -1138,6 +1142,9 @@ impl BinaryScanOperator {
     /// Resolve p_id → Sid (pre-computed, O(1)).
     #[inline]
     fn resolve_p_id(&self, p_id: u32) -> Sid {
+        if let Some(sid) = self.p_sids_ephemeral.get(&p_id) {
+            return sid.clone();
+        }
         self.p_sids
             .get(p_id as usize)
             .cloned()
@@ -1170,8 +1177,12 @@ impl BinaryScanOperator {
         if self.include_system_facts {
             return false;
         }
-        let Some(sid) = self.p_sids.get(p_id as usize) else {
-            return false;
+        let sid = match self.p_sids_ephemeral.get(&p_id) {
+            Some(sid) => sid,
+            None => match self.p_sids.get(p_id as usize) {
+                Some(sid) => sid,
+                None => return false,
+            },
         };
         // Always hide `f:reifies*` regardless of graph.
         if fluree_db_core::is_reserved_reifies_predicate(sid) {
@@ -1774,21 +1785,14 @@ impl Operator for BinaryScanOperator {
             return self.open_range_fallback(ctx).await;
         }
 
-        // Pre-compute p_id → Sid table.
-        let mut p_sids = Vec::new();
         let store = self.store.as_ref().ok_or_else(|| {
             QueryError::Internal(
                 "BinaryScanOperator::open: no binary_store on ExecutionContext".into(),
             )
         })?;
         let store_ref = store.as_ref();
-        for p_id in 0u32.. {
-            match store_ref.resolve_predicate_iri(p_id) {
-                Some(iri) => p_sids.push(store_ref.encode_iri(iri)),
-                None => break,
-            }
-        }
-        self.p_sids = p_sids;
+        // Persisted p_id → Sid table, built once per store instance.
+        self.p_sids = Arc::clone(store_ref.p_sid_table());
 
         // Extract bound terms in snapshot namespace space and build the persisted-ID filter
         // by translating through full IRIs into store namespace space.
@@ -2204,14 +2208,10 @@ impl Operator for BinaryScanOperator {
                 }
             };
 
-            // Extend p_sids table with novelty-only predicates so that ephemeral
-            // p_ids from overlay ops can be decoded back to Sids during row binding.
+            // Record novelty-only predicates so that ephemeral p_ids from
+            // overlay ops can be decoded back to Sids during row binding.
             for (sid, ep_id) in &translated.ephemeral_preds {
-                let idx = *ep_id as usize;
-                if idx >= self.p_sids.len() {
-                    self.p_sids.resize(idx + 1, Sid::new(0, ""));
-                }
-                self.p_sids[idx] = sid.clone();
+                self.p_sids_ephemeral.insert(*ep_id, sid.clone());
             }
 
             if !translated.ops.is_empty() {
@@ -2394,7 +2394,8 @@ impl Operator for BinaryScanOperator {
         self.range_iter = None;
         self.store = None;
         self.sid_cache.clear();
-        self.p_sids.clear();
+        self.p_sids = Vec::new().into();
+        self.p_sids_ephemeral.clear();
         self.unresolved_bound_subject_iri = None;
         self.state = OperatorState::Closed;
     }
@@ -2751,8 +2752,8 @@ pub(crate) fn translate_one_flake_v3_pub(
     // Predicate: persisted → ephemeral (keyed by Sid to avoid namespace decode issues).
     //
     // For novelty-only predicates (not present in the persisted predicate dictionary),
-    // we allocate ephemeral p_ids and later extend `p_sids` so decode produces the
-    // original Sid (in snapshot namespace space).
+    // we allocate ephemeral p_ids and later record them in `p_sids_ephemeral` so
+    // decode produces the original Sid (in snapshot namespace space).
     let p_id = match store.sid_to_p_id(&flake.p) {
         Some(id) => id,
         None => runtime_small_dicts

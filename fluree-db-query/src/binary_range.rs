@@ -717,9 +717,9 @@ fn binary_range_eq_v3(
                 Some(sid) => sid.clone(),
                 None => resolve_sid(s_id, &view)?,
             };
-            // Resolve predicate: persisted dict first, then ephemeral overlay map.
-            let p_sid = match store.resolve_predicate_iri(p_id) {
-                Some(iri) => store.encode_iri(iri),
+            // Resolve predicate: persisted table first, then ephemeral overlay map.
+            let p_sid = match store.p_sid_table().get(p_id as usize) {
+                Some(sid) => sid.clone(),
                 None => match ephemeral_p_id_to_sid.get(&p_id) {
                     Some(sid) => sid.clone(),
                     None => continue, // truly unknown — shouldn't happen
@@ -1361,9 +1361,9 @@ fn binary_range_bounded_v3(
                 }
             }
 
-            // Resolve predicate: persisted dict first, then ephemeral overlay map.
-            let p_sid = match store.resolve_predicate_iri(p_id) {
-                Some(iri) => store.encode_iri(iri),
+            // Resolve predicate: persisted table first, then ephemeral overlay map.
+            let p_sid = match store.p_sid_table().get(p_id as usize) {
+                Some(sid) => sid.clone(),
                 None => match ephemeral_p_id_to_sid.get(&p_id) {
                     Some(sid) => sid.clone(),
                     None => continue, // truly unknown — shouldn't happen
