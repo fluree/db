@@ -48,17 +48,49 @@ if [ "$publishable" != "true" ]; then
 	fi
 	case "$host" in
 	*-translated)
-		echo "  This shell runs under binary translation. uname reports the emulated"
-		echo "  architecture and the harness itself is emulated, so these are not"
-		echo "  measurements of the tools alone."
+		echo "  This SHELL runs under binary translation, so the harness's own"
+		echo "  per-sample overhead is emulated. It does NOT follow that the tools"
+		echo "  are: a translated parent still runs an arm64-only child natively,"
+		echo "  which is what the ARCH column reports per cell. Read that column"
+		echo "  rather than inferring emulation from this line."
 		;;
 	*) echo "  host_class is not the official publication locus (H-10)." ;;
 	esac
 fi
 
 echo
-printf '  %-10s %-12s %-7s %10s %10s %12s %10s %9s\n' \
-	TOOL MODE SYNTAX MEDIAN_S REL_MAD% MB/S STMT/S PEAK_RSS
+# Arch heterogeneity check: comparing a native cell against an emulated one
+# reports the emulator as a performance difference.
+declare -A arch_seen=()
+for cell in "$RUN_DIR"/*.json; do
+	[ "$(basename "$cell")" = "manifest.json" ] && continue
+	[ "$(jq -r '.status' "$cell")" = "ok" ] || continue
+	a="$(jq -r '.tool_arch_class // "unknown"' "$cell")"
+	arch_seen["$a"]=1
+done
+if [ "${#arch_seen[@]}" -gt 1 ]; then
+	echo
+	echo "  *** NON-COMPARABLE: tool architectures differ ***"
+	echo "  Cells in this run ran as: ${!arch_seen[*]}"
+	echo "  A native cell against an emulated one measures the emulator, not the"
+	echo "  tool. Same disqualification tier as host translation."
+fi
+for a in "${!arch_seen[@]}"; do
+	case "$a" in
+	native-*) ;;
+	*)
+		echo
+		echo "  *** ARCH NOT CONFIRMED NATIVE: $a ***"
+		echo "  A universal binary's chosen slice is not observable from outside the"
+		echo "  process, and one launched from a translated parent does not reliably"
+		echo "  pick the native slice. Treat these cells as unverified."
+		;;
+	esac
+done
+
+echo
+printf '  %-10s %-12s %-7s %10s %10s %12s %10s %9s %-28s\n' \
+	TOOL MODE SYNTAX MEDIAN_S REL_MAD% MB/S STMT/S PEAK_RSS ARCH
 printf '  %s\n' "-------------------------------------------------------------------------------------"
 
 for cell in "$RUN_DIR"/*.json; do
@@ -71,13 +103,14 @@ for cell in "$RUN_DIR"/*.json; do
 		printf '  %-10s %-12s %-7s %s\n' "$tool" "$mode" "$syntax" "FAILED"
 		continue
 	fi
-	printf '  %-10s %-12s %-7s %10.4f %9.1f%% %12.2f %10d %8.1fM\n' \
+	printf '  %-10s %-12s %-7s %10.4f %9.1f%% %12.2f %10d %8.1fM %-28s\n' \
 		"$tool" "$mode" "$syntax" \
 		"$(jq -r '.wall_seconds.median' "$cell")" \
 		"$(jq -r '.wall_seconds.rel_mad_pct' "$cell")" \
 		"$(jq -r '.mb_per_second' "$cell")" \
 		"$(jq -r '.statements_per_second' "$cell")" \
-		"$(jq -r '.peak_rss_bytes / 1048576' "$cell")"
+		"$(jq -r '.peak_rss_bytes / 1048576' "$cell")" \
+		"$(jq -r '.tool_arch_class // "unknown"' "$cell")"
 done
 
 echo
@@ -95,6 +128,11 @@ echo "    flips to riot check_true vs our validate (per H-8), and today's"
 echo "    check_false pairing becomes the disclosed secondary. The lock already"
 echo "    carries the column so the matrix is never quietly asymmetric."
 echo "  * rapper is dormant-since-2023 and carried for historical continuity."
+echo "  * ARCH is the class the tool's executable actually runs as. Only"
+echo "    native-<host arch> cells are comparable to each other; a translated or"
+echo "    universal-indeterminate cell measures partly the emulator. riot is a"
+echo "    script over a universal JVM, so its slice is not observable from"
+echo "    outside — stated rather than assumed."
 echo "  * REL_MAD% is the spread of the bulk of the samples. Above ~5%, treat the"
 echo "    cell as noise and re-run on a quieter host."
 echo

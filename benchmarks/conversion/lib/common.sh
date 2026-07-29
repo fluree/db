@@ -165,6 +165,76 @@ host_is_quiet() {
 	awk -v r="$(host_load_per_core)" 'BEGIN{exit (r < 0.5) ? 0 : 1}'
 }
 
+# Architecture class of a tool's executable, as it will actually RUN here.
+#
+# The hazard this exists for (corrected from the earlier host-level reading): a
+# translated shell does NOT translate its arm64 children, so our own binaries
+# run native. What does bite is a COMPETITOR shipping x86_64-only — a Homebrew
+# build from the Intel prefix, say — because then one column is emulated and
+# another is not, and the matrix reports that as a performance difference.
+#
+# Classes, and note that two of them are honest admissions rather than answers:
+#
+#   native-arm64            single-slice arm64: runs native, comparable
+#   translated-x86_64       single-slice x86_64 on arm64: runs under Rosetta
+#   universal-indeterminate several slices; which one the kernel picked is not
+#                           observable from outside the process, and a universal
+#                           binary launched from a translated parent does not
+#                           reliably choose the native slice
+#   script:<class>          a wrapper; the class shown is its runtime's
+#   absent / unknown
+tool_arch_class() {
+	local bin
+	bin="$(command -v "$1" 2>/dev/null)" || {
+		printf 'absent'
+		return
+	}
+	_arch_class_of_file "$bin"
+}
+
+_arch_class_of_file() {
+	local bin="$1" archs host
+	host="$(host_arch)"
+
+	if archs="$(lipo -archs "$bin" 2>/dev/null)"; then
+		local count
+		count="$(printf '%s' "$archs" | wc -w | tr -d ' ')"
+		if [ "$count" -gt 1 ]; then
+			printf 'universal-indeterminate(%s)' "$(printf '%s' "$archs" | tr ' ' ',')"
+			return
+		fi
+		case "$archs" in
+		arm64* | "$host"*) printf 'native-%s' "$archs" ;;
+		*) printf 'translated-%s' "$archs" ;;
+		esac
+		return
+	fi
+
+	# A script: the arch that matters is its interpreter's or runtime's.
+	if file -b "$bin" 2>/dev/null | grep -q 'script'; then
+		local runtime=""
+		if grep -qE 'JAVA_HOME|\bjava\b' "$bin" 2>/dev/null; then
+			runtime="$(command -v java 2>/dev/null || true)"
+		fi
+		[ -n "$runtime" ] || runtime="$(awk 'NR==1 && /^#!/{sub(/^#! *"?/,"");print $1}' "$bin" 2>/dev/null)"
+		if [ -n "$runtime" ] && [ -x "$runtime" ]; then
+			printf 'script:%s' "$(_arch_class_of_file "$runtime")"
+			return
+		fi
+		printf 'script:unknown'
+		return
+	fi
+	printf 'unknown'
+}
+
+# Whether a class is a confirmed-native single slice, i.e. safe to compare.
+arch_is_comparable() {
+	case "$1" in
+	native-*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
 sha256_of() {
 	local file="$1"
 	if command -v sha256sum >/dev/null 2>&1; then

@@ -56,11 +56,25 @@ question it. The harness reads the label and ships `calibrate`, which allocates
 a known 200 MiB and checks the reading, so the next host answers the question by
 measurement instead of by trusting this paragraph.
 
-**Binary translation.** On an Apple-silicon Mac running a translated shell,
-`uname -m` reports `x86_64`. Every result would be stamped with hardware that
-was not involved, and the harness's own clock calls would be emulated. Detected
-via `sysctl.proc_translated`, stamped as `…-translated`, and disqualified from
-publication — recorded, not corrected.
+**Binary translation, and what it does *not* imply.** On an Apple-silicon Mac
+running a translated shell, `uname -m` reports `x86_64`, so every result would
+be stamped with hardware that was not involved. Detected via
+`sysctl.proc_translated` and stamped `…-translated`.
+
+But the interesting hazard is not the shell. A translated parent still runs an
+**arm64-only child natively**, so our own binaries are fine. What bites is a
+*competitor* shipping x86_64-only — an Intel-prefix Homebrew build, say —
+because then one column is emulated, another is not, and the matrix reports the
+emulator as a performance difference. Every cell therefore records the
+architecture class its executable actually runs as, and the renderer marks a run
+whose cells disagree as non-comparable.
+
+Two classes are deliberate admissions rather than answers:
+`translated-x86_64` (definitely emulated here) and `universal-indeterminate`
+(several slices; which one the kernel chose is not observable from outside the
+process, and a universal binary launched from a translated parent does not
+reliably pick the native one). **riot is a script over a universal JVM, so it
+falls in the second class** — which matters, since riot is the named target.
 
 **Machine load.** A benchmark harness that cannot distinguish "this tool is
 slow" from "this machine was busy" is not measuring the tool. Load inflates

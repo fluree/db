@@ -134,6 +134,17 @@ run_cell() {
 		rss_bytes="$("$HARNESS" rss "$time_file")"
 	done
 
+	# Load AT measurement time, not at run start: a build that begins midway
+	# through the matrix contaminates only the cells after it, and a single
+	# run-level figure would hide that.
+	local cell_load
+	cell_load="$(host_load_per_core)"
+
+	# Architecture the tool actually runs as. A native cell and an emulated
+	# cell are not comparable, and the difference reads as performance.
+	local arch_class
+	arch_class="$(tool_arch_class "${cmd[0]}")"
+
 	local stats
 	stats="$(printf '%s\n' "${timings[@]}" | "$HARNESS" stats)"
 
@@ -169,6 +180,7 @@ run_cell() {
 		--argjson out_statements "$out_lines" \
 		--argjson mb_s "$mb_s" --argjson tr_s "$tr_s" \
 		--argjson expected "$expected" --argjson verdict "$verdict" \
+		--argjson cell_load "$cell_load" --arg arch_class "$arch_class" \
 		--arg child_elapsed "${child_elapsed[*]}" \
 		--arg cmd "${cmd[*]}" \
 		'{tool:$tool, mode:$mode, syntax:$syntax, corpus:$corpus,
@@ -178,12 +190,14 @@ run_cell() {
 		  child_elapsed_seconds_crosscheck:$child_elapsed,
 		  child_elapsed_note:"GNU time %e, child-only but centisecond-resolution; corroboration only, not the primary clock",
 		  peak_rss_bytes:$rss, input_bytes:$in_bytes,
+		  load_per_core_at_measurement:$cell_load,
+		  tool_arch_class:$arch_class,
 		  out_statements:$out_statements, expected_statements:$expected,
 		  mb_per_second:$mb_s, statements_per_second:$tr_s,
 		  invocation:$cmd, status:$verdict}' >"$cell_out.json"
 
-	printf '  %-10s %-12s %-9s %8.3fs  %8s MB/s  %10s stmt/s  %6s stmts\n' \
-		"$tool" "$mode" "$syntax" "$median" "$mb_s" "$tr_s" "$out_lines" >&2
+	printf '  %-10s %-12s %-9s %8.3fs  %8s MB/s  %10s stmt/s  %6s stmts  [%s]\n' \
+		"$tool" "$mode" "$syntax" "$median" "$mb_s" "$tr_s" "$out_lines" "$arch_class" >&2
 }
 
 # ---------------------------------------------------------------------------
