@@ -311,11 +311,13 @@ pub trait GraphSink {
     /// - Annotation-body properties (`{| p o |}`) arrive as ordinary
     ///   [`Self::emit_triple`] events with `reifier` as the subject.
     ///
-    /// Only called when [`Self::supports_reified_triples`] returns `true`;
-    /// the default implementation is a no-op guarded by a debug assert
-    /// (every producer of these events already refuses the input up-front
-    /// when the capability probe is `false`, so the default body is
-    /// unreachable rather than a silent fallback).
+    /// Only called when [`Self::supports_reified_triples`] returns `true`.
+    /// The default body refuses — `debug_assert` in development, an error in
+    /// release — for the same reason [`Self::emit_quad`] does: a dropped
+    /// reification is data loss, not a fallback. Every producer already
+    /// checks the probe and rejects the input up-front, so the refusal costs
+    /// nothing on any path that exists today; it is the backstop for the
+    /// producer that forgets.
     fn emit_reified_triple(
         &mut self,
         subject: TermId,
@@ -328,7 +330,9 @@ pub trait GraphSink {
             self.supports_reified_triples(),
             "emit_reified_triple called on a sink that does not support reified triples"
         );
-        Ok(())
+        Err(SinkError::rejected(
+            "this sink cannot represent reified triples",
+        ))
     }
 }
 
@@ -731,6 +735,43 @@ mod tests {
         }
     }
 
+    /// Claims reified-triple support but never overrides
+    /// `emit_reified_triple` — reaches the trait default past its
+    /// `debug_assert`, which is the release-build backstop under test.
+    #[derive(Default)]
+    struct ReifyClaimingSink {
+        terms: u32,
+    }
+
+    impl GraphSink for ReifyClaimingSink {
+        fn on_base(&mut self, _base_iri: &str) {}
+        fn on_prefix(&mut self, _prefix: &str, _namespace_iri: &str) {}
+        fn term_iri(&mut self, _iri: &str) -> TermId {
+            self.terms += 1;
+            TermId::new(self.terms)
+        }
+        fn term_blank(&mut self, _label: Option<&str>) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal(
+            &mut self,
+            _value: &str,
+            _datatype: Datatype,
+            _language: Option<&str>,
+        ) -> TermId {
+            TermId::new(0)
+        }
+        fn term_literal_value(&mut self, _value: LiteralValue, _datatype: Datatype) -> TermId {
+            TermId::new(0)
+        }
+        fn emit_triple(&mut self, _s: TermId, _p: TermId, _o: TermId) -> SinkResult {
+            Ok(())
+        }
+        fn supports_reified_triples(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn triple_only_sinks_do_not_claim_quad_support() {
         // The capability probe producers of N-Quads/TriG/`@graph` must
@@ -738,6 +779,24 @@ mod tests {
         let sink = GraphCollectorSink::new();
         assert!(!sink.supports_quads());
         assert!(!sink.supports_reified_triples());
+    }
+
+    /// Symmetric with quads: a sink that claims the capability but never
+    /// overrides the method must be refused, not silently ignored. A dropped
+    /// reification is data loss.
+    #[test]
+    fn default_emit_reified_triple_refuses_instead_of_dropping_the_reifier() {
+        let mut sink = ReifyClaimingSink::default();
+        let s = sink.term_iri("http://example.org/s");
+        let p = sink.term_iri("http://example.org/p");
+        let o = sink.term_iri("http://example.org/o");
+        let r = sink.term_iri("http://example.org/r");
+
+        let err = sink
+            .emit_reified_triple(s, p, o, r)
+            .expect_err("the default reified body must refuse");
+        assert!(matches!(err, SinkError::Rejected(_)), "{err:?}");
+        assert!(err.to_string().contains("reified triples"), "{err}");
     }
 
     #[test]
