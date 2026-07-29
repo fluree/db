@@ -50,7 +50,7 @@ pub use turtle::{TrigWriter, TurtleWriter};
 use crate::prefix::PrefixMap;
 
 /// Shared configuration for every writer in this module.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct WriterConfig {
     /// How blank-node labels reach the output. See [`BlankNodeLabels`].
     pub blank_labels: BlankNodeLabels,
@@ -62,6 +62,23 @@ pub struct WriterConfig {
     /// and JSON-LD ignore them: the first two have no prefixed-name syntax,
     /// and JSON-LD takes its `@context` from its own format config.
     pub prefixes: PrefixMap,
+
+    /// Whether Turtle and TriG emit `@prefix` declarations at all.
+    ///
+    /// On by default: a document that compacts IRIs must declare the prefixes
+    /// it compacts with, or it is not readable.
+    ///
+    /// Off exists for one caller — chunk-parallel conversion, where several
+    /// writers each produce a fragment of one document and the fragments are
+    /// concatenated. The chunks all see the same header prelude, so every one
+    /// of them would declare the same prefixes; the first chunk declares them
+    /// for the whole output and the rest suppress. Compaction is unaffected
+    /// either way, because the prefix map is still populated; only the
+    /// directives are withheld.
+    ///
+    /// Turning this off on a writer whose output is NOT preceded by another
+    /// writer's declarations produces a document no reader accepts.
+    pub declare_prefixes: bool,
 
     /// Hold each statement's bytes until the producer commits it.
     ///
@@ -79,11 +96,29 @@ pub struct WriterConfig {
     pub buffer_statements: bool,
 }
 
+impl Default for WriterConfig {
+    fn default() -> Self {
+        Self {
+            blank_labels: BlankNodeLabels::default(),
+            prefixes: PrefixMap::default(),
+            declare_prefixes: true,
+            buffer_statements: false,
+        }
+    }
+}
+
 impl WriterConfig {
-    /// A default configuration: relabelled blank nodes, no prefixes, no
-    /// statement buffering.
+    /// A default configuration: relabelled blank nodes, no prefixes, prefix
+    /// declarations on, no statement buffering.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether to emit `@prefix` declarations. See
+    /// [`declare_prefixes`](Self::declare_prefixes) before turning it off.
+    pub fn with_prefix_declarations(mut self, declare_prefixes: bool) -> Self {
+        self.declare_prefixes = declare_prefixes;
+        self
     }
 
     /// Set the blank-node labelling policy.

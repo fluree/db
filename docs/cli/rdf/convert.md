@@ -228,6 +228,50 @@ error: broken.ttl:3:16: unexpected character '?'
 The same applies to a blank-node collision under `--bnode-policy preserve`:
 the refusal arrives mid-parse, so `-o` is already partial when it does.
 
+### Parallelism
+
+`--parallelism <N>` (the global flag) parses across threads. `1` is the serial
+path exactly, so the flag is never a correctness decision; `0` — the default —
+uses as many threads as the host reports.
+
+```bash
+fluree rdf convert big.ttl --to nt -o big.nt --parallelism 8
+```
+
+The document is cut at statement boundaries, each worker parses its chunk and
+writes its own bytes, and the fragments are concatenated in order. Every text
+syntax participates; JSON-LD does not, because it is document-at-once and there
+are no fragments to concatenate.
+
+**Parallel and serial output are equivalent, not identical.** Blank-node labels
+are assigned by a deterministic function of (label, chunk) so that workers need
+no coordination, and that does not produce the same labels a single serial pass
+does. What is guaranteed:
+
+- the same input at the same `--parallelism` is **byte-identical across runs**
+  — thread scheduling cannot reach the output;
+- serial and parallel denote the **same graph**: same triples, same number of
+  distinct blank nodes, and a blank node named in two chunks is still one node.
+
+`riot` makes no cross-mode byte promise either. If you need byte-stability
+across a change of thread count, pin `--parallelism`.
+
+Two smaller consequences worth knowing. In Turtle and TriG output, prefixes are
+declared once — by the first chunk — and a subject whose statements straddle a
+chunk boundary is written as two subject blocks rather than one. Both are valid
+blocks-tier output; the tier already declines to regroup a subject that recurs
+later in a document.
+
+Parallelism trades memory for threads: in-flight chunks are bounded, so peak
+usage is roughly `(threads + queue) × chunk output size` rather than the whole
+output.
+
+`--profile` reports `threads_used` and a `parallel_reason`, so a run that fell
+back to serial says why. It also records the machine's 1-minute load average
+next to the core count, and prints a `LOADED` line when the average exceeds the
+core count — a duration measured on a contended machine is not a measurement,
+and this is the only way to tell after the fact.
+
 ### `--continue-on-error`
 
 Skip the statements that do not parse and keep the rest:

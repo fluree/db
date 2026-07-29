@@ -94,6 +94,18 @@ struct HostInfo {
     /// platforms. `None` where it cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     peak_rss_bytes: Option<u64>,
+    /// One-minute load average when the run finished. `None` where it cannot
+    /// be read.
+    ///
+    /// Recorded on every run, not just benchmark ones, because a timing taken
+    /// on a busy machine is not a timing and there is otherwise no way to tell
+    /// after the fact. This exists because a scaling sweep on this repo's own
+    /// hardware measured 1.46x while the load average was 65 on 16 cores —
+    /// the serial baseline, running unchanged code, had slowed by 3.1x. The
+    /// number was contention, not architecture, and nothing in the report
+    /// said so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load_average_1m: Option<f64>,
 }
 
 /// Environment variable naming the host's comparability class.
@@ -172,6 +184,24 @@ fn peak_rss_bytes() -> Option<u64> {
 
 #[cfg(not(unix))]
 fn peak_rss_bytes() -> Option<u64> {
+    None
+}
+
+/// One-minute load average, or `None` where the platform will not say.
+///
+/// Compared against `available_parallelism`, this is what tells a later reader
+/// whether a timing in the same document is worth anything.
+#[cfg(unix)]
+fn load_average_1m() -> Option<f64> {
+    let mut averages = [0f64; 3];
+    // SAFETY: `getloadavg` fills up to `nelem` entries of the array it is
+    // given and returns how many it wrote; the array outlives the call.
+    let written = unsafe { libc::getloadavg(averages.as_mut_ptr(), 3) };
+    (written > 0).then_some(averages[0])
+}
+
+#[cfg(not(unix))]
+fn load_average_1m() -> Option<f64> {
     None
 }
 
@@ -408,6 +438,7 @@ impl ProfileReport {
                 threads_used: ctx.threads_used,
                 parallel_reason: ctx.parallel_reason,
                 peak_rss_bytes: peak_rss_bytes(),
+                load_average_1m: load_average_1m(),
             },
             corpus: CorpusInfo {
                 input: ctx.input.clone(),
@@ -570,6 +601,23 @@ impl ProfileReport {
             "  profiler cost {:.3}% of wall ({} clock reads @ {}ns/pair)",
             cal.measured_overhead_pct, cal.clock_reads, cal.clock_pair_ns,
         );
+        // A timing taken on a loaded machine is not a timing. Say so here
+        // rather than leave a later reader to wonder.
+        if let Some(load) = self.host.load_average_1m {
+            let cores = self.host.available_parallelism as f64;
+            if load > cores {
+                eprintln!(
+                    "  LOADED: 1-minute load average {load:.1} on {} core(s) — every duration \
+                     above is contended and none of them is a measurement",
+                    self.host.available_parallelism,
+                );
+            } else {
+                eprintln!(
+                    "  load average {load:.2} on {} core(s)",
+                    self.host.available_parallelism
+                );
+            }
+        }
         // Two verdicts, because they fail for different reasons and a Tier-1
         // gate keys on the first. A single flag that is false on every `count`
         // run is a flag nobody reads.

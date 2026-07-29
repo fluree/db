@@ -72,20 +72,31 @@ impl ParallelConfig {
     }
 }
 
-/// Whether a syntax can be produced by the parallel path at all.
+/// Whether a syntax can be produced by the parallel path.
 ///
-/// Every writer here is fed by one replayer thread, so the *writer* never sees
-/// concurrency and any syntax would work. What decides this is whether
-/// splitting the input changes the output: a blocks-tier Turtle writer folds
-/// consecutive same-subject runs, and a chunk boundary that falls inside such
-/// a run ends the fold early. The output is still correct RDF and still
-/// isomorphic — but it is not byte-identical to the serial path, and the
-/// differential gate this bucket ships is byte equality.
+/// Every text syntax can, now that the differential gate is equivalence rather
+/// than cross-mode byte equality. Two things had to be true for the
+/// Turtle family:
 ///
-/// Line-based syntaxes have no cross-statement state, so they are identical by
-/// construction. Restricting to them is also what Oxigraph does.
+/// - **Prefixes are declared once.** Each chunk re-parses the header prelude,
+///   so every chunk's writer would otherwise emit the same `@prefix` block.
+///   Chunk 0 declares for the whole output and the rest suppress via
+///   [`WriterConfig::declare_prefixes`](fluree_graph_format::WriterConfig::declare_prefixes);
+///   compaction still works everywhere, because the prefix map is populated
+///   regardless.
+/// - **A subject spanning a boundary is re-declared.** Blocks-tier folding is
+///   per-writer, so a run of same-subject statements split across two chunks
+///   comes out as two subject blocks instead of one. That is valid
+///   blocks-tier Turtle — the tier already declines to regroup a subject that
+///   recurs later in the document — and the only cost is a few bytes.
+///
+/// JSON-LD is the exception, and not for either of those reasons: it is
+/// document-at-once, so there are no fragments to concatenate.
 pub fn can_run_parallel(syntax: RdfSyntax) -> bool {
-    matches!(syntax, RdfSyntax::NTriples | RdfSyntax::NQuads)
+    matches!(
+        syntax,
+        RdfSyntax::NTriples | RdfSyntax::NQuads | RdfSyntax::Turtle | RdfSyntax::TriG
+    )
 }
 
 /// Renames a collector's anonymous mints into a per-chunk namespace.
@@ -541,7 +552,10 @@ fn write_chunk(
     // correct across chunks, and a second relabelling would undo it.
     let config = writer_config
         .clone()
-        .with_blank_labels(fluree_graph_format::BlankNodeLabels::Preserve);
+        .with_blank_labels(fluree_graph_format::BlankNodeLabels::Preserve)
+        // Chunk 0 declares the prefixes for the whole concatenated document;
+        // every later chunk sees the same prelude and would redeclare them.
+        .with_prefix_declarations(index == 0);
     let writer = match crate::rdf::writer::AnyWriter::new(
         syntax,
         Vec::new(),
@@ -896,14 +910,16 @@ mod tests {
     }
 
     #[test]
-    fn only_line_based_syntaxes_run_parallel() {
-        assert!(can_run_parallel(RdfSyntax::NTriples));
-        assert!(can_run_parallel(RdfSyntax::NQuads));
-        // Blocks-tier folding is cross-statement state, so a chunk boundary
-        // inside a same-subject run changes the bytes.
-        assert!(!can_run_parallel(RdfSyntax::Turtle));
-        assert!(!can_run_parallel(RdfSyntax::TriG));
-        // Document-at-once has no streaming form to parallelize into.
+    fn every_text_syntax_runs_parallel_and_jsonld_does_not() {
+        for syntax in [
+            RdfSyntax::NTriples,
+            RdfSyntax::NQuads,
+            RdfSyntax::Turtle,
+            RdfSyntax::TriG,
+        ] {
+            assert!(can_run_parallel(syntax), "{syntax} should run parallel");
+        }
+        // Document-at-once: there are no fragments to concatenate.
         assert!(!can_run_parallel(RdfSyntax::JsonLd));
     }
 

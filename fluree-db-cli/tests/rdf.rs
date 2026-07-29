@@ -2794,3 +2794,97 @@ fn the_parallel_scheme_is_injective_over_its_three_label_classes() {
         }
     }
 }
+
+#[test]
+fn turtle_runs_parallel_and_declares_its_prefixes_exactly_once() {
+    // Each chunk re-parses the header prelude, so without suppression every
+    // chunk's writer would emit the same `@prefix` block into the middle of
+    // the concatenated document.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &parallel_corpus(60_000));
+
+    let convert = |threads: &str, out: &str| -> String {
+        let path = tmp.path().join(out);
+        rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "turtle"])
+            .arg("-o")
+            .arg(&path)
+            .assert()
+            .success();
+        std::fs::read_to_string(&path).unwrap()
+    };
+
+    let parallel = convert("8", "p.ttl");
+    assert_eq!(
+        parallel.matches("@prefix").count(),
+        1,
+        "prefixes declared once for the whole document, not once per chunk"
+    );
+
+    // And the result is a document our own reader accepts, with every triple.
+    let reparsed = tmp.path().join("p.ttl");
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).arg(&reparsed);
+    let parallel_count = stdout_of(&mut cmd).trim().to_string();
+
+    let serial_path = tmp.path().join("s.ttl");
+    std::fs::write(&serial_path, convert("1", "s.ttl")).unwrap();
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).arg(&serial_path);
+    assert_eq!(
+        parallel_count,
+        stdout_of(&mut cmd).trim(),
+        "the parallel Turtle document holds a different number of triples"
+    );
+}
+
+#[test]
+fn a_parallel_turtle_run_is_byte_identical_to_itself() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &blank_heavy_corpus(20_000));
+
+    let convert = |out: &str| -> Vec<u8> {
+        let path = tmp.path().join(out);
+        rdf_cmd()
+            .args(["--parallelism", "8", "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "turtle"])
+            .arg("-o")
+            .arg(&path)
+            .assert()
+            .success();
+        std::fs::read(&path).unwrap()
+    };
+    assert_eq!(convert("a.ttl"), convert("b.ttl"));
+}
+
+#[test]
+fn the_profile_records_the_load_average() {
+    // A timing taken on a loaded machine is not a timing, and there is no way
+    // to tell after the fact unless the run says so.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&out)
+        .args(["--to", "nt", "--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    if cfg!(unix) {
+        let load = v["host"]["load_average_1m"]
+            .as_f64()
+            .expect("unix reports a load average");
+        assert!(load >= 0.0, "{load}");
+    }
+}
