@@ -42,13 +42,14 @@ members = [
     "fluree-db-docs",
     "fluree-db-mcp",
     "fluree-bench-support",
+    "fluree-bench-alloc",
     "fluree-bench-virtual",
     "fluree-db-consensus",
 ]
 exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
 
 [workspace.package]
-version = "4.1.3"
+version = "4.1.4"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"

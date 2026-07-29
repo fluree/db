@@ -522,11 +522,19 @@ fn compute_clean(
 // overlay-merging cursor (linear in the *predicate's* rows, not the graph's).
 
 /// Whether the overlay-aware lane may run: a single-ledger, policy-cleared read
-/// carrying novelty (the exact condition that makes the directory-only
-/// [`compute_clean`] lane stale). Pure historical reads (`to_t < max_t` with no
-/// novelty) are out of scope and fall through to the general pipeline.
+/// carrying novelty, **at or after the persisted index** (`to_t >= max_t`) — the
+/// exact condition that makes the directory-only [`compute_clean`] lane stale
+/// while keeping its `max_t` base counts valid. A read below the index
+/// (`to_t < max_t`, e.g. `GraphDb::as_of(t)` composed onto a live-overlay view)
+/// would reconcile `max_t` base lead-group counts against a `to_t`-bounded
+/// overlay delta that filters out every above-`to_t` flake, overcounting to the
+/// `index_t` snapshot; it declines here and falls through to the general
+/// pipeline (which honors `to_t`). Mirrors the clean lane's `to_t == max_t`
+/// discipline.
 fn overlay_lane_eligible(ctx: &crate::context::ExecutionContext<'_>) -> bool {
-    ctx.binary_store.is_some()
+    ctx.binary_store
+        .as_ref()
+        .is_some_and(|store| ctx.to_t >= store.max_t())
         && !ctx.is_multi_ledger()
         && ctx.from_t.is_none()
         && ctx.allow_unfiltered()

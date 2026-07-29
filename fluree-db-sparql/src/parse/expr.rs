@@ -24,8 +24,12 @@ use std::sync::Arc;
 /// Parse a SPARQL expression.
 ///
 /// This is the main entry point for expression parsing.
+///
+/// Recursion-guarded: parenthesized expressions and function arguments
+/// re-enter here from `parse_primary_expr`, so each expression nesting
+/// level counts against the stream's depth ceiling.
 pub fn parse_expression(tokens: &mut TokenStream) -> Result<Expression, String> {
-    parse_or_expr(tokens)
+    tokens.with_recursion_guard(parse_or_expr)
 }
 
 /// Parse an OR expression: expr1 || expr2
@@ -185,6 +189,10 @@ fn parse_multiplicative_expr(tokens: &mut TokenStream) -> Result<Expression, Str
 }
 
 /// Parse a unary expression: !, +, -
+///
+/// Recursion-guarded: stacked unary operators (`!!x`, `--x`) self-recurse
+/// without passing through `parse_expression`, so each operator counts one
+/// nesting level against the stream's depth ceiling.
 fn parse_unary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
     let start = tokens.current_span().start;
 
@@ -202,7 +210,7 @@ fn parse_unary_expr(tokens: &mut TokenStream) -> Result<Expression, String> {
     };
 
     if let Some(op) = op {
-        let operand = parse_unary_expr(tokens)?;
+        let operand = tokens.with_recursion_guard(parse_unary_expr)?;
         let span = SourceSpan::new(start, tokens.previous_span().end);
         Ok(Expression::unary(op, operand, span))
     } else {

@@ -376,6 +376,19 @@ WHERE {
 ORDER BY ?t
 ```
 
+The `<< ... >>` bindings are what populate `?t` and `?op`. Selecting those
+variables without them is **not** an error — the query returns history rows
+with both columns null, and no way to tell an assert from a retract. The
+quoted triple's object must be a variable; a constant object is rejected.
+
+Two restrictions on the SPARQL form:
+
+- `FROM ... TO ...` is accepted only on the **connection-scoped** endpoint
+  (`POST /v1/fluree/query`). The ledger-scoped path (`/v1/fluree/query/{ledger}`)
+  and the streaming path (`/v1/fluree/stream/query`) reject it.
+- History mode and [reasoning](../query/reasoning.md) are mutually exclusive;
+  a history-range query that requests reasoning is rejected.
+
 ### Property-Specific History
 
 Query changes for specific properties:
@@ -428,7 +441,9 @@ Query history using ISO 8601 datetime strings:
 
 ### Filter by Operation Type
 
-Filter to show only assertions or only retractions:
+Filter to show only assertions or only retractions. `@op` is a **boolean**
+(`true` = assert, `false` = retract), so filter against `true` / `false` —
+the strings `"assert"` / `"retract"` are not accepted and match nothing:
 
 ```json
 {
@@ -438,9 +453,16 @@ Filter to show only assertions or only retractions:
   "select": ["?name", "?t"],
   "where": [
     { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } },
-    ["filter", "(= ?op \"retract\")"]
+    ["filter", "(= ?op false)"]
   ]
 }
+```
+
+The constant shorthand is equivalent and shorter — `"@op": false` lowers to
+the same filter without binding a variable:
+
+```json
+{ "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": false } }
 ```
 
 ### Pattern History Across Subjects

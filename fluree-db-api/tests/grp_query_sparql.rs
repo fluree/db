@@ -19,6 +19,8 @@ mod it_query_sparql_parse_errors;
 mod it_query_sparql_setop_subselect;
 #[path = "it_query_subquery.rs"]
 mod it_query_subquery;
+#[path = "it_query_subselect_correlation.rs"]
+mod it_query_subselect_correlation;
 #[path = "it_query_unwind.rs"]
 mod it_query_unwind;
 #[path = "it_query_values.rs"]

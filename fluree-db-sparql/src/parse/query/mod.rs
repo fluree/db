@@ -271,6 +271,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Run `f` one recursion level deeper, emitting a
+    /// [`DiagCode::NestingTooDeep`] diagnostic and returning `None` past the
+    /// stream's depth ceiling. Owns both sides of the depth bookkeeping for
+    /// the diagnostic-based pattern/term parsers; the `Result`-based
+    /// expression and path parsers use
+    /// [`TokenStream::with_recursion_guard`](super::stream::TokenStream::with_recursion_guard).
+    fn with_recursion_guard<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if !self.stream.try_enter_recursion() {
+            let span = self.stream.current_span();
+            self.stream.add_diagnostic(Diagnostic::error(
+                DiagCode::NestingTooDeep,
+                format!(
+                    "query nesting exceeds the maximum depth of {}",
+                    super::stream::MAX_PARSE_DEPTH
+                ),
+                span,
+            ));
+            return None;
+        }
+        let result = f(self);
+        self.stream.leave_recursion();
+        result
+    }
+
     /// Parse a complete SPARQL query or update request.
     fn parse_query(&mut self) -> Option<SparqlAst> {
         let start_span = self.stream.current_span();

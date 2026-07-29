@@ -87,6 +87,7 @@ pub use iri::IriCompactor;
 use crate::QueryResult;
 use fluree_db_core::LedgerSnapshot;
 use fluree_db_core::{FuelExceededError, GraphDbRef, Tracker};
+#[cfg(feature = "iceberg")]
 use fluree_db_query::binding::Binding;
 use fluree_graph_json_ld::ParsedContext;
 use serde_json::{json, Value as JsonValue};
@@ -112,6 +113,7 @@ use serde_json::{json, Value as JsonValue};
 ///   formats, matching native (`true`, not `"true"` — defect D3).
 ///
 /// The crawl shapes the root `@id` and `@type` itself; those never reach here.
+#[cfg(feature = "iceberg")]
 pub(crate) fn format_node_object_binding(
     result: &QueryResult,
     binding: &Binding,
@@ -153,6 +155,7 @@ pub(crate) fn format_node_object_binding(
 /// Shape a non-reference binding per `config.format`: `typed-json` reaches the
 /// typed value-object formatter; every other format keeps the default JSON-LD
 /// shaping (byte-identical to the crawl's prior behavior for the default path).
+#[cfg(feature = "iceberg")]
 fn format_scalar_binding(
     result: &QueryResult,
     binding: &Binding,
@@ -172,6 +175,7 @@ fn format_scalar_binding(
 /// a string. Returns `None` — keep the original binding — for every non-boolean
 /// literal: numerics are already typed by `encode`, and strings / temporals keep
 /// their operator-produced lexical form.
+#[cfg(feature = "iceberg")]
 fn coerce_bool_literal(binding: &Binding, compactor: &IriCompactor) -> Option<Binding> {
     use fluree_db_core::{coerce_value, FlakeValue};
     let Binding::Lit {

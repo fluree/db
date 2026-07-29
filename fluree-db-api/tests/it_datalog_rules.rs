@@ -1095,3 +1095,340 @@ async fn datalog_query_time_rules_stripped_under_non_root_policy() {
         "query-time datalog rules must be stripped under a non-root view policy, got {policed_rows:?}"
     );
 }
+
+// =============================================================================
+// Property-Position Variables (issue #1531)
+// =============================================================================
+
+/// A variable in property position of an `insert` pattern must be replaced
+/// with its bound value, not committed as the literal property name (#1531).
+///
+/// The rule binds `?rel` to a predicate IRI via an object reference in the
+/// where clause, then uses it as the property of the derived fact:
+/// `{"@id": "?s", "?rel": "?o"}` with `?rel` = `ex:knows` must derive
+/// `ex:alice ex:knows ex:bob`.
+#[tokio::test]
+async fn datalog_rule_insert_property_variable_substituted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/insert-prop-var");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:relateRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:relates": {"@id": "?o"}},
+                            {"@id": "?s", "ex:relType": {"@id": "?rel"}}
+                        ],
+                        "insert": {"@id": "?s", "?rel": {"@id": "?o"}}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice",
+             "ex:relates": {"@id": "ex:bob"},
+             "ex:relType": {"@id": "ex:knows"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?who",
+        "where": {"@id": "ex:alice", "ex:knows": "?who"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!("ex:bob")),
+        "insert-position property var ?rel must resolve to ex:knows, got {results:?}"
+    );
+}
+
+/// A variable in property position of a `where` pattern must match any
+/// predicate and bind it, so the insert clause can re-use it (#1531).
+///
+/// The rule copies every property of a `ex:sameAs` target onto the subject:
+/// `where {?s ex:sameAs ?other . ?other ?prop ?val}` /
+/// `insert {?s ?prop ?val}`.
+#[tokio::test]
+async fn datalog_rule_where_property_variable_binds_and_substitutes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/where-prop-var");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:copyRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+                            {"@id": "?other", "?prop": "?val"}
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:sameAs": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:color": "blue", "ex:size": 5}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?color", "?size"],
+        "where": {"@id": "ex:a", "ex:color": "?color", "ex:size": "?size"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!(["blue", 5])),
+        "where-position property var ?prop must match and carry into insert, got {results:?}"
+    );
+}
+
+/// A rule whose predicate variable ends up bound to a literal (not an IRI)
+/// matches nothing for that row — it must not abort rule execution and drop
+/// every other rule's derived facts.
+#[tokio::test]
+async fn datalog_rule_literal_bound_property_variable_does_not_abort_other_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/literal-prop-var");
+
+    // Rule 1 (sound): derives grandparent. Rule 2 (unsatisfiable): binds ?p to
+    // the string value of ex:tag, then reuses ?p in predicate position, where
+    // a literal can never match.
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                "@id": "ex:literalPredicateRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?x", "ex:tag": "?p"},
+                            {"@id": "?x", "?p": "?v"}
+                        ],
+                        "insert": {"@id": "?x", "ex:derived": "?v"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}, "ex:tag": "blue"},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "sound rule's derivations must survive a sibling rule's literal-bound \
+         predicate var, got {results:?}"
+    );
+}
+
+/// A literal *constant* in subject position (a plausible typo for a prefixed
+/// IRI, e.g. `{"@id": "Alice"}` instead of `{"@id": "ex:Alice"}`) can never
+/// match a flake, so that rule derives nothing — but it must not abort the
+/// fixpoint and drop every other rule's derivations.
+#[tokio::test]
+async fn datalog_rule_literal_subject_constant_does_not_abort_other_rules() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/literal-subject");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // `"Alice"` is colon-less and non-`?`, so it parses as a string
+                // literal in subject position — a rule that can never match.
+                "@id": "ex:literalSubjectRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "Alice", "ex:parent": "?p"},
+                        "insert": {"@id": "Alice", "ex:derived": "?p"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "sound rule's derivations must survive a sibling rule's literal subject \
+         constant, got {results:?}"
+    );
+}
+
+/// A copy-properties rule whose all-unbound pattern `{?other ?prop ?val}` is
+/// written FIRST (the full-scan-leading order) must still derive correctly —
+/// the matcher reorders patterns most-constrained-first, hoisting the
+/// grounding `ex:sameAs` pattern ahead of it. Mirrors
+/// `datalog_rule_where_property_variable_binds_and_substitutes` with the
+/// where patterns reversed.
+#[tokio::test]
+async fn datalog_rule_all_unbound_leading_pattern_still_derives_correctly() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/reorder-leading-unbound");
+
+    let rule_data = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "f": "https://ns.flur.ee/db#"
+        },
+        "@graph": [
+            {
+                "@id": "ex:copyRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?other", "?prop": "?val"},
+                            {"@id": "?s", "ex:sameAs": {"@id": "?other"}}
+                        ],
+                        "insert": {"@id": "?s", "?prop": "?val"}
+                    }
+                }
+            }
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:a", "ex:sameAs": {"@id": "ex:b"}},
+            {"@id": "ex:b", "ex:color": "blue", "ex:size": 5}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?color", "?size"],
+        "where": {"@id": "ex:a", "ex:color": "?color", "ex:size": "?size"},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!(["blue", 5])),
+        "reordered rule with all-unbound leading pattern must still derive, got {results:?}"
+    );
+}

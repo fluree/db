@@ -52,7 +52,7 @@ pub use where_plan::expand_edge_annotation_patterns;
 pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block};
 
 // Re-export operator tree builder and runner for custom execution pipelines
-pub use operator_tree::build_operator_tree;
+pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
 pub use runner::{run_operator, run_operator_streaming};
 
 // Re-export pushdown utilities for tests

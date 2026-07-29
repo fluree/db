@@ -23,14 +23,24 @@ fluree history <ENTITY> [OPTIONS]
 | `--to <TIME>` | End of time range (default: `latest`) |
 | `-p, --predicate <PRED>` | Filter to specific predicate |
 | `--format <FORMAT>` | Output format: `json`, `table`, or `csv` (default: `table`) |
+| `--remote <NAME>` | Execute against a remote server (e.g. `origin`) |
 
 ## Description
 
 Shows the change history for a specific entity across transactions. Each change shows:
 - `t` - Transaction number
-- `op` - Operation: `+` (assert) or `-` (retract)
+- `op` - Operation: `+` (assert) or `-` (retract) in table/CSV output; `true` / `false` in JSON
 - `predicate` - The property that changed (if not filtered)
 - `value` - The value asserted or retracted
+
+The argument is an **entity IRI**, not a query. This command builds the
+underlying history query for you; to write your own history query — across
+multiple subjects, with filters, or in SPARQL — use
+[`fluree query`](query.md) with `from` and `to`, as shown in
+[Cookbook: Time Travel](../guides/cookbook-time-travel.md#history-queries).
+
+History requires a local commit chain. On a *tracked* ledger it is
+unavailable locally; pass `--remote <name>` to query the upstream.
 
 ## Prefix Expansion
 

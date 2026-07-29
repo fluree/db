@@ -782,7 +782,7 @@ pub enum Commands {
         #[arg(short = 'p', long)]
         predicate: Option<String>,
 
-        /// Output format (json, table, csv, or tsv)
+        /// Output format (json, table, or csv)
         #[arg(long, default_value = "table")]
         format: String,
 
@@ -1673,6 +1673,50 @@ pub enum ModelAccessAction {
         remote: Option<String>,
     },
 
+    /// Disable an access profile: delete its compiled policies from the
+    /// dataset and optionally detach the policy class from a space grant
+    ///
+    /// The inverse of `enable`. Identify the policy class either the same
+    /// way it was enabled (--profile + --class, deriving the default
+    /// {class}/access/{profile} id) or explicitly via --policy-class.
+    /// Deletes the policy class node and its owned policy nodes
+    /// ({policy-class}/view, {policy-class}/write) in one transaction.
+    /// With --space/--remote, first removes the policy class from the
+    /// space's grant on the dataset (other classes on the grant survive;
+    /// the grant itself and its access level are left in place).
+    Disable {
+        /// Target dataset (ledger alias)
+        dataset: String,
+
+        /// Profile the policy class was enabled with (with --class):
+        /// read | write | intake. Not needed with --policy-class.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Class IRI the profile was enabled on (with --profile).
+        /// Not needed with --policy-class.
+        #[arg(long)]
+        class: Option<String>,
+
+        /// Policy class IRI to disable (overrides --profile/--class
+        /// derivation; required if enable used a --policy-class override)
+        #[arg(long)]
+        policy_class: Option<String>,
+
+        /// Detach the policy class from this space's grant on the dataset
+        /// (hosted stacks; requires --remote)
+        #[arg(long)]
+        space: Option<String>,
+
+        /// Print the delete transaction without transacting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Remote to run against
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
     /// Show compiled access policies on a dataset (grouped by policy class)
     Show {
         /// Target dataset (ledger alias)
@@ -2422,6 +2466,19 @@ pub enum AuthAction {
 
     /// Clear the stored token for a remote
     Logout {
+        /// Remote name (defaults to only configured remote)
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Print the stored access token for a remote (for scripting)
+    ///
+    /// Prints exactly the access token to stdout — nothing else — so it
+    /// composes into .env files and shell substitution:
+    /// `FLUREE_TOKEN=$(fluree auth token --remote prod)`. Warns on stderr
+    /// if the token is expired. The refresh token is never printed; use
+    /// `fluree config list` only if you truly need the raw config.
+    Token {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]
         remote: Option<String>,

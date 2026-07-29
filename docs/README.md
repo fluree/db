@@ -38,7 +38,7 @@ Fluree DB is a single binary that stores your data as an RDF knowledge graph, qu
 - [Security and policy](security/) — authentication, encryption, commit signing, policy model
 - [Indexing and search](indexing-and-search/) — background indexing, BM25, vector search, geospatial
 - [Graph sources and integrations](graph-sources/) — Iceberg/Parquet, R2RML, BM25 graph source
-- [Operations](operations/) — configuration, Docker, storage modes, telemetry, archive/restore
+- [Operations](operations/) — scaling and resilience, configuration, Docker, storage modes, telemetry, archive/restore
 - [Design](design/) — internals: query execution, storage traits, index format, nameservice
 - [Reference](reference/) — glossary, vocabulary, OWL/RDFS support, crate map
 - [Troubleshooting](troubleshooting/) — common errors, debugging queries, performance tracing

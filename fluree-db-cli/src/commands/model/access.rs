@@ -37,7 +37,7 @@
 
 use serde_json::{json, Value};
 
-use super::{query, replace_nodes, require_absolute_iri, resolve_mode};
+use super::{query, replace_nodes, replace_txn, require_absolute_iri, resolve_mode, update};
 use crate::cli::ModelAccessAction;
 use crate::error::{CliError, CliResult};
 use fluree_db_api::server_defaults::FlureeDir;
@@ -112,6 +112,28 @@ pub async fn run(action: &ModelAccessAction, dirs: &FlureeDir, direct: bool) -> 
                 policy_class.as_deref(),
                 space.as_deref(),
                 connected.as_deref(),
+                *dry_run,
+                remote.as_deref(),
+                dirs,
+                direct,
+            )
+            .await
+        }
+        ModelAccessAction::Disable {
+            dataset,
+            profile,
+            class,
+            policy_class,
+            space,
+            dry_run,
+            remote,
+        } => {
+            run_disable(
+                dataset,
+                profile.as_deref(),
+                class.as_deref(),
+                policy_class.as_deref(),
+                space.as_deref(),
                 *dry_run,
                 remote.as_deref(),
                 dirs,
@@ -228,6 +250,7 @@ async fn run_enable(
             dataset,
             space_id,
             &policy_class,
+            profile.as_str(),
             !profile.write_verbs().is_empty(),
         )
         .await?;
@@ -256,6 +279,116 @@ fn validate_connected_path(path: &str) -> CliResult<()> {
         )));
     }
     Ok(())
+}
+
+// ── disable ─────────────────────────────────────────────────────────────
+
+/// Undo `enable`: delete the policy class node and both owned policy
+/// nodes, and (with --space/--remote) detach the policy class from the
+/// space's grant. Grant detach runs FIRST — the mirror of enable's
+/// ordering rationale: a partial failure leaves policies without a grant
+/// referencing them (harmless) rather than deleting policies while a
+/// grant still points at them mid-operation. A grant that does end up
+/// naming a deleted policy class is fail-closed (the class selects no
+/// policies), but we avoid creating that state deliberately.
+#[allow(clippy::too_many_arguments)]
+async fn run_disable(
+    dataset: &str,
+    profile: Option<&str>,
+    class: Option<&str>,
+    policy_class_override: Option<&str>,
+    space: Option<&str>,
+    dry_run: bool,
+    remote: Option<&str>,
+    dirs: &FlureeDir,
+    direct: bool,
+) -> CliResult<()> {
+    let policy_class = resolve_policy_class(policy_class_override, profile, class)?;
+    if space.is_some() && remote.is_none() {
+        return Err(CliError::Usage(
+            "--space detaches the policy class from a hosted stack's grant; pass --remote <r>"
+                .into(),
+        ));
+    }
+
+    let txn = disable_txn(&policy_class);
+    println!("Policy class: {policy_class}");
+    println!(
+        "Removes:      {policy_class}\n              {policy_class}/view\n              {policy_class}/write"
+    );
+
+    if dry_run {
+        println!("\n-- dry run; delete transaction --");
+        println!("{}", serde_json::to_string_pretty(&txn)?);
+        return Ok(());
+    }
+
+    if let (Some(space_id), Some(remote_name)) = (space, remote) {
+        detach_grant(dirs, remote_name, dataset, space_id, &policy_class).await?;
+    }
+
+    let mode = resolve_mode(dataset, remote, dirs, direct).await?;
+    update(&mode, &txn).await?;
+    println!("\nPolicies removed from '{dataset}'.");
+
+    if space.is_none() {
+        println!(
+            "If a space grant carries {policy_class}, the reference is now inert \
+             (it selects no policies). Detach it with:\n  \
+             fluree model access disable {dataset} --policy-class {policy_class} \
+             --space <spaceId> --remote <r>"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the policy class to operate on: an explicit --policy-class, or
+/// the deterministic default enable minted from --profile + --class.
+fn resolve_policy_class(
+    policy_class: Option<&str>,
+    profile: Option<&str>,
+    class: Option<&str>,
+) -> CliResult<String> {
+    if let Some(pc) = policy_class {
+        require_absolute_iri("--policy-class", pc)?;
+        return Ok(pc.to_string());
+    }
+    match (profile, class) {
+        (Some(p), Some(c)) => {
+            let profile = Profile::parse(p)?;
+            require_absolute_iri("--class", c)?;
+            Ok(format!(
+                "{}/access/{}",
+                c.trim_end_matches('/'),
+                profile.as_str()
+            ))
+        }
+        _ => Err(CliError::Usage(
+            "identify the policy class to disable: --profile <p> --class <iri> \
+             (as it was enabled), or --policy-class <iri>"
+                .into(),
+        )),
+    }
+}
+
+/// Delete-only transaction covering every node enable owns: the policy
+/// class and its view/write policies. Wildcard-deletes are delete-if-exists,
+/// so disabling an already-disabled (or read-only) profile is a no-op for
+/// the nodes that aren't there.
+fn disable_txn(policy_class: &str) -> Value {
+    let owned = [
+        policy_class.to_string(),
+        format!("{policy_class}/view"),
+        format!("{policy_class}/write"),
+    ];
+    let owned_refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let mut txn = replace_txn(&json!({"@graph": []}), &owned_refs, &[]);
+    // Delete-only: an empty insert clause adds nothing but confuses readers
+    // of --dry-run output (and not every endpoint accepts it).
+    txn.as_object_mut()
+        .expect("replace_txn returns an object")
+        .remove("insert");
+    txn
 }
 
 // ── compile ─────────────────────────────────────────────────────────────
@@ -443,6 +576,150 @@ fn list_values(v: Option<&Value>) -> Vec<String> {
     out
 }
 
+/// Resolved handle on a hosted stack's grants API for one dataset.
+struct GrantsApi {
+    url: String,
+    token: String,
+    dataset_id: String,
+}
+
+impl GrantsApi {
+    /// Resolve the grants endpoint from a configured remote. The remote
+    /// points at the data plane (…/v1/fluree); the grants API lives at the
+    /// stack root.
+    async fn resolve(dirs: &FlureeDir, remote_name: &str, dataset: &str) -> CliResult<Self> {
+        use crate::config::TomlSyncConfigStore;
+        use fluree_db_nameservice::RemoteName;
+        use fluree_db_nameservice_sync::{RemoteEndpoint, SyncConfigStore};
+
+        let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+        let remote = store
+            .get_remote(&RemoteName::new(remote_name))
+            .await
+            .map_err(|e| CliError::Config(e.to_string()))?
+            .ok_or_else(|| CliError::NotFound(format!("remote '{remote_name}' not found")))?;
+        let base_url = match &remote.endpoint {
+            RemoteEndpoint::Http { base_url } => base_url.clone(),
+            _ => {
+                return Err(CliError::Config(format!(
+                    "remote '{remote_name}' is not an HTTP remote"
+                )));
+            }
+        };
+
+        let trimmed = base_url.trim_end_matches('/');
+        let root = trimmed.strip_suffix("/v1/fluree").ok_or_else(|| {
+            CliError::Config(format!(
+                "remote '{remote_name}' ({base_url}) does not look like a hosted stack \
+                 (expected a …/v1/fluree data-plane URL); manage the grant manually"
+            ))
+        })?;
+        let token = remote.auth.token.clone().ok_or_else(|| {
+            CliError::Config(format!(
+                "remote '{remote_name}' has no auth token; run `fluree auth login` first"
+            ))
+        })?;
+
+        // Base ledger name (no branch) is the dataset id on the stack.
+        let dataset_id = dataset.split(':').next().unwrap_or(dataset).to_string();
+        Ok(Self {
+            url: format!("{root}/v1/datasets/{dataset_id}/grants"),
+            token,
+            dataset_id,
+        })
+    }
+
+    /// Fetch the space-scoped grant for `space_id`, if any.
+    async fn space_grant(
+        &self,
+        http: &reqwest::Client,
+        space_id: &str,
+    ) -> CliResult<Option<Value>> {
+        let list: Value = http
+            .get(&self.url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| CliError::Config(format!("grants read failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| CliError::Config(format!("grants read failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| CliError::Config(format!("grants read returned non-JSON: {e}")))?;
+        Ok(list["grants"]
+            .as_array()
+            .map(|grants| {
+                grants
+                    .iter()
+                    .find(|g| {
+                        g["scopeType"].as_str() == Some("space")
+                            && g["scopeRef"].as_str() == Some(space_id)
+                    })
+                    .cloned()
+            })
+            .unwrap_or(None))
+    }
+
+    /// Upsert the space grant with the given access level and class list.
+    async fn upsert(
+        &self,
+        http: &reqwest::Client,
+        space_id: &str,
+        access: &str,
+        classes: &[String],
+    ) -> CliResult<()> {
+        let body = json!({
+            "scopeType": "space",
+            "scopeRef": space_id,
+            "access": access,
+            "policyClasses": classes,
+        });
+        http.post(&self.url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| CliError::Config(format!("grant upsert failed: {e}")))?
+            .error_for_status()
+            .map_err(|e| CliError::Config(format!("grant upsert rejected: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Extract the policyClasses list from a grant object.
+fn grant_classes(grant: Option<&Value>) -> Vec<String> {
+    grant
+        .and_then(|g| g["policyClasses"].as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the grant's post-upsert access level plus a provenance note
+/// explaining where that level came from. The note is what keeps a read
+/// enable onto a pre-existing write grant from reading as "I just granted
+/// write": the level line always says whether THIS enable set, upgraded,
+/// or merely inherited it.
+fn grant_access_transition(
+    existing_access: Option<&str>,
+    wants_write: bool,
+) -> (String, &'static str) {
+    match (existing_access, wants_write) {
+        (Some("read"), true) => (
+            "write".to_string(),
+            "upgraded from read — this profile requires writes",
+        ),
+        (Some(a), _) => (a.to_string(), "pre-existing, unchanged by this enable"),
+        (None, _) => (
+            if wants_write { "write" } else { "read" }.to_string(),
+            "set by this enable",
+        ),
+    }
+}
+
 /// Merge `policy_class` into the space's grant on the dataset via the stack's
 /// grants API. System-plane state (grants) is the one place the compiler
 /// talks to an API instead of the data plane — grants are router-owned
@@ -453,82 +730,16 @@ async fn attach_grant(
     dataset: &str,
     space_id: &str,
     policy_class: &str,
+    profile: &str,
     wants_write: bool,
 ) -> CliResult<()> {
-    use crate::config::TomlSyncConfigStore;
-    use fluree_db_nameservice::RemoteName;
-    use fluree_db_nameservice_sync::{RemoteEndpoint, SyncConfigStore};
-
-    let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    let remote = store
-        .get_remote(&RemoteName::new(remote_name))
-        .await
-        .map_err(|e| CliError::Config(e.to_string()))?
-        .ok_or_else(|| CliError::NotFound(format!("remote '{remote_name}' not found")))?;
-    let base_url = match &remote.endpoint {
-        RemoteEndpoint::Http { base_url } => base_url.clone(),
-        _ => {
-            return Err(CliError::Config(format!(
-                "remote '{remote_name}' is not an HTTP remote"
-            )));
-        }
-    };
-
-    // The remote points at the data plane (…/v1/fluree); the grants API
-    // lives at the stack root.
-    let trimmed = base_url.trim_end_matches('/');
-    let root = trimmed.strip_suffix("/v1/fluree").ok_or_else(|| {
-        CliError::Config(format!(
-            "remote '{remote_name}' ({base_url}) does not look like a hosted stack \
-             (expected a …/v1/fluree data-plane URL); attach the grant manually"
-        ))
-    })?;
-    let token = remote.auth.token.clone().ok_or_else(|| {
-        CliError::Config(format!(
-            "remote '{remote_name}' has no auth token; run `fluree auth login` first"
-        ))
-    })?;
-
-    // Base ledger name (no branch) is the dataset id on the stack.
-    let dataset_id = dataset.split(':').next().unwrap_or(dataset);
-    let grants_url = format!("{root}/v1/datasets/{dataset_id}/grants");
+    let api = GrantsApi::resolve(dirs, remote_name, dataset).await?;
     let http = reqwest::Client::new();
 
     // Read existing grants: merge classes, never clobber; keep (or upgrade)
     // the access level.
-    let list: Value = http
-        .get(&grants_url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| CliError::Config(format!("grants read failed: {e}")))?
-        .error_for_status()
-        .map_err(|e| CliError::Config(format!("grants read failed: {e}")))?
-        .json()
-        .await
-        .map_err(|e| CliError::Config(format!("grants read returned non-JSON: {e}")))?;
-    let existing = list["grants"]
-        .as_array()
-        .map(|grants| {
-            grants
-                .iter()
-                .find(|g| {
-                    g["scopeType"].as_str() == Some("space")
-                        && g["scopeRef"].as_str() == Some(space_id)
-                })
-                .cloned()
-        })
-        .unwrap_or(None);
-
-    let mut classes: Vec<String> = existing
-        .as_ref()
-        .and_then(|g| g["policyClasses"].as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
+    let existing = api.space_grant(&http, space_id).await?;
+    let mut classes = grant_classes(existing.as_ref());
     if !classes.iter().any(|c| c == policy_class) {
         classes.push(policy_class.to_string());
     }
@@ -537,33 +748,75 @@ async fn attach_grant(
         .as_ref()
         .and_then(|g| g["access"].as_str())
         .map(String::from);
-    let access = match (&existing_access, wants_write) {
-        (Some(a), true) if a == "read" => {
-            println!("  grant access upgraded read → write (profile requires writes)");
-            "write".to_string()
-        }
-        (Some(a), _) => a.clone(),
-        (None, true) => "write".to_string(),
-        (None, false) => "read".to_string(),
+    let (access, access_note) = grant_access_transition(existing_access.as_deref(), wants_write);
+
+    api.upsert(&http, space_id, &access, &classes).await?;
+
+    // Two separate facts, two separate lines: what THIS enable attached
+    // (the class and its profile), and the grant's merged state (class
+    // count + grant-wide access level, which may predate this enable).
+    // The access level is a grant-wide ceiling; what each class actually
+    // permits is its compiled policies — point at `show` for that view.
+    println!("Grant attached: space {space_id} → {}", api.dataset_id);
+    println!("  attached:    {policy_class} ({profile} profile)");
+    println!(
+        "  grant state: {} policy class{}; access level: {access} ({access_note})",
+        classes.len(),
+        if classes.len() == 1 { "" } else { "es" }
+    );
+    println!(
+        "  per-class grants: fluree model access show {} --remote {remote_name}",
+        api.dataset_id
+    );
+    Ok(())
+}
+
+/// Remove `policy_class` from the space's grant on the dataset. Other
+/// classes on the grant — and the grant itself, with its access level —
+/// survive. Never posts an empty class list: on the hosted stack a
+/// class-less grant reads as instance-wide access, so dropping the last
+/// class would WIDEN the grant instead of revoking it.
+async fn detach_grant(
+    dirs: &FlureeDir,
+    remote_name: &str,
+    dataset: &str,
+    space_id: &str,
+    policy_class: &str,
+) -> CliResult<()> {
+    let api = GrantsApi::resolve(dirs, remote_name, dataset).await?;
+    let http = reqwest::Client::new();
+
+    let existing = api.space_grant(&http, space_id).await?;
+    let Some(grant) = existing else {
+        println!(
+            "  no grant for space {space_id} on '{}'; nothing to detach",
+            api.dataset_id
+        );
+        return Ok(());
     };
 
-    let body = json!({
-        "scopeType": "space",
-        "scopeRef": space_id,
-        "access": access,
-        "policyClasses": classes,
-    });
-    http.post(&grants_url)
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| CliError::Config(format!("grant upsert failed: {e}")))?
-        .error_for_status()
-        .map_err(|e| CliError::Config(format!("grant upsert rejected: {e}")))?;
+    let mut classes = grant_classes(Some(&grant));
+    let before = classes.len();
+    classes.retain(|c| c != policy_class);
+    if classes.len() == before {
+        println!("  grant for space {space_id} does not carry {policy_class}; nothing to detach");
+        return Ok(());
+    }
+    if classes.is_empty() {
+        println!(
+            "  {policy_class} is the grant's last policy class; grant left unchanged \
+             (an empty class list would make the grant instance-wide, not revoke it).\n  \
+             The reference is inert once the policies are deleted; remove the grant \
+             itself via the stack UI/API to revoke the space's access entirely."
+        );
+        return Ok(());
+    }
 
+    let access = grant["access"].as_str().unwrap_or("read");
+    api.upsert(&http, space_id, access, &classes).await?;
     println!(
-        "Grant attached: space {space_id} → {dataset_id} ({access}, {} class{})",
+        "Grant updated: space {space_id} → {} now carries {} policy class{} at {access} access",
+        api.dataset_id,
         classes.len(),
         if classes.len() == 1 { "" } else { "es" }
     );
@@ -699,5 +952,91 @@ mod tests {
     #[test]
     fn profile_parse_rejects_unknown() {
         assert!(Profile::parse("admin").is_err());
+    }
+
+    #[test]
+    fn resolve_policy_class_derives_enable_default() {
+        // Must mint the exact same id enable derives, or disable would
+        // delete the wrong nodes.
+        assert_eq!(
+            resolve_policy_class(None, Some("write"), Some(LEAD)).unwrap(),
+            POLICY_CLASS
+        );
+    }
+
+    #[test]
+    fn resolve_policy_class_override_wins() {
+        let pc = resolve_policy_class(Some("https://example.org/custom"), Some("read"), Some(LEAD))
+            .unwrap();
+        assert_eq!(pc, "https://example.org/custom");
+    }
+
+    #[test]
+    fn resolve_policy_class_requires_identification() {
+        assert!(resolve_policy_class(None, Some("write"), None).is_err());
+        assert!(resolve_policy_class(None, None, Some(LEAD)).is_err());
+        assert!(resolve_policy_class(None, None, None).is_err());
+    }
+
+    #[test]
+    fn disable_txn_deletes_all_owned_nodes_without_insert() {
+        let txn = disable_txn(POLICY_CLASS);
+        assert!(txn.get("insert").is_none(), "delete-only transaction");
+
+        let deleted: Vec<&str> = txn["delete"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["@id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![
+                POLICY_CLASS,
+                &format!("{POLICY_CLASS}/view"),
+                &format!("{POLICY_CLASS}/write"),
+            ]
+        );
+        // Every delete is guarded by an optional match (delete-if-exists),
+        // so disabling a read profile (no write node) is not an error.
+        let where_clause = txn["where"].as_array().unwrap();
+        assert_eq!(where_clause.len(), 3);
+        assert!(where_clause.iter().all(|w| w[0] == "optional"));
+    }
+
+    #[test]
+    fn grant_access_transition_labels_provenance() {
+        // The confusing case from user feedback: read profile attached to a
+        // pre-existing write grant — level stays write but must read as
+        // inherited, not as the result of this enable.
+        let (access, note) = grant_access_transition(Some("write"), false);
+        assert_eq!(access, "write");
+        assert_eq!(note, "pre-existing, unchanged by this enable");
+
+        let (access, note) = grant_access_transition(Some("read"), true);
+        assert_eq!(access, "write");
+        assert!(note.starts_with("upgraded from read"));
+
+        let (access, note) = grant_access_transition(Some("write"), true);
+        assert_eq!(access, "write");
+        assert_eq!(note, "pre-existing, unchanged by this enable");
+
+        let (access, note) = grant_access_transition(None, false);
+        assert_eq!(access, "read");
+        assert_eq!(note, "set by this enable");
+
+        let (access, note) = grant_access_transition(None, true);
+        assert_eq!(access, "write");
+        assert_eq!(note, "set by this enable");
+    }
+
+    #[test]
+    fn grant_classes_extracts_list() {
+        let grant = json!({"policyClasses": ["https://x/a", "https://x/b"]});
+        assert_eq!(
+            grant_classes(Some(&grant)),
+            vec!["https://x/a".to_string(), "https://x/b".to_string()]
+        );
+        assert!(grant_classes(None).is_empty());
     }
 }

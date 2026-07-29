@@ -2,7 +2,7 @@
 
 Manage authentication tokens for remote servers. Tokens are stored in `.fluree/config.toml` as part of the remote configuration.
 
-Token values are never printed to stdout. The `status` command shows token presence, expiry, and identity only.
+Token values reach stdout only through the explicit `auth token` subcommand, which prints exactly one access token for scripting. The `status` command shows token presence, expiry, and identity only, and refresh tokens are never printed by any command.
 
 ## Subcommands
 
@@ -11,6 +11,7 @@ Token values are never printed to stdout. The `status` command shows token prese
 | `status` | Show authentication status for a remote |
 | `login` | Store a bearer token for a remote |
 | `logout` | Clear the stored token for a remote |
+| `token` | Print the stored access token for a remote (for scripting) |
 
 ---
 
@@ -51,6 +52,17 @@ Auth Status:
   Identity: did:example:alice
   Issuer: did:key:z6Mk...
   Subject: alice@example.com
+```
+
+For OIDC remotes, the auth type is shown as `oidc` together with the OAuth flow the last login actually used (recorded at login; the flow is re-detected from the IdP's discovery document on every login):
+```
+Auth Status:
+  Remote: origin
+  Auth type: oidc
+  Login flow: authorization code + PKCE
+  Issuer: https://cognito-idp.us-east-1.amazonaws.com/...
+  Token:  configured
+  ...
 ```
 
 When no token is configured:
@@ -123,6 +135,36 @@ Token stored for remote 'origin'
 
 ---
 
+## fluree auth token
+
+Print the stored access token for a remote — the scripting escape hatch for `.env`-style workflows. Exactly the token is written to stdout (no decoration), so it composes into shell substitution and pipelines. Diagnostics go to stderr: if the stored token is expired, a warning is printed there and the token is still emitted.
+
+Only the access token is printed. Refresh tokens stay in the config file and are never emitted by any command.
+
+### Usage
+
+```bash
+fluree auth token [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--remote <NAME>` | Remote name (defaults to the only configured remote) |
+
+### Examples
+
+```bash
+# Write the token into an .env file
+echo "FLUREE_TOKEN=$(fluree auth token --remote prod)" >> .env
+
+# Use it inline
+curl -H "Authorization: Bearer $(fluree auth token)" https://db.example.com/v1/fluree/...
+```
+
+---
+
 ## fluree auth logout
 
 Clear the stored token for a remote.
@@ -186,7 +228,7 @@ When `--remote` is omitted:
 ## Security Notes
 
 - Tokens are stored in plaintext in `.fluree/config.toml`. On Unix, the CLI restricts the config file to `0600` and the `.fluree` directory to `0700` (owner-only) whenever it writes token material, so the file is not group/world-readable. On other platforms, protect the file with appropriate filesystem permissions yourself.
-- The `status` command never displays the raw token value.
+- The `status` command never displays the raw token value. `auth token` is the single, explicit command that prints an access token (refresh tokens are never printed) — prefer it over `fluree config list` in scripts so credentials for other remotes never enter your pipeline.
 - On 401 errors from remote operations, the CLI checks token expiry and suggests `fluree auth login` if the token appears expired.
 
 ## OIDC login flow

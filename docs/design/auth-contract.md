@@ -190,6 +190,10 @@ scopes = ["openid", "profile"]
 redirect_port = 8400
 token = "eyJ..."           # cached Fluree Bearer token (written by 'fluree auth login')
 refresh_token = "eyJ..."   # refresh token (written by 'fluree auth login')
+login_flow = "auth_code_pkce"  # OAuth flow the last login used: "device_code" or
+                               # "auth_code_pkce" (written by 'fluree auth login',
+                               # cleared by logout/manual logins; display-only —
+                               # flow selection is re-discovered on every login)
 
 [[remotes]]
 name = "local"

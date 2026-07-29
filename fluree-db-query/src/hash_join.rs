@@ -1070,11 +1070,9 @@ mod tests {
 
         let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
         let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
-        let build_batch =
-            Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let build_batch = Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
         let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
-        let probe_batch =
-            Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let probe_batch = Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
         let right_pattern =
             TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
         let mut hj = HashJoinOperator::new(
@@ -1120,11 +1118,9 @@ mod tests {
 
         let key = || Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"));
         let build_schema: Arc<[VarId]> = Arc::from(vec![x, driver].into_boxed_slice());
-        let build_batch =
-            Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let build_batch = Batch::new(build_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
         let probe_schema: Arc<[VarId]> = Arc::from(vec![x, s].into_boxed_slice());
-        let probe_batch =
-            Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
+        let probe_batch = Batch::new(probe_schema.clone(), vec![vec![key()], vec![key()]]).unwrap();
         let right_pattern =
             TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(1, "p")), Term::Var(x));
         let mut hj = HashJoinOperator::new(
