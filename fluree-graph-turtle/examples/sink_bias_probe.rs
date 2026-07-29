@@ -202,6 +202,18 @@ impl<S: GraphSink> GraphSink for FullSink<S> {
     fn emit_quad(&mut self, a: TermId, b: TermId, c: TermId, g: TermId) -> SinkResult {
         self.f(|s| s.emit_quad(a, b, c, g))
     }
+
+    fn emit_quad_list_item(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        index: i32,
+        graph: TermId,
+    ) -> SinkResult {
+        self.inner
+            .emit_quad_list_item(subject, predicate, object, index, graph)
+    }
     fn supports_reified_triples(&self) -> bool {
         self.inner.supports_reified_triples()
     }

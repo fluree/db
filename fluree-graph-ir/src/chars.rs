@@ -287,9 +287,19 @@ pub fn simple_escape(c: char) -> Option<char> {
 
 /// Decode the hex payload of a `\uXXXX` / `\UXXXXXXXX` escape.
 ///
-/// `None` when the digits are not hex or name a surrogate / out-of-range code
-/// point, which is not a Unicode scalar value and so cannot be a `char`.
+/// `None` when the payload is not PURE ASCII hex, or names a surrogate /
+/// out-of-range code point, which is not a Unicode scalar value and so cannot
+/// be a `char`.
+///
+/// The pure-hex check is not redundant with `from_str_radix`, which accepts a
+/// leading `+` — so `\u+041` would decode as `A`. The Turtle lexer never hit
+/// that because it gates on `is_hex_digit` while scanning, but a caller that
+/// slices first and converts second would inherit it. Gating HERE is what
+/// makes the two readers agree, which is the whole point of sharing this.
 pub fn unicode_escape_value(hex: &str) -> Option<char> {
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
 }
 
@@ -326,5 +336,20 @@ mod escape_tests {
         assert_eq!(unicode_escape_value("D800"), None);
         assert_eq!(unicode_escape_value("110000"), None);
         assert_eq!(unicode_escape_value("zzzz"), None);
+    }
+
+    /// `from_str_radix` accepts a leading sign; a hex ESCAPE payload does not.
+    /// Without this gate `\\u+041` decodes as `A` — the one escape-handling
+    /// difference that survived unifying the table.
+    #[test]
+    fn a_signed_or_spaced_payload_is_not_hex() {
+        for payload in ["+041", "-041", " 041", "041 ", "0x41", "+0041"] {
+            assert_eq!(
+                unicode_escape_value(payload),
+                None,
+                "{payload:?} must not decode"
+            );
+        }
+        assert_eq!(unicode_escape_value("0041"), Some('A'));
     }
 }

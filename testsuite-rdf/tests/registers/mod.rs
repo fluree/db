@@ -92,8 +92,15 @@ pub const RDF11_NTRIPLES: &[&str] = &[
 pub const RDF11_TRIG: &[&str] = &[
     // C — IRI / language-tag validation (H-8), the exact four-test shape the
     // Turtle suite has: three ill-formed IRIs behind `\uXXXX` escapes and one
-    // bad language tag. Cause F (eval blocked on an N-Quads reader) is closed:
-    // the reader landed and all 147 eval tests cleared with no TriG change.
+    // bad language tag.
+    //
+    // Cause F (eval blocked on an N-Quads reader) is closed: the reader landed
+    // and the eval family cleared with no TriG change. Precisely — because the
+    // earlier wording here overstated it — all 143 POSITIVE `TestTrigEval`
+    // tests pass, and 144 of the 147 eval-family tests do. The 3 that remain
+    // are `TestTrigNegativeEval`, and they are listed right below as cause C:
+    // they are ill-formed-IRI tests, not eval-machinery tests, which is why
+    // they did not clear with the reader.
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-bad-lang-01",
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-01",
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-02",

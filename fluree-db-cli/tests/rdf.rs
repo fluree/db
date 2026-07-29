@@ -364,6 +364,96 @@ fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
         .stderr(predicate::str::contains("turtle, ntriples"));
 }
 
+/// A malformed `\u` escape must be a parse ERROR, never a panic.
+///
+/// The scanner sliced the 4/8-byte hex window by byte index after checking
+/// only that the bytes existed. A multi-byte character straddling that window
+/// is not a char boundary, so the slice panicked and took the process with it
+/// — exit 101 out of `fluree rdf check`, on input a user can trivially have.
+/// Both escape positions (literal and IRI) went through the same scanner.
+#[test]
+fn a_multibyte_char_in_an_escape_window_is_an_error_not_a_panic() {
+    let tmp = TempDir::new().unwrap();
+    let cases = [
+        // Two-byte chars inside a \u window, in a literal.
+        ("lit2.nq", "<http://e/s> <http://e/p> \"\\u0éé\" .\n"),
+        // Same, in IRI position.
+        ("iri2.nq", "<http://e/\\u0éé> <http://e/p> <http://e/o> .\n"),
+        // A 4-byte char, which straddles differently.
+        ("lit4.nq", "<http://e/s> <http://e/p> \"\\u0😀\" .\n"),
+        // \U has an 8-byte window with the same hazard.
+        ("big.nq", "<http://e/s> <http://e/p> \"\\U000000éé\" .\n"),
+        // Truncated at EOF.
+        ("trunc.nq", "<http://e/s> <http://e/p> \"\\u00\" .\n"),
+    ];
+
+    for (name, body) in cases {
+        let path = fixture(&tmp, name, body);
+        // EXIT_DOCUMENT_INVALID (a malformed document is a data error, not
+        // a usage error), and specifically NOT 101. Asserting an exact code is what
+        // makes this a panic test rather than a "did not succeed" test —
+        // a panic also fails `success()`, so that weaker assertion would
+        // have passed against the bug.
+        rdf_cmd()
+            .args(["rdf", "check"])
+            .arg(&path)
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+        rdf_cmd()
+            .args(["rdf", "convert"])
+            .arg(&path)
+            .arg("--syntax")
+            .arg("nquads")
+            .arg("-o")
+            .arg(tmp.path().join("out.nq"))
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+    }
+}
+
+/// `u32::from_str_radix` accepts a leading `+`, so `\u+041` decoded as `A`.
+/// The Turtle lexer never had this because it gates on hex digits while
+/// scanning; the strict reader sliced first and converted second, and
+/// inherited it. The gate now lives in the shared decoder, so neither reader
+/// can drift back.
+#[test]
+fn a_signed_hex_payload_is_refused_not_decoded() {
+    let tmp = TempDir::new().unwrap();
+    for (name, body) in [
+        ("plus.nq", "<http://e/s> <http://e/p> \"\\u+041\" .\n"),
+        ("minus.nq", "<http://e/s> <http://e/p> \"\\u-041\" .\n"),
+    ] {
+        let path = fixture(&tmp, name, body);
+        rdf_cmd()
+            .args(["rdf", "check"])
+            .arg(&path)
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+    }
+}
+
+/// The fixes must not have cost the escapes that ARE valid, including a
+/// 4-byte scalar via `\U`.
+#[test]
+fn well_formed_escapes_still_decode() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(
+        &tmp,
+        "ok.nq",
+        "<http://e/s> <http://e/p> \"\\u0041\\U0001F600\" .\n",
+    );
+    let out = tmp.path().join("ok.out.nq");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success();
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(written.contains("\"A😀\""), "{written}");
+}
+
 /// The writers fold only CONSECUTIVE same-subject runs ("blocks" tier), so a
 /// subject that recurs non-consecutively is written as a SECOND block for the
 /// same subject. That output has to read back — and until there were real

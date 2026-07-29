@@ -337,7 +337,7 @@ mod tests {
     /// The triple form still means the default graph — it carries no graph
     /// term, so there is nothing else it could mean.
     #[test]
-    fn the_triple_form_of_a_list_item_still_means_the_default_graph() {
+    fn a_list_item_without_a_graph_term_means_the_default_graph() {
         let mut sink = DatasetCollectorSink::new();
         let s = sink.term_iri("http://a/s");
         let p = sink.term_iri("http://a/p");

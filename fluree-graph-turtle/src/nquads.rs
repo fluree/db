@@ -301,13 +301,25 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
         };
         self.pos += 1;
         let start = self.pos;
-        if start + width > self.bytes.len() {
-            return Err(self.err("truncated unicode escape"));
+        let end = start + width;
+
+        // Validate the window as BYTES before slicing it as a string. Hex
+        // digits are ASCII, so proving all `width` bytes are hex digits also
+        // proves `end` is a char boundary — which is what stops a multi-byte
+        // character straddling the window from panicking the process.
+        // Checking only the LENGTH, as this did, is not enough: `"\u0ee"`
+        // with two-byte `e`s has the bytes and splits one of them in half.
+        if end > self.bytes.len() || !self.bytes[start..end].iter().all(u8::is_ascii_hexdigit) {
+            return Err(self.err(format!(
+                "a \\{} escape needs exactly {width} hex digits",
+                if width == 4 { 'u' } else { 'U' }
+            )));
         }
-        let hex = &self.input[start..start + width];
+
+        let hex = &self.input[start..end];
         let ch = unicode_escape_value(hex)
             .ok_or_else(|| self.err(format!("\\u{hex} is not a Unicode scalar value")))?;
-        self.pos += width;
+        self.pos = end;
         Ok(ch)
     }
 
