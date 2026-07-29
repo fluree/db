@@ -432,7 +432,7 @@ fn language_tags_and_string_escapes_survive() {
     let doc = r#"
 <http://ex/s> <http://ex/p> "plain" ;
     <http://ex/q> "tagged"@en-GB ;
-    <http://ex/r> "  \t \n \r \" \\ ünïcødé ☃" .
+    <http://ex/r> "\u0000 \t \n \r \" \\ ünïcødé ☃" .
 "#;
     assert_round_trips(doc);
     let written = to_ntriples(doc, &WriterConfig::default());
