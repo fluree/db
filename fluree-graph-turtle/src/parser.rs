@@ -68,6 +68,11 @@ pub struct Parser<'a, 'input, S> {
     nesting_depth: u32,
     /// Conformance knobs; [`ParserOptions::default`] is the ingest shape.
     options: ParserOptions,
+    /// Emissions so far. Compared against its value at the statement's start
+    /// to decide whether a failed statement needs
+    /// [`GraphSink::abort_statement`] — a statement that failed before
+    /// emitting has nothing to roll back.
+    emit_count: u64,
 }
 
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
@@ -116,6 +121,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             annotation_depth: 0,
             nesting_depth: 0,
             options,
+            emit_count: 0,
         })
     }
 
@@ -156,12 +162,32 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         let mut statement_count: u64 = 0;
         while !self.is_at_end() {
-            self.parse_statement()?;
-            // Statement terminator: only reached once the statement parsed
-            // and emitted cleanly, so a sink may reclaim statement-scoped
-            // literal term ids / commit statement-scoped buffers here.
-            self.sink.end_statement();
-            statement_count += 1;
+            let emitted_before = self.emit_count;
+            match self.parse_statement() {
+                // Committed at its own terminator; anything else (the
+                // SPARQL-style directives) commits here.
+                Ok(committed) => {
+                    if !committed {
+                        self.sink.end_statement();
+                    }
+                    statement_count += 1;
+                }
+                Err(e) => {
+                    // The parser emits during descent, so a statement can
+                    // fail having already pushed triples. Tell the sink to
+                    // drop them, so "a rejected statement contributes
+                    // nothing" holds at the sink and not just in the error
+                    // return. Nothing emitted means nothing to roll back.
+                    //
+                    // A statement that already committed and then failed on
+                    // the lookahead advance lands here too; its rollback is a
+                    // no-op because the commit moved the sink's mark past it.
+                    if self.emit_count > emitted_before {
+                        self.sink.abort_statement();
+                    }
+                    return Err(e);
+                }
+            }
         }
         span.record("statement_count", statement_count);
         span.record("iri_cache_hits", self.iri_cache_hits);
@@ -274,6 +300,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         object: TermId,
     ) -> Result<()> {
         self.sink.emit_triple(subject, predicate, object)?;
+        self.emit_count += 1;
         Ok(())
     }
 
@@ -287,6 +314,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     ) -> Result<()> {
         self.sink
             .emit_list_item(subject, predicate, object, index)?;
+        self.emit_count += 1;
         Ok(())
     }
 
@@ -300,6 +328,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     ) -> Result<()> {
         self.sink
             .emit_reified_triple(subject, predicate, object, reifier)?;
+        self.emit_count += 1;
         Ok(())
     }
 
@@ -435,18 +464,41 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     // Parsing
     // =========================================================================
 
+    /// Consume the `.` terminating a statement, committing the statement to
+    /// the sink BEFORE advancing.
+    ///
+    /// The commit has to happen before the advance because the parser keeps
+    /// one token of lookahead: advancing past the `.` lexes the first token
+    /// of the NEXT statement, and a lexical error there would otherwise be
+    /// reported while this statement is still in flight — rolling back a
+    /// statement that was in fact complete and valid.
+    fn end_statement_at_dot(&mut self) -> Result<()> {
+        if !self.check(&TokenKind::Dot) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                format!("expected Dot, found {:?}", self.current().kind),
+            ));
+        }
+        self.sink.end_statement();
+        self.advance()
+    }
+
     /// Parse a single statement (directive or triples).
-    fn parse_statement(&mut self) -> Result<()> {
+    ///
+    /// Returns whether the statement already committed itself to the sink via
+    /// [`Self::end_statement_at_dot`]; the SPARQL-style `PREFIX`/`BASE` forms
+    /// have no terminator, so the caller commits those.
+    fn parse_statement(&mut self) -> Result<bool> {
         match self.current().kind {
             TokenKind::KwPrefix | TokenKind::KwSparqlPrefix => self.parse_prefix_directive(),
             TokenKind::KwBase | TokenKind::KwSparqlBase => self.parse_base_directive(),
-            TokenKind::Eof => Ok(()),
-            _ => self.parse_triples(),
+            TokenKind::Eof => Ok(false),
+            _ => self.parse_triples().map(|()| true),
         }
     }
 
     /// Parse @prefix or PREFIX directive.
-    fn parse_prefix_directive(&mut self) -> Result<()> {
+    fn parse_prefix_directive(&mut self) -> Result<bool> {
         let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlPrefix);
         self.advance()?; // consume @prefix or PREFIX
 
@@ -490,14 +542,15 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Consume trailing dot (required for @prefix, not for PREFIX)
         if !is_sparql_style {
-            self.expect(&TokenKind::Dot)?;
+            self.end_statement_at_dot()?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Parse @base or BASE directive.
-    fn parse_base_directive(&mut self) -> Result<()> {
+    fn parse_base_directive(&mut self) -> Result<bool> {
         let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlBase);
         self.advance()?; // consume @base or BASE
 
@@ -524,10 +577,11 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Consume trailing dot (required for @base, not for BASE)
         if !is_sparql_style {
-            self.expect(&TokenKind::Dot)?;
+            self.end_statement_at_dot()?;
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Parse a triple statement.
@@ -540,8 +594,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         if !(bnode_list_subject && matches!(self.current().kind, TokenKind::Dot)) {
             self.parse_predicate_object_list(subject)?;
         }
-        self.expect(&TokenKind::Dot)?;
-        Ok(())
+        self.end_statement_at_dot()
     }
 
     /// Parse a subject term.

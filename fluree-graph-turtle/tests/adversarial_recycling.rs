@@ -154,21 +154,21 @@ fn one_sink_many_parses_survives_recycling() {
     assert_eq!(rows(&recycling.into_graph()), rows(&control.0.into_graph()));
 }
 
-/// A statement that FAILS after emitting: the parser returns Err without
-/// calling `end_statement`, so the failed statement's literal slots stay
-/// consumed. Documents the observable consequence for a resuming producer.
+/// A statement that FAILS after emitting contributes NOTHING: the parser
+/// calls `abort_statement` and the sink rolls back to the statement
+/// boundary. This is riot's semantics, and what `--continue-on-error` has to
+/// guarantee — the parser emits during descent, so without the rollback a
+/// rejected statement would leave partial triples behind.
 #[test]
-fn failed_statement_leaves_its_slots_consumed() {
+fn failed_statement_contributes_nothing() {
     let mut sink = GraphCollectorSink::new();
-    // Statement 1 completes (2 literals). Statement 2 emits one literal then
+    // Statement 1 completes (2 literals). Statement 2 emits one triple then
     // hits a syntax error before its terminator.
     let doc = r#"@prefix ex: <http://example.org/> .
                  ex:a ex:p "1" ; ex:q "2" .
                  ex:b ex:p "3" ; ex:q @@@ ."#;
     parse(doc, &mut sink).expect_err("statement 2 must fail");
 
-    // The graph already holds the half-statement's triple — there is no
-    // rollback hook in the protocol.
     let g = sink.into_graph();
     let objects: Vec<String> = g
         .iter()
@@ -176,7 +176,32 @@ fn failed_statement_leaves_its_slots_consumed() {
         .filter(|s| s.starts_with('"'))
         .collect();
     assert!(
-        objects.iter().any(|o| o.contains("\"3\"")),
-        "half-emitted statement is retained by the sink: {objects:?}"
+        !objects.iter().any(|o| o.contains("\"3\"")),
+        "the failed statement's triples must be rolled back, got {objects:?}"
     );
+    // …and only the failed statement is rolled back; the committed one stays.
+    assert_eq!(
+        objects.len(),
+        2,
+        "statement 1 must survive intact: {objects:?}"
+    );
+    assert!(objects.iter().any(|o| o.contains("\"1\"")), "{objects:?}");
+    assert!(objects.iter().any(|o| o.contains("\"2\"")), "{objects:?}");
+}
+
+/// The rollback must not fire when the statement failed before emitting —
+/// there is nothing to roll back, and a spurious `abort_statement` would
+/// discard the PREVIOUS statement (whose triples sit past the mark only
+/// until `end_statement` advances it).
+#[test]
+fn failure_before_any_emit_leaves_earlier_statements_intact() {
+    let mut sink = GraphCollectorSink::new();
+    // Statement 2 fails at its subject, before a single triple is emitted.
+    let doc = r#"@prefix ex: <http://example.org/> .
+                 ex:a ex:p "1" ; ex:q "2" .
+                 @@@ ex:p "3" ."#;
+    parse(doc, &mut sink).expect_err("statement 2 must fail");
+
+    let g = sink.into_graph();
+    assert_eq!(g.len(), 2, "the committed statement must survive");
 }

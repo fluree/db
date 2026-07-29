@@ -90,6 +90,17 @@ impl Graph {
         self.triples.len()
     }
 
+    /// Drop every triple past `len`, keeping the first `len` in insertion
+    /// order. No-op if the graph is already that short.
+    ///
+    /// Exists for statement-scoped rollback: a sink that has emitted part of
+    /// a statement before it turned out to be invalid rewinds to the mark it
+    /// took at the statement boundary (see
+    /// [`GraphSink::abort_statement`](crate::GraphSink::abort_statement)).
+    pub fn truncate(&mut self, len: usize) {
+        self.triples.truncate(len);
+    }
+
     /// Check if the graph is empty
     pub fn is_empty(&self) -> bool {
         self.triples.is_empty()

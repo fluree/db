@@ -243,10 +243,34 @@ pub trait GraphSink {
     ///   statement (needed for `--continue-on-error`, because triples are
     ///   emitted during descent, before the terminating `.` proves the
     ///   statement valid) commits its buffer here. A statement that fails to
-    ///   parse never reaches this call, so it contributes nothing.
+    ///   parse reaches [`Self::abort_statement`] instead, and so contributes
+    ///   nothing.
     ///
     /// Default: no-op.
     fn end_statement(&mut self) {}
+
+    /// Called by the producer when a statement FAILS after it had already
+    /// emitted — the counterpart to [`Self::end_statement`].
+    ///
+    /// The parser emits during descent: property lists and collections push
+    /// triples before the terminating `.` proves the statement well-formed.
+    /// Without this hook a rejected statement still leaves its partial
+    /// triples in the sink, so "a rejected statement contributes nothing"
+    /// (riot's semantics, and what `--continue-on-error` has to guarantee)
+    /// would be false at the sink level.
+    ///
+    /// Contract:
+    /// - Called at most once per statement, and only when at least one
+    ///   `emit_*` succeeded for it — a statement that fails before emitting
+    ///   has nothing to roll back.
+    /// - Never paired with [`Self::end_statement`] for the same statement:
+    ///   exactly one of the two ends a statement.
+    /// - Implementations discard everything emitted since the last statement
+    ///   boundary and may reclaim the same storage `end_statement` reclaims.
+    ///
+    /// Default: no-op, preserving the pre-rollback behavior for sinks that
+    /// have no notion of a statement.
+    fn abort_statement(&mut self) {}
 
     /// Flush and finalize. Called once by whoever owns the sink, after the
     /// last producer has finished emitting.
@@ -333,6 +357,10 @@ pub struct GraphCollectorSink {
     /// Reset to 0 by `end_statement`, which is what turns the list into a
     /// per-statement ring instead of a per-document one.
     literal_cursor: usize,
+    /// Graph length at the current statement's start — the rewind point for
+    /// [`GraphSink::abort_statement`]. Advanced at every statement boundary,
+    /// so it is always "everything before the statement in flight".
+    statement_mark: usize,
 }
 
 impl GraphCollectorSink {
@@ -345,6 +373,7 @@ impl GraphCollectorSink {
             blank_labels: HashMap::new(),
             literal_slots: Vec::new(),
             literal_cursor: 0,
+            statement_mark: 0,
         }
     }
 
@@ -357,6 +386,7 @@ impl GraphCollectorSink {
             blank_labels: HashMap::new(),
             literal_slots: Vec::new(),
             literal_cursor: 0,
+            statement_mark: 0,
         }
     }
 
@@ -480,10 +510,20 @@ impl GraphSink for GraphCollectorSink {
         self.add_literal_term(term)
     }
 
-    /// Retire this statement's literal slots for reuse. Sound because
+    /// Retire this statement's literal slots for reuse, and move the rewind
+    /// point past the statement just committed. Recycling is sound because
     /// `emit_*` has already cloned every term it needed into the graph, and
     /// because producers only cache IRI and blank ids across statements.
     fn end_statement(&mut self) {
+        self.literal_cursor = 0;
+        self.statement_mark = self.graph.len();
+    }
+
+    /// Roll the graph back to the statement's start, so a statement that
+    /// failed mid-emit contributes nothing. Its literal slots are retired
+    /// exactly as a successful statement's are.
+    fn abort_statement(&mut self) {
+        self.graph.truncate(self.statement_mark);
         self.literal_cursor = 0;
     }
 
