@@ -539,10 +539,15 @@ impl<S: GraphSink> TimingSink<S> {
 
         // The same rule, applied to the one exact measurement. `finish` is a
         // single bracketed call, so its floor is a single clock pair rather
-        // than a scaled one: a sink whose `finish` is `Ok(())` measures tens
-        // of nanoseconds, and reporting that as a flush cost would put the
-        // clock back in the report through the one door left open.
-        let finish_floor = clock_ns.saturating_mul(u128::from(FLOOR_MULTIPLE));
+        // than a scaled one — but not *only* that: a no-op `finish` still
+        // measures 100–200 ns of dispatch and clock variance, which is over
+        // three clock pairs and would print as a flush cost that does not
+        // exist. A flush worth naming is not a sub-microsecond one, so the
+        // floor is whichever of the two is larger.
+        const FINISH_FLOOR_NS: u128 = 1_000;
+        let finish_floor = clock_ns
+            .saturating_mul(u128::from(FLOOR_MULTIPLE))
+            .max(FINISH_FLOOR_NS);
         let finish = if self.finish_time.as_nanos() >= finish_floor {
             self.finish_time
         } else {
@@ -1215,6 +1220,10 @@ mod tests {
         drive_discard(&mut sink, 500);
         sink.finish().unwrap();
         assert_eq!(sink.sink_timing().finish, Duration::ZERO);
+        // The raw measurement was not zero — dispatch and clock variance put a
+        // no-op `finish` in the 100-200ns range, comfortably over three clock
+        // pairs. It is the sub-microsecond floor that suppresses it.
+        assert!(sink.finish_time < Duration::from_micros(1));
     }
 
     #[test]

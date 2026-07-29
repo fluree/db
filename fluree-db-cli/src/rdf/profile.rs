@@ -529,8 +529,12 @@ fn human_duration(ns: u128) -> String {
         format!("{secs:.2}s")
     } else if secs >= 0.001 {
         format!("{:.1}ms", secs * 1e3)
-    } else {
+    } else if ns >= 1_000 {
         format!("{}μs", ns / 1_000)
+    } else {
+        // Integer-dividing sub-microsecond values into μs printed "0μs",
+        // which reads as "free" for something that was measured.
+        format!("{ns}ns")
     }
 }
 
@@ -966,6 +970,10 @@ mod tests {
         assert_eq!(human_duration(1_500_000_000), "1.50s");
         assert_eq!(human_duration(1_500_000), "1.5ms");
         assert_eq!(human_duration(1_500), "1μs");
+        // Sub-microsecond is rendered in ns, not truncated to "0μs" — a
+        // measured value must never print as nothing.
+        assert_eq!(human_duration(150), "150ns");
+        assert_eq!(human_duration(0), "0ns");
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(2048), "2.0 KiB");
         assert_eq!(human_bytes(5 * 1024 * 1024), "5.00 MiB");
