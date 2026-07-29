@@ -52,14 +52,7 @@ pub const NEGATIVE_SYNTAX_BLIND_SPOT: &str =
 pub const RDF11_TURTLE: &[&str] = &[
     // A1 (repeated `;` as empty predicateObjectList items) — FIXED, entries
     // removed with the fix.
-    // ---------------------------------------------------------------------
-    // A2. PARSER BUG — `PN_LOCAL` may contain interior dots (`:s.1`, `:s..2`,
-    // `:3.s`); only a TRAILING dot terminates the name. The lexer treats the
-    // first dot as the statement terminator. Note the interaction with the
-    // one-token-lookahead fact recorded in the plan's M1 section: deciding
-    // "interior or terminator" is exactly a lookahead question. (1)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-ln-dots",
+    // A2 (PN_LOCAL interior dots) — FIXED, entry removed with the fix.
     // ---------------------------------------------------------------------
     // A3. PARSER BUG — a RELATIVE `@base` must be resolved against the
     // in-scope base (RFC 3986 §5.1.1), and a relative prefix namespace

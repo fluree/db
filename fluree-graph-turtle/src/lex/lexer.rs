@@ -412,27 +412,33 @@ fn parse_pn_local(input: &mut Input<'_>) -> ModalResult<()> {
         return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
     }
 
+    // PN_LOCAL ::= (PN_CHARS_U | ':' | [0-9] | PLX)
+    //              ((PN_CHARS | '.' | ':' | PLX)* (PN_CHARS | ':' | PLX))?
+    //
+    // Dots are ordinary interior characters — a RUN of them is fine
+    // (`:s..2`) — and only the FINAL character is constrained: it may not be
+    // a dot, so a name-final dot is the statement terminator instead.
+    //
+    // One char of lookahead cannot decide that (`.` followed by `.` may still
+    // be interior), so scan greedily like `parse_blank_node_name` does and
+    // rewind to the last legal end. `last_good` is the byte length of the
+    // longest prefix that ends on PN_CHARS | ':' | PLX; it is tracked rather
+    // than trimmed off at the end because a trailing PLX may legally BE an
+    // escaped dot (`:a\.`), which trimming would eat.
+    let start = input.checkpoint();
+    let all: &str = input.as_ref();
+    let mut last_good: Option<usize> = None;
+    let consumed = |input: &Input<'_>| all.len() - input.as_ref().len();
+
     loop {
-        let _chunk: &str =
-            take_while(0.., |c: char| is_pn_chars(c) || c == ':').parse_next(input)?;
+        let chunk: &str =
+            take_while(0.., |c: char| is_pn_chars(c) || c == ':' || c == '.').parse_next(input)?;
 
-        if input.is_empty() {
-            break;
-        }
-
-        if input.starts_with('.') {
-            let rest = &input.as_ref()[1..];
-            if let Some(next_char) = rest.chars().next() {
-                if is_pn_chars(next_char)
-                    || next_char == ':'
-                    || next_char == '%'
-                    || next_char == '\\'
-                {
-                    '.'.parse_next(input)?;
-                    continue;
-                }
+        if !chunk.is_empty() {
+            let without_trailing_dots = chunk.trim_end_matches('.');
+            if !without_trailing_dots.is_empty() {
+                last_good = Some(consumed(input) - (chunk.len() - without_trailing_dots.len()));
             }
-            break;
         }
 
         if input.starts_with('%') {
@@ -441,18 +447,26 @@ fn parse_pn_local(input: &mut Input<'_>) -> ModalResult<()> {
             if hex.len() != 2 {
                 return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
             }
+            last_good = Some(consumed(input));
         } else if input.starts_with('\\') {
             '\\'.parse_next(input)?;
             let escaped: char = any.parse_next(input)?;
-            if "_~.-!$&'()*+,;=/?#@%".contains(escaped) {
-                // Valid local escape — consumed, content is in the span
-            } else {
+            if !"_~.-!$&'()*+,;=/?#@%".contains(escaped) {
                 return Err(winnow::error::ErrMode::Backtrack(ContextError::new()));
             }
+            last_good = Some(consumed(input));
         } else {
             break;
         }
     }
+
+    // No legal end means everything scanned was dots — not a local name.
+    let end = last_good.ok_or_else(|| winnow::error::ErrMode::Backtrack(ContextError::new()))?;
+
+    // Re-consume exactly the legal prefix so the token span stops before any
+    // trailing dot. `end` is a char boundary: only ASCII '.' is dropped.
+    input.reset(&start);
+    let _ = input.next_slice(end);
 
     Ok(())
 }
@@ -1044,6 +1058,77 @@ mod tests {
         assert_eq!(tok("@base"), vec![TokenKind::KwBase]);
         assert_eq!(tok("PREFIX"), vec![TokenKind::KwSparqlPrefix]);
         assert_eq!(tok("BASE"), vec![TokenKind::KwSparqlBase]);
+    }
+
+    /// PN_LOCAL takes dots as ordinary interior characters — including runs
+    /// of them — and only forbids a dot as the FINAL character, where it is
+    /// the statement terminator instead. W3C: `turtle-syntax-ln-dots`.
+    #[test]
+    fn test_pn_local_interior_dots() {
+        // Single interior dot.
+        assert_eq!(tok_spans(":o.1"), vec![(TokenKind::PrefixedName, ":o.1")]);
+        // A RUN of interior dots — the case one char of lookahead cannot see.
+        assert_eq!(tok_spans(":s..2"), vec![(TokenKind::PrefixedName, ":s..2")]);
+        assert_eq!(
+            tok_spans(":a...b"),
+            vec![(TokenKind::PrefixedName, ":a...b")]
+        );
+        // Leading digit plus interior dot.
+        assert_eq!(tok_spans(":3.s"), vec![(TokenKind::PrefixedName, ":3.s")]);
+    }
+
+    /// A name-final dot terminates the statement and is not part of the name.
+    #[test]
+    fn test_pn_local_trailing_dot_is_the_terminator() {
+        assert_eq!(
+            tok_spans(":o.1."),
+            vec![(TokenKind::PrefixedName, ":o.1"), (TokenKind::Dot, ".")]
+        );
+        // A trailing RUN: the name keeps none of it, and each dot lexes out.
+        assert_eq!(
+            tok_spans(":s..2.."),
+            vec![
+                (TokenKind::PrefixedName, ":s..2"),
+                (TokenKind::Dot, "."),
+                (TokenKind::Dot, "."),
+            ]
+        );
+        assert_eq!(
+            tok_spans(":3."),
+            vec![(TokenKind::PrefixedName, ":3"), (TokenKind::Dot, ".")]
+        );
+    }
+
+    /// PLX (`%XX` and `\`-escapes) is a legal final element, so a name ending
+    /// in an ESCAPED dot keeps it — the reason the scan tracks the last legal
+    /// end instead of trimming trailing dots off the span.
+    #[test]
+    fn test_pn_local_plx_endings_survive() {
+        assert_eq!(tok_spans(r":a\."), vec![(TokenKind::PrefixedName, r":a\.")]);
+        assert_eq!(
+            tok_spans(r":a\..b"),
+            vec![(TokenKind::PrefixedName, r":a\..b")]
+        );
+        assert_eq!(tok_spans(":a%20"), vec![(TokenKind::PrefixedName, ":a%20")]);
+        // Percent-escape after an interior dot run.
+        assert_eq!(
+            tok_spans(":a..%20"),
+            vec![(TokenKind::PrefixedName, ":a..%20")]
+        );
+        // An escaped dot followed by the real terminator.
+        assert_eq!(
+            tok_spans(r":a\.."),
+            vec![(TokenKind::PrefixedName, r":a\."), (TokenKind::Dot, ".")]
+        );
+    }
+
+    /// PN_LOCAL may not START with a dot: `:.a` is the empty namespace, then
+    /// a dot — never a local name of `.a`.
+    #[test]
+    fn test_pn_local_cannot_start_with_a_dot() {
+        let toks = tok_spans(":.a");
+        assert_eq!(toks[0], (TokenKind::PrefixedNameNs, ":"));
+        assert_eq!(toks[1], (TokenKind::Dot, "."));
     }
 
     #[test]
