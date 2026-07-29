@@ -62,7 +62,9 @@ pub use diagnostic::{Diagnostic, Severity};
 pub use graph::Graph;
 pub use line_index::LineIndex;
 pub use quad::Quad;
-pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
+pub use sink::{
+    GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId, PROTOCOL_QUAD_EVENTS,
+};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;
 pub use xsd_double::{canonical_xsd_double, push_canonical_xsd_double, write_canonical_xsd_double};

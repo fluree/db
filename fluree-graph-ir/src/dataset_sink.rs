@@ -182,7 +182,9 @@ impl GraphSink for DatasetCollectorSink {
     /// goes through [`GraphSink::emit_quad`] like anything else. It bites
     /// only the indexed style, which exists for Fluree ingest. Whether the
     /// trait grows a quad form belongs to whoever owns the protocol; until
-    /// then this behavior is pinned by test so it cannot change unnoticed.
+    /// then this routing is pinned by test, and
+    /// [`PROTOCOL_QUAD_EVENTS`](crate::PROTOCOL_QUAD_EVENTS) is the tripwire
+    /// for widening the quad surface.
     fn emit_list_item(
         &mut self,
         subject: TermId,
@@ -240,6 +242,13 @@ impl GraphSink for DatasetCollectorSink {
     /// statement that failed mid-emit contributes nothing — including no
     /// empty named graph that only its own failed writes brought into
     /// existence.
+    ///
+    /// Statements only. A `@base` or `@prefix` accepted before the failure
+    /// stays accepted, exactly as in
+    /// [`GraphCollectorSink`](crate::GraphCollectorSink): directives are
+    /// document-scoped, `on_base`/`on_prefix` are infallible, and a producer
+    /// that has resolved later IRIs against a prefix cannot un-resolve them.
+    /// A `--continue-on-error` driver inherits that.
     fn abort_statement(&mut self) {
         self.terms.end_statement();
         self.dataset.default_graph_mut().truncate(self.default_mark);
@@ -419,10 +428,13 @@ mod tests {
 
     #[test]
     fn list_items_land_in_the_default_graph_because_the_protocol_has_no_quad_form() {
-        // Pinning the gap documented on `emit_list_item`: there is no way for
-        // a producer to put an indexed collection in a named graph, so this
-        // is the only meaning the event has. If the protocol grows a quad
-        // form, this test is the thing that should fail.
+        // What this guarantees, precisely: the ROUTING of today's
+        // `emit_list_item` is pinned, so it cannot start going somewhere else
+        // unnoticed. What it does NOT do is notice a new quad-shaped event
+        // being added to the trait — a default-bodied `emit_quad_list_item`
+        // would compile and this test would stay green. That tripwire is
+        // `PROTOCOL_QUAD_EVENTS` in sink.rs, and it is a forced decision
+        // point rather than a detector; see the note there.
         let mut sink = DatasetCollectorSink::new();
         let s = sink.term_iri("http://ex/s");
         let p = sink.term_iri("http://ex/p");

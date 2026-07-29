@@ -54,6 +54,26 @@ impl SinkError {
 /// Result alias for [`GraphSink`] emission methods.
 pub type SinkResult = std::result::Result<(), SinkError>;
 
+/// How many *quad-shaped* events [`GraphSink`] defines — events that carry a
+/// graph term and so must be routed to a particular graph by a dataset sink.
+///
+/// Today that is exactly one: [`GraphSink::emit_quad`]. Every other emission
+/// event ([`GraphSink::emit_triple`], [`GraphSink::emit_list_item`],
+/// [`GraphSink::emit_reified_triple`]) has no graph term, which leaves the
+/// default graph as the only thing it can mean — see
+/// [`DatasetCollectorSink::emit_list_item`](crate::DatasetCollectorSink) for
+/// the consequence.
+///
+/// **If you add a quad-shaped event to the trait, bump this and route it in
+/// every dataset sink.** A test asserts the value, so the bump is forced and
+/// the failure names the work; what it cannot do is notice the new method by
+/// itself. Rust has no reflection over trait items, and a default-bodied
+/// addition compiles against every existing impl — which is exactly how such
+/// an event would otherwise reach a dataset sink and be silently dropped into
+/// the default graph. Hence a hand-maintained count, deliberately sited next
+/// to the methods it counts so the adding diff touches it.
+pub const PROTOCOL_QUAD_EVENTS: usize = 1;
+
 /// Opaque term identifier for efficient triple emission
 ///
 /// `TermId` is only valid within a single sink session. It allows parsers
@@ -206,6 +226,9 @@ pub trait GraphSink {
 
     /// Emit a quad: the triple `(subject, predicate, object)` in the named
     /// graph `graph`.
+    ///
+    /// This is the trait's only quad-shaped event; adding another means
+    /// bumping [`PROTOCOL_QUAD_EVENTS`] and routing it in every dataset sink.
     ///
     /// Only called when [`Self::supports_quads`] returns `true`. Unlike
     /// [`Self::emit_reified_triple`] — whose producers are all guarded by an
@@ -691,6 +714,28 @@ mod tests {
         let sink = GraphCollectorSink::new();
         assert!(!sink.supports_quads());
         assert!(!sink.supports_reified_triples());
+    }
+
+    /// The trait's quad-shaped surface is one method wide. This is the
+    /// tripwire for widening it: an event that carries a graph term needs
+    /// routing in every dataset sink, and one added with a default body
+    /// compiles silently against them all and lands in the default graph.
+    ///
+    /// The assertion cannot detect the new method — nothing in Rust can
+    /// enumerate trait items — so what it buys is a forced, greppable
+    /// decision point next to the methods it counts, and a failure message
+    /// that names the follow-up work.
+    #[test]
+    fn widening_the_quad_surface_forces_a_routing_decision() {
+        assert_eq!(
+            PROTOCOL_QUAD_EVENTS, 1,
+            "GraphSink's quad-shaped surface changed. Every dataset sink must \
+             route the new event to its named graph — DatasetCollectorSink, \
+             and anything downstream implementing GraphSink. Check \
+             DatasetCollectorSink::emit_list_item's doc comment too: it \
+             explains why the NON-quad events land in the default graph, and \
+             a new quad form may retire part of that reasoning."
+        );
     }
 
     /// The probe is what routes a producer between the two sinks, so the
