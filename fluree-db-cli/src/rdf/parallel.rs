@@ -178,6 +178,123 @@ impl<S: GraphSink> GraphSink for ChunkScopedBlanks<S> {
     }
 }
 
+/// Rewrites every blank-node label into a form that is correct across chunks
+/// without any coordination between them — plan §1.3's bijective rename.
+///
+/// This is what lets workers produce *bytes* instead of graphs. The
+/// collect-then-replay design needed one relabeller on one thread to see the
+/// whole document in order, and that serial replay turned out to be half the
+/// wall clock. Here the mapping is a pure function of (label, chunk), so every
+/// worker can run its own writer and the results simply concatenate.
+///
+/// Three classes of label come out, and they are pairwise disjoint by
+/// construction rather than by check:
+///
+/// - A user's `_:L` becomes `u{L}`. Prefixing is injective, so two distinct
+///   user labels stay distinct, and a label naming the same node in two chunks
+///   maps to the same output label in both — which is what document scoping
+///   requires.
+/// - An anonymous node in chunk `c` becomes `g{c}_{n}`. Different chunks
+///   cannot collide because `c` differs; within a chunk `n` differs.
+/// - A `_:fdb-…` stable identifier passes through verbatim, preserving
+///   #1432's addressability contract.
+///
+/// Disjointness across the classes is by first character: `u…` never equals
+/// `g…`, and neither can equal `fdb-…`. A user label that *looks* like a mint
+/// is no threat — `_:g0_1` becomes `ug0_1`, not `g0_1`.
+pub struct DeterministicBlanks<S> {
+    inner: S,
+    chunk: usize,
+    minted: u64,
+}
+
+/// Labels the writers treat as addressable identifiers rather than syntax.
+const FDB_CARVE_OUT: &str = "fdb-";
+
+impl<S: GraphSink> DeterministicBlanks<S> {
+    /// Wrap `inner` for chunk `chunk`.
+    pub fn new(inner: S, chunk: usize) -> Self {
+        Self {
+            inner,
+            chunk,
+            minted: 0,
+        }
+    }
+
+    /// Unwrap.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+
+    /// The output label for a user-written one.
+    fn rename(label: &str) -> std::borrow::Cow<'_, str> {
+        if label.starts_with(FDB_CARVE_OUT) {
+            std::borrow::Cow::Borrowed(label)
+        } else {
+            std::borrow::Cow::Owned(format!("u{label}"))
+        }
+    }
+}
+
+impl<S: GraphSink> GraphSink for DeterministicBlanks<S> {
+    fn term_blank(&mut self, label: Option<&str>) -> TermId {
+        match label {
+            Some(label) => {
+                let renamed = Self::rename(label);
+                self.inner.term_blank(Some(&renamed))
+            }
+            None => {
+                self.minted += 1;
+                let minted = format!("g{}_{}", self.chunk, self.minted);
+                self.inner.term_blank(Some(&minted))
+            }
+        }
+    }
+
+    fn on_base(&mut self, base_iri: &str) {
+        self.inner.on_base(base_iri);
+    }
+    fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) {
+        self.inner.on_prefix(prefix, namespace_iri);
+    }
+    fn term_iri(&mut self, iri: &str) -> TermId {
+        self.inner.term_iri(iri)
+    }
+    fn term_literal(&mut self, value: &str, datatype: Datatype, language: Option<&str>) -> TermId {
+        self.inner.term_literal(value, datatype, language)
+    }
+    fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
+        self.inner.term_literal_value(value, datatype)
+    }
+    fn emit_triple(&mut self, s: TermId, p: TermId, o: TermId) -> SinkResult {
+        self.inner.emit_triple(s, p, o)
+    }
+    fn emit_list_item(&mut self, s: TermId, p: TermId, o: TermId, index: i32) -> SinkResult {
+        self.inner.emit_list_item(s, p, o, index)
+    }
+    fn supports_quads(&self) -> bool {
+        self.inner.supports_quads()
+    }
+    fn emit_quad(&mut self, s: TermId, p: TermId, o: TermId, g: TermId) -> SinkResult {
+        self.inner.emit_quad(s, p, o, g)
+    }
+    fn supports_reified_triples(&self) -> bool {
+        self.inner.supports_reified_triples()
+    }
+    fn emit_reified_triple(&mut self, s: TermId, p: TermId, o: TermId, r: TermId) -> SinkResult {
+        self.inner.emit_reified_triple(s, p, o, r)
+    }
+    fn end_statement(&mut self) {
+        self.inner.end_statement();
+    }
+    fn abort_statement(&mut self) {
+        self.inner.abort_statement();
+    }
+    fn finish(&mut self) -> SinkResult {
+        self.inner.finish()
+    }
+}
+
 /// One chunk's parsed result, waiting its turn to be written.
 struct ChunkResult {
     index: usize,
@@ -202,6 +319,8 @@ pub struct ParallelOutcome {
     pub reassembly_wait_nanos: u128,
     /// The first parse failure in document order, if any.
     pub error: Option<fluree_graph_turtle::TurtleError>,
+    /// Statements written across all chunks.
+    pub statements: u64,
 }
 
 /// Parse `text` across `config.workers` threads and replay it into `sink` in
@@ -280,7 +399,192 @@ pub fn convert_parallel<S: GraphSink>(
         // rather than a true per-chunk wait. Reported as what it is.
         reassembly_wait_nanos: replay_start.elapsed().as_nanos(),
         error: first_error,
+        statements: 0,
     })
+}
+
+/// Parse across threads with each worker writing its own bytes, and
+/// concatenate the results in chunk order.
+///
+/// The architecture plan §1.3 specifies, and the reason it is worth the label
+/// scheme: no shared relabeller means no serial replay, and the serial replay
+/// was ~half the wall clock of the collect-then-replay design it replaces.
+///
+/// In-flight chunks are bounded by the channel capacity, so peak memory is
+/// roughly `(workers + capacity) × chunk output size` rather than the whole
+/// output. Out-of-order arrivals wait in a reorder buffer; a worker can always
+/// deposit because the capacity is at least the worker count, so no worker
+/// blocks on a chunk the writer is waiting for.
+pub fn convert_parallel_bytes<W: std::io::Write>(
+    text: &str,
+    base: Option<&str>,
+    out: &mut W,
+    syntax: RdfSyntax,
+    writer_config: &fluree_graph_format::WriterConfig,
+    config: ParallelConfig,
+) -> CliResult<ParallelOutcome> {
+    let (prefix_block, ranges) =
+        splitter::chunk_in_memory(text, config.chunk_bytes).map_err(|e| {
+            CliError::Usage(format!("cannot split the input for parallel parsing: {e}"))
+        })?;
+    let chunk_count = ranges.len();
+    let workers = config.workers.min(chunk_count).max(1);
+
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Capacity >= workers so a worker can always deposit and never blocks
+    // holding a chunk the writer is waiting for.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ChunkBytes>(workers.max(2));
+
+    let outcome = std::thread::scope(|scope| -> CliResult<ParallelOutcome> {
+        let next = &next;
+        let ranges = &ranges;
+        let prefix_block = &prefix_block;
+
+        for _ in 0..workers {
+            let tx = tx.clone();
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(range) = ranges.get(index) else {
+                    break;
+                };
+                let produced = write_chunk(
+                    index,
+                    prefix_block,
+                    &text[range.clone()],
+                    base,
+                    syntax,
+                    writer_config,
+                );
+                if tx.send(produced).is_err() {
+                    break;
+                }
+            });
+        }
+        // The scope's own sender must go, or `rx` never sees a disconnect.
+        drop(tx);
+
+        let mut pending: std::collections::BTreeMap<usize, ChunkBytes> =
+            std::collections::BTreeMap::new();
+        let mut want = 0usize;
+        let mut worker_parse_nanos = 0u128;
+        let mut first_error = None;
+        let mut statements = 0u64;
+
+        let replay_start = std::time::Instant::now();
+        let mut wait_nanos = 0u128;
+
+        while want < chunk_count {
+            if let Some(ready) = pending.remove(&want) {
+                worker_parse_nanos += ready.parse_nanos;
+                statements += ready.statements;
+                if first_error.is_none() {
+                    first_error = ready.error;
+                }
+                out.write_all(&ready.bytes)
+                    .map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+                want += 1;
+                // A failed chunk ends the document: what follows was parsed
+                // from chunks the failure never reached, and emitting it would
+                // claim a document that does not exist.
+                if first_error.is_some() {
+                    break;
+                }
+                continue;
+            }
+            let waited = std::time::Instant::now();
+            match rx.recv() {
+                Ok(chunk) => {
+                    wait_nanos += waited.elapsed().as_nanos();
+                    pending.insert(chunk.index, chunk);
+                }
+                // Every worker is gone and the chunk we want never arrived.
+                Err(_) => break,
+            }
+        }
+
+        Ok(ParallelOutcome {
+            chunks: chunk_count,
+            worker_parse_nanos,
+            reassembly_wait_nanos: wait_nanos.max(replay_start.elapsed().as_nanos() / 1_000),
+            error: first_error,
+            statements,
+        })
+    })?;
+
+    Ok(outcome)
+}
+
+/// One chunk's bytes, ready to concatenate.
+struct ChunkBytes {
+    index: usize,
+    bytes: Vec<u8>,
+    statements: u64,
+    parse_nanos: u128,
+    error: Option<fluree_graph_turtle::TurtleError>,
+}
+
+/// Parse one chunk straight into its own writer.
+fn write_chunk(
+    index: usize,
+    prefix_block: &str,
+    body: &str,
+    base: Option<&str>,
+    syntax: RdfSyntax,
+    writer_config: &fluree_graph_format::WriterConfig,
+) -> ChunkBytes {
+    let mut doc = String::with_capacity(prefix_block.len() + body.len());
+    doc.push_str(prefix_block);
+    doc.push_str(body);
+
+    // Preserve, because the labels reaching the writer are already the final
+    // ones: `DeterministicBlanks` has done the renaming that makes them
+    // correct across chunks, and a second relabelling would undo it.
+    let config = writer_config
+        .clone()
+        .with_blank_labels(fluree_graph_format::BlankNodeLabels::Preserve);
+    let writer = match crate::rdf::writer::AnyWriter::new(
+        syntax,
+        Vec::new(),
+        &config,
+        &fluree_graph_format::PrefixMap::new(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            return ChunkBytes {
+                index,
+                bytes: Vec::new(),
+                statements: 0,
+                parse_nanos: 0,
+                error: Some(fluree_graph_turtle::TurtleError::parse(0, e.to_string())),
+            }
+        }
+    };
+    let mut sink = DeterministicBlanks::new(writer, index);
+
+    let started = std::time::Instant::now();
+    let result = fluree_graph_turtle::parse_with_prefixes_base_options(
+        &doc,
+        &mut sink,
+        &[],
+        base,
+        ParserOptions::conformant(),
+    );
+    let parse_nanos = started.elapsed().as_nanos();
+
+    let mut writer = sink.into_inner();
+    let finish = GraphSink::finish(&mut writer);
+    let statements = writer.stats().statements;
+    let bytes = writer.into_inner();
+
+    ChunkBytes {
+        index,
+        bytes,
+        statements,
+        parse_nanos,
+        error: result
+            .err()
+            .or_else(|| finish.err().map(fluree_graph_turtle::TurtleError::Sink)),
+    }
 }
 
 /// Parse one chunk into its own collector, with its mints scoped to the chunk.

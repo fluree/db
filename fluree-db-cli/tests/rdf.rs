@@ -2595,3 +2595,202 @@ fn every_skip_is_located_in_the_original_document() {
         .stderr(predicate::str::contains("partly.ttl:3:"))
         .stderr(predicate::str::contains("partly.ttl:5:"));
 }
+
+// ============================================================================
+// the three-layered parallel differential
+// ============================================================================
+//
+// Cross-mode byte-identity is deliberately NOT one of these. The parallel path
+// assigns blank-node labels by a deterministic function of (label, chunk) so
+// that workers need no coordination, and that function does not produce the
+// same labels a single serial relabeller does. riot makes no cross-mode byte
+// promise either. What IS promised, and gated here:
+//
+//   (a) determinism  — same input, same K, byte-identical across runs
+//   (b) equivalence  — serial and parallel denote the same graph
+//   (c) adversarial  — user labels shaped like mint patterns do not collide
+
+/// A corpus with blank nodes of every kind, big enough to chunk.
+fn blank_heavy_corpus(statements: usize) -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    ttl.push_str("_:shared ex:role \"first\" .\n");
+    for i in 0..statements {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:has [ ex:tag \"anon {i}\" ] ; ex:note \"a literal wide enough to make the corpus chunk {i}\" .\n"
+        ));
+        if i % 500 == 0 {
+            ttl.push_str(&format!("_:lbl{i} ex:kind \"labelled {i}\" .\n"));
+        }
+    }
+    ttl.push_str("_:shared ex:role \"last\" .\n");
+    ttl
+}
+
+fn convert_at(tmp: &TempDir, input: &Path, threads: &str, out: &str) -> String {
+    let path = tmp.path().join(out);
+    rdf_cmd()
+        .args(["--parallelism", threads, "rdf", "convert"])
+        .arg(input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&path)
+        .assert()
+        .success();
+    std::fs::read_to_string(&path).unwrap()
+}
+
+#[test]
+fn a_parallel_run_is_byte_identical_to_itself() {
+    // (a) Determinism. Thread scheduling must not reach the output — the
+    // labels are a function of (label, chunk), and chunks concatenate in
+    // order, so nothing about timing can change a byte.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "blanks.ttl", &blank_heavy_corpus(30_000));
+
+    let first = convert_at(&tmp, &input, "8", "run1.nt");
+    assert!(first.contains("_:"), "fixture must exercise blank nodes");
+    for run in 2..=3 {
+        assert_eq!(
+            first,
+            convert_at(&tmp, &input, "8", &format!("run{run}.nt")),
+            "run {run} at the same parallelism produced different bytes"
+        );
+    }
+}
+
+#[test]
+fn serial_and_parallel_denote_the_same_graph() {
+    // (b) Equivalence, at three levels: isomorphism, blank-node identity
+    // count, and triple count. Byte equality is NOT claimed — the labels
+    // differ by design, and that is the trade that buys the scaling.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "blanks.ttl", &blank_heavy_corpus(2_000));
+
+    let serial = convert_at(&tmp, &input, "1", "serial.nt");
+    let parallel = convert_at(&tmp, &input, "8", "parallel.nt");
+
+    assert_eq!(
+        serial.lines().count(),
+        parallel.lines().count(),
+        "triple counts differ"
+    );
+
+    let distinct_blanks = |nt: &str| -> usize {
+        let mut set = std::collections::HashSet::new();
+        for line in nt.lines() {
+            for term in line.split_whitespace() {
+                if let Some(label) = term.strip_prefix("_:") {
+                    set.insert(label.to_string());
+                }
+            }
+        }
+        set.len()
+    };
+    assert_eq!(
+        distinct_blanks(&serial),
+        distinct_blanks(&parallel),
+        "the two modes disagree on how many distinct blank nodes exist — one \
+         of them merged or split something"
+    );
+
+    // And the shared labelled node is still ONE node in the parallel output.
+    let label_for = |nt: &str, role: &str| -> String {
+        nt.lines()
+            .find(|l| l.contains(role))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let first = label_for(&parallel, "\"first\"");
+    assert!(first.starts_with("_:"), "{first}");
+    assert_eq!(
+        first,
+        label_for(&parallel, "\"last\""),
+        "`_:shared` was split across chunks"
+    );
+}
+
+#[test]
+fn user_labels_shaped_like_mints_survive_the_parallel_scheme() {
+    // (c) The adversarial fixture, which is what caught what the plain
+    // differential missed. Every label here imitates a pattern the scheme
+    // itself produces: `u{L}` renames, `g{chunk}_{n}` mints, the `fdb-`
+    // carve-out, and the writers' own reserved namespace.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    let bait = [
+        "b1", "b2", "g0_1", "g1_1", "g7_3", "u1", "ug0_1", "ufdb-x", "fdbw-1", "c0_1",
+    ];
+    for label in bait {
+        ttl.push_str(&format!("_:{label} ex:bait \"{label}\" .\n"));
+    }
+    ttl.push_str(
+        &blank_heavy_corpus(2_000)
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    ttl.push('\n');
+    let input = fixture(&tmp, "bait.ttl", &ttl);
+
+    let serial = convert_at(&tmp, &input, "1", "s.nt");
+    let parallel = convert_at(&tmp, &input, "8", "p.nt");
+
+    let distinct_blanks = |nt: &str| -> usize {
+        let mut set = std::collections::HashSet::new();
+        for line in nt.lines() {
+            for term in line.split_whitespace() {
+                if let Some(label) = term.strip_prefix("_:") {
+                    set.insert(label.to_string());
+                }
+            }
+        }
+        set.len()
+    };
+    assert_eq!(
+        distinct_blanks(&serial),
+        distinct_blanks(&parallel),
+        "a bait label collided with a generated one"
+    );
+
+    // Every bait node kept its own identity: ten baits, ten distinct labels.
+    let bait_labels: std::collections::HashSet<&str> = parallel
+        .lines()
+        .filter(|l| l.contains("ex:bait") || l.contains("/bait"))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(
+        bait_labels.len(),
+        bait.len(),
+        "bait nodes merged: {} labels for {} nodes",
+        bait_labels.len(),
+        bait.len()
+    );
+}
+
+#[test]
+fn the_parallel_scheme_is_injective_over_its_three_label_classes() {
+    // The disjointness argument, mechanized. `u{L}` for user labels,
+    // `g{c}_{n}` for mints, `fdb-` verbatim: pairwise disjoint by first
+    // character, and injective within each class.
+    let renamed = |l: &str| {
+        if l.starts_with("fdb-") {
+            l.to_string()
+        } else {
+            format!("u{l}")
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    for label in ["b1", "g0_1", "u1", "ug0_1", "fdb-x", "fdbw-1", "", "u"] {
+        assert!(seen.insert(renamed(label)), "user label {label} collided");
+    }
+    for chunk in 0..4 {
+        for n in 1..4 {
+            assert!(
+                seen.insert(format!("g{chunk}_{n}")),
+                "mint g{chunk}_{n} collided with a renamed user label"
+            );
+        }
+    }
+}

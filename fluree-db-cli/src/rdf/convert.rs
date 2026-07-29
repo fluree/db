@@ -126,30 +126,22 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         );
     }
 
-    let options = rdf::verb_options(common.nocheck);
-    let run = match plan.workers {
-        Some(workers) => {
-            let config = ParallelConfig {
-                workers,
-                ..ParallelConfig::for_input(workers, loaded.text.len())
-            };
-            rdf::parse_into_parallel(
-                &loaded.text,
-                common.base.as_deref(),
-                writer,
-                config,
-                &mut timings,
-            )
-        }
-        None => rdf::parse_into(
-            &loaded.text,
-            loaded.resolved.syntax,
-            common.base.as_deref(),
-            writer,
-            options,
-            &mut timings,
-        ),
-    };
+    if let Some(workers) = plan.workers {
+        // Workers write their own bytes; see `parallel` for the label scheme
+        // that makes that sound without a shared relabeller.
+        return run_parallel(
+            common, args, &loaded, writer, &clock, target, &config, workers, quiet, timings,
+        );
+    }
+
+    let run = rdf::parse_into(
+        &loaded.text,
+        loaded.resolved.syntax,
+        common.base.as_deref(),
+        writer,
+        rdf::verb_options(common.nocheck),
+        &mut timings,
+    );
     let stats = run.sink.stats();
 
     // Flush before reporting anything, and through a handle that can return
@@ -218,6 +210,140 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         }
     }
     Ok(())
+}
+
+/// The parallel path: workers write bytes, the driver concatenates in order.
+#[allow(clippy::too_many_arguments)]
+fn run_parallel(
+    common: &RdfCommonArgs,
+    args: &ConvertArgs<'_>,
+    loaded: &rdf::Loaded,
+    writer: AnyWriter<destination::Out>,
+    clock: &crate::rdf::writer::WriteClock,
+    target: RdfSyntax,
+    writer_config: &WriterConfig,
+    workers: usize,
+    quiet: bool,
+    mut timings: PhaseTimings,
+) -> CliResult<()> {
+    // The destination was opened through a writer that the parallel path does
+    // not use — the workers each build their own. Take the sink back out.
+    let mut out = writer.into_inner();
+
+    let config = ParallelConfig {
+        workers,
+        ..ParallelConfig::for_input(workers, loaded.text.len())
+    };
+
+    timings.enter(Phase::Parse);
+    let outcome = crate::rdf::parallel::convert_parallel_bytes(
+        &loaded.text,
+        common.base.as_deref(),
+        &mut out,
+        target,
+        writer_config,
+        config,
+    );
+    timings.finish();
+    let outcome = outcome?;
+
+    timings.enter(Phase::Write);
+    let flushed = out.flush();
+    timings.finish();
+
+    let wall = timings.wall();
+    timings.set(
+        Phase::Write,
+        clock.elapsed() + timings.elapsed(Phase::Write),
+    );
+    timings.set(
+        Phase::Workers,
+        Duration::from_nanos(outcome.worker_parse_nanos as u64),
+    );
+    timings.set(
+        Phase::Reassembly,
+        Duration::from_nanos(outcome.reassembly_wait_nanos as u64),
+    );
+
+    if flushed
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+    {
+        return Ok(());
+    }
+    flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+
+    if let Some(err) = &outcome.error {
+        let d = diagnostic::from_turtle_error(err, &loaded.text);
+        eprintln!(
+            "{} {}: {}",
+            "error:".red().bold(),
+            loaded.input.display(),
+            d.message
+        );
+        eprintln!(
+            "  wrote {} statement(s) before the document stopped parsing — the output is a \
+             prefix of the conversion, not the whole of it",
+            outcome.statements
+        );
+        return Err(exit_document_invalid());
+    }
+
+    if let Some(format) = common.profile {
+        let empty = rdf::ParseOutcome {
+            counts: fluree_graph_ir::SinkCounts {
+                triples: outcome.statements,
+                ..fluree_graph_ir::SinkCounts::default()
+            },
+            sink: unresolved_sink_timing(),
+            error: None,
+        };
+        emit_profile(
+            common,
+            loaded,
+            &empty,
+            &timings,
+            wall,
+            format,
+            ParallelPlan {
+                workers: Some(workers),
+                reason: "parallel",
+            },
+        )?;
+    } else if common.time {
+        rdf::count::print_timing(wall, outcome.statements, loaded.text.len() as u64);
+    }
+
+    if !quiet && common.profile != Some(crate::rdf::profile::ProfileFormat::Json) {
+        if let Some(path) = args.output {
+            eprintln!(
+                "{} {} statements → {} ({target}, {workers} workers, {} chunks)",
+                "✓".green(),
+                outcome.statements,
+                path.display(),
+                outcome.chunks,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The parallel path has no single sink to sample, so it reports no sink
+/// estimate rather than a fabricated one — each worker has its own writer and
+/// there is no one instrument that saw them all.
+fn unresolved_sink_timing() -> fluree_graph_ir::SinkTiming {
+    fluree_graph_ir::SinkTiming {
+        body: None,
+        finish: Duration::ZERO,
+        artifact: Duration::ZERO,
+        calls: 0,
+        sampled_calls: 0,
+        sampled_statements: 0,
+        clock_reads: 0,
+        clock_pair: Duration::ZERO,
+        relative_std_error: None,
+    }
 }
 
 /// The `--continue-on-error` path: parse with resync, report every skip, and
