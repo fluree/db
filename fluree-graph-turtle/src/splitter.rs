@@ -294,6 +294,36 @@ struct Lookahead {
     pending_cr: bool,
 }
 
+/// Find the first statement boundary at or after `from`.
+///
+/// The resync primitive for `--continue-on-error`: a parse fails somewhere,
+/// and the driver needs the next point at which a fresh parse can start on a
+/// statement rather than in the middle of one. Returns the byte offset just
+/// past the terminator, or `None` when the rest of the document contains no
+/// complete statement.
+///
+/// Scanning starts at `from` rather than at zero, so a `.` inside a string
+/// that OPENED before `from` will be miscounted as a terminator. That is
+/// unavoidable without rescanning the document from the start on every error,
+/// and it is safe in the direction that matters: the worst case is resuming
+/// mid-statement, which fails again and resyncs again, rather than swallowing
+/// input. Resync always advances, so a document with many errors terminates.
+pub fn next_statement_boundary(text: &str, from: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let from = from.min(bytes.len());
+    let mut scanner = BoundaryScanner::new();
+    for (offset, &b) in bytes.iter().enumerate().skip(from) {
+        // A mid-file directive is not an error during resync — the caller is
+        // already recovering, and refusing here would abort the recovery.
+        match scanner.feed(b, offset as u64) {
+            Ok(Some(boundary)) => return Some(boundary as usize),
+            Ok(None) => {}
+            Err(_) => {}
+        }
+    }
+    scanner.finish().map(|b| (b as usize).min(text.len()))
+}
+
 /// Split an in-memory Turtle document into independently-parseable pieces.
 ///
 /// Returns `(prefix_block, chunk_ranges)`. Each range is a byte range into
@@ -2522,6 +2552,50 @@ ex:carol ex:name \"Carol\" .\n";
         let (prefix, ranges) = chunk_in_memory(&ttl, 100).expect("splits");
         assert_eq!(ranges.len(), 1, "one statement is one chunk");
         crate::parse_to_json(&format!("{prefix}{}", &ttl[ranges[0].clone()])).unwrap();
+    }
+
+    #[test]
+    fn next_statement_boundary_finds_the_resume_point() {
+        let ttl = "@prefix ex: <http://e/> .\nex:a ex:p \"1\" .\nex:b ex:p \"2\" .\n";
+
+        // From the very start: the end of the directive.
+        let first = next_statement_boundary(ttl, 0).unwrap();
+        assert_eq!(&ttl[..first], "@prefix ex: <http://e/> .");
+
+        // From inside the second statement: the end of it, not of the third.
+        let inside = ttl.find("ex:a").unwrap() + 2;
+        let next = next_statement_boundary(ttl, inside).unwrap();
+        assert!(ttl[..next].ends_with("\"1\" ."), "{:?}", &ttl[..next]);
+
+        // Past every terminator: nothing left to resume at.
+        assert_eq!(next_statement_boundary(ttl, ttl.len()), None);
+    }
+
+    #[test]
+    fn next_statement_boundary_always_advances() {
+        // The property that makes a resync loop terminate: the answer is
+        // strictly greater than where the scan began.
+        let ttl = "ex:a ex:p \"1\" . ex:b ex:p \"2\" . ex:c ex:p \"3\" .";
+        let mut at = 0usize;
+        let mut steps = 0;
+        while let Some(next) = next_statement_boundary(ttl, at) {
+            assert!(next > at, "resync did not advance: {at} -> {next}");
+            at = next;
+            steps += 1;
+            assert!(steps < 10, "resync looped");
+        }
+        assert_eq!(steps, 3, "three statements, three boundaries");
+    }
+
+    #[test]
+    fn next_statement_boundary_ignores_a_dot_inside_a_literal() {
+        let ttl = "ex:a ex:p \"one. two. three\" .\nex:b ex:p \"x\" .\n";
+        let first = next_statement_boundary(ttl, 0).unwrap();
+        assert!(
+            ttl[..first].ends_with("three\" ."),
+            "resumed inside a literal: {:?}",
+            &ttl[..first]
+        );
     }
 
     #[test]

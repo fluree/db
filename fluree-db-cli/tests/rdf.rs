@@ -2457,3 +2457,141 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
         "unattributed {unattributed} > wall {wall}"
     );
 }
+
+// ============================================================================
+// --continue-on-error
+// ============================================================================
+
+const PARTLY_BROKEN: &str = "@prefix ex: <http://example.org/> .\n\
+                             ex:a ex:p \"1\" .\n\
+                             ex:b ex:p ?? .\n\
+                             ex:c ex:p \"3\" .\n\
+                             ex:d ex:p ?? .\n\
+                             ex:e ex:p \"5\" .\n";
+
+#[test]
+fn continue_on_error_keeps_the_good_statements_and_exits_1() {
+    // riot semantics: skipping is not success. A script must not be able to
+    // read a partial conversion as a whole one, so the exit code says so even
+    // though output was produced.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
+
+    let out = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("2 statement(s) skipped"))
+        .stderr(predicate::str::contains("skipped:"))
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(text.lines().count(), 3, "the three good statements: {text}");
+    for good in ["\"1\"", "\"3\"", "\"5\""] {
+        assert!(text.contains(good), "lost a good statement {good}: {text}");
+    }
+    assert!(
+        !text.contains("ex:b"),
+        "a skipped statement reached the output"
+    );
+}
+
+#[test]
+fn without_the_flag_the_first_error_still_stops_the_run() {
+    // The default must not change: a converter that quietly drops input is
+    // worse than one that refuses.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
+
+    let out = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains("prefix of the conversion"))
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().lines().count(),
+        1,
+        "the default stops at the first bad statement"
+    );
+}
+
+#[test]
+fn a_clean_document_under_continue_on_error_exits_0() {
+    // The flag must not turn a good document into a failure.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "clean.ttl", VALID_TURTLE);
+    let out = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("skipped").not())
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        String::from_utf8(out).unwrap().lines().count(),
+        VALID_TURTLE_TRIPLES as usize
+    );
+}
+
+#[test]
+fn a_skipped_statement_leaves_no_fragment_behind() {
+    // The parser emits during descent, so a statement with several
+    // predicate-object pairs has written part of itself before the failure is
+    // known. "Skipped" has to mean nothing of it survives.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(
+        &tmp,
+        "fragments.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:good ex:p \"keep\" .\n\
+         ex:bad ex:p \"fragment one\" ; ex:q \"fragment two\" ; ex:r ?? .\n\
+         ex:after ex:p \"keep too\" .\n",
+    );
+
+    let out = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("keep"), "{text}");
+    assert!(text.contains("keep too"), "{text}");
+    assert!(
+        !text.contains("fragment"),
+        "a rolled-back statement left its first triples in the output:\n{text}"
+    );
+}
+
+#[test]
+fn every_skip_is_located_in_the_original_document() {
+    // Diagnostics are positioned against the whole file, not the fragment the
+    // resumed parse saw — a user counting lines is counting the file's.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "partly.ttl", PARTLY_BROKEN);
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        // The two bad statements are on lines 3 and 5 of the file.
+        .stderr(predicate::str::contains("partly.ttl:3:"))
+        .stderr(predicate::str::contains("partly.ttl:5:"));
+}

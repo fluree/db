@@ -99,6 +99,8 @@ $ fluree rdf convert dump.ttl
 | `-o, --output <FILE>` | Write to a file instead of stdout |
 | `--bnode-policy <POLICY>` | `relabel` (default) or `preserve` |
 | `--prefixes <JSON\|PATH>` | Prefixes for compaction — inline JSON or a file. Namespaces must be absolute IRIs |
+| `--continue-on-error` | Skip unparseable statements; report each and exit 1 |
+| `--parallelism <N>` | Parse threads (global flag). `1` is the serial path exactly |
 | `--pretty` | Buffered, regrouped Turtle. **Not implemented** |
 | `--syntax <SYNTAX>` | Input syntax, overriding extension and sniffing |
 | `--base <IRI>` | Base IRI for resolving relative references |
@@ -226,10 +228,34 @@ error: broken.ttl:3:16: unexpected character '?'
 The same applies to a blank-node collision under `--bnode-policy preserve`:
 the refusal arrives mid-parse, so `-o` is already partial when it does.
 
-`--continue-on-error`, which would skip the bad statement and carry on, needs
-statement-scoped output buffering to be correct (a Turtle statement emits
-triples during descent, before its terminating `.` proves it well-formed). The
-writers support that buffering; wiring it to a flag is the next piece of work.
+### `--continue-on-error`
+
+Skip the statements that do not parse and keep the rest:
+
+```console
+$ fluree rdf convert partly-broken.ttl --to nt --continue-on-error > out.nt
+skipped: partly-broken.ttl:3:11: unexpected character '?'
+skipped: partly-broken.ttl:5:11: unexpected character '?'
+warning: 2 statement(s) skipped, 3 written → stdout
+```
+
+**It still exits 1.** Skipping is not success — riot's rule, and the one thing
+a script must not do is read a partial conversion as a whole one. A clean
+document under the flag exits 0 and says nothing.
+
+A skipped statement contributes **nothing**, not even the part of itself that
+had already been written. Turtle emits during descent, so
+`ex:bad ex:p "one" ; ex:q "two" ; ex:r ??` has two triples in flight before the
+failure is known; the flag turns on statement buffering so the rollback is
+real. Each skip is reported with its position in the original file.
+
+Recovery is serial: resync needs to see the document as one sequence of
+statements, so `--continue-on-error` and `--parallelism` do not combine — the
+former wins, and `--profile` reports why.
+
+The recovery point is the next statement boundary after the error. A directive
+that gets skipped over as part of a bad statement is therefore lost, and the
+statements needing it fail in turn — each reported, none silent.
 
 ## Compressed output
 

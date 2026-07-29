@@ -2884,6 +2884,12 @@ pub enum RdfAction {
         #[arg(long, value_enum, default_value_t = BnodePolicyArg::Relabel)]
         bnode_policy: BnodePolicyArg,
 
+        /// Skip statements that do not parse instead of stopping at the
+        /// first one. Every skip is reported, and the run exits 1 so a
+        /// partial conversion cannot be mistaken for a clean one.
+        #[arg(long)]
+        continue_on_error: bool,
+
         /// Prefixes for compaction, as inline JSON or a path to a JSON file.
         /// A JSON-LD `@context` document works unchanged. Turtle and TriG
         /// compact IRIs with these and declare them; JSON-LD uses them as its

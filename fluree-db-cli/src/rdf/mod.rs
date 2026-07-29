@@ -18,6 +18,7 @@ pub mod diagnostic;
 pub mod input;
 pub mod parallel;
 pub mod profile;
+pub mod recover;
 pub mod syntax;
 pub mod writer;
 
@@ -49,6 +50,7 @@ pub fn run(action: &RdfAction, quiet: bool, parallelism: usize) -> CliResult<()>
             pretty,
             bnode_policy,
             prefixes,
+            continue_on_error,
         } => convert::run(
             common,
             &convert::ConvertArgs {
@@ -58,6 +60,7 @@ pub fn run(action: &RdfAction, quiet: bool, parallelism: usize) -> CliResult<()>
                 bnode_policy: *bnode_policy,
                 prefixes: prefixes.as_deref(),
                 parallelism,
+                continue_on_error: *continue_on_error,
             },
             quiet,
         ),

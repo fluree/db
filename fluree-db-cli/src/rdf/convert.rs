@@ -24,7 +24,7 @@ use crate::rdf::writer::{is_writable, AnyWriter};
 use crate::rdf::{self, destination, diagnostic, exit_document_invalid};
 use colored::Colorize;
 use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig, WriterStats};
-use fluree_graph_ir::{Phase, PhaseTimings, SinkError};
+use fluree_graph_ir::{GraphSink, Phase, PhaseTimings, SinkError};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -52,6 +52,8 @@ pub struct ConvertArgs<'a> {
     /// Parse threads. `0` means "as many as this host has"; `1` is the serial
     /// path exactly, so the flag is never a correctness decision.
     pub parallelism: usize,
+    /// Skip statements that do not parse rather than stopping at the first.
+    pub continue_on_error: bool,
 }
 
 /// Run `fluree rdf convert`.
@@ -96,7 +98,12 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
 
     let config = WriterConfig::new()
         .with_blank_labels(BlankNodeLabels::from(args.bnode_policy))
-        .with_prefixes(prefixes.clone());
+        .with_prefixes(prefixes.clone())
+        // Recovery needs `abort_statement` to be a true rollback: the parser
+        // emits during descent, so a bad statement has usually written part of
+        // itself by the time it is rejected. Without buffering, "skipped"
+        // would still leave fragments in the output.
+        .with_statement_buffering(args.continue_on_error);
 
     let destination::Destination { out, clock } = destination::open(args.output, target)?;
     let writer = AnyWriter::new(target, out, &config, &prefixes)?;
@@ -104,7 +111,21 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     // Parallel where it is byte-identical to serial, serial otherwise. The
     // decision is reported under --profile rather than left implicit, because
     // "why is this not using my cores" is otherwise unanswerable from outside.
-    let plan = ParallelPlan::decide(args.parallelism, target, loaded.text.len());
+    //
+    // Recovery is serial: resync needs to see the document as one sequence of
+    // statements, and a chunk boundary is not a place a skipped statement can
+    // be reasoned about.
+    let plan = if args.continue_on_error {
+        ParallelPlan::serial("--continue-on-error resyncs over the whole document")
+    } else {
+        ParallelPlan::decide(args.parallelism, target, loaded.text.len())
+    };
+    if args.continue_on_error {
+        return run_recovering(
+            common, args, &loaded, writer, &clock, target, quiet, timings,
+        );
+    }
+
     let options = rdf::verb_options(common.nocheck);
     let run = match plan.workers {
         Some(workers) => {
@@ -199,6 +220,102 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     Ok(())
 }
 
+/// The `--continue-on-error` path: parse with resync, report every skip, and
+/// exit 1 if anything was skipped.
+///
+/// Serial by construction and separate from the main driver because almost
+/// every step differs — the parse loop, the exit code, and what "success"
+/// means. Folding it into `run` with three `if recovering` branches would make
+/// both harder to read than either is apart.
+#[allow(clippy::too_many_arguments)]
+fn run_recovering(
+    common: &RdfCommonArgs,
+    args: &ConvertArgs<'_>,
+    loaded: &rdf::Loaded,
+    writer: AnyWriter<destination::Out>,
+    clock: &crate::rdf::writer::WriteClock,
+    target: RdfSyntax,
+    quiet: bool,
+    mut timings: PhaseTimings,
+) -> CliResult<()> {
+    let mut sink = crate::rdf::recover::PrefixRecorder::new(writer);
+
+    timings.enter(Phase::Parse);
+    let recovery =
+        crate::rdf::recover::parse_recovering(&loaded.text, common.base.as_deref(), &mut sink);
+    timings.finish();
+    let recovery = recovery?;
+
+    let mut writer = sink.into_inner();
+    let finished = GraphSink::finish(&mut writer);
+    let stats = writer.stats();
+    let mut out = writer.into_inner();
+
+    timings.enter(Phase::Write);
+    let flushed = out.flush();
+    timings.finish();
+
+    let wall = timings.wall();
+    timings.set(
+        Phase::Write,
+        clock.elapsed() + timings.elapsed(Phase::Write),
+    );
+
+    if flushed
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+        || finished
+            .as_ref()
+            .err()
+            .is_some_and(SinkError::is_broken_pipe)
+    {
+        return Ok(());
+    }
+    flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+    finished.map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
+
+    // Every skip, in document order, before the summary.
+    for d in &recovery.skipped {
+        let where_ = match (d.line, d.column) {
+            (Some(line), Some(column)) => format!("{}:{line}:{column}", loaded.input.display()),
+            _ => loaded.input.display(),
+        };
+        eprintln!("{} {where_}: {}", "skipped:".yellow().bold(), d.message);
+    }
+
+    if common.time {
+        rdf::count::print_timing(wall, stats.statements, loaded.text.len() as u64);
+    }
+
+    if recovery.is_clean() {
+        if !quiet {
+            if let Some(path) = args.output {
+                eprintln!(
+                    "{} {} statements → {} ({target})",
+                    "✓".green(),
+                    stats.statements,
+                    path.display(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // riot semantics: skipping is not success. The summary goes to stderr even
+    // under --quiet, because the one thing a script must not do is read a
+    // partial conversion as a whole one.
+    eprintln!(
+        "{} {} statement(s) skipped, {} written → {}",
+        "warning:".yellow().bold(),
+        recovery.skipped.len(),
+        stats.statements,
+        args.output
+            .map_or_else(|| "stdout".to_string(), |p| p.display().to_string()),
+    );
+    Err(exit_document_invalid())
+}
+
 /// Whether this conversion runs across threads, and why not when it does not.
 ///
 /// Reported rather than silent: a user who passed `--parallelism 8` and got
@@ -215,6 +332,14 @@ impl ParallelPlan {
     /// Below this, threads cost more than they save — the whole document
     /// parses in less time than it takes to start a pool.
     const MIN_PARALLEL_BYTES: usize = 4 * 1024 * 1024;
+
+    /// The serial path, for a named reason.
+    pub fn serial(reason: &'static str) -> Self {
+        Self {
+            workers: None,
+            reason,
+        }
+    }
 
     /// Decide, from the flag, the output syntax and the input size.
     pub fn decide(parallelism: usize, target: RdfSyntax, input_len: usize) -> Self {
