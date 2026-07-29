@@ -17,12 +17,19 @@ use std::cell::OnceCell;
 ///
 /// # Line and column semantics
 ///
-/// - Lines are delimited by `\n` and numbered from 1. A `\r` immediately
-///   before the newline belongs to the terminator and is not part of the
-///   line's text, matching [`str::lines`].
+/// - Lines are delimited by `\n` and numbered from 1. A trailing `\r` is
+///   stripped from a line's text **unconditionally**, which is a deliberate
+///   deviation from [`str::lines`]: that strips `\r` only from a line that
+///   was `\n`-terminated, so a final unterminated line ending in `\r` keeps
+///   it. Here it never survives, because a raw carriage return inside
+///   [`Self::caret_block`] would return the cursor to column 0 and shred the
+///   rendered diagnostic. The two agree on every other input.
 /// - Columns are 1-based **character** counts, not byte offsets — the same
 ///   convention the Turtle lexer's caret diagnostics already use, and the
-///   one that makes a caret line up under the character it blames.
+///   one that makes a caret line up under the character it blames. An offset
+///   landing *inside* a multi-byte character resolves to the column
+///   following that character rather than panicking, preserving what the
+///   lexer's own algorithm did before it shared this one.
 /// - An offset past the end of the input resolves to the end, rather than
 ///   panicking: an "unexpected end of input" error points there routinely.
 ///
@@ -63,9 +70,14 @@ impl<'a> LineIndex<'a> {
 
     /// Resolve a byte offset to a 1-based (line, column) pair.
     ///
-    /// Offsets past the end of the input clamp to the end. An offset that
-    /// falls inside a multi-byte character resolves to that character's
-    /// column rather than panicking.
+    /// Offsets past the end of the input clamp to the end.
+    ///
+    /// The column counts every character that *starts* before the offset, so
+    /// an offset landing inside a multi-byte character resolves to the column
+    /// following it rather than to that character's own column — and, more to
+    /// the point, rather than panicking on a non-boundary slice. Producers
+    /// report character-boundary offsets, so this only governs the malformed
+    /// case; it matches what the lexer computed before it shared this code.
     pub fn line_col(&self, offset: usize) -> (u32, u32) {
         let offset = offset.min(self.source.len());
         let starts = self.starts();
@@ -86,6 +98,12 @@ impl<'a> LineIndex<'a> {
     ///
     /// Returns `""` for line 0 or for a line past the end — including the
     /// empty final line a source ending in `\n` has.
+    ///
+    /// A trailing `\r` is always removed, even on a final line that no `\n`
+    /// terminates — where [`str::lines`] would keep it. This text is rendered
+    /// into [`Self::caret_block`], and a carriage return there would move the
+    /// cursor back over the gutter and corrupt the diagnostic, so render
+    /// safety wins over exact `lines()` parity in that one case.
     pub fn line_text(&self, line: u32) -> &'a str {
         let starts = self.starts();
         let Some(index) = (line as usize).checked_sub(1) else {
@@ -126,10 +144,17 @@ impl<'a> LineIndex<'a> {
     /// that shape: both the Turtle lexer's own error messages and
     /// [`Diagnostic::render`](crate::Diagnostic::render) go through it, which
     /// is what keeps the two renderings from drifting.
+    ///
+    /// The blank gutter is padded to the width of the line number, so the
+    /// three `|` columns line up at any line number. A fixed two-space gutter
+    /// — which is what this rendering used while it lived inline in the lexer
+    /// — silently skews the caret one cell left from line 10 on, and further
+    /// with each digit.
     pub fn caret_block(&self, line: u32, col: u32) -> String {
         let text = self.line_text(line);
+        let gutter = " ".repeat(line.to_string().len());
         let pointer = " ".repeat(col.saturating_sub(1) as usize);
-        format!("  |\n{line} | {text}\n  | {pointer}^")
+        format!("{gutter} |\n{line} | {text}\n{gutter} | {pointer}^")
     }
 
     /// The line-start table, building it on first use.
@@ -173,6 +198,22 @@ mod tests {
         (line, col)
     }
 
+    /// What [`str::lines`] yields for a line, adjusted for the ONE documented
+    /// deviation: `lines()` strips a trailing `\r` only from a line that was
+    /// `\n`-terminated, while `line_text` strips it always, so a final
+    /// unterminated line ending in `\r` differs. Encoding the carve-out here
+    /// — rather than dropping `lines()` as the oracle — keeps every other
+    /// input genuinely checked against std.
+    fn expected_line_text(source: &str, line: usize) -> &str {
+        let raw = source.lines().nth(line - 1).unwrap_or("");
+        let is_unterminated_last = !source.ends_with('\n') && line == source.lines().count();
+        if is_unterminated_last {
+            raw.strip_suffix('\r').unwrap_or(raw)
+        } else {
+            raw
+        }
+    }
+
     fn assert_matches_legacy(source: &str) {
         let index = LineIndex::new(source);
         for offset in 0..=source.len() {
@@ -185,7 +226,7 @@ mod tests {
             );
             assert_eq!(
                 index.line_text(line),
-                source.lines().nth(line as usize - 1).unwrap_or(""),
+                expected_line_text(source, line as usize),
                 "line {line} text of {source:?}"
             );
         }
@@ -248,10 +289,38 @@ mod tests {
     }
 
     #[test]
-    fn an_offset_inside_a_character_resolves_to_that_character() {
-        // Slicing at byte 2 would panic; the index must not.
+    fn an_offset_inside_a_character_resolves_to_the_following_column() {
+        // Slicing at a non-boundary byte would panic; the index must not.
+        // 'é' occupies column 1 and spans bytes 0..2, and byte 1 is inside
+        // it — the answer is column 2, the column AFTER it, not column 1.
+        // Counting characters that start before the offset is what produces
+        // that, and it is what the lexer's own algorithm did.
         let index = LineIndex::new("é");
-        assert_eq!(index.line_col(1), (1, 2));
+        assert_eq!(index.line_col(0), (1, 1), "the character's own column");
+        assert_eq!(index.line_col(1), (1, 2), "inside it — the column after");
+        assert_matches_legacy("é");
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_stripped_where_str_lines_keeps_it() {
+        // The one documented deviation from `str::lines`, deliberate: this
+        // text is rendered into the caret block, and a raw CR there would
+        // return the cursor over the gutter and corrupt the diagnostic.
+        assert_eq!(
+            "a\r".lines().next(),
+            Some("a\r"),
+            "std keeps it on an unterminated final line"
+        );
+        assert_eq!(LineIndex::new("a\r").line_text(1), "a", "we do not");
+        assert_eq!(LineIndex::new("\r").line_text(1), "");
+        assert!(!LineIndex::new("a\r").caret_block(1, 1).contains('\r'));
+
+        // Everywhere else the two still agree, including a CRLF line and a
+        // doubled CR, which the oracle checks at every offset.
+        assert_matches_legacy("a\r");
+        assert_matches_legacy("\r");
+        assert_matches_legacy("a\r\r\n");
+        assert_matches_legacy("a\rb\n");
     }
 
     #[test]
@@ -287,6 +356,34 @@ mod tests {
         let (line, col) = index.line_col(5);
         assert_eq!((line, col), (2, 2));
         assert_eq!(index.caret_block(line, col), "  |\n2 | two\n  |  ^");
+    }
+
+    #[test]
+    fn the_caret_gutter_widens_with_the_line_number() {
+        // A fixed two-space gutter skews the caret one cell left from line 10
+        // on. The three `|` must land in the same column on all three lines.
+        let source = "\n".repeat(11) + "abcdef";
+        let index = LineIndex::new(&source);
+        let block = index.caret_block(12, 3);
+        assert_eq!(block, "   |\n12 | abcdef\n   |   ^");
+
+        for (line, col) in [(1, 1), (9, 4), (10, 4), (100, 2), (1000, 1)] {
+            let block = index.caret_block(line, col);
+            let bars: Vec<usize> = block
+                .lines()
+                .map(|l| l.find('|').expect("every gutter line has a bar"))
+                .collect();
+            assert_eq!(
+                bars[0], bars[1],
+                "line {line}: blank gutter and number gutter disagree in {block:?}"
+            );
+            assert_eq!(bars[1], bars[2], "line {line}: caret gutter drifted");
+
+            // And the caret sits `col - 1` cells past the text's first column.
+            let text_start = bars[1] + 2;
+            let caret = block.lines().nth(2).unwrap().find('^').unwrap();
+            assert_eq!(caret, text_start + col as usize - 1, "line {line}");
+        }
     }
 
     #[test]

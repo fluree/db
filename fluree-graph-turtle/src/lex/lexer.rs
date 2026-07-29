@@ -1420,6 +1420,33 @@ mod caret_pin_tests {
         }
     }
 
+    /// The gutter widens with the line number, so the three `|` stay in one
+    /// column past line 9. This is the one place the caret rendering
+    /// deliberately differs from what the lexer emitted before it shared
+    /// `LineIndex::caret_block`: the old fixed two-space gutter put the bar
+    /// (and the caret) one cell left of the source text from line 10 on.
+    /// Single-digit lines — every other case pinned above — are byte-identical.
+    #[test]
+    fn the_gutter_widens_past_line_nine() {
+        let mut source = "<http://ex/s> <http://ex/p> \"ok\" .\n".repeat(11);
+        source.push_str("ex:other $ .");
+        let err = tokenize(&source).expect_err("input must not lex");
+        let TurtleError::Lexer { message, .. } = &err else {
+            panic!("expected a lexer error, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "unexpected character '$' at line 12, column 10\n   |\n12 | ex:other $ .\n   |          ^"
+        );
+
+        let (_, block) = message.split_once('\n').expect("headline then block");
+        let bars: Vec<usize> = block
+            .lines()
+            .map(|l| l.find('|').expect("gutter bar"))
+            .collect();
+        assert_eq!(bars, vec![3, 3, 3], "all three bars share a column");
+    }
+
     /// A non-ASCII, non-name character keeps its escaped spelling and its
     /// code point — and the caret still counts CHARACTERS, so it lands under
     /// the offending glyph rather than drifting right by its extra bytes.
@@ -1436,5 +1463,46 @@ mod caret_pin_tests {
             message,
             "unexpected character '\\u{a7}' (U+00A7) at line 1, column 14\n  |\n1 | ex:a \"héllö\" § .\n  |              ^"
         );
+    }
+}
+
+#[cfg(test)]
+mod mint_namespace_tests {
+    use super::*;
+
+    /// `GraphCollectorSink`/`TermTable` mint anonymous blank nodes as
+    /// `-b{N}`, and the disjointness argument for that prefix is that the
+    /// grammar cannot lex it. This asserts that argument against the real
+    /// lexer instead of asserting it in a comment — the comment was wrong
+    /// once already, claiming the label "still serializes".
+    ///
+    /// The consequence is the writers' contract: a minted anonymous label
+    /// CANNOT be passed through to output the way a user-written label can.
+    /// Round-tripping one produces a document this parser rejects, so a
+    /// writer must relabel every anonymous mint.
+    #[test]
+    fn minted_anonymous_labels_are_deliberately_unlexable() {
+        for position in [
+            "_:-b1 <http://ex/p> <http://ex/o> .",
+            "<http://ex/s> <http://ex/p> _:-b1 .",
+        ] {
+            let err = tokenize(position)
+                .expect_err("a leading '-' must not lex — that is what buys disjointness");
+            assert!(
+                matches!(err, TurtleError::Lexer { .. }),
+                "{position}: {err:?}"
+            );
+        }
+
+        // A MEDIAL '-' is legal, which is the distinction the old comment
+        // blurred: it is why `_:b-1` is fine and `_:-b1` is not.
+        assert!(
+            tokenize("_:b-1 <http://ex/p> <http://ex/o> .").is_ok(),
+            "a medial '-' is legal in BLANK_NODE_LABEL"
+        );
+
+        // And the collision the prefix exists to prevent is real: a bare
+        // `b1` mint is indistinguishable from a document's own `_:b1`.
+        assert!(tokenize("_:b1 <http://ex/p> <http://ex/o> .").is_ok());
     }
 }

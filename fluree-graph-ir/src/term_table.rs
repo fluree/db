@@ -86,13 +86,22 @@ impl TermTable {
                 // reifiers) — unique counter-based label. The leading '-'
                 // keeps the minted namespace disjoint from every
                 // user-written label: Turtle's BLANK_NODE_LABEL must start
-                // with PN_CHARS_U | [0-9], so `_:-b1` can never lex, while
-                // '-' stays legal medially so the label still serializes.
+                // with PN_CHARS_U | [0-9], so `_:-b1` can never lex.
                 //
-                // Without it a document's own `_:b1` and the first mint are
-                // the same `BlankId` and their nodes silently MERGE. Matches
-                // `FlakeSink`/`ImportSink`, which carry the same fix for the
-                // same reason.
+                // Which means the mint is deliberately NOT serializable.
+                // Disjointness here is bought with illegality: `_:-b1`
+                // written out is input this repo's own lexer rejects
+                // (verified — a MEDIAL '-' like `_:b-1` is legal, but a
+                // leading one is not, and these labels lead with it). So a
+                // writer MUST relabel every anonymous mint on its way out; it
+                // cannot pass one through the way it passes a user-written
+                // label through. That is the writers' contract, not a
+                // property of this table.
+                //
+                // Without the prefix a document's own `_:b1` and the first
+                // mint are the same `BlankId` and their nodes silently MERGE.
+                // Matches `FlakeSink`/`ImportSink`, which carry the same fix
+                // for the same reason.
                 self.blank_counter += 1;
                 let label = format!("-b{}", self.blank_counter);
                 self.add_term(Term::blank(label))
