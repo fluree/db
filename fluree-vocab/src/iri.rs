@@ -217,9 +217,223 @@ fn remove_dot_segments(path: &str) -> String {
     }
 }
 
+/// Why a string is not usable as an RDF IRI term.
+///
+/// Indices are byte offsets into the *checked* string — which, for a Turtle
+/// IRI, is the value after `\uXXXX` expansion and base resolution, not the
+/// source text. They locate the character within the IRI for a human-readable
+/// message; they do NOT map back to a source offset, because escape expansion
+/// and resolution both change the length. A caller reporting a position should
+/// use the IRI token's own start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IriViolation {
+    /// A character the IRI grammar excludes appears in the IRI.
+    ForbiddenChar {
+        /// Byte offset of the character within the checked IRI.
+        index: usize,
+        /// The offending character.
+        ch: char,
+    },
+    /// The IRI has no scheme, so it is a relative reference rather than an
+    /// IRI. RDF terms are absolute IRIs; a relative one denotes nothing on
+    /// its own.
+    NotAbsolute,
+}
+
+impl std::fmt::Display for IriViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IriViolation::ForbiddenChar { index, ch } => write!(
+                f,
+                "IRI contains {} at position {index}, which is not allowed in an IRI",
+                describe_char(*ch)
+            ),
+            IriViolation::NotAbsolute => {
+                f.write_str("IRI is relative — an RDF term must be an absolute IRI with a scheme")
+            }
+        }
+    }
+}
+
+/// Spell a character so the message is readable when it is invisible.
+fn describe_char(ch: char) -> String {
+    match ch {
+        ' ' => "a space".to_string(),
+        '\t' => "a tab".to_string(),
+        '\n' => "a newline".to_string(),
+        '\r' => "a carriage return".to_string(),
+        c if (c as u32) < 0x20 => format!("the control character U+{:04X}", c as u32),
+        c => format!("'{c}' (U+{:04X})", c as u32),
+    }
+}
+
+/// Is this character excluded from an IRI?
+///
+/// The set is the one the Turtle / N-Triples `IRIREF` production excludes:
+/// `[^#x00-#x20<>"{}|^`\]`. Deliberately exactly that set and no more —
+/// over-rejection is the standing hazard for a conformance parser, and the
+/// grammar is the thing the W3C suites actually test. Notably U+007F is NOT
+/// excluded here, because the production does not exclude it.
+#[inline]
+#[must_use]
+pub const fn is_forbidden_iri_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{0}'..='\u{20}' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\'
+    )
+}
+
+/// Check a **resolved** IRI for use as an RDF term.
+///
+/// Turtle's `IRIREF` production already excludes the forbidden characters
+/// from the *source* text, so a raw `<http://ex/a b>` never lexes. What it
+/// does not constrain is what a `\uXXXX` escape expands to, nor what base
+/// resolution produces — and RDF requires the *result* to be an IRI. That is
+/// exactly the `turtle-eval-bad-01/02/03` class: the document lexes, and the
+/// term it denotes is not an IRI.
+///
+/// So this runs on the final string, after expansion and resolution. It is a
+/// scan with no allocation on the passing path.
+///
+/// # Example
+///
+/// ```
+/// use fluree_vocab::iri::{iri_violation, IriViolation};
+///
+/// assert_eq!(iri_violation("http://example.org/ok"), None);
+///
+/// // What `<http://example.org/\u0020>` expands to.
+/// assert!(matches!(
+///     iri_violation("http://example.org/ "),
+///     Some(IriViolation::ForbiddenChar { ch: ' ', .. })
+/// ));
+///
+/// assert_eq!(iri_violation("not-absolute"), Some(IriViolation::NotAbsolute));
+/// ```
+#[must_use]
+pub fn iri_violation(iri: &str) -> Option<IriViolation> {
+    if let Some((index, ch)) = iri.char_indices().find(|(_, c)| is_forbidden_iri_char(*c)) {
+        return Some(IriViolation::ForbiddenChar { index, ch });
+    }
+    if !is_absolute_iri(iri) {
+        return Some(IriViolation::NotAbsolute);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =====================================================================
+    // Term validation (H-8)
+    // =====================================================================
+
+    #[test]
+    fn the_three_w3c_eval_bad_cases() {
+        // turtle-eval-bad-01/02/03 are `<http://.../\u0020>`, `\u003C`,
+        // `\u003E`. The document LEXES — the escape is legal source — and
+        // what it expands to is not an IRI. These are the expanded values.
+        for (iri, ch) in [
+            ("http://www.w3.org/2013/TurtleTests/ ", ' '),
+            ("http://www.w3.org/2013/TurtleTests/<", '<'),
+            ("http://www.w3.org/2013/TurtleTests/>", '>'),
+        ] {
+            assert_eq!(
+                iri_violation(iri),
+                Some(IriViolation::ForbiddenChar { index: 35, ch }),
+                "{iri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_iris_including_non_ascii() {
+        for iri in [
+            "http://example.org/",
+            "http://example.org/a/b?q=1#f",
+            "urn:uuid:1234",
+            "mailto:a@b.c",
+            "did:key:z6Mk",
+            // RFC 3987 is an IRI spec, not a URI spec: non-ASCII is the point.
+            "http://example.org/\u{e9}",
+            "http://example.org/\u{4e2d}\u{6587}",
+            // U+007F is NOT excluded by the IRIREF production, so we do not
+            // exclude it either — matching the grammar exactly is what keeps
+            // this from over-rejecting.
+            "http://example.org/\u{7f}",
+        ] {
+            assert_eq!(iri_violation(iri), None, "{iri:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_every_character_the_iriref_production_excludes() {
+        for ch in [
+            '<', '>', '"', '{', '}', '|', '^', '`', '\\', ' ', '\t', '\n', '\r', '\u{0}', '\u{1f}',
+            '\u{20}',
+        ] {
+            assert!(is_forbidden_iri_char(ch), "{ch:?} must be forbidden");
+            let iri = format!("http://example.org/{ch}");
+            assert_eq!(
+                iri_violation(&iri),
+                Some(IriViolation::ForbiddenChar { index: 19, ch }),
+                "{iri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_reference_is_not_a_term() {
+        // After resolution an RDF term must be absolute; a leftover relative
+        // reference denotes nothing.
+        for iri in ["not-absolute", "/abs/path", "#frag", "", "1x:y"] {
+            assert_eq!(
+                iri_violation(iri),
+                Some(IriViolation::NotAbsolute),
+                "{iri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn forbidden_characters_are_reported_before_absoluteness() {
+        // A relative reference that ALSO holds a space should name the
+        // space: it is the more specific, more actionable complaint.
+        assert!(matches!(
+            iri_violation("rel ative"),
+            Some(IriViolation::ForbiddenChar { ch: ' ', .. })
+        ));
+    }
+
+    #[test]
+    fn violation_messages_spell_invisible_characters() {
+        let msg = iri_violation("http://example.org/ ").unwrap().to_string();
+        assert!(msg.contains("a space"), "{msg}");
+        let msg = iri_violation("http://example.org/\t").unwrap().to_string();
+        assert!(msg.contains("a tab"), "{msg}");
+        let msg = iri_violation("http://example.org/\u{1}")
+            .unwrap()
+            .to_string();
+        assert!(msg.contains("U+0001"), "{msg}");
+        let msg = iri_violation("http://example.org/<").unwrap().to_string();
+        assert!(msg.contains("'<'"), "{msg}");
+        let msg = iri_violation("relative").unwrap().to_string();
+        assert!(msg.contains("absolute"), "{msg}");
+    }
+
+    #[test]
+    fn indices_are_byte_offsets_into_the_checked_string() {
+        // Multi-byte characters before the offender: the index must be a byte
+        // offset so a caller can slice with it without panicking.
+        let iri = "http://example.org/\u{e9}<";
+        let Some(IriViolation::ForbiddenChar { index, ch }) = iri_violation(iri) else {
+            panic!("expected a forbidden char");
+        };
+        assert_eq!(ch, '<');
+        assert_eq!(index, 21, "19 ASCII bytes + 2 for the e-acute");
+        assert_eq!(&iri[index..], "<");
+    }
 
     #[test]
     fn absolute_references_returned_verbatim() {
