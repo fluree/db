@@ -321,6 +321,18 @@ pub struct GraphCollectorSink {
     blank_counter: u32,
     /// Cache for blank node labels to TermId mapping
     blank_labels: HashMap<String, TermId>,
+    /// Slots in `terms` that hold literals, in mint order.
+    ///
+    /// Literals are the only statement-scoped terms (see [`TermId`]): they
+    /// are minted per occurrence and never deduplicated, while IRI and blank
+    /// ids are cached by producers for the whole parse. `emit_*` clones a
+    /// term into the graph, so once the statement ends its literal slots hold
+    /// nothing anyone can still reference and may be overwritten.
+    literal_slots: Vec<u32>,
+    /// How far into `literal_slots` the current statement has consumed.
+    /// Reset to 0 by `end_statement`, which is what turns the list into a
+    /// per-statement ring instead of a per-document one.
+    literal_cursor: usize,
 }
 
 impl GraphCollectorSink {
@@ -331,6 +343,8 @@ impl GraphCollectorSink {
             terms: Vec::new(),
             blank_counter: 0,
             blank_labels: HashMap::new(),
+            literal_slots: Vec::new(),
+            literal_cursor: 0,
         }
     }
 
@@ -341,6 +355,8 @@ impl GraphCollectorSink {
             terms: Vec::new(),
             blank_counter: 0,
             blank_labels: HashMap::new(),
+            literal_slots: Vec::new(),
+            literal_cursor: 0,
         }
     }
 
@@ -371,6 +387,26 @@ impl GraphCollectorSink {
     fn add_term(&mut self, term: Term) -> TermId {
         let id = TermId(self.terms.len() as u32);
         self.terms.push(term);
+        id
+    }
+
+    /// Add a literal term, reusing a slot retired by [`GraphSink::end_statement`]
+    /// when one is available.
+    ///
+    /// Without this, the term table grows by one entry per literal
+    /// *occurrence* for the length of the document; with it, the high-water
+    /// mark is the widest single statement. Producers that never delimit
+    /// statements (the JSON-LD adapter) simply never recycle and keep
+    /// today's behavior.
+    fn add_literal_term(&mut self, term: Term) -> TermId {
+        if let Some(&slot) = self.literal_slots.get(self.literal_cursor) {
+            self.literal_cursor += 1;
+            self.terms[slot as usize] = term;
+            return TermId(slot);
+        }
+        let id = self.add_term(term);
+        self.literal_slots.push(id.0);
+        self.literal_cursor = self.literal_slots.len();
         id
     }
 }
@@ -422,7 +458,7 @@ impl GraphSink for GraphCollectorSink {
             None if datatype.is_xsd_string() => Term::string(value),
             None => Term::typed(value, datatype),
         };
-        self.add_term(term)
+        self.add_literal_term(term)
     }
 
     fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
@@ -431,7 +467,14 @@ impl GraphSink for GraphCollectorSink {
             datatype,
             language: None,
         };
-        self.add_term(term)
+        self.add_literal_term(term)
+    }
+
+    /// Retire this statement's literal slots for reuse. Sound because
+    /// `emit_*` has already cloned every term it needed into the graph, and
+    /// because producers only cache IRI and blank ids across statements.
+    fn end_statement(&mut self) {
+        self.literal_cursor = 0;
     }
 
     fn emit_triple(&mut self, subject: TermId, predicate: TermId, object: TermId) -> SinkResult {
@@ -694,5 +737,93 @@ mod tests {
 
         let rejected = SinkError::rejected("nope");
         assert!(!rejected.is_broken_pipe());
+    }
+
+    // =====================================================================
+    // Statement-scoped literal term recycling
+    // =====================================================================
+
+    #[test]
+    fn literal_slots_are_reused_after_a_statement_ends() {
+        let mut sink = GraphCollectorSink::new();
+        let a = sink.term_literal("a", Datatype::xsd_string(), None);
+        let b = sink.term_literal("b", Datatype::xsd_string(), None);
+        assert_ne!(a, b, "literals within one statement must stay distinct");
+
+        sink.end_statement();
+
+        let c = sink.term_literal("c", Datatype::xsd_string(), None);
+        let d = sink.term_literal("d", Datatype::xsd_string(), None);
+        assert_eq!((a, b), (c, d), "the next statement reuses the same slots");
+    }
+
+    #[test]
+    fn recycling_does_not_disturb_already_emitted_triples() {
+        // The soundness argument: `emit_*` clones into the graph, so
+        // overwriting the slot afterwards cannot reach back into a triple
+        // that was already collected.
+        let mut sink = GraphCollectorSink::new();
+        let s = sink.term_iri("http://example.org/s");
+        let p = sink.term_iri("http://example.org/p");
+
+        let first = sink.term_literal("first", Datatype::xsd_string(), None);
+        sink.emit_triple(s, p, first).unwrap();
+        sink.end_statement();
+
+        let second = sink.term_literal("second", Datatype::xsd_string(), None);
+        assert_eq!(first, second, "slot reused — the aliasing case under test");
+        sink.emit_triple(s, p, second).unwrap();
+        sink.end_statement();
+
+        let graph = sink.into_graph();
+        let objects: Vec<String> = graph
+            .iter()
+            .map(|t| match &t.o {
+                Term::Literal { value, .. } => value.lexical(),
+                other => panic!("expected literal, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(objects, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn iri_and_blank_ids_survive_statement_boundaries() {
+        // Producers cache these for the whole parse, so recycling them would
+        // dangle. Only literals are statement-scoped.
+        let mut sink = GraphCollectorSink::new();
+        let iri = sink.term_iri("http://example.org/s");
+        let labeled = sink.term_blank(Some("b0"));
+        let anon = sink.term_blank(None);
+        sink.end_statement();
+
+        let literal = sink.term_literal("v", Datatype::xsd_string(), None);
+        assert_ne!(literal, iri);
+        assert_ne!(literal, labeled);
+        assert_ne!(literal, anon);
+
+        // And the originals still resolve to what they were.
+        sink.emit_triple(iri, iri, literal).unwrap();
+        let graph = sink.into_graph();
+        let t = graph.iter().next().unwrap();
+        assert_eq!(t.s.as_iri(), Some("http://example.org/s"));
+    }
+
+    #[test]
+    fn the_term_table_tracks_the_widest_statement_not_the_document() {
+        // The O(document) growth this exists to remove: 1000 statements of
+        // two literals each must not leave 2000 live term slots behind.
+        let mut sink = GraphCollectorSink::new();
+        let s = sink.term_iri("http://example.org/s");
+        let p = sink.term_iri("http://example.org/p");
+        for i in 0..1000 {
+            let a = sink.term_literal(&format!("a{i}"), Datatype::xsd_string(), None);
+            let b = sink.term_literal(&format!("b{i}"), Datatype::xsd_string(), None);
+            sink.emit_triple(s, p, a).unwrap();
+            sink.emit_triple(s, p, b).unwrap();
+            sink.end_statement();
+        }
+        // 2 IRIs + 2 recycled literal slots.
+        assert_eq!(sink.terms.len(), 4);
+        assert_eq!(sink.into_graph().len(), 2000);
     }
 }

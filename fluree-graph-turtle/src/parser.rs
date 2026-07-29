@@ -2120,6 +2120,45 @@ mod tests {
         assert_depth_err(parse_to_graph(&nested_property_lists(100_000)).expect_err("deep"));
     }
 
+    /// End-to-end guard for the statement-scoped literal recycling that
+    /// `end_statement` enables in `GraphCollectorSink`: a later statement
+    /// reuses an earlier statement's literal slot, so if any triple held a
+    /// slot reference instead of a clone, the earlier values would be
+    /// overwritten here.
+    #[test]
+    fn recycled_literal_slots_do_not_corrupt_earlier_statements() {
+        let input = r#"
+            @prefix ex: <http://example.org/> .
+            ex:a ex:p "one" .
+            ex:b ex:p "two" .
+            ex:c ex:p "three", "four" .
+        "#;
+        let graph = parse_to_graph(input).unwrap();
+        assert_eq!(graph.len(), 4);
+
+        let mut pairs: Vec<(String, String)> = graph
+            .iter()
+            .map(|t| {
+                let subject = t.s.as_iri().expect("IRI subject").to_string();
+                let object = match &t.o {
+                    Term::Literal { value, .. } => value.lexical(),
+                    other => panic!("expected literal, got {other:?}"),
+                };
+                (subject, object)
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("http://example.org/a".to_string(), "one".to_string()),
+                ("http://example.org/b".to_string(), "two".to_string()),
+                ("http://example.org/c".to_string(), "four".to_string()),
+                ("http://example.org/c".to_string(), "three".to_string()),
+            ]
+        );
+    }
+
     // =========================================================================
     // Sink protocol: early termination + statement lifecycle
     // =========================================================================
