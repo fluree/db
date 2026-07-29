@@ -678,8 +678,12 @@ impl AnnotationEdgeProbeOperator {
     /// materializing it is cheap relative to the per-batch reader rebuild
     /// it replaces.
     async fn probe_all(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        // The reifier binding is appended as the final schema column.
-        debug_assert_eq!(self.schema.last(), Some(&self.ann_var));
+        // The reifier binding is appended as the final schema column —
+        // unless the child already binds it (nested reifier patterns like
+        // `?t :p :z . << ?s ?p ?o ~ ?t >>`), in which case candidates
+        // UNIFY with the existing column instead of appending.
+        let ann_col = self.child.schema().iter().position(|v| *v == self.ann_var);
+        debug_assert!(ann_col.is_some() || self.schema.last() == Some(&self.ann_var));
         let parent_schema_len = self.child.schema().len();
 
         // Collect every child row's parent-schema bindings plus its
@@ -724,22 +728,34 @@ impl AnnotationEdgeProbeOperator {
                 })?
         };
 
-        for (i, mut rb) in saved_rows.into_iter().enumerate() {
+        for (i, rb) in saved_rows.into_iter().enumerate() {
             let Some(edge_idx) = edge_of_row[i] else {
                 continue;
             };
             let anns = &anns_per_edge[edge_idx];
-            match anns.as_slice() {
-                [] => {}
-                [single] => {
-                    rb.push(Binding::sid(single.clone()));
-                    self.result_buffer.push(rb);
-                }
-                many => {
-                    // Fan out: one output row per live reifier.
-                    for ann in many {
+            match ann_col {
+                // Fan out: one output row per live reifier.
+                None => {
+                    for ann in anns {
                         let mut row = rb.clone();
                         row.push(Binding::sid(ann.clone()));
+                        self.result_buffer.push(row);
+                    }
+                }
+                // Pre-bound reifier column: a bound value is a join key
+                // (keep only the matching candidate); an unbound one is
+                // filled per candidate.
+                Some(c) => {
+                    let bound = match &rb[c] {
+                        Binding::Unbound | Binding::Poisoned => None,
+                        b => binding_sid(b, view.as_ref())?,
+                    };
+                    for ann in anns {
+                        if bound.as_ref().is_some_and(|t| t != ann) {
+                            continue;
+                        }
+                        let mut row = rb.clone();
+                        row[c] = Binding::sid(ann.clone());
                         self.result_buffer.push(row);
                     }
                 }
@@ -953,11 +969,16 @@ impl HashAnnotationEdgeProbeOperator {
                     .get(child_row, *var)
                     .cloned()
                     .unwrap_or(Binding::Unbound);
-                // An unbound driving subject takes the edge's value (the
-                // join binds it), like any join would.
+                // An unbound driving position takes the join's value —
+                // the matched reifier for the ann var, the edge's value
+                // for a base position — like any join would.
                 if matches!(b, Binding::Unbound) {
-                    self.pos_binding_for_var(*var, edge)
-                        .unwrap_or(Binding::Unbound)
+                    if *var == self.ann_var {
+                        Binding::sid(ann.clone())
+                    } else {
+                        self.pos_binding_for_var(*var, edge)
+                            .unwrap_or(Binding::Unbound)
+                    }
                 } else {
                     b
                 }
@@ -1073,6 +1094,16 @@ impl HashAnnotationEdgeProbeOperator {
                     None => edges.values().flatten().collect(),
                     Some(k) => edges.get(k).map(|v| v.iter().collect()).unwrap_or_default(),
                 };
+                // A pre-bound reifier var (nested reifier patterns bind
+                // `?t` upstream: `?t :p :z . << ?s ?p ?o ~ ?t >>`) is a
+                // JOIN key like any other position — candidates must
+                // unify with it, not be overwritten by it. Without this,
+                // every candidate emitted a row stamped with the child's
+                // binding (W3C sparql12 eval-triple-terms pattern-8).
+                let bound_ann: Option<Sid> = match batch.get(row, self.ann_var) {
+                    None | Some(Binding::Unbound | Binding::Poisoned) => None,
+                    Some(b) => binding_sid(b, view)?,
+                };
                 for edge in row_edges {
                     if p_bound_sid.as_ref().is_some_and(|ps| *ps != edge.p_sid) {
                         continue;
@@ -1085,7 +1116,10 @@ impl HashAnnotationEdgeProbeOperator {
                     };
                     let matching: Vec<Sid> = cands
                         .iter()
-                        .filter(|ann| maps.matches(ann, &edge.p_sid, &edge.o_key))
+                        .filter(|ann| {
+                            bound_ann.as_ref().is_none_or(|t| *t == **ann)
+                                && maps.matches(ann, &edge.p_sid, &edge.o_key)
+                        })
                         .cloned()
                         .collect();
                     for ann in matching {
