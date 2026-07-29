@@ -343,6 +343,14 @@ impl StatsView {
         !self.properties.is_empty()
     }
 
+    /// Sum of per-property flake counts — an upper-bound estimate of the
+    /// ledger's total triple count. Used to bound plans that consider a
+    /// one-pass full sweep (e.g. the annotation hash probe's base-edge
+    /// collection) against per-row probing.
+    pub fn total_property_flakes(&self) -> u64 {
+        self.properties.values().map(|p| p.count).sum()
+    }
+
     /// Check if any class statistics are available.
     pub fn has_class_stats(&self) -> bool {
         !self.classes.is_empty()

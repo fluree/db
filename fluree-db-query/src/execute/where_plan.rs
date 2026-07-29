@@ -2598,6 +2598,26 @@ pub(crate) fn build_scan_or_join(
             // Extract object bounds if available for this pattern's object variable
             let bounds = tp.o.as_var().and_then(|v| object_bounds.get(&v).cloned());
 
+            // A right triple that binds nothing new is a pure existence
+            // filter (each ground row matches at most once in current-state
+            // mode). The nested-loop join re-opens a scan per driving row —
+            // ~ms each, ~30 s for a 21k-row `?o rdf:type :Class` membership
+            // check. Evaluate it as a build-once hash membership probe when
+            // the build side is bounded; rows that do not fully ground the
+            // pattern keep exact join semantics via a per-row fallback.
+            if bounds.is_none() && inline_ops.is_empty() {
+                if let Some(key_vars) =
+                    membership_join_key_vars(&left_schema, tp, planning, hash_planner)
+                {
+                    return Box::new(crate::membership_join::MembershipJoinOperator::new(
+                        left,
+                        tp.clone(),
+                        key_vars,
+                        *planning,
+                    ));
+                }
+            }
+
             // For object→subject "path" joins, build a hash table from the small
             // (left/driving) side and probe a single contiguous scan of the large
             // predicate, instead of the per-driving-row OPST object seek that degrades
@@ -2656,6 +2676,67 @@ pub(crate) fn build_scan_or_join(
             )
         }
     }
+}
+
+/// Max estimated build-side rows for the membership-join hash lane: the
+/// one-time drain of the right triple (a single predicate slice / class
+/// extension) must stay bounded — beyond this the per-row nested loop is
+/// kept, since a huge build would cost more than the reopens it saves.
+const MEMBERSHIP_JOIN_MAX_BUILD: f64 = 250_000.0;
+
+/// Recognize the membership-join shape for `build_scan_or_join`: every
+/// variable of `tp` (≥ 1) already appears in the left schema, the query is
+/// current-state (in history mode a ground triple matches once per
+/// `(t, op)` version, so keep/drop is not join-equivalent), and stats
+/// bound the standalone build within [`MEMBERSHIP_JOIN_MAX_BUILD`].
+/// Returns the key vars in left-schema order (load-bearing for column
+/// lookup at open), or `None` to keep the nested-loop join.
+fn membership_join_key_vars(
+    left_schema: &[VarId],
+    tp: &TriplePattern,
+    planning: &PlanningContext,
+    hash_planner: &HashJoinPlanner,
+) -> Option<Vec<VarId>> {
+    if planning.is_history() {
+        return None;
+    }
+    // `(?s bound-from-left, const p, const o)` is the nested-loop join's own
+    // batched-EXISTS shape (`is_batched_subject_exists_eligible`): it probes
+    // PSOT for the driving subjects only — O(driving locality) — where this
+    // lane would drain the whole class/predicate extension. Leave that
+    // subset to the NLJ; membership handles the shapes it can't (a
+    // bound-VAR object or predicate).
+    if tp.s.as_var().is_some_and(|v| left_schema.contains(&v))
+        && tp.p.is_sid()
+        && !matches!(&tp.o, Term::Var(_))
+        && tp.dtc.is_none()
+    {
+        return None;
+    }
+    let mut tp_vars: Vec<VarId> = Vec::new();
+    for v in [tp.s.as_var(), tp.p.as_var(), tp.o.as_var()]
+        .into_iter()
+        .flatten()
+    {
+        if !left_schema.contains(&v) {
+            return None;
+        }
+        if !tp_vars.contains(&v) {
+            tp_vars.push(v);
+        }
+    }
+    if tp_vars.is_empty() {
+        return None;
+    }
+    let stats = hash_planner.stats()?;
+    let inner_est = crate::planner::estimate_triple_row_count(tp, &HashSet::new(), Some(stats));
+    (inner_est <= MEMBERSHIP_JOIN_MAX_BUILD).then(|| {
+        left_schema
+            .iter()
+            .copied()
+            .filter(|v| tp_vars.contains(v))
+            .collect()
+    })
 }
 
 #[inline]

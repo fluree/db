@@ -70,6 +70,7 @@ pub mod join;
 pub mod lang_support;
 pub mod limit;
 pub mod materializer;
+pub(crate) mod membership_join;
 pub mod minus;
 pub(crate) mod object_binding;
 pub mod offset;

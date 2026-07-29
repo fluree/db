@@ -40,6 +40,13 @@ use async_trait::async_trait;
 use fluree_db_core::{Sid, StatsView};
 use std::sync::Arc;
 
+/// Below this many estimated driving rows the generic (well-ordered)
+/// `f:reifies*` chain — three narrow per-row probes — beats draining the
+/// whole annotation sidecar into hash maps. An unknown estimate takes the
+/// hash path: the unbounded-stream shape is exactly what the drain
+/// protects against.
+const HASH_ANNOTATION_MIN_DRIVING_ROWS: usize = 256;
+
 /// Resolve a recognized relationship predicate ref to a concrete `Sid`
 /// for this snapshot. Cypher lowers relationship types to `Ref::Iri`, so
 /// the common case is an IRI encode; `None` means the predicate isn't
@@ -173,6 +180,72 @@ impl DefaultGraphSourceOperator {
                 }
             }
         }
+        // Required-lane hash fallback: no sealed arena (bulk-imported and
+        // reindexed-without-annotations roots) or an arena gate failed. The
+        // generic chain evaluates the base edge and the three `f:reifies*`
+        // joins per driving row; for a large driving stream (a 21k-row
+        // UNWIND) that is tens of thousands of scattered scan re-opens.
+        // Drain the sidecar and sweep the base pattern ONCE instead and
+        // answer each row by hash lookup — but only when the driving
+        // stream is large or unknown (below the threshold the per-row
+        // probes beat the sweeps) AND the base sweep is bounded (an
+        // untyped relationship sweeps the whole default graph once, so
+        // very large ledgers keep the per-row chain).
+        if self.hash_annotation_gates_pass(ctx) {
+            if let Some(shape) =
+                crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
+            {
+                let p_pos = match &shape.p_pred {
+                    Ref::Var(v) => Some(crate::annotation_edge_probe::EdgePos::Var(*v)),
+                    pred => resolve_pred_sid(pred, ctx)
+                        .map(crate::annotation_edge_probe::EdgePos::Const),
+                };
+                let driving_large_or_unknown = child
+                    .estimated_rows()
+                    .is_none_or(|n| n >= HASH_ANNOTATION_MIN_DRIVING_ROWS);
+                let sweep_bounded = self.base_sweep_bounded(&shape);
+                if let (
+                    Some(p_pos),
+                    true,
+                    true,
+                    Pattern::Triple(base_tp),
+                    Pattern::Triple(r_subj),
+                    Pattern::Triple(r_pred),
+                    Pattern::Triple(r_obj),
+                ) = (
+                    p_pos,
+                    driving_large_or_unknown,
+                    sweep_bounded,
+                    &self.inner_patterns[0],
+                    &self.inner_patterns[1],
+                    &self.inner_patterns[2],
+                    &self.inner_patterns[3],
+                ) {
+                    let probe = Box::new(
+                        crate::annotation_edge_probe::HashAnnotationEdgeProbeOperator::new(
+                            child,
+                            base_tp.clone(),
+                            shape.ann_var,
+                            shape.s_pos,
+                            p_pos,
+                            shape.o_pos,
+                            r_subj.clone(),
+                            r_pred.clone(),
+                            r_obj.clone(),
+                            self.stats.clone(),
+                            self.planning,
+                        ),
+                    );
+                    return build_where_operators_seeded(
+                        Some(probe),
+                        &shape.body,
+                        self.stats.clone(),
+                        None,
+                        &self.planning,
+                    );
+                }
+            }
+        }
         build_where_operators_seeded(
             Some(child),
             &self.inner_patterns,
@@ -180,6 +253,38 @@ impl DefaultGraphSourceOperator {
             None,
             &self.planning,
         )
+    }
+
+    /// Eligibility for the required-lane hash sidecar probe. Unlike the
+    /// arena path, the drained `f:reifies*` scans are ordinary planned
+    /// scans — overlay novelty and policy filtering apply — so neither an
+    /// empty overlay nor root policy is required. History timelines change
+    /// per-row visibility (the maps are one `to_t` snapshot of a planned
+    /// scan, which history mode plans differently), and multi-ledger
+    /// contexts have no single sidecar — both keep the generic chain.
+    fn hash_annotation_gates_pass(&self, ctx: &ExecutionContext<'_>) -> bool {
+        !self.planning.is_history() && !ctx.is_multi_ledger()
+    }
+
+    /// Is the probe's one-pass base-edge sweep bounded? A typed
+    /// relationship sweeps one predicate partition (its stats count); an
+    /// untyped one sweeps the whole default graph, bounded by the summed
+    /// property counts. Stats absent → the ledger has no built index
+    /// (novelty-scale) — trivially bounded.
+    fn base_sweep_bounded(
+        &self,
+        shape: &crate::annotation_edge_probe::AnnotationEdgeShape,
+    ) -> bool {
+        const BASE_SWEEP_MAX_ROWS: u64 = 20_000_000;
+        let Some(stats) = self.stats.as_deref() else {
+            return true;
+        };
+        let rows = match &shape.p_pred {
+            Ref::Var(_) => stats.total_property_flakes(),
+            Ref::Sid(sid) => stats.get_property(sid).map_or(0, |p| p.count),
+            Ref::Iri(iri) => stats.get_property_by_iri(iri).map_or(0, |p| p.count),
+        };
+        rows <= BASE_SWEEP_MAX_ROWS
     }
 
     /// Eligibility for the forward-arena probe fast path. All checked
@@ -334,8 +439,27 @@ impl Operator for DefaultGraphSourceOperator {
         }
 
         // Single-graph fast path: stream the once-built inner subplan directly.
+        // The delegate's batch column order comes from the REORDERED inner
+        // chain (plus whichever probe lane fired), which need not match this
+        // operator's declared schema — re-project so positional consumers
+        // above (NestedLoopJoin bind instructions read by column index) see
+        // the contract they were planned against. Matching layouts pass
+        // through untouched.
         if let Some(delegate) = self.single_graph_delegate.as_mut() {
-            return delegate.next_batch(ctx).await;
+            let out = delegate.next_batch(ctx).await?;
+            let Some(batch) = out else { return Ok(None) };
+            if batch.schema() == self.schema.as_ref() {
+                return Ok(Some(batch));
+            }
+            let columns: Vec<Vec<Binding>> = self
+                .schema
+                .iter()
+                .map(|var| match batch.column(*var) {
+                    Some(col) => col.to_vec(),
+                    None => vec![Binding::Unbound; batch.len()],
+                })
+                .collect();
+            return Ok(Some(Batch::new(Arc::clone(&self.schema), columns)?));
         }
 
         if self.buffer_pos < self.result_buffer.len() {
