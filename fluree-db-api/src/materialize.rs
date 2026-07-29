@@ -1271,7 +1271,7 @@ impl TripleObserver for SampleAndCountObserver {
         if !self.wanted.is_empty() {
             let token = render_term(subject);
             if self.wanted.contains(&token) {
-                let line = canonicalize_numeric_nt(&format!(
+                let line = canonicalize_value_nt(&format!(
                     "{token} <{predicate}> {} .",
                     render_term(object)
                 ));
@@ -1338,7 +1338,7 @@ async fn twin_subject_triples(
     for b in &bindings {
         let p = b["p"]["value"].as_str().unwrap_or_default();
         let o = term_to_ntriples(&b["o"]);
-        set.insert(canonicalize_numeric_nt(&format!(
+        set.insert(canonicalize_value_nt(&format!(
             "<{subject_iri}> <{p}> {o} ."
         )));
     }
@@ -1424,7 +1424,7 @@ impl TripleObserver for FileWritingObserver {
                 *self.class_counts.entry(class.clone()).or_default() += 1;
             }
         }
-        let line = canonicalize_numeric_nt(&format!(
+        let line = canonicalize_value_nt(&format!(
             "{} <{predicate}> {} .",
             render_term(subject),
             render_term(object)
@@ -1475,7 +1475,7 @@ async fn spool_twin_ntriples(
                     }
                 }
             }
-            let line = canonicalize_numeric_nt(&format!("{s} <{p}> {o} ."));
+            let line = canonicalize_value_nt(&format!("{s} <{p}> {o} ."));
             writeln!(writer, "{line}")
                 .map_err(|e| R2rmlError::Materialization(format!("twin spool write: {e}")))?;
         }
@@ -1713,14 +1713,13 @@ fn escape_nt_literal(value: &str) -> String {
     out
 }
 
-/// Canonicalize the numeric object literal of an N-Triple so two value-equal but
+/// Canonicalize a typed object literal of an N-Triple so two value-equal but
 /// lexically-different forms compare equal — e.g. the source's `"5.00"^^decimal`
-/// and the twin's re-rendered `"5"^^decimal`. Only a typed numeric object is
-/// touched; IRIs, plain/lang literals, and non-numeric typed literals pass
-/// through byte-for-byte. Applied to BOTH sides, so whichever canonical form each
-/// produces, they agree. (The LIVE native-sf01 full-triple diff needs the same
-/// value-level treatment for typed literals — surfaced here.)
-fn canonicalize_numeric_nt(triple: &str) -> String {
+/// vs the twin's `"5"^^decimal`, or `"…T…:42.000000Z"^^dateTime` vs `"…T…:42Z"`.
+/// Only a typed NUMERIC or TEMPORAL object is touched; IRIs, plain/lang literals,
+/// and other typed literals pass through byte-for-byte. Applied to BOTH sides, so
+/// whichever canonical form each produces, they agree.
+fn canonicalize_value_nt(triple: &str) -> String {
     // `<s> <p> OBJ .` — subject/predicate are `<…>`/`_:…` with no spaces, so the
     // first two spaces delimit them; OBJ (which may contain spaces inside quotes)
     // is the remainder minus the trailing ` .`.
@@ -1738,13 +1737,14 @@ fn canonicalize_numeric_nt(triple: &str) -> String {
     let lex = &obj[1..caret];
     let dt = &obj[caret + 4..obj.len() - 1];
     let local = dt.rsplit(['#', '/']).next().unwrap_or(dt);
-    if !is_numeric_datatype(dt) {
-        return triple.to_string();
-    }
-    format!(
-        "{s} {p} \"{}\"^^<{dt}> .",
+    let canon = if is_numeric_datatype(dt) {
         normalize_numeric_lexical(lex, local)
-    )
+    } else if is_temporal_datatype(local) {
+        normalize_temporal_lexical(lex)
+    } else {
+        return triple.to_string();
+    };
+    format!("{s} {p} \"{canon}\"^^<{dt}> .")
 }
 
 /// Value-canonical lexical form of a numeric literal, so two lexically-different
@@ -1820,6 +1820,74 @@ fn is_numeric_datatype(dt: &str) -> bool {
             | "unsignedShort"
             | "unsignedByte"
     )
+}
+
+/// Whether an XSD datatype LOCAL NAME names a temporal type whose lexical form
+/// admits value-preserving normalization (fractional-second padding + timezone).
+fn is_temporal_datatype(local: &str) -> bool {
+    matches!(local, "dateTime" | "dateTimeStamp" | "date" | "time")
+}
+
+/// Value-canonical lexical form of a date/time literal, so two lexically-different
+/// but value-equal encodings compare equal. THE dateTime false-reject the 35M
+/// acceptance run caught: Fluree stores/exports whole-second timestamps
+/// microsecond-padded (`"…T00:16:42.000000Z"`) while the verify oracle's
+/// `format_timestamp` (r2rml term.rs) DROPS the fraction when it is zero
+/// (`"…T00:16:42Z"`) — the numeric canonicalizer never touched dateTime, so a
+/// PROVEN-identical twin was dropped. Fix (mirrors the decimal trailing-zero
+/// strip): drop insignificant trailing fractional-second zeros (and a bare `.`),
+/// and normalize a zero UTC offset (`+00:00`/`-00:00`) or `Z` to canonical `Z`.
+/// A non-zero offset is left as-is (it denotes a different instant without
+/// date arithmetic; this schema is all-UTC — a documented residual). Applied to
+/// BOTH sides.
+fn normalize_temporal_lexical(lex: &str) -> String {
+    let (body, tz) = split_timezone(lex);
+    let tz_norm = match tz {
+        Some("Z" | "+00:00" | "-00:00") => "Z",
+        Some(other) => other,
+        None => "",
+    };
+    let body_norm = strip_fraction_zeros(body);
+    format!("{body_norm}{tz_norm}")
+}
+
+/// Split a trailing timezone designator (`Z` or `(+|-)HH:MM`) off a temporal
+/// lexical form. The date part uses `-` separators, but a real offset has `:` at
+/// the sign+3 position, which `-MM-DD` never does — so a bare `xsd:date` keeps its
+/// whole body.
+fn split_timezone(lex: &str) -> (&str, Option<&str>) {
+    if let Some(body) = lex.strip_suffix('Z') {
+        return (body, Some("Z"));
+    }
+    if lex.len() >= 6 {
+        let tz = &lex[lex.len() - 6..];
+        let b = tz.as_bytes();
+        if (b[0] == b'+' || b[0] == b'-')
+            && b[3] == b':'
+            && tz[1..3].bytes().all(|c| c.is_ascii_digit())
+            && tz[4..6].bytes().all(|c| c.is_ascii_digit())
+        {
+            return (&lex[..lex.len() - 6], Some(tz));
+        }
+    }
+    (lex, None)
+}
+
+/// Drop insignificant trailing zeros from the fractional-seconds group (and a
+/// bare trailing `.`). The date uses `-` and the time uses `:`, so the only `.`
+/// in a temporal body is the fractional-second separator.
+fn strip_fraction_zeros(body: &str) -> String {
+    match body.rsplit_once('.') {
+        Some((head, frac)) if !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit()) => {
+            let trimmed = frac.trim_end_matches('0');
+            if trimmed.is_empty() {
+                head.to_string()
+            } else {
+                format!("{head}.{trimmed}")
+            }
+        }
+        _ => body.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1931,10 +1999,10 @@ mod tests {
         // oracle renders the raw Arrow Float64 as plain. A correct twin must NOT be
         // rejected because the two encodings differ lexically.
         let dt = "http://www.w3.org/2001/XMLSchema#double";
-        let enot = super::canonicalize_numeric_nt(&format!(
+        let enot = super::canonicalize_value_nt(&format!(
             "<http://ex/geography/3683> <http://ex/latitude> \"-1.5521762E1\"^^<{dt}> ."
         ));
-        let plain = super::canonicalize_numeric_nt(&format!(
+        let plain = super::canonicalize_value_nt(&format!(
             "<http://ex/geography/3683> <http://ex/latitude> \"-15.521762\"^^<{dt}> ."
         ));
         assert_eq!(
@@ -1942,11 +2010,11 @@ mod tests {
             "E-notation and plain double must canonicalize equal"
         );
 
-        let big_enot = super::canonicalize_numeric_nt(&format!(
+        let big_enot = super::canonicalize_value_nt(&format!(
             "<http://ex/account/1269> <http://ex/rev> \"2.8897281511E8\"^^<{dt}> ."
         ));
         // 2.8897281511E8 == 288972815.11 (the plain form the enumerator renders).
-        let big_plain = super::canonicalize_numeric_nt(&format!(
+        let big_plain = super::canonicalize_value_nt(&format!(
             "<http://ex/account/1269> <http://ex/rev> \"288972815.11\"^^<{dt}> ."
         ));
         assert_eq!(
@@ -1958,11 +2026,11 @@ mod tests {
     #[test]
     fn decimal_trailing_zeros_canonicalize_equal() {
         let dt = "http://www.w3.org/2001/XMLSchema#decimal";
-        let a = super::canonicalize_numeric_nt(&format!("<s> <p> \"5.00\"^^<{dt}> ."));
-        let b = super::canonicalize_numeric_nt(&format!("<s> <p> \"5\"^^<{dt}> ."));
+        let a = super::canonicalize_value_nt(&format!("<s> <p> \"5.00\"^^<{dt}> ."));
+        let b = super::canonicalize_value_nt(&format!("<s> <p> \"5\"^^<{dt}> ."));
         assert_eq!(a, b, "'5.00' and '5' decimals must canonicalize equal");
-        let c = super::canonicalize_numeric_nt(&format!("<s> <p> \"9.90\"^^<{dt}> ."));
-        let d = super::canonicalize_numeric_nt(&format!("<s> <p> \"9.9\"^^<{dt}> ."));
+        let c = super::canonicalize_value_nt(&format!("<s> <p> \"9.90\"^^<{dt}> ."));
+        let d = super::canonicalize_value_nt(&format!("<s> <p> \"9.9\"^^<{dt}> ."));
         assert_eq!(c, d, "'9.90' and '9.9' decimals must canonicalize equal");
     }
 
@@ -1973,29 +2041,78 @@ mod tests {
         // different high-precision decimals stay distinct.
         let dt = "http://www.w3.org/2001/XMLSchema#decimal";
         let a =
-            super::canonicalize_numeric_nt(&format!("<s> <p> \"123456789012345678.1\"^^<{dt}> ."));
+            super::canonicalize_value_nt(&format!("<s> <p> \"123456789012345678.1\"^^<{dt}> ."));
         let b =
-            super::canonicalize_numeric_nt(&format!("<s> <p> \"123456789012345678.2\"^^<{dt}> ."));
+            super::canonicalize_value_nt(&format!("<s> <p> \"123456789012345678.2\"^^<{dt}> ."));
         assert_ne!(a, b, "distinct high-precision decimals must not collapse");
+    }
+
+    #[test]
+    fn datetime_microsecond_padding_canonicalizes_equal() {
+        // THE 35M-run receipt: storage pads whole-second timestamps to 6-digit
+        // microseconds (".000000Z"); the enumerator oracle drops a zero fraction.
+        // A correct twin must NOT be rejected for that.
+        let dt = "http://www.w3.org/2001/XMLSchema#dateTime";
+        let padded = super::canonicalize_value_nt(&format!(
+            "<http://ex/e/1> <http://ex/ts> \"2026-06-28T00:16:42.000000Z\"^^<{dt}> ."
+        ));
+        let unpadded = super::canonicalize_value_nt(&format!(
+            "<http://ex/e/1> <http://ex/ts> \"2026-06-28T00:16:42Z\"^^<{dt}> ."
+        ));
+        assert_eq!(
+            padded, unpadded,
+            "padded and unpadded whole-second dateTime must agree"
+        );
+        // A non-zero sub-second fraction is preserved but its padding equalized.
+        let a = super::canonicalize_value_nt(&format!(
+            "<s> <p> \"2026-06-28T00:16:42.500000Z\"^^<{dt}> ."
+        ));
+        let b =
+            super::canonicalize_value_nt(&format!("<s> <p> \"2026-06-28T00:16:42.5Z\"^^<{dt}> ."));
+        assert_eq!(a, b, "'.500000' and '.5' fractions must agree");
+        // Distinct instants must NOT collapse.
+        let x =
+            super::canonicalize_value_nt(&format!("<s> <p> \"2026-06-28T00:16:42.5Z\"^^<{dt}> ."));
+        let y =
+            super::canonicalize_value_nt(&format!("<s> <p> \"2026-06-28T00:16:43Z\"^^<{dt}> ."));
+        assert_ne!(x, y, "different instants must stay distinct");
+    }
+
+    #[test]
+    fn datetime_zulu_and_zero_offset_canonicalize_equal() {
+        let dt = "http://www.w3.org/2001/XMLSchema#dateTime";
+        let zulu =
+            super::canonicalize_value_nt(&format!("<s> <p> \"2026-06-28T00:16:42Z\"^^<{dt}> ."));
+        let offset = super::canonicalize_value_nt(&format!(
+            "<s> <p> \"2026-06-28T00:16:42+00:00\"^^<{dt}> ."
+        ));
+        assert_eq!(zulu, offset, "'Z' and '+00:00' must canonicalize equal");
+        // A genuinely different (non-UTC) offset is left intact, so it does not
+        // silently collapse into the UTC form.
+        let nonzero = super::canonicalize_value_nt(&format!(
+            "<s> <p> \"2026-06-28T00:16:42+05:00\"^^<{dt}> ."
+        ));
+        assert_ne!(zulu, nonzero, "a non-zero offset must not collapse to Z");
     }
 
     #[test]
     fn non_numeric_and_plain_literals_pass_through() {
         let s = "<s> <p> \"hello world\" .";
         assert_eq!(
-            super::canonicalize_numeric_nt(s),
+            super::canonicalize_value_nt(s),
             s,
             "plain literal untouched"
         );
+        // A bare date (no fractional seconds, no offset) normalizes to itself.
         let dated = "<s> <p> \"2020-01-01\"^^<http://www.w3.org/2001/XMLSchema#date> .";
         assert_eq!(
-            super::canonicalize_numeric_nt(dated),
+            super::canonicalize_value_nt(dated),
             dated,
-            "date untouched"
+            "whole date normalizes to itself"
         );
         let iri = "<s> <p> <http://ex/o> .";
         assert_eq!(
-            super::canonicalize_numeric_nt(iri),
+            super::canonicalize_value_nt(iri),
             iri,
             "IRI object untouched"
         );
