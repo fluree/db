@@ -757,7 +757,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             self.parse_object_list(subject, predicate)?;
 
             if matches!(self.current().kind, TokenKind::Semicolon) {
-                self.advance()?;
+                // `predicateObjectList ::= verb objectList (';' (verb
+                // objectList)?)*` — the tail item is OPTIONAL, so a run of
+                // semicolons is legal and denotes nothing. Consume the whole
+                // run before deciding whether a predicate follows; generators
+                // emit `;;` and a trailing `;` routinely.
+                while matches!(self.current().kind, TokenKind::Semicolon) {
+                    self.advance()?;
+                }
                 if matches!(
                     self.current().kind,
                     TokenKind::Dot
@@ -1644,6 +1651,44 @@ mod tests {
         assert!(
             matches!(&triple.p, Term::Iri(iri) if iri.as_ref() == "http://xmlns.com/foaf/0.1/name")
         );
+    }
+
+    /// `predicateObjectList`'s tail item is optional, so a run of semicolons
+    /// is legal Turtle that denotes nothing. W3C: `repeated_semis_at_end`,
+    /// `repeated_semis_not_at_end`, `turtle-syntax-struct-04/05`.
+    #[test]
+    fn test_repeated_semicolons_are_empty_list_items() {
+        let cases = [
+            // between items
+            "<http://a/s> <http://a/p1> <http://a/o1>;; <http://a/p2> <http://a/o2> .",
+            // trailing, before the dot
+            "<http://a/s> <http://a/p1> <http://a/o1> ;; .",
+            // separated run, and a run longer than two
+            "<http://a/s> <http://a/p1> <http://a/o1> ; ; ; <http://a/p2> <http://a/o2> .",
+        ];
+
+        for input in cases {
+            let graph = parse_to_graph(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            let expected = if input.contains("p2") { 2 } else { 1 };
+            assert_eq!(graph.len(), expected, "wrong triple count for: {input}");
+        }
+    }
+
+    /// A semicolon run inside a blank-node property list terminates on `]`
+    /// the same way it terminates on `.` at statement level.
+    #[test]
+    fn test_repeated_semicolons_inside_blank_node_property_list() {
+        let input = r#"<http://a/s> <http://a/p> [ <http://a/q> "v" ;; ] ."#;
+        let graph = parse_to_graph(input).unwrap();
+        assert_eq!(graph.len(), 2);
+    }
+
+    /// The list must still START with a verb — `;` is a separator, not a
+    /// prefix, so a leading one stays an error.
+    #[test]
+    fn test_leading_semicolon_is_still_rejected() {
+        let input = "<http://a/s> ; <http://a/p> <http://a/o> .";
+        assert!(parse_to_graph(input).is_err());
     }
 
     #[test]

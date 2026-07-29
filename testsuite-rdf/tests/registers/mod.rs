@@ -50,19 +50,8 @@ pub const NEGATIVE_SYNTAX_BLIND_SPOT: &str =
 
 /// RDF 1.1 Turtle — 16 known failures out of 313.
 pub const RDF11_TURTLE: &[&str] = &[
-    // ---------------------------------------------------------------------
-    // A1. PARSER BUG — an empty item in a predicateObjectList (`;;`) is
-    // rejected. The Turtle grammar's `predicateObjectList` is
-    // `verb objectList (';' (verb objectList)?)*`, so a `;` followed by
-    // another `;` or by the statement's `.` is legal and means nothing.
-    // The parser demands a predicate after every `;`. Trivial grammar fix,
-    // and it is real-world relevant: generators emit trailing `;` routinely.
-    // (4)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#repeated_semis_at_end",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#repeated_semis_not_at_end",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-struct-04",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-struct-05",
+    // A1 (repeated `;` as empty predicateObjectList items) — FIXED, entries
+    // removed with the fix.
     // ---------------------------------------------------------------------
     // A2. PARSER BUG — `PN_LOCAL` may contain interior dots (`:s.1`, `:s..2`,
     // `:3.s`); only a TRAILING dot terminates the name. The lexer treats the
