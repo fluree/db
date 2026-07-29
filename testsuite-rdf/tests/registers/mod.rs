@@ -18,9 +18,25 @@
 //! below.
 //!
 //! Grouping comments name the root cause; the letters match the burn-down
-//! categories in the workstream report. Baseline: rdf-tests submodule
-//! @ efccbc6b8, captured 2026-07-28 against the `feat/graphsink-protocol`
-//! base (#1552).
+//! categories in the workstream report. There are SEVEN groups, not six —
+//! it is easy to count the Turtle causes and forget E, which is the largest
+//! single group in the whole register:
+//!
+//! - **A1** repeated `;` as empty predicateObjectList items (Turtle)
+//! - **A2** PN_LOCAL interior dot runs (Turtle)
+//! - **A3** relative `@base` resolution (Turtle)
+//! - **B**  directive keyword case, both directions (Turtle)
+//! - **C**  IRI / language-tag validation — the H-8 workstream (Turtle + NT)
+//! - **D**  boolean keyword vs longhand IR duality (Turtle)
+//! - **E**  no strict N-Triples reader, so the NT suites run through the
+//!   Turtle parser and a negative test whose document is valid Turtle cannot
+//!   fail (N-Triples only)
+//!
+//! E is a product gap rather than a parser bug, which is why it reads as a
+//! footnote and then turns out to account for most of the N-Triples column.
+//!
+//! Baseline: rdf-tests submodule @ efccbc6b8, captured 2026-07-28 against the
+//! `feat/graphsink-protocol` base (#1552).
 
 /// A negative-syntax test passes when the parser rejects the document — for
 /// ANY reason. A parser that rejected a valid construct would still be scored
