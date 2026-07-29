@@ -48,13 +48,18 @@
 pub const NEGATIVE_SYNTAX_BLIND_SPOT: &str =
     "negative-syntax tests do not check WHY the parser rejected the document";
 
-/// RDF 1.1 Turtle — 16 known failures out of 313.
+/// RDF 1.1 Turtle — 4 known failures out of 313, all cause C.
+///
+/// Causes A1, A2, A3, B and D were fixed in the burn-down; only the H-8
+/// term-validation work remains.
 pub const RDF11_TURTLE: &[&str] = &[
     // A1 (repeated `;` as empty predicateObjectList items) — FIXED, entries
     // removed with the fix.
     // A2 (PN_LOCAL interior dots) — FIXED, entry removed with the fix.
     // A3 (relative @base resolution) — FIXED, entry removed with the fix.
     // B (directive keyword case, both directions) — FIXED, entries removed
+    // with the fix.
+    // D (boolean keyword vs longhand IR duality) — FIXED, entries removed
     // with the fix.
     // ---------------------------------------------------------------------
     // C. TERM VALIDATION NOT IMPLEMENTED — the H-8 workstream ("IRI
@@ -70,28 +75,6 @@ pub const RDF11_TURTLE: &[&str] = &[
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-02",
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-03",
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-bad-lang-01",
-    // ---------------------------------------------------------------------
-    // D. IR LIMITATION — one RDF term, two unequal IR representations. The
-    // Turtle keywords `true`/`false` still become `LiteralValue::Boolean`,
-    // while `"true"^^xsd:boolean` (the same term, written longhand, and what
-    // every gold `.nt` file uses) becomes `LiteralValue::String`. The IR's
-    // `PartialEq`/`Hash` are variant-sensitive (`term.rs` `_ => false`), so
-    // the two compare unequal and hash apart even though `Display` renders
-    // both as `"true"^^<...#boolean>`.
-    //
-    // This is the boolean lane of exactly what `NumericStyle::PreserveLexical`
-    // fixed for integers and doubles — the conformant preset simply does not
-    // reach the `KwTrue`/`KwFalse` arms of `parse_literal`. It is NOT only a
-    // harness concern: a document stating a fact both ways denotes ONE
-    // triple, and today's IR would hold two, so graph dedup and set semantics
-    // are wrong wherever a boolean is written longhand.
-    //
-    // Deliberately NOT papered over by normalizing inside the isomorphism
-    // checker — that would hide a live defect behind a green suite. (3)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#literal_true",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#literal_false",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-subm-22",
 ];
 
 /// RDF 1.1 N-Triples — 15 known failures out of 70.

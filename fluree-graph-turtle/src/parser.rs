@@ -1014,16 +1014,43 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     Ok(self.sink_term_literal(text, Datatype::xsd_double(), None))
                 }
             },
-            TokenKind::KwTrue => {
-                self.advance()?;
-                Ok(self
-                    .sink_term_literal_value(LiteralValue::Boolean(true), Datatype::xsd_boolean()))
-            }
-            TokenKind::KwFalse => {
-                self.advance()?;
-                Ok(self
-                    .sink_term_literal_value(LiteralValue::Boolean(false), Datatype::xsd_boolean()))
-            }
+            // The boolean keywords take the same lane as `Integer` and
+            // `Double`: canonicalized to a native value for ingest, routed
+            // through the typed-string lane for conformance. `true` and
+            // `"true"^^xsd:boolean` are ONE RDF term, and only the
+            // typed-string form makes them one IR term as well — `Term`'s
+            // equality and hash are variant-sensitive, so the two spellings
+            // would otherwise be distinct members of the same graph.
+            //
+            // Unlike the numeric tokens there is no span to read: the lexer
+            // matched these keywords case-sensitively, so the source spelling
+            // is exactly "true"/"false".
+            TokenKind::KwTrue => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal_value(
+                        LiteralValue::Boolean(true),
+                        Datatype::xsd_boolean(),
+                    ))
+                }
+                NumericStyle::PreserveLexical => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal("true", Datatype::xsd_boolean(), None))
+                }
+            },
+            TokenKind::KwFalse => match self.options.numerics {
+                NumericStyle::Canonicalize => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal_value(
+                        LiteralValue::Boolean(false),
+                        Datatype::xsd_boolean(),
+                    ))
+                }
+                NumericStyle::PreserveLexical => {
+                    self.advance()?;
+                    Ok(self.sink_term_literal("false", Datatype::xsd_boolean(), None))
+                }
+            },
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!("expected literal, found {:?}", self.current().kind),
@@ -1672,6 +1699,87 @@ mod tests {
         );
     }
 
+    /// `true` and `"true"^^xsd:boolean` are one RDF term written two ways.
+    /// Under the conformant preset they must be one IR term too, or a graph
+    /// stating the fact both ways holds two triples where RDF says one.
+    /// W3C: `literal_true`, `literal_false`, `turtle-subm-22`.
+    #[test]
+    fn test_boolean_keyword_and_longhand_agree_under_preserve_lexical() {
+        let both_ways = r#"
+            <http://a/s> <http://a/p> true .
+            <http://a/s> <http://a/p> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+            <http://a/s> <http://a/q> false .
+            <http://a/s> <http://a/q> "false"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+        "#;
+
+        let mut sink = GraphCollectorSink::new();
+        parse_with_options(both_ways, &mut sink, ParserOptions::conformant()).unwrap();
+        let mut graph = sink.into_graph();
+
+        // Four statements, two distinct triples — the halves must collapse.
+        assert_eq!(graph.len(), 4);
+        graph.canonicalize();
+        assert_eq!(
+            graph.len(),
+            2,
+            "keyword and longhand booleans did not dedupe to one term each"
+        );
+    }
+
+    /// The ingest default is unchanged: booleans stay native values there,
+    /// and the two spellings stay distinct (the behavior that made this a
+    /// defect, preserved deliberately for the storage path).
+    #[test]
+    fn test_boolean_keyword_stays_native_under_the_ingest_default() {
+        let input = "<http://a/s> <http://a/p> true .";
+
+        let mut sink = GraphCollectorSink::new();
+        parse(input, &mut sink).unwrap();
+        let triples = sink.into_graph().into_triples();
+
+        match &triples[0].o {
+            Term::Literal {
+                value, datatype, ..
+            } => {
+                assert!(
+                    matches!(value, fluree_graph_ir::LiteralValue::Boolean(true)),
+                    "ingest default must keep the native boolean, got {value:?}"
+                );
+                assert_eq!(
+                    datatype.as_iri(),
+                    "http://www.w3.org/2001/XMLSchema#boolean"
+                );
+            }
+            other => panic!("expected a literal, got {other:?}"),
+        }
+    }
+
+    /// Under the conformant preset the boolean carries its lexical form, so a
+    /// writer round-trips the source spelling rather than a re-canonicalized
+    /// one — the same contract the numeric lane already provides.
+    #[test]
+    fn test_boolean_keeps_its_lexical_form_under_the_conformant_preset() {
+        for (source, lexical) in [("true", "true"), ("false", "false")] {
+            let input = format!("<http://a/s> <http://a/p> {source} .");
+            let mut sink = GraphCollectorSink::new();
+            parse_with_options(&input, &mut sink, ParserOptions::conformant()).unwrap();
+            let triples = sink.into_graph().into_triples();
+
+            match &triples[0].o {
+                Term::Literal {
+                    value, datatype, ..
+                } => {
+                    assert_eq!(value.lexical(), lexical);
+                    assert_eq!(
+                        datatype.as_iri(),
+                        "http://www.w3.org/2001/XMLSchema#boolean"
+                    );
+                }
+                other => panic!("expected a literal, got {other:?}"),
+            }
+        }
+    }
+
     /// A relative `@base` resolves against the base in scope (RFC 3986
     /// §5.1.1), and the resolution COMPOUNDS across redeclarations. W3C:
     /// `turtle-subm-27`.
@@ -1711,10 +1819,7 @@ mod tests {
         ";
         let graph = parse_to_graph(input).unwrap();
         let triple = graph.iter().next().unwrap();
-        assert_eq!(
-            triple.s.as_iri(),
-            Some("http://example.org/ns/foo/bar#a4")
-        );
+        assert_eq!(triple.s.as_iri(), Some("http://example.org/ns/foo/bar#a4"));
     }
 
     /// A relative base with nothing to resolve against is an error, not a
