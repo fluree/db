@@ -291,6 +291,73 @@ fn failure_before_any_emit_does_not_abort() {
     );
 }
 
+/// LATCH GUARDS. `committed_current` is reset at the start of every statement;
+/// if it ever stopped being reset, it would latch true after the first
+/// committed statement and `abort_statement` would never fire again —
+/// rollback dying silently, which is worse than the contract bug the flag
+/// fixes. A latched flag turns both cases below into no-Abort / 2 triples.
+///
+/// Both use a COMMITTED statement followed by one that emits and then fails,
+/// so the trailing Abort is mandatory.
+#[test]
+fn abort_still_fires_after_a_committed_statement_wrong_terminator() {
+    // `ex:q` sits where the `.` belongs: it lexes fine, the triple is emitted,
+    // and the statement then fails at its terminator.
+    let doc = "@prefix ex: <http://example.org/> .\nex:a ex:p \"1\" .\nex:b ex:p \"2\" ex:q .\n";
+    let mut sink = LoggingSink::default();
+    parse(doc, &mut sink).expect_err("a non-dot terminator must fail");
+
+    assert_eq!(
+        sink.log,
+        vec!["End", "Emit", "End", "Emit", "Abort"],
+        "the flag must have reset: statement 3 emitted and must still abort"
+    );
+    assert_eq!(
+        sink.inner.into_graph().len(),
+        1,
+        "only the committed statement's triple survives"
+    );
+}
+
+#[test]
+fn abort_still_fires_after_a_committed_statement_missing_final_dot() {
+    // Runs out of input before the terminator — the same shape a truncated
+    // file produces.
+    let doc = "@prefix ex: <http://example.org/> .\nex:a ex:p \"1\" .\nex:b ex:p \"2\"\n";
+    let mut sink = LoggingSink::default();
+    parse(doc, &mut sink).expect_err("a missing final dot must fail");
+
+    assert_eq!(
+        sink.log,
+        vec!["End", "Emit", "End", "Emit", "Abort"],
+        "the flag must have reset: statement 3 emitted and must still abort"
+    );
+    assert_eq!(
+        sink.inner.into_graph().len(),
+        1,
+        "only the committed statement's triple survives"
+    );
+}
+
+/// A lexical error can also strike BEFORE the emit, even mid-statement: a
+/// literal's `@lang`/`^^type` suffix is checked by lexing the next token, so
+/// `"2" @@@` fails before the triple is emitted. Recorded because it looks
+/// like the wrong-terminator case above and behaves differently — no Abort,
+/// because nothing was emitted.
+#[test]
+fn lexical_error_in_a_literal_suffix_aborts_nothing() {
+    let doc = "@prefix ex: <http://example.org/> .\nex:a ex:p \"1\" .\nex:b ex:p \"2\" @@@\n";
+    let mut sink = LoggingSink::default();
+    parse(doc, &mut sink).expect_err("@@@ must fail to lex");
+
+    assert_eq!(
+        sink.log,
+        vec!["End", "Emit", "End"],
+        "no Emit and so no Abort: the lexer failed inside the literal's suffix lookahead"
+    );
+    assert_eq!(sink.inner.into_graph().len(), 1);
+}
+
 /// The other guard: a statement that already COMMITTED at its `.` must not be
 /// aborted either. It reaches the error arm only because the one-token
 /// lookahead failed while reading the NEXT statement — the committed
