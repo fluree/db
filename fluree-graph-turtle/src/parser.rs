@@ -596,6 +596,25 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     /// The cost on the path that matters is nil: one extra hash lookup per
     /// prefix *directive*, of which a document has a handful, against a cache
     /// consulted once per prefixed *name*, of which it has millions.
+    ///
+    /// # The comparison is on meaning, not spelling
+    ///
+    /// `namespace` arrives already resolved — `parse_prefix_directive` runs
+    /// `resolve_iri` before calling this — so `prefixes` holds resolved IRIs
+    /// and this compares what the two declarations MEAN. Both directions of
+    /// that are load-bearing, and neither is obvious:
+    ///
+    /// - Same spelling, different meaning. `@prefix e: <a/>` under
+    ///   `@base <http://x/>` and again under `@base <http://y/>` is the same
+    ///   text naming two different namespaces. Comparing raw text would find
+    ///   them equal and skip a clear that is required.
+    /// - Different spelling, same meaning. `<http://x/a/>` and `<a/>` under
+    ///   `@base <http://x/>` name one namespace. Comparing raw text would
+    ///   clear a cache that was entirely correct.
+    ///
+    /// So storing the resolved form is not an incidental convenience of the
+    /// directive parser; it is what makes this comparison the right one. Both
+    /// cases are pinned in `tests/prefix_redefinition.rs`.
     fn bind_prefix(&mut self, prefix: String, namespace: String) {
         let rebinds = self
             .prefixes
@@ -603,12 +622,28 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             .is_some_and(|current| *current != namespace);
         self.prefixes.insert(prefix, namespace);
         if rebinds {
-            // Coarse on purpose. A rebind could strand only the entries for
-            // that one prefix, but finding them means scanning every key, and
-            // a rebind is rare enough that paying O(cache) once beats making
-            // the common path cleverer.
+            // Coarse on purpose: a rebind invalidates only that prefix's
+            // entries, but finding them means scanning every key, so we drop
+            // them all. A rebind is rare enough that paying O(cache) once
+            // beats making the common path cleverer.
             self.prefixed_term_cache.clear();
         }
+    }
+
+    /// Test-only: parse, then report `(prefixed_cache_hits, prefixed_cache_misses)`.
+    ///
+    /// The "only if it rebinds" in [`Self::bind_prefix`] is invisible in parser
+    /// output — clearing on a same-binding redeclaration yields identical
+    /// triples, just colder, because `iri_term_cache` absorbs the repeated
+    /// work before it can reach the sink. Without a view of the counters,
+    /// nothing stops a later simplification from clearing unconditionally and
+    /// quietly costing hit rate on every chunk of every import.
+    #[cfg(test)]
+    fn parse_reporting_cache(mut self) -> Result<(u64, u64)> {
+        while !self.is_at_end() {
+            self.parse_statement()?;
+        }
+        Ok((self.prefixed_cache_hits, self.prefixed_cache_misses))
     }
 
     /// Parse @base or BASE directive.
@@ -1511,6 +1546,48 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
 mod tests {
     use super::*;
     use fluree_graph_ir::{Graph, GraphCollectorSink, Term};
+
+    /// Counts for a document whose only prefixed names are two `e:x`.
+    fn prefixed_cache_counts(doc: &str) -> (u64, u64) {
+        let mut sink = GraphCollectorSink::new();
+        Parser::new(doc, &mut sink)
+            .unwrap()
+            .parse_reporting_cache()
+            .unwrap()
+    }
+
+    /// Redeclaring the SAME binding must leave the expansion cache warm.
+    ///
+    /// This is the shape chunked import produces on every chunk, and it is the
+    /// reason `bind_prefix` clears only on a real rebinding. No output pins it:
+    /// the triples are identical either way.
+    #[test]
+    fn a_same_binding_redeclaration_keeps_the_cache_warm() {
+        let doc = "@prefix e: <http://a/> .\n\
+                   e:x <http://p/> \"1\" .\n\
+                   @prefix e: <http://a/> .\n\
+                   e:x <http://p/> \"2\" .\n";
+        assert_eq!(
+            prefixed_cache_counts(doc),
+            (1, 1),
+            "same-binding redeclaration must NOT clear the expansion cache"
+        );
+    }
+
+    /// A real rebinding must drop the cached expansion — the correctness half,
+    /// pinned at the cache rather than only through the emitted triples.
+    #[test]
+    fn a_rebinding_drops_the_cached_expansion() {
+        let doc = "@prefix e: <http://a/> .\n\
+                   e:x <http://p/> \"1\" .\n\
+                   @prefix e: <http://b/> .\n\
+                   e:x <http://p/> \"2\" .\n";
+        assert_eq!(
+            prefixed_cache_counts(doc),
+            (0, 2),
+            "a rebinding MUST clear the expansion cache"
+        );
+    }
 
     fn parse_to_graph(input: &str) -> Result<Graph> {
         let mut sink = GraphCollectorSink::new();
