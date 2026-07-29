@@ -4,6 +4,15 @@
 //! and computes selectivity scores.
 //!
 //! Call `explain_patterns` with a set of patterns and optional stats to get an `ExplainPlan`.
+//!
+//! ## Fast-path outcomes (PR-1 seed — TODO(PR-3))
+//!
+//! This module explains WHERE-clause pattern optimization only. Whether a
+//! kill-switch-gated fast path was *taken* vs. fell back to the generic
+//! pipeline is emitted separately on the `fluree::fastpath` tracing target (see
+//! [`crate::fast_path_outcome`]). PR-3 folds that planned-vs-executed signal
+//! into [`ExplainPlan`] here, so a single EXPLAIN shows both the pattern plan
+//! and the fast-path routing.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::planner::{classify_pattern, estimate_triple_row_count, PatternType};

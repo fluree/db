@@ -39,6 +39,9 @@ jobs:
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
+      # Baseline is runner_class=local, so the nightly compare enforces memory and
+      # treats time as advisory until a ci-* baseline is committed (bench-capture).
+      FLUREE_BENCH_RUNNER_CLASS: ci-ubuntu-latest
     steps:
       - name: Free disk space
         run: |
@@ -72,3 +75,66 @@ jobs:
       # broken setup, missing API surface).
       - name: Smoke-run benches at tiny scale
         run: cargo bench --workspace -- --test
+
+      # Real per-bench compare of the captured subset against the committed
+      # baseline (the nightly perf-regression gate). `if: always()` so it runs
+      # even when an unrelated workspace bench trips the smoke step above.
+      # Follow-up (ROADMAP.md §7 cost caveat): the full workspace compare at
+      # +medium against a phase post-baseline needs the 45-min cap raised or the
+      # workflow split, so it is deliberately NOT wired here yet.
+      - name: Compare captured subset against committed baseline
+        if: always()
+        run: |
+          rm -rf target/fluree-bench-mem
+          cargo bench -p fluree-db-api --bench query_overlay_matrix
+          cargo bench -p fluree-db-api --bench query_hot_bsbm
+          cargo run -p fluree-bench-support --bin bench-baseline -- \
+            compare --baseline bench-baselines/guardrails-pre.json
+
+  bench-capture:
+    # On-demand CI-class baseline capture (review item 1c). Captures the cheap
+    # subset on ubuntu-latest with runner_class=ci-ubuntu-latest and uploads the
+    # JSON as an artifact. Committing it to bench-baselines/ is a human follow-up
+    # — once a ci-* baseline lands, the per-PR compare's TIME half enforces
+    # automatically (runner classes match). workflow_dispatch only (not on the
+    # nightly schedule) to avoid the extra cost every night.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FLUREE_BENCH_PROFILE: quick
+      FLUREE_BENCH_SCALE: tiny
+      FLUREE_BENCH_RUNNER_CLASS: ci-ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Same cheap subset and scales (tiny+small) as the committed baseline, so
+      # the artifact is a drop-in ci-* replacement once a human commits it.
+      - name: Capture cheap subset (CI-class)
+        run: |
+          rm -rf target/fluree-bench-mem
+          for scale in tiny small; do
+            FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_overlay_matrix
+            FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_hot_bsbm
+          done
+          cargo run -p fluree-bench-support --bin bench-baseline -- \
+            capture --label guardrails-pre-ci --out bench-baselines/guardrails-pre-ci.json
+
+      - name: Upload CI-class baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardrails-pre-ci-baseline
+          path: bench-baselines/guardrails-pre-ci.json

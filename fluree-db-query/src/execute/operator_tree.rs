@@ -22,6 +22,7 @@ use crate::fast_group_count_firsts::{
 };
 use crate::fast_label_regex_type::label_regex_type_operator;
 use crate::fast_min_max_string::{predicate_min_max_string_operator, MinMaxMode};
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::fast_path_plus_count_all::{
     property_path_plus_count_all_operator, transitive_path_plus_count_all_operator,
 };
@@ -55,7 +56,7 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::stats_query::StatsCountByPredicateOperator;
+use crate::stats_query::stats_count_by_predicate_operator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
@@ -1680,6 +1681,15 @@ fn detect_stats_count_by_predicate(query: &Query) -> Option<(VarId, VarId)> {
     if !query.order_binds.is_empty() {
         return None;
     }
+    // OFFSET is applied twice when this operator declines at open() time and
+    // its fallback runs: the fallback tree already applies the full modifier
+    // stack, and the dispatch below wraps modifiers (including OFFSET) around
+    // this operator again. Sort/project/distinct/limit are idempotent under
+    // that re-wrapping; OFFSET is not. Decline and let the generic pipeline
+    // handle it.
+    if query.offset.is_some() {
+        return None;
+    }
     // Must have stats available (checked by caller)
     // Must have exactly one triple pattern with all variables
     if query.patterns.len() != 1 {
@@ -2175,6 +2185,43 @@ fn detect_union_star_count_all(
     Some((union_preds, extra_preds, mode, out_var))
 }
 
+/// Global fast-path kill switch.
+///
+/// When set (programmatically via [`set_fast_paths_disabled`] or via the
+/// `FLUREE_DISABLE_QUERY_FAST_PATHS` env var), the planner skips every
+/// `detect_*` shape recognizer — the fused chain *and* the history-gated
+/// non-fused paths — and always builds the generic operator pipeline.
+///
+/// This exists for the differential correctness harness
+/// (`fluree-db-api/tests/it_differential_fastpath.rs`), which runs the same
+/// query with fast paths on and off and asserts identical results, and as
+/// an operational escape hatch when triaging a suspected fast-path bug.
+/// It is NOT a tuning knob: runtime operator-internal optimizations
+/// (cursor selection, batched joins) are unaffected.
+static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Disable (or re-enable) planner fast paths process-wide. Test/triage use.
+///
+/// Env-override footgun: [`fast_paths_disabled`] OR's this flag with the
+/// `FLUREE_DISABLE_QUERY_FAST_PATHS` env var (read once per process), so when
+/// that env var is set `set_fast_paths_disabled(false)` CANNOT re-enable fast
+/// paths. A harness that toggles fast paths on and off to compare their results
+/// (the differential harness) must run with the env var UNSET — otherwise its
+/// fast-paths-on phase silently runs generically and every fast-vs-generic
+/// assertion passes vacuously. That harness guards against this at startup.
+pub fn set_fast_paths_disabled(disabled: bool) {
+    FAST_PATHS_DISABLED.store(disabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// True when planner fast paths are disabled, either programmatically or
+/// via `FLUREE_DISABLE_QUERY_FAST_PATHS` (read once per process).
+pub fn fast_paths_disabled() -> bool {
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FAST_PATHS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        || *ENV.get_or_init(|| std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_some())
+}
+
 /// Build the complete operator tree for a query
 ///
 /// Constructs operators in the order:
@@ -2230,6 +2277,23 @@ fn build_operator_tree_inner(
     enable_fused_fast_paths: bool,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // Global kill switch (differential harness / triage): force the generic
+    // pipeline for the fused chain and the non-fused history-gated paths
+    // below alike.
+    let fast_paths_globally_disabled = fast_paths_disabled();
+    let enable_fused_fast_paths = enable_fused_fast_paths && !fast_paths_globally_disabled;
+    // EXPLAIN seed (PR-1): record whether the kill switch suppressed the fused
+    // fast-path chain at this gate. TODO(PR-3): per-detector verdicts, not one
+    // aggregate chain stamp.
+    stamp_fast_path(
+        "fused_chain",
+        if fast_paths_globally_disabled {
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch)
+        } else {
+            FastPathOutcome::Proceed
+        },
+    );
+
     // Phase 5 of the planner-mode refactor: fast paths emit current-state
     // bindings (no `op` channel, no retract events) and don't consult the
     // history sidecar. In `History` mode they're semantically wrong, so the
@@ -2776,10 +2840,11 @@ fn build_operator_tree_inner(
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
         {
+            stamp_fast_path("group_by_object_count_topk", FastPathOutcome::Proceed);
             return Ok(Box::new(PredicateGroupCountFirstsOperator::new(
                 s_var,
                 o_var,
@@ -2806,8 +2871,9 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
-    if !planning.is_history() {
+    if !planning.is_history() && !fast_paths_globally_disabled {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
+            stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
             let mut operator: BoxedOperator = Box::new(PredicateObjectCountFirstsOperator::new(
                 pred,
                 s_var,
@@ -2849,71 +2915,81 @@ fn build_operator_tree_inner(
         }
     }
 
-    // Fast-path: stats-based count-by-predicate query
-    // This avoids scanning all triples when we can answer directly from IndexStats.
-    // Skipped in `History` mode — IndexStats reflects current-state cardinality,
-    // not the asserts + retracts a history-range query needs.
-    if !planning.is_history() {
-        if let Some(ref stats_view) = stats {
-            if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
-                // Build the policy-enforced fallback: the same query as a generic
-                // GROUP BY, producing the operator's internal `[pred, count]`
-                // schema (output forced to those two vars; ORDER BY / LIMIT /
-                // OFFSET stripped, since those wrap the stats operator below).
-                // Recurse with stats disabled so this fast path isn't re-entered.
-                // The operator streams from this fallback when a view policy is
-                // active (the whole-index stats counts can't be trusted then).
-                let mut fallback_query = query.clone();
-                fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
-                fallback_query.ordering = Vec::new();
-                fallback_query.order_binds = Vec::new();
-                fallback_query.limit = None;
-                fallback_query.offset = None;
-                let fallback = build_operator_tree_inner(
-                    &fallback_query,
-                    None,
-                    enable_fused_fast_paths,
-                    planning,
-                )?;
+    // Fast-path: per-predicate count answered from POST leaf-directory metadata
+    // (exact — see stats_query.rs for why the old IndexStats numbers were wrong
+    // answers, differential harness FD-3). Skipped in `History` mode (directory
+    // rows are current-state only) and under the kill switch. `stats.is_some()`
+    // both keeps the probe to plausibly-indexed ledgers AND is the re-entry
+    // guard — the fallback below recurses with `stats = None`, so a false here on
+    // that recursion stops this fast path re-wrapping itself. The operator's
+    // open()-time gate (`fast_path_store`) is the real guard, declining to the
+    // generic fallback under overlay novelty, time-travel, a non-root policy, or
+    // multi-ledger.
+    if !planning.is_history() && !fast_paths_globally_disabled && stats.is_some() {
+        if let Some((pred_var, count_var)) = detect_stats_count_by_predicate(query) {
+            // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
+            // stamps the runtime Proceed/Fallback(GateDeclined) at open().
+            stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            // Build the fallback: the same query as a generic GROUP BY,
+            // producing the operator's internal `[pred, count]` schema (output
+            // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
+            // since those wrap the operator below). Recurse with stats=None so
+            // this fast path isn't re-entered. The operator streams from this
+            // fallback whenever the directory-count gate declines (overlay,
+            // time-travel, policy, multi-ledger) — which also keeps a non-root
+            // policy's restricted predicates from leaking through stale counts.
+            let mut fallback_query = query.clone();
+            fallback_query.output = QueryOutput::select_all(vec![pred_var, count_var]);
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let fallback = build_operator_tree_inner(
+                &fallback_query,
+                None,
+                enable_fused_fast_paths,
+                planning,
+            )?;
 
-                let mut operator: BoxedOperator = Box::new(StatsCountByPredicateOperator::new(
-                    Arc::clone(stats_view),
-                    pred_var,
-                    count_var,
-                    Some(fallback),
-                ));
+            let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
+                pred_var,
+                count_var,
+                Some(fallback),
+            ));
 
-                // ORDER BY (on predicate or count)
-                if !query.ordering.is_empty() {
-                    operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
-                }
-
-                // PROJECT (select specific columns)
-                if let Some(vars) = query.output.projected_vars() {
-                    if !vars.is_empty() {
-                        operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
-                    }
-                }
-
-                // DISTINCT
-                if query.output.is_distinct() {
-                    operator = Box::new(crate::distinct::DistinctOperator::new(operator));
-                }
-
-                // OFFSET
-                if let Some(offset) = query.offset {
-                    if offset > 0 {
-                        operator = Box::new(OffsetOperator::new(operator, offset));
-                    }
-                }
-
-                // LIMIT
-                if let Some(limit) = query.limit {
-                    operator = Box::new(LimitOperator::new(operator, limit));
-                }
-
-                return Ok(operator);
+            // ORDER BY (on predicate or count)
+            if !query.ordering.is_empty() {
+                operator = Box::new(SortOperator::new(operator, query.ordering.clone()));
             }
+
+            // PROJECT (select specific columns)
+            if let Some(vars) = query.output.projected_vars() {
+                if !vars.is_empty() {
+                    operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
+                }
+            }
+
+            // DISTINCT
+            if query.output.is_distinct() {
+                operator = Box::new(crate::distinct::DistinctOperator::new(operator));
+            }
+
+            // OFFSET: unreachable. detect_stats_count_by_predicate declines any
+            // query with `offset.is_some()` (~:1690) — OFFSET is not idempotent
+            // when the fallback re-applies the full modifier stack — so it is
+            // always None here. Asserted rather than wrapped so the next reader
+            // need not re-derive the double-OFFSET analysis.
+            debug_assert!(
+                query.offset.is_none(),
+                "stats-count dispatch reached with OFFSET set; the detector must decline it"
+            );
+
+            // LIMIT
+            if let Some(limit) = query.limit {
+                operator = Box::new(LimitOperator::new(operator, limit));
+            }
+
+            return Ok(operator);
         }
     }
 

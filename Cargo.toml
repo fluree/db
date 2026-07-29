@@ -42,6 +42,7 @@ members = [
     "fluree-db-docs",
     "fluree-db-mcp",
     "fluree-bench-support",
+    "fluree-bench-alloc",
     "fluree-bench-virtual",
     "fluree-db-consensus",
 ]

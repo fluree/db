@@ -2533,11 +2533,16 @@ pub fn translate_overlay_flakes_with_untranslated(
         ) {
             Ok(op) => ops.push(op),
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::Unsupported {
-                    untranslated.push(flake.clone());
-                } else {
-                    tracing::warn!(error = %e, "failed to translate overlay flake to V3");
+                // Keep the raw flake for ALL failure kinds (mirrors the
+                // range-provider keep-raw path, binary_range.rs:78-98). A
+                // non-Unsupported failure (NotFound from a stale/detached
+                // DictNovelty, InvalidData) still signals degraded dict state
+                // worth investigating, but must not cost data — the untranslated
+                // post-pass emits it as a materialized row.
+                if e.kind() != std::io::ErrorKind::Unsupported {
+                    tracing::warn!(error = %e, "failed to translate overlay flake to V3; keeping as raw");
                 }
+                untranslated.push(flake.clone());
             }
         },
     );

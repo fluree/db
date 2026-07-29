@@ -44,6 +44,7 @@ pub(crate) mod fast_group_count_firsts;
 pub(crate) mod fast_label_regex_type;
 pub(crate) mod fast_min_max_string;
 pub(crate) mod fast_path_common;
+pub mod fast_path_outcome;
 pub(crate) mod fast_path_plus_count_all;
 pub(crate) mod fast_post_order_limit;
 pub(crate) mod fast_predicate_scalar_agg;
@@ -120,8 +121,8 @@ pub use dataset_operator::{DatasetBuilder, DatasetOperator, ScanDatasetBuilder};
 pub use distinct::DistinctOperator;
 pub use error::{QueryError, Result};
 pub use execute::{
-    build_operator_tree, execute, expand_edge_annotation_patterns, run_operator, ContextConfig,
-    ExecutableQuery,
+    build_operator_tree, execute, expand_edge_annotation_patterns, fast_paths_disabled,
+    run_operator, set_fast_paths_disabled, ContextConfig, ExecutableQuery,
 };
 pub use exists::ExistsOperator;
 pub use explain::{
@@ -163,7 +164,7 @@ pub use rewrite_owl_ql::{rewrite_owl_ql_patterns, Ontology, OwlQlContext};
 pub use seed::{EmptyOperator, SeedOperator};
 pub use shortest_path::ShortestPathOperator;
 pub use sort::{compare_bindings, compare_flake_values, SortDirection, SortOperator, SortSpec};
-pub use stats_query::StatsCountByPredicateOperator;
+pub use stats_query::stats_count_by_predicate_operator;
 pub use subquery::SubqueryOperator;
 pub use temporal_mode::{PlanningContext, TemporalMode};
 pub use unwind::UnwindOperator;
