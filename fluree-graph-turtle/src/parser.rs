@@ -1276,6 +1276,26 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         predicate: TermId,
         object: TermId,
     ) -> Result<()> {
+        // TERM-LIFETIME HAZARD, named here because this is the one place it
+        // can bite. `object` may be a LITERAL id, and it stays live across the
+        // annotation body — which mints further terms, including literals of
+        // its own — before being handed to `emit_reified_triple` below.
+        //
+        // Everywhere else the parser emits a literal immediately after minting
+        // it, so at most one literal id is live at a time and a sink may
+        // recycle literal slots per statement (see `GraphSink::end_statement`)
+        // without any live id being clobbered. Here that is not true: the
+        // invariant this code relies on is that a sink does NOT reuse a
+        // literal slot until `end_statement`, and the whole annotation tail is
+        // inside one statement.
+        //
+        // Unreachable today — star constructs require
+        // `supports_reified_triples()`, and the only recycling sink
+        // (`GraphCollectorSink`) returns false, so no sink both recycles and
+        // accepts these events. It becomes live the moment a writer sink
+        // supports both. A sink that does must either keep literal ids valid
+        // for the whole statement (what `end_statement` already promises) or
+        // this function must materialize `object` before parsing the body.
         let mut pending: Option<TermId> = None;
         loop {
             match self.current().kind {
