@@ -2899,6 +2899,18 @@ fn the_profile_records_the_load_average() {
 // bounded channel, and `thread::scope` joined them forever at 0% CPU. Any
 // input over the parallel threshold piped to `head` hung, which is the default
 // path.
+//
+// Restoring the pre-fix receiver shape — the receiver borrowed from outside the
+// scope closure, so nothing can drop it before the join — makes the matrix
+// below fail at `--parallelism 4 × immediate close` in 10s while the `-o FILE`
+// control still passes. Keeping that ownership but dropping the shutdown flag
+// does *not* hang: the flag governs how promptly workers stop, the ownership
+// governs whether they stop at all.
+
+/// `ParallelPlan::MIN_PARALLEL_BYTES`: below this an input converts serially
+/// whatever `--parallelism` says, so a fixture under it tests the wrong path.
+/// This is the reason a green suite missed the hang.
+const MIN_PARALLEL_BYTES: usize = 4 * 1024 * 1024;
 
 /// A corpus over the parallel input threshold, kept as small as possible
 /// because chunking is a full byte scan and these run in a debug build.
@@ -2910,102 +2922,174 @@ fn over_threshold_corpus() -> String {
             i % 90
         ));
     }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate: \
+         every case below would silently run serially",
+        ttl.len()
+    );
     ttl
 }
 
-/// Run convert with stdout piped, apply `close`, and report its exit status.
-fn convert_with_dead_reader(
-    input: &Path,
-    threads: &str,
-    close: impl FnOnce(std::process::ChildStdout),
-) -> Option<i32> {
+/// 2 triples per subject × 120_000 subjects.
+const OVER_THRESHOLD_TRIPLES: usize = 240_000;
+
+/// How long one case may take before the run is called hung. A deadlock is
+/// only distinguishable from slowness by waiting, and this fixture converts in
+/// a couple of seconds in a debug build, so 90s is an order of magnitude of
+/// headroom for a loaded machine and still finite.
+const HUNG: std::time::Duration = std::time::Duration::from_secs(90);
+
+fn spawn_convert(input: &Path, threads: &str, out: Option<&Path>) -> std::process::Child {
     use std::process::{Command as StdCommand, Stdio};
 
-    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"))
-        .args(["--parallelism", threads, "rdf", "convert"])
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"));
+    cmd.args(["--parallelism", threads, "rdf", "convert"])
         .arg(input)
-        .args(["--to", "nt"])
-        .env("NO_COLOR", "1")
+        .args(["--to", "nt"]);
+    if let Some(out) = out {
+        cmd.arg("-o").arg(out);
+    }
+    cmd.env("NO_COLOR", "1")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap();
+        .unwrap()
+}
 
-    close(child.stdout.take().unwrap());
-    child.wait_with_output().unwrap().status.code()
+/// Wait for `child` with a ceiling, killing it and FAILING on expiry.
+///
+/// A plain `wait()` turns a deadlock into a frozen suite rather than a red
+/// test: nextest prints SLOW and the run stalls, and `cargo test` waits
+/// forever. The wait happens on another thread so the timeout is enforceable,
+/// and `wait_with_output` drains stderr so the child cannot block on a full
+/// pipe and look hung when it is only chatty.
+fn wait_bounded(child: std::process::Child, case: &str) -> (Option<i32>, String) {
+    #[cfg(unix)]
+    let pid = child.id();
+    let started = std::time::Instant::now();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(HUNG) {
+        Ok(Ok(out)) => (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ),
+        Ok(Err(e)) => panic!("{case}: waiting on the child failed: {e}"),
+        Err(_) => {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            panic!(
+                "{case}: still running after {:?} — hung, not slow",
+                started.elapsed()
+            );
+        }
+    }
+}
+
+/// What the process on the other end of the pipe does before going away.
+#[derive(Copy, Clone)]
+enum DeadReader {
+    /// The pipe is closed before a single byte is consumed.
+    Immediate,
+    /// `| head -1`, and `| head -100`: a few statements, then gone.
+    Lines(usize),
+    /// Closes part-way through a read, so the write failure lands inside the
+    /// reassembly loop rather than on the first write.
+    MidStream,
+}
+
+impl DeadReader {
+    const ALL: [Self; 4] = [
+        Self::Immediate,
+        Self::Lines(1),
+        Self::Lines(100),
+        Self::MidStream,
+    ];
+
+    fn name(self) -> String {
+        match self {
+            Self::Immediate => "immediate close".into(),
+            Self::Lines(n) => format!("head -{n}"),
+            Self::MidStream => "close mid-read".into(),
+        }
+    }
+
+    fn apply(self, stdout: std::process::ChildStdout) {
+        use std::io::{BufRead, BufReader, Read};
+        match self {
+            Self::Immediate => drop(stdout),
+            Self::Lines(n) => {
+                let mut reader = BufReader::new(stdout);
+                for i in 0..n {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    assert!(
+                        line.starts_with('<'),
+                        "line {i} should be a triple, got {line:?}"
+                    );
+                }
+                // Dropping the reader closes the pipe.
+            }
+            Self::MidStream => {
+                let mut stdout = stdout;
+                let mut sink = vec![0u8; 256 * 1024];
+                let _ = stdout.read(&mut sink);
+            }
+        }
+    }
 }
 
 #[test]
-fn a_reader_that_never_reads_ends_a_parallel_run_quietly() {
-    // The harshest case: the pipe is closed before a single byte is consumed.
+fn a_dead_reader_ends_a_run_quietly_at_every_parallelism() {
     let tmp = TempDir::new().unwrap();
     let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
 
-    for threads in ["4", "8"] {
-        let code = convert_with_dead_reader(&input, threads, drop);
+    // 1 is the serial baseline — it always honoured the contract — and 4 and 8
+    // are the widths at which the pool deadlocked.
+    for threads in ["1", "4", "8"] {
+        for reader in DeadReader::ALL {
+            let case = format!("--parallelism {threads} × {}", reader.name());
+            let mut child = spawn_convert(&input, threads, None);
+            reader.apply(child.stdout.take().unwrap());
+            let (code, stderr) = wait_bounded(child, &case);
+            assert_eq!(
+                code,
+                Some(0),
+                "{case}: a closed downstream is a normal end, not a failure. stderr: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_file_destination_completes_at_every_parallelism() {
+    // The negative control. `-o FILE` never sees EPIPE and passed before the
+    // fix, so if it hangs the pool itself is broken; if only the piped cases
+    // hang, the termination path is. It also pins that ending quietly on a
+    // dead pipe did not come at the cost of ending correctly on a live one.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
+
+    for threads in ["1", "4", "8"] {
+        let case = format!("--parallelism {threads} × -o FILE");
+        let out = tmp.path().join(format!("out{threads}.nt"));
+        let child = spawn_convert(&input, threads, Some(&out));
+        let (code, stderr) = wait_bounded(child, &case);
+        assert_eq!(code, Some(0), "{case}: stderr: {stderr}");
+        let written = std::fs::read_to_string(&out).unwrap();
         assert_eq!(
-            code,
-            Some(0),
-            "parallelism {threads}: a closed downstream is a normal end, not a failure"
+            written.lines().count(),
+            OVER_THRESHOLD_TRIPLES,
+            "{case}: a live destination must receive the whole document"
         );
     }
-}
-
-#[test]
-fn a_reader_that_takes_one_line_ends_a_parallel_run_quietly() {
-    // `convert big.ttl | head -1`, which is the default path for any input
-    // over the parallel threshold.
-    use std::io::{BufRead, BufReader};
-
-    let tmp = TempDir::new().unwrap();
-    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
-
-    for threads in ["4", "8"] {
-        let code = convert_with_dead_reader(&input, threads, |stdout| {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            assert!(line.starts_with('<'), "expected a triple, got {line:?}");
-            // Dropping the reader closes the pipe.
-        });
-        assert_eq!(code, Some(0), "parallelism {threads}");
-    }
-}
-
-#[test]
-fn a_reader_that_stops_mid_stream_ends_a_parallel_run_quietly() {
-    // Closing after several chunks' worth, so the failure lands well inside
-    // the reassembly loop rather than on the first write.
-    use std::io::Read;
-
-    let tmp = TempDir::new().unwrap();
-    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
-
-    let code = convert_with_dead_reader(&input, "8", |mut stdout| {
-        let mut sink = vec![0u8; 256 * 1024];
-        // Read a bit, then abandon it.
-        let _ = stdout.read(&mut sink);
-    });
-    assert_eq!(code, Some(0));
-}
-
-#[test]
-fn a_dead_destination_does_not_outlive_its_workers() {
-    // The deadlock signature was a process sitting at 0% CPU forever. This
-    // pins the observable consequence: the run ENDS. Without the shutdown
-    // signal, `thread::scope` joins workers blocked on a full channel and the
-    // test would hang until nextest's kill rather than fail.
-    let tmp = TempDir::new().unwrap();
-    let input = fixture(&tmp, "big.ttl", &over_threshold_corpus());
-
-    let started = std::time::Instant::now();
-    let code = convert_with_dead_reader(&input, "8", drop);
-    assert_eq!(code, Some(0));
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(120),
-        "the run took {:?} — the pool is not being told to stop",
-        started.elapsed()
-    );
 }
 
 #[test]
