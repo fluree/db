@@ -1568,6 +1568,14 @@ pub fn parse_with_options<S: GraphSink>(
 /// directives (e.g., from a file header) and wants to parse subsequent Turtle
 /// fragments without re-prepending/re-parsing the directive text.
 ///
+/// # Errors
+///
+/// `base` must be an ABSOLUTE IRI. A relative one is refused rather than
+/// resolved: a caller-supplied base has no document context to resolve
+/// against, and inventing one would guess at the caller's intent. Callers
+/// holding a possibly-relative base (a CLI `--base` flag, say) must resolve
+/// it themselves before calling.
+///
 /// Notes:
 /// - The provided `prefixes` and `base` affect **prefix expansion and IRI resolution**
 ///   inside the parser.
@@ -1588,6 +1596,10 @@ pub fn parse_with_prefixes_base<S: GraphSink>(
 /// This is the full entry point — every other `parse*` function is this one
 /// with something defaulted — so the chunked reader paths, which need the
 /// pre-seeded prelude, can opt into conformance options too.
+///
+/// # Errors
+///
+/// `base` must be an ABSOLUTE IRI; see [`parse_with_prefixes_base`].
 pub fn parse_with_prefixes_base_options<S: GraphSink>(
     input: &str,
     sink: &mut S,
@@ -1597,6 +1609,25 @@ pub fn parse_with_prefixes_base_options<S: GraphSink>(
 ) -> Result<()> {
     let mut parser = Parser::with_options(input, sink, options)?;
     if let Some(base) = base {
+        // The base PARAMETER gets the same absoluteness guarantee the `@base`
+        // DIRECTIVE gets, and for the same reason: a non-absolute base is not
+        // a base, and installing one silently mangles every IRI in the
+        // document rather than failing. `Some("foo/")` used to yield
+        // `<:foo/a>` — identical corruption to the directive bug, reached
+        // through the API instead of the syntax.
+        //
+        // A relative parameter is REFUSED outright rather than resolved:
+        // unlike a directive, which has a document base in scope to resolve
+        // against, a caller-supplied base has no context, and inventing one
+        // would be guessing at the caller's intent. This matches the error a
+        // relative `@base` gets when nothing is in scope.
+        if !is_absolute_iri(base) {
+            return Err(TurtleError::IriResolution(format!(
+                "base parameter '{base}' is not an absolute IRI — a base must be \
+                 absolute (it is what relative IRIs resolve against, so there is \
+                 nothing to resolve it against itself)"
+            )));
+        }
         parser.base = Some(base.to_string());
     }
     if !prefixes.is_empty() {
@@ -1778,6 +1809,64 @@ mod tests {
                 other => panic!("expected a literal, got {other:?}"),
             }
         }
+    }
+
+    /// The base PARAMETER reaches the same corruption the `@base` DIRECTIVE
+    /// did, through the API instead of the syntax: `Some("foo/")` produced
+    /// `<:foo/a>`. It is refused, not resolved — a caller-supplied base has
+    /// no document context to resolve against.
+    #[test]
+    fn test_relative_base_parameter_is_refused() {
+        for relative in ["foo/", "a3", "./x/", "../up/", "#frag"] {
+            let mut sink = GraphCollectorSink::new();
+            let result = parse_with_prefixes_base(r"<a> <b> <c> .", &mut sink, &[], Some(relative));
+            assert!(
+                result.is_err(),
+                "relative base parameter {relative:?} must be refused, not installed"
+            );
+        }
+    }
+
+    /// The refusal names the offending value, so a caller passing a bad
+    /// `--base` learns which input was wrong.
+    #[test]
+    fn test_relative_base_parameter_error_names_the_value() {
+        let mut sink = GraphCollectorSink::new();
+        let err = parse_with_prefixes_base(r"<a> <b> <c> .", &mut sink, &[], Some("foo/"))
+            .expect_err("a relative base parameter must be refused");
+        let msg = format!("{err}");
+        assert!(msg.contains("foo/"), "error must name the value: {msg}");
+        assert!(msg.contains("absolute"), "error must say why: {msg}");
+    }
+
+    /// An absolute parameter still works, and still resolves relative IRIs.
+    #[test]
+    fn test_absolute_base_parameter_still_resolves() {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base(
+            r"<a> <b> <c> .",
+            &mut sink,
+            &[],
+            Some("http://example.org/ns/"),
+        )
+        .unwrap();
+        let triples = sink.into_graph().into_triples();
+        assert_eq!(triples[0].s.as_iri(), Some("http://example.org/ns/a"));
+        assert_eq!(triples[0].o.as_iri(), Some("http://example.org/ns/c"));
+    }
+
+    /// `None` is unaffected — no base is not a bad base.
+    #[test]
+    fn test_absent_base_parameter_is_not_refused() {
+        let mut sink = GraphCollectorSink::new();
+        parse_with_prefixes_base(
+            r"<http://a/s> <http://a/p> <http://a/o> .",
+            &mut sink,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(sink.into_graph().len(), 1);
     }
 
     /// A relative `@base` resolves against the base in scope (RFC 3986

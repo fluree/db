@@ -279,9 +279,11 @@ mod tests {
         assert!(are_graphs_isomorphic(&a, &b));
     }
 
-    /// The bijection must be injective: two distinct blanks on one side may
+    /// The bijection must be INJECTIVE: two distinct blanks on one side may
     /// not collapse onto one blank on the other, even though the triple
-    /// counts agree.
+    /// counts agree. This is the reverse-map guard specifically; the
+    /// structural side of matching is locked by
+    /// `a_two_cycle_is_not_two_self_loops`.
     #[test]
     fn distinct_blanks_may_not_collapse() {
         let two_blanks = vec![
@@ -328,6 +330,12 @@ mod tests {
     /// self-loops have the same triple count, the same blank-node count and
     /// the same per-node degree, but are not isomorphic. A checker that
     /// matched on counts alone would pass this.
+    ///
+    /// What this locks is the BLANK-MATCHING logic — that a candidate pairing
+    /// is rejected when it cannot be extended consistently across the whole
+    /// graph. It is not an injectivity test; injectivity is what
+    /// `distinct_blanks_may_not_collapse` guards. Two different properties,
+    /// two different tests — do not carry one's expectation onto the other.
     #[test]
     fn a_two_cycle_is_not_two_self_loops() {
         let two_cycle = vec![
