@@ -116,13 +116,18 @@ pub trait OptionalBuilder: Send + Sync {
         Ok(None)
     }
 
-    /// Whether this builder takes the batched single-seed hash-join path — i.e.
+    /// Whether this builder WILL take the batched single-seed hash-join path — i.e.
     /// `build_batch` can collapse the correlated inner into ONE scan over the
     /// distinct correlation tuples. When true, the OptionalOperator may COALESCE
     /// the whole (bounded) driving side into one seed (PR-4d) so the inner is
-    /// scanned once rather than once per outer batch. Default: false — a per-row
-    /// builder gains nothing from coalescing and must keep streaming.
-    fn supports_seed_coalescing(&self) -> bool {
+    /// scanned once rather than once per outer batch. Implementations must
+    /// mirror their `build_batch` admission gates against `ctx`: returning
+    /// true and then declining at `build_batch` time would buffer up to the
+    /// coalesce cap of driving rows only to fall back per-row anyway —
+    /// delaying the fallback, defeating an early LIMIT, and inflating
+    /// memory. Default: false — a per-row builder gains nothing from
+    /// coalescing and must keep streaming.
+    fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
         false
     }
 
@@ -433,8 +438,24 @@ impl OptionalBuilder for PatternOptionalBuilder {
     /// per-row joins emit 1-row batches, and a chain of these OPTIONALs
     /// re-fragments its own output — without coalescing the KB `p.p`
     /// pipeline ran ~2k probe calls of 2-4 subjects each.
-    fn supports_seed_coalescing(&self) -> bool {
-        true
+    ///
+    /// True only when `build_batch`'s own admission gates hold, so the
+    /// operator never buffers the driving side just to fall back per-row.
+    fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if ctx.is_multi_ledger() || self.pattern.dtc.is_some() || self.subject_left_col().is_none()
+        {
+            return false;
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return false;
+        };
+        let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
+            return false;
+        };
+        !matches!(
+            subject_probe_lane_plan(ctx, store, &pred_sid),
+            Err(_) | Ok(ProbeLanePlan::Decline)
+        )
     }
 
     fn build(
@@ -821,8 +842,26 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
     /// Per-row joins upstream emit 1-row batches, and a chain of OPTIONALs
     /// re-fragments its own output; without coalescing the KB `p.p`
     /// pipeline ran hundreds of 2-4-subject probes per predicate.
-    fn supports_seed_coalescing(&self) -> bool {
-        true
+    ///
+    /// True only when `build_batch`'s admission gates hold for EVERY
+    /// grouped triple, so the operator never buffers the driving side
+    /// just to fall back per-row.
+    fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if ctx.is_multi_ledger() || self.triples.iter().any(|tp| tp.dtc.is_some()) {
+            return false;
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return false;
+        };
+        self.triples.iter().all(|triple| {
+            let Some(pred_sid) = try_normalize_pred_sid(store, &triple.p) else {
+                return false;
+            };
+            !matches!(
+                subject_probe_lane_plan(ctx, store, &pred_sid),
+                Err(_) | Ok(ProbeLanePlan::Decline)
+            )
+        })
     }
 
     fn build(
@@ -1193,7 +1232,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     /// exactly when every inner pattern is hash-join-safe, so the OptionalOperator
     /// may coalesce the whole driving side into one seed (one inner scan) rather
     /// than one scan per outer batch. Mirrors `build_batch`'s own admission gate.
-    fn supports_seed_coalescing(&self) -> bool {
+    fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
         self.inner_patterns
             .iter()
             .all(inner_pattern_is_hash_join_safe)
@@ -2408,7 +2447,7 @@ impl Operator for OptionalOperator {
                 let coalesce = optional_seed_coalesce_enabled()
                     && !optional_hash_join_disabled()
                     && !ctx.is_multi_ledger()
-                    && self.optional_builder.supports_seed_coalescing();
+                    && self.optional_builder.supports_seed_coalescing(ctx);
                 let next = if coalesce {
                     self.pull_coalesced_required(ctx).await?
                 } else {
@@ -3456,7 +3495,7 @@ mod tests {
                     .collect(),
             ))
         }
-        fn supports_seed_coalescing(&self) -> bool {
+        fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
             true
         }
         fn schema(&self) -> &[VarId] {

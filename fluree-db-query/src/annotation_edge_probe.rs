@@ -257,27 +257,70 @@ impl AnnotationEdgeProbeOperator {
         let Some(p) = resolve_pos_pred(batch, row, &self.p_pos, view)? else {
             return Ok(None);
         };
-        // Object: ref-valued for a relationship edge. Resolve to a Sid
-        // and wrap as a ref FlakeValue with the `@id` datatype, matching
-        // how the arena stored the edge. A literal object (a wildcard
-        // `?s ?p ?o` base scan also delivers literal-valued triples) has
-        // no probeable ref edge in this v1 fast path — the row is
-        // dropped, matching Cypher's node-to-node relationship
-        // semantics. (Literal-reified quoted triples take the generic
-        // chain whenever recognition declines; probing the arena by
-        // materialized literal `EdgeKey` is a known follow-up.)
-        let Some(o) = resolve_obj_ref(batch, row, &self.o_pos, view)? else {
+        // Object: any FlakeValue. Ref objects key with the `@id`
+        // datatype; literal objects (a wildcard `?s ?p ?o` base scan
+        // also delivers literal-valued triples, and SPARQL quoted
+        // triples reify them) key by value + effective datatype +
+        // language tag — exactly as `EdgeKey::from_flake` stored them,
+        // so reified literal triples are probeable rather than dropped.
+        let Some((o, dt, lang)) = resolve_obj_key_parts(batch, row, &self.o_pos, view)? else {
             return Ok(None);
         };
         Ok(Some(EdgeKey {
             g: None,
             s,
             p,
-            o: FlakeValue::Ref(o),
-            dt: id_datatype_sid(),
-            lang: None,
+            o,
+            dt,
+            lang,
             list_i: None,
         }))
+    }
+}
+
+/// Resolve the base edge's OBJECT position into arena `EdgeKey` parts
+/// (`o`, `dt`, `lang`) exactly as [`EdgeKey::from_flake`] recorded them
+/// at write time. `None` drops the row: an unbound position matches no
+/// `f:reifies*` row, and Poisoned follows join semantics (a failed
+/// OPTIONAL row joins nothing). Value/dt/lang decode through the same
+/// dictionaries the writer used — sound here because the arena gates
+/// require an empty overlay, so every binding comes from the indexed
+/// scan.
+fn resolve_obj_key_parts(
+    batch: &Batch,
+    row: usize,
+    pos: &EdgePos,
+    view: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> Result<Option<(FlakeValue, Sid, Option<String>)>> {
+    let ref_parts = |sid: Sid| (FlakeValue::Ref(sid), id_datatype_sid(), None);
+    match pos {
+        EdgePos::Const(sid) => Ok(Some(ref_parts(sid.clone()))),
+        EdgePos::Var(v) => {
+            let Some(b) = batch.get(row, *v) else {
+                return Ok(None);
+            };
+            match b {
+                Binding::Sid { sid, .. } => Ok(Some(ref_parts(sid.clone()))),
+                Binding::EncodedSid { .. } => {
+                    Ok(resolve_pos_ref(batch, row, pos, view)?.map(ref_parts))
+                }
+                Binding::Unbound | Binding::Poisoned => Ok(None),
+                other => {
+                    // Literal object: decode to (value, effective dt, lang).
+                    match crate::group_aggregate::materialize_encoded(other, view) {
+                        Binding::Lit { val, dtc, .. } => Ok(Some((
+                            val,
+                            dtc.datatype().clone(),
+                            dtc.lang_tag().map(str::to_string),
+                        ))),
+                        // Anything else (cross-ledger Iri, list/path/rel
+                        // values) has no arena key — the row matches no
+                        // reified edge.
+                        _ => Ok(None),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -364,25 +407,6 @@ pub(crate) fn resolve_pos_ref(
             ))),
         },
     }
-}
-
-/// Like [`resolve_pos_ref`] for the base edge's OBJECT position, where a
-/// non-ref binding is NOT a shape violation: a wildcard (`?s ?p ?o`)
-/// base scan also delivers literal-valued triples, which carry no
-/// probeable ref edge — `None` drops the row instead of erroring.
-pub(crate) fn resolve_obj_ref(
-    batch: &Batch,
-    row: usize,
-    pos: &EdgePos,
-    view: Option<&fluree_db_binary_index::BinaryGraphView>,
-) -> Result<Option<Sid>> {
-    if let EdgePos::Var(v) = pos {
-        match batch.get(row, *v) {
-            Some(Binding::Sid { .. } | Binding::EncodedSid { .. }) => {}
-            Some(_) | None => return Ok(None),
-        }
-    }
-    resolve_pos_ref(batch, row, pos, view)
 }
 
 /// Normalize a binding to a raw `Sid` — decoding late-materialized
@@ -747,8 +771,14 @@ impl AnnotationEdgeProbeOperator {
                 // filled per candidate.
                 Some(c) => {
                     let bound = match &rb[c] {
-                        Binding::Unbound | Binding::Poisoned => None,
-                        b => binding_sid(b, view.as_ref())?,
+                        // Poisoned rows join nothing (nested-loop parity);
+                        // a bound non-ref reifier matches no annotation.
+                        Binding::Poisoned => continue,
+                        Binding::Unbound => None,
+                        b => match binding_sid(b, view.as_ref())? {
+                            Some(sid) => Some(sid),
+                            None => continue,
+                        },
                     };
                     for ann in anns {
                         if bound.as_ref().is_some_and(|t| t != ann) {
@@ -1084,8 +1114,12 @@ impl HashAnnotationEdgeProbeOperator {
                 let p_bound_sid = match &self.p_pos {
                     EdgePos::Const(_) => None,
                     EdgePos::Var(v) => match batch.get(row, *v) {
+                        Some(Binding::Poisoned) => continue,
                         None | Some(Binding::Unbound) => None,
-                        Some(b) => binding_sid(b, view)?,
+                        Some(b) => match binding_sid(b, view)? {
+                            Some(sid) => Some(sid),
+                            None => continue,
+                        },
                     },
                 };
                 let o_key = row_key(&self.o_pos);
@@ -1100,9 +1134,17 @@ impl HashAnnotationEdgeProbeOperator {
                 // unify with it, not be overwritten by it. Without this,
                 // every candidate emitted a row stamped with the child's
                 // binding (W3C sparql12 eval-triple-terms pattern-8).
+                // Poisoned = a failed upstream OPTIONAL: join semantics
+                // drop the row (the nested-loop join skips poisoned rows)
+                // — never treat it as a wildcard. A bound non-ref reifier
+                // can match no annotation, so it too joins nothing.
                 let bound_ann: Option<Sid> = match batch.get(row, self.ann_var) {
-                    None | Some(Binding::Unbound | Binding::Poisoned) => None,
-                    Some(b) => binding_sid(b, view)?,
+                    Some(Binding::Poisoned) => continue,
+                    None | Some(Binding::Unbound) => None,
+                    Some(b) => match binding_sid(b, view)? {
+                        Some(sid) => Some(sid),
+                        None => continue,
+                    },
                 };
                 for edge in row_edges {
                     if p_bound_sid.as_ref().is_some_and(|ps| *ps != edge.p_sid) {
