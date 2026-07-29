@@ -773,8 +773,13 @@ struct PrefixCheck {
     /// or a comment from matching; this flag only decides *where in the token
     /// stream* a match may begin.
     at_token_start: bool,
-    /// Current match position into one of the keywords.
+    /// Current match position into the keywords still viable.
     match_pos: usize,
+    /// Bitmask of keywords still consistent with the bytes seen so far.
+    ///
+    /// A set rather than a single index because `@prefix` and `@base` share a
+    /// first byte; see the matcher for what committing to one cost.
+    candidates: u8,
     /// Which keyword we're trying to match (index into KEYWORDS).
     match_keyword: usize,
     /// All keyword bytes matched; waiting for a delimiter to confirm.
@@ -784,12 +789,51 @@ struct PrefixCheck {
 /// Keywords to detect (case-sensitive).
 const KEYWORDS: &[&[u8]] = &[b"@prefix", b"@base", b"PREFIX", b"BASE"];
 
+/// Whether `b` ends the current token, so a directive keyword may begin at the
+/// next byte.
+///
+/// Whitespace plus the punctuation that terminates or separates a Turtle term:
+/// `.` `;` `,` and the closers `] ) >` and `"`. Deliberately not "whitespace",
+/// which is what let `.@prefix` through — Turtle does not require space around
+/// its punctuation, and a directive written tight against a terminator is as
+/// corrupting to chunk as one on its own line.
+fn is_token_delimiter(b: u8) -> bool {
+    matches!(
+        b,
+        b'\n' | b'\r' | b' ' | b'\t' | b'.' | b';' | b',' | b']' | b')' | b'>' | b'"'
+    )
+}
+
+/// Whether a keyword is matched case-insensitively.
+///
+/// Turtle §6.5 makes the SPARQL-style `PREFIX`/`BASE` forms case-INsensitive
+/// and the `@`-prefixed forms case-SENSITIVE, and the lexer implements exactly
+/// that. This check matched everything case-sensitively, so `prefix` or
+/// `Prefix` mid-document lexed as a directive while the chunker saw ordinary
+/// data — the redefinition then reached only the first chunk and every later
+/// chunk resolved against the header binding. Silent wrong IRIs, from a
+/// spelling the grammar explicitly allows.
+fn keyword_is_case_insensitive(keyword: &[u8]) -> bool {
+    !keyword.starts_with(b"@")
+}
+
+/// Compare one keyword byte, honouring that keyword's case rule.
+fn keyword_byte_matches(keyword: &[u8], at: usize, b: u8) -> bool {
+    let expected = keyword[at];
+    if keyword_is_case_insensitive(keyword) {
+        expected.eq_ignore_ascii_case(&b)
+    } else {
+        expected == b
+    }
+}
+
 impl PrefixCheck {
     fn new() -> Self {
         Self {
             data_started: false,
             at_token_start: true,
             match_pos: 0,
+            candidates: 0,
             match_keyword: usize::MAX,
             awaiting_delimiter: false,
         }
@@ -813,59 +857,74 @@ impl PrefixCheck {
             // Not a delimiter — false alarm (e.g. "BASELINE"), reset.
             self.match_keyword = usize::MAX;
             self.match_pos = 0;
+            self.candidates = 0;
             self.at_token_start = false;
             self.data_started = true;
             return Ok(());
         }
 
         match b {
-            // Any whitespace ends a token and opens the next. A keyword has
-            // none internally, so an in-flight match is abandoned here.
-            b'\n' | b'\r' | b' ' | b'\t' => {
+            // Anything that ends a token opens the next one. Whitespace is the
+            // common case, but Turtle needs none: `ex:a ex:p "1".@prefix ex:
+            // <...> .` is legal and evaded a whitespace-only rule. A keyword
+            // has no internal delimiters, so an in-flight match is abandoned
+            // here either way.
+            b if is_token_delimiter(b) => {
                 self.at_token_start = true;
                 self.match_pos = 0;
+                self.candidates = 0;
                 self.match_keyword = usize::MAX;
             }
             _ => {
-                if self.at_token_start && self.match_pos == 0 {
-                    // Try to start matching a keyword.
-                    for (i, kw) in KEYWORDS.iter().enumerate() {
-                        if b == kw[0] {
+                // Every keyword still viable, as a bitmask. Tracking one
+                // candidate could not work: `@prefix` and `@base` share their
+                // first byte, so committing to whichever matched first meant
+                // `@base` was never reachable — it mismatched `@prefix` at
+                // byte 1 and reset. `@base` mid-document therefore evaded
+                // detection entirely.
+                let advancing = if self.at_token_start && self.match_pos == 0 {
+                    self.candidates = KEYWORDS
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, kw)| keyword_byte_matches(kw, 0, b))
+                        .fold(0u8, |mask, (i, _)| mask | (1 << i));
+                    true
+                } else {
+                    self.candidates != 0
+                };
+
+                if advancing {
+                    if self.match_pos > 0 {
+                        self.candidates = KEYWORDS
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, kw)| {
+                                self.candidates & (1 << i) != 0
+                                    && self.match_pos < kw.len()
+                                    && keyword_byte_matches(kw, self.match_pos, b)
+                            })
+                            .fold(0u8, |mask, (i, _)| mask | (1 << i));
+                    }
+                    if self.candidates != 0 {
+                        self.match_pos += 1;
+                        // A candidate that has run out of bytes is a complete
+                        // keyword; the delimiter that follows confirms it.
+                        if let Some(i) = (0..KEYWORDS.len()).find(|i| {
+                            self.candidates & (1 << i) != 0 && self.match_pos >= KEYWORDS[*i].len()
+                        }) {
                             self.match_keyword = i;
-                            self.match_pos = 1;
-                            if self.match_pos >= kw.len() {
-                                // Single-byte keyword (shouldn't happen with current set,
-                                // but handle for correctness).
-                                self.awaiting_delimiter = true;
-                            }
+                            self.awaiting_delimiter = true;
                             self.at_token_start = false;
                             self.data_started = true;
                             return Ok(());
                         }
-                    }
-                    // No keyword match — just data.
-                    self.at_token_start = false;
-                    self.data_started = true;
-                } else if self.match_keyword < KEYWORDS.len() {
-                    let kw = KEYWORDS[self.match_keyword];
-                    if self.match_pos < kw.len() && b == kw[self.match_pos] {
-                        self.match_pos += 1;
-                        if self.match_pos >= kw.len() {
-                            // All keyword bytes matched — need delimiter confirmation.
-                            self.awaiting_delimiter = true;
-                            return Ok(());
-                        }
                     } else {
-                        // Mismatch — reset.
-                        self.match_keyword = usize::MAX;
                         self.match_pos = 0;
                     }
-                    self.at_token_start = false;
-                    self.data_started = true;
-                } else {
-                    self.at_token_start = false;
-                    self.data_started = true;
                 }
+
+                self.at_token_start = false;
+                self.data_started = true;
             }
         }
         Ok(())
@@ -2582,6 +2641,82 @@ ex:carol ex:name \"Carol\" .\n";
             "a mid-line directive evaded detection; later chunks would resolve \
              ex: against the header binding and be silently wrong"
         );
+    }
+
+    #[test]
+    fn every_spelling_the_lexer_accepts_is_detected() {
+        // Turtle §6.5: the SPARQL-style forms are case-INsensitive, the
+        // @-forms are case-sensitive, and the lexer implements exactly that.
+        // The chunker matched everything case-sensitively, so `prefix` or
+        // `Prefix` lexed as a directive while the chunker saw ordinary data —
+        // the redefinition reached only the first chunk and every later chunk
+        // resolved against the header binding. Silent wrong IRIs, from a
+        // spelling the grammar explicitly allows.
+        for spelling in [
+            "@prefix ex: <http://second.example/> .",
+            "@base <http://second.example/> .",
+            "PREFIX ex: <http://second.example/>",
+            "prefix ex: <http://second.example/>",
+            "Prefix ex: <http://second.example/>",
+            "BASE <http://second.example/>",
+            "base <http://second.example/>",
+            "Base <http://second.example/>",
+        ] {
+            let ttl = format!(
+                "@prefix ex: <http://first.example/> .\n\
+                 ex:a ex:p \"1\" .\n\
+                 {spelling}\n\
+                 ex:b ex:p \"2\" .\n"
+            );
+            assert!(
+                matches!(
+                    chunk_in_memory(&ttl, 10),
+                    Err(SplitError::PrefixAfterData { .. })
+                ),
+                "spelling {spelling:?} evaded detection"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directive_tight_against_a_terminator_is_detected() {
+        // Turtle needs no space around punctuation, so a token can begin
+        // straight after `.`, `;`, `,` or a closer. A whitespace-only notion
+        // of "token start" let all of these through.
+        for tight in [
+            "ex:a ex:p \"1\".@prefix ex: <http://second.example/> .",
+            "ex:a ex:p \"1\";@prefix ex: <http://second.example/> .",
+            "ex:a ex:p [ ex:q \"1\" ].@prefix ex: <http://second.example/> .",
+            "ex:a ex:p <http://e/o>.PREFIX ex: <http://second.example/>",
+        ] {
+            let ttl =
+                format!("@prefix ex: <http://first.example/> .\n{tight}\nex:b ex:p \"2\" .\n");
+            assert!(
+                matches!(
+                    chunk_in_memory(&ttl, 10),
+                    Err(SplitError::PrefixAfterData { .. })
+                ),
+                "tight form {tight:?} evaded detection"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_that_merely_starts_like_a_keyword_is_not_one() {
+        // `BASELINE` and friends must not trip the check, in any case, and the
+        // delimiter requirement is what keeps them out.
+        for benign in [
+            "ex:a ex:p \"BASELINE\" .",
+            "ex:a ex:baseline \"x\" .",
+            "ex:a ex:p ex:prefixed .",
+            "ex:prefixthing ex:p \"x\" .",
+        ] {
+            let ttl = format!("@prefix ex: <http://e/> .\n{benign}\nex:b ex:p \"2\" .\n");
+            assert!(
+                chunk_in_memory(&ttl, 10).is_ok(),
+                "benign text {benign:?} was mistaken for a directive"
+            );
+        }
     }
 
     #[test]
