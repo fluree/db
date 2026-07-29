@@ -53,16 +53,7 @@ pub const RDF11_TURTLE: &[&str] = &[
     // A1 (repeated `;` as empty predicateObjectList items) — FIXED, entries
     // removed with the fix.
     // A2 (PN_LOCAL interior dots) — FIXED, entry removed with the fix.
-    // ---------------------------------------------------------------------
-    // A3. PARSER BUG — a RELATIVE `@base` must be resolved against the
-    // in-scope base (RFC 3986 §5.1.1), and a relative prefix namespace
-    // against the base current at the `@prefix`. `@base <foo/>` under
-    // `http://example.org/ns/` must yield `http://example.org/ns/foo/`; the
-    // parser instead installs the relative reference verbatim, so every
-    // subsequent IRI comes out mangled (`<:foo/a3>`). Silent data corruption
-    // in a converter, not just a failed test. (1)
-    // ---------------------------------------------------------------------
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-subm-27",
+    // A3 (relative @base resolution) — FIXED, entry removed with the fix.
     // ---------------------------------------------------------------------
     // B. PARSER BUG — directive keyword case. Turtle has two directive
     // spellings with DIFFERENT case rules: `@base`/`@prefix` are lowercase

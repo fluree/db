@@ -681,6 +681,25 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         };
         self.advance()?;
 
+        // RFC 3986 §5.1.1: a base declared relative resolves against the base
+        // already in scope — `@base <foo/>` under `http://example.org/ns/` is
+        // `http://example.org/ns/foo/`. Installing the reference verbatim
+        // instead does not fail loudly; it silently mangles every IRI in the
+        // rest of the document, which is a converter writing wrong data.
+        //
+        // The mangling had a distinctive shape worth recording, because it is
+        // what the symptom looks like if this ever regresses: every later IRI
+        // came out with a LEADING COLON (`<:foo/a3>`). Nothing prepends that
+        // colon as a separate bug. With the base left as `foo/`,
+        // `fluree_vocab::iri::parse_iri_components` finds no `:`, so it
+        // reports an EMPTY scheme and treats the whole string as the path;
+        // §5.3 recomposition then unconditionally emits `scheme ":"`, and an
+        // empty scheme prints as a bare `:`. Verified directly:
+        // `resolve_iri("foo/", "a3") == ":foo/a3"`. The resolver is behaving
+        // as specified for an input that cannot occur once the base is
+        // guaranteed absolute — which is what this line guarantees.
+        let base_iri = self.resolve_iri(&base_iri)?;
+
         // Set base
         self.sink_on_base(&base_iri);
         self.base = Some(base_iri);
@@ -1651,6 +1670,62 @@ mod tests {
         assert!(
             matches!(&triple.p, Term::Iri(iri) if iri.as_ref() == "http://xmlns.com/foaf/0.1/name")
         );
+    }
+
+    /// A relative `@base` resolves against the base in scope (RFC 3986
+    /// §5.1.1), and the resolution COMPOUNDS across redeclarations. W3C:
+    /// `turtle-subm-27`.
+    #[test]
+    fn test_relative_base_resolves_against_the_in_scope_base() {
+        let input = r"
+            @base <http://example.org/ns/> .
+            <a2> <b2> <c2> .
+            @base <foo/> .
+            <a3> <b3> <c3> .
+            @base <bar/> .
+            <a4> <b4> <c4> .
+        ";
+        let graph = parse_to_graph(input).unwrap();
+
+        let subjects: Vec<&str> = graph.iter().filter_map(|t| t.s.as_iri()).collect();
+        assert_eq!(
+            subjects,
+            vec![
+                "http://example.org/ns/a2",
+                "http://example.org/ns/foo/a3",
+                // Nested: `bar/` resolves against `.../ns/foo/`, not `.../ns/`.
+                "http://example.org/ns/foo/bar/a4",
+            ]
+        );
+    }
+
+    /// A relative prefix namespace resolves against the base current at the
+    /// `@prefix`, including a base that was itself relative.
+    #[test]
+    fn test_relative_prefix_namespace_follows_a_relative_base() {
+        let input = r"
+            @base <http://example.org/ns/> .
+            @base <foo/> .
+            @prefix p: <bar#> .
+            p:a4 p:b4 p:c4 .
+        ";
+        let graph = parse_to_graph(input).unwrap();
+        let triple = graph.iter().next().unwrap();
+        assert_eq!(
+            triple.s.as_iri(),
+            Some("http://example.org/ns/foo/bar#a4")
+        );
+    }
+
+    /// A relative base with nothing to resolve against is an error, not a
+    /// verbatim install — the failure mode this fix exists to remove.
+    #[test]
+    fn test_relative_base_without_a_base_is_an_error() {
+        let input = r"
+            @base <foo/> .
+            <a> <b> <c> .
+        ";
+        assert!(parse_to_graph(input).is_err());
     }
 
     /// `predicateObjectList`'s tail item is optional, so a run of semicolons
