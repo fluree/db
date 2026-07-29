@@ -119,7 +119,13 @@ impl NTriplesCollector {
     /// The lines as a sorted, de-duplicated set — the canonical form for a set
     /// comparison against another graph's N-Triples (RDF graphs are sets).
     pub fn sorted_unique(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.lines.iter().cloned().collect::<HashSet<_>>().into_iter().collect();
+        let mut v: Vec<String> = self
+            .lines
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         v.sort();
         v
     }
@@ -343,11 +349,11 @@ pub fn emit_batch(
 
         // Predicate-object maps.
         for (i, pom) in tm.predicate_object_maps.iter().enumerate() {
-            let predicate =
-                match materialize_predicate_from_batch(&pom.predicate_map, batch, row)? {
-                    Some(p) => p,
-                    None => continue, // null templated/column predicate → no triple
-                };
+            let predicate = match materialize_predicate_from_batch(&pom.predicate_map, batch, row)?
+            {
+                Some(p) => p,
+                None => continue, // null templated/column predicate → no triple
+            };
 
             match &pom.object_map {
                 ObjectMap::RefObjectMap(rom) => {
@@ -422,10 +428,11 @@ pub fn dependency_order(mapping: &CompiledR2rmlMapping) -> (Vec<String>, Vec<Str
     }
 
     // Kahn's algorithm; process the ready set in sorted order for determinism.
-    let mut indeg: HashMap<String, usize> =
-        iris.iter().map(|i| (i.clone(), parents_of[i].len())).collect();
-    let mut queue: VecDeque<String> =
-        iris.iter().filter(|i| indeg[*i] == 0).cloned().collect();
+    let mut indeg: HashMap<String, usize> = iris
+        .iter()
+        .map(|i| (i.clone(), parents_of[i].len()))
+        .collect();
+    let mut queue: VecDeque<String> = iris.iter().filter(|i| indeg[*i] == 0).cloned().collect();
     let mut order: Vec<String> = Vec::with_capacity(iris.len());
     while let Some(n) = queue.pop_front() {
         order.push(n.clone());
@@ -444,7 +451,11 @@ pub fn dependency_order(mapping: &CompiledR2rmlMapping) -> (Vec<String>, Vec<Str
     }
 
     let placed: HashSet<&String> = order.iter().collect();
-    let mut cyclic: Vec<String> = iris.iter().filter(|i| !placed.contains(i)).cloned().collect();
+    let mut cyclic: Vec<String> = iris
+        .iter()
+        .filter(|i| !placed.contains(i))
+        .cloned()
+        .collect();
     cyclic.sort();
     (order, cyclic)
 }
@@ -691,13 +702,19 @@ mod tests {
         assert_eq!(triples, expected, "materialized triple set mismatch");
 
         // Stats cross-check.
-        assert_eq!(stats.type_triples, 7, "2 customers×2 classes + 3 orders×1 class");
+        assert_eq!(
+            stats.type_triples, 7,
+            "2 customers×2 classes + 3 orders×1 class"
+        );
         assert_eq!(stats.data_triples, 1 /*Acme name*/ + 3 /*amounts*/);
         assert_eq!(stats.ref_triples, 1, "only order 1 matches a customer");
         // order 2 (cust 99) is a present-but-unmatched FK = dangling; order 3's
         // FK is NULL (no reference intended), skipped like a null object — not
         // counted as dangling. Both correctly produce no placedBy edge.
-        assert_eq!(stats.ref_dangling, 1, "order 2 (99) only; order 3 FK is null");
+        assert_eq!(
+            stats.ref_dangling, 1,
+            "order 2 (99) only; order 3 FK is null"
+        );
         assert_eq!(stats.null_objects, 1, "customer 20 name is null");
         assert_eq!(
             *stats
@@ -715,7 +732,10 @@ mod tests {
         assert!(cyclic.is_empty());
         let cust = order.iter().position(|i| i == "<#Customer>").unwrap();
         let ord = order.iter().position(|i| i == "<#Order>").unwrap();
-        assert!(cust < ord, "parent Customer must precede child Order: {order:?}");
+        assert!(
+            cust < ord,
+            "parent Customer must precede child Order: {order:?}"
+        );
     }
 
     #[test]
@@ -793,7 +813,9 @@ mod tests {
             &"<http://ex.org/visit/1> <http://ex.org/atSite> <http://ex.org/site/EU-A1> ."
                 .to_string()
         ));
-        assert!(!triples.iter().any(|t| t.contains("visit/2") && t.contains("atSite")));
+        assert!(!triples
+            .iter()
+            .any(|t| t.contains("visit/2") && t.contains("atSite")));
     }
 
     #[test]
@@ -835,8 +857,7 @@ mod tests {
     #[test]
     fn null_subject_key_drops_entire_row() {
         let mut tm = TriplesMap::new("<#T>", "dw.t");
-        tm.subject_map =
-            SubjectMap::template("http://ex.org/t/{id}").with_class("http://ex.org/T");
+        tm.subject_map = SubjectMap::template("http://ex.org/t/{id}").with_class("http://ex.org/T");
         tm.predicate_object_maps = vec![PredicateObjectMap {
             predicate_map: PredicateMap::constant("http://ex.org/p"),
             object_map: ObjectMap::column("v"),
@@ -883,10 +904,7 @@ mod tests {
             },
             PredicateObjectMap {
                 predicate_map: PredicateMap::constant("http://ex.org/homepage"),
-                object_map: ObjectMap::template(
-                    "http://ex.org/page/{id}",
-                    vec!["id".to_string()],
-                ),
+                object_map: ObjectMap::template("http://ex.org/page/{id}", vec!["id".to_string()]),
             },
         ];
         let mapping = CompiledR2rmlMapping::new(vec![tm]);
@@ -905,9 +923,8 @@ mod tests {
         let mut batches = HashMap::new();
         batches.insert("<#T>".to_string(), vec![batch]);
         let (triples, _stats) = run(&mapping, &batches);
-        assert!(triples.contains(
-            &"<http://ex.org/t/1> <http://ex.org/label> \"Hello\"@en .".to_string()
-        ));
+        assert!(triples
+            .contains(&"<http://ex.org/t/1> <http://ex.org/label> \"Hello\"@en .".to_string()));
         assert!(triples.contains(
             &"<http://ex.org/t/1> <http://ex.org/kind> <http://ex.org/Widget> .".to_string()
         ));

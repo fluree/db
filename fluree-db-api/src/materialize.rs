@@ -600,7 +600,12 @@ where
 
     // Pin-all pre-pass — pin every table's snapshot before emission so the
     // watermark is complete and cross-table skew is bounded to seconds (§17(a)).
+    let pin_start = std::time::Instant::now();
     pin_all_tables(provider, graph_source_id, &mapping).await?;
+    tracing::info!(
+        pin_ms = pin_start.elapsed().as_millis() as u64,
+        "materialize.phase pin_all_tables"
+    );
 
     // Pass 1 — pre-index cyclic / self-referential parents (no triples emitted).
     for tm_iri in &materialization.preindex {
@@ -628,6 +633,7 @@ where
     let mut chunker = ChunkingObserver::new(chunk_size_bytes);
     let mut next_idx = 0usize;
     let mut pending: Option<Vec<OwnedTriple>> = None;
+    let mut encode_ms: u128 = 0;
 
     for tm_iri in &materialization.emit_order {
         let Some(tm) = mapping.triples_maps.get(tm_iri) else {
@@ -638,6 +644,8 @@ where
             .ok_or_else(|| MaterializeError::NoTable(tm.iri.clone()))?;
         let projection = scan_projection(tm, &parents);
         let lazy_index = !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
+        let table_start = std::time::Instant::now();
+        let triples_before = stats.total_triples();
         let mut stream = provider
             .scan_table(graph_source_id, table, &projection, &[], None, None)
             .await?;
@@ -652,7 +660,9 @@ where
                 // as a non-final chunk, keeping the last group for the stamp.
                 if let Some(prev) = pending.replace(triples) {
                     let t = (next_idx + 1) as i64;
+                    let enc = std::time::Instant::now();
                     let parsed = build_virtual_chunk(&prev, ctx, t, next_idx, None)?;
+                    encode_ms += enc.elapsed().as_millis();
                     if !emit_chunk(next_idx, parsed) {
                         return Ok(stats);
                     }
@@ -660,6 +670,12 @@ where
                 }
             }
         }
+        tracing::info!(
+            table = %table,
+            scan_emit_ms = table_start.elapsed().as_millis() as u64,
+            triples = stats.total_triples() - triples_before,
+            "materialize.phase table_scan_emit"
+        );
     }
 
     // Assemble the twin's completion stamp now that every table is pinned and
@@ -678,7 +694,9 @@ where
     if let Some(triples) = chunker.take_final() {
         if let Some(prev) = pending.replace(triples) {
             let t = (next_idx + 1) as i64;
+            let enc = std::time::Instant::now();
             let parsed = build_virtual_chunk(&prev, ctx, t, next_idx, None)?;
+            encode_ms += enc.elapsed().as_millis();
             if !emit_chunk(next_idx, parsed) {
                 return Ok(stats);
             }
@@ -691,9 +709,17 @@ where
     // the last commit, a head-walk finds the stamp iff the build completed (§17(a)).
     let final_triples = pending.unwrap_or_default();
     let t = (next_idx + 1) as i64;
+    let enc = std::time::Instant::now();
     let parsed = build_virtual_chunk(&final_triples, ctx, t, next_idx, Some(&stamp))?;
+    encode_ms += enc.elapsed().as_millis();
     emit_chunk(next_idx, parsed);
 
+    tracing::info!(
+        encode_ms = encode_ms as u64,
+        chunks = next_idx + 1,
+        total_triples = stats.total_triples(),
+        "materialize.phase encode_total"
+    );
     Ok(stats)
 }
 
@@ -797,19 +823,31 @@ where
     // normalization (e.g. a stored `xsd:decimal` re-rendering "5.00" as "5") is
     // not misreported as a divergence.
     let mut collector = NTriplesCollector::default();
+    let oracle_start = std::time::Instant::now();
     materialize_graph(provider, graph_source_id, &mut collector).await?;
     let source: BTreeSet<String> = collector
         .sorted_unique()
         .into_iter()
         .map(|t| canonicalize_numeric_nt(&t))
         .collect();
+    tracing::info!(
+        verify_oracle_ms = oracle_start.elapsed().as_millis() as u64,
+        source_triples = source.len(),
+        "materialize.phase verify_source_oracle"
+    );
 
     // Twin side: read every default-graph triple back and render identically.
+    let twin_start = std::time::Instant::now();
     let twin: BTreeSet<String> = read_twin_ntriples(fluree, ledger)
         .await?
         .into_iter()
         .map(|t| canonicalize_numeric_nt(&t))
         .collect();
+    tracing::info!(
+        verify_twin_read_ms = twin_start.elapsed().as_millis() as u64,
+        twin_triples = twin.len(),
+        "materialize.phase verify_twin_read"
+    );
 
     let mapping = provider.compiled_mapping(graph_source_id, None).await?;
     let classes: BTreeSet<String> = mapping
