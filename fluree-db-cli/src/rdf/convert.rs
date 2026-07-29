@@ -19,11 +19,11 @@ use crate::cli::{BnodePolicyArg, RdfCommonArgs};
 use crate::error::{CliError, CliResult};
 use crate::rdf::profile::{ProfileReport, RunContext};
 use crate::rdf::syntax::{split_compression, RdfSyntax};
-use crate::rdf::writer::AnyWriter;
+use crate::rdf::writer::{is_writable, AnyWriter};
 use crate::rdf::{self, destination, diagnostic, exit_document_invalid};
 use colored::Colorize;
 use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig, WriterStats};
-use fluree_graph_ir::{Phase, PhaseTimings};
+use fluree_graph_ir::{Phase, PhaseTimings, SinkError};
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
@@ -55,8 +55,13 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     let target = resolve_output_syntax(args.to, args.output)?;
 
     if args.pretty && target != RdfSyntax::Turtle {
+        // Blame the syntax the way it was actually chosen. "--to nquads has no
+        // pretty form" reads as a lie to someone who never passed --to.
         return Err(CliError::Usage(format!(
-            "--pretty applies to turtle output; --to {target} has no pretty form"
+            "--pretty applies to turtle output; {} has no pretty form\n  {} pass \
+             --to turtle, or drop --pretty",
+            describe_target(target, args.to, args.output),
+            "help:".cyan().bold(),
         )));
     }
     if args.pretty {
@@ -69,6 +74,16 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
              recurs later is not regrouped\n  {} drop --pretty for streaming output",
             "help:".cyan().bold(),
         )));
+    }
+
+    // Everything that can be refused without reading the input is refused
+    // here, BEFORE the destination is opened. `File::create` truncates, so a
+    // refusal after it destroys whatever `-o` pointed at — and a run that was
+    // never going to produce output should not be the thing that empties a
+    // file. What cannot move is a failure only the parse can discover; that
+    // one does leave a partial file, and the error says so.
+    if !is_writable(target) {
+        return Err(no_writer_error(target, args.to, args.output));
     }
 
     let mut timings = PhaseTimings::start();
@@ -90,9 +105,9 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     // and that error is the one saying the output is truncated.
     let mut out = run.sink.into_inner();
     timings.enter(Phase::Write);
-    let flushed = out
-        .flush()
-        .map_err(|e| CliError::Usage(format!("cannot write output: {e}")));
+    // Kept as an `io::Result` until after the broken-pipe check below, so the
+    // `ErrorKind` is still there to check.
+    let flushed = out.flush();
     timings.finish();
 
     let wall = timings.wall();
@@ -110,8 +125,18 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     if is_broken_pipe(&run.outcome, &run.finished, &flushed) {
         return Ok(());
     }
-    flushed?;
-    run.finished?;
+
+    // The writer's FIRST refusal, before the latch. The writers deliberately
+    // latch — a sink that failed once keeps failing rather than pretending —
+    // but the latched message ("this writer already refused an event") carries
+    // no cause. The cause is in the error the parse loop got, and reporting
+    // `finished` first threw it away in favour of the placeholder.
+    if let Some(fluree_graph_turtle::TurtleError::Sink(cause)) = &run.outcome.error {
+        return Err(refusal_error(cause));
+    }
+    flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
+    run.finished
+        .map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
 
     if let Some(err) = &run.outcome.error {
         report_parse_failure(&loaded, err, stats);
@@ -126,8 +151,11 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     }
 
     // A summary on the way to a file is useful; the same line beside piped
-    // data is noise, so it is only printed when the data went somewhere else.
-    if !quiet {
+    // data is noise. And under `--profile=json` stderr is not a place for
+    // prose at all — `2> run.json` is the bench lane's idiom, and one ✓ line
+    // ahead of the document makes the file unparseable.
+    let stderr_is_a_document = common.profile == Some(crate::rdf::profile::ProfileFormat::Json);
+    if !quiet && !stderr_is_a_document {
         if let Some(path) = args.output {
             eprintln!(
                 "{} {} statements → {} ({target})",
@@ -163,23 +191,134 @@ pub fn resolve_output_syntax(to: Option<RdfSyntax>, output: Option<&Path>) -> Cl
 ///
 /// A JSON-LD `@context` document works unchanged, which is the point — a user
 /// who already has one should not have to transcribe it.
+///
+/// Every namespace is checked for being an absolute IRI before it can reach a
+/// writer. Without that, `--prefixes '{"ok":"not an iri"}'` produced
+/// `@prefix ok: <not an iri> .` and exited 0 — a document this
+/// tool's own reader rejects, written by this tool, reported as a success.
+/// A converter that emits something it cannot read back has failed at the one
+/// thing it is for.
 fn load_prefixes(source: Option<&str>) -> CliResult<PrefixMap> {
     let Some(source) = source else {
         return Ok(PrefixMap::new());
     };
-    let text = if source.trim_start().starts_with('{') {
+    let trimmed = source.trim_start();
+    let text = if trimmed.starts_with('{') || trimmed.starts_with('[') {
         source.to_string()
     } else {
-        std::fs::read_to_string(source)
-            .map_err(|e| CliError::Usage(format!("cannot read prefixes from '{source}': {e}")))?
+        std::fs::read_to_string(source).map_err(|e| {
+            // Valid JSON that is not a path — `42`, `"x"`, `null` — is an
+            // argument, not a missing file, and saying "No such file" about it
+            // sends the reader looking in the wrong place entirely.
+            if serde_json::from_str::<serde_json::Value>(source).is_ok() {
+                return CliError::Usage(format!(
+                    "--prefixes must be a JSON object mapping prefix to namespace IRI, or a \
+                     JSON-LD @context, or a path to one; got {}",
+                    json_shape(&serde_json::from_str(source).unwrap_or(serde_json::Value::Null)),
+                ));
+            }
+            CliError::Usage(format!("cannot read prefixes from '{source}': {e}"))
+        })?
     };
     let json: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| CliError::Usage(format!("--prefixes is not valid JSON: {e}")))?;
+
     // A whole JSON-LD document, or just its context, or a bare prefix map:
     // `from_context` drops `@`-prefixed keys, so the wrapper has to come off
     // here or a real context file would silently yield no prefixes at all.
     let map = json.get("@context").unwrap_or(&json);
+    let Some(entries) = map.as_object() else {
+        // Valid JSON, wrong shape. Reported as such rather than let through to
+        // produce an empty prefix map, and distinct from the file-not-found
+        // message it used to collide with.
+        return Err(CliError::Usage(format!(
+            "--prefixes must be a JSON object mapping prefix to namespace IRI, or a \
+             JSON-LD @context; got {}\n  {} for example: \
+             --prefixes '{{\"ex\": \"http://example.org/\"}}'",
+            json_shape(map),
+            "help:".cyan().bold(),
+        )));
+    };
+
+    for (prefix, value) in entries {
+        if prefix.starts_with('@') {
+            continue; // a context term, not a prefix — `from_context` drops it
+        }
+        let Some(iri) = value.as_str() else {
+            continue; // likewise: a term definition object, not a namespace
+        };
+        if !fluree_vocab::iri::is_absolute_iri(iri) {
+            return Err(CliError::Usage(format!(
+                "--prefixes: namespace for '{prefix}' is not an absolute IRI: '{iri}'\n  \
+                 {} a namespace needs a scheme, like \"http://example.org/\" — a relative \
+                 or malformed one produces a document no RDF reader accepts",
+                "help:".cyan().bold(),
+            )));
+        }
+    }
+
     Ok(PrefixMap::from_context(map))
+}
+
+/// Namespace the writers reserve for blank nodes they mint under
+/// `--bnode-policy preserve`. A refusal mentioning it is a label collision,
+/// and has a remedy this CLI can name.
+const RESERVED_BNODE_NAMESPACE: &str = "fdbw-";
+
+/// Render a writer's refusal with its cause and, where one exists, a remedy in
+/// this CLI's vocabulary.
+fn refusal_error(cause: &fluree_graph_ir::SinkError) -> CliError {
+    let mut message = format!("the output is incomplete — the writer refused an event: {cause}");
+    if cause.to_string().contains(RESERVED_BNODE_NAMESPACE) {
+        message.push_str(&format!(
+            "\n  {} convert with --bnode-policy relabel, which renames every blank node \
+             and cannot collide",
+            "help:".cyan().bold(),
+        ));
+    }
+    CliError::Usage(message)
+}
+
+/// Refuse an unwritable target, blaming it the way it was chosen.
+fn no_writer_error(target: RdfSyntax, to: Option<RdfSyntax>, output: Option<&Path>) -> CliError {
+    CliError::Usage(format!(
+        "cannot write {target} yet — {}\n  {} writable today: turtle, ntriples, nquads, \
+         trig, jsonld ({})",
+        match target {
+            RdfSyntax::RdfXml => "the RDF/XML writer lands with the XML family",
+            RdfSyntax::RdfJson => "RDF/JSON lands with the XML family",
+            RdfSyntax::Jelly => "Jelly lands last in the format set",
+            _ => "no writer exists for it",
+        },
+        "help:".cyan().bold(),
+        describe_target(target, to, output),
+    ))
+}
+
+/// How the output syntax came to be what it is, for an error that blames it.
+fn describe_target(target: RdfSyntax, to: Option<RdfSyntax>, output: Option<&Path>) -> String {
+    if to.is_some() {
+        return format!("--to {target}");
+    }
+    if let Some(path) = output {
+        let (ext, _) = split_compression(path);
+        if ext.as_deref().and_then(RdfSyntax::from_extension).is_some() {
+            return format!("{target}, from the '{}' extension", path.display());
+        }
+    }
+    format!("no --to given, so the default {target}")
+}
+
+/// Name a JSON value's shape, for an error that has to explain what arrived.
+fn json_shape(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
 }
 
 impl From<BnodePolicyArg> for BlankNodeLabels {
@@ -219,21 +358,27 @@ fn attribute_serialize(timings: &mut PhaseTimings, outcome: &rdf::ParseOutcome) 
 /// behaviour, and what makes the tool usable in a shell at all.
 fn is_broken_pipe(
     outcome: &rdf::ParseOutcome,
-    finished: &CliResult<()>,
-    flushed: &CliResult<()>,
+    finished: &Result<(), fluree_graph_ir::SinkError>,
+    flushed: &std::io::Result<()>,
 ) -> bool {
+    // Every check is on `ErrorKind`, never on the message. `strerror` is
+    // localized by glibc under `LC_MESSAGES`, so a substring match for
+    // "Broken pipe" is a check that passes for whoever wrote it and fails for
+    // everyone running in another language — and the failure mode is a
+    // spurious error at the end of an ordinary `| head`.
     let in_parse = matches!(
         &outcome.error,
         Some(fluree_graph_turtle::TurtleError::Sink(e)) if e.is_broken_pipe()
     );
-    // `finished` and `flushed` have already been flattened into CliError, so
-    // the io::ErrorKind is gone and the message is what is left to match on.
-    let mentions_pipe = |r: &CliResult<()>| {
-        r.as_ref()
-            .err()
-            .is_some_and(|e| e.to_string().contains("Broken pipe"))
-    };
-    in_parse || mentions_pipe(finished) || mentions_pipe(flushed)
+    let at_finish = finished
+        .as_ref()
+        .err()
+        .is_some_and(SinkError::is_broken_pipe);
+    let at_flush = flushed
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe);
+    in_parse || at_finish || at_flush
 }
 
 fn report_parse_failure(
@@ -279,7 +424,6 @@ fn emit_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rdf::writer::is_writable;
 
     #[test]
     fn the_output_syntax_is_the_flag_then_the_extension_then_nquads() {

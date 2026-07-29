@@ -274,7 +274,8 @@ pub fn parse_document(
     // A sink failure is the pipeline's problem, not the document's — a broken
     // pipe or a full disk must not be reported as a syntax error. The discard
     // sink has none, but the shared path can.
-    run.finished?;
+    run.finished
+        .map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
     Ok(run.outcome)
 }
 
@@ -287,13 +288,19 @@ pub struct ParseRun<S> {
     /// anything buffering bytes — flush it where a failure can still be
     /// reported.
     pub sink: S,
-    /// The sink's `finish()` verdict.
+    /// The sink's `finish()` verdict, in the sink's own error type.
     ///
     /// Separate from [`ParseOutcome::error`] because the two mean opposite
     /// things: a parse error is the document's fault and a finish error is the
     /// destination's, and a converter that conflates them tells a user their
     /// RDF is broken when their disk is full.
-    pub finished: CliResult<()>,
+    ///
+    /// Deliberately NOT flattened into [`CliError`] here. Flattening loses the
+    /// [`std::io::ErrorKind`], which left callers matching the *text* of the
+    /// error to recognize a broken pipe — and glibc translates `strerror`
+    /// under `LC_MESSAGES`, so that check silently stops working in any locale
+    /// but the tester's.
+    pub finished: Result<(), fluree_graph_ir::SinkError>,
 }
 
 /// Parse a Turtle-family document into `sink`, timing and counting it.
@@ -350,7 +357,7 @@ pub fn parse_into<S: GraphSink>(
             error: result.err(),
         },
         sink: sink.into_inner(),
-        finished: finished.map_err(|e| CliError::Usage(format!("sink error: {e}"))),
+        finished,
     }
 }
 

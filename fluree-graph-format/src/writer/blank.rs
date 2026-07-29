@@ -137,7 +137,7 @@ impl BlankLabeler {
                     return Err(SinkError::rejected(format!(
                         "blank-node label `{input}` is inside the `_:{PRESERVE_MINT}` namespace \
                          this writer reserves for anonymous nodes; preserving it could merge it \
-                         with a minted node. Drop --preserve-bnode-labels to relabel instead."
+                         with a minted node. Relabel instead of preserving."
                     )));
                 }
                 if !is_blank_node_label(input) {
