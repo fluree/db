@@ -2283,3 +2283,177 @@ fn a_byte_order_mark_does_not_break_the_verbs() {
         .success()
         .stderr(predicate::str::contains("no syntax errors"));
 }
+
+// ============================================================================
+// parallel convert
+// ============================================================================
+
+/// A corpus big enough to clear the parallel threshold and split into chunks.
+fn parallel_corpus(statements: usize) -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..statements {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:name \"person {i}\" ; ex:age {} ; ex:note \"a longer literal to make the corpus wide enough to chunk {i}\" .\n",
+            i % 90
+        ));
+    }
+    ttl
+}
+
+#[test]
+fn parallelism_does_not_change_the_output_bytes() {
+    // The gate the whole parallel design is built around. A user must be able
+    // to change --parallelism without re-verifying their pipeline.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &parallel_corpus(30_000));
+
+    let convert_with = |threads: &str, out: &str| -> Vec<u8> {
+        let path = tmp.path().join(out);
+        rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(&path)
+            .assert()
+            .success();
+        std::fs::read(&path).unwrap()
+    };
+
+    let serial = convert_with("1", "serial.nt");
+    assert!(
+        serial.len() > 4 * 1024 * 1024,
+        "corpus must clear the threshold"
+    );
+    for threads in ["2", "4", "8"] {
+        assert_eq!(
+            serial,
+            convert_with(threads, &format!("p{threads}.nt")),
+            "--parallelism {threads} changed the output"
+        );
+    }
+}
+
+#[test]
+fn a_blank_node_named_in_two_chunks_stays_one_node_through_the_cli() {
+    // Turtle scopes a labelled blank node to the document. Split across
+    // chunks, independent relabellers would give it two output labels.
+    let tmp = TempDir::new().unwrap();
+    let mut ttl =
+        String::from("@prefix ex: <http://example.org/> .\n_:shared ex:role \"first\" .\n");
+    ttl.push_str(
+        &parallel_corpus(30_000)
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    ttl.push_str("\n_:shared ex:role \"last\" .\n");
+    let input = fixture(&tmp, "shared.ttl", &ttl);
+
+    let out = tmp.path().join("out.nt");
+    rdf_cmd()
+        .args(["--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success();
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let label_for = |role: &str| -> String {
+        text.lines()
+            .find(|l| l.contains(role))
+            .and_then(|l| l.split_whitespace().next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let first = label_for("\"first\"");
+    assert!(
+        first.starts_with("_:"),
+        "expected a blank subject, got {first}"
+    );
+    assert_eq!(
+        first,
+        label_for("\"last\""),
+        "`_:shared` was split into two nodes across chunks"
+    );
+}
+
+#[test]
+fn a_syntax_that_chunking_would_change_falls_back_to_serial() {
+    // Turtle folds consecutive same-subject runs, so a chunk boundary inside
+    // one changes the bytes. The run must still succeed — serially — rather
+    // than either refusing or silently producing different output.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &parallel_corpus(20_000));
+
+    let with = |threads: &str, out: &str| -> Vec<u8> {
+        let path = tmp.path().join(out);
+        rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "turtle"])
+            .arg("-o")
+            .arg(&path)
+            .assert()
+            .success();
+        std::fs::read(&path).unwrap()
+    };
+    assert_eq!(
+        with("1", "s.ttl"),
+        with("8", "p.ttl"),
+        "turtle output must be identical whatever --parallelism says, because \
+         it is produced serially either way"
+    );
+}
+
+#[test]
+fn the_profile_reports_the_parallel_decision_and_its_phases() {
+    let tmp = TempDir::new().unwrap();
+    // Comfortably over the parallel input-size threshold.
+    let input = fixture(&tmp, "big.ttl", &parallel_corpus(60_000));
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "4", "-q", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    // The decision itself is reported, so "why is this not using my cores" is
+    // answerable from the outside.
+    assert_eq!(
+        v["host"]["threads_used"], 4,
+        "reason: {}",
+        v["host"]["parallel_reason"]
+    );
+    assert_eq!(v["host"]["parallel_reason"], "parallel");
+
+    let phases: Vec<&str> = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["phase"].as_str().unwrap())
+        .collect();
+    assert!(phases.contains(&"workers"), "phases: {phases:?}");
+    assert!(phases.contains(&"reassembly"), "phases: {phases:?}");
+
+    // Worker time is a cross-thread sum, so it may exceed wall — and must not
+    // have been folded into the sequential total.
+    let unattributed = v["unattributed_ns"].as_u64().unwrap();
+    let wall = v["wall_ns"].as_u64().unwrap();
+    assert!(
+        unattributed <= wall,
+        "unattributed {unattributed} > wall {wall}"
+    );
+}

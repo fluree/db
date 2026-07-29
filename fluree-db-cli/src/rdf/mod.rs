@@ -16,6 +16,7 @@ pub mod count;
 pub mod destination;
 pub mod diagnostic;
 pub mod input;
+pub mod parallel;
 pub mod profile;
 pub mod syntax;
 pub mod writer;
@@ -32,7 +33,7 @@ use std::time::Duration;
 use syntax::{RdfSyntax, Resolved};
 
 /// Dispatch an `rdf` subcommand.
-pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
+pub fn run(action: &RdfAction, quiet: bool, parallelism: usize) -> CliResult<()> {
     let common = match action {
         RdfAction::Convert { common, .. }
         | RdfAction::Check { common, .. }
@@ -56,6 +57,7 @@ pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
                 pretty: *pretty,
                 bnode_policy: *bnode_policy,
                 prefixes: prefixes.as_deref(),
+                parallelism,
             },
             quiet,
         ),
@@ -425,6 +427,58 @@ pub fn parse_into<S: GraphSink>(
     }
 }
 
+/// Parse across threads and replay into `sink`, in the shape [`parse_into`]
+/// returns so the two paths are interchangeable at the call site.
+///
+/// The sink is written on this thread only — see [`parallel`] for why that is
+/// a correctness requirement and not a simplification.
+pub fn parse_into_parallel<S: GraphSink>(
+    text: &str,
+    base: Option<&str>,
+    sink: S,
+    config: parallel::ParallelConfig,
+    timings: &mut PhaseTimings,
+) -> ParseRun<S> {
+    let mut sink = TimingSink::with_corpus(sink, text.as_bytes());
+
+    timings.enter(Phase::Parse);
+    let outcome = parallel::convert_parallel(text, base, &mut sink, config);
+    let finished = sink.finish();
+    timings.finish();
+
+    // Worker parse time is a sum across threads, so it exceeds the wall clock
+    // by roughly the speedup. Recorded on its own lane rather than added to
+    // Parse, which would claim more wall than the run took.
+    let (error, workers_nanos, wait_nanos) = match outcome {
+        Ok(o) => (o.error, o.worker_parse_nanos, o.reassembly_wait_nanos),
+        // A chunking failure is a usage problem, not a parse error; surface it
+        // through `finished` so the caller reports it as the pipeline's.
+        Err(e) => {
+            return ParseRun {
+                outcome: ParseOutcome {
+                    counts: sink.counts(),
+                    sink: sink.sink_timing(),
+                    error: None,
+                },
+                sink: sink.into_inner(),
+                finished: Err(fluree_graph_ir::SinkError::rejected(e.to_string())),
+            };
+        }
+    };
+    timings.set(Phase::Workers, Duration::from_nanos(workers_nanos as u64));
+    timings.set(Phase::Reassembly, Duration::from_nanos(wait_nanos as u64));
+
+    ParseRun {
+        outcome: ParseOutcome {
+            counts: sink.counts(),
+            sink: sink.sink_timing(),
+            error,
+        },
+        sink: sink.into_inner(),
+        finished,
+    }
+}
+
 /// Emit `--profile` or `--time` for a finished run.
 ///
 /// Shared by every verb, and called on the failure path as well as the success
@@ -453,6 +507,10 @@ pub fn report_run(
             // `wall_ns` docs for what the measured window covers.
             sha256: (!common.no_hash).then(|| profile::sha256_hex(&loaded.text)),
             validate: !common.nocheck,
+            // check and count parse on the calling thread; only convert has a
+            // parallel path.
+            threads_used: 1,
+            parallel_reason: "verb parses on the calling thread",
         };
         profile::ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink)
             .emit(format)?;

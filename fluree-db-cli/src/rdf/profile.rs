@@ -65,6 +65,12 @@ pub struct RunContext {
     /// worth benchmarking against validates by default, so an unlabelled
     /// `--nocheck` figure would be a faster answer to an easier question.
     pub validate: bool,
+    /// Threads that parsed. One is the serial path.
+    pub threads_used: usize,
+    /// Why that thread count — "parallel", or the reason the serial path was
+    /// taken. Reported because "why is this not using my cores" has no other
+    /// answer from outside the process.
+    pub parallel_reason: &'static str,
 }
 
 #[derive(Serialize)]
@@ -82,6 +88,8 @@ struct HostInfo {
     /// single-threaded number is never mistaken for a saturated one.
     available_parallelism: usize,
     threads_used: usize,
+    /// Why `threads_used` is what it is.
+    parallel_reason: &'static str,
     /// Peak resident set size for the process, in bytes, normalized across
     /// platforms. `None` where it cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -363,11 +371,13 @@ impl ProfileReport {
             .filter(|e| e.ns > 0)
             .collect();
 
-        // The sink runs inside the parse, so it is not part of the sequential
-        // sum; counting it would make "unattributed" negative on a fast run.
-        let sequential: u128 = Phase::ALL
+        // Only the phases that run one after another. The sink, serializer,
+        // writer and both parallel phases run INSIDE the parse, and `workers`
+        // is a cross-thread sum that exceeds the wall clock on any run that
+        // scales — counting them would claim more time than the run took and
+        // saturate the gap that is meant to reveal unmeasured work.
+        let sequential: u128 = Phase::SEQUENTIAL
             .into_iter()
-            .filter(|p| *p != Phase::Sink)
             .map(|p| timings.elapsed(p).as_nanos())
             .sum();
 
@@ -395,9 +405,8 @@ impl ProfileReport {
                 host_class: host_class(),
                 available_parallelism: std::thread::available_parallelism()
                     .map_or(1, std::num::NonZeroUsize::get),
-                // `check` and `count` parse on the calling thread. The
-                // parallel pipeline reports its real width here.
-                threads_used: 1,
+                threads_used: ctx.threads_used,
+                parallel_reason: ctx.parallel_reason,
                 peak_rss_bytes: peak_rss_bytes(),
             },
             corpus: CorpusInfo {
@@ -671,6 +680,8 @@ mod tests {
             bytes_decoded: 4096,
             sha256: Some("abc123".to_string()),
             validate: true,
+            threads_used: 1,
+            parallel_reason: "verb parses on the calling thread",
         }
     }
 

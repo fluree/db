@@ -17,6 +17,7 @@
 
 use crate::cli::{BnodePolicyArg, RdfCommonArgs};
 use crate::error::{CliError, CliResult};
+use crate::rdf::parallel::ParallelConfig;
 use crate::rdf::profile::{ProfileReport, RunContext};
 use crate::rdf::syntax::{split_compression, RdfSyntax};
 use crate::rdf::writer::{is_writable, AnyWriter};
@@ -48,6 +49,9 @@ pub struct ConvertArgs<'a> {
     pub bnode_policy: BnodePolicyArg,
     /// Prefixes to seed compaction with, as JSON or a path to JSON.
     pub prefixes: Option<&'a str>,
+    /// Parse threads. `0` means "as many as this host has"; `1` is the serial
+    /// path exactly, so the flag is never a correctness decision.
+    pub parallelism: usize,
 }
 
 /// Run `fluree rdf convert`.
@@ -97,14 +101,34 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     let destination::Destination { out, clock } = destination::open(args.output, target)?;
     let writer = AnyWriter::new(target, out, &config, &prefixes)?;
 
-    let run = rdf::parse_into(
-        &loaded.text,
-        loaded.resolved.syntax,
-        common.base.as_deref(),
-        writer,
-        rdf::verb_options(common.nocheck),
-        &mut timings,
-    );
+    // Parallel where it is byte-identical to serial, serial otherwise. The
+    // decision is reported under --profile rather than left implicit, because
+    // "why is this not using my cores" is otherwise unanswerable from outside.
+    let plan = ParallelPlan::decide(args.parallelism, target, loaded.text.len());
+    let options = rdf::verb_options(common.nocheck);
+    let run = match plan.workers {
+        Some(workers) => {
+            let config = ParallelConfig {
+                workers,
+                ..ParallelConfig::for_input(workers, loaded.text.len())
+            };
+            rdf::parse_into_parallel(
+                &loaded.text,
+                common.base.as_deref(),
+                writer,
+                config,
+                &mut timings,
+            )
+        }
+        None => rdf::parse_into(
+            &loaded.text,
+            loaded.resolved.syntax,
+            common.base.as_deref(),
+            writer,
+            options,
+            &mut timings,
+        ),
+    };
     let stats = run.sink.stats();
 
     // Flush before reporting anything, and through a handle that can return
@@ -152,7 +176,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     }
 
     if let Some(format) = common.profile {
-        emit_profile(common, &loaded, &run.outcome, &timings, wall, format)?;
+        emit_profile(common, &loaded, &run.outcome, &timings, wall, format, plan)?;
     } else if common.time {
         rdf::count::print_timing(wall, stats.statements, loaded.text.len() as u64);
     }
@@ -173,6 +197,57 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         }
     }
     Ok(())
+}
+
+/// Whether this conversion runs across threads, and why not when it does not.
+///
+/// Reported rather than silent: a user who passed `--parallelism 8` and got
+/// one core has no way to find out why from the outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParallelPlan {
+    /// Worker count, or `None` for the serial path.
+    pub workers: Option<usize>,
+    /// Why the serial path was chosen, for the profile report.
+    pub reason: &'static str,
+}
+
+impl ParallelPlan {
+    /// Below this, threads cost more than they save — the whole document
+    /// parses in less time than it takes to start a pool.
+    const MIN_PARALLEL_BYTES: usize = 4 * 1024 * 1024;
+
+    /// Decide, from the flag, the output syntax and the input size.
+    pub fn decide(parallelism: usize, target: RdfSyntax, input_len: usize) -> Self {
+        let requested = match parallelism {
+            // 0 is the global flag's "auto".
+            0 => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            n => n,
+        };
+        if requested <= 1 {
+            return Self {
+                workers: None,
+                reason: "one worker requested",
+            };
+        }
+        if !crate::rdf::parallel::can_run_parallel(target) {
+            return Self {
+                workers: None,
+                // Not a limitation of the writer: splitting the input changes
+                // the bytes for a syntax that folds across statements.
+                reason: "output syntax is not line-based, so chunking would change the bytes",
+            };
+        }
+        if input_len < Self::MIN_PARALLEL_BYTES {
+            return Self {
+                workers: None,
+                reason: "input is smaller than the parallel threshold",
+            };
+        }
+        Self {
+            workers: Some(requested),
+            reason: "parallel",
+        }
+    }
 }
 
 /// Resolve the output syntax: `--to`, then the output file's extension, then
@@ -406,6 +481,7 @@ fn report_parse_failure(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_profile(
     common: &RdfCommonArgs,
     loaded: &rdf::Loaded,
@@ -413,6 +489,7 @@ fn emit_profile(
     timings: &PhaseTimings,
     wall: Duration,
     format: crate::rdf::profile::ProfileFormat,
+    plan: ParallelPlan,
 ) -> CliResult<()> {
     let ctx = RunContext {
         verb: "convert",
@@ -424,6 +501,8 @@ fn emit_profile(
         bytes_decoded: loaded.text.len() as u64,
         sha256: (!common.no_hash).then(|| crate::rdf::profile::sha256_hex(&loaded.text)),
         validate: !common.nocheck,
+        threads_used: plan.workers.unwrap_or(1),
+        parallel_reason: plan.reason,
     };
     ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink).emit(format)?;
     Ok(())

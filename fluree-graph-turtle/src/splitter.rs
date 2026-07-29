@@ -294,6 +294,64 @@ struct Lookahead {
     pending_cr: bool,
 }
 
+/// Split an in-memory Turtle document into independently-parseable pieces.
+///
+/// Returns `(prefix_block, chunk_ranges)`. Each range is a byte range into
+/// `text` holding whole statements; prepending `prefix_block` to any of them
+/// produces a valid Turtle document, which is what lets chunks be parsed
+/// concurrently.
+///
+/// The same [`BoundaryScanner`] the file paths use, so the three answers agree
+/// — including the refusal: a mid-file `@prefix`/`@base` yields
+/// [`SplitError::PrefixAfterData`], because only the first chunk would carry
+/// the redefinition and every later one would resolve the prefix against the
+/// header binding instead.
+///
+/// Ranges are cut at the first statement boundary at or past each
+/// `target_bytes` multiple, so an actual chunk is a little larger than the
+/// target and a document with one enormous statement yields one chunk.
+pub fn chunk_in_memory(
+    text: &str,
+    target_bytes: u64,
+) -> Result<(String, Vec<std::ops::Range<usize>>), SplitError> {
+    let (prefix_block, data_start) = extract_prefix_block_from_bytes(text.as_bytes())?;
+    let data_start = data_start as usize;
+    if data_start >= text.len() {
+        return Err(SplitError::EmptyData);
+    }
+
+    let bytes = text.as_bytes();
+    let mut scanner = BoundaryScanner::new();
+    let mut ranges = Vec::new();
+    let mut start = data_start;
+
+    for (offset, &b) in bytes.iter().enumerate().skip(data_start) {
+        if let Some(boundary) = scanner.feed(b, offset as u64)? {
+            let boundary = boundary as usize;
+            if (boundary - start) as u64 >= target_bytes {
+                ranges.push(start..boundary);
+                start = boundary;
+            }
+        }
+    }
+    // Everything after the last cut, terminator or not — the parser is the
+    // authority on whether a trailing fragment is valid, not the chunker.
+    // A tail that is only whitespace and comments is absorbed into the
+    // previous chunk rather than becoming a chunk of its own: it carries no
+    // statement, and a worker spun up for it would do nothing.
+    if start < text.len() {
+        let tail_is_noise = is_noise_only_chunk(&bytes[start..]);
+        match ranges.last_mut() {
+            Some(last) if tail_is_noise => last.end = text.len(),
+            _ => ranges.push(start..text.len()),
+        }
+    }
+    if ranges.is_empty() {
+        return Err(SplitError::EmptyData);
+    }
+    Ok((prefix_block, ranges))
+}
+
 /// Compute chunk byte ranges by scanning the file for statement boundaries.
 ///
 /// Returns a `Vec<(start, end)>` of byte ranges. Each range represents a chunk
@@ -2405,6 +2463,65 @@ ex:carol ex:name \"Carol\" .\n";
             total += json.as_array().map_or(0, Vec::len);
         }
         assert_eq!(total, 60, "every statement must survive the split");
+    }
+
+    // ---- in-memory chunking ----
+
+    #[test]
+    fn in_memory_chunks_are_independently_parseable_and_lose_nothing() {
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+        for i in 0..200 {
+            ttl.push_str(&format!("ex:s{i} ex:p \"v{i}\" .\n"));
+        }
+
+        let (prefix, ranges) = chunk_in_memory(&ttl, 300).expect("splits");
+        assert!(
+            ranges.len() >= 3,
+            "expected several chunks, got {}",
+            ranges.len()
+        );
+
+        // Ranges tile the data region with no gap and no overlap.
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "ranges must tile");
+        }
+        assert_eq!(ranges.last().unwrap().end, ttl.len());
+
+        let mut total = 0usize;
+        for (i, r) in ranges.iter().enumerate() {
+            let doc = format!("{prefix}{}", &ttl[r.clone()]);
+            let json = crate::parse_to_json(&doc)
+                .unwrap_or_else(|e| panic!("chunk {i} is not valid Turtle: {e}\n{doc}"));
+            total += json.as_array().map_or(0, Vec::len);
+        }
+        assert_eq!(total, 200, "every statement survives chunking");
+    }
+
+    #[test]
+    fn in_memory_chunking_refuses_a_mid_file_directive() {
+        // Same refusal as the file paths, for the same reason: only the first
+        // chunk would carry the redefinition.
+        let ttl = "@prefix ex: <http://first.example/> .\n\
+                   ex:a ex:p \"1\" .\n\
+                   @prefix ex: <http://second.example/> .\n\
+                   ex:b ex:p \"2\" .\n";
+        assert!(matches!(
+            chunk_in_memory(ttl, 10),
+            Err(SplitError::PrefixAfterData { .. })
+        ));
+    }
+
+    #[test]
+    fn in_memory_chunking_keeps_one_huge_statement_whole() {
+        // A target smaller than a single statement cannot cut it: boundaries
+        // exist only at terminators.
+        let mut ttl = String::from("@prefix ex: <http://example.org/> .\nex:s ex:p ");
+        ttl.push_str(&format!("\"{}\"", "x".repeat(5000)));
+        ttl.push_str(" .\n");
+
+        let (prefix, ranges) = chunk_in_memory(&ttl, 100).expect("splits");
+        assert_eq!(ranges.len(), 1, "one statement is one chunk");
+        crate::parse_to_json(&format!("{prefix}{}", &ttl[ranges[0].clone()])).unwrap();
     }
 
     #[test]
