@@ -39,8 +39,8 @@ use std::process::ExitCode;
 
 use fluree_bench_support::baseline::{
     accumulate, capture, compare, default_criterion_dir, describe_corpus, host_class,
-    load_baseline, save_baseline, CompareOptions, CompareStatus, Comparison, HostMismatchPolicy,
-    Metric,
+    load_baseline, save_baseline, AccumulateOptions, CompareOptions, CompareStatus, Comparison,
+    HostMismatchPolicy, Metric,
 };
 use fluree_bench_support::budget;
 use fluree_bench_support::mem;
@@ -76,7 +76,8 @@ fn print_usage() {
         "bench-baseline — capture and compare performance baselines\n\n\
          USAGE:\n  \
          bench-baseline capture --label <name> --out <file> [--criterion-dir <dir>] [--mem-dir <dir>]\n                          \
-         [--meta-dir <dir>] [--host-class <name>] [--accumulate] [--clean-sidecars]\n  \
+         [--meta-dir <dir>] [--host-class <name>] [--accumulate] [--allow-revision-drift]\n                          \
+         [--clean-sidecars]\n  \
          bench-baseline compare --baseline <file> [--criterion-dir <dir>] [--mem-dir <dir>]\n                          \
          [--meta-dir <dir>] [--budget <file>] [--only <substr>] [--host-class <name>]\n                          \
          [--share-drift-pp <pp>] [--allow-host-mismatch] [--advisory]\n\n\
@@ -185,7 +186,12 @@ fn run_capture(args: &[String]) -> ExitCode {
             "--meta-dir",
             "--host-class",
         ],
-        &["--clean-mem", "--clean-sidecars", "--accumulate"],
+        &[
+            "--clean-mem",
+            "--clean-sidecars",
+            "--accumulate",
+            "--allow-revision-drift",
+        ],
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -232,7 +238,13 @@ fn run_capture(args: &[String]) -> ExitCode {
         match load_baseline(&out_path) {
             // `accumulate` enforces the host-class and corpus guards itself, so
             // the CLI has no policy of its own to apply here.
-            Ok(prev) => match accumulate(&prev, &file) {
+            Ok(prev) => match accumulate(
+                &prev,
+                &file,
+                &AccumulateOptions {
+                    allow_revision_drift: flags.contains_key("--allow-revision-drift"),
+                },
+            ) {
                 Ok(merged) => file = merged,
                 Err(e) => {
                     eprintln!("{e}");
@@ -431,9 +443,6 @@ fn run_compare(args: &[String]) -> ExitCode {
             "new scenarios (no baseline entry): {}",
             report.new_scenarios.join(", ")
         );
-    }
-    for anomaly in &report.anomalies {
-        println!("::warning::{anomaly}");
     }
 
     let advisories: Vec<_> = report.advisories().collect();

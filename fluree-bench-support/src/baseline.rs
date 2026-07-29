@@ -303,8 +303,40 @@ impl NoiseStats {
         }
     }
 
+    /// Recompute `n`, `median_ns`, and `mad_ns` from `samples_ns`, which is the
+    /// only field a reader can verify.
+    ///
+    /// A baseline file is untrusted input, and these four fields are
+    /// independently settable: a stale or hand-edited file could claim `n = 5`
+    /// beside an arbitrary median and MAD, moving the comparison baseline and
+    /// widening the budget on the strength of numbers nothing derived. Applied
+    /// at load, so every later reader sees stats that match their own samples.
+    ///
+    /// A set with no samples, too few samples, or any non-finite / non-positive
+    /// sample cannot be recomputed, so it is returned unusable rather than
+    /// trusted — the floor only ever widens, and losing it is the safe
+    /// direction.
+    fn revalidated(self) -> Self {
+        let usable_samples = self.samples_ns.len() >= MIN_NOISE_SAMPLES as usize
+            && self.samples_ns.iter().all(|s| s.is_finite() && *s > 0.0);
+        if !usable_samples {
+            return Self {
+                n: self.samples_ns.len() as u32,
+                median_ns: 0.0,
+                mad_ns: 0.0,
+                samples_ns: self.samples_ns,
+            };
+        }
+        Self::from_samples(self.samples_ns)
+    }
+
     fn is_usable(&self) -> bool {
-        self.n >= MIN_NOISE_SAMPLES && self.median_ns > 0.0
+        self.n >= MIN_NOISE_SAMPLES
+            && self.n as usize == self.samples_ns.len()
+            && self.median_ns > 0.0
+            && self.median_ns.is_finite()
+            && self.mad_ns.is_finite()
+            && self.mad_ns >= 0.0
     }
 }
 
@@ -475,6 +507,16 @@ impl From<RawBaselineFile> for BaselineFile {
             },
             None => HostBlock::of_class(legacy_class()),
         };
+        // Noise stats are recomputed from their own samples at the boundary, so
+        // no later reader has to wonder whether they were derived or asserted.
+        let entries = raw
+            .entries
+            .into_iter()
+            .map(|(id, mut entry)| {
+                entry.noise = entry.noise.map(NoiseStats::revalidated);
+                (id, entry)
+            })
+            .collect();
         BaselineFile {
             schema_version: raw.schema_version,
             label: raw.label,
@@ -484,8 +526,30 @@ impl From<RawBaselineFile> for BaselineFile {
             scale: raw.scale,
             host,
             corpus: raw.corpus,
-            entries: raw.entries,
+            entries,
         }
+    }
+}
+
+impl BaselineFile {
+    /// Reject a document that parsed but is not a usable baseline.
+    ///
+    /// Every top-level field carries a serde default so schema-1 files keep
+    /// loading, which means `{}` also deserializes "successfully" — and an
+    /// empty baseline compares against nothing, reports every current scenario
+    /// as new, breaches no metric, and exits 0. A gate that passes because it
+    /// had no reference points is worse than one that fails.
+    fn validate_structure(&self, source: &str) -> Result<(), String> {
+        if self.schema_version == 0 {
+            return Err(format!("{source}: schema_version must be >= 1"));
+        }
+        if self.entries.is_empty() {
+            return Err(format!(
+                "{source}: baseline contains no scenarios — an empty baseline compares against \
+                 nothing and would pass every gate vacuously"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -581,6 +645,14 @@ pub fn capture(
     }
 }
 
+/// Policy knobs for [`accumulate`]. Defaults refuse everything questionable.
+#[derive(Debug, Clone, Default)]
+pub struct AccumulateOptions {
+    /// Permit pooling samples captured at different `git_sha`s. Off by default:
+    /// samples from different revisions are different populations.
+    pub allow_revision_drift: bool,
+}
+
 /// Fold a fresh capture into an existing baseline as one more sample.
 ///
 /// This is how a baseline reaches [`MIN_NOISE_SAMPLES`]: run the benches, run
@@ -605,10 +677,33 @@ pub fn capture(
 /// happens to call it — a bench harness or script calling `accumulate` directly
 /// gets the same protection:
 ///
+/// - **schema version** — `prev` must not be newer than this binary
+///   understands. An older binary can deserialize an additive future schema,
+///   clone a fresh capture over it, and write it back having silently dropped
+///   every field it did not recognise.
 /// - **host class** must match between `prev` and `fresh`.
+/// - **revision** — differing non-empty `git_sha`s refuse unless
+///   [`AccumulateOptions::allow_revision_drift`]. Accumulating across a code
+///   change pools pre- and post-change populations, relabels every sample as
+///   the new revision, and can widen the MAD enough to hide the very change
+///   being measured.
 /// - **corpus identity** must match for every scenario present in both,
-///   resolved entry-then-file exactly as [`compare`] resolves it.
-pub fn accumulate(prev: &BaselineFile, fresh: &BaselineFile) -> Result<BaselineFile, String> {
+///   resolved entry-then-file exactly as [`compare`] resolves it — and, as in
+///   `compare`, a `prev` that declares a corpus against a `fresh` that declares
+///   none is a refusal, not a pass.
+pub fn accumulate(
+    prev: &BaselineFile,
+    fresh: &BaselineFile,
+    opts: &AccumulateOptions,
+) -> Result<BaselineFile, String> {
+    if prev.schema_version > BASELINE_SCHEMA_VERSION {
+        return Err(format!(
+            "refusing to accumulate: existing baseline schema_version {} is newer than this binary \
+             understands ({BASELINE_SCHEMA_VERSION}). Merging would write it back with every \
+             unrecognised field silently dropped.",
+            prev.schema_version
+        ));
+    }
     if prev.host.class != fresh.host.class {
         return Err(format!(
             "refusing to accumulate across host classes: existing baseline is '{}' ({}), this run \
@@ -619,18 +714,28 @@ pub fn accumulate(prev: &BaselineFile, fresh: &BaselineFile) -> Result<BaselineF
             fresh.host.describe(),
         ));
     }
+    if !opts.allow_revision_drift {
+        if let (Some(prev_sha), Some(fresh_sha)) = (&prev.git_sha, &fresh.git_sha) {
+            if !prev_sha.is_empty() && !fresh_sha.is_empty() && prev_sha != fresh_sha {
+                return Err(format!(
+                    "refusing to accumulate across revisions: existing samples were captured at \
+                     {prev_sha}, this run at {fresh_sha}. Pooling them mixes pre- and \
+                     post-change populations, relabels every sample as {fresh_sha}, and can widen \
+                     the MAD enough to hide the change being measured. Pass \
+                     --allow-revision-drift if the difference is genuinely irrelevant."
+                ));
+            }
+        }
+    }
     for id in prev.entries.keys() {
         if !fresh.entries.contains_key(id) {
             continue;
         }
-        if let (Some(prev_corpus), Some(fresh_corpus)) = (prev.corpus_for(id), fresh.corpus_for(id))
-        {
-            if let Some(detail) = prev_corpus.identity_mismatch(fresh_corpus) {
-                return Err(format!(
-                    "refusing to accumulate across corpora for {id}: {detail}. Samples over \
-                     different inputs cannot be pooled into one median/MAD."
-                ));
-            }
+        if let Some(detail) = corpus_refusal(prev.corpus_for(id), fresh.corpus_for(id)) {
+            return Err(format!(
+                "refusing to accumulate for {id}: {detail}. Samples over different inputs cannot \
+                 be pooled into one median/MAD."
+            ));
         }
     }
 
@@ -667,7 +772,10 @@ pub fn accumulate(prev: &BaselineFile, fresh: &BaselineFile) -> Result<BaselineF
 
 pub fn load_baseline(path: &Path) -> Result<BaselineFile, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
+    let file: BaselineFile =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    file.validate_structure(&path.display().to_string())?;
+    Ok(file)
 }
 
 pub fn save_baseline(file: &BaselineFile, path: &Path) -> Result<(), String> {
@@ -789,6 +897,9 @@ pub enum MismatchKind {
     Corpus,
     /// The baseline file is newer than this binary understands.
     SchemaVersion,
+    /// A phase-share set that could not have been produced by the constructor,
+    /// and so cannot be gated on.
+    PhaseShares,
 }
 
 impl MismatchKind {
@@ -797,6 +908,7 @@ impl MismatchKind {
             MismatchKind::HostClass => "host-class",
             MismatchKind::Corpus => "corpus",
             MismatchKind::SchemaVersion => "schema-version",
+            MismatchKind::PhaseShares => "phase-shares",
         }
     }
 }
@@ -856,9 +968,6 @@ pub struct CompareReport {
     /// Comparisons the gate refused to make. Any entry here fails the gate,
     /// distinctly from a budget breach.
     pub fatal: Vec<FatalMismatch>,
-    /// Data that looks wrong but does not invalidate the comparison — reported,
-    /// never gating. Today: phase shares that don't sum to 100%.
-    pub anomalies: Vec<String>,
     /// Why absolute metrics are advisory, when they are.
     pub advisory_reason: Option<String>,
 }
@@ -1059,30 +1168,82 @@ fn compare_phases(
     }
 }
 
+/// Decide whether two resolved corpus blocks make the scenario comparable.
+///
+/// The asymmetry matters and is not symmetric on purpose:
+///
+/// - **baseline has one, current does not** → refuse. A producer that stopped
+///   emitting its sidecar, or a sidecar write that failed, would otherwise slip
+///   past the identity gate entirely and exit 0. Absence of evidence is not
+///   evidence of the same input.
+/// - **current has one, baseline does not** → compare. This is the legacy case:
+///   a schema-1 baseline predates corpus blocks, and there is nothing to check
+///   against. Refusing here would make every old baseline unusable.
+fn corpus_refusal(base: Option<&CorpusInfo>, cur: Option<&CorpusInfo>) -> Option<String> {
+    match (base, cur) {
+        (Some(base_corpus), Some(cur_corpus)) => {
+            if let Err(e) = base_corpus.validate() {
+                return Some(format!("baseline {e}"));
+            }
+            if let Err(e) = cur_corpus.validate() {
+                return Some(format!("current {e}"));
+            }
+            base_corpus.identity_mismatch(cur_corpus)
+        }
+        (Some(base_corpus), None) => Some(format!(
+            "baseline declares corpus '{}' (sha256:{}) but this run recorded none — a missing \
+             sidecar cannot be assumed to be the same input",
+            base_corpus.name,
+            short_hash(&base_corpus.sha256),
+        )),
+        (None, _) => None,
+    }
+}
+
+/// Reject a phase-share set that cannot be trusted to gate.
+///
 /// Shares are constructed to sum to 100 across a scenario's measured phases,
 /// but that is a property of [`crate::meta::ScenarioMeta::with_phase_ns`], not
-/// an invariant — the fields are public and a baseline file is untrusted input.
-/// A sum far from 100 means the shares were hand-written or assembled by
-/// something other than the constructor, which makes every drift number on that
-/// scenario suspect. Report it; do not gate on it, since the drift comparison
-/// is still internally consistent and failing here would block on a cosmetic
-/// defect.
-fn note_share_sum_anomaly(
-    report: &mut CompareReport,
-    id: &str,
-    side: &str,
-    phases: &BTreeMap<String, PhaseTiming>,
-) {
-    if phases.is_empty() {
-        return;
+/// an invariant of the type — the fields are public and a baseline file is
+/// untrusted input. This is emphatically not cosmetic: `phase_share` is the
+/// ONLY metric that still enforces across a host mismatch, so a current sidecar
+/// with every share at 0.0 would mark every phase "improved" and exit 0 while
+/// the absolute metrics were merely advisory. A share set that the constructor
+/// could not have produced therefore refuses rather than gates.
+fn share_refusal(
+    base: &BTreeMap<String, PhaseTiming>,
+    cur: &BTreeMap<String, PhaseTiming>,
+) -> Option<String> {
+    for (side, phases) in [("baseline", base), ("current", cur)] {
+        if phases.is_empty() {
+            continue;
+        }
+        for (name, timing) in phases {
+            if !timing.share_pct.is_finite() || timing.share_pct < 0.0 {
+                return Some(format!(
+                    "{side} phase '{name}' has share_pct {} — shares must be finite and \
+                     non-negative",
+                    timing.share_pct
+                ));
+            }
+            if !timing.ns.is_finite() || timing.ns < 0.0 {
+                return Some(format!(
+                    "{side} phase '{name}' has ns {} — phase timings must be finite and \
+                     non-negative",
+                    timing.ns
+                ));
+            }
+        }
+        let sum: f64 = phases.values().map(|p| p.share_pct).sum();
+        if (sum - 100.0).abs() > SHARE_SUM_TOLERANCE_PP {
+            return Some(format!(
+                "{side} phase shares sum to {sum:.1}%, not 100% (±{SHARE_SUM_TOLERANCE_PP}) — the \
+                 share set was not derived from its own nanoseconds, so drift numbers computed \
+                 from it mean nothing"
+            ));
+        }
     }
-    let sum: f64 = phases.values().map(|p| p.share_pct).sum();
-    if (sum - 100.0).abs() > SHARE_SUM_TOLERANCE_PP {
-        report.anomalies.push(format!(
-            "{id}: {side} phase shares sum to {sum:.1}%, not 100% — drift numbers for this \
-             scenario are only as trustworthy as the shares they came from"
-        ));
-    }
+    None
 }
 
 /// Compare a current capture against a baseline under the given budgets.
@@ -1172,20 +1333,32 @@ pub fn compare(
         // Corpus identity gates everything else about this scenario: if the two
         // runs read different inputs, none of their numbers are comparable and
         // emitting rows for them would be worse than emitting nothing.
-        if let (Some(base_corpus), Some(cur_corpus)) =
-            (baseline.corpus_for(id), current.corpus_for(id))
-        {
-            if let Some(detail) = base_corpus.identity_mismatch(cur_corpus) {
-                report.fatal.push(FatalMismatch {
-                    kind: MismatchKind::Corpus,
-                    id: Some(id.clone()),
-                    detail,
-                    remedy: "rerun against the corpus the baseline recorded, or recapture the \
-                             baseline against the corpus you intend to gate on"
-                        .to_string(),
-                });
-                continue;
-            }
+        if let Some(detail) = corpus_refusal(baseline.corpus_for(id), current.corpus_for(id)) {
+            report.fatal.push(FatalMismatch {
+                kind: MismatchKind::Corpus,
+                id: Some(id.clone()),
+                detail,
+                remedy: "rerun against the corpus the baseline recorded, or recapture the \
+                         baseline against the corpus you intend to gate on"
+                    .to_string(),
+            });
+            continue;
+        }
+
+        // Phase shares are the only signal that still enforces across host
+        // classes, so a malformed share set is not cosmetic: all-zero shares
+        // make every phase look improved. Validate before any gating decision
+        // reads them.
+        if let Some(detail) = share_refusal(&base.phases, &cur.phases) {
+            report.fatal.push(FatalMismatch {
+                kind: MismatchKind::PhaseShares,
+                id: Some(id.clone()),
+                detail,
+                remedy: "regenerate the phase block through ScenarioMeta::with_phase_ns, which \
+                         derives every share from its nanoseconds"
+                    .to_string(),
+            });
+            continue;
         }
 
         let declared_budget = budget_for_id(budget, id);
@@ -1250,8 +1423,6 @@ pub fn compare(
             opts.share_drift_pp,
             advisory,
         );
-        note_share_sum_anomaly(&mut report, id, "baseline", &base.phases);
-        note_share_sum_anomaly(&mut report, id, "current", &cur.phases);
     }
 
     for id in current.entries.keys() {
@@ -2125,7 +2296,7 @@ mod tests {
         let mut acc = file_of("local", vec![("g/q1/small", entry(1000.0))]);
         for mean in [1010.0, 990.0, 1005.0, 995.0] {
             let fresh = file_of("local", vec![("g/q1/small", entry(mean))]);
-            acc = accumulate(&acc, &fresh).unwrap();
+            acc = accumulate(&acc, &fresh, &AccumulateOptions::default()).unwrap();
         }
         let noise = acc.entries["g/q1/small"].noise.as_ref().unwrap();
         assert_eq!(noise.n, 5, "seed run plus four accumulations");
@@ -2140,7 +2311,7 @@ mod tests {
             vec![("g/q1/small", entry(1000.0)), ("g/q2/small", entry(2000.0))],
         );
         let fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
-        let merged = accumulate(&acc, &fresh).unwrap();
+        let merged = accumulate(&acc, &fresh, &AccumulateOptions::default()).unwrap();
         assert_eq!(merged.entries.len(), 2);
         assert_eq!(merged.entries["g/q2/small"].mean_ns, 2000.0);
         assert!(merged.entries["g/q2/small"].noise.is_none());
@@ -2155,7 +2326,7 @@ mod tests {
     fn accumulate_refuses_across_host_classes() {
         let prev = file_of("bench-m8gd", vec![("g/q1/small", entry(1000.0))]);
         let fresh = file_of("macos-aarch64", vec![("g/q1/small", entry(1010.0))]);
-        let err = accumulate(&prev, &fresh).unwrap_err();
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
         assert!(
             err.contains("bench-m8gd") && err.contains("macos-aarch64"),
             "{err}"
@@ -2172,7 +2343,7 @@ mod tests {
         let prev = file_of("local", vec![("g/q1/small", prev_entry)]);
         let fresh = file_of("local", vec![("g/q1/small", fresh_entry)]);
 
-        let err = accumulate(&prev, &fresh).unwrap_err();
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
         assert!(err.contains("g/q1/small"), "{err}");
         assert!(err.contains("sha256"), "{err}");
     }
@@ -2183,7 +2354,63 @@ mod tests {
         prev.corpus = Some(corpus(b"one"));
         let mut fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
         fresh.corpus = Some(corpus(b"two"));
-        assert!(accumulate(&prev, &fresh).is_err());
+        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_err());
+    }
+
+    /// bplatz review item 1, accumulate half. `fresh.clone()` would otherwise
+    /// erase the prior corpus identity while still pooling the sample.
+    #[test]
+    fn accumulate_refuses_when_fresh_drops_the_corpus() {
+        let mut prev_entry = entry(1000.0);
+        prev_entry.corpus = Some(corpus(b"one"));
+        let prev = file_of("local", vec![("g/q1/small", prev_entry)]);
+        let fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
+        assert!(err.contains("recorded none"), "{err}");
+        assert!(err.contains("g/q1/small"), "{err}");
+    }
+
+    /// bplatz review item 3.
+    #[test]
+    fn accumulate_refuses_a_newer_schema() {
+        let mut prev = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        prev.schema_version = BASELINE_SCHEMA_VERSION + 1;
+        let fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
+        assert!(err.contains("newer than this binary"), "{err}");
+    }
+
+    /// bplatz review item 4.
+    #[test]
+    fn accumulate_refuses_across_revisions_unless_overridden() {
+        let mut prev = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        prev.git_sha = Some("aaaaaaa".into());
+        let mut fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        fresh.git_sha = Some("bbbbbbb".into());
+
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
+        assert!(err.contains("aaaaaaa") && err.contains("bbbbbbb"), "{err}");
+        assert!(err.contains("--allow-revision-drift"), "{err}");
+
+        let allowed = AccumulateOptions {
+            allow_revision_drift: true,
+        };
+        assert!(accumulate(&prev, &fresh, &allowed).is_ok());
+    }
+
+    #[test]
+    fn accumulate_allows_a_matching_or_absent_revision() {
+        // Same sha: normal loop. Absent sha (no git): nothing to compare.
+        let mut prev = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        let mut fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        prev.git_sha = Some("aaaaaaa".into());
+        fresh.git_sha = Some("aaaaaaa".into());
+        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
+
+        prev.git_sha = None;
+        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
     }
 
     #[test]
@@ -2194,7 +2421,7 @@ mod tests {
         fresh_entry.corpus = Some(corpus(b"same"));
         let prev = file_of("local", vec![("g/q1/small", prev_entry)]);
         let fresh = file_of("local", vec![("g/q1/small", fresh_entry)]);
-        assert!(accumulate(&prev, &fresh).is_ok());
+        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
     }
 
     #[test]
@@ -2213,7 +2440,7 @@ mod tests {
         let mut fresh_a = entry(1010.0);
         fresh_a.corpus = Some(corpus(b"one"));
         let fresh = file_of("local", vec![("g/q1/small", fresh_a)]);
-        assert!(accumulate(&prev, &fresh).is_ok());
+        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
     }
 
     /// The remedy must not suggest relabelling this host to the baseline's
@@ -2234,44 +2461,115 @@ mod tests {
         );
     }
 
+    fn with_raw_phases(mean: f64, phases: &[(&str, f64, f64)]) -> BaselineEntry {
+        BaselineEntry {
+            phases: phases
+                .iter()
+                .map(|(n, ns, share)| {
+                    (
+                        n.to_string(),
+                        PhaseTiming {
+                            ns: *ns,
+                            share_pct: *share,
+                        },
+                    )
+                })
+                .collect(),
+            ..entry(mean)
+        }
+    }
+
+    /// bplatz review item 2. A malformed share set is NOT cosmetic: on a host
+    /// mismatch `phase_share` is the only enforcing metric, so all-zero shares
+    /// would mark every phase "improved" and exit 0 while the absolute metrics
+    /// were merely advisory.
     #[test]
-    fn shares_that_do_not_sum_to_100_are_reported_but_do_not_gate() {
-        // Hand-assembled or hand-edited shares: the drift comparison is still
-        // internally consistent, so report rather than fail.
-        let mut skewed = entry(1000.0);
-        skewed.phases = [
-            (
-                "parse".to_string(),
-                PhaseTiming {
-                    ns: 10.0,
-                    share_pct: 30.0,
-                },
-            ),
-            (
-                "write".to_string(),
-                PhaseTiming {
-                    ns: 10.0,
-                    share_pct: 30.0,
-                },
-            ),
-        ]
-        .into_iter()
-        .collect();
+    fn all_zero_current_shares_refuse_instead_of_gating_as_improved() {
+        let base = file_of(
+            "bench-m8gd",
+            vec![(
+                "g/q1/small",
+                phased(1000.0, &[("parse", 600.0), ("write", 400.0)]),
+            )],
+        );
+        let current = file_of(
+            "macos-aarch64",
+            vec![(
+                "g/q1/small",
+                with_raw_phases(1000.0, &[("parse", 600.0, 0.0), ("write", 400.0, 0.0)]),
+            )],
+        );
+        let budget = RegressionBudget::empty(5.0);
+
+        let report = compare(&base, &current, &budget, &allow_mismatch());
+        assert!(report.is_fatal(), "must refuse, not gate");
+        assert_eq!(report.fatal[0].kind, MismatchKind::PhaseShares);
+        assert!(!report.passed());
+        assert!(
+            !report
+                .comparisons
+                .iter()
+                .any(|c| c.status == CompareStatus::Improved),
+            "must not report a bogus improvement"
+        );
+    }
+
+    #[test]
+    fn non_finite_and_negative_shares_refuse() {
+        for bad in [f64::NAN, f64::INFINITY, -10.0] {
+            let base = file_of(
+                "local",
+                vec![("g/q1/small", phased(1000.0, &[("parse", 1000.0)]))],
+            );
+            let current = file_of(
+                "local",
+                vec![(
+                    "g/q1/small",
+                    with_raw_phases(1000.0, &[("parse", 1.0, bad)]),
+                )],
+            );
+            let budget = RegressionBudget::empty(5.0);
+            let report = compare(&base, &current, &budget, &opts());
+            assert!(report.is_fatal(), "share_pct {bad} must refuse");
+            assert_eq!(report.fatal[0].kind, MismatchKind::PhaseShares);
+        }
+    }
+
+    #[test]
+    fn non_finite_phase_ns_refuses() {
+        let base = file_of(
+            "local",
+            vec![("g/q1/small", phased(1000.0, &[("parse", 1000.0)]))],
+        );
+        let current = file_of(
+            "local",
+            vec![(
+                "g/q1/small",
+                with_raw_phases(1000.0, &[("parse", f64::NAN, 100.0)]),
+            )],
+        );
+        let budget = RegressionBudget::empty(5.0);
+        assert!(compare(&base, &current, &budget, &opts()).is_fatal());
+    }
+
+    #[test]
+    fn shares_that_do_not_sum_to_100_refuse() {
+        let skewed = with_raw_phases(1000.0, &[("parse", 10.0, 30.0), ("write", 10.0, 30.0)]);
         let base = file_of("local", vec![("g/q1/small", skewed.clone())]);
         let current = file_of("local", vec![("g/q1/small", skewed)]);
         let budget = RegressionBudget::empty(5.0);
 
         let report = compare(&base, &current, &budget, &opts());
-        assert!(report.passed(), "a cosmetic share defect must not gate");
+        assert!(report.is_fatal());
         assert!(
-            report.anomalies.iter().any(|a| a.contains("60.0%")),
+            report.fatal[0].detail.contains("60.0%"),
             "{:?}",
-            report.anomalies
+            report.fatal
         );
     }
 
     #[test]
-    fn well_formed_shares_produce_no_anomaly() {
+    fn well_formed_shares_do_not_refuse() {
         let base = file_of(
             "local",
             vec![(
@@ -2281,9 +2579,52 @@ mod tests {
         );
         let current = base.clone();
         let budget = RegressionBudget::empty(5.0);
-        assert!(compare(&base, &current, &budget, &opts())
-            .anomalies
-            .is_empty());
+        let report = compare(&base, &current, &budget, &opts());
+        assert!(!report.is_fatal());
+        assert!(report.passed());
+    }
+
+    /// bplatz review item 1. A producer that stops emitting its sidecar, or a
+    /// sidecar write that fails, must not slip past the identity gate.
+    #[test]
+    fn baseline_corpus_with_no_current_corpus_refuses() {
+        let mut base_entry = entry(1000.0);
+        base_entry.corpus = Some(corpus(b"one"));
+        let base = baseline_with(vec![("g/q1/small", base_entry)]);
+        let current = current_with(vec![("g/q1/small", entry(1000.0))]);
+        let budget = RegressionBudget::empty(5.0);
+
+        let report = compare(&base, &current, &budget, &opts());
+        assert!(report.is_fatal(), "missing current corpus must refuse");
+        assert_eq!(report.fatal[0].kind, MismatchKind::Corpus);
+        assert!(report.fatal[0].detail.contains("recorded none"));
+        assert!(report.comparisons.is_empty());
+    }
+
+    #[test]
+    fn malformed_sha256_refuses_rather_than_panicking() {
+        // Untrusted input: a multibyte hash used to panic the report path when
+        // sliced at byte 12, turning a refusal into exit 101.
+        for bad in [
+            "\u{fc}nicode-hash-not-hex-but-plenty-long-enough-to-slice-at-twelve",
+            "",
+            "ABC123",
+            "zz",
+        ] {
+            let mut c = corpus(b"one");
+            c.sha256 = bad.to_string();
+            let mut base_entry = entry(1000.0);
+            base_entry.corpus = Some(c.clone());
+            let mut cur_entry = entry(1000.0);
+            cur_entry.corpus = Some(c);
+            let base = baseline_with(vec![("g/q1/small", base_entry)]);
+            let current = current_with(vec![("g/q1/small", cur_entry)]);
+            let budget = RegressionBudget::empty(5.0);
+
+            let report = compare(&base, &current, &budget, &opts());
+            assert!(report.is_fatal(), "malformed sha256 {bad:?} must refuse");
+            assert_eq!(report.fatal[0].kind, MismatchKind::Corpus);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2331,6 +2672,91 @@ mod tests {
                 .peak_bytes,
             4_820_445
         );
+    }
+
+    /// bplatz review item 5. `n`/`median_ns`/`mad_ns` were trusted
+    /// independently of the samples they claim to summarise.
+    #[test]
+    fn noise_stats_are_recomputed_from_their_own_samples_at_load() {
+        // Claims n=5 with a fabricated median and MAD beside real samples.
+        let json = r#"{"schema_version":2,"label":"x","captured_at":"t","profile":"quick",
+            "scale":"small","host":{"class":"local"},
+            "entries":{"g/q1/small":{"mean_ns":1000.0,"median_ns":1000.0,
+              "noise":{"n":5,"median_ns":99999.0,"mad_ns":88888.0,
+                       "samples_ns":[980.0,990.0,1000.0,1010.0,1020.0]}}}}"#;
+        let read: BaselineFile = serde_json::from_str(json).unwrap();
+        let noise = read.entries["g/q1/small"].noise.as_ref().unwrap();
+        assert_eq!(noise.median_ns, 1000.0, "median recomputed from samples");
+        assert_eq!(noise.mad_ns, 10.0, "MAD recomputed from samples");
+    }
+
+    #[test]
+    fn fabricated_noise_without_samples_is_unusable() {
+        // No samples to verify against: the floor is dropped rather than
+        // trusted. Losing a floor is the safe direction — it only widens.
+        let json = r#"{"schema_version":2,"label":"x","captured_at":"t","profile":"quick",
+            "scale":"small","host":{"class":"local"},
+            "entries":{"g/q1/small":{"mean_ns":1000.0,"median_ns":1000.0,
+              "noise":{"n":5,"median_ns":1000.0,"mad_ns":900.0,"samples_ns":[]}}}}"#;
+        let read: BaselineFile = serde_json::from_str(json).unwrap();
+        let entry = &read.entries["g/q1/small"];
+        assert_eq!(entry.noise_floor_pct(), 0.0, "no samples -> no floor");
+        assert_eq!(entry.effective_ns(), 1000.0, "falls back to the mean");
+    }
+
+    #[test]
+    fn non_positive_samples_are_rejected_as_a_floor() {
+        for bad in [
+            vec![0.0, 1.0, 1.0, 1.0, 1.0],
+            vec![-5.0, 1.0, 1.0, 1.0, 1.0],
+        ] {
+            let stats = NoiseStats {
+                n: 5,
+                median_ns: 1000.0,
+                mad_ns: 500.0,
+                samples_ns: bad,
+            }
+            .revalidated();
+            let e = BaselineEntry {
+                noise: Some(stats),
+                ..entry(1000.0)
+            };
+            assert_eq!(e.noise_floor_pct(), 0.0);
+        }
+    }
+
+    /// bplatz review item 6. `{}` deserialized as a valid schema-1 baseline; an
+    /// empty baseline breaches no metric and exits 0.
+    #[test]
+    fn empty_document_is_rejected_at_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluree-baseline-empty-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.json");
+
+        for doc in ["{}", r#"{"schema_version":2,"label":"x","entries":{}}"#] {
+            std::fs::write(&path, doc).unwrap();
+            let err = load_baseline(&path).unwrap_err();
+            assert!(err.contains("no scenarios"), "{doc} -> {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_baseline_with_scenarios_still_loads() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluree-baseline-ok-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ok.json");
+        save_baseline(&baseline_with(vec![("g/q1/small", entry(1.0))]), &path).unwrap();
+        assert!(load_baseline(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
