@@ -1,0 +1,709 @@
+//! End-to-end tests for `fluree rdf`.
+//!
+//! These drive the real binary, because most of what this surface promises is
+//! only true at the process boundary: exit codes, which stream output lands
+//! on, whether stdin works, whether a `.gz` decodes. Unit tests inside
+//! `src/rdf/` cover the resolution and rendering logic; this file covers the
+//! contract a script sees.
+
+use assert_cmd::cargo_bin_cmd;
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+/// Exit code for a document that did not parse.
+const EXIT_DOCUMENT_INVALID: i32 = 1;
+/// Exit code for an invocation that was wrong.
+const EXIT_USAGE: i32 = 2;
+
+const VALID_TURTLE: &str = "@prefix ex: <http://example.org/> .\n\
+                            ex:alice ex:name \"Alice\" ;\n\
+                                     ex:age 30 .\n\
+                            ex:bob ex:name \"Bob\" .\n";
+
+/// 3 triples: alice's name and age, plus bob's name.
+const VALID_TURTLE_TRIPLES: u64 = 3;
+
+const BROKEN_TURTLE: &str = "@prefix ex: <http://example.org/> .\n\
+                             ex:alice ex:name \"Alice\" .\n\
+                             ex:bob ex:name ?? .\n";
+
+const VALID_NTRIPLES: &str = "<http://example.org/a> <http://example.org/b> \"c\" .\n\
+                              <http://example.org/d> <http://example.org/e> \"f\" .\n";
+
+fn rdf_cmd() -> Command {
+    let mut cmd = cargo_bin_cmd!("fluree");
+    cmd.env("NO_COLOR", "1");
+    cmd
+}
+
+/// Write `content` into `dir` under `name` and return the path.
+fn fixture(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn gz_fixture(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(content.as_bytes()).unwrap();
+    std::fs::write(&path, enc.finish().unwrap()).unwrap();
+    path
+}
+
+fn zst_fixture(dir: &TempDir, name: &str, content: &str) -> PathBuf {
+    let path = dir.path().join(name);
+    std::fs::write(
+        &path,
+        zstd::stream::encode_all(content.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+/// stdout of a successful run, as a string.
+fn stdout_of(cmd: &mut Command) -> String {
+    let out = cmd.assert().success().get_output().stdout.clone();
+    String::from_utf8(out).unwrap()
+}
+
+// ============================================================================
+// check
+// ============================================================================
+
+#[test]
+fn check_accepts_a_valid_turtle_file() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no syntax errors"));
+}
+
+#[test]
+fn check_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        // line:column, the offending line, and a caret under it.
+        .stdout(predicate::str::contains("broken.ttl:3:16"))
+        .stdout(predicate::str::contains("ex:bob ex:name ?? ."))
+        .stdout(predicate::str::contains("^"));
+}
+
+#[test]
+fn check_reads_ntriples_by_extension() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.nt", VALID_NTRIPLES);
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .success();
+}
+
+#[test]
+fn check_reads_stdin_when_no_file_is_named() {
+    rdf_cmd()
+        .args(["rdf", "check", "--syntax", "turtle"])
+        .write_stdin(VALID_TURTLE)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<stdin>"));
+}
+
+#[test]
+fn check_reads_stdin_when_the_file_is_a_dash() {
+    rdf_cmd()
+        .args(["rdf", "check", "-"])
+        .write_stdin(VALID_TURTLE)
+        .assert()
+        .success();
+}
+
+#[test]
+fn check_sniffs_the_syntax_of_a_pipe_with_no_flag() {
+    // Nothing names the syntax: no extension, no --syntax. The leading
+    // `@prefix` has to be enough.
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .write_stdin(VALID_TURTLE)
+        .assert()
+        .success();
+}
+
+#[test]
+fn check_decompresses_a_gzipped_file() {
+    let tmp = TempDir::new().unwrap();
+    let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .success();
+}
+
+#[test]
+fn check_decompresses_a_gzipped_pipe_from_its_magic_bytes() {
+    // A pipe has no suffix to read. Without magic-byte detection this is a
+    // UTF-8 error on compressed bytes.
+    let tmp = TempDir::new().unwrap();
+    let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
+    let bytes = std::fs::read(&path).unwrap();
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "check", "--syntax", "turtle"]);
+    cmd.write_stdin(bytes).assert().success();
+}
+
+#[test]
+fn check_json_format_reports_the_diagnostic_with_offsets() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+    let out = rdf_cmd()
+        .args(["rdf", "check", "--format", "json"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+    assert_eq!(v["schema"], "fluree.rdf.check.v1");
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["syntax"], "turtle");
+    assert_eq!(v["diagnostics"][0]["line"], 3);
+    assert_eq!(v["diagnostics"][0]["column"], 16);
+    assert!(v["diagnostics"][0]["offset"].as_u64().unwrap() > 0);
+    assert_eq!(
+        v["statements"], 2,
+        "the `@prefix` directive plus the one triple statement that parsed \
+         before the failure — Turtle counts a directive as a statement"
+    );
+}
+
+#[test]
+fn check_json_format_on_a_clean_document_reports_an_empty_diagnostic_array() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "check", "--format", "json"]).arg(&path);
+    let v: serde_json::Value = serde_json::from_str(&stdout_of(&mut cmd)).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["diagnostics"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn check_under_quiet_says_nothing_on_success_and_still_exits_0() {
+    // The loop-over-ten-thousand-files case: the exit code is the answer.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["-q", "rdf", "check"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+// ============================================================================
+// count
+// ============================================================================
+
+#[test]
+fn count_reports_the_triple_count_of_a_known_fixture() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "count"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "triples: {VALID_TURTLE_TRIPLES}"
+        )))
+        .stdout(predicate::str::contains("prefixes: 1"));
+}
+
+#[test]
+fn count_under_quiet_prints_only_the_number() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    assert_eq!(
+        stdout_of(&mut cmd).trim(),
+        VALID_TURTLE_TRIPLES.to_string(),
+        "`$(fluree rdf count -q f.ttl)` has to be usable as a number"
+    );
+}
+
+#[test]
+fn count_of_a_collection_matches_the_rdf_spine_not_flattened_list_items() {
+    // Three items: 3 rdf:first + 3 rdf:rest + the statement = 7. Fluree's
+    // ingest path would flatten this to 3 indexed list items; reporting that
+    // number would disagree with every other RDF tool.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(
+        &tmp,
+        "list.ttl",
+        "<http://e/s> <http://e/p> ( \"a\" \"b\" \"c\" ) .\n",
+    );
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    assert_eq!(stdout_of(&mut cmd).trim(), "7");
+}
+
+#[test]
+fn count_reads_a_zstd_file() {
+    let tmp = TempDir::new().unwrap();
+    let path = zst_fixture(&tmp, "valid.ttl.zst", VALID_TURTLE);
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).arg(&path);
+    assert_eq!(stdout_of(&mut cmd).trim(), VALID_TURTLE_TRIPLES.to_string());
+}
+
+#[test]
+fn count_reads_a_gzipped_file_and_agrees_with_the_plain_one() {
+    let tmp = TempDir::new().unwrap();
+    let plain = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let gz = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
+
+    let mut a = rdf_cmd();
+    a.args(["-q", "rdf", "count"]).arg(&plain);
+    let mut b = rdf_cmd();
+    b.args(["-q", "rdf", "count"]).arg(&gz);
+    assert_eq!(stdout_of(&mut a), stdout_of(&mut b));
+}
+
+#[test]
+fn count_reads_stdin() {
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).write_stdin(VALID_NTRIPLES);
+    assert_eq!(stdout_of(&mut cmd).trim(), "2");
+}
+
+#[test]
+fn count_refuses_to_print_a_partial_number_for_a_broken_document() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "count"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("before the document stopped"));
+}
+
+#[test]
+fn count_time_writes_to_stderr_so_stdout_stays_pipeable() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let out = rdf_cmd()
+        .args(["-q", "rdf", "count", "--time"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        VALID_TURTLE_TRIPLES.to_string()
+    );
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("statements/s"),
+        "the timing footer belongs on stderr"
+    );
+}
+
+// ============================================================================
+// syntax resolution at the process boundary
+// ============================================================================
+
+#[test]
+fn an_explicit_syntax_overrides_a_misleading_extension() {
+    // The file is Turtle; the name says N-Quads, which has no reader. The
+    // flag has to win, or a mislabelled corpus is unusable.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "actually-turtle.nq", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "check", "--syntax", "turtle"])
+        .arg(&path)
+        .assert()
+        .success();
+}
+
+#[test]
+fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "data.trig", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "count"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("trig"))
+        .stderr(predicate::str::contains("turtle, ntriples"));
+}
+
+#[test]
+fn an_unidentifiable_input_names_the_flag_instead_of_guessing() {
+    // No extension, and content that opens like no RDF syntax does.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "mystery", "42 is not a document\n");
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("--syntax"));
+}
+
+#[test]
+fn binary_input_is_reported_as_binary_not_as_an_unknown_syntax() {
+    // The UTF-8 check runs before syntax resolution, which is the more
+    // useful answer: "this is not text" beats "I could not name the syntax".
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("mystery");
+    std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("not valid UTF-8"));
+}
+
+#[test]
+fn syntax_aliases_are_accepted() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "data.txt", VALID_NTRIPLES);
+    for alias in ["nt", "ntriples", "n-triples"] {
+        rdf_cmd()
+            .args(["rdf", "check", "--syntax", alias])
+            .arg(&path)
+            .assert()
+            .success();
+    }
+}
+
+// ============================================================================
+// exit codes
+// ============================================================================
+
+#[test]
+fn a_missing_file_exits_2_not_1() {
+    // The contract that makes these verbs scriptable: 1 means the RDF is
+    // bad, 2 means the invocation is.
+    rdf_cmd()
+        .args(["rdf", "check", "/nonexistent/nope.ttl"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("nope.ttl"));
+}
+
+#[test]
+fn a_directory_given_as_input_exits_2() {
+    let tmp = TempDir::new().unwrap();
+    rdf_cmd()
+        .args(["rdf", "count", "--syntax", "turtle"])
+        .arg(tmp.path())
+        .assert()
+        .code(EXIT_USAGE);
+}
+
+#[test]
+fn every_exit_code_in_the_contract_is_reachable() {
+    let tmp = TempDir::new().unwrap();
+    let valid = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let broken = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+
+    let code = |args: &[&str], path: Option<&Path>| {
+        let mut cmd = rdf_cmd();
+        cmd.args(args);
+        if let Some(p) = path {
+            cmd.arg(p);
+        }
+        cmd.assert().get_output().status.code().unwrap()
+    };
+
+    assert_eq!(code(&["rdf", "check"], Some(&valid)), 0);
+    assert_eq!(code(&["rdf", "check"], Some(&broken)), 1);
+    assert_eq!(code(&["rdf", "check", "/no/such.ttl"], None), 2);
+}
+
+// ============================================================================
+// convert (stub)
+// ============================================================================
+
+#[test]
+fn convert_refuses_clearly_and_names_the_verbs_that_do_work() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "convert", "--to", "nquads"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("no serializers have landed"))
+        .stderr(predicate::str::contains("check"));
+}
+
+// ============================================================================
+// --profile
+// ============================================================================
+
+#[test]
+fn profile_json_carries_the_whole_schema_and_lands_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let out = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    // stdout is still the count, uncontaminated.
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        VALID_TURTLE_TRIPLES.to_string()
+    );
+
+    let v: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(v["schema"], "fluree.rdf.profile.v1");
+    assert_eq!(v["verb"], "count");
+    assert!(!v["tool_version"].as_str().unwrap().is_empty());
+    assert!(v["host"]["os"].is_string());
+    assert!(v["host"]["arch"].is_string());
+    assert!(v["host"]["available_parallelism"].as_u64().unwrap() >= 1);
+    assert_eq!(v["host"]["threads_used"], 1);
+    assert_eq!(v["corpus"]["syntax"], "turtle");
+    assert_eq!(v["corpus"]["syntax_source"], "extension");
+    assert_eq!(v["corpus"]["compression"], "none");
+    assert_eq!(
+        v["corpus"]["bytes_decoded"].as_u64().unwrap(),
+        VALID_TURTLE.len() as u64
+    );
+    assert_eq!(
+        v["corpus"]["sha256"].as_str().unwrap().len(),
+        64,
+        "the corpus fingerprint is a full sha256"
+    );
+    assert!(v["wall_ns"].as_u64().unwrap() > 0);
+    assert_eq!(v["counts"]["triples"], VALID_TURTLE_TRIPLES);
+    assert!(v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["phase"] == "parse"));
+    assert!(v["self_calibration"]["overhead_pct"].is_number());
+    assert!(v["self_calibration"]["trusted"].is_boolean());
+    assert!(v["self_calibration"]["clock_reads"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn profile_json_records_which_rule_resolved_the_syntax() {
+    // Traceability: a surprising syntax should be attributable to a rule.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+
+    let explicit = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--syntax", "turtle"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&explicit).unwrap();
+    assert_eq!(v["corpus"]["syntax_source"], "explicit");
+
+    let sniffed = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json"])
+        .write_stdin(VALID_TURTLE)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&sniffed).unwrap();
+    assert_eq!(v["corpus"]["syntax_source"], "sniff");
+    assert_eq!(v["corpus"]["input"], "<stdin>");
+}
+
+#[test]
+fn profile_json_reports_the_compression_layer_and_both_byte_counts() {
+    let tmp = TempDir::new().unwrap();
+    let path = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    assert_eq!(v["corpus"]["compression"], "gzip");
+    assert_eq!(
+        v["corpus"]["bytes_decoded"].as_u64().unwrap(),
+        VALID_TURTLE.len() as u64
+    );
+    assert_ne!(
+        v["corpus"]["bytes_on_wire"], v["corpus"]["bytes_decoded"],
+        "the wire figure is the compressed size"
+    );
+    assert!(
+        v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["phase"] == "decompress"),
+        "a compressed run must show a decompress phase"
+    );
+}
+
+#[test]
+fn no_hash_omits_the_fingerprint_entirely() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert!(
+        v["corpus"].get("sha256").is_none(),
+        "an absent fingerprint must be absent, not null"
+    );
+}
+
+#[test]
+fn the_same_document_fingerprints_identically_plain_and_compressed() {
+    // The hash is over the decoded RDF, so storage format does not change the
+    // corpus identity — which is what makes a cross-compression comparison
+    // legible.
+    let tmp = TempDir::new().unwrap();
+    let plain = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let gz = gz_fixture(&tmp, "valid.ttl.gz", VALID_TURTLE);
+
+    let hash_of = |path: &Path| -> String {
+        let stderr = rdf_cmd()
+            .args(["-q", "rdf", "count", "--profile=json"])
+            .arg(path)
+            .assert()
+            .success()
+            .get_output()
+            .stderr
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+        v["corpus"]["sha256"].as_str().unwrap().to_string()
+    };
+
+    assert_eq!(hash_of(&plain), hash_of(&gz));
+}
+
+#[test]
+fn profile_human_prints_a_table_to_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile"])
+        .arg(&path)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("phase"))
+        .stderr(predicate::str::contains("% wall"))
+        .stderr(predicate::str::contains("profiler overhead"))
+        .stderr(predicate::str::contains("sink phase is estimated"));
+}
+
+#[test]
+fn profile_works_on_check_as_well_as_count() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "check", "--profile=json"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(v["verb"], "check");
+}
+
+// ============================================================================
+// help surface
+// ============================================================================
+
+#[test]
+fn rdf_help_lists_every_verb() {
+    rdf_cmd()
+        .args(["rdf", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("check"))
+        .stdout(predicate::str::contains("count"))
+        .stdout(predicate::str::contains("convert"));
+}
+
+#[test]
+fn rdf_appears_in_the_top_level_help() {
+    rdf_cmd()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rdf"));
+}
+
+#[test]
+fn count_help_lists_every_nameable_syntax_including_the_unbuilt_ones() {
+    // Naming a syntax is how a user finds out it is not built yet, so the
+    // full set has to be discoverable from help.
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "count", "--help"]);
+    let help = stdout_of(&mut cmd);
+    for syntax in [
+        "turtle", "ntriples", "nquads", "trig", "jsonld", "rdfxml", "rdfjson", "jelly",
+    ] {
+        assert!(help.contains(syntax), "help omits {syntax}:\n{help}");
+    }
+}
+
+#[test]
+fn no_rdf_verb_requires_a_fluree_directory() {
+    // The whole point of the surface: these read files, not ledgers. Run
+    // from a directory with no `.fluree/` anywhere above it that we control,
+    // with HOME redirected so the global-config fallback cannot rescue it.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    for verb in ["check", "count"] {
+        let mut cmd = rdf_cmd();
+        cmd.current_dir(tmp.path());
+        cmd.env("HOME", tmp.path());
+        cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
+        cmd.args(["rdf", verb]).arg(&path).assert().success();
+    }
+}

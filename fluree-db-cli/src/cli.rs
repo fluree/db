@@ -1148,6 +1148,21 @@ pub enum Commands {
         action: DocsAction,
     },
 
+    /// RDF syntax tooling: check, count, and convert files without a ledger
+    ///
+    /// These verbs read files, not databases — no `fluree init`, no ledger,
+    /// no connection. Input may be a path, `-`, or piped on stdin, and
+    /// `.gz` / `.zst` inputs decompress transparently.
+    ///
+    /// Examples:
+    ///   fluree rdf check dump.ttl
+    ///   fluree rdf count dump.nt.gz --time
+    ///   cat dump.ttl | fluree rdf count --profile=json
+    Rdf {
+        #[command(subcommand)]
+        action: RdfAction,
+    },
+
     /// Manage Apache Iceberg table connections
     Iceberg {
         #[command(subcommand)]
@@ -2758,6 +2773,105 @@ pub enum UpstreamAction {
 
     /// List all upstream configurations
     List,
+}
+
+// =============================================================================
+// `fluree rdf` subcommands
+// =============================================================================
+
+/// Arguments every `fluree rdf` verb takes.
+///
+/// Flattened rather than repeated so `--syntax` means the same thing in every
+/// verb — the same reason [`PolicyArgs`] is flattened across query and
+/// transaction commands.
+///
+/// `--quiet` is deliberately absent: it is a global flag on [`Cli`] and
+/// declaring it again here would collide. The verbs read `cli.quiet`.
+#[derive(Args, Debug, Clone)]
+pub struct RdfCommonArgs {
+    /// Input file. `-` or no argument reads stdin. `.gz` / `.zst` inputs
+    /// decompress transparently.
+    #[arg(value_name = "FILE")]
+    pub input: Option<PathBuf>,
+
+    /// Input syntax, overriding the file extension and content sniffing.
+    /// Required when a piped or oddly-named input cannot be identified.
+    #[arg(long, value_enum, value_name = "SYNTAX")]
+    pub syntax: Option<crate::rdf::syntax::RdfSyntax>,
+
+    /// Base IRI for resolving relative references in the input.
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// Print elapsed time and throughput to stderr when finished.
+    #[arg(long)]
+    pub time: bool,
+
+    /// Print a per-phase timing breakdown to stderr. `--profile` for a table,
+    /// `--profile=json` for a machine-readable report.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "human"
+    )]
+    pub profile: Option<crate::rdf::profile::ProfileFormat>,
+
+    /// Skip the corpus SHA-256 in `--profile` output. The hash is a full pass
+    /// over the input; leave it out when the timing is what matters.
+    #[arg(long)]
+    pub no_hash: bool,
+}
+
+/// `fluree rdf` verbs.
+#[derive(Subcommand)]
+pub enum RdfAction {
+    /// Convert a document from one RDF syntax to another
+    ///
+    /// Not yet implemented — no serializers have landed. The flags are final;
+    /// the writers are what is missing.
+    Convert {
+        #[command(flatten)]
+        common: RdfCommonArgs,
+
+        /// Output syntax. Defaults to nquads.
+        #[arg(long, value_enum, value_name = "SYNTAX")]
+        to: Option<crate::rdf::syntax::RdfSyntax>,
+
+        /// Write to a file instead of stdout.
+        #[arg(short = 'o', long, value_name = "FILE")]
+        output: Option<PathBuf>,
+
+        /// Group and indent Turtle output. Buffers the whole graph; the
+        /// default streaming form does not.
+        #[arg(long)]
+        pretty: bool,
+    },
+
+    /// Parse a document and report syntax errors
+    ///
+    /// Exits 0 when the document parses, 1 when it does not, and 2 when the
+    /// invocation itself was wrong (missing file, unknown syntax).
+    Check {
+        #[command(flatten)]
+        common: RdfCommonArgs,
+
+        /// Diagnostic format.
+        #[arg(long, value_enum, default_value_t = crate::rdf::check::CheckFormat::Table)]
+        format: crate::rdf::check::CheckFormat,
+    },
+
+    /// Count the statements in a document
+    ///
+    /// Collections are counted as the rdf:first/rdf:rest spine they denote,
+    /// so the number is comparable with other RDF tools. Under `--quiet` the
+    /// output is the bare total, for capturing in a shell variable.
+    Count {
+        #[command(flatten)]
+        common: RdfCommonArgs,
+    },
 }
 
 // =============================================================================
