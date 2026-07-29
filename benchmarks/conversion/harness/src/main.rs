@@ -78,7 +78,10 @@ fn parse_peak_rss_bytes(gnu_time_output: &str) -> Result<u64, String> {
             .parse()
             .map_err(|_| format!("unparseable RSS value in {line:?}"))?;
 
-        let unit = unit_part.trim().trim_start_matches('(').trim_end_matches(')');
+        let unit = unit_part
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')');
         return match unit {
             "kbytes" => Ok(value * 1024),
             "bytes" => Ok(value),
@@ -94,7 +97,9 @@ fn parse_peak_rss_bytes(gnu_time_output: &str) -> Result<u64, String> {
 }
 
 fn cmd_rss(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("usage: bench-harness rss <gtime-output>")?;
+    let path = args
+        .first()
+        .ok_or("usage: bench-harness rss <gtime-output>")?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     println!("{}", parse_peak_rss_bytes(&text)?);
     Ok(())
@@ -423,7 +428,10 @@ mod tests {
     #[test]
     fn an_unknown_unit_is_refused_rather_than_guessed() {
         let err = parse_peak_rss_bytes("\tMaximum resident set size (pages): 512").unwrap_err();
-        assert!(err.contains("calibrate"), "the error must name the remedy: {err}");
+        assert!(
+            err.contains("calibrate"),
+            "the error must name the remedy: {err}"
+        );
     }
 
     // -- median / MAD -----------------------------------------------------
