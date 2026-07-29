@@ -73,6 +73,16 @@ pub struct Parser<'a, 'input, S> {
     /// [`GraphSink::abort_statement`] — a statement that failed before
     /// emitting has nothing to roll back.
     emit_count: u64,
+    /// Whether the statement currently being parsed already committed itself
+    /// via [`Self::end_statement_at_dot`].
+    ///
+    /// Lives on `self` rather than riding a return value because the case it
+    /// exists for is the ERROR path: a statement commits at its `.`, then the
+    /// one-token lookahead hits a lexical error in the next statement, so the
+    /// commit has happened but `parse_statement` still returns `Err`. Without
+    /// this the error arm would also fire `abort_statement`, breaking the
+    /// published "exactly one of end/abort per statement" contract.
+    committed_current: bool,
 }
 
 impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
@@ -122,6 +132,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             nesting_depth: 0,
             options,
             emit_count: 0,
+            committed_current: false,
         })
     }
 
@@ -163,11 +174,13 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let mut statement_count: u64 = 0;
         while !self.is_at_end() {
             let emitted_before = self.emit_count;
+            self.committed_current = false;
             match self.parse_statement() {
-                // Committed at its own terminator; anything else (the
-                // SPARQL-style directives) commits here.
-                Ok(committed) => {
-                    if !committed {
+                Ok(()) => {
+                    // Statements ending in `.` commit at the terminator; the
+                    // SPARQL-style `PREFIX`/`BASE` forms have none, so they
+                    // commit here.
+                    if !self.committed_current {
                         self.sink.end_statement();
                     }
                     statement_count += 1;
@@ -177,12 +190,17 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                     // fail having already pushed triples. Tell the sink to
                     // drop them, so "a rejected statement contributes
                     // nothing" holds at the sink and not just in the error
-                    // return. Nothing emitted means nothing to roll back.
+                    // return.
                     //
-                    // A statement that already committed and then failed on
-                    // the lookahead advance lands here too; its rollback is a
-                    // no-op because the commit moved the sink's mark past it.
-                    if self.emit_count > emitted_before {
+                    // Two guards, and both are load-bearing. Nothing emitted
+                    // means nothing to roll back. And a statement that
+                    // already committed is NOT rolled back at all: it reaches
+                    // here only because the one-token lookahead failed while
+                    // reading the NEXT statement, and it is complete and
+                    // valid. Firing abort there would also break the "exactly
+                    // one of end/abort per statement" contract this trait
+                    // publishes.
+                    if !self.committed_current && self.emit_count > emitted_before {
                         self.sink.abort_statement();
                     }
                     return Err(e);
@@ -480,25 +498,26 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             ));
         }
         self.sink.end_statement();
+        self.committed_current = true;
         self.advance()
     }
 
     /// Parse a single statement (directive or triples).
     ///
-    /// Returns whether the statement already committed itself to the sink via
-    /// [`Self::end_statement_at_dot`]; the SPARQL-style `PREFIX`/`BASE` forms
-    /// have no terminator, so the caller commits those.
-    fn parse_statement(&mut self) -> Result<bool> {
+    /// Whether the statement committed itself is reported through
+    /// [`Self::committed_current`], not the return value, because the caller
+    /// needs that answer on the error path too.
+    fn parse_statement(&mut self) -> Result<()> {
         match self.current().kind {
             TokenKind::KwPrefix | TokenKind::KwSparqlPrefix => self.parse_prefix_directive(),
             TokenKind::KwBase | TokenKind::KwSparqlBase => self.parse_base_directive(),
-            TokenKind::Eof => Ok(false),
-            _ => self.parse_triples().map(|()| true),
+            TokenKind::Eof => Ok(()),
+            _ => self.parse_triples(),
         }
     }
 
     /// Parse @prefix or PREFIX directive.
-    fn parse_prefix_directive(&mut self) -> Result<bool> {
+    fn parse_prefix_directive(&mut self) -> Result<()> {
         let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlPrefix);
         self.advance()?; // consume @prefix or PREFIX
 
@@ -542,15 +561,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Consume trailing dot (required for @prefix, not for PREFIX)
         if !is_sparql_style {
-            self.end_statement_at_dot()?;
-            return Ok(true);
+            return self.end_statement_at_dot();
         }
 
-        Ok(false)
+        Ok(())
     }
 
     /// Parse @base or BASE directive.
-    fn parse_base_directive(&mut self) -> Result<bool> {
+    fn parse_base_directive(&mut self) -> Result<()> {
         let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlBase);
         self.advance()?; // consume @base or BASE
 
@@ -577,11 +595,10 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
         // Consume trailing dot (required for @base, not for BASE)
         if !is_sparql_style {
-            self.end_statement_at_dot()?;
-            return Ok(true);
+            return self.end_statement_at_dot();
         }
 
-        Ok(false)
+        Ok(())
     }
 
     /// Parse a triple statement.
