@@ -67,7 +67,7 @@ pub mod stats;
 
 // Re-export commonly used types
 pub use config::{CatalogConfig, IcebergGsConfig, IoConfig, MappingSource, TableConfig};
-pub use config_value::ConfigValue;
+pub use config_value::{ConfigValue, SecretResolveError, SecretResolver};
 pub use error::{IcebergError, Result};
 pub use mor_guard::{
     ensure_manifests_scannable, ensure_no_delete_manifests, ensure_no_summary_deletes,

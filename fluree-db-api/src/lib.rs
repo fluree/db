@@ -156,7 +156,7 @@ pub use import::{
     EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
     ImportSummary, RemoteSource,
 };
-pub use ledger_info::LedgerInfoBuilder;
+pub use ledger_info::{redact_graph_source_config, LedgerInfoBuilder};
 pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
@@ -201,14 +201,21 @@ pub use view::{
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
     browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
-    sample_column_values, sample_iceberg_rows, BrowseDepth, CatalogBrowse, CatalogMode, ColumnInfo,
-    ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions, GenerateR2rmlRequest,
-    GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig, IcebergCreateResult,
-    PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode,
-    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StructuredR2rmlMapping,
-    SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
-    ValidateR2rmlResponse,
+    sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse,
+    CatalogMode, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions,
+    GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig,
+    IcebergCreateResult, PartitionFieldInfo, R2rmlCreateConfig, R2rmlCreateResult,
+    R2rmlMappingInput, RestCatalogMode, SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier,
+    StorageAccessReport, StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride,
+    TablePreview, TableRef, TableSchema, ValidateR2rmlResponse,
 };
+
+/// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
+/// graph-source auth. The host constructs a [`SecretResolver`] with the tenant
+/// captured and injects it via [`Fluree::with_secret_resolver`]; db stays
+/// tenant-agnostic and fails closed when a secret reference has no resolver.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::{SecretResolveError, SecretResolver};
 
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
@@ -1259,6 +1266,10 @@ pub struct FlureeBuilder {
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     /// Read-only remote mounts applied at build time (alias-prefixed).
     remote_mounts: Vec<RemoteMountSpec>,
+    /// Optional secret resolver forwarded to the built `Fluree` for
+    /// `ConfigValue::SecretRef` hydration. See [`FlureeBuilder::with_secret_resolver`].
+    #[cfg(feature = "iceberg")]
+    secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
 }
 
 /// Configuration for background indexing in `FlureeBuilder`.
@@ -1475,6 +1486,8 @@ impl FlureeBuilder {
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
+            #[cfg(feature = "iceberg")]
+            secret_resolver: None,
         }
     }
 
@@ -1491,6 +1504,8 @@ impl FlureeBuilder {
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
+            #[cfg(feature = "iceberg")]
+            secret_resolver: None,
         }
     }
 
@@ -1559,6 +1574,8 @@ impl FlureeBuilder {
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
+            #[cfg(feature = "iceberg")]
+            secret_resolver: None,
         }
     }
 
@@ -1753,6 +1770,8 @@ impl FlureeBuilder {
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
+            #[cfg(feature = "iceberg")]
+            secret_resolver: None,
         })
     }
 
@@ -1951,6 +1970,19 @@ impl FlureeBuilder {
     /// spawned on the tokio runtime, so `build()` must be called within a
     /// tokio context.
     #[cfg(feature = "native")]
+    /// Inject a secret resolver used to hydrate `ConfigValue::SecretRef` auth
+    /// references in Iceberg graph sources built by this builder. It is forwarded
+    /// to the finalized `Fluree`. Most hosts inject per-request via
+    /// [`Fluree::with_secret_resolver`] instead; use this for a build-time default.
+    #[cfg(feature = "iceberg")]
+    pub fn with_secret_resolver(
+        mut self,
+        resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
+    ) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
     pub fn build(mut self) -> Result<Fluree> {
         let path = self
             .storage_path
@@ -1981,6 +2013,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2011,6 +2045,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         )
     }
 
@@ -2118,6 +2154,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2155,6 +2193,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         )
     }
 
@@ -2189,6 +2229,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         )
     }
 
@@ -2243,6 +2285,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         )
     }
 
@@ -2321,6 +2365,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2423,6 +2469,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2509,6 +2557,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2642,6 +2692,12 @@ impl FlureeBuilder {
         parts: RuntimeParts,
         remote_connections: remote_service::RemoteConnectionRegistry,
         remote_mounts: Vec<RemoteMountSpec>,
+        // The single assembly point forwards the builder's secret resolver so
+        // every `build*` path carries it uniformly. Gated: the trait lives in the
+        // optional `fluree-db-iceberg` dep.
+        #[cfg(feature = "iceberg")] secret_resolver: Option<
+            Arc<dyn fluree_db_iceberg::SecretResolver>,
+        >,
     ) -> Fluree {
         let RuntimeParts {
             backend,
@@ -2695,6 +2751,8 @@ impl FlureeBuilder {
             event_bus,
             ledger_manager,
             remote_service: build_remote_service(remote_connections),
+            #[cfg(feature = "iceberg")]
+            secret_resolver,
         }
     }
 
@@ -2802,6 +2860,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2873,6 +2933,8 @@ impl FlureeBuilder {
                 },
                 self.remote_connections,
                 self.remote_mounts,
+                #[cfg(feature = "iceberg")]
+                self.secret_resolver,
             ))
         }
     }
@@ -2934,6 +2996,8 @@ impl FlureeBuilder {
             },
             self.remote_connections,
             self.remote_mounts,
+            #[cfg(feature = "iceberg")]
+            self.secret_resolver,
         ))
     }
 
@@ -2984,6 +3048,12 @@ impl FlureeBuilder {
 ///
 /// Combines connection management, nameservice, and query execution
 /// into a unified interface.
+///
+/// `Clone` is cheap: every field is either config data or `Arc`-backed shared
+/// state (caches, event bus, ledger manager). This lets a host derive a
+/// per-tenant instance via [`Fluree::with_secret_resolver`] per request without
+/// re-opening storage.
+#[derive(Clone)]
 pub struct Fluree {
     /// Connection configuration
     config: ConnectionConfig,
@@ -3022,6 +3092,13 @@ pub struct Fluree {
     /// the executor is passed to `ContextConfig` and made available to
     /// `ServiceOperator` during query execution.
     remote_service: Option<Arc<dyn fluree_db_query::remote_service::RemoteServiceExecutor>>,
+    /// Injected resolver for `ConfigValue::SecretRef` secret references in
+    /// Iceberg graph-source auth. `None` in OSS/CLI (secret references then fail
+    /// closed); a host (e.g. solo) injects a tenant-scoped resolver via
+    /// [`Fluree::with_secret_resolver`]. db never sees tenant identity — the
+    /// resolver authorizes itself.
+    #[cfg(feature = "iceberg")]
+    secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
 }
 
 impl Fluree {
@@ -3059,6 +3136,8 @@ impl Fluree {
             event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
             ledger_manager: None,
             remote_service: None,
+            #[cfg(feature = "iceberg")]
+            secret_resolver: None,
         }
     }
 
@@ -3082,12 +3161,38 @@ impl Fluree {
             event_bus: Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024)),
             ledger_manager: None,
             remote_service: None,
+            #[cfg(feature = "iceberg")]
+            secret_resolver: None,
         }
     }
 
     /// Set the indexing mode
     pub fn set_indexing_mode(&mut self, mode: tx::IndexingMode) {
         self.indexing_mode = mode;
+    }
+
+    /// Return a clone of this `Fluree` carrying `resolver`, used to hydrate
+    /// `ConfigValue::SecretRef` auth references in Iceberg graph sources.
+    ///
+    /// The clone is cheap (config + `Arc`-backed shared state) and the original
+    /// is left untouched, so a host can derive a per-tenant instance per request.
+    /// db performs no authorization itself — the resolver captures the tenant and
+    /// authorizes each `secret_ref` resolution.
+    #[cfg(feature = "iceberg")]
+    pub fn with_secret_resolver(
+        &self,
+        resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
+    ) -> Fluree {
+        let mut cloned = self.clone();
+        cloned.secret_resolver = Some(resolver);
+        cloned
+    }
+
+    /// The injected secret resolver, if any. Used by the Iceberg auth-hydration
+    /// path; `None` means `ConfigValue::SecretRef` references fail closed.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn secret_resolver(&self) -> Option<&Arc<dyn fluree_db_iceberg::SecretResolver>> {
+        self.secret_resolver.as_ref()
     }
 
     /// Get the remote SERVICE executor, if configured.

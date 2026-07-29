@@ -1370,6 +1370,18 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             Arc::from(self.optional_only_vars.clone().into_boxed_slice());
 
         // Execute once; hash-partition output rows by the full correlation key.
+        //
+        // Rebuild-boundary memory accounting (D1): this inner subplan is rebuilt once
+        // PER required BATCH (see the method doc) and genuinely dropped at the end of
+        // this call — its recorded bytes (hash-join / GROUP BY / fused-dim build tables)
+        // are provably freed HERE. Snapshot the shared counter before it charges, then
+        // release exactly its delta after it drains and closes (below), so a correlation
+        // spanning N batches accounts one build's peak, not their all-time sum. Releases
+        // only what the finished inner charged — never a live/persistent build (the delta
+        // is 0 if it retained nothing) — and execution on one handle is sequential, so no
+        // other charger races the delta. Without it the counter grows ~N× the true peak
+        // and false-aborts a legitimate batched OPTIONAL with a typed 507.
+        let mem_before_inner = ctx.mem_used();
         inner.open(ctx).await?;
         let mut buckets: HashMap<Vec<GroupKeyOwned>, Vec<Vec<Binding>>> = HashMap::new();
         while let Some(batch) = inner.next_batch(ctx).await? {
@@ -1387,6 +1399,10 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             }
         }
         inner.close();
+        // Release this rebuild's charge (see the snapshot before `inner.open`). An
+        // early `?`-exit in the drain loop skips this — that only over-counts (the safe
+        // direction) and the query is aborting on that path anyway.
+        ctx.release(ctx.mem_used().saturating_sub(mem_before_inner));
 
         // One result Batch per correlation key (optional-only columns only),
         // then assigned to each required row that shares the key.

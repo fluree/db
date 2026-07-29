@@ -535,6 +535,41 @@ impl R2rmlScanOperator {
         !self.pattern.star_bindings.is_empty() || !self.pattern.star_constraints.is_empty()
     }
 
+    /// F-16: whether a pattern is a FOLDED crawl wildcard (W4-1b: `?s ?p ?o`
+    /// plus same-subject const-object constraints) whose every constraint is a
+    /// scalar. Only such a pattern may keep the `trust_fk_refs` FK-template ref
+    /// shortcut: a scalar constraint checks a scalar column and never relaxes a
+    /// ref, while an IRI (or any non-scalar) constraint on a ref predicate would
+    /// be satisfied by the templated render of a DANGLING FK — the shortcut
+    /// skips exactly the parent scan that would have dropped that subject, so
+    /// re-enabling it there would over-match (catch #11). Var star members
+    /// (`star_bindings`) also disqualify: they are fixed-predicate star shapes,
+    /// not the crawl fold.
+    fn folded_wildcard_all_scalar(pattern: &R2rmlPattern) -> bool {
+        pattern.predicate_var.is_some()
+            && pattern.star_bindings.is_empty()
+            && !pattern.star_constraints.is_empty()
+            && pattern
+                .star_constraints
+                .iter()
+                .all(|(_, c)| matches!(c, crate::r2rml::ObjectConstant::Scalar(_)))
+    }
+
+    /// The `trust_fk_refs` FK-template ref-shortcut admission (the seam the
+    /// parent-lookup build consults; see the comment at the call site). A
+    /// pattern qualifies when trust is on, it is a plain OR scalar-folded true
+    /// wildcard, and no predicate filter narrows it. Extracted so the composed
+    /// predicate is pinned by `f16_ref_template_shortcut_fires_for_scalar_folded`
+    /// — the production build calls THIS fn, so the test exercises the real
+    /// admission, not a copy.
+    fn ref_template_shortcut_enabled(trust_fk_refs: bool, pattern: &R2rmlPattern) -> bool {
+        let star_free = pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
+        trust_fk_refs
+            && (star_free || Self::folded_wildcard_all_scalar(pattern))
+            && pattern.predicate_filter.is_none()
+            && pattern.object_var.is_some()
+    }
+
     /// True for a pure `rdf:type`/subject-only pattern: no object var, no
     /// predicate filter, no star members. Such a pattern derives only the subject
     /// (its `rr:class` constraint is enforced by TriplesMap selection), so it
@@ -637,18 +672,20 @@ impl R2rmlScanOperator {
             &self.pattern.object_constant,
             self.pattern.predicate_filter.as_deref(),
         ) {
-            let mut matching = triples_map
-                .predicate_object_maps
-                .iter()
-                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
-            if let (Some(pom), None) = (matching.next(), matching.next()) {
-                if let Some(col) = value_pushdown_column(&pom.object_map) {
-                    out.push(crate::r2rml::ScanFilter {
-                        column: col.to_string(),
-                        op: crate::r2rml::ScanCmpOp::Eq,
-                        value: value.clone(),
-                    });
-                }
+            push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
+        }
+
+        // W4-1 PRIMARY: a scalar constant-object member of a same-subject star
+        // (`?ol ex:orderLineKey "1"; ?ol ex:order ?ord`) lands in `star_constraints`,
+        // not the base `object_constant`, so without this it was enforced ONLY
+        // residually — the whole FACT was read and filtered post-scan (the round-3b
+        // point-lookup fanned into a full 120 M-row scan). Push each scalar star
+        // constraint as a scan filter under the same soundness gate, so a constant
+        // key equality prunes the scan even alongside other predicates. IRI/decimal/
+        // double constraints stay operator-enforced only (not pushable here).
+        for (pred_iri, constant) in &self.pattern.star_constraints {
+            if let crate::r2rml::ObjectConstant::Scalar(value) = constant {
+                push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
             }
         }
 
@@ -790,14 +827,20 @@ impl R2rmlScanOperator {
         // complete star row, so this is a provably-empty prune, result-preserving).
         // Computed before the resolution closure, which borrows `self.pattern`.
         let star_prune_on = star_tm_prune_enabled();
-        let star_required_preds: Vec<String> = if star_prune_on && self.has_star_members() {
-            self.pattern_predicates()
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // F-16/catch-#10: the all-preds prune argument holds only for FIXED-predicate
+        // stars (a map missing a member yields no complete star row). A folded crawl
+        // WILDCARD emits per-(p,o) across co-subject maps, so a map lacking the
+        // folded constraint predicate can still contribute rows — pruning it would
+        // drop those rows for vertically-partitioned subjects (F10-class mappings).
+        let star_required_preds: Vec<String> =
+            if star_prune_on && self.pattern.predicate_var.is_none() && self.has_star_members() {
+                self.pattern_predicates()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // PR-3 fix (b'): resolution-only class prune (template-disjoint; see
         // `R2rmlPattern::class_prune_hint`). Gated by the same switch as fix (a).
         let prune_class: Option<String> = if star_prune_on {
@@ -918,7 +961,21 @@ impl R2rmlScanOperator {
             // Determine projection columns. For a same-subject star, project the
             // union of columns needed for every star predicate so the whole star
             // is satisfied by one scan.
-            let projection: Vec<String> = if !self.has_star_members() {
+            let projection: Vec<String> = if self.pattern.predicate_var.is_some() {
+                // Variable-predicate wildcard (`?s ?p ?o`): materialize EVERY POM, so
+                // project ALL columns. A W4-1b-folded crawl wildcard ALSO carries
+                // star_constraints, but those are a subject-level existence filter,
+                // not a projection restriction — `columns_for_predicate(None)` already
+                // covers the constraint predicates' columns too. (Without this branch a
+                // folded wildcard fell into the `has_star_members` else below and
+                // projected ONLY the constraint column, dropping every other POM's
+                // value so `?p`/`?o` never materialized.)
+                triples_map
+                    .columns_for_predicate(None)
+                    .into_iter()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            } else if !self.has_star_members() {
                 if self.is_subject_only_pattern() {
                     // rdf:type / subject-only pattern: only the subject columns are
                     // load-bearing. Projecting every POM column (the
@@ -1023,7 +1080,7 @@ impl R2rmlScanOperator {
                         as_of_t,
                     )
                     .await?;
-                match collect_scan_capped(fresh, materialize_window_rows()).await? {
+                match collect_scan_capped(fresh, materialize_window_rows(), ctx).await? {
                     CollectedScan::Complete(batches) => {
                         let arc = Arc::new(batches);
                         self.scan_cache.insert(cache_key, Arc::clone(&arc));
@@ -1049,10 +1106,18 @@ impl R2rmlScanOperator {
             // `?s <ref> ?o` join) or a star/predicate-list crawl keeps the scan +
             // dangling-FK semantics and its subject set — a ref used as a subject
             // filter must not be relaxed to a match.
-            let ref_template_shortcut = ctx.trust_fk_refs
-                && !self.has_star_members()
-                && self.pattern.predicate_filter.is_none()
-                && self.pattern.object_var.is_some();
+            //
+            // F-16/catch-#10+#11 carve-out: a FOLDED crawl wildcard (W4-1b — the
+            // same true-wildcard shape plus same-subject const-object constraints)
+            // keeps the shortcut ONLY when every folded constraint is a scalar: a
+            // scalar constraint checks a scalar column and never touches a ref,
+            // while an IRI constraint on a ref predicate would be satisfied by the
+            // templated render of a DANGLING FK (the shortcut skips the parent
+            // scan that would have dropped it) — an over-match. Non-scalar
+            // constraints keep the shortcut off and take the sound parent-scan
+            // path.
+            let ref_template_shortcut =
+                Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
             // Scoped so `star_preds` (which borrows `self`) is released before the
             // parent-lookup loop mutates `self.parent_lookup_cache` (PR-4).
             let filtered_poms: Vec<_> = {
@@ -1061,7 +1126,7 @@ impl R2rmlScanOperator {
                     .predicate_object_maps
                     .iter()
                     .filter(|pom| {
-                        if self.has_star_members() {
+                        if self.pattern.predicate_var.is_none() && self.has_star_members() {
                             pom.predicate_map
                                 .as_constant()
                                 .is_some_and(|p| star_preds.contains(&p))
@@ -1215,7 +1280,7 @@ impl R2rmlScanOperator {
                             as_of_t,
                         )
                         .await?;
-                    let parent_batches = collect_stream(parent_stream).await?;
+                    let parent_batches = collect_stream(parent_stream, ctx).await?;
 
                     let lookup = Arc::new(build_parent_lookup(
                         parent_tm,
@@ -1402,10 +1467,22 @@ impl R2rmlScanOperator {
 
 /// Drain a [`ColumnBatchStream`] fully into a vector. Used for small dimension
 /// (parent) tables whose entire contents become a lookup.
-async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch>> {
+async fn collect_stream(
+    mut stream: ColumnBatchStream,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<ColumnBatch>> {
     let mut out = Vec::new();
-    while let Some(batch) = stream.next().await {
-        out.push(batch?);
+    loop {
+        // T3.1a: cancellation checkpoint before decoding the next batch, so a
+        // deadline/abort stops a parent-dimension drain mid-sweep instead of
+        // materializing the whole table into the lookup first. (The main
+        // streaming scan already polls per-batch in `next_batch`; this closes the
+        // collect-into-lookup helpers that drained a scan without a checkpoint.)
+        ctx.check_cancelled()?;
+        match stream.next().await {
+            Some(batch) => out.push(batch?),
+            None => break,
+        }
     }
     Ok(out)
 }
@@ -1441,10 +1518,17 @@ enum CollectedScan {
 /// reaches `cap` with more remaining (→ `Overflow`, too large to cache). The cap
 /// equals one materialize window, so a cached inner never exceeds the resident
 /// footprint a single scan window already materializes.
-async fn collect_scan_capped(mut stream: ColumnBatchStream, cap: usize) -> Result<CollectedScan> {
+async fn collect_scan_capped(
+    mut stream: ColumnBatchStream,
+    cap: usize,
+    ctx: &ExecutionContext<'_>,
+) -> Result<CollectedScan> {
     let mut collected = Vec::new();
     let mut rows = 0usize;
     while rows < cap {
+        // T3.1a: cancellation checkpoint before decoding the next cached-inner
+        // batch (bounded by the materialize window, but still a large drain).
+        ctx.check_cancelled()?;
         match stream.next().await {
             Some(batch) => {
                 let batch = batch?;
@@ -1714,6 +1798,108 @@ fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
     }
 }
 
+/// The xsd integer-family datatypes: types whose canonical lexical form of an
+/// integer value carries no decimal point, so a decimal-free integer string is the
+/// column's exact rendering. Only these admit the string→`Int` scan-filter coercion
+/// (`coerce_scalar_for_pushdown`); `xsd:decimal`/`double` render with a fractional
+/// part, so their lexical↔numeric relationship is scale-dependent and not coerced.
+fn is_xsd_integer_datatype(iri: &str) -> bool {
+    use fluree_vocab::xsd;
+    matches!(
+        iri,
+        xsd::INTEGER
+            | xsd::LONG
+            | xsd::INT
+            | xsd::SHORT
+            | xsd::BYTE
+            | xsd::UNSIGNED_LONG
+            | xsd::UNSIGNED_INT
+            | xsd::UNSIGNED_SHORT
+            | xsd::UNSIGNED_BYTE
+            | xsd::NON_NEGATIVE_INTEGER
+            | xsd::POSITIVE_INTEGER
+    )
+}
+
+/// Coerce a scalar constant to the [`ScanValue`] that soundly prunes `om`'s column,
+/// or `None` to DECLINE the push (leaving the operator's residual check the sole
+/// authority — a declined push is never wrong, only unpruned).
+///
+/// SOUNDNESS (the W4-1 hard requirement): the residual
+/// [`rdf_term_eq_object_constant`] compares a `Scalar(Str)` constant LEXICALLY
+/// against the column's materialized rendering, so a pushed file-prune filter is
+/// admissible only when its match-set PROVABLY covers that residual match-set. The
+/// one coercion performed — a string literal against a declared xsd-integer column —
+/// fires ONLY when the string round-trips canonically (`n.to_string() == s`): then
+/// lexical-eq ⟺ integer-eq and an `Int(n)` equality prunes exactly the residual's
+/// rows. Non-canonical forms (`"01"`, `"1.0"`, a non-numeric string) are ambiguous
+/// and DECLINED. A value already carrying a pushable, residual-matched type
+/// (`Int`/`Bool`/`Date`) pushes as-is; a string against any non-integer column
+/// pushes as-is too — a string column prunes lexicographically, and the reader
+/// safely ignores a string filter on a numeric physical column (pre-existing).
+fn coerce_scalar_for_pushdown(
+    value: &crate::r2rml::ScanValue,
+    om: &ObjectMap,
+) -> Option<crate::r2rml::ScanValue> {
+    use crate::r2rml::ScanValue;
+    match value {
+        ScanValue::Str(s) => {
+            if object_map_datatype(om).is_some_and(is_xsd_integer_datatype) {
+                match s.parse::<i64>() {
+                    // Canonical round-trip ⇒ lexical-eq ⟺ integer-eq; otherwise the
+                    // coercion is ambiguous and could over-prune vs the residual.
+                    Ok(n) if n.to_string() == *s => Some(ScanValue::Int(n)),
+                    _ => None,
+                }
+            } else {
+                Some(ScanValue::Str(s.clone()))
+            }
+        }
+        // Already a pushable, type-matched value; the residual uses the same
+        // semantics for these variants.
+        ScanValue::Int(_) | ScanValue::Bool(_) | ScanValue::Date(_) => Some(value.clone()),
+        // Double/Decimal/TemplateKey never wrap a Scalar object constant (a numeric
+        // object routes to ObjectConstant::Double/Decimal, operator-enforced only),
+        // so these are unreachable here; push as-is defensively — never wrong.
+        ScanValue::Double(_) | ScanValue::Decimal { .. } | ScanValue::TemplateKey(_) => {
+            Some(value.clone())
+        }
+    }
+}
+
+/// Push an `Eq` scan filter for a scalar constant-object equality on `pred_iri`,
+/// applying the [`coerce_scalar_for_pushdown`] soundness gate. Shared by the base
+/// `object_constant` (single-predicate `?s pred const`) and the `star_constraints`
+/// (a constant-object member of a same-subject star, e.g. `?ol …key "1"; ?ol ?p ?o`)
+/// so both classes of constant key-equality prune the scan identically. A file-level
+/// prune is only sound when the predicate maps to EXACTLY ONE scalar object map
+/// backed by one column (else a row could match via an unpruned column); otherwise
+/// no filter is pushed and the operator's residual check remains the authority.
+fn push_scalar_eq_filter(
+    out: &mut Vec<crate::r2rml::ScanFilter>,
+    triples_map: &TriplesMap,
+    pred_iri: &str,
+    value: &crate::r2rml::ScanValue,
+) {
+    let mut matching = triples_map
+        .predicate_object_maps
+        .iter()
+        .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+    let (Some(pom), None) = (matching.next(), matching.next()) else {
+        return;
+    };
+    let Some(col) = value_pushdown_column(&pom.object_map) else {
+        return;
+    };
+    if let Some(v) = coerce_scalar_for_pushdown(value, &pom.object_map) {
+        out.push(crate::r2rml::ScanFilter {
+            column: col.to_string(),
+            op: crate::r2rml::ScanCmpOp::Eq,
+            value: v,
+        });
+    }
+}
+
 /// Materialize the object term for one POM at a table row, resolving a
 /// RefObjectMap through the pre-built parent lookup. Free fn so it runs off the
 /// operator inside a rayon worker.
@@ -1795,7 +1981,7 @@ fn materialize_pom_object(
 /// precomputed canonical string (see [`decimal_canonical_of`]); an exact lexical
 /// match (the common same-scale case) then skips the per-row `BigDecimal` parse,
 /// while a scale variant (`"9.990"` vs `"9.99"`) falls back to the numeric compare.
-fn rdf_term_eq_object_constant_cached(
+pub(crate) fn rdf_term_eq_object_constant_cached(
     term: &RdfTerm,
     constant: &crate::r2rml::ObjectConstant,
     numeric_column: bool,
@@ -1876,7 +2062,7 @@ fn subject_term_matches_iri(term: &RdfTerm, want: &str) -> bool {
 /// The constant's precomputed `BigDecimal::to_string()`, for an
 /// `ObjectConstant::Decimal` — computed once per scan so the hot per-row match
 /// can skip re-parsing. `None` for any other constant.
-fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
+pub(crate) fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
     match constant {
         crate::r2rml::ObjectConstant::Decimal(d) => Some(d.to_string()),
         _ => None,
@@ -1907,7 +2093,7 @@ fn decimal_lexical_eq_int(v: &str, n: i64) -> bool {
 /// type, so an integer constant may match a decimal lexical form. Only a plain
 /// `rr:column` object qualifies — anything else does not push a scan filter (see
 /// [`value_pushdown_column`]), so the strict lexical match already suffices.
-fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
+pub(crate) fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
     let ObjectMap::Column { column, .. } = &pom.object_map else {
         return false;
     };
@@ -1915,6 +2101,49 @@ fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bo
         batch.column_by_name(column),
         Some(Column::Decimal { .. } | Column::Float32(_) | Column::Float64(_))
     )
+}
+
+/// Whether the current row's subject satisfies EVERY folded `star_constraint` — each
+/// constraint predicate must yield at least one object equal to its constant. The
+/// E2 / W4-1b constant-object existence filter, shared by the fixed-predicate star
+/// branch and the folded-wildcard subject pre-check. `star_constraint_canon` is the
+/// per-constraint precomputed decimal canonical (parallel to `star_constraints`).
+#[allow(clippy::too_many_arguments)]
+fn row_passes_star_constraints(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    table_row_idx: usize,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+    star_constraint_canon: &[Option<String>],
+) -> Result<bool> {
+    for ((pred, required), canon) in pattern.star_constraints.iter().zip(star_constraint_canon) {
+        let mut matched = false;
+        for pom in triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
+        {
+            if let Some(t) = materialize_pom_object(
+                pom,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+            )? {
+                let numeric = object_column_is_numeric(pom, iceberg_batch);
+                if rdf_term_eq_object_constant_cached(&t, required, numeric, canon.as_deref()) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Materialize one column batch into produced variable assignments (subject +
@@ -1961,7 +2190,15 @@ fn materialize_batch(
         }
         let subject_binding = encoder.encode(&subject_term);
 
-        if !pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty() {
+        // A fixed-predicate same-subject star (extra star_bindings and/or folded
+        // const-object star_constraints). A variable-predicate WILDCARD is excluded
+        // here even when it carries folded star_constraints (W4-1b): it must reach
+        // the wildcard POM loop below to bind ?p/?o, so its star_constraints are
+        // applied as a subject-level existence pre-check there — this fixed-predicate
+        // path never binds a predicate var and would emit a subject-only row.
+        if pattern.predicate_var.is_none()
+            && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
+        {
             let mut members: Vec<(VarId, &str)> = Vec::new();
             if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
             {
@@ -2000,40 +2237,18 @@ fn materialize_batch(
             // Fused constant-object constraints: the row survives only when each
             // predicate produces at least one object equal to its constant. This
             // is an existence filter (produces no var), enforced by the operator.
-            if row_ok {
-                for ((pred, required), canon) in
-                    pattern.star_constraints.iter().zip(&star_constraint_canon)
-                {
-                    let mut matched = false;
-                    for pom in triples_map
-                        .predicate_object_maps
-                        .iter()
-                        .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
-                    {
-                        if let Some(t) = materialize_pom_object(
-                            pom,
-                            iceberg_batch,
-                            table_row_idx,
-                            parent_lookups,
-                            ref_shortcuts,
-                        )? {
-                            let numeric = object_column_is_numeric(pom, iceberg_batch);
-                            if rdf_term_eq_object_constant_cached(
-                                &t,
-                                required,
-                                numeric,
-                                canon.as_deref(),
-                            ) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !matched {
-                        row_ok = false;
-                        break;
-                    }
-                }
+            if row_ok
+                && !row_passes_star_constraints(
+                    pattern,
+                    triples_map,
+                    iceberg_batch,
+                    table_row_idx,
+                    parent_lookups,
+                    ref_shortcuts,
+                    &star_constraint_canon,
+                )?
+            {
+                row_ok = false;
             }
             if !row_ok {
                 continue;
@@ -2137,6 +2352,27 @@ fn materialize_batch(
             }
             continue;
         };
+
+        // W4-1b: a folded crawl wildcard carries const-object members as
+        // `star_constraints`. Apply them as a SUBJECT existence pre-check before
+        // emitting any (p,o) row: keep this subject's wildcard rows only when every
+        // constraint predicate yields its constant — the same existence filter the
+        // standalone joined key scan enforced. Empty (a no-op) for a plain wildcard;
+        // a fixed-predicate star with constraints took the star branch above, so only
+        // a folded wildcard reaches here with a non-empty set.
+        if !pattern.star_constraints.is_empty()
+            && !row_passes_star_constraints(
+                pattern,
+                triples_map,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+                &star_constraint_canon,
+            )?
+        {
+            continue;
+        }
 
         for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
             pattern
@@ -2488,6 +2724,42 @@ mod tests {
     use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
     use fluree_db_r2rml::materialize::RdfTerm;
 
+    /// T3.1a: a cancelled query must stop a parent-dimension drain up front
+    /// (return `Cancelled`) instead of materializing the whole table into the
+    /// lookup. Without the checkpoint the empty stream would drain to `Ok`.
+    #[tokio::test]
+    async fn collect_stream_bails_on_cancelled_query() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        assert!(matches!(
+            collect_stream(stream, &ctx).await,
+            Err(QueryError::Cancelled { .. })
+        ));
+    }
+
+    /// T3.1a: same checkpoint on the capped cached-inner drain.
+    #[tokio::test]
+    async fn collect_scan_capped_bails_on_cancelled_query() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        assert!(matches!(
+            collect_scan_capped(stream, 1000, &ctx).await,
+            Err(QueryError::Cancelled { .. })
+        ));
+    }
+
     /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
     /// carries a residual filter the operator enforces after emitting rows —
     /// otherwise the heap is fed pre-filter values and could prune files whose
@@ -2825,6 +3097,191 @@ mod tests {
         );
     }
 
+    // W4-1 SECONDARY (the hard requirement): a pushed filter's match-set must
+    // PROVABLY cover the residual's. The residual (`rdf_term_eq_object_constant`,
+    // `Scalar(Str)` arm) compares LEXICALLY, so a string literal coerces to `Int`
+    // ONLY when it round-trips canonically (lexical-eq ⟺ integer-eq); every
+    // ambiguous form declines the push so the residual — never wrong — stays sole
+    // authority. These are the refutation cases (residual-matches-but-would-mismatch
+    // and non-numeric-vs-numeric are never over-pruned).
+    #[test]
+    fn w4_1_coerce_string_to_int_only_when_canonical() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::ObjectMap;
+
+        let int_col = ObjectMap::column_typed("K", fluree_vocab::xsd::INTEGER);
+        let long_col = ObjectMap::column_typed("K", fluree_vocab::xsd::LONG);
+        let str_untyped = ObjectMap::column("NAME"); // no rr:datatype → xsd:string
+        let str_typed = ObjectMap::column_typed("NAME", fluree_vocab::xsd::STRING);
+        let dec_col = ObjectMap::column_typed("AMT", fluree_vocab::xsd::DECIMAL);
+
+        // Canonical integer string against an integer column → coerced (prunes).
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &int_col),
+            Some(ScanValue::Int(1))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("-5".into()), &long_col),
+            Some(ScanValue::Int(-5))
+        );
+
+        // REFUTATION — non-canonical / non-integer against an integer column DECLINE
+        // (never over-prune vs the lexical residual): "01" (leading zero), "1.0"
+        // (fraction), "+1" (sign form), " 1" (space), "abc" (non-numeric), "-0"
+        // (parses to 0 whose canonical render "0" ≠ "-0", so the pushed Int would
+        // prune rows the lexical residual keeps), and a >i64 value (parse overflow).
+        for s in [
+            "01",
+            "1.0",
+            "+1",
+            " 1",
+            "abc",
+            "",
+            "-0",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                coerce_scalar_for_pushdown(&ScanValue::Str(s.into()), &int_col),
+                None,
+                "non-canonical {s:?} against an integer column must DECLINE the push"
+            );
+        }
+
+        // A string against a string column pushes AS-IS (lexicographic prune matches
+        // the residual's lexical compare) — no coercion, incl. non-canonical forms.
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &str_untyped),
+            Some(ScanValue::Str("1".into()))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("01".into()), &str_typed),
+            Some(ScanValue::Str("01".into()))
+        );
+        // A string against a DECIMAL column is not coerced (scale-dependent lexical
+        // relationship) → pushed as-is; the reader safely ignores a string filter on
+        // a numeric physical column (no prune, never wrong).
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &dec_col),
+            Some(ScanValue::Str("1".into()))
+        );
+
+        // Already-typed, residual-matched values push as-is.
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Int(7), &int_col),
+            Some(ScanValue::Int(7))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Bool(true), &str_untyped),
+            Some(ScanValue::Bool(true))
+        );
+    }
+
+    // W4-1 PRIMARY dispatch: the shared push helper resolves a scalar key equality
+    // to a single scalar pushdown column and applies the coercion gate, declining
+    // on a duplicate-predicate (unsound file-prune) or a non-column object map.
+    #[test]
+    fn w4_1_push_scalar_eq_filter_resolution_and_gate() {
+        use crate::r2rml::{ScanCmpOp, ScanValue};
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let tm = TriplesMap::new("#OrderLine", "FACT_ORDER_LINE")
+            .with_subject_template("http://ex/ol/{ORDER_LINE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+                object_map: ObjectMap::column_typed("ORDER_LINE_KEY", fluree_vocab::xsd::INTEGER),
+            });
+
+        // Canonical key equality → one coerced Int filter on the mapped column.
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("1".into()),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].column, "ORDER_LINE_KEY");
+        assert!(matches!(out[0].op, ScanCmpOp::Eq));
+        assert_eq!(out[0].value, ScanValue::Int(1));
+
+        // Non-canonical → declined (coercion gate).
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("01".into()),
+        );
+        assert!(out.is_empty());
+
+        // Duplicate predicate (two POMs) → not a sound single-column prune → declined.
+        let tm_dup = tm.clone().with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+            object_map: ObjectMap::column("ORDER_LINE_KEY_ALT"),
+        });
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm_dup,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("1".into()),
+        );
+        assert!(out.is_empty());
+
+        // A value-transforming (template) object map is not pushable → declined.
+        let tm_tmpl = TriplesMap::new("#X", "T").with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/p"),
+            object_map: ObjectMap::template("PRE-{C}", vec!["C".to_string()]),
+        });
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm_tmpl,
+            "http://ex/p",
+            &ScanValue::Str("1".into()),
+        );
+        assert!(out.is_empty());
+    }
+
+    // W4-1 PRIMARY end-to-end: a scalar constant-object member of a same-subject
+    // star (`?ol …key "1"; ?ol ex:order ?ord`) lands in `star_constraints` and now
+    // produces a scan filter, so the multi-predicate point-lookup prunes the FACT
+    // scan (was residual-only → full read). The residual guard stays intact.
+    #[test]
+    fn w4_1_star_constraint_pushes_scan_filter() {
+        use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
+        use crate::seed::EmptyOperator;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let tm = TriplesMap::new("#OrderLine", "FACT_ORDER_LINE")
+            .with_subject_template("http://ex/ol/{ORDER_LINE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+                object_map: ObjectMap::column_typed("ORDER_LINE_KEY", fluree_vocab::xsd::INTEGER),
+            })
+            .with_predicate_object(pom("http://ex/order", "ORDER_KEY"));
+
+        // ?ol ex:order ?ord (the star base) + ?ol ex:orderLineKey "1" (folded const).
+        let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        pattern.predicate_filter = Some("http://ex/order".to_string());
+        pattern.star_constraints = vec![(
+            "http://ex/orderLineKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Str("1".to_string())),
+        )];
+        // The star constraint is a residual filter regardless of the push (the
+        // operator still enforces it post-scan) — the push is an optimization on top.
+        assert!(topk_residual_filter_present(&pattern));
+
+        let op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        let filters = op.build_scan_filters(&tm);
+        let key = filters
+            .iter()
+            .find(|f| f.column == "ORDER_LINE_KEY")
+            .expect("the folded key equality must now push a scan filter");
+        assert!(matches!(key.op, ScanCmpOp::Eq));
+        assert_eq!(key.value, ScanValue::Int(1));
+    }
+
     #[test]
     fn numeric_and_date_object_matching() {
         use bigdecimal::BigDecimal;
@@ -3058,6 +3515,203 @@ mod tests {
             }),
             "the data POM row must survive alongside the type row: {rows:?}"
         );
+    }
+
+    // W4-1b SHIP-BLOCKER regression (lambda-audit-2): a FOLDED crawl wildcard carries
+    // const-object members as star_constraints. Before the execution fix,
+    // has_star_members()==true routed it into the fixed-predicate star materialize,
+    // which emitted a subject-only row and NEVER bound ?p/?o. It must instead behave
+    // as a wildcard whose SUBJECT is filtered by the constraint: satisfied → all
+    // (p,o) rows; violated → the subject drops entirely.
+    #[test]
+    fn w4_1b_folded_wildcard_emits_po_rows_under_star_constraint() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: fluree_db_r2rml::mapping::PredicateMap::constant(
+                    "http://ex/storeKey",
+                ),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let batch = single_col_batch("STORE_KEY", vec![Some(7)]);
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let encoder = LiteralEncoder::build(&tm, &snapshot);
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        // `?s ?p ?o` with a folded const-object constraint storeKey==7 (SATISFIED):
+        // behaves exactly like the plain wildcard — data POM row + rdf:type row, each
+        // binding ?p AND ?o (this is what the ship-blocker broke).
+        let mut pass =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        pass.star_constraints = vec![(
+            "http://ex/storeKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(7)),
+        )];
+        let rows =
+            materialize_batch(&pass, &tm, &batch, &lookups, &shortcuts, &encoder).expect("mat");
+        assert_eq!(
+            rows.len(),
+            2,
+            "satisfied → wildcard emits (p,o): data POM + type row, NOT a subject-only row: {rows:?}"
+        );
+        // The folded wildcard must emit the SAME (p,o) triples the UNFOLDED wildcard
+        // does when the subject satisfies the constraint (lambda-audit-2: assert the
+        // bindings, not just the count — a count alone could pass on two subject-only
+        // rows from some other path). Mirrors var_subject_wildcard_emits_rdf_type_rows.
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == "http://ex/storeKey"))
+                    .unwrap_or(false)
+                    && find(r, VarId(2)).is_some()
+            }),
+            "data POM row must bind ?p=storeKey AND ?o: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == fluree_vocab::rdf::TYPE))
+                    .unwrap_or(false)
+                    && find(r, VarId(2)).map(iri_of).as_deref() == Some("http://ex/Store")
+            }),
+            "rdf:type row must bind ?p=rdf:type AND ?o=Store: {rows:?}"
+        );
+
+        // Same wildcard, constraint storeKey==8 (VIOLATED) → the subject drops.
+        let mut fail =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        fail.star_constraints = vec![(
+            "http://ex/storeKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(8)),
+        )];
+        let rows =
+            materialize_batch(&fail, &tm, &batch, &lookups, &shortcuts, &encoder).expect("mat");
+        assert!(
+            rows.is_empty(),
+            "violated → no rows (subject filtered by the star_constraint): {rows:?}"
+        );
+    }
+
+    /// F-16/catch-#11: the `trust_fk_refs` shortcut re-enable for a folded crawl
+    /// wildcard is SCALAR-GATED. A scalar-constrained fold qualifies; an IRI
+    /// constraint (which a dangling-FK template render would falsely satisfy),
+    /// a mixed set, a fixed-predicate star (`star_bindings`), a plain wildcard
+    /// (no constraints — governed by `!has_star_members()`, not this helper),
+    /// and a non-wildcard all DISQUALIFY.
+    #[test]
+    fn f16_folded_wildcard_all_scalar_gate() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let scalar = |p: &str| (p.to_string(), ObjectConstant::Scalar(ScanValue::Int(7)));
+        let iri = |p: &str| {
+            (
+                p.to_string(),
+                ObjectConstant::Iri("http://ex/order/5".to_string()),
+            )
+        };
+
+        // Folded wildcard, all-scalar → qualifies.
+        let mut pass =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        pass.star_constraints = vec![scalar("http://ex/lineNumber")];
+        assert!(R2rmlScanOperator::folded_wildcard_all_scalar(&pass));
+
+        // IRI constraint → disqualified (dangling-FK over-match hazard).
+        let mut ref_c = pass.clone();
+        ref_c.star_constraints = vec![iri("http://ex/order")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&ref_c));
+
+        // Mixed scalar + IRI → disqualified (every constraint must be scalar).
+        let mut mixed = pass.clone();
+        mixed.star_constraints = vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&mixed));
+
+        // Fixed-predicate star member present → not the crawl fold.
+        let mut star = pass.clone();
+        star.star_bindings = vec![("http://ex/qty".to_string(), VarId(3))];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&star));
+
+        // Plain wildcard (no constraints) → not this helper's business.
+        let plain =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&plain));
+
+        // Fixed-predicate pattern (no predicate_var) → disqualified.
+        let mut fixed = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
+        fixed.star_constraints = vec![scalar("http://ex/lineNumber")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&fixed));
+    }
+
+    /// Task #17 — the F-16 closure evidence: the SHORTCUT FIRES (not merely the
+    /// flag) for a scalar-folded crawl wildcard under `trust_fk_refs`. The
+    /// production parent-lookup build consults `ref_template_shortcut_enabled`
+    /// (this exact fn) and, when true, inserts the `build_ref_shortcut` result
+    /// instead of scanning the parent — so admission==true AND
+    /// build_ref_shortcut==Some together pin the fire condition for the folded
+    /// shape. The corpus cannot exercise this seam: SPARQL queries run via
+    /// `query_from` where `trust_fk_refs` is always false (the shortcut is a
+    /// browse-crawl-API feature), so a regression here is perf-silent to q068.
+    #[test]
+    fn f16_ref_template_shortcut_fires_for_scalar_folded() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        // The ref side: single-column templated FK — shortcut-eligible (the
+        // deployed `edw:order` → FactOrder shape).
+        let parent = TriplesMap::new("#Order", "FACT_ORDER")
+            .with_subject_template("http://ex/order/{ORDER_KEY}");
+        let rom = RefObjectMap::new("#Order", "ORDER_KEY", "ORDER_KEY");
+        assert!(
+            build_ref_shortcut(&parent, &rom).is_some(),
+            "single-col templated FK must be shortcut-eligible"
+        );
+
+        // Scalar-folded crawl wildcard + trust ON → admission true ⇒ with the
+        // eligible ref above, the build inserts the shortcut (no parent scan).
+        let mut folded =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        folded.star_constraints = vec![(
+            "http://ex/lineNumber".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(1)),
+        )];
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &folded
+        ));
+
+        // Iri-folded → admission false (sound parent-scan path; catch #11).
+        let mut iri_folded = folded.clone();
+        iri_folded.star_constraints = vec![(
+            "http://ex/order".to_string(),
+            ObjectConstant::Iri("http://ex/order/5".to_string()),
+        )];
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true,
+            &iri_folded
+        ));
+
+        // Trust OFF (the chat/`query_from` path) → admission false regardless.
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            false, &folded
+        ));
+
+        // Plain wildcard + trust ON → admission true (pre-existing behavior,
+        // unchanged by the F-16 amendment).
+        let plain =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &plain
+        ));
+
+        // Fixed-predicate star + trust ON → admission false (star shapes keep
+        // parent-scan + dangling-FK semantics; unchanged).
+        let mut star = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
+        star.star_constraints = vec![(
+            "http://ex/lineNumber".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(1)),
+        )];
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &star
+        ));
     }
 
     /// A templated (non-constant) predicate binds `?p` from the row when the

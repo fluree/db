@@ -66,6 +66,23 @@ pub(crate) fn union_budget_enabled() -> bool {
     *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_UNION_BUDGET"))
 }
 
+/// T1.3: whether `DatasetOperator` forwards a top-of-tree `LIMIT` row budget /
+/// `ORDER BY … LIMIT` top-k into each member's inner subtree. Every chat SPARQL is
+/// executed as a `FROM <ledger>` dataset query (the single-view path rejects
+/// SPARQL), so it routes through `DatasetOperator`; without forwarding, a bare
+/// `LIMIT 20` never reaches the R2RML scan and the whole table is materialized.
+/// Mirrors `GraphOperator`'s wrapper forwarding (the same directive-threading
+/// pattern) — the dataset wrapper was the one wrapper on that path that lacked it.
+/// Categorically sound: the consuming `LIMIT` truncates the member concatenation
+/// to `budget`, and each member's own `Sort`/`Distinct` still absorb the budget
+/// (no-op) where present, so this only removes the wrapper's artificial block. The
+/// switch exists for differential hygiene: OFF is byte-identical to pre-T1.3.
+/// Default on; `FLUREE_R2RML_DATASET_BUDGET=0|false|off|no` disables. Read once.
+pub(crate) fn dataset_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_DATASET_BUDGET"))
+}
+
 /// Whether a multi-table query may warm its per-table catalog contexts
 /// (`loadTable` GET + metadata) CONCURRENTLY before the serial scan loop, so the
 /// per-table GETs overlap instead of summing (PR-8 slice 1). Default on;

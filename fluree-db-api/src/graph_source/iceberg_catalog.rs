@@ -20,7 +20,8 @@ use crate::Result;
 
 use fluree_db_iceberg::catalog::{RestCatalogClient, RestCatalogConfig, SendCatalogClient};
 use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
-use fluree_db_iceberg::io::S3IcebergStorage;
+use fluree_db_iceberg::io::{S3IcebergStorage, SendIcebergStorage};
+use fluree_db_iceberg::manifest::DataFile;
 use fluree_db_iceberg::metadata::{
     PartitionField, Schema, SchemaField, Snapshot, SortField, TableMetadata,
 };
@@ -218,6 +219,34 @@ fn split_qualified_table(queried_ns: &str, qualified: &str) -> TableRef {
 }
 
 impl crate::Fluree {
+    /// Resolve any `ConfigValue::SecretRef` auth references in a REST connection
+    /// via this instance's injected secret resolver, returning a connection whose
+    /// auth is resolver-free (literal / env-var / none) and therefore safe to
+    /// hand to the SYNCHRONOUS [`rest_catalog_client`].
+    ///
+    /// Pass-through for Direct mode (no catalog auth) and for connections with no
+    /// secret reference. Fails closed with an actionable error when a `SecretRef`
+    /// is present but no resolver was injected (the OSS/CLI path). This is the
+    /// single hydration hop the impl-`Fluree` catalog wrappers call at their top,
+    /// keeping `rest_catalog_client` and the free functions unchanged for
+    /// external literal/env-var users.
+    pub(crate) async fn hydrate_conn(
+        &self,
+        mut conn: IcebergConnectionConfig,
+    ) -> Result<IcebergConnectionConfig> {
+        if let CatalogMode::Rest(ref mut rest) = conn.catalog_mode {
+            let hydrated = rest
+                .auth
+                .hydrate(self.secret_resolver())
+                .await
+                .map_err(|e| {
+                    crate::ApiError::config(format!("Failed to resolve catalog auth secret: {e}"))
+                })?;
+            rest.auth = hydrated;
+        }
+        Ok(conn)
+    }
+
     /// Browse an Iceberg REST catalog (namespaces, and tables at
     /// `depth = Tables`). Convenience wrapper over the stateless
     /// [`browse_iceberg_catalog`] free function — browse needs no engine state.
@@ -226,6 +255,7 @@ impl crate::Fluree {
         conn: IcebergConnectionConfig,
         depth: BrowseDepth,
     ) -> Result<CatalogBrowse> {
+        let conn = self.hydrate_conn(conn).await?;
         browse_iceberg_catalog(conn, depth).await
     }
 }
@@ -716,10 +746,10 @@ pub async fn preview_iceberg_table(
                         send_read_snapshot_data_files(&storage, snapshot)
                             .await
                             .map_err(|e| {
-                                crate::ApiError::config(format!(
-                                    "Failed to read manifests for {}: {e}",
-                                    table.qualified()
-                                ))
+                                storage_api_error(
+                                    &format!("Failed to read manifests for {}", table.qualified()),
+                                    e,
+                                )
                             })?;
 
                     let agg = aggregate_column_stats(&data_files, iceberg_schema);
@@ -790,30 +820,159 @@ pub async fn preview_iceberg_table(
     }
 }
 
+/// Lift an [`IcebergError`](fluree_db_iceberg::IcebergError) raised at a
+/// **storage-read** site into a [`QueryError`](fluree_db_query::QueryError),
+/// preserving the typed access-denied case.
+///
+/// [`StorageAccessDenied`](fluree_db_iceberg::IcebergError::StorageAccessDenied)
+/// becomes `QueryError::StorageAccessDenied` (→ HTTP 403); every other variant
+/// becomes `QueryError::Internal("{context}: {err}")`, byte-for-byte the
+/// pre-existing wrapping. Use ONLY at storage-read sites (metadata / manifest /
+/// Parquet / resolve-from-table-location) — client-construction failures stay
+/// `Internal`.
+pub(crate) fn storage_query_error(
+    context: &str,
+    err: fluree_db_iceberg::IcebergError,
+) -> fluree_db_query::QueryError {
+    match err {
+        fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        } => fluree_db_query::QueryError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        },
+        // §2's fail-closed error, raised inside a deferred `LazyS3Storage` build and
+        // ferried out through the builder's `IcebergError` channel. Lift it back so
+        // the 403 + `err:catalog/CredentialsNotVended` wire code survives the lazy
+        // path exactly as it does the eager one.
+        fluree_db_iceberg::IcebergError::CatalogCredentialsNotVended { catalog_uri } => {
+            fluree_db_query::QueryError::CatalogCredentialsNotVended { catalog_uri }
+        }
+        other => fluree_db_query::QueryError::Internal(format!("{context}: {other}")),
+    }
+}
+
+/// Preview/browse-path analogue of [`storage_query_error`]: lift a
+/// storage-read [`IcebergError`](fluree_db_iceberg::IcebergError) into an
+/// [`ApiError`](crate::ApiError). The access-denied case becomes
+/// `ApiError::StorageAccessDenied` (→ HTTP 403); everything else becomes
+/// `ApiError::config("{context}: {err}")`, matching the pre-existing preview
+/// wrapping.
+pub(crate) fn storage_api_error(
+    context: &str,
+    err: fluree_db_iceberg::IcebergError,
+) -> crate::ApiError {
+    match err {
+        fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        } => crate::ApiError::StorageAccessDenied {
+            bucket,
+            key,
+            region,
+            message,
+        },
+        other => crate::ApiError::config(format!("{context}: {other}")),
+    }
+}
+
+/// Which credential source a scan/preview should use, given the source's
+/// `vended_credentials` flag, whether the catalog actually vended credentials,
+/// and whether this is a REST catalog. See [`decide_credential_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    /// Use the catalog-vended credentials (they are present).
+    Vended,
+    /// Use the ambient AWS credential chain (explicit `vended_credentials =
+    /// false` opt-in, or Direct mode which never vends).
+    Ambient,
+    /// Refuse: the REST source requires vending but the catalog vended none.
+    FailClosed,
+}
+
+/// §2 credential-source decision — the single source of truth for the scan and
+/// preview paths, factored out so the full matrix is unit-testable.
+///
+/// | `vended_credentials` | vended creds present | REST | decision |
+/// |----------------------|----------------------|------|----------|
+/// | any                  | yes                  | any  | `Vended` (response-driven) |
+/// | true                 | no                   | yes  | `FailClosed` |
+/// | true                 | no                   | no (Direct) | `Ambient` (Direct never vends) |
+/// | false                | no                   | any  | `Ambient` (explicit opt-in) |
+///
+/// The `(false, present)` case stays `Vended` to preserve today's
+/// response-driven behavior: `vended_credentials = false` suppresses the
+/// delegation request, so credentials should not arrive — but if a catalog vends
+/// them anyway, using them (rather than ignoring them) matches prior behavior.
+pub(crate) fn decide_credential_source(
+    vended_credentials_cfg: bool,
+    has_vended_creds: bool,
+    is_rest_catalog: bool,
+) -> CredentialSource {
+    if has_vended_creds {
+        CredentialSource::Vended
+    } else if vended_credentials_cfg && is_rest_catalog {
+        CredentialSource::FailClosed
+    } else {
+        CredentialSource::Ambient
+    }
+}
+
 /// Build S3 storage for reading manifests during a Tier-B preview, mirroring the
-/// scan path's policy: vended credentials when the catalog delegated them,
-/// otherwise the ambient AWS credential chain.
+/// scan path's policy via [`decide_credential_source`]: vended credentials when
+/// the catalog delegated them, otherwise — for `vended_credentials = false` or
+/// Direct mode — the ambient AWS credential chain.
+///
+/// §2 fail-closed: a REST source configured to require vended credentials
+/// (`io.vended_credentials = true`, the default) must NOT silently downgrade to
+/// ambient credentials when the catalog vended none — that would read from
+/// whatever ambient identity the process happens to have. Direct mode never
+/// vends (it sends no delegation request), so it is exempt.
 pub(crate) async fn build_preview_storage(
     conn: &IcebergConnectionConfig,
     credentials: Option<&fluree_db_iceberg::credential::VendedCredentials>,
 ) -> Result<S3IcebergStorage> {
     let io = &conn.io;
-    let storage = if let Some(creds) = credentials {
-        S3IcebergStorage::from_vended_credentials(
-            creds,
-            io.s3_region.as_deref(),
-            io.s3_endpoint.as_deref(),
-            io.s3_path_style,
-        )
-        .await
-    } else {
-        S3IcebergStorage::from_default_chain(
-            io.s3_region.as_deref(),
-            io.s3_endpoint.as_deref(),
-            io.s3_path_style,
-        )
-        .await
-    };
+    let is_rest = matches!(conn.catalog_mode, CatalogMode::Rest(_));
+    let storage =
+        match decide_credential_source(io.vended_credentials, credentials.is_some(), is_rest) {
+            CredentialSource::Vended => {
+                let creds = credentials.expect("Vended decision implies credentials are present");
+                S3IcebergStorage::from_vended_credentials(
+                    creds,
+                    io.s3_region.as_deref(),
+                    io.s3_endpoint.as_deref(),
+                    io.s3_path_style,
+                )
+                .await
+            }
+            CredentialSource::Ambient => {
+                S3IcebergStorage::from_default_chain(
+                    io.s3_region.as_deref(),
+                    io.s3_endpoint.as_deref(),
+                    io.s3_path_style,
+                )
+                .await
+            }
+            CredentialSource::FailClosed => {
+                // FailClosed only arises for a REST catalog (see the decision table),
+                // so this destructure always matches.
+                let catalog_uri = match &conn.catalog_mode {
+                    CatalogMode::Rest(rest) => rest.catalog_uri.clone(),
+                    CatalogMode::Direct { .. } => {
+                        unreachable!("FailClosed is only produced for REST catalogs")
+                    }
+                };
+                return Err(crate::ApiError::CatalogCredentialsNotVended { catalog_uri });
+            }
+        };
     storage.map_err(|e| crate::ApiError::config(format!("Failed to create S3 storage: {e}")))
 }
 
@@ -842,13 +1001,303 @@ impl crate::Fluree {
         table: TableIdentifier,
         tier: StatsTier,
     ) -> Result<TablePreview> {
+        let conn = self.hydrate_conn(conn).await?;
         preview_iceberg_table(conn, table, tier).await
+    }
+}
+
+// =============================================================================
+// (c) Storage-access verification (§6)
+//
+// A config-time probe that goes through the ENGINE'S OWN credential decision
+// ([`decide_credential_source`], §2 fail-closed included) and storage
+// construction, then proves BOTH S3 prefixes a query needs — the `metadata/`
+// prefix (manifest-list + manifests) and the `data/` prefix (a `HeadObject` on
+// the first data file). It never reads a Parquet/data file's bytes. A green
+// report proves a query will not fail on storage permissions, so solo's
+// onboarding "Test" button validates on the same path queries use.
+// =============================================================================
+
+/// The result of a storage-access verification probe.
+///
+/// This shape goes over HTTP verbatim (solo's onboarding wizard renders it), so
+/// the field names are pinned.
+#[derive(Debug, Serialize)]
+pub struct StorageAccessReport {
+    /// Which credential source the probe used: `"vended"` (catalog-delegated) or
+    /// `"ambient"` (the process AWS credential chain). This is the SAME decision
+    /// the scan/preview paths make (see [`decide_credential_source`]), so a green
+    /// probe proves a query authenticates to storage the same way.
+    pub credential_source: &'static str,
+    /// The table's current metadata-JSON location
+    /// (`…/metadata/*.metadata.json`), from the catalog `loadTable` response.
+    pub metadata_location: String,
+    /// Number of data files listed in the current snapshot's manifests. Listing
+    /// them proves the `metadata/` prefix (manifest-list + manifests) is readable.
+    pub data_files_listed: usize,
+    /// The single data file the probe stat-checked (`HeadObject`) to prove the
+    /// `data/` prefix is readable; `None` when the data probe was skipped.
+    pub probed_data_file: Option<String>,
+    /// The stat-checked data file's size in bytes; `None` when skipped.
+    pub probed_data_file_bytes: Option<u64>,
+    /// `true` when the `data/` prefix probe was skipped because the table has no
+    /// data file to stat (an empty table, or a snapshotless table). The
+    /// `metadata/` prefix was still proven for an empty table; for a snapshotless
+    /// table there were no manifests to read either — see `skip_reason`.
+    pub data_probe_skipped: bool,
+    /// Human-readable reason the data probe was skipped; `None` when it ran.
+    pub skip_reason: Option<String>,
+}
+
+/// The `data/`-prefix half of the probe, factored out so it is unit-testable over
+/// a stub storage (no Avro manifest fixtures needed): given the already-listed
+/// data files, `HeadObject` the first one to prove the `data/` prefix is
+/// readable, or record a skip when the table lists no data files.
+#[derive(Debug)]
+struct DataFileProbe {
+    probed_data_file: Option<String>,
+    probed_data_file_bytes: Option<u64>,
+    data_probe_skipped: bool,
+    skip_reason: Option<String>,
+}
+
+async fn probe_data_files<S: SendIcebergStorage + ?Sized>(
+    storage: &S,
+    data_files: &[DataFile],
+    table_qualified: &str,
+) -> Result<DataFileProbe> {
+    match data_files.first() {
+        Some(first) => {
+            // `HeadObject` (not a byte read): proves the `data/` prefix is
+            // readable under the same credentials without downloading the file.
+            let bytes = storage.file_size(&first.file_path).await.map_err(|e| {
+                storage_api_error(
+                    &format!(
+                        "Failed to stat data file {} for {table_qualified}",
+                        first.file_path
+                    ),
+                    e,
+                )
+            })?;
+            Ok(DataFileProbe {
+                probed_data_file: Some(first.file_path.clone()),
+                probed_data_file_bytes: Some(bytes),
+                data_probe_skipped: false,
+                skip_reason: None,
+            })
+        }
+        None => Ok(DataFileProbe {
+            probed_data_file: None,
+            probed_data_file_bytes: None,
+            data_probe_skipped: true,
+            skip_reason: Some(
+                "table snapshot lists no data files (empty table); the data/ prefix \
+                 was not probed"
+                    .to_string(),
+            ),
+        }),
+    }
+}
+
+/// Read the snapshot's manifests (proving the `metadata/` prefix) and stat the
+/// first data file (proving the `data/` prefix), assembling a
+/// [`StorageAccessReport`]. Factored to be generic over the storage trait so the
+/// metadata- and data-prefix denial paths are unit-testable without S3 (mirrors
+/// §1's `resolve_table_metadata`).
+async fn probe_storage_access<S: SendIcebergStorage + ?Sized>(
+    storage: &S,
+    snapshot: &Snapshot,
+    credential_source: &'static str,
+    metadata_location: String,
+    table_qualified: &str,
+) -> Result<StorageAccessReport> {
+    // `metadata/` prefix proof: read the manifest-list + manifests (never a data
+    // file). Reuses the same reader the Tier-B preview / scan planner use.
+    let (data_files, _manifests_read, _has_deletes) =
+        send_read_snapshot_data_files(storage, snapshot)
+            .await
+            .map_err(|e| {
+                storage_api_error(
+                    &format!("Failed to read manifests for {table_qualified}"),
+                    e,
+                )
+            })?;
+
+    let data_files_listed = data_files.len();
+    let probe = probe_data_files(storage, &data_files, table_qualified).await?;
+
+    Ok(StorageAccessReport {
+        credential_source,
+        metadata_location,
+        data_files_listed,
+        probed_data_file: probe.probed_data_file,
+        probed_data_file_bytes: probe.probed_data_file_bytes,
+        data_probe_skipped: probe.data_probe_skipped,
+        skip_reason: probe.skip_reason,
+    })
+}
+
+/// Split a `"NAMESPACE.NAME"` table string into a catalog [`TableIdentifier`].
+/// Namespaces may themselves contain dots, so the LAST dot separates namespace
+/// from name (mirrors [`split_qualified_table`] / the validate path). A name with
+/// no dot yields an empty-namespace identifier, which the catalog rejects as
+/// not-found.
+fn parse_qualified_table(table: &str) -> TableIdentifier {
+    match table.rsplit_once('.') {
+        Some((namespace, name)) => TableIdentifier::new(namespace, name),
+        None => TableIdentifier::new("", table),
+    }
+}
+
+/// Verify that this connection's resolved credentials can actually READ a table's
+/// storage — the config-time probe behind solo's onboarding "Test" button.
+///
+/// It goes through the ENGINE'S OWN credential decision
+/// ([`decide_credential_source`], including §2 fail-closed) and storage
+/// construction, then proves both S3 prefixes a query needs: the `metadata/`
+/// prefix (manifest-list + manifests) and the `data/` prefix (a `HeadObject` on
+/// the first data file — never a byte read). A green report therefore proves a
+/// query will not fail on storage permissions, on the same credential path
+/// queries use.
+///
+/// REST catalogs only: Direct mode returns the same clear typed error as
+/// [`preview_iceberg_table`] (there is no catalog to authorize the read).
+pub async fn verify_storage_access(
+    conn: IcebergConnectionConfig,
+    table: &str,
+) -> Result<StorageAccessReport> {
+    let (catalog, _uri, _wh) = rest_catalog_client(&conn, "storage access verification")?;
+    let table_id = parse_qualified_table(table);
+    let catalog_table = table_id.to_catalog();
+
+    let load = SendCatalogClient::load_table(&catalog, &catalog_table, conn.io.vended_credentials)
+        .await
+        .map_err(|e| {
+            crate::ApiError::config(format!(
+                "Failed to load table {}: {e}",
+                table_id.qualified()
+            ))
+        })?;
+
+    // Build storage through the SAME credential decision the scan path uses. §2
+    // fail-closed fires HERE: a REST source that requires vended credentials but
+    // whose catalog vended none is refused (ApiError::CatalogCredentialsNotVended)
+    // rather than silently probing with ambient credentials — which is exactly the
+    // "validated on a different credential path than queries use" bug this guards.
+    let storage = build_preview_storage(&conn, load.credentials.as_ref()).await?;
+    let credential_source = if load.credentials.is_some() {
+        "vended"
+    } else {
+        "ambient"
+    };
+
+    let metadata = load.metadata.as_ref().ok_or_else(|| {
+        crate::ApiError::config(format!(
+            "Catalog did not return inline table metadata for {} — storage verification \
+             resolves the current snapshot from the loadTable `metadata` object.",
+            table_id.qualified()
+        ))
+    })?;
+
+    // Mirror the Tier-B preview: resolve the CURRENT snapshot from the inline
+    // metadata. A snapshotless table has no manifests or data files to read, so
+    // there is nothing to probe — report a skip rather than erroring (the catalog
+    // authorization and the credential decision were still exercised above).
+    match metadata.current_snapshot() {
+        Some(snapshot) => {
+            probe_storage_access(
+                &storage,
+                snapshot,
+                credential_source,
+                load.metadata_location,
+                &table_id.qualified(),
+            )
+            .await
+        }
+        None => Ok(StorageAccessReport {
+            credential_source,
+            metadata_location: load.metadata_location,
+            data_files_listed: 0,
+            probed_data_file: None,
+            probed_data_file_bytes: None,
+            data_probe_skipped: true,
+            skip_reason: Some(
+                "table has no current snapshot; there are no manifests or data files to \
+                 probe (catalog authorization and credential resolution still succeeded)"
+                    .to_string(),
+            ),
+        }),
+    }
+}
+
+impl crate::Fluree {
+    /// Verify that a connection's resolved credentials can read an Iceberg table's
+    /// storage (the onboarding "Test" probe). Resolver-aware wrapper over
+    /// [`verify_storage_access`]: hydrates any `SecretRef` catalog auth via this
+    /// instance's secret resolver FIRST (mirroring the browse/preview wrappers),
+    /// then runs the probe through the engine's own credential + storage path.
+    pub async fn verify_iceberg_storage_access(
+        &self,
+        conn: IcebergConnectionConfig,
+        table: &str,
+    ) -> Result<StorageAccessReport> {
+        let conn = self.hydrate_conn(conn).await?;
+        verify_storage_access(conn, table).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── §2 credential-source decision (pure; the full matrix) ──
+
+    #[test]
+    fn creds_present_always_vended() {
+        // Response-driven: if the catalog vended credentials, use them —
+        // regardless of the flag or catalog kind.
+        for &cfg in &[true, false] {
+            for &rest in &[true, false] {
+                assert_eq!(
+                    decide_credential_source(cfg, true, rest),
+                    CredentialSource::Vended,
+                    "cfg={cfg} rest={rest}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rest_requires_vending_fails_closed_when_none() {
+        // vended_credentials = true (default) + REST + no creds → refuse.
+        assert_eq!(
+            decide_credential_source(true, false, true),
+            CredentialSource::FailClosed
+        );
+    }
+
+    #[test]
+    fn direct_mode_never_fails_closed() {
+        // Direct never vends; vended_credentials = true must NOT start failing —
+        // it uses the ambient chain (item 8).
+        assert_eq!(
+            decide_credential_source(true, false, false),
+            CredentialSource::Ambient
+        );
+    }
+
+    #[test]
+    fn explicit_opt_in_uses_ambient() {
+        // vended_credentials = false + no creds → ambient (both catalog kinds).
+        assert_eq!(
+            decide_credential_source(false, false, true),
+            CredentialSource::Ambient
+        );
+        assert_eq!(
+            decide_credential_source(false, false, false),
+            CredentialSource::Ambient
+        );
+    }
 
     #[tokio::test]
     async fn browse_direct_mode_errors() {
@@ -1160,6 +1609,307 @@ mod tests {
                 true
             ),
             Some("xsd:decimal")
+        );
+    }
+
+    // ── secret-resolver injection + fail-closed hydration gate ──
+
+    #[derive(Debug)]
+    struct StubResolver;
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for StubResolver {
+        async fn resolve_secret(
+            &self,
+            secret_ref: &str,
+        ) -> std::result::Result<String, fluree_db_iceberg::SecretResolveError> {
+            Ok(format!("resolved:{secret_ref}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn with_secret_resolver_clones_and_leaves_original_untouched() {
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        assert!(fluree.secret_resolver().is_none());
+
+        let resolver: std::sync::Arc<dyn fluree_db_iceberg::SecretResolver> =
+            std::sync::Arc::new(StubResolver);
+        let derived = fluree.with_secret_resolver(resolver);
+
+        // The derived clone carries the resolver; the original is untouched.
+        assert!(derived.secret_resolver().is_some());
+        assert!(fluree.secret_resolver().is_none());
+    }
+
+    #[tokio::test]
+    async fn hydrate_conn_fails_closed_before_network_when_ref_has_no_resolver() {
+        // No resolver injected + SecretRef auth ⇒ hydrate_conn errors with an
+        // actionable message BEFORE any catalog client is built or network I/O
+        // happens (the same gate the connection test relies on).
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let conn = IcebergConnectionConfig::rest("https://unreachable.invalid")
+            .with_auth_bearer_token_ref("vault://team/bearer");
+        let err = fluree.hydrate_conn(conn).await.unwrap_err().to_string();
+        assert!(
+            err.contains("secret resolver"),
+            "actionable message expected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_conn_passes_through_literal_auth() {
+        // A literal-auth connection with no resolver hydrates to itself (no error).
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let conn = IcebergConnectionConfig::rest("https://c.example.com")
+            .with_auth_bearer("literal-token");
+        assert!(fluree.hydrate_conn(conn).await.is_ok());
+    }
+
+    // ── §6 storage-access verification ──
+
+    use fluree_db_iceberg::error::Result as IcebergResult;
+    use fluree_db_iceberg::manifest::{FileFormat, PartitionData};
+
+    /// A structured 403 as the S3 storage layer produces it, so the probe's
+    /// error-lift is exercised end to end (StorageAccessDenied → 403).
+    fn denied(path: &str) -> fluree_db_iceberg::IcebergError {
+        fluree_db_iceberg::IcebergError::StorageAccessDenied {
+            bucket: "bucket".to_string(),
+            key: path.to_string(),
+            region: Some("us-east-1".to_string()),
+            message: "service error: AccessDenied".to_string(),
+        }
+    }
+
+    /// Storage stub whose every access denies with a structured 403.
+    #[derive(Debug)]
+    struct DeniedStorage;
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for DeniedStorage {
+        async fn read(&self, path: &str) -> IcebergResult<bytes::Bytes> {
+            Err(denied(path))
+        }
+        async fn read_range(
+            &self,
+            path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            Err(denied(path))
+        }
+        async fn file_size(&self, path: &str) -> IcebergResult<u64> {
+            Err(denied(path))
+        }
+    }
+
+    /// Storage stub that panics on ANY access: the empty-table data probe must not
+    /// touch storage, so a panic here fails the test loudly.
+    #[derive(Debug)]
+    struct PanicStorage;
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for PanicStorage {
+        async fn read(&self, path: &str) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read must not be called on the empty-table probe (path={path})");
+        }
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read_range must not be called on the empty-table probe");
+        }
+        async fn file_size(&self, path: &str) -> IcebergResult<u64> {
+            panic!("storage.file_size must not be called on the empty-table probe (path={path})");
+        }
+    }
+
+    /// Storage stub that answers `file_size` (`HeadObject`) with a fixed size and
+    /// panics on any byte read: the data-prefix probe must stat, never download.
+    #[derive(Debug)]
+    struct HeadOnlyStorage {
+        size: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for HeadOnlyStorage {
+        async fn read(&self, path: &str) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read must not be called on the data-prefix probe (path={path})");
+        }
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read_range must not be called on the data-prefix probe");
+        }
+        async fn file_size(&self, _path: &str) -> IcebergResult<u64> {
+            Ok(self.size)
+        }
+    }
+
+    fn sample_data_file(path: &str) -> DataFile {
+        DataFile {
+            file_path: path.to_string(),
+            file_format: FileFormat::Parquet,
+            record_count: 10,
+            file_size_in_bytes: 100,
+            partition: PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        }
+    }
+
+    fn snapshot_with_manifest_list(path: &str) -> Snapshot {
+        Snapshot {
+            snapshot_id: 1,
+            parent_snapshot_id: None,
+            sequence_number: 0,
+            timestamp_ms: 1_700_000_000_000,
+            manifest_list: Some(path.to_string()),
+            manifests: None,
+            summary: HashMap::new(),
+            schema_id: Some(0),
+        }
+    }
+
+    #[test]
+    fn storage_access_report_serde_shape() {
+        // The solo wizard reads these exact keys — pin the field set + names.
+        let report = StorageAccessReport {
+            credential_source: "vended",
+            metadata_location: "s3://bucket/warehouse/t/metadata/v3.metadata.json".to_string(),
+            data_files_listed: 4,
+            probed_data_file: Some("s3://bucket/warehouse/t/data/part-0.parquet".to_string()),
+            probed_data_file_bytes: Some(2048),
+            data_probe_skipped: false,
+            skip_reason: None,
+        };
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["credential_source"], "vended");
+        assert_eq!(
+            v["metadata_location"],
+            "s3://bucket/warehouse/t/metadata/v3.metadata.json"
+        );
+        assert_eq!(v["data_files_listed"], 4);
+        assert_eq!(
+            v["probed_data_file"],
+            "s3://bucket/warehouse/t/data/part-0.parquet"
+        );
+        assert_eq!(v["probed_data_file_bytes"], 2048);
+        assert_eq!(v["data_probe_skipped"], false);
+        assert!(v["skip_reason"].is_null());
+        assert_eq!(
+            v.as_object().unwrap().len(),
+            7,
+            "report field set is pinned: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_skips_data_prefix_for_empty_table() {
+        // No data files ⇒ the data/ prefix probe is skipped WITHOUT any storage
+        // read (PanicStorage would panic on a touch).
+        let probe = probe_data_files(&PanicStorage, &[], "DW.EMPTY")
+            .await
+            .expect("empty-table probe must succeed without any storage read");
+        assert!(probe.data_probe_skipped);
+        assert!(probe.probed_data_file.is_none());
+        assert!(probe.probed_data_file_bytes.is_none());
+        assert!(probe.skip_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn probe_stats_first_data_file_when_present() {
+        // A non-empty table stats (HeadObject) the first data file — never reads it.
+        let df = sample_data_file("s3://bucket/warehouse/t/data/part-0.parquet");
+        let probe = probe_data_files(
+            &HeadOnlyStorage { size: 99 },
+            std::slice::from_ref(&df),
+            "DW.T",
+        )
+        .await
+        .expect("a readable data file resolves via HeadObject");
+        assert!(!probe.data_probe_skipped);
+        assert_eq!(
+            probe.probed_data_file.as_deref(),
+            Some("s3://bucket/warehouse/t/data/part-0.parquet")
+        );
+        assert_eq!(probe.probed_data_file_bytes, Some(99));
+        assert!(probe.skip_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_data_prefix_denied_surfaces_storage_access_denied() {
+        // A denied HeadObject on the data/ prefix must surface as the typed
+        // access-denied variant (→ HTTP 403), not a generic config error.
+        let df = sample_data_file("s3://bucket/warehouse/t/data/part-0.parquet");
+        let err = probe_data_files(&DeniedStorage, std::slice::from_ref(&df), "DW.T")
+            .await
+            .expect_err("a denied HeadObject must propagate");
+        assert!(
+            matches!(err, crate::ApiError::StorageAccessDenied { .. }),
+            "expected StorageAccessDenied, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_metadata_prefix_denied_surfaces_storage_access_denied() {
+        // A denied read of the manifest list (metadata/ prefix) must likewise
+        // surface as the typed access-denied variant.
+        let snapshot = snapshot_with_manifest_list(
+            "s3://bucket/warehouse/t/metadata/snap-1-manifest-list.avro",
+        );
+        let err = probe_storage_access(
+            &DeniedStorage,
+            &snapshot,
+            "vended",
+            "s3://bucket/warehouse/t/metadata/v3.metadata.json".to_string(),
+            "DW.T",
+        )
+        .await
+        .expect_err("a denied manifest-list read must propagate");
+        assert!(
+            matches!(err, crate::ApiError::StorageAccessDenied { .. }),
+            "expected StorageAccessDenied, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_qualified_table_splits_on_last_dot() {
+        assert_eq!(
+            parse_qualified_table("DW.DIM_STORE"),
+            TableIdentifier::new("DW", "DIM_STORE")
+        );
+        // Dotted namespace: the LAST dot separates namespace from name.
+        assert_eq!(
+            parse_qualified_table("db.schema.events"),
+            TableIdentifier::new("db.schema", "events")
+        );
+        // No dot ⇒ empty namespace (catalog rejects as not-found).
+        assert_eq!(
+            parse_qualified_table("bare"),
+            TableIdentifier::new("", "bare")
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_direct_mode_errors() {
+        // Direct mode has no catalog to authorize the read — mirror preview and
+        // reject with a clear typed error, without any network access.
+        let conn = IcebergConnectionConfig::direct("s3://bucket/warehouse/ns/table");
+        let err = verify_storage_access(conn, "ns.table")
+            .await
+            .expect_err("Direct mode must not be verifiable");
+        assert!(
+            err.to_string().contains("Direct catalog mode"),
+            "error should explain Direct mode is unsupported, got: {err}"
         );
     }
 }

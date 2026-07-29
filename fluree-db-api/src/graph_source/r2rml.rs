@@ -8,6 +8,9 @@
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
 use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
+use crate::graph_source::iceberg_catalog::{
+    decide_credential_source, storage_query_error, CredentialSource,
+};
 use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
 use crate::Result;
 use async_trait::async_trait;
@@ -458,9 +461,19 @@ impl crate::Fluree {
             }
         };
 
-        // Create auth provider
-        let auth = rest
+        // Hydrate any SecretRef auth BEFORE building the provider — this is the
+        // connection-test gate, so a secret reference with no resolver (or a
+        // Denied resolution) must error HERE, actionably, before any network call.
+        let hydrated_auth = rest
             .auth
+            .hydrate(self.secret_resolver())
+            .await
+            .map_err(|e| {
+                crate::ApiError::Config(format!("Failed to resolve catalog auth secret: {e}"))
+            })?;
+
+        // Create auth provider
+        let auth = hydrated_auth
             .create_provider_arc()
             .map_err(|e| crate::ApiError::Config(format!("Failed to create auth provider: {e}")))?;
 
@@ -916,6 +929,125 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     }
 }
 
+/// Build the catalog auth provider for a REST client, hydrating any
+/// `ConfigValue::SecretRef` first (§3 of fluree/db#1500).
+///
+/// **Every query-path provider build goes through this**, never through a bare
+/// `create_provider_arc`: that resolves `ConfigValue`s SYNCHRONOUSLY, so a `SecretRef`
+/// reaching it un-hydrated hard-errors via `resolve()`'s fail-closed arm. Pairing the
+/// two here means a NEW client-construction site cannot silently ship without
+/// hydration — which is exactly how the pointer rung's copy arrived. (The one
+/// deliberate exception is `test_iceberg_connection`, which is `ApiError`-typed and
+/// hydrates inline so a missing/denied resolver surfaces as an actionable *config*
+/// error at the connection-test gate rather than a query error.)
+///
+/// ⚠️ ORDERING: the caller MUST already have computed its `rest_client_cache_key`
+/// fingerprint over the RAW, reference-bearing config BEFORE calling this. Hydrating
+/// before the fingerprint re-keys the client cache on every secret rotation, turning
+/// one resolver call + OAuth exchange per client lifetime into one PER QUERY. Pinned
+/// by `secret_ref_fingerprint_is_rotation_stable`.
+async fn hydrated_auth_provider(
+    auth: &fluree_db_iceberg::auth::AuthConfig,
+    resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
+) -> QueryResult<Arc<dyn fluree_db_iceberg::auth::SendCatalogAuth>> {
+    let hydrated = auth
+        .hydrate(resolver)
+        .await
+        .map_err(|e| QueryError::Internal(format!("Failed to resolve catalog auth secret: {e}")))?;
+    hydrated
+        .create_provider_arc()
+        .map_err(|e| QueryError::Internal(format!("Failed to create auth provider: {e}")))
+}
+
+/// Resolve the S3 storage client for a REST table: the §2 credential decision, the
+/// query-session reuse (#1498), and the vended/ambient construction — in ONE place.
+///
+/// **Both** the eager `load_table_context` arm and the deferred [`LazyS3Storage`]
+/// builder (via [`resolve_rest_load_and_storage`]) construct storage for the same
+/// table under the same config, so they MUST make the same credential decision. They
+/// were two independent copies; the copy the deferred builder used silently omitted
+/// §2's fail-closed check, which reopened the ambient downgrade on any lazy-forced
+/// build. Keep them behind this one helper — a second copy is a fail-open waiting to
+/// happen.
+///
+/// §2: a source configured for vended credentials (`io.vended_credentials = true`,
+/// the default) whose catalog vended none ERRORS — it must never silently fall back
+/// to the process's ambient AWS identity. Ambient is reachable only via an explicit
+/// `vended_credentials = false`. REST only: Direct never requests vending and has its
+/// own [`direct_session_storage`].
+async fn rest_session_storage(
+    session: &super::catalog_session::IcebergCatalogSession,
+    lt_key: &str,
+    io: &IoConfig,
+    load_response: &LoadTableResponse,
+    catalog_uri: &str,
+) -> QueryResult<Arc<S3IcebergStorage>> {
+    // The loadTable caches preserve `credentials` verbatim and only ever
+    // MISS-and-reload on expiry, so a resolved `credentials == None` always means
+    // the catalog genuinely vended nothing — never a dropped-credential
+    // reconstruction. Safe to fail closed on.
+    if decide_credential_source(
+        io.vended_credentials,
+        load_response.credentials.is_some(),
+        true,
+    ) == CredentialSource::FailClosed
+    {
+        return Err(QueryError::CatalogCredentialsNotVended {
+            catalog_uri: catalog_uri.to_string(),
+        });
+    }
+
+    // Reuse the query session's cached S3 client for this table when one is present:
+    // constructing it (`aws_config` load + S3 client + HTTP client) is not free, and a
+    // correlated join — or the slice-1 prefetch→scan — resolves the same table
+    // repeatedly. Any fresh loadTable dropped the entry via `store_load_table`, so a
+    // hit here always corresponds to the current pinned credentials.
+    if let Some(cached) = session.cached_storage(lt_key) {
+        debug!("S3 storage client reused (query-scoped)");
+        return Ok(cached);
+    }
+
+    // GCS-backed tables (S3-interop endpoint) are read through this same S3 SDK path;
+    // the SDK client is pinned to HTTP/1.1 so the GCS HTTP/2 range-read bug cannot
+    // occur.
+    let built = if let Some(ref credentials) = load_response.credentials {
+        info!(
+            region = ?io.s3_region,
+            endpoint = ?io.s3_endpoint,
+            "Using vended credentials from catalog"
+        );
+        // Thread the io overrides so a catalog that omits the region (or where we want
+        // an operator-configured endpoint/path-style) still resolves correctly.
+        // Precedence inside the call: vended > these overrides > SDK.
+        S3IcebergStorage::from_vended_credentials(
+            credentials,
+            io.s3_region.as_deref(),
+            io.s3_endpoint.as_deref(),
+            io.s3_path_style,
+        )
+        .await
+        .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
+    } else {
+        // Reachable only under an explicit `vended_credentials = false` (§2 returned
+        // above otherwise).
+        info!(
+            region = ?io.s3_region,
+            endpoint = ?io.s3_endpoint,
+            "Using ambient AWS credentials"
+        );
+        S3IcebergStorage::from_default_chain(
+            io.s3_region.as_deref(),
+            io.s3_endpoint.as_deref(),
+            io.s3_path_style,
+        )
+        .await
+        .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
+    };
+    let built = Arc::new(built);
+    session.store_storage(lt_key.to_string(), Arc::clone(&built));
+    Ok(built)
+}
+
 /// Resolve `loadTable` (the REST catalog GET, honoring the query pin + the
 /// cross-query cache) and build the vended-credential S3 storage — the SAME
 /// session-pin path the eager scan used before the lazy split (PR-8 loadTable-
@@ -939,6 +1071,7 @@ async fn resolve_rest_load_and_storage(
     table_id: TableIdentifier,
     io: IoConfig,
     lt_key: String,
+    catalog_uri: String,
 ) -> QueryResult<(Arc<S3IcebergStorage>, LoadTableResponse)> {
     // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
     // the cross-query cache (skips the ~1–3s GET), then a real REST load.
@@ -988,32 +1121,10 @@ async fn resolve_rest_load_and_storage(
         resp
     };
 
-    // (2) Build (or reuse the query session's) S3 storage from the vended creds.
-    let storage = if let Some(cached) = session.cached_storage(&lt_key) {
-        cached
-    } else {
-        let built = if let Some(ref credentials) = load_response.credentials {
-            S3IcebergStorage::from_vended_credentials(
-                credentials,
-                io.s3_region.as_deref(),
-                io.s3_endpoint.as_deref(),
-                io.s3_path_style,
-            )
-            .await
-            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
-        } else {
-            S3IcebergStorage::from_default_chain(
-                io.s3_region.as_deref(),
-                io.s3_endpoint.as_deref(),
-                io.s3_path_style,
-            )
-            .await
-            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
-        };
-        let built = Arc::new(built);
-        session.store_storage(lt_key.clone(), Arc::clone(&built));
-        built
-    };
+    // (2) Build (or reuse the query session's) S3 storage — §2 fail-closed decision
+    // and session reuse included, shared verbatim with the eager arm.
+    let storage =
+        rest_session_storage(&session, &lt_key, &io, &load_response, &catalog_uri).await?;
 
     Ok((storage, load_response))
 }
@@ -1091,9 +1202,10 @@ impl FlureeR2rmlProvider<'_> {
                     ))
                     .await
                     .map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read manifests for row count of '{table_name}': {e}"
-                        ))
+                        storage_query_error(
+                            &format!("Failed to read manifests for row count of '{table_name}'"),
+                            e,
+                        )
                     })?;
             catalog_cache.put_count_stats(&metadata_location, &data_files, has_delete_manifests);
             (data_files, has_delete_manifests)
@@ -1277,9 +1389,11 @@ impl FlureeR2rmlProvider<'_> {
                     let catalog = match cache.rest_client(&client_fp) {
                         Some(c) => c,
                         None => {
-                            let auth_provider = auth.create_provider_arc().map_err(|e| {
-                                QueryError::Internal(format!("Failed to create auth provider: {e}"))
-                            })?;
+                            // ORDERING TRAP (§3): hydration happens ONLY here, inside
+                            // the cache-miss arm, strictly AFTER `client_fp` was
+                            // computed above over the RAW, reference-bearing config.
+                            let auth_provider =
+                                hydrated_auth_provider(auth, self.fluree.secret_resolver()).await?;
                             let client = Arc::new(
                                 RestCatalogClient::new(
                                     RestCatalogConfig {
@@ -1308,6 +1422,7 @@ impl FlureeR2rmlProvider<'_> {
                     let io = iceberg_config.io.clone();
                     let table_id = table_id.clone();
                     let lt_key_b = lt_key.clone();
+                    let uri_b = uri.clone();
                     let builder: super::lazy_storage::StorageBuilder<'static, S3IcebergStorage> =
                         Arc::new(move || {
                             let catalog = Arc::clone(&catalog);
@@ -1316,13 +1431,44 @@ impl FlureeR2rmlProvider<'_> {
                             let io = io.clone();
                             let table_id = table_id.clone();
                             let lt_key = lt_key_b.clone();
+                            let catalog_uri = uri_b.clone();
                             Box::pin(async move {
                                 resolve_rest_load_and_storage(
-                                    catalog, cache, session, table_id, io, lt_key,
+                                    catalog,
+                                    cache,
+                                    session,
+                                    table_id,
+                                    io,
+                                    lt_key,
+                                    catalog_uri,
                                 )
                                 .await
                                 .map(|(storage, _)| storage)
-                                .map_err(|e| IcebergError::Catalog(e.to_string()))
+                                // Preserve the TYPED errors across the builder's
+                                // `IcebergError` channel: `storage_query_error` lifts
+                                // these two straight back to their `QueryError`
+                                // counterparts, so a lazy-forced build reports the same
+                                // 403 + wire code (`err:storage/AccessDenied` /
+                                // `err:catalog/CredentialsNotVended`) as the eager path.
+                                // A blanket `to_string()` here would flatten them into
+                                // an opaque string and put hosts back to regex-guessing.
+                                .map_err(|e| match e {
+                                    QueryError::StorageAccessDenied {
+                                        bucket,
+                                        key,
+                                        region,
+                                        message,
+                                    } => IcebergError::StorageAccessDenied {
+                                        bucket,
+                                        key,
+                                        region,
+                                        message,
+                                    },
+                                    QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+                                        IcebergError::CatalogCredentialsNotVended { catalog_uri }
+                                    }
+                                    other => IcebergError::Catalog(other.to_string()),
+                                })
                             })
                         });
                     return Ok((Arc::new(LazyS3Storage::deferred(builder)), md, loc));
@@ -1330,8 +1476,10 @@ impl FlureeR2rmlProvider<'_> {
             }
         }
 
-        // Resolve metadata location and create storage based on catalog mode
-        let (load_response, storage) = match &iceberg_config.catalog {
+        // Resolve metadata location and create storage based on catalog mode.
+        // `mut` so we can move the REST catalog's inline metadata out of the
+        // response below (see the metadata resolution) without cloning it.
+        let (mut load_response, storage) = match &iceberg_config.catalog {
             CatalogConfig::Rest {
                 uri,
                 warehouse,
@@ -1350,9 +1498,12 @@ impl FlureeR2rmlProvider<'_> {
                 let catalog = match cache.rest_client(&client_fp) {
                     Some(c) => c,
                     None => {
-                        let auth_provider = auth.create_provider_arc().map_err(|e| {
-                            QueryError::Internal(format!("Failed to create auth provider: {e}"))
-                        })?;
+                        // ORDERING TRAP (§3): hydration happens ONLY here, inside the
+                        // cache-miss arm, strictly AFTER `client_fp` was computed above
+                        // over the RAW, reference-bearing config. The fingerprint-
+                        // stability test pins this.
+                        let auth_provider =
+                            hydrated_auth_provider(auth, self.fluree.secret_resolver()).await?;
                         let catalog_config = RestCatalogConfig {
                             uri: uri.clone(),
                             warehouse: warehouse.clone(),
@@ -1457,61 +1608,18 @@ impl FlureeR2rmlProvider<'_> {
                     resp
                 };
 
-                // GCS-backed tables (S3-interop endpoint) are read through this
-                // same S3 SDK path; the SDK client is pinned to HTTP/1.1 so the
-                // GCS HTTP/2 range-read bug cannot occur.
-                //
-                // Reuse the query session's cached S3 client for this table when
-                // one is present: constructing it (`aws_config` load + S3 client +
-                // HTTP client) is not free, and a correlated join — or the slice-1
-                // prefetch→scan — resolves the same table repeatedly. Any fresh
-                // loadTable above dropped the entry via `store_load_table`, so a hit
-                // here always corresponds to the current pinned credentials.
-                let storage = if let Some(cached) = self.session.cached_storage(&lt_key) {
-                    debug!(namespace = %table_id.namespace, table = %table_id.table,
-                        "S3 storage client reused (query-scoped)");
-                    cached
-                } else {
-                    let built = if let Some(ref credentials) = load_response.credentials {
-                        info!(
-                            region = ?iceberg_config.io.s3_region,
-                            endpoint = ?iceberg_config.io.s3_endpoint,
-                            "Using vended credentials from catalog"
-                        );
-                        // Thread the io overrides so a catalog that omits the region (or where
-                        // we want an operator-configured endpoint/path-style) still resolves
-                        // correctly. Precedence inside the call: vended > these overrides > SDK.
-                        S3IcebergStorage::from_vended_credentials(
-                            credentials,
-                            iceberg_config.io.s3_region.as_deref(),
-                            iceberg_config.io.s3_endpoint.as_deref(),
-                            iceberg_config.io.s3_path_style,
-                        )
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?
-                    } else {
-                        info!(
-                            region = ?iceberg_config.io.s3_region,
-                            endpoint = ?iceberg_config.io.s3_endpoint,
-                            "Using ambient AWS credentials"
-                        );
-                        S3IcebergStorage::from_default_chain(
-                            iceberg_config.io.s3_region.as_deref(),
-                            iceberg_config.io.s3_endpoint.as_deref(),
-                            iceberg_config.io.s3_path_style,
-                        )
-                        .await
-                        .map_err(|e| {
-                            QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                        })?
-                    };
-                    let built = Arc::new(built);
-                    self.session
-                        .store_storage(lt_key.clone(), Arc::clone(&built));
-                    built
-                };
+                // §2 fail-closed + query-session reuse + vended/ambient construction,
+                // shared verbatim with the deferred `LazyS3Storage` builder's path so
+                // the two can never make different credential decisions for the same
+                // table (see `rest_session_storage`).
+                let storage = rest_session_storage(
+                    &self.session,
+                    &lt_key,
+                    &iceberg_config.io,
+                    &load_response,
+                    uri,
+                )
+                .await?;
 
                 (load_response, storage)
             }
@@ -1521,24 +1629,26 @@ impl FlureeR2rmlProvider<'_> {
                     "Loading table via direct S3 access"
                 );
 
-                // Direct mode: create storage once, share via Arc. gs://-backed
-                // tables (GCS S3-interop endpoint) are read through the same S3
-                // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK
-                // HTTP/2 range-read bug against that endpoint.
-                let storage: Arc<S3IcebergStorage> = Arc::new(
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?,
+                // Session cache key for this table's storage client — the same
+                // key the REST branch uses (source id + fully-qualified table),
+                // so repeated scans of one Direct table in a query reuse a single
+                // S3 client instead of rebuilding it (credential-chain resolution
+                // + a fresh connection pool) per scan (fluree/db#1498).
+                let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
+                    graph_source_id,
+                    &table_id.namespace,
+                    &table_id.table,
                 );
 
                 let cache = self.fluree.r2rml_cache();
-                let load_response = if let Some(metadata_location) =
+                // Storage construction sits BELOW the metadata-location check so a
+                // hit resolves through `direct_session_storage`, which serves the
+                // session-cached client when this table was already resolved this
+                // query and skips `from_default_chain` entirely. Both arms still
+                // need storage (the scan reads data files; the miss arm also reads
+                // version-hint/metadata via the direct catalog), so this is a
+                // reordering — the session cache covers it, not an elision.
+                let (load_response, storage) = if let Some(metadata_location) =
                     cache.get_direct_metadata_location(table_location).await
                 {
                     debug!(
@@ -1546,14 +1656,34 @@ impl FlureeR2rmlProvider<'_> {
                         metadata_location = %metadata_location,
                         "Direct metadata-location cache hit"
                     );
-                    fluree_db_iceberg::catalog::LoadTableResponse {
+                    let storage = direct_session_storage(
+                        &self.session,
+                        &lt_key,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await?;
+                    let load_response = fluree_db_iceberg::catalog::LoadTableResponse {
                         metadata_location,
                         config: std::collections::HashMap::default(),
                         credentials: None,
                         metadata: None,
-                    }
+                    };
+                    (load_response, storage)
                 } else {
                     debug!(table_location = %table_location, "Direct metadata-location cache miss");
+
+                    // The direct catalog reads version-hint.text + metadata from
+                    // S3, so it needs the storage client up front.
+                    let storage = direct_session_storage(
+                        &self.session,
+                        &lt_key,
+                        iceberg_config.io.s3_region.as_deref(),
+                        iceberg_config.io.s3_endpoint.as_deref(),
+                        iceberg_config.io.s3_path_style,
+                    )
+                    .await?;
 
                     let direct_catalog =
                         SendDirectCatalogClient::new(table_location.clone(), Arc::clone(&storage));
@@ -1563,9 +1693,12 @@ impl FlureeR2rmlProvider<'_> {
                             .load_table(&table_id, false)
                             .await
                             .map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to resolve table metadata from {table_location}: {e}"
-                                ))
+                                storage_query_error(
+                                    &format!(
+                                        "Failed to resolve table metadata from {table_location}"
+                                    ),
+                                    e,
+                                )
                             })?;
                     cache
                         .put_direct_metadata_location(
@@ -1573,7 +1706,7 @@ impl FlureeR2rmlProvider<'_> {
                             load_response.metadata_location.clone(),
                         )
                         .await;
-                    load_response
+                    (load_response, storage)
                 };
 
                 info!(
@@ -1585,65 +1718,26 @@ impl FlureeR2rmlProvider<'_> {
             }
         };
 
-        // Check cache for table metadata
-        let cache = self.fluree.r2rml_cache();
-        let metadata_location = &load_response.metadata_location;
-
-        let metadata = if let Some(cached) = cache.get_metadata(metadata_location).await {
-            debug!(metadata_location = %metadata_location, "Table metadata cache hit");
-            cached
-        } else {
-            debug!(metadata_location = %metadata_location, "Table metadata cache miss");
-
-            // PR-8 slice 2: on the in-memory miss, try the persistent disk catalog
-            // cache before hitting S3. `metadata_location` is content-addressed, so
-            // a hit is always current for that snapshot. A cold process with a warm
-            // catalog dir serves the parsed metadata from local disk (no S3 GET,
-            // no `r2rml.read_metadata` span).
-            let catalog_cache = self.catalog_disk_cache();
-            let metadata = if let Some(disk) = catalog_cache.get_metadata(metadata_location) {
-                debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
-                disk
-            } else {
-                // Measurement sub-span (PR-8 cold decomposition): isolate the
-                // metadata-JSON S3 GET + parse — the `load_table_context` component
-                // between the loadTable REST GET (`r2rml.load_table`) and the
-                // manifest read (`iceberg.scan_plan` / `r2rml.count_manifest_read`).
-                // Allowlisted in `fluree-bench-virtual::spans`.
-                let metadata = async {
-                    let metadata_bytes =
-                        storage
-                            .as_ref()
-                            .read(metadata_location)
-                            .await
-                            .map_err(|e| {
-                                QueryError::Internal(format!("Failed to read table metadata: {e}"))
-                            })?;
-                    let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
-                        QueryError::Internal(format!("Failed to parse table metadata: {e}"))
-                    })?;
-                    Ok::<_, QueryError>(Arc::new(parsed))
-                }
-                .instrument(tracing::debug_span!(
-                    "r2rml.read_metadata",
-                    metadata_location = %metadata_location,
-                ))
-                .await?;
-                catalog_cache.put_metadata(metadata_location, metadata.as_ref());
-                metadata
-            };
-            cache
-                .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
-                .await;
-
-            info!(
-                metadata_location = %metadata_location,
-                format_version = metadata.format_version,
-                "Loaded and cached table metadata"
-            );
-
-            metadata
-        };
+        // Resolve the table metadata from the cheapest available source: the
+        // in-memory cache, the REST catalog's inline `metadata`, the disk catalog
+        // cache, then a fresh S3 GET. Extracted into `resolve_table_metadata` so the
+        // resolution order — in particular that an inline `loadTable` copy
+        // short-circuits the disk/S3 fetch and its `r2rml.read_metadata` span — is
+        // unit-testable against a storage stub. The inline metadata is moved out of
+        // `load_response` (never cloned — it replaces an S3 GET) and is `None` for
+        // Direct mode and cache-reconstructed responses (per-query pin / cross-query
+        // cache), which is precisely why the disk/S3 fallback in the helper must stay
+        // intact. It seeds BOTH cache layers — the disk write is what lets the pointer
+        // rung above serve the NEXT process with zero REST (see the fn doc).
+        let inline_metadata = load_response.metadata.take();
+        let metadata = resolve_table_metadata(
+            self.fluree.r2rml_cache(),
+            storage.as_ref(),
+            &load_response.metadata_location,
+            inline_metadata,
+            &disk,
+        )
+        .await?;
         // Persist the credential-free pointer so the NEXT process resolves this
         // table's `metadata_location` without a loadTable GET. `snapshot_ms` feeds
         // the as_of_t rider (grep r2rml-as-of-t). The eager `storage` is already
@@ -1760,7 +1854,7 @@ impl FlureeR2rmlProvider<'_> {
             let plan = planner
                 .plan_scan()
                 .await
-                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
             (
                 plan.tasks,
                 plan.files_selected,
@@ -1840,7 +1934,7 @@ impl FlureeR2rmlProvider<'_> {
             let plan = planner
                 .plan_scan()
                 .await
-                .map_err(|e| QueryError::Internal(format!("Failed to plan scan: {e}")))?;
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
 
             // Stamp whether this snapshot carries merge-on-read delete manifests so
             // a later cache hit (in-memory or disk) can re-refuse a delete-omitting
@@ -1960,10 +2054,13 @@ impl FlureeR2rmlProvider<'_> {
                     .instrument(read_span)
                     .await
                     .map_err(|e| {
-                        QueryError::Internal(format!(
-                            "Failed to read Parquet file '{}': {e}",
-                            tasks[orig].data_file.file_path
-                        ))
+                        storage_query_error(
+                            &format!(
+                                "Failed to read Parquet file '{}'",
+                                tasks[orig].data_file.file_path
+                            ),
+                            e,
+                        )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
                     // rows this scan EMITS — which are the QUALIFYING result rows
@@ -2038,10 +2135,13 @@ impl FlureeR2rmlProvider<'_> {
                                     );
                                     reader.read_task(&task).instrument(read_span).await.map_err(
                                         |e| {
-                                            QueryError::Internal(format!(
-                                                "Failed to read Parquet file '{}': {e}",
-                                                task.data_file.file_path
-                                            ))
+                                            storage_query_error(
+                                                &format!(
+                                                    "Failed to read Parquet file '{}'",
+                                                    task.data_file.file_path
+                                                ),
+                                                e,
+                                            )
                                         },
                                     )
                                 })
@@ -2063,9 +2163,18 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         let concurrency = iceberg_scan_concurrency(tasks.len());
+        // T2.3: split the vCPU budget between the file-level fan-out and per-file
+        // row-group parallelism. A single-file table (file concurrency 1) grants
+        // all cores to its row groups; a many-file scan (file concurrency already
+        // ≈ cores) grants 1 — no oversubscription. Deterministic integer division.
+        let rowgroup_concurrency = (std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            / concurrency)
+            .max(1);
         debug!(
             files = tasks.len(),
-            concurrency, "streaming Parquet files (bounded parallel)"
+            concurrency, rowgroup_concurrency, "streaming Parquet files (bounded parallel)"
         );
 
         let stream = futures::stream::iter(tasks)
@@ -2093,16 +2202,20 @@ impl FlureeR2rmlProvider<'_> {
                             footers.as_ref(),
                             &disk_cache,
                             &cache_dir,
-                        );
+                        )
+                        .with_rowgroup_concurrency(rowgroup_concurrency);
                         reader
                             .read_task(&task)
                             .instrument(read_span)
                             .await
                             .map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to read Parquet file '{}': {e}",
-                                    task.data_file.file_path
-                                ))
+                                storage_query_error(
+                                    &format!(
+                                        "Failed to read Parquet file '{}'",
+                                        task.data_file.file_path
+                                    ),
+                                    e,
+                                )
                             })
                     })
                     .await
@@ -2176,6 +2289,145 @@ fn sound_manifest_row_count(
         total = total.checked_add(u64::try_from(df.record_count).ok()?)?;
     }
     Some(total)
+}
+
+/// Resolve a table's [`TableMetadata`] from the cheapest available source.
+///
+/// Order, cheapest first:
+/// 1. the in-memory moka cache (`cache`);
+/// 2. `inline_metadata` — the parsed `metadata` a real REST `loadTable` already
+///    handed us in `LoadTableResponse` (populated in `catalog/rest.rs`). It is
+///    `None` for Direct mode and for cache-reconstructed responses (per-query pin
+///    / cross-query cache), which carry only a metadata location;
+/// 3. the persistent disk catalog cache (`disk`);
+/// 4. a fresh S3 GET of the metadata JSON, timed under the `r2rml.read_metadata`
+///    span.
+///
+/// The inline short-circuit is §1 of fluree/db#1500: a REST catalog that vends
+/// metadata inline never re-fetches it from S3, and emits NO `r2rml.read_metadata`
+/// span (that span must fire only on a real S3 read; the live gate asserts n=0 for
+/// inline-vending REST catalogs).
+///
+/// The inline result seeds BOTH cache layers, and the disk write is LOAD-BEARING —
+/// not bookkeeping. The pointer rung in `load_table_context` serves a cross-process
+/// zero-REST resolve only when it finds BOTH a persisted `metadata_location` pointer
+/// AND the metadata itself via `metadata_from_caches`, which reads the in-memory
+/// cache then **this disk layer**. A fresh process has an empty in-memory cache, so
+/// skipping the disk write here would starve the pointer rung for exactly the
+/// catalogs that vend inline metadata (Snowflake Horizon / Polaris) — silently
+/// converting their zero-REST first-ask back into a ~1–3 s `loadTable` GET, with the
+/// regression visible only in the cache gate's `load_table.n` counter. Seeding from
+/// the free inline copy is strictly better than the pre-§1 behaviour, where this
+/// layer could only be populated by first paying an S3 GET.
+async fn resolve_table_metadata<S: SendIcebergStorage>(
+    cache: &R2rmlCache,
+    storage: &S,
+    metadata_location: &str,
+    inline_metadata: Option<TableMetadata>,
+    disk: &super::disk_catalog_cache::DiskCatalogCache,
+) -> QueryResult<Arc<TableMetadata>> {
+    if let Some(cached) = cache.get_metadata(metadata_location).await {
+        debug!(metadata_location = %metadata_location, "Table metadata cache hit");
+        return Ok(cached);
+    }
+
+    if let Some(inline) = inline_metadata {
+        debug!(
+            metadata_location = %metadata_location,
+            "Table metadata used inline from loadTable response (no S3 fetch)"
+        );
+        let metadata = Arc::new(inline);
+        // Seed the disk layer too: this is what the next process's pointer rung
+        // reads (see the fn doc). Content-addressed by `metadata_location`, so the
+        // entry is immutable and always current for that snapshot.
+        disk.put_metadata(metadata_location, metadata.as_ref());
+        cache
+            .put_metadata(metadata_location.to_string(), Arc::clone(&metadata))
+            .await;
+        return Ok(metadata);
+    }
+
+    debug!(metadata_location = %metadata_location, "Table metadata cache miss");
+
+    // PR-8 slice 2: on the in-memory miss, try the persistent disk catalog cache
+    // before hitting S3. `metadata_location` is content-addressed, so a hit is
+    // always current for that snapshot. A cold process with a warm catalog dir
+    // serves the parsed metadata from local disk (no S3 GET, no
+    // `r2rml.read_metadata` span).
+    let metadata = if let Some(cached) = disk.get_metadata(metadata_location) {
+        debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
+        cached
+    } else {
+        // Measurement sub-span (PR-8 cold decomposition): isolate the metadata-JSON
+        // S3 GET + parse — the `load_table_context` component between the loadTable
+        // REST GET (`r2rml.load_table`) and the manifest read (`iceberg.scan_plan` /
+        // `r2rml.count_manifest_read`). Allowlisted in `fluree-bench-virtual::spans`.
+        let metadata = async {
+            let metadata_bytes = storage
+                .read(metadata_location)
+                .await
+                .map_err(|e| storage_query_error("Failed to read table metadata", e))?;
+            let parsed = TableMetadata::from_json(&metadata_bytes).map_err(|e| {
+                QueryError::Internal(format!("Failed to parse table metadata: {e}"))
+            })?;
+            Ok::<_, QueryError>(Arc::new(parsed))
+        }
+        .instrument(tracing::debug_span!(
+            "r2rml.read_metadata",
+            metadata_location = %metadata_location,
+        ))
+        .await?;
+        disk.put_metadata(metadata_location, metadata.as_ref());
+        metadata
+    };
+    cache
+        .put_metadata(metadata_location.to_string(), Arc::clone(&metadata))
+        .await;
+
+    info!(
+        metadata_location = %metadata_location,
+        format_version = metadata.format_version,
+        "Loaded and cached table metadata"
+    );
+
+    Ok(metadata)
+}
+
+/// Acquire the S3 storage client for a Direct-mode table, reusing the query
+/// session's cached client when one is present.
+///
+/// Direct mode builds from the ambient AWS credential chain
+/// (`from_default_chain`: env → `~/.aws` → IMDS/ECS network round-trips) and
+/// stands up a fresh connection pool — not free, and repeated for every scan of
+/// a table that a correlated join (or the slice-1 prefetch→scan) re-resolves.
+/// This mirrors the REST branch's `cached_storage`/`store_storage` reuse
+/// (fluree/db#1498). Unlike REST, Direct never calls `store_load_table` (it has
+/// no vended credentials to rotate), so the cached client is never invalidated
+/// mid-query: the first build is stored and every later resolution of the same
+/// table returns that Arc. `cached_storage`/`store_storage` are gated on
+/// `cache_enabled()`, so with caching disabled this still builds per call
+/// (matching REST and the pre-#1498 behavior).
+async fn direct_session_storage(
+    session: &super::catalog_session::IcebergCatalogSession,
+    lt_key: &str,
+    region: Option<&str>,
+    endpoint: Option<&str>,
+    path_style: bool,
+) -> QueryResult<Arc<S3IcebergStorage>> {
+    if let Some(cached) = session.cached_storage(lt_key) {
+        debug!("S3 storage client reused (query-scoped, direct)");
+        return Ok(cached);
+    }
+    // gs://-backed tables (GCS S3-interop endpoint) are read through this same S3
+    // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK HTTP/2
+    // range-read bug against that endpoint.
+    let built = Arc::new(
+        S3IcebergStorage::from_default_chain(region, endpoint, path_style)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?,
+    );
+    session.store_storage(lt_key.to_string(), Arc::clone(&built));
+    Ok(built)
 }
 
 #[cfg(test)]
@@ -2530,6 +2782,413 @@ mod tests {
         assert_eq!(
             sound_manifest_row_count(&schema, &files, false, &["NOPE".to_string()]),
             None
+        );
+    }
+
+    // ---- §1 (fluree/db#1500): inline loadTable metadata short-circuits S3 ----
+
+    use crate::graph_source::disk_catalog_cache::DiskCatalogCache;
+    use fluree_db_iceberg::error::Result as IcebergResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal valid Iceberg table metadata JSON (only the non-defaulted fields),
+    /// so tests build `TableMetadata` through the real `from_json` path.
+    fn sample_metadata_json(location: &str) -> String {
+        serde_json::json!({
+            "format-version": 2,
+            "location": location,
+            "last-updated-ms": 0,
+            "last-column-id": 0,
+        })
+        .to_string()
+    }
+
+    fn sample_metadata(location: &str) -> TableMetadata {
+        TableMetadata::from_json(sample_metadata_json(location).as_bytes())
+            .expect("sample metadata JSON parses")
+    }
+
+    /// Storage stub that panics on any access: the inline-metadata path must never
+    /// touch storage, so any read here fails the test loudly.
+    #[derive(Debug)]
+    struct NeverReadStorage;
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for NeverReadStorage {
+        async fn read(&self, path: &str) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read must not be called on the inline-metadata path (path={path})");
+        }
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            panic!("storage.read_range must not be called on the inline-metadata path");
+        }
+        async fn file_size(&self, _path: &str) -> IcebergResult<u64> {
+            panic!("storage.file_size must not be called on the inline-metadata path");
+        }
+    }
+
+    /// Storage stub that serves a fixed metadata JSON and counts reads, for the
+    /// fallback-intact test (no inline metadata => a real object read must happen).
+    #[derive(Debug)]
+    struct CountingStorage {
+        body: bytes::Bytes,
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl SendIcebergStorage for CountingStorage {
+        async fn read(&self, _path: &str) -> IcebergResult<bytes::Bytes> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(self.body.clone())
+        }
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> IcebergResult<bytes::Bytes> {
+            unreachable!("resolve_table_metadata reads whole objects, not ranges")
+        }
+        async fn file_size(&self, _path: &str) -> IcebergResult<u64> {
+            unreachable!("resolve_table_metadata does not stat")
+        }
+    }
+
+    /// A disk cache rooted at a unique temp dir (a guaranteed miss on first read).
+    fn tmp_disk_cache(tag: &str) -> (DiskCatalogCache, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("fluree-r2rml-md-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (DiskCatalogCache::for_dir(&dir), dir)
+    }
+
+    #[tokio::test]
+    async fn inline_metadata_short_circuits_s3_and_seeds_both_caches() {
+        let cache = R2rmlCache::new(4, 4);
+        let loc = "s3://bucket/warehouse/t/metadata/v3.metadata.json";
+        let inline = sample_metadata("s3://bucket/warehouse/t");
+        let (disk, dir) = tmp_disk_cache("inline");
+
+        // In-memory cache empty (miss); inline metadata present. `NeverReadStorage`
+        // panics on any access, so a green result proves S3 was never touched —
+        // without §1's inline branch this would fall through to the disk miss and
+        // then a storage read, which panics here.
+        let out = resolve_table_metadata(&cache, &NeverReadStorage, loc, Some(inline), &disk)
+            .await
+            .expect("inline metadata resolves without any storage read");
+        assert_eq!(out.location, "s3://bucket/warehouse/t");
+
+        // The inline result seeds the in-memory cache so a later cache-reconstructed
+        // load (which carries `metadata: None`) hits it instead of re-fetching.
+        assert!(
+            cache.get_metadata(loc).await.is_some(),
+            "inline metadata must be cached in-memory for later loads"
+        );
+
+        // ...and seeds the DISK layer, which is what the NEXT PROCESS's pointer rung
+        // reads via `metadata_from_caches` (its in-memory cache is empty). Skipping
+        // this write would silently starve the zero-REST first-ask for exactly the
+        // catalogs that vend inline metadata — the regression would show up only as
+        // the cache gate's `load_table.n` going non-zero. Asserted only when disk
+        // caching is enabled; `put_metadata` is a no-op when the env switch is off.
+        if crate::graph_source::disk_catalog_cache::disk_catalog_cache_enabled() {
+            assert!(
+                disk.get_metadata(loc).is_some(),
+                "inline metadata must seed the disk layer for the pointer rung"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Composition guards (restack onto the loadTable-METADATA cache chain) ----
+    //
+    // These cover the seams where OUR credential handling meets the chain's
+    // pointer-rung / `LazyS3Storage` architecture. Neither suite could see them
+    // before: ours predates the rung, theirs predates SecretRef / fail-closed /
+    // typed errors. Each one FAILS if the corresponding guard is dropped in a
+    // future merge.
+
+    fn vended_response(loc: &str, with_creds: bool) -> LoadTableResponse {
+        LoadTableResponse {
+            metadata_location: loc.to_string(),
+            config: std::collections::HashMap::default(),
+            credentials: with_creds.then(|| fluree_db_iceberg::credential::VendedCredentials {
+                access_key_id: "AKIAEXAMPLE".to_string(),
+                secret_access_key: "secret".to_string(),
+                session_token: None,
+                expires_at: None,
+                endpoint: None,
+                region: Some("us-east-2".to_string()),
+                path_style: false,
+            }),
+            metadata: None,
+        }
+    }
+
+    /// §2 on the LAZY path: a REST source configured to require vended credentials
+    /// whose catalog vends none must FAIL CLOSED — never silently read under the
+    /// process's ambient AWS identity. `rest_session_storage` is the one decision
+    /// point the eager arm AND the deferred `LazyS3Storage` builder share, so this
+    /// covers both; a second, unguarded copy is exactly the fail-open this pins.
+    #[tokio::test]
+    async fn rest_storage_fails_closed_when_catalog_vends_nothing() {
+        let session = super::super::catalog_session::IcebergCatalogSession::default();
+        let lt_key = super::super::catalog_session::IcebergCatalogSession::load_table_key(
+            "gs:main",
+            "DW",
+            "DIM_STORE",
+        );
+        let io = IoConfig {
+            vended_credentials: true, // the default
+            ..Default::default()
+        };
+        let resp = vended_response("s3://b/t/metadata/v1.metadata.json", false);
+
+        let err = rest_session_storage(&session, &lt_key, &io, &resp, "https://cat.example/v1")
+            .await
+            .expect_err("vended-configured source with no vended creds must fail closed");
+        match err {
+            QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+                assert_eq!(catalog_uri, "https://cat.example/v1");
+            }
+            other => panic!("expected CatalogCredentialsNotVended, got: {other:?}"),
+        }
+        // ...and it must NOT have cached an ambient client under this key.
+        assert!(
+            session.cached_storage(&lt_key).is_none(),
+            "fail-closed must not leave a storage client in the session"
+        );
+    }
+
+    /// The explicit ambient opt-in (`vended_credentials = false`) still resolves —
+    /// fail-closed must not turn BYO-IAM into an error.
+    #[tokio::test]
+    async fn rest_storage_allows_explicit_ambient_opt_in() {
+        let session = super::super::catalog_session::IcebergCatalogSession::default();
+        let lt_key = super::super::catalog_session::IcebergCatalogSession::load_table_key(
+            "gs:main",
+            "DW",
+            "DIM_AMBIENT",
+        );
+        let io = IoConfig {
+            vended_credentials: false, // explicit BYO-IAM
+            s3_region: Some("us-east-2".to_string()),
+            ..Default::default()
+        };
+        let resp = vended_response("s3://b/t/metadata/v1.metadata.json", false);
+        rest_session_storage(&session, &lt_key, &io, &resp, "https://cat.example/v1")
+            .await
+            .expect("explicit vended_credentials=false must use the ambient chain");
+    }
+
+    /// §5 across the deferred builder's `IcebergError` channel: the typed errors must
+    /// round-trip back to their `QueryError` counterparts (and thus their 403 wire
+    /// codes) instead of being flattened to an opaque string by a blanket
+    /// `to_string()`. Mirrors the `map_err` the `LazyS3Storage` builder applies.
+    #[test]
+    fn typed_storage_errors_survive_the_lazy_builder_channel() {
+        let denied = QueryError::StorageAccessDenied {
+            bucket: "b".to_string(),
+            key: "k".to_string(),
+            region: Some("us-east-2".to_string()),
+            message: "AccessDenied ... no identity-based policy allows".to_string(),
+        };
+        let ferried = match denied {
+            QueryError::StorageAccessDenied {
+                bucket,
+                key,
+                region,
+                message,
+            } => IcebergError::StorageAccessDenied {
+                bucket,
+                key,
+                region,
+                message,
+            },
+            other => IcebergError::Catalog(other.to_string()),
+        };
+        match super::super::iceberg_catalog::storage_query_error("ctx", ferried) {
+            QueryError::StorageAccessDenied { bucket, key, .. } => {
+                assert_eq!((bucket.as_str(), key.as_str()), ("b", "k"));
+            }
+            other => panic!("StorageAccessDenied must survive the builder: {other:?}"),
+        }
+
+        let not_vended = QueryError::CatalogCredentialsNotVended {
+            catalog_uri: "https://cat.example/v1".to_string(),
+        };
+        let ferried = match not_vended {
+            QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+                IcebergError::CatalogCredentialsNotVended { catalog_uri }
+            }
+            other => IcebergError::Catalog(other.to_string()),
+        };
+        match super::super::iceberg_catalog::storage_query_error("ctx", ferried) {
+            QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+                assert_eq!(catalog_uri, "https://cat.example/v1");
+            }
+            other => panic!("CatalogCredentialsNotVended must survive the builder: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_inline_metadata_falls_back_to_storage_read() {
+        let cache = R2rmlCache::new(4, 4);
+        let loc = "s3://bucket/warehouse/u/metadata/v1.metadata.json";
+        let reads = Arc::new(AtomicUsize::new(0));
+        let storage = CountingStorage {
+            body: bytes::Bytes::from(sample_metadata_json("s3://bucket/warehouse/u")),
+            reads: Arc::clone(&reads),
+        };
+
+        // No inline metadata and an empty in-memory cache: resolution must reach
+        // storage. A unique temp dir keeps the disk cache a guaranteed miss (or a
+        // no-op when disk caching is disabled), so the resolution proceeds to the
+        // object read regardless of the ambient disk-cache setting.
+        let (disk, dir) = tmp_disk_cache("fallback");
+        let out = resolve_table_metadata(&cache, &storage, loc, None, &disk)
+            .await
+            .expect("fallback resolves via the storage read");
+        assert_eq!(out.location, "s3://bucket/warehouse/u");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "fallback path must perform exactly one storage read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── ORDERING-TRAP GUARD: rest_client_cache_key must fingerprint the RAW,
+    //    reference-bearing config, NOT a hydrated one. ──
+
+    #[derive(Debug)]
+    struct FixedResolver(&'static str);
+
+    #[async_trait]
+    impl fluree_db_iceberg::SecretResolver for FixedResolver {
+        async fn resolve_secret(
+            &self,
+            _secret_ref: &str,
+        ) -> std::result::Result<String, fluree_db_iceberg::SecretResolveError> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    fn oauth2_auth(
+        client_secret: fluree_db_iceberg::ConfigValue,
+    ) -> fluree_db_iceberg::auth::AuthConfig {
+        fluree_db_iceberg::auth::AuthConfig::OAuth2ClientCredentials {
+            token_url: "https://c.example.com/token".to_string(),
+            client_id: fluree_db_iceberg::ConfigValue::literal("svc"),
+            client_secret,
+            scope: None,
+            audience: None,
+        }
+    }
+
+    fn gs_config_json(auth: fluree_db_iceberg::auth::AuthConfig) -> String {
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+        fluree_db_iceberg::IcebergGsConfig {
+            catalog: CatalogConfig::Rest {
+                catalog_type: "rest".to_string(),
+                uri: "https://c.example.com".to_string(),
+                auth,
+                warehouse: None,
+            },
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig::default(),
+            mapping: None,
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    /// The fingerprint keys the process-wide REST client cache. It MUST be stable
+    /// across secret rotations (so a warm server does one OAuth exchange per client
+    /// lifetime, not one per query) — which holds ONLY because it is computed over
+    /// the raw, reference-bearing config, BEFORE hydration. This test proves that
+    /// discipline: fingerprinting the ref-bearing config is rotation-stable, while
+    /// fingerprinting a hydrated config would re-key on every rotation.
+    #[tokio::test]
+    async fn secret_ref_fingerprint_is_rotation_stable() {
+        use std::sync::Arc;
+        let gsid = "gs-1";
+
+        // Raw stored config carries the REFERENCE (this is `record.config` at the
+        // scan site). Recomputing over it is identical even though the secret
+        // behind the ref may have rotated between queries: the cache is NOT re-keyed.
+        let raw = gs_config_json(oauth2_auth(fluree_db_iceberg::ConfigValue::SecretRef {
+            secret_ref: "vault://cs".to_string(),
+        }));
+        let key_raw = rest_client_cache_key(gsid, &raw);
+        assert_eq!(
+            rest_client_cache_key(gsid, &raw),
+            key_raw,
+            "the ref-bearing fingerprint must be stable across rotations"
+        );
+
+        // Hydrate the SAME auth with two different resolver outputs (a rotation),
+        // serialize the hydrated configs, and fingerprint those. They differ —
+        // which is EXACTLY why hydration must run AFTER the fingerprint, never
+        // before (hydrating first would re-key the client cache every rotation).
+        let auth = oauth2_auth(fluree_db_iceberg::ConfigValue::SecretRef {
+            secret_ref: "vault://cs".to_string(),
+        });
+        let r1: Arc<dyn fluree_db_iceberg::SecretResolver> = Arc::new(FixedResolver("secret-v1"));
+        let r2: Arc<dyn fluree_db_iceberg::SecretResolver> = Arc::new(FixedResolver("secret-v2"));
+        let hydrated_v1 = gs_config_json(auth.hydrate(Some(&r1)).await.unwrap());
+        let hydrated_v2 = gs_config_json(auth.hydrate(Some(&r2)).await.unwrap());
+        let key_h1 = rest_client_cache_key(gsid, &hydrated_v1);
+        let key_h2 = rest_client_cache_key(gsid, &hydrated_v2);
+        assert_ne!(
+            key_h1, key_h2,
+            "hydrated configs with rotated secrets differ → hydrating before the \
+             fingerprint would re-key the client cache every rotation"
+        );
+        assert_ne!(
+            key_raw, key_h1,
+            "the raw ref-bearing key must differ from the hydrated key"
+        );
+    }
+
+    /// fluree/db#1498: Direct mode resolves its S3 client through the query
+    /// session cache, so two resolutions of the same table in one query share ONE
+    /// client instead of rebuilding it (credential-chain resolution + a fresh
+    /// connection pool) per scan. Direct mode never calls `store_load_table`, so
+    /// nothing invalidates the cached client mid-query — the second acquisition
+    /// must return the first Arc. `from_default_chain(Some(region), ..)` builds an
+    /// SDK client offline (region set, ambient creds resolved lazily, no request),
+    /// so this runs in CI without AWS credentials. This is the strongest seam that
+    /// exercises the actual fix without a live catalog: it drives the exact helper
+    /// the Direct branch now calls in both metadata-location arms.
+    #[tokio::test]
+    async fn direct_session_storage_reuses_arc_across_calls() {
+        use crate::graph_source::catalog_session::IcebergCatalogSession;
+        let session = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+
+        let first = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
+            .await
+            .expect("offline SDK client construction");
+        let second = direct_session_storage(&session, &key, Some("us-east-2"), None, false)
+            .await
+            .expect("offline SDK client construction");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second Direct-mode acquisition must reuse the session-cached S3 client"
+        );
+
+        // A different table (different key) is a distinct client — the cache keys
+        // per (source, table), so unrelated tables never alias one client.
+        let other_key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_GEOGRAPHY");
+        let other = direct_session_storage(&session, &other_key, Some("us-east-2"), None, false)
+            .await
+            .expect("offline SDK client construction");
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a different table must not reuse another table's cached client"
         );
     }
 

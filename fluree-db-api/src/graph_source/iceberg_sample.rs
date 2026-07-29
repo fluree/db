@@ -275,6 +275,7 @@ impl crate::Fluree {
         projection: Option<Vec<String>>,
         n: usize,
     ) -> Result<Vec<Value>> {
+        let conn = self.hydrate_conn(conn).await?;
         sample_iceberg_rows(conn, table, projection, n).await
     }
 
@@ -288,6 +289,7 @@ impl crate::Fluree {
         column: String,
         n: usize,
     ) -> Result<Vec<Value>> {
+        let conn = self.hydrate_conn(conn).await?;
         sample_column_values(conn, table, column, n).await
     }
 }

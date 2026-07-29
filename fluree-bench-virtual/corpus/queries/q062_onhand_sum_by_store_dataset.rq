@@ -1,0 +1,14 @@
+# q062 onhand_sum_by_store_dataset
+# Intent: C5 dataset-path (FROM <gs>) family-C — a fact->dim SUM rollup through
+#         query_from(), gating the already-fused join fold on the deployed path
+#         shape (cheap insurance; the join fold predates this PR but was never
+#         corpus-exercised via FROM <gs>).
+# BI lineage (BI-16): "What is total on-hand inventory by store?" (dataset path)
+# Predicates verified against enterprise.ttl — FactInventorySnapshot: onHandQty, store; DimStore: name.
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?sn (SUM(?oh) AS ?tot)
+FROM <enterprise-sf01-v:main>
+WHERE { ?inv a edw:InventorySnapshot ; edw:onHandQty ?oh ; edw:store ?st .
+        ?st edw:name ?sn . }
+GROUP BY ?sn

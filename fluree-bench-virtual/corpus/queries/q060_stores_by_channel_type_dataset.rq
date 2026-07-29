@@ -1,0 +1,12 @@
+# q060 stores_by_channel_type_dataset
+# Intent: C5 dataset-path (FROM <gs>) family-A grouped COUNT — a 2-key single-DIM
+#         rollup that exercises the fused single-table aggregate admission on the
+#         query_from (DatasetOperator) path, not the fluree.graph() path.
+# BI lineage (BI-01): "How many stores do we have by channel and store type?"
+# Predicates verified against enterprise.ttl — DimStore: channel, storeType.
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?ch ?t (COUNT(?s) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?s a edw:Store ; edw:channel ?ch ; edw:storeType ?t . }
+GROUP BY ?ch ?t

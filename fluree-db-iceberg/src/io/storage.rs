@@ -135,6 +135,49 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     msg
 }
 
+/// Classify whether an S3 read failure denotes access-denied.
+///
+/// Pure decision split out from the SDK call sites so it is unit-testable
+/// without constructing `SdkError` values. S3 signals denial either through the
+/// modeled service error code `AccessDenied` or a raw HTTP 403; either counts.
+/// A missing object *without* `s3:ListBucket` also arrives as `AccessDenied`
+/// (S3 will not reveal 404 vs 403 without list permission), so a denied result
+/// does not distinguish "no permission" from "object moved/removed".
+#[cfg(any(feature = "aws", test))]
+fn is_s3_access_denied(error_code: Option<&str>, http_status: Option<u16>) -> bool {
+    matches!(error_code, Some(code) if code.eq_ignore_ascii_case("AccessDenied"))
+        || http_status == Some(403)
+}
+
+/// Build an [`IcebergError`] from a failed S3 read.
+///
+/// Returns the structured [`IcebergError::StorageAccessDenied`] (which the API/
+/// server layers surface as HTTP 403) when [`is_s3_access_denied`] fires, and
+/// otherwise the pre-existing stringly [`IcebergError::Storage`] with the exact
+/// `"S3 {op} failed: …"` message — so every non-denial failure is byte-for-byte
+/// unchanged from before.
+#[cfg(any(feature = "aws", test))]
+fn s3_read_error(
+    op: &str,
+    bucket: &str,
+    key: &str,
+    region: Option<String>,
+    error_code: Option<&str>,
+    http_status: Option<u16>,
+    chained_message: String,
+) -> IcebergError {
+    if is_s3_access_denied(error_code, http_status) {
+        IcebergError::StorageAccessDenied {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            region,
+            message: chained_message,
+        }
+    } else {
+        IcebergError::storage(format!("S3 {op} failed: {chained_message}"))
+    }
+}
+
 #[cfg(feature = "aws")]
 impl S3IcebergStorage {
     /// Resolve effective region/endpoint/path-style from vended credentials plus
@@ -329,6 +372,15 @@ impl S3IcebergStorage {
         }
     }
 
+    /// The region resolved onto the S3 client, if any (used to annotate
+    /// access-denied errors). `None` when the SDK default chain applies.
+    fn configured_region(&self) -> Option<String> {
+        self.client
+            .config()
+            .region()
+            .map(|r| r.as_ref().to_string())
+    }
+
     /// Parse an object-store URI into (bucket, key).
     ///
     /// Supports formats:
@@ -375,7 +427,16 @@ impl S3IcebergStorage {
             .send()
             .await
             .map_err(|e| {
-                IcebergError::storage(format!("S3 GetObject failed: {}", error_chain(&e)))
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "GetObject",
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
             })?;
 
         let body = response.body.collect().await.map_err(|e| {
@@ -429,7 +490,16 @@ impl IcebergStorage for S3IcebergStorage {
             .send()
             .await
             .map_err(|e| {
-                IcebergError::storage(format!("S3 GetObject failed: {}", error_chain(&e)))
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "GetObject",
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
             })?;
 
         let body = response.body.collect().await.map_err(|e| {
@@ -455,7 +525,16 @@ impl IcebergStorage for S3IcebergStorage {
             .send()
             .await
             .map_err(|e| {
-                IcebergError::storage(format!("S3 HeadObject failed: {}", error_chain(&e)))
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "HeadObject",
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
             })?;
 
         response
@@ -479,7 +558,16 @@ impl SendIcebergStorage for S3IcebergStorage {
             .send()
             .await
             .map_err(|e| {
-                IcebergError::storage(format!("S3 GetObject failed: {}", error_chain(&e)))
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "GetObject",
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
             })?;
 
         let body = response.body.collect().await.map_err(|e| {
@@ -505,7 +593,16 @@ impl SendIcebergStorage for S3IcebergStorage {
             .send()
             .await
             .map_err(|e| {
-                IcebergError::storage(format!("S3 HeadObject failed: {}", error_chain(&e)))
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "HeadObject",
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
             })?;
 
         response
@@ -811,5 +908,88 @@ mod tests {
         // Start beyond end - should return empty
         let empty = storage.read_range("test.txt", 100..200).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── Access-denied classification (feature-independent; no SDK types) ──
+
+    #[test]
+    fn access_denied_by_service_code() {
+        assert!(is_s3_access_denied(Some("AccessDenied"), None));
+        // Case-insensitive so an SDK code-casing change does not silently
+        // reclassify a 403 as a generic storage error.
+        assert!(is_s3_access_denied(Some("accessdenied"), Some(200)));
+    }
+
+    #[test]
+    fn access_denied_by_http_403() {
+        assert!(is_s3_access_denied(None, Some(403)));
+        // A 403 is denied even when the modeled code is something else.
+        assert!(is_s3_access_denied(Some("Forbidden"), Some(403)));
+    }
+
+    #[test]
+    fn not_access_denied_for_other_errors() {
+        assert!(!is_s3_access_denied(Some("NoSuchKey"), Some(404)));
+        assert!(!is_s3_access_denied(Some("SlowDown"), Some(503)));
+        assert!(!is_s3_access_denied(None, Some(500)));
+        assert!(!is_s3_access_denied(None, None));
+    }
+
+    #[test]
+    fn s3_read_error_maps_denied_to_structured_variant() {
+        let err = s3_read_error(
+            "GetObject",
+            "my-bucket",
+            "path/to/data.parquet",
+            Some("us-east-2".to_string()),
+            Some("AccessDenied"),
+            Some(403),
+            "service error: AccessDenied".to_string(),
+        );
+        match err {
+            IcebergError::StorageAccessDenied {
+                bucket,
+                key,
+                region,
+                message,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(key, "path/to/data.parquet");
+                assert_eq!(region.as_deref(), Some("us-east-2"));
+                assert!(message.contains("AccessDenied"));
+            }
+            other => panic!("expected StorageAccessDenied, got {other:?}"),
+        }
+
+        // Display is actionable: names the object, the region, and the
+        // ListBucket caveat (no-permission OR object-moved).
+        let shown = IcebergError::StorageAccessDenied {
+            bucket: "b".into(),
+            key: "k".into(),
+            region: Some("us-west-1".into()),
+            message: "svc".into(),
+        }
+        .to_string();
+        assert!(shown.contains("s3://b/k"), "shown: {shown}");
+        assert!(shown.contains("region us-west-1"), "shown: {shown}");
+        assert!(shown.contains("s3:ListBucket"), "shown: {shown}");
+    }
+
+    #[test]
+    fn s3_read_error_preserves_legacy_message_for_non_denied() {
+        let err = s3_read_error(
+            "HeadObject",
+            "b",
+            "k",
+            None,
+            Some("NoSuchKey"),
+            Some(404),
+            "chain".to_string(),
+        );
+        // Byte-for-byte identical to the pre-typed-error stringly message.
+        assert_eq!(
+            err.to_string(),
+            "Storage error: S3 HeadObject failed: chain"
+        );
     }
 }

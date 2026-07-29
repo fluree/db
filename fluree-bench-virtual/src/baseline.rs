@@ -598,7 +598,7 @@ mod tests {
 
     // --- bless overwrite guard -------------------------------------------
 
-    use crate::corpus::{ExpectedRows, ExpectedStatus, OrderSensitivity, QueryDef, Tag};
+    use crate::corpus::{ExecPath, ExpectedRows, ExpectedStatus, OrderSensitivity, QueryDef, Tag};
     use crate::schema::{RunMeta, TargetFingerprint, SCHEMA_VERSION};
 
     fn bless_meta(run_id: &str) -> RunMeta {
@@ -639,6 +639,7 @@ mod tests {
                 subsets: vec!["smoke".to_string()],
                 expected_status: ExpectedStatus::default(),
                 hash_gate: *gate,
+                exec_path: ExecPath::default(),
             })
             .collect();
         Corpus {

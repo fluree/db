@@ -185,6 +185,16 @@ pub struct DatasetOperator {
     /// True when members span multiple distinct ledger IDs, requiring
     /// `Binding::Sid` → `Binding::IriMatch` conversion.
     needs_provenance: bool,
+    /// T1.3: a top-of-tree `LIMIT` row budget, recorded by `set_row_budget` and
+    /// threaded into each member's inner subtree at build time in `open` (mirrors
+    /// `GraphOperator`, which builds its inner subplan the same way). Without this
+    /// the dataset wrapper swallowed the budget and a `LIMIT` never reached the
+    /// R2RML scan. `None` unless the switch is on AND a budget was pushed.
+    row_budget: Option<usize>,
+    /// T1.3: an `ORDER BY … LIMIT` top-k directive, applied per member like
+    /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
+    /// partial top-k into the global one.
+    topk: Option<(VarId, usize)>,
 }
 
 impl DatasetOperator {
@@ -196,6 +206,23 @@ impl DatasetOperator {
             members: Vec::new(),
             current_member: 0,
             needs_provenance: false,
+            row_budget: None,
+            topk: None,
+        }
+    }
+
+    /// Thread a recorded top-of-tree `LIMIT` budget / top-k directive into a
+    /// freshly built member's inner subtree, before it is opened. No-op unless
+    /// `set_row_budget`/`set_topk` recorded one (which only happens when the
+    /// `FLUREE_R2RML_DATASET_BUDGET` switch is on). Each member's own operators
+    /// forward or absorb the directive exactly as they would below a
+    /// `GraphOperator`, so no soundness reasoning is duplicated here.
+    fn apply_member_directives(&self, member: &mut dyn Operator) {
+        if let Some(budget) = self.row_budget {
+            member.set_row_budget(budget);
+        }
+        if let Some((sort_var, k)) = self.topk {
+            member.set_topk(sort_var, k);
         }
     }
 
@@ -341,6 +368,29 @@ impl Operator for DatasetOperator {
         self.builder.schema()
     }
 
+    fn set_row_budget(&mut self, budget: usize) {
+        // T1.3: record a top-of-tree LIMIT budget; threaded into each member's
+        // inner subtree at build time (`open` → `apply_member_directives`), NOT
+        // forwarded to a single child (there is none — members are built lazily
+        // per active graph). Sound because the consuming LIMIT truncates the
+        // member concatenation to `budget`, and each member's own Sort/Distinct
+        // still absorb the budget (no-op) where present; this only removes the
+        // artificial block the dataset wrapper imposed. Switch-gated for OFF-parity.
+        if crate::r2rml::dataset_budget_enabled() {
+            self.row_budget = Some(budget);
+        }
+    }
+
+    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+        // T1.3: record ORDER BY … LIMIT top-k; applied per member like the row
+        // budget. Per-member top-k is sound — the outer sort merges the members'
+        // partial top-k into the global one (same reasoning as `GraphOperator`'s
+        // per-partition top-k). Switch-gated.
+        if crate::r2rml::dataset_budget_enabled() {
+            self.topk = Some((sort_var, k));
+        }
+    }
+
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
         self.builder.plan_details()
     }
@@ -358,6 +408,7 @@ impl Operator for DatasetOperator {
                 // Single-graph mode: build one operator, open with parent
                 // context directly. No fanout, no provenance stamping.
                 let mut inner = self.builder.build()?;
+                self.apply_member_directives(inner.as_mut());
                 inner.open(ctx).await?;
                 self.members.push(DatasetMember {
                     operator: inner,
@@ -384,6 +435,7 @@ impl Operator for DatasetOperator {
 
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;
+                    self.apply_member_directives(inner.as_mut());
                     let mut per_graph_ctx = ctx.with_graph_ref(graph);
 
                     // When provenance stamping is needed (multi-ledger),
@@ -563,5 +615,154 @@ mod tests {
         let op2 = builder.build().unwrap();
         assert_eq!(op1.schema(), op2.schema());
         assert_eq!(op1.schema(), builder.schema());
+    }
+
+    // ---- T1.3: DatasetOperator LIMIT / top-k forwarding ----
+
+    use std::sync::Mutex;
+
+    /// Inner operator that records the budget / top-k directive its dataset member
+    /// receives, and yields no rows. Lets a test read what `open` threaded into a
+    /// freshly built member.
+    struct DirectiveRecorder {
+        budget: Arc<Mutex<Option<usize>>>,
+        topk: Arc<Mutex<Option<(VarId, usize)>>>,
+        schema: Arc<[VarId]>,
+        state: OperatorState,
+    }
+
+    #[async_trait]
+    impl Operator for DirectiveRecorder {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            self.state = OperatorState::Open;
+            Ok(())
+        }
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            self.state = OperatorState::Exhausted;
+            Ok(None)
+        }
+        fn close(&mut self) {
+            self.state = OperatorState::Closed;
+        }
+        fn set_row_budget(&mut self, budget: usize) {
+            *self.budget.lock().unwrap() = Some(budget);
+        }
+        fn set_topk(&mut self, sort_var: VarId, k: usize) {
+            *self.topk.lock().unwrap() = Some((sort_var, k));
+        }
+    }
+
+    /// `DatasetBuilder` that yields a fresh `DirectiveRecorder` sharing the given
+    /// handles, so a test can read what the built member(s) received.
+    struct RecorderBuilder {
+        budget: Arc<Mutex<Option<usize>>>,
+        topk: Arc<Mutex<Option<(VarId, usize)>>>,
+        schema: Arc<[VarId]>,
+    }
+
+    impl DatasetBuilder for RecorderBuilder {
+        fn build(&self) -> Result<BoxedOperator> {
+            Ok(Box::new(DirectiveRecorder {
+                budget: Arc::clone(&self.budget),
+                topk: Arc::clone(&self.topk),
+                schema: Arc::clone(&self.schema),
+                state: OperatorState::Created,
+            }))
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+    }
+
+    type RecorderHandles = (
+        Arc<Mutex<Option<usize>>>,
+        Arc<Mutex<Option<(VarId, usize)>>>,
+    );
+
+    fn recorder_dataset() -> (DatasetOperator, RecorderHandles) {
+        let budget = Arc::new(Mutex::new(None));
+        let topk = Arc::new(Mutex::new(None));
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let builder = RecorderBuilder {
+            budget: Arc::clone(&budget),
+            topk: Arc::clone(&topk),
+            schema,
+        };
+        (DatasetOperator::new(Box::new(builder)), (budget, topk))
+    }
+
+    /// Open an operator against a trivial single-graph context and drain it, so the
+    /// dataset member is built + opened — the point at which directives are applied.
+    async fn open_and_drain(op: &mut dyn Operator) {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        op.open(&ctx).await.unwrap();
+        while op.next_batch(&ctx).await.unwrap().is_some() {}
+    }
+
+    #[tokio::test]
+    async fn dataset_forwards_row_budget_to_member() {
+        let (mut op, (budget, _topk)) = recorder_dataset();
+        op.set_row_budget(20);
+        open_and_drain(&mut op).await;
+        assert_eq!(
+            *budget.lock().unwrap(),
+            Some(20),
+            "a LIMIT budget on the dataset operator must reach the member scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn dataset_forwards_topk_to_member() {
+        let (mut op, (_budget, topk)) = recorder_dataset();
+        op.set_topk(VarId(3), 5);
+        open_and_drain(&mut op).await;
+        assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5)));
+    }
+
+    #[tokio::test]
+    async fn dataset_without_limit_leaves_member_unbudgeted() {
+        // No set_row_budget / set_topk (also the switch-OFF shape) → the member
+        // sees nothing, i.e. byte-identical to the pre-T1.3 no-forward behavior.
+        let (mut op, (budget, topk)) = recorder_dataset();
+        open_and_drain(&mut op).await;
+        assert_eq!(*budget.lock().unwrap(), None);
+        assert_eq!(*topk.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sort_above_dataset_absorbs_budget() {
+        // ORDER BY must rank every row, so a LIMIT budget must NOT reach the dataset
+        // scan through it — the dataset-path absorb boundary. `SortOperator`
+        // inherits the no-op `set_row_budget`, so the dataset below is never
+        // budgeted, and the member scan stays full.
+        use crate::sort::{SortOperator, SortSpec};
+        let (dataset, (budget, _topk)) = recorder_dataset();
+        let mut sort = SortOperator::new(Box::new(dataset), vec![SortSpec::asc(VarId(0))]);
+        sort.set_row_budget(7);
+        open_and_drain(&mut sort).await;
+        assert_eq!(
+            *budget.lock().unwrap(),
+            None,
+            "Sort must absorb the budget; the dataset scan below stays unbudgeted"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_above_dataset_absorbs_budget() {
+        // DISTINCT may need > k raw rows to yield k unique → must absorb; the
+        // dataset scan below stays full.
+        use crate::distinct::DistinctOperator;
+        let (dataset, (budget, _topk)) = recorder_dataset();
+        let mut distinct = DistinctOperator::new(Box::new(dataset));
+        distinct.set_row_budget(7);
+        open_and_drain(&mut distinct).await;
+        assert_eq!(*budget.lock().unwrap(), None);
     }
 }

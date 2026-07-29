@@ -420,6 +420,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cached_storage_persists_without_a_fresh_load_table() {
+        // fluree/db#1498: Direct mode caches its S3 client here but NEVER calls
+        // `store_load_table` (it has no vended credentials to rotate), so the only
+        // thing that would invalidate the client never happens — the client stays
+        // cached for the whole query and every repeated scan of the table reuses
+        // it. This is the session-layer invariant the direct-branch reuse relies
+        // on; the r2rml helper test drives the same contract end-to-end.
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        let storage = Arc::new(
+            S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
+                .await
+                .expect("offline SDK client construction"),
+        );
+        s.store_storage(key.clone(), Arc::clone(&storage));
+        // No `store_load_table` in between (Direct mode's flow) — the client must
+        // still be served, and it must be the very same Arc.
+        let hit = s
+            .cached_storage(&key)
+            .expect("storage stays cached with no reload");
+        assert!(
+            Arc::ptr_eq(&hit, &storage),
+            "the cached Direct-mode client must be the same Arc across resolutions"
+        );
+    }
+
     #[test]
     fn keys_isolate_by_source_and_table() {
         let s = IcebergCatalogSession::default();

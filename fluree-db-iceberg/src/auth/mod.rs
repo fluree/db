@@ -15,11 +15,12 @@ mod oauth2;
 pub use bearer::BearerTokenAuth;
 pub use oauth2::{OAuth2ClientCredentials, OAuth2Config};
 
-use crate::config_value::ConfigValue;
+use crate::config_value::{ConfigValue, SecretResolver};
 use crate::error::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Authentication provider for REST catalog requests.
 ///
@@ -141,6 +142,38 @@ impl AuthConfig {
             }
         }
     }
+
+    /// Resolve every [`ConfigValue::SecretRef`] auth field via `resolver`,
+    /// returning a config whose secret-bearing values are all literal (or
+    /// env-var / `None`) and therefore safe to hand to the SYNCHRONOUS
+    /// [`create_provider`](Self::create_provider) /
+    /// [`create_provider_arc`](Self::create_provider_arc).
+    ///
+    /// This is the single async step in the auth pipeline; call it once (with the
+    /// host's injected resolver) before building a provider. Fields carrying no
+    /// secret reference clone through untouched, and a `None` resolver only
+    /// errors when a `SecretRef` is actually present (fail closed).
+    pub async fn hydrate(&self, resolver: Option<&Arc<dyn SecretResolver>>) -> Result<AuthConfig> {
+        match self {
+            AuthConfig::None => Ok(AuthConfig::None),
+            AuthConfig::Bearer { token } => Ok(AuthConfig::Bearer {
+                token: token.hydrate(resolver).await?,
+            }),
+            AuthConfig::OAuth2ClientCredentials {
+                token_url,
+                client_id,
+                client_secret,
+                scope,
+                audience,
+            } => Ok(AuthConfig::OAuth2ClientCredentials {
+                token_url: token_url.clone(),
+                client_id: client_id.hydrate(resolver).await?,
+                client_secret: client_secret.hydrate(resolver).await?,
+                scope: scope.clone(),
+                audience: audience.clone(),
+            }),
+        }
+    }
 }
 
 /// No-op authentication (for testing or public catalogs).
@@ -217,5 +250,57 @@ mod tests {
             }
             _ => panic!("Expected OAuth2 auth"),
         }
+    }
+
+    #[derive(Debug)]
+    struct StubResolver;
+
+    #[async_trait]
+    impl SecretResolver for StubResolver {
+        async fn resolve_secret(
+            &self,
+            secret_ref: &str,
+        ) -> std::result::Result<String, crate::config_value::SecretResolveError> {
+            Ok(format!("resolved:{secret_ref}"))
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_oauth2_resolves_secret_ref_client_secret() {
+        let resolver: Arc<dyn SecretResolver> = Arc::new(StubResolver);
+        let auth = AuthConfig::OAuth2ClientCredentials {
+            token_url: "https://c.example.com/token".to_string(),
+            client_id: ConfigValue::literal("svc-client"),
+            client_secret: ConfigValue::SecretRef {
+                secret_ref: "vault://cs".to_string(),
+            },
+            scope: Some("session:role:ANALYST".to_string()),
+            audience: None,
+        };
+        let hydrated = auth.hydrate(Some(&resolver)).await.unwrap();
+        match hydrated {
+            AuthConfig::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                scope,
+                ..
+            } => {
+                // client_id (no ref) untouched; client_secret ref resolved.
+                assert_eq!(client_id.resolve().unwrap(), "svc-client");
+                assert_eq!(client_secret.resolve().unwrap(), "resolved:vault://cs");
+                assert_eq!(scope, Some("session:role:ANALYST".to_string()));
+            }
+            _ => panic!("expected OAuth2 auth"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrate_bearer_secret_ref_without_resolver_fails_closed() {
+        let auth = AuthConfig::Bearer {
+            token: ConfigValue::SecretRef {
+                secret_ref: "vault://tok".to_string(),
+            },
+        };
+        assert!(auth.hydrate(None).await.is_err());
     }
 }

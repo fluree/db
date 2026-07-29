@@ -34,6 +34,9 @@ pub enum Tag {
     Aggregate,
     Count,
     GroupBy,
+    /// A GROUP BY whose keys span BOTH the fact table and a joined dimension
+    /// (W4-2: fused mixed fact+dim group-key resolution).
+    MixedGroupKeys,
     Having,
     OrderBy,
     Distinct,
@@ -123,6 +126,23 @@ pub enum HashGate {
     RowsOnly,
 }
 
+/// Which engine entry point a corpus query is executed through.
+///
+/// `Graph` (the default) runs `fluree.graph(alias).query()…` — a single graph
+/// source targeted directly. `From` runs `fluree.query_from().sparql(…)` where
+/// the query text itself carries a `FROM <graph-source>` clause — the deployed
+/// solo chat shape (a `FROM <ledger>` dataset query through `DatasetOperator`).
+/// The `From` members gate the C1 dataset-path budget forwarding AND the C5
+/// dataset-path fused-aggregate admission together (the pre-existing corpus is
+/// GRAPH-wrapped only). Absent ⇒ `Graph`, so existing entries need no edit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecPath {
+    #[default]
+    Graph,
+    From,
+}
+
 /// Expected row count: an exact value or an inclusive `[min, max]` range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -175,6 +195,9 @@ pub struct QueryDef {
     /// How native-vs-virtual parity is gated. Absent ⇒ `Full` (exact hash).
     #[serde(default)]
     pub hash_gate: HashGate,
+    /// Which engine entry point runs this query. Absent ⇒ `Graph`.
+    #[serde(default)]
+    pub exec_path: ExecPath,
 }
 
 impl QueryDef {
@@ -315,8 +338,14 @@ mod tests {
         let corpus = Corpus::load(&dir).expect("shipped corpus must validate");
         assert_eq!(
             corpus.queries.len(),
-            59,
-            "full corpus: 54 design queries (Q01-Q54) + the 5 exploration family (q055-q059)"
+            68,
+            "full corpus: 54 design queries (Q01-Q54) + 5 exploration (q055-q059) + \
+             4 C5 dataset-path members (q060 family-A, q061 family-B over-count trap, \
+             q062 family-C fact-dim SUM, q063 family-A ORDER BY/OFFSET) + \
+             1 E1 shared-predicate member (q064 Product-by-category) + \
+             1 E2 join+flag member (q065 orders-by-current-customer-segment) + \
+             2 W4-2 mixed fact+dim group-key members (q066 COUNT, q067 COUNT+intSUM) + \
+             1 W4-1b folded-crawl sentinel (q068 orderline detail crawl)"
         );
         // The smoke subset is a cheap, dims-heavy cover of every feature tag.
         let smoke = corpus.select(Some("smoke"));
@@ -335,8 +364,9 @@ mod tests {
             .collect();
         assert_eq!(
             smoke_tags.len(),
-            22,
-            "smoke must exercise all 22 feature tags (20 design + wildcard + exploration)"
+            23,
+            "smoke must exercise all 23 feature tags \
+             (20 design + wildcard + exploration + mixed_group_keys)"
         );
     }
 
@@ -421,6 +451,10 @@ mod tests {
             // rr:predicate + rdf:type) > the LIMIT 100, making the 100-subset
             // nondeterministic — empirically the sole parity failure in the run.
             "q055", "q057",
+            // W4-1b folded-crawl sentinel: `?ol ?p ?o` LIMIT 200 truncates the
+            // unordered (p,o) set of the key-constrained subject's crawl —
+            // rows-only for the same LIMIT-nondeterminism reason.
+            "q068",
         ]
         .into_iter()
         .collect();
@@ -459,6 +493,7 @@ mod tests {
             subsets: vec!["smoke".to_string()],
             expected_status: ExpectedStatus::default(),
             hash_gate: HashGate::default(),
+            exec_path: ExecPath::default(),
         };
         let corpus = Corpus {
             dir: Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus"),
