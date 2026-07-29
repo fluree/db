@@ -563,8 +563,7 @@ impl R2rmlScanOperator {
     /// — the production build calls THIS fn, so the test exercises the real
     /// admission, not a copy.
     fn ref_template_shortcut_enabled(trust_fk_refs: bool, pattern: &R2rmlPattern) -> bool {
-        let star_free =
-            pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
+        let star_free = pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
         trust_fk_refs
             && (star_free || Self::folded_wildcard_all_scalar(pattern))
             && pattern.predicate_filter.is_none()
@@ -833,17 +832,15 @@ impl R2rmlScanOperator {
         // WILDCARD emits per-(p,o) across co-subject maps, so a map lacking the
         // folded constraint predicate can still contribute rows — pruning it would
         // drop those rows for vertically-partitioned subjects (F10-class mappings).
-        let star_required_preds: Vec<String> = if star_prune_on
-            && self.pattern.predicate_var.is_none()
-            && self.has_star_members()
-        {
-            self.pattern_predicates()
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let star_required_preds: Vec<String> =
+            if star_prune_on && self.pattern.predicate_var.is_none() && self.has_star_members() {
+                self.pattern_predicates()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         // PR-3 fix (b'): resolution-only class prune (template-disjoint; see
         // `R2rmlPattern::class_prune_hint`). Gated by the same switch as fix (a).
         let prune_class: Option<String> = if star_prune_on {
@@ -3607,12 +3604,7 @@ mod tests {
     #[test]
     fn f16_folded_wildcard_all_scalar_gate() {
         use crate::r2rml::{ObjectConstant, ScanValue};
-        let scalar = |p: &str| {
-            (
-                p.to_string(),
-                ObjectConstant::Scalar(ScanValue::Int(7)),
-            )
-        };
+        let scalar = |p: &str| (p.to_string(), ObjectConstant::Scalar(ScanValue::Int(7)));
         let iri = |p: &str| {
             (
                 p.to_string(),
@@ -3633,8 +3625,7 @@ mod tests {
 
         // Mixed scalar + IRI → disqualified (every constraint must be scalar).
         let mut mixed = pass.clone();
-        mixed.star_constraints =
-            vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
+        mixed.star_constraints = vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
         assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&mixed));
 
         // Fixed-predicate star member present → not the crawl fold.
@@ -3667,8 +3658,8 @@ mod tests {
         use crate::r2rml::{ObjectConstant, ScanValue};
         // The ref side: single-column templated FK — shortcut-eligible (the
         // deployed `edw:order` → FactOrder shape).
-        let parent =
-            TriplesMap::new("#Order", "FACT_ORDER").with_subject_template("http://ex/order/{ORDER_KEY}");
+        let parent = TriplesMap::new("#Order", "FACT_ORDER")
+            .with_subject_template("http://ex/order/{ORDER_KEY}");
         let rom = RefObjectMap::new("#Order", "ORDER_KEY", "ORDER_KEY");
         assert!(
             build_ref_shortcut(&parent, &rom).is_some(),
@@ -3683,7 +3674,9 @@ mod tests {
             "http://ex/lineNumber".to_string(),
             ObjectConstant::Scalar(ScanValue::Int(1)),
         )];
-        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(true, &folded));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &folded
+        ));
 
         // Iri-folded → admission false (sound parent-scan path; catch #11).
         let mut iri_folded = folded.clone();
@@ -3705,7 +3698,9 @@ mod tests {
         // unchanged by the F-16 amendment).
         let plain =
             R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
-        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(true, &plain));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &plain
+        ));
 
         // Fixed-predicate star + trust ON → admission false (star shapes keep
         // parent-scan + dangling-FK semantics; unchanged).
@@ -3714,7 +3709,9 @@ mod tests {
             "http://ex/lineNumber".to_string(),
             ObjectConstant::Scalar(ScanValue::Int(1)),
         )];
-        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(true, &star));
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &star
+        ));
     }
 
     /// A templated (non-constant) predicate binds `?p` from the row when the
