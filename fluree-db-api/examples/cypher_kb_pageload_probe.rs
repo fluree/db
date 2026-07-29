@@ -54,16 +54,16 @@ fn kb_node(i: usize, nodes: usize, classes: usize, rel_types: usize) -> serde_js
         "kind": "uri",
     });
     let obj = node.as_object_mut().unwrap();
-    if i % 3 != 0 {
+    if !i.is_multiple_of(3) {
         obj.insert("type".into(), json!("concept"));
     }
-    if i % 2 == 0 {
+    if i.is_multiple_of(2) {
         obj.insert("lang".into(), json!("en"));
     }
     let edge_count = if i % 5 < 3 { 3 } else { 2 };
     for e in 0..edge_count {
         let target = ((i as u64 + e as u64 + 1).wrapping_mul(2_654_435_761)) % nodes as u64;
-        let k = ((i * 31 + e * 7) % rel_types).max(0);
+        let k = (i * 31 + e * 7) % rel_types;
         let pred = rel_pred(k);
         obj.insert(
             pred.clone(),
@@ -73,7 +73,7 @@ fn kb_node(i: usize, nodes: usize, classes: usize, rel_types: usize) -> serde_js
             }),
         );
     }
-    if i % 40 == 0 {
+    if i.is_multiple_of(40) {
         let pred = "http://kb.example/rel/inScheme".to_string();
         obj.insert(
             pred.clone(),
