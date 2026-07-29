@@ -29,7 +29,7 @@ use fluree_graph_ir::{
 use fluree_graph_turtle::{ParserOptions, TurtleError};
 use input::RdfInput;
 use std::time::Duration;
-use syntax::Resolved;
+use syntax::{RdfSyntax, Resolved};
 
 /// Dispatch an `rdf` subcommand.
 pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
@@ -278,10 +278,11 @@ pub struct ParseOutcome {
 /// `fluree rdf count` would disagree with every other tool in the field.
 pub fn parse_document(
     text: &str,
+    syntax: RdfSyntax,
     base: Option<&str>,
     timings: &mut PhaseTimings,
 ) -> CliResult<ParseOutcome> {
-    let run = parse_into(text, base, DiscardSink::new(), timings);
+    let run = parse_into(text, syntax, base, DiscardSink::new(), timings);
     // A sink failure is the pipeline's problem, not the document's — a broken
     // pipe or a full disk must not be reported as a syntax error. The discard
     // sink has none, but the shared path can.
@@ -338,6 +339,7 @@ pub struct ParseRun<S> {
 /// list item is a Fluree storage shape with no RDF serialization.
 pub fn parse_into<S: GraphSink>(
     text: &str,
+    syntax: RdfSyntax,
     base: Option<&str>,
     sink: S,
     timings: &mut PhaseTimings,
@@ -348,13 +350,34 @@ pub fn parse_into<S: GraphSink>(
     let mut sink = TimingSink::with_corpus(sink, text.as_bytes());
 
     timings.enter(Phase::Parse);
-    let result = fluree_graph_turtle::parse_with_prefixes_base_options(
-        text,
-        &mut sink,
-        &[],
-        base,
-        ParserOptions::conformant(),
-    );
+    // Four readers, one shape. The two line formats go through the STRICT
+    // scanner rather than the Turtle parser: they are not Turtle subsets to a
+    // reader, they are grammars defined by what they refuse, and reading them
+    // with the Turtle parser would accept documents `fluree rdf check` is
+    // being asked to reject.
+    //
+    // `base` is deliberately not threaded into the line formats: N-Triples
+    // and N-Quads have no base and no relative IRIs, so there is nothing for
+    // it to apply to. A `--base` passed alongside one of them is inert, not
+    // silently mis-applied.
+    let result = match syntax {
+        RdfSyntax::NTriples => fluree_graph_turtle::parse_ntriples(text, &mut sink),
+        RdfSyntax::NQuads => fluree_graph_turtle::parse_nquads(text, &mut sink),
+        RdfSyntax::TriG => fluree_graph_turtle::parse_with_prefixes_base_options(
+            text,
+            &mut sink,
+            &[],
+            base,
+            ParserOptions::conformant().with_dialect(fluree_graph_turtle::Dialect::TriG),
+        ),
+        _ => fluree_graph_turtle::parse_with_prefixes_base_options(
+            text,
+            &mut sink,
+            &[],
+            base,
+            ParserOptions::conformant(),
+        ),
+    };
     // `finish` is the owner's call, and the owner is here. The writers latch
     // their failures precisely so this call sees one that had no earlier
     // return value to ride out on.
@@ -424,7 +447,7 @@ mod tests {
     use super::*;
 
     fn parse(doc: &str) -> ParseOutcome {
-        parse_document(doc, None, &mut PhaseTimings::start()).unwrap()
+        parse_document(doc, RdfSyntax::Turtle, None, &mut PhaseTimings::start()).unwrap()
     }
 
     fn args_with(input: Option<&str>, profile: Option<profile::ProfileFormat>) -> RdfCommonArgs {
@@ -549,8 +572,13 @@ mod tests {
     #[test]
     fn a_base_iri_resolves_relative_references() {
         let mut timings = PhaseTimings::start();
-        let out =
-            parse_document("<a> <b> <c> .\n", Some("http://example.org/"), &mut timings).unwrap();
+        let out = parse_document(
+            "<a> <b> <c> .\n",
+            RdfSyntax::Turtle,
+            Some("http://example.org/"),
+            &mut timings,
+        )
+        .unwrap();
         assert!(out.error.is_none(), "{:?}", out.error);
         assert_eq!(out.counts.triples, 1);
 
@@ -563,7 +591,7 @@ mod tests {
     fn parsing_charges_its_time_to_the_parse_phase_only() {
         let mut timings = PhaseTimings::start();
         let doc = "<http://e/s> <http://e/p> \"o\" .\n".repeat(200);
-        parse_document(&doc, None, &mut timings).unwrap();
+        parse_document(&doc, RdfSyntax::Turtle, None, &mut timings).unwrap();
         assert!(timings.elapsed(Phase::Parse) > Duration::ZERO);
         assert_eq!(timings.elapsed(Phase::Read), Duration::ZERO);
         assert_eq!(timings.elapsed(Phase::Decompress), Duration::ZERO);

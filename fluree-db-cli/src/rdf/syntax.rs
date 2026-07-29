@@ -103,13 +103,16 @@ impl RdfSyntax {
 
     /// Whether a reader exists for this syntax today.
     ///
-    /// Turtle and N-Triples share one parser: N-Triples is a proper subset of
-    /// the Turtle grammar, so reading it is not an approximation.
+    /// Four readers, not one grammar wearing four hats. Turtle and TriG share
+    /// the token-level parser (TriG is Turtle plus graph blocks); N-Triples
+    /// and N-Quads go through the STRICT line scanner, which is a separate
+    /// reader on purpose — those grammars are defined by what they refuse,
+    /// and reading them with the Turtle parser would accept documents this
+    /// CLI is being asked to reject.
     pub fn read_support(self) -> ReadSupport {
         match self {
-            RdfSyntax::Turtle | RdfSyntax::NTriples => ReadSupport::Yes,
-            RdfSyntax::NQuads | RdfSyntax::TriG => {
-                ReadSupport::NotYet("streaming quad readers land with dataset support")
+            RdfSyntax::Turtle | RdfSyntax::NTriples | RdfSyntax::NQuads | RdfSyntax::TriG => {
+                ReadSupport::Yes
             }
             RdfSyntax::JsonLd => ReadSupport::NotYet(
                 "JSON-LD is read by `fluree insert`, but not yet on the rdf conversion path",
@@ -127,7 +130,8 @@ impl RdfSyntax {
         match self.read_support() {
             ReadSupport::Yes => Ok(()),
             ReadSupport::NotYet(why) => Err(CliError::Usage(format!(
-                "cannot read {} input yet — {why}\n  {} readable today: turtle, ntriples",
+                "cannot read {} input yet — {why}\n  {} readable today: turtle, ntriples, \
+                 nquads, trig",
                 self.as_str(),
                 colored::Colorize::bold(colored::Colorize::cyan("help:")),
             ))),
@@ -593,14 +597,25 @@ mod tests {
     }
 
     #[test]
-    fn turtle_and_ntriples_are_the_readable_pair() {
-        // N-Triples is a Turtle subset, so one parser covers both. If this
-        // ever stops being true the resolver has to route them separately.
+    fn the_four_text_formats_are_readable() {
+        // Was "turtle and ntriples are the readable pair", back when
+        // N-Triples was read as a Turtle subset by the same parser. It is not
+        // any more: the line formats go through the strict scanner, which is
+        // what makes their negative-syntax tests meaningful, and TriG shares
+        // the token-level parser with Turtle. Two readers, four formats.
         let readable: Vec<RdfSyntax> = RdfSyntax::ALL
             .into_iter()
             .filter(|s| s.read_support() == ReadSupport::Yes)
             .collect();
-        assert_eq!(readable, vec![RdfSyntax::Turtle, RdfSyntax::NTriples]);
+        assert_eq!(
+            readable,
+            vec![
+                RdfSyntax::Turtle,
+                RdfSyntax::NTriples,
+                RdfSyntax::NQuads,
+                RdfSyntax::TriG
+            ]
+        );
     }
 
     #[test]

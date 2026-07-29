@@ -97,7 +97,13 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     let destination::Destination { out, clock } = destination::open(args.output, target)?;
     let writer = AnyWriter::new(target, out, &config, &prefixes)?;
 
-    let run = rdf::parse_into(&loaded.text, common.base.as_deref(), writer, &mut timings);
+    let run = rdf::parse_into(
+        &loaded.text,
+        loaded.resolved.syntax,
+        common.base.as_deref(),
+        writer,
+        &mut timings,
+    );
     let stats = run.sink.stats();
 
     // Flush before reporting anything, and through a handle that can return

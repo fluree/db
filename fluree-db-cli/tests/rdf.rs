@@ -349,15 +349,70 @@ fn an_explicit_syntax_overrides_a_misleading_extension() {
 
 #[test]
 fn a_syntax_with_no_reader_is_refused_by_name_with_what_it_waits_on() {
+    // Was `.trig`, which is readable now. RDF/XML is the current example of a
+    // syntax the resolver can NAME but not read — the distinction this test
+    // exists to protect, since "unknown syntax" and "known but unreadable"
+    // want different messages.
     let tmp = TempDir::new().unwrap();
-    let path = fixture(&tmp, "data.trig", VALID_TURTLE);
+    let path = fixture(&tmp, "data.rdf", VALID_TURTLE);
     rdf_cmd()
         .args(["rdf", "count"])
         .arg(&path)
         .assert()
         .code(EXIT_USAGE)
-        .stderr(predicate::str::contains("trig"))
+        .stderr(predicate::str::contains("rdfxml"))
         .stderr(predicate::str::contains("turtle, ntriples"));
+}
+
+/// The quad round trip, end to end through the binary: TriG in, N-Quads out,
+/// TriG back. Both directions are REAL readers now — before this the `.nq`
+/// leg could only be hand-fed, so nothing proved the two formats agreed.
+#[test]
+fn a_dataset_round_trips_through_trig_and_nquads() {
+    let tmp = TempDir::new().unwrap();
+    let src = fixture(
+        &tmp,
+        "in.trig",
+        "@prefix : <http://ex/> .\n\
+         :s :p :o .\n\
+         GRAPH :g { :a :b :c . :d :e \"lit\"@en }\n\
+         :g2 { :x :y :z }\n",
+    );
+    let nq = tmp.path().join("mid.nq");
+    let back = tmp.path().join("back.trig");
+
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&nq)
+        .assert()
+        .success();
+
+    let quads = std::fs::read_to_string(&nq).unwrap();
+    assert_eq!(quads.lines().filter(|l| !l.trim().is_empty()).count(), 4);
+    // The graph names survive as the fourth term — the property the whole
+    // dataset path exists for.
+    assert!(quads.contains("<http://ex/c> <http://ex/g> ."), "{quads}");
+    assert!(quads.contains("<http://ex/z> <http://ex/g2> ."), "{quads}");
+    // A default-graph statement has exactly three terms.
+    assert!(
+        quads.contains("<http://ex/s> <http://ex/p> <http://ex/o> .\n"),
+        "{quads}"
+    );
+
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&nq)
+        .arg("-o")
+        .arg(&back)
+        .assert()
+        .success();
+
+    let trig = std::fs::read_to_string(&back).unwrap();
+    assert!(trig.contains("GRAPH <http://ex/g> {"), "{trig}");
+    assert!(trig.contains("GRAPH <http://ex/g2> {"), "{trig}");
+    assert!(trig.contains("\"lit\"@en"), "{trig}");
 }
 
 #[test]
