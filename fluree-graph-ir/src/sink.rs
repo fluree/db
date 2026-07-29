@@ -444,9 +444,19 @@ impl GraphSink for GraphCollectorSink {
                 id
             }
             None => {
-                // Generate a fresh blank node ID
+                // Anonymous blank node (`[ … ]`, collection spine nodes,
+                // reifiers) — unique counter-based label. The leading '-'
+                // keeps the minted namespace disjoint from every
+                // user-written label: Turtle's BLANK_NODE_LABEL must start
+                // with PN_CHARS_U | [0-9], so `_:-b1` can never lex, while
+                // '-' stays legal medially so the label still serializes.
+                //
+                // Without it a document's own `_:b1` and the first mint are
+                // the same `BlankId` and their nodes silently MERGE. Matches
+                // `FlakeSink`/`ImportSink`, which carry the same fix for the
+                // same reason.
                 self.blank_counter += 1;
-                let label = format!("b{}", self.blank_counter);
+                let label = format!("-b{}", self.blank_counter);
                 self.add_term(Term::blank(label))
             }
         }
@@ -737,6 +747,31 @@ mod tests {
 
         let rejected = SinkError::rejected("nope");
         assert!(!rejected.is_broken_pipe());
+    }
+
+    /// Minted anonymous labels must live in a namespace no user-written
+    /// label can occupy. Turtle's BLANK_NODE_LABEL starts with
+    /// PN_CHARS_U | [0-9], so a leading '-' is unlexable and therefore safe;
+    /// a bare `b{N}` mint collides with a document's own `_:b1` and the two
+    /// nodes MERGE.
+    #[test]
+    fn anonymous_mints_are_disjoint_from_user_written_labels() {
+        let mut sink = GraphCollectorSink::new();
+        let user = sink.term_blank(Some("b1"));
+        let minted = sink.term_blank(None);
+        assert_ne!(user, minted);
+
+        let label_of = |sink: &GraphCollectorSink, id: TermId| match sink.get_term(id) {
+            Term::BlankNode(b) => b.as_str().to_string(),
+            other => panic!("expected blank, got {other:?}"),
+        };
+        assert_eq!(label_of(&sink, user), "b1");
+        let minted_label = label_of(&sink, minted);
+        assert_eq!(minted_label, "-b1");
+        assert!(
+            !minted_label.starts_with(|c: char| c.is_alphanumeric() || c == '_'),
+            "a mint that can lex as BLANK_NODE_LABEL can collide: {minted_label}"
+        );
     }
 
     // =====================================================================

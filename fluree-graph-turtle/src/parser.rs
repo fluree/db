@@ -2238,6 +2238,72 @@ mod tests {
     }
 
     // =========================================================================
+    // Blank-node namespace disjointness
+    // =========================================================================
+
+    /// User-written labels and parser-minted anonymous nodes must never
+    /// collide. An isomorphism check structurally CANNOT catch this: merged
+    /// nodes are isomorphic to themselves, so the merged graph looks
+    /// well-formed. Only counting distinct identities finds it.
+    ///
+    /// Spine mode makes it systematic — every collection mints spine nodes —
+    /// but `[ … ]` and reifiers hit the same mint, so this guards all of them.
+    #[test]
+    fn minted_blanks_never_collide_with_user_written_labels() {
+        // `_:b1`/`_:b2` are exactly what a naive `b{N}` counter mints.
+        let doc = r#"
+            @prefix ex: <http://example.org/> .
+            _:b1 ex:p "user-one" .
+            _:b2 ex:p "user-two" .
+            ex:s ex:list ( ex:a ex:b ) .
+            ex:t ex:has [ ex:q "anon" ] .
+        "#;
+
+        for (mode, options) in [
+            ("spine", ParserOptions::conformant()),
+            ("default", ParserOptions::default()),
+        ] {
+            let mut sink = GraphCollectorSink::new();
+            parse_with_options(doc, &mut sink, options).expect("parses");
+            let graph = sink.into_graph();
+
+            // Each user label must own exactly the one triple written for it.
+            for (label, object) in [("b1", "user-one"), ("b2", "user-two")] {
+                let owned: Vec<String> = graph
+                    .iter()
+                    .filter(|t| matches!(&t.s, Term::BlankNode(b) if b.as_str() == label))
+                    .map(|t| format!("{} {} {}", t.s, t.p, t.o))
+                    .collect();
+                assert_eq!(
+                    owned.len(),
+                    1,
+                    "[{mode}] _:{label} must own only its own triple; extra triples mean a \
+                     minted node merged into it: {owned:#?}"
+                );
+                assert!(owned[0].contains(object), "[{mode}] {owned:?}");
+            }
+
+            // And no minted label may be lexable as a user label, which is
+            // what makes the disjointness structural rather than lucky.
+            let minted: Vec<String> = graph
+                .iter()
+                .flat_map(|t| [&t.s, &t.o])
+                .filter_map(|t| match t {
+                    Term::BlankNode(b) => Some(b.as_str().to_string()),
+                    _ => None,
+                })
+                .filter(|l| l != "b1" && l != "b2")
+                .collect();
+            for label in &minted {
+                assert!(
+                    label.starts_with('-'),
+                    "[{mode}] minted label {label} can lex as BLANK_NODE_LABEL and so can collide"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
     // ParserOptions — collection + numeric conformance
     // =========================================================================
     //
