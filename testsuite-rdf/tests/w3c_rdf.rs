@@ -13,8 +13,8 @@
 
 use anyhow::Result;
 use testsuite_rdf::{
-    check_testsuite, report_testsuite, ParseMode, RDF11_NTRIPLES, RDF11_TURTLE, RDF12_NTRIPLES,
-    RDF12_TURTLE,
+    check_testsuite, report_testsuite, ParseMode, RDF11_NTRIPLES, RDF11_TRIG, RDF11_TURTLE,
+    RDF12_NTRIPLES, RDF12_TURTLE,
 };
 
 mod registers;
@@ -37,6 +37,13 @@ fn rdf11_turtle_conformant() -> Result<()> {
 #[test]
 fn rdf11_ntriples_conformant() -> Result<()> {
     check_testsuite(&RDF11_NTRIPLES, ParseMode::Conformant, reg::RDF11_NTRIPLES)
+}
+
+/// RDF 1.1 TriG: positive/negative syntax gate; eval is registered pending an
+/// N-Quads reader.
+#[test]
+fn rdf11_trig_conformant() -> Result<()> {
+    check_testsuite(&RDF11_TRIG, ParseMode::Conformant, reg::RDF11_TRIG)
 }
 
 // =============================================================================

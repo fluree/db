@@ -112,6 +112,17 @@ pub const RDF11_NTRIPLES: Suite = Suite {
     expected_total: 70,
 };
 
+/// RDF 1.1 TriG.
+///
+/// Syntax tests gate; the 147 eval tests are registered pending an N-Quads
+/// reader, since they compare against `.nq` gold files.
+pub const RDF11_TRIG: Suite = Suite {
+    format: "trig",
+    spec: "rdf11",
+    manifests: &["https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl"],
+    expected_total: 356,
+};
+
 /// RDF 1.2 Turtle — informational (asserting subset only), RDF 1.2 tests only.
 pub const RDF12_TURTLE: Suite = Suite {
     format: "turtle",

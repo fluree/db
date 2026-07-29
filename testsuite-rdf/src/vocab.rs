@@ -40,6 +40,12 @@ pub mod rdft {
         "http://www.w3.org/ns/rdftest#TestNTriplesPositiveSyntax";
     pub const NTRIPLES_NEGATIVE_SYNTAX: &str =
         "http://www.w3.org/ns/rdftest#TestNTriplesNegativeSyntax";
+    // TriG
+    pub const TRIG_POSITIVE_SYNTAX: &str = "http://www.w3.org/ns/rdftest#TestTrigPositiveSyntax";
+    pub const TRIG_NEGATIVE_SYNTAX: &str = "http://www.w3.org/ns/rdftest#TestTrigNegativeSyntax";
+    pub const TRIG_EVAL: &str = "http://www.w3.org/ns/rdftest#TestTrigEval";
+    pub const TRIG_NEGATIVE_EVAL: &str = "http://www.w3.org/ns/rdftest#TestTrigNegativeEval";
+
     /// RDF 1.2 canonicalization test: parse, serialize in canonical N-Triples,
     /// compare to the gold file byte-for-byte. No canonical writer exists yet.
     pub const NTRIPLES_POSITIVE_C14N: &str =

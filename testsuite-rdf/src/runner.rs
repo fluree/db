@@ -1,8 +1,9 @@
 //! Executing a single W3C RDF syntax test.
 
 use anyhow::{anyhow, bail, Result};
+use fluree_graph_ir::DatasetCollectorSink;
 use fluree_graph_ir::{GraphCollectorSink, Triple};
-use fluree_graph_turtle::{parse_with_prefixes_base_options, ParserOptions};
+use fluree_graph_turtle::{parse_with_prefixes_base_options, Dialect, ParserOptions};
 
 use crate::files::read_file_to_string;
 use crate::isomorphism::are_graphs_isomorphic;
@@ -47,6 +48,30 @@ pub type TestOutcome = Result<()>;
 /// ignored a whole test class would report a green pass rate over a
 /// denominator that quietly shrank.
 pub fn run_test(test: &Test, mode: ParseMode) -> TestOutcome {
+    if test.is_kind(rdft::TRIG_POSITIVE_SYNTAX) {
+        let action = test
+            .action
+            .as_deref()
+            .ok_or_else(|| anyhow!("positive syntax test has no mf:action"))?;
+        return parse_trig_document(action, test.base.as_deref())
+            .map_err(|e| anyhow!("expected the document to parse, but it was rejected: {e:#}"));
+    }
+    if test.is_kind(rdft::TRIG_NEGATIVE_SYNTAX) {
+        let action = test
+            .action
+            .as_deref()
+            .ok_or_else(|| anyhow!("negative syntax test has no mf:action"))?;
+        return match parse_trig_document(action, test.base.as_deref()) {
+            Ok(()) => bail!("expected the document to be REJECTED, but it parsed"),
+            Err(_) => Ok(()),
+        };
+    }
+    if test.is_kind(rdft::TRIG_EVAL) || test.is_kind(rdft::TRIG_NEGATIVE_EVAL) {
+        bail!(
+            "TriG eval compares against an N-Quads gold file, and no N-Quads \
+             reader exists yet — the TriG parser is not what is missing here"
+        );
+    }
     if test.is_kind(rdft::TURTLE_POSITIVE_SYNTAX) || test.is_kind(rdft::NTRIPLES_POSITIVE_SYNTAX) {
         return positive_syntax(test, mode);
     }
@@ -77,6 +102,25 @@ pub fn run_test(test: &Test, mode: ParseMode) -> TestOutcome {
 }
 
 /// Parse a document, returning its triples.
+/// Parse a TriG document into a dataset, discarding it — syntax tests only
+/// ask whether it parses.
+///
+/// A dataset sink is required, not incidental: named graphs are refused
+/// against a triple-only sink, so parsing TriG into `GraphCollectorSink`
+/// would report every named-graph document as a syntax error.
+fn parse_trig_document(url: &str, base: Option<&str>) -> Result<()> {
+    let content = read_file_to_string(url)?;
+    let mut sink = DatasetCollectorSink::new();
+    parse_with_prefixes_base_options(
+        &content,
+        &mut sink,
+        &[],
+        base,
+        ParserOptions::conformant().with_dialect(Dialect::TriG),
+    )?;
+    Ok(())
+}
+
 fn parse_document(url: &str, base: Option<&str>, mode: ParseMode) -> Result<Vec<Triple>> {
     let content = read_file_to_string(url)?;
     let mut sink = GraphCollectorSink::new();

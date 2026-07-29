@@ -72,6 +72,27 @@ pub enum NumericStyle {
     PreserveLexical,
 }
 
+/// Which grammar the parser accepts.
+///
+/// TriG is Turtle plus named-graph blocks, sharing one lexer and one set of
+/// term/statement productions — so it is a mode of the same parser rather
+/// than a fork, for the same reason [`CollectionStyle`] is: one grammar, one
+/// conformance surface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Dialect {
+    /// Turtle. A `{` or a `GRAPH` keyword is a syntax error.
+    #[default]
+    Turtle,
+    /// TriG: `GRAPH label { … }`, bare `label { … }`, and bare `{ … }`
+    /// default-graph blocks, alongside ordinary Turtle statements.
+    ///
+    /// Named-graph output requires a quad-capable sink
+    /// ([`GraphSink::supports_quads`](fluree_graph_ir::GraphSink::supports_quads));
+    /// the parser refuses named graphs against a triple-only sink rather than
+    /// folding them into the default graph.
+    TriG,
+}
+
 /// Conformance knobs for the Turtle parser.
 ///
 /// The default is today's ingest behavior in every field; opting in is
@@ -83,6 +104,8 @@ pub struct ParserOptions {
     pub collections: CollectionStyle,
     /// How numeric literals reach the sink.
     pub numerics: NumericStyle,
+    /// Which grammar to accept.
+    pub dialect: Dialect,
 }
 
 impl ParserOptions {
@@ -98,6 +121,7 @@ impl ParserOptions {
         Self {
             collections: CollectionStyle::Spine,
             numerics: NumericStyle::PreserveLexical,
+            dialect: Dialect::Turtle,
         }
     }
 
@@ -110,6 +134,12 @@ impl ParserOptions {
     /// Set the numeric style.
     pub fn with_numerics(mut self, numerics: NumericStyle) -> Self {
         self.numerics = numerics;
+        self
+    }
+
+    /// Set the dialect.
+    pub fn with_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
         self
     }
 }

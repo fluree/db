@@ -42,9 +42,10 @@ pub mod splitter;
 pub use adapter::graph_to_transaction_json;
 pub use error::{Result, TurtleError};
 pub use lex::{tokenize, Lexer, StreamingLexer, Token, TokenKind};
-pub use options::{CollectionStyle, NumericStyle, ParserOptions};
+pub use options::{CollectionStyle, Dialect, NumericStyle, ParserOptions};
 pub use parser::{
-    parse, parse_with_options, parse_with_prefixes_base, parse_with_prefixes_base_options,
+    parse, parse_trig, parse_with_options, parse_with_prefixes_base,
+    parse_with_prefixes_base_options,
 };
 
 use fluree_graph_ir::GraphCollectorSink;
