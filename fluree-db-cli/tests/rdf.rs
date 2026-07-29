@@ -451,16 +451,20 @@ fn every_exit_code_in_the_contract_is_reachable() {
 // ============================================================================
 
 #[test]
-fn convert_refuses_clearly_and_names_the_verbs_that_do_work() {
+fn convert_writes_the_default_syntax_when_nothing_names_one() {
+    // Was the stub's refusal test. The default is N-Quads, matching riot, and
+    // with no `--to` and no output extension that is what should come out.
     let tmp = TempDir::new().unwrap();
     let path = fixture(&tmp, "valid.ttl", VALID_TURTLE);
-    rdf_cmd()
-        .args(["rdf", "convert", "--to", "nquads"])
-        .arg(&path)
-        .assert()
-        .code(EXIT_USAGE)
-        .stderr(predicate::str::contains("no serializers have landed"))
-        .stderr(predicate::str::contains("check"));
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "convert"]).arg(&path);
+    let out = stdout_of(&mut cmd);
+
+    assert_eq!(out.lines().count(), VALID_TURTLE_TRIPLES as usize);
+    for line in out.lines() {
+        assert!(line.ends_with(" ."), "not a line-based syntax: {line}");
+        assert!(line.starts_with('<') || line.starts_with("_:"), "{line}");
+    }
 }
 
 // ============================================================================
@@ -976,4 +980,436 @@ fn no_rdf_verb_requires_a_fluree_directory() {
         cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
         cmd.args(["rdf", verb]).arg(&path).assert().success();
     }
+}
+
+// ============================================================================
+// convert
+// ============================================================================
+
+/// Everything a converter can get wrong in one small document: a typed
+/// literal, a language tag, an escaped literal, a collection (which is only
+/// representable at all under conformant parser options), an anonymous blank
+/// node, and a labelled one.
+const HOSTILE_TURTLE: &str = r#"@prefix ex: <http://example.org/> .
+ex:alice ex:name "Alice" ; ex:age 30 ; ex:knows ex:bob .
+ex:bob ex:name "Bob"@en ; ex:tags ( "x" "y" ) ; ex:note "quote \" and \\ and \n newline" .
+ex:empty ex:list () .
+[] ex:anon "yes" .
+_:named ex:label "kept" .
+"#;
+
+/// N-Triples lines, sorted.
+///
+/// A stronger comparison than isomorphism, and deliberately so: blank-node
+/// relabelling is a bijection assigned in document order, and the blocks-tier
+/// Turtle writer preserves document order, so labels are stable across a
+/// round trip. If that ever stops being true this test should say so rather
+/// than paper over it with a bnode-blind comparison.
+fn canonical_lines(nt: &str) -> Vec<String> {
+    let mut lines: Vec<String> = nt
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+fn convert_to_string(path: &Path, to: &str) -> String {
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "convert"]).arg(path).args(["--to", to]);
+    stdout_of(&mut cmd)
+}
+
+#[test]
+fn every_supported_format_pair_converts() {
+    // {ttl, nt} in × {ttl, nt, nq, trig, jsonld} out. Each cell has to
+    // produce output in the syntax it names, from a document that exercises
+    // literals, language tags, collections and both kinds of blank node.
+    let tmp = TempDir::new().unwrap();
+    let ttl = fixture(&tmp, "hostile.ttl", HOSTILE_TURTLE);
+    let nt = fixture(&tmp, "hostile.nt", &convert_to_string(&ttl, "nt"));
+
+    for input in [&ttl, &nt] {
+        for to in ["ttl", "nt", "nq", "trig", "jsonld"] {
+            let out = convert_to_string(input, to);
+            assert!(
+                !out.trim().is_empty(),
+                "{} → {to} produced nothing",
+                input.display()
+            );
+            let shaped_right = match to {
+                "jsonld" => out.trim_start().starts_with('{'),
+                "ttl" | "trig" => out.contains("@prefix") || out.contains('<'),
+                _ => out.starts_with('<') || out.starts_with("_:"),
+            };
+            assert!(shaped_right, "{to} output is not {to}: {out}");
+            // Whatever the syntax, the payload survived.
+            assert!(out.contains("Alice"), "{to} lost a literal: {out}");
+        }
+    }
+}
+
+#[test]
+fn convert_parses_in_conformant_mode_never_the_ingest_default() {
+    // MANDATED, and not a preference: under the ingest options a collection
+    // arrives as indexed list items, which every writer refuses because an
+    // indexed list item is a Fluree storage shape with no RDF serialization.
+    // So this pins the observable consequence — the rdf:first/rdf:rest spine
+    // W3C says a collection is, and rdf:nil for the empty one.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "lists.ttl", HOSTILE_TURTLE);
+    let nt = convert_to_string(&path, "nt");
+
+    assert!(
+        nt.contains("22-rdf-syntax-ns#first"),
+        "no rdf:first — collections did not arrive as a spine:\n{nt}"
+    );
+    assert!(nt.contains("22-rdf-syntax-ns#rest"), "{nt}");
+    assert!(
+        nt.contains("22-rdf-syntax-ns#nil"),
+        "no rdf:nil — the empty collection was dropped, which is what the \
+         ingest options do:\n{nt}"
+    );
+    // Three spine triples for a two-item list, plus nil for the empty one.
+    let firsts = nt.matches("22-rdf-syntax-ns#first").count();
+    assert_eq!(firsts, 2, "one rdf:first per list item:\n{nt}");
+}
+
+#[test]
+fn a_turtle_round_trip_preserves_the_graph() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "hostile.ttl", HOSTILE_TURTLE);
+
+    let direct = convert_to_string(&path, "nt");
+    let via_turtle = fixture(&tmp, "rt.ttl", &convert_to_string(&path, "ttl"));
+    let round_tripped = convert_to_string(&via_turtle, "nt");
+
+    assert_eq!(
+        canonical_lines(&direct),
+        canonical_lines(&round_tripped),
+        "ttl → ttl → nt disagrees with ttl → nt"
+    );
+}
+
+#[test]
+fn an_ntriples_round_trip_preserves_the_graph() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "hostile.ttl", HOSTILE_TURTLE);
+    let once = fixture(&tmp, "once.nt", &convert_to_string(&path, "nt"));
+    let twice = convert_to_string(&once, "nt");
+
+    assert_eq!(
+        canonical_lines(&std::fs::read_to_string(&once).unwrap()),
+        canonical_lines(&twice),
+        "nt → nt is not a fixed point"
+    );
+}
+
+#[test]
+fn the_output_file_extension_picks_the_syntax_and_the_flag_overrides_it() {
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "in.ttl", VALID_TURTLE);
+
+    let by_ext = tmp.path().join("out.nt");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&by_ext)
+        .assert()
+        .success();
+    assert!(std::fs::read_to_string(&by_ext).unwrap().starts_with('<'));
+
+    // --to wins over an extension that says otherwise.
+    let overridden = tmp.path().join("out2.nt");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&input)
+        .arg("-o")
+        .arg(&overridden)
+        .args(["--to", "turtle"])
+        .assert()
+        .success();
+    assert!(std::fs::read_to_string(&overridden)
+        .unwrap()
+        .contains("@prefix"));
+}
+
+#[test]
+fn convert_reads_stdin_and_a_gzipped_file() {
+    let tmp = TempDir::new().unwrap();
+
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "convert", "--syntax", "turtle", "--to", "nt"])
+        .write_stdin(VALID_TURTLE);
+    let from_stdin = stdout_of(&mut cmd);
+    assert_eq!(from_stdin.lines().count(), VALID_TURTLE_TRIPLES as usize);
+
+    let gz = gz_fixture(&tmp, "in.ttl.gz", VALID_TURTLE);
+    assert_eq!(
+        canonical_lines(&convert_to_string(&gz, "nt")),
+        canonical_lines(&from_stdin)
+    );
+}
+
+#[test]
+fn a_closed_downstream_pipe_ends_the_run_quietly() {
+    // `convert big.ttl | head -1` is a normal way to use the tool. Every
+    // layer reports EPIPE and the right answer to all of them is to stop with
+    // status 0 and say nothing — riot's behaviour.
+    use std::process::{Command as StdCommand, Stdio};
+
+    let tmp = TempDir::new().unwrap();
+    // Long enough that the writer is still producing when `head` exits.
+    let big: String = std::iter::once("@prefix ex: <http://example.org/> .\n".to_string())
+        .chain((0..20_000).map(|i| format!("ex:s{i} ex:name \"person {i}\" .\n")))
+        .collect();
+    let path = fixture(&tmp, "big.ttl", &big);
+
+    let mut convert = StdCommand::new(assert_cmd::cargo::cargo_bin!("fluree"))
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "nt"])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let head = StdCommand::new("head")
+        .arg("-1")
+        .stdin(convert.stdout.take().unwrap())
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+
+    let convert_out = convert.wait_with_output().unwrap();
+    assert_eq!(
+        convert_out.status.code(),
+        Some(0),
+        "a closed pipe is not a failure; stderr was: {}",
+        String::from_utf8_lossy(&convert_out.stderr)
+    );
+    assert!(
+        convert_out.stderr.is_empty(),
+        "and it says nothing on the way out: {}",
+        String::from_utf8_lossy(&convert_out.stderr)
+    );
+    assert_eq!(String::from_utf8(head.stdout).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn converting_a_broken_document_exits_1_and_says_the_output_is_partial() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "nt"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .stderr(predicate::str::contains(
+            "before the document stopped parsing",
+        ))
+        .stderr(predicate::str::contains("prefix of the conversion"));
+}
+
+#[test]
+fn an_output_syntax_with_no_writer_is_refused_by_name() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "rdfxml"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("rdfxml"))
+        .stderr(predicate::str::contains("writable today"));
+}
+
+#[test]
+fn a_compressed_output_name_is_refused_rather_than_written_plain() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .arg("-o")
+        .arg(tmp.path().join("out.nt.gz"))
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("compressed output"));
+}
+
+#[test]
+fn pretty_is_refused_rather_than_silently_ignored() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    // Wrong syntax for it: the flag itself is the complaint.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "nt", "--pretty"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("--pretty applies to turtle"));
+
+    // Right syntax, but not built: say so rather than emit blocks-tier output
+    // under a flag that promised something else.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "turtle", "--pretty"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("not implemented"));
+}
+
+#[test]
+fn the_bnode_policy_flag_changes_which_labels_come_out() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "bnodes.ttl", HOSTILE_TURTLE);
+
+    let relabelled = convert_to_string(&path, "nt");
+    assert!(
+        !relabelled.contains("_:named"),
+        "the default relabels user labels:\n{relabelled}"
+    );
+
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "nt", "--bnode-policy", "preserve"]);
+    let preserved = stdout_of(&mut cmd);
+    assert!(
+        preserved.contains("_:named"),
+        "preserve keeps the user's label:\n{preserved}"
+    );
+}
+
+#[test]
+fn supplied_prefixes_compact_turtle_output() {
+    let tmp = TempDir::new().unwrap();
+    // No @prefix in the input, so any compaction comes from the flag alone.
+    let path = fixture(
+        &tmp,
+        "plain.nt",
+        "<http://example.org/s> <http://example.org/p> \"o\" .\n",
+    );
+
+    let mut cmd = rdf_cmd();
+    cmd.args(["rdf", "convert"]).arg(&path).args([
+        "--to",
+        "turtle",
+        "--prefixes",
+        r#"{"ex": "http://example.org/"}"#,
+    ]);
+    let out = stdout_of(&mut cmd);
+
+    assert!(out.contains("@prefix ex:"), "{out}");
+    assert!(out.contains("ex:s"), "{out}");
+}
+
+#[test]
+fn convert_profile_json_carries_the_serialize_and_write_phases() {
+    let tmp = TempDir::new().unwrap();
+    // Big enough that the sink estimate clears the measurement floor — the
+    // decomposition is derived from it and is absent when it does not.
+    let big: String = std::iter::once("@prefix ex: <http://example.org/> .\n".to_string())
+        .chain(
+            (0..60_000).map(|i| format!("ex:s{i} ex:name \"person {i}\" ; ex:age {} .\n", i % 90)),
+        )
+        .collect();
+    let path = fixture(&tmp, "big.ttl", &big);
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "convert"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&out)
+        .args(["--to", "nt", "--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    assert_eq!(v["verb"], "convert");
+    let phases: Vec<&str> = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["phase"].as_str().unwrap())
+        .collect();
+    assert!(phases.contains(&"write"), "phases: {phases:?}");
+    assert!(phases.contains(&"serialize"), "phases: {phases:?}");
+    // The decomposition supersedes the total; showing both invites a reader
+    // to add the sink to its own parts.
+    assert!(
+        !phases.contains(&"sink"),
+        "the sink row must give way to its decomposition: {phases:?}"
+    );
+    // …and the total is still reported, in the block that carries it.
+    assert!(v["sink"]["body_ns"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn convert_time_reports_the_statements_it_wrote() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    let out = tmp.path().join("out.nt");
+    rdf_cmd()
+        .args(["-q", "rdf", "convert"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&out)
+        .arg("--time")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("triples/s"));
+}
+
+#[test]
+fn a_conversion_to_a_file_reports_what_it_wrote_and_a_pipe_stays_clean() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
+
+    // To a file: a summary is useful.
+    let out = tmp.path().join("out.nt");
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .arg("-o")
+        .arg(&out)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("statements →"));
+
+    // To stdout: the same line would sit beside the data it describes.
+    rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "nt"])
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty());
+}
+
+#[test]
+fn convert_needs_no_fluree_directory_either() {
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "in.ttl", VALID_TURTLE);
+    let mut cmd = rdf_cmd();
+    cmd.current_dir(tmp.path());
+    cmd.env("HOME", tmp.path());
+    cmd.env("FLUREE_HOME", tmp.path().join("nowhere"));
+    cmd.args(["rdf", "convert"])
+        .arg(&path)
+        .args(["--to", "nt"])
+        .assert()
+        .success();
 }

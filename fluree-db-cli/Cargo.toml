@@ -59,6 +59,8 @@ fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 # graph crates rather than going through the ledger API — there is no ledger.
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-turtle = { path = "../fluree-graph-turtle" }
+# `fluree rdf convert`: the streaming writers the verb serializes through.
+fluree-graph-format = { path = "../fluree-graph-format" }
 # `--profile`'s box table. Every dependency of this crate is already in the
 # CLI's graph, so sharing the renderer with the bench lane costs nothing and
 # keeps the two tables comparable by construction.

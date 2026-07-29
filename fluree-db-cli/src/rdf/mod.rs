@@ -13,10 +13,12 @@
 pub mod check;
 pub mod convert;
 pub mod count;
+pub mod destination;
 pub mod diagnostic;
 pub mod input;
 pub mod profile;
 pub mod syntax;
+pub mod writer;
 
 use crate::cli::{RdfAction, RdfCommonArgs};
 use crate::error::{CliError, CliResult, EXIT_ERROR};
@@ -44,7 +46,19 @@ pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
             to,
             output,
             pretty,
-        } => convert::run(common, *to, output.as_deref(), *pretty),
+            bnode_policy,
+            prefixes,
+        } => convert::run(
+            common,
+            &convert::ConvertArgs {
+                to: *to,
+                output: output.as_deref(),
+                pretty: *pretty,
+                bnode_policy: *bnode_policy,
+                prefixes: prefixes.as_deref(),
+            },
+            quiet,
+        ),
         RdfAction::Check { common, format } => check::run(common, *format, quiet),
         RdfAction::Count { common } => count::run(common, quiet),
     }
@@ -256,10 +270,64 @@ pub fn parse_document(
     base: Option<&str>,
     timings: &mut PhaseTimings,
 ) -> CliResult<ParseOutcome> {
+    let run = parse_into(text, base, DiscardSink::new(), timings);
+    // A sink failure is the pipeline's problem, not the document's — a broken
+    // pipe or a full disk must not be reported as a syntax error. The discard
+    // sink has none, but the shared path can.
+    run.finished?;
+    Ok(run.outcome)
+}
+
+/// A finished parse: what happened, the sink it happened into, and whether
+/// the sink itself is in a good state.
+pub struct ParseRun<S> {
+    /// Counts, sink timing, and the parse error if there was one.
+    pub outcome: ParseOutcome,
+    /// The sink, handed back so the caller can read its product and — for
+    /// anything buffering bytes — flush it where a failure can still be
+    /// reported.
+    pub sink: S,
+    /// The sink's `finish()` verdict.
+    ///
+    /// Separate from [`ParseOutcome::error`] because the two mean opposite
+    /// things: a parse error is the document's fault and a finish error is the
+    /// destination's, and a converter that conflates them tells a user their
+    /// RDF is broken when their disk is full.
+    pub finished: CliResult<()>,
+}
+
+/// Parse a Turtle-family document into `sink`, timing and counting it.
+///
+/// The generalization behind [`parse_document`]: `check` and `count` want the
+/// events discarded, `convert` wants them written, and everything else about
+/// the run — the parser options, the sampling seed, which phase the clock is
+/// in — has to be identical or the three verbs stop describing the same work.
+///
+/// The sink comes back in the [`ParseRun`], because [`TimingSink`] has to own
+/// what it measures and a caller holding buffered bytes has to flush them
+/// somewhere a failure can still be returned. Letting a `BufWriter` flush on
+/// drop instead would discard exactly the error that says the output is
+/// incomplete.
+///
+/// # Conformant options are not optional here
+///
+/// [`ParserOptions::conformant`], never the ingest default. These verbs report
+/// on and reproduce the RDF a document denotes, so collections must arrive as
+/// the `rdf:first`/`rdf:rest` spine W3C says they are and numeric literals
+/// must keep the lexical form they were written with. Under the ingest options
+/// a collection arrives as indexed list items instead — which `count` would
+/// under-report, and which every writer refuses outright, because an indexed
+/// list item is a Fluree storage shape with no RDF serialization.
+pub fn parse_into<S: GraphSink>(
+    text: &str,
+    base: Option<&str>,
+    sink: S,
+    timings: &mut PhaseTimings,
+) -> ParseRun<S> {
     // Seeding the sampler from the corpus keeps repeat profiles of one input
     // comparable while leaving no fixed pattern for a periodic corpus to
     // alias against.
-    let mut sink = TimingSink::with_corpus(DiscardSink::new(), text.as_bytes());
+    let mut sink = TimingSink::with_corpus(sink, text.as_bytes());
 
     timings.enter(Phase::Parse);
     let result = fluree_graph_turtle::parse_with_prefixes_base_options(
@@ -269,18 +337,21 @@ pub fn parse_document(
         base,
         ParserOptions::conformant(),
     );
+    // `finish` is the owner's call, and the owner is here. The writers latch
+    // their failures precisely so this call sees one that had no earlier
+    // return value to ride out on.
     let finished = sink.finish();
     timings.finish();
 
-    // A sink failure is the pipeline's problem, not the document's — a broken
-    // pipe or a full disk must not be reported as a syntax error.
-    finished.map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
-
-    Ok(ParseOutcome {
-        counts: sink.counts(),
-        sink: sink.sink_timing(),
-        error: result.err(),
-    })
+    ParseRun {
+        outcome: ParseOutcome {
+            counts: sink.counts(),
+            sink: sink.sink_timing(),
+            error: result.err(),
+        },
+        sink: sink.into_inner(),
+        finished: finished.map_err(|e| CliError::Usage(format!("sink error: {e}"))),
+    }
 }
 
 /// Emit `--profile` or `--time` for a finished run.

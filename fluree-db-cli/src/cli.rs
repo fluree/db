@@ -2829,6 +2829,17 @@ pub struct RdfCommonArgs {
     pub no_hash: bool,
 }
 
+/// How blank-node labels reach converted output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum BnodePolicyArg {
+    /// Mint fresh labels, bijectively. What riot and Oxigraph do, and what
+    /// makes parallel output deterministic.
+    #[default]
+    Relabel,
+    /// Emit the input's labels unchanged where they are legal to emit.
+    Preserve,
+}
+
 /// `fluree rdf` verbs.
 #[derive(Subcommand)]
 pub enum RdfAction {
@@ -2849,9 +2860,23 @@ pub enum RdfAction {
         output: Option<PathBuf>,
 
         /// Group and indent Turtle output. Buffers the whole graph; the
-        /// default streaming form does not.
+        /// default streaming form does not. Not yet implemented.
         #[arg(long)]
         pretty: bool,
+
+        /// How blank-node labels reach the output. `relabel` (default) mints
+        /// fresh labels, as riot and Oxigraph do; `preserve` emits the
+        /// input's. Fluree's own `_:fdb-` stable identifiers pass through
+        /// either way.
+        #[arg(long, value_enum, default_value_t = BnodePolicyArg::Relabel)]
+        bnode_policy: BnodePolicyArg,
+
+        /// Prefixes for compaction, as inline JSON or a path to a JSON file.
+        /// A JSON-LD `@context` document works unchanged. Turtle and TriG
+        /// compact IRIs with these and declare them; JSON-LD uses them as its
+        /// `@context`. Prefixes declared by the input are always included.
+        #[arg(long, value_name = "JSON|PATH")]
+        prefixes: Option<String>,
     },
 
     /// Parse a document and report syntax errors

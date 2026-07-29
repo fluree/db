@@ -331,7 +331,15 @@ impl ProfileReport {
         sink: SinkTiming,
     ) -> Self {
         let mut timings = timings.clone();
-        timings.set(Phase::Sink, sink.reportable());
+        // The sink total goes in as a phase row only when nothing has already
+        // broken it down. `convert` splits it into serialize and write, and
+        // showing the total beside its own parts invites a reader to add all
+        // three together. The `sink` block below carries the total either way.
+        let decomposed = timings.elapsed(Phase::Serialize) > Duration::ZERO
+            || timings.elapsed(Phase::Write) > Duration::ZERO;
+        if !decomposed {
+            timings.set(Phase::Sink, sink.reportable());
+        }
 
         let phases: Vec<PhaseEntry> = Phase::ALL
             .into_iter()
@@ -514,7 +522,7 @@ impl ProfileReport {
                 human_duration(sink.body_ns.unwrap_or(0)),
                 sink.sampled_pct,
                 sink.relative_std_error_pct
-                    .map(|e| format!(" (±{e:.0}% sampling error)"))
+                    .map(|e| format!(" (±{e:.1}% sampling error)"))
                     .unwrap_or_default(),
             );
         }
