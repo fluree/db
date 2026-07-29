@@ -228,127 +228,206 @@ fn cmd_stats() -> Result<(), String> {
 // N-Triples normalization for cross-tool diffing
 // ---------------------------------------------------------------------------
 
+/// One normalized statement, plus whether it mentions a blank node.
+pub struct Normalized {
+    pub text: String,
+    pub has_blank: bool,
+}
+
 /// Canonicalize one N-Triples line so two conformant tools that spell the same
 /// RDF differently compare equal (§6b "Tier-2 normalization rules").
 ///
-/// Three rules, each of which is a real difference between real tools rather
-/// than a hypothetical:
+/// The line is walked TERM BY TERM rather than character by character, because
+/// the rules differ per term and applying any of them across a term boundary is
+/// how a normalizer invents equalities that are not there.
 ///
-/// 1. **Language tags case-fold.** `@EN-gb` and `@en-GB` are the same tag; BCP
-///    47 is case-insensitive. We preserve the source spelling losslessly and
-///    riot canonicalizes it. A byte-diff would report every language-tagged
-///    triple in the corpus as a mismatch.
-/// 2. **`"s"^^xsd:string` is `"s"`.** Identical literals in RDF 1.1. We and
-///    riot emit the short form; rdflib and rapper keep the explicit datatype.
-/// 3. **Whitespace between terms is not content.**
+/// Rules, each a real difference between real tools:
 ///
-/// What this deliberately does NOT do is touch IRIs. An input IRI containing a
-/// space is invalid per RFC 3987, and riot will warn about it — but the warning
-/// is about the IRI *value*, not about how it was spelled, and both tools are
-/// naming the same resource. Normalizing that away would hide a genuine
-/// difference if one ever appeared; counting it as a mismatch would flag every
-/// tool against every other. It is neither: warnings are not triples.
-fn normalize_ntriples_line(line: &str) -> Option<String> {
+/// 1. **`UCHAR` escapes decode to their code point**, in literals *and* in
+///    IRIs. `é` and a literal `é` are the same character by the grammar's
+///    own definition, and raptor emits the escaped form for non-ASCII where
+///    others emit the character. Without this, every non-ASCII term in a real
+///    corpus is a false mismatch.
+/// 2. **Language tags case-fold.** `@EN-gb` and `@en-GB` are one tag; BCP 47 is
+///    case-insensitive.
+/// 3. **`"s"^^xsd:string` is `"s"`.** Identical literals in RDF 1.1.
+/// 4. **Whitespace BETWEEN terms is not content**, and whitespace *inside* a
+///    term is. An earlier version collapsed runs of spaces everywhere, which
+///    made `<http://ex/a  b>` and `<http://ex/a b>` compare equal — two
+///    different resources, silently fused, on exactly the population of IRIs
+///    the escaping rules are about.
+///
+/// # What it does not do
+///
+/// Blank-node labels are not canonicalized, and a statement mentioning one is
+/// flagged via [`Normalized::has_blank`] so the caller can exempt it. Deciding
+/// whether two graphs agree up to blank-node renaming is graph isomorphism, not
+/// a line transform; the harness owns that at level 2 with rdflib, and faking
+/// it here would produce confident wrong answers on the one question this
+/// cannot answer.
+pub fn normalize_ntriples_line(line: &str) -> Option<Normalized> {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
+
     let mut out = String::with_capacity(trimmed.len());
+    let mut has_blank = false;
     let mut chars = trimmed.chars().peekable();
 
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            out.push(c);
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
             continue;
         }
-        // A literal: copy it verbatim through its closing quote, honouring
-        // backslash escapes so an escaped quote does not end it early.
-        out.push('"');
-        let mut escaped = false;
-        for lc in chars.by_ref() {
-            out.push(lc);
-            if escaped {
-                escaped = false;
-            } else if lc == '\\' {
-                escaped = true;
-            } else if lc == '"' {
-                break;
-            }
+        if !out.is_empty() {
+            out.push(' ');
         }
-        // Suffix: a language tag, a datatype, or neither.
-        if chars.peek() == Some(&'@') {
-            out.push(chars.next().expect("peeked"));
+        match c {
+            '<' => out.push_str(&take_iri(&mut chars)),
+            '"' => out.push_str(&take_literal(&mut chars)),
+            '_' => {
+                has_blank = true;
+                out.push_str(&take_bare(&mut chars));
+            }
+            _ => out.push_str(&take_bare(&mut chars)),
+        }
+    }
+
+    Some(Normalized {
+        text: out,
+        has_blank,
+    })
+}
+
+/// Consume `<...>` and return it with `UCHAR` escapes decoded.
+///
+/// Interior bytes are otherwise untouched — including whitespace, which is what
+/// distinguishes two IRIs that differ only by a space.
+fn take_iri(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut raw = String::new();
+    chars.next(); // '<'
+    for c in chars.by_ref() {
+        if c == '>' {
+            break;
+        }
+        raw.push(c);
+    }
+    format!("<{}>", decode_uchar(&raw))
+}
+
+/// Consume a literal and any `@lang` / `^^<datatype>` suffix.
+fn take_literal(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut body = String::new();
+    chars.next(); // opening quote
+    let mut escaped = false;
+    for c in chars.by_ref() {
+        if escaped {
+            body.push('\\');
+            body.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            break;
+        } else {
+            body.push(c);
+        }
+    }
+    let mut out = format!("\"{}\"", decode_uchar(&body));
+
+    match chars.peek() {
+        Some('@') => {
+            chars.next();
             let mut tag = String::new();
-            while let Some(&tc) = chars.peek() {
-                if tc.is_ascii_alphanumeric() || tc == '-' {
-                    tag.push(tc);
+            while let Some(&t) = chars.peek() {
+                if t.is_ascii_alphanumeric() || t == '-' {
+                    tag.push(t);
                     chars.next();
                 } else {
                     break;
                 }
             }
-            out.push_str(&canonical_lang_tag(&tag));
-        } else if chars.peek() == Some(&'^') {
-            let mut datatype = String::new();
-            while let Some(&dc) = chars.peek() {
-                datatype.push(dc);
+            // BCP 47 is case-insensitive; lowercase is a canonical form and is
+            // only ever compared, never emitted as RDF.
+            out.push('@');
+            out.push_str(&tag.to_ascii_lowercase());
+        }
+        Some('^') => {
+            chars.next(); // first '^'
+            if chars.peek() == Some(&'^') {
                 chars.next();
-                if dc == '>' {
-                    break;
-                }
             }
-            if datatype != "^^<http://www.w3.org/2001/XMLSchema#string>" {
+            let datatype = if chars.peek() == Some(&'<') {
+                take_iri(chars)
+            } else {
+                take_bare(chars)
+            };
+            // RDF 1.1: a bare string literal IS xsd:string.
+            if datatype != "<http://www.w3.org/2001/XMLSchema#string>" {
+                out.push_str("^^");
                 out.push_str(&datatype);
             }
         }
+        _ => {}
     }
-
-    // Collapse inter-term whitespace outside literals. Splitting on whitespace
-    // is safe here only because literals were copied as single units above.
-    Some(collapse_outside_literals(&out))
+    out
 }
 
-/// Language tags are case-insensitive; canonical form is lowercase primary
-/// subtag with uppercase region. Rather than implement BCP 47's full subtag
-/// grammar, lowercase everything: it is a canonical form, it is stable, and it
-/// is only ever used for comparison, never emitted.
-fn canonical_lang_tag(tag: &str) -> String {
-    tag.to_ascii_lowercase()
-}
-
-fn collapse_outside_literals(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    let mut pending_space = false;
-    while let Some(c) = chars.next() {
-        if c == '"' {
-            if pending_space && !out.is_empty() {
-                out.push(' ');
-            }
-            pending_space = false;
-            out.push('"');
-            let mut escaped = false;
-            for lc in chars.by_ref() {
-                out.push(lc);
-                if escaped {
-                    escaped = false;
-                } else if lc == '\\' {
-                    escaped = true;
-                } else if lc == '"' {
-                    break;
-                }
-            }
-            continue;
-        }
+/// Consume a run of non-whitespace: a blank-node label, a bare `.`, anything
+/// that is not bracketed or quoted.
+fn take_bare(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut out = String::new();
+    while let Some(&c) = chars.peek() {
         if c.is_whitespace() {
-            pending_space = true;
+            break;
+        }
+        out.push(c);
+        chars.next();
+    }
+    out
+}
+
+/// Decode `\uXXXX` and `\UXXXXXXXX` to their code points, leaving every other
+/// escape alone.
+///
+/// A decoded `"` or `\` is re-escaped, so the result stays an unambiguous
+/// comparison key rather than a string whose own delimiters moved.
+fn decode_uchar(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
             continue;
         }
-        if pending_space && !out.is_empty() {
-            out.push(' ');
+        let width = match chars.peek() {
+            Some('u') => 4,
+            Some('U') => 8,
+            // Any other escape is not a UCHAR: pass it through untouched so
+            // `\\u0041` stays an escaped backslash followed by "u0041".
+            _ => {
+                out.push('\\');
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+                continue;
+            }
+        };
+        chars.next(); // 'u' or 'U'
+        let hex: String = (0..width).filter_map(|_| chars.next()).collect();
+        match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+            Some('"') => out.push_str("\\\""),
+            Some('\\') => out.push_str("\\\\"),
+            Some(decoded) => out.push(decoded),
+            // Not a valid escape: keep the source text rather than guess.
+            None => {
+                out.push('\\');
+                out.push(if width == 4 { 'u' } else { 'U' });
+                out.push_str(&hex);
+            }
         }
-        pending_space = false;
-        out.push(c);
     }
     out
 }
@@ -358,16 +437,29 @@ fn cmd_normalize(args: &[String]) -> Result<(), String> {
         .first()
         .ok_or("usage: bench-harness normalize <file.nt>")?;
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let mut lines: Vec<String> = text.lines().filter_map(normalize_ntriples_line).collect();
-    // Sorted because statement ORDER is not RDF. Two tools may emit the same
-    // graph in different orders and both be right.
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut exempt = 0usize;
+    for normalized in text.lines().filter_map(normalize_ntriples_line) {
+        if normalized.has_blank {
+            // Level 2 (rdflib isomorphism) owns blank-node structure.
+            exempt += 1;
+            continue;
+        }
+        lines.push(normalized.text);
+    }
+    // Statement ORDER is not RDF.
     lines.sort_unstable();
+
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
     use std::io::Write;
     for line in lines {
         writeln!(out, "{line}").map_err(|e| e.to_string())?;
     }
+    // Reported on stderr so a caller can surface how much of the file this
+    // comparison did NOT cover.
+    eprintln!("{exempt}");
     Ok(())
 }
 
@@ -468,7 +560,7 @@ mod tests {
     // -- normalization ----------------------------------------------------
 
     fn norm(line: &str) -> String {
-        normalize_ntriples_line(line).expect("a statement")
+        normalize_ntriples_line(line).expect("a statement").text
     }
 
     /// We preserve `@EN-gb` losslessly; riot canonicalizes to `@en-GB`. Both
@@ -491,8 +583,6 @@ mod tests {
         assert_eq!(norm(bare), norm(explicit));
     }
 
-    /// Any OTHER datatype is content and must survive — the rule above is
-    /// about one specific datatype, not about datatypes generally.
     #[test]
     fn other_datatypes_are_not_stripped() {
         let integer =
@@ -502,13 +592,45 @@ mod tests {
         assert!(norm(integer).contains("XMLSchema#integer"));
     }
 
-    /// A literal's own content is never touched: quotes, escapes, whitespace
-    /// and `@`/`^^`-looking text inside a literal are data.
+    /// Grammar-defined equivalence, and the one that bites hardest on a real
+    /// corpus: raptor emits `UCHAR` escapes for non-ASCII where other tools
+    /// emit the character. Without decoding, every accented term in DBLP is a
+    /// false mismatch.
     #[test]
-    fn literal_content_survives_normalization_intact() {
-        let tricky = r#"<http://ex/s> <http://ex/p> "a \" b @en ^^<x>  c" ."#;
-        let out = norm(tricky);
-        assert!(out.contains(r#""a \" b @en ^^<x>  c""#), "{out}");
+    fn uchar_escapes_decode_in_literals_and_in_iris() {
+        let escaped = r#"<http://ex/café> <http://ex/p> "résumé" ."#;
+        let literal = "<http://ex/café> <http://ex/p> \"résumé\" .";
+        assert_eq!(norm(escaped), norm(literal));
+
+        // The 8-hex form too.
+        let long = r#"<http://ex/s> <http://ex/p> "\U0001F600" ."#;
+        let direct = "<http://ex/s> <http://ex/p> \"\u{1F600}\" .";
+        assert_eq!(norm(long), norm(direct));
+    }
+
+    /// An escaped backslash followed by text that merely LOOKS like a UCHAR is
+    /// not one. Getting this wrong would silently rewrite literal content.
+    #[test]
+    fn an_escaped_backslash_is_not_the_start_of_a_uchar() {
+        let out = norm(r#"<http://ex/s> <http://ex/p> "\\u0041" ."#);
+        assert!(out.contains(r"\\u0041"), "{out}");
+        assert!(!out.contains('A'), "{out}");
+    }
+
+    /// The bug this replaced. Whitespace INSIDE a term is content; only
+    /// whitespace BETWEEN terms is not. Collapsing runs of spaces everywhere
+    /// made two different resources compare equal — on exactly the population
+    /// of IRIs the escaping rules concern.
+    #[test]
+    fn whitespace_inside_an_iri_is_content_and_two_such_iris_stay_different() {
+        let one_space = "<http://ex/a b> <http://ex/p> <http://ex/o> .";
+        let two_spaces = "<http://ex/a  b> <http://ex/p> <http://ex/o> .";
+        assert_ne!(
+            norm(one_space),
+            norm(two_spaces),
+            "two distinct IRIs were fused by normalization"
+        );
+        assert!(norm(two_spaces).contains("<http://ex/a  b>"));
     }
 
     #[test]
@@ -519,19 +641,44 @@ mod tests {
     }
 
     #[test]
+    fn literal_content_survives_normalization_intact() {
+        let tricky = r#"<http://ex/s> <http://ex/p> "a \" b @en ^^<x>  c" ."#;
+        let out = norm(tricky);
+        assert!(out.contains(r#"a \" b @en ^^<x>  c"#), "{out}");
+    }
+
+    #[test]
     fn comments_and_blank_lines_are_not_statements() {
         assert!(normalize_ntriples_line("").is_none());
         assert!(normalize_ntriples_line("   ").is_none());
         assert!(normalize_ntriples_line("# a comment").is_none());
     }
 
-    /// An IRI that RFC 3987 would reject is still the same resource in both
-    /// tools' output, and riot's warning about it is not a triple. The
-    /// normalizer leaves IRIs alone, so such a pair compares equal on content.
+    /// Blank-node statements are flagged for exemption rather than
+    /// canonicalized. Deciding whether `_:b0` here is `_:x` there is graph
+    /// isomorphism; level 2 owns it.
     #[test]
-    fn iri_values_are_left_alone_so_validation_warnings_cannot_become_mismatches() {
+    fn blank_node_statements_are_flagged_for_exemption() {
+        let with_blank = normalize_ntriples_line("_:b0 <http://ex/p> <http://ex/o> .").unwrap();
+        assert!(with_blank.has_blank);
+
+        let object_blank = normalize_ntriples_line("<http://ex/s> <http://ex/p> _:b1 .").unwrap();
+        assert!(object_blank.has_blank);
+
+        let no_blank =
+            normalize_ntriples_line("<http://ex/s> <http://ex/p> <http://ex/o> .").unwrap();
+        assert!(!no_blank.has_blank);
+
+        // A literal that merely CONTAINS "_:" is not a blank node.
+        let literal = normalize_ntriples_line(r#"<http://ex/s> <http://ex/p> "_:b0" ."#).unwrap();
+        assert!(!literal.has_blank, "a literal is not a blank node");
+    }
+
+    /// IRI values are not otherwise rewritten, so riot's validation warnings
+    /// about an IRI's *value* cannot become triple-level mismatches.
+    #[test]
+    fn iri_values_are_left_alone_apart_from_grammar_escapes() {
         let line = r#"<http://ex/a b> <http://ex/p> <http://ex/o> ."#;
-        assert_eq!(norm(line), norm(line));
         assert!(norm(line).contains("<http://ex/a b>"));
     }
 }

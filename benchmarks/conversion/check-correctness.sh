@@ -20,6 +20,7 @@ set -euo pipefail
 # shellcheck source=lib/common.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
+require_bash 5
 require_cmd jq
 HARNESS="$(require_harness_bin)"
 
@@ -39,38 +40,85 @@ fi
 
 printf '\ncorrectness gate: %s\n\n' "$(basename "$RUN_DIR")" >&2
 
-# --- 1. cross-tool agreement on normalized output ---------------------------
-declare -a outputs=()
-while IFS= read -r f; do outputs+=("$f"); done < <(find "$RUN_DIR" -name '*.out.nt' | sort)
+# --- 0. ground truth: every cell must have emitted the right COUNT ----------
+#
+# A cell that produced nothing is not a fast cell, and an empty file trivially
+# agrees with another empty file — so without this the cross-tool diff below
+# blesses two tools that both emitted zero statements.
+failures=0
+checked_cells=0
+for cell in "$RUN_DIR"/*.json; do
+	[ "$(basename "$cell")" = "manifest.json" ] && continue
+	status="$(jq -r '.status' "$cell")"
+	name="$(basename "$cell" .json)"
+	if [ "$status" != "ok" ]; then
+		printf '  %-30s cell status %s — EXCLUDED from comparison\n' "$name" "$status" >&2
+		failures=$((failures + 1))
+		continue
+	fi
+	got="$(jq -r '.out_statements' "$cell")"
+	want="$(jq -r '.expected_statements // "null"' "$cell")"
+	if [ "$want" = "null" ]; then
+		printf '  %-30s %s statements (no ground truth for this corpus)\n' "$name" "$got" >&2
+	elif [ "$got" != "$want" ]; then
+		printf '  %-30s WRONG COUNT: expected %s, got %s\n' "$name" "$want" "$got" >&2
+		failures=$((failures + 1))
+	else
+		printf '  %-30s %s statements, matches ground truth\n' "$name" "$got" >&2
+	fi
+	checked_cells=$((checked_cells + 1))
+done
+printf '\n' >&2
 
-[ ${#outputs[@]} -gt 0 ] || die "no cell outputs in $RUN_DIR"
+# --- 1. cross-tool agreement on normalized output ---------------------------
+#
+# Only cells that passed the count check above take part: comparing against a
+# known-bad cell tells you nothing about the good one.
+declare -a outputs=()
+while IFS= read -r f; do
+	cell_json="${f%.out.nt}.json"
+	[ -f "$cell_json" ] || continue
+	[ "$(jq -r '.status' "$cell_json")" = "ok" ] || continue
+	outputs+=("$f")
+done < <(find "$RUN_DIR" -name '*.out.nt' | sort)
+
+[ ${#outputs[@]} -gt 0 ] || die "no usable cell outputs in $RUN_DIR"
 
 normalized_dir="$RUN_DIR/normalized"
 mkdir -p "$normalized_dir"
 
 declare -A by_syntax=()
+declare -A exempt_of=()
 for out in "${outputs[@]}"; do
 	base="$(basename "$out" .out.nt)"   # tool.mode.syntax
 	syntax="${base##*.}"
 	norm="$normalized_dir/$base.norm.nt"
-	"$HARNESS" normalize "$out" >"$norm"
+	# The normalizer reports on stderr how many blank-node statements it left
+	# out of the level-1 comparison; level 2 owns those.
+	exempt_of["$base"]="$("$HARNESS" normalize "$out" 2>"$normalized_dir/$base.exempt" >"$norm"; cat "$normalized_dir/$base.exempt")"
 	by_syntax["$syntax"]="${by_syntax[$syntax]:-} $norm"
 done
 
-failures=0
+compared_pairs=0
 for syntax in "${!by_syntax[@]}"; do
 	# shellcheck disable=SC2206  # deliberate word-splitting of the accumulated list
 	files=(${by_syntax[$syntax]})
-	[ ${#files[@]} -gt 1 ] || {
-		info "$syntax: only one tool produced output — nothing to cross-check"
+	if [ ${#files[@]} -le 1 ]; then
+		# NOT a pass. One tool agreeing with itself verifies nothing, and
+		# reporting success here is how a matrix with a single eligible tool
+		# looks fully validated.
+		printf '  %-9s only ONE tool produced output — cross-tool agreement UNVERIFIED\n' "$syntax" >&2
+		failures=$((failures + 1))
 		continue
-	}
+	fi
 	reference="${files[0]}"
 	ref_name="$(basename "$reference" .norm.nt)"
 	for candidate in "${files[@]:1}"; do
 		cand_name="$(basename "$candidate" .norm.nt)"
 		if diff -q "$reference" "$candidate" >/dev/null 2>&1; then
-			printf '  %-9s %-28s == %-28s  agree\n' "$syntax" "$ref_name" "$cand_name" >&2
+			compared_pairs=$((compared_pairs + 1))
+			printf '  %-9s %-28s == %-28s  agree (%s blank-node stmts exempt)\n' \
+				"$syntax" "$ref_name" "$cand_name" "${exempt_of[$ref_name]:-0}" >&2
 		else
 			# `|| true` is load-bearing: diff exits 1 when files differ, and
 			# under `set -o pipefail` that becomes the substitution's status,
@@ -78,6 +126,7 @@ for syntax in "${!by_syntax[@]}"; do
 			# SILENTLY at the exact moment it found a defect — indistinguishable
 			# from passing, if the caller only reads stdout.
 			first_diff="$(diff "$reference" "$candidate" | head -6 || true)"
+			compared_pairs=$((compared_pairs + 1))
 			printf '  %-9s %-28s != %-28s  DIFFER\n' "$syntax" "$ref_name" "$cand_name" >&2
 			printf '%s\n' "$first_diff" | sed 's/^/        /' >&2
 			failures=$((failures + 1))
@@ -127,6 +176,9 @@ fi
 
 printf '\n' >&2
 REPORTED=1
+if [ "$checked_cells" -eq 0 ]; then
+	die "no cell reached the correctness gate — nothing was verified."
+fi
 if [ "$failures" -gt 0 ]; then
 	die "$failures correctness failure(s) — the speed numbers in this run are not comparable."
 fi

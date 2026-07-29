@@ -104,7 +104,6 @@ fetch_one() {
 	for syn in "${syntaxes[@]}"; do
 		local url dest
 		url="$(jq -r --arg c "$corpus" --arg s "$syn" '.corpora[$c].files[$s].url' "$CORPORA_LOCK")"
-		dest="$CORPORA_DIR/$corpus.$syn.$(basename "$url" | sed 's/^.*\.\(gz\|xz\|bz2\)$/\1/')"
 		dest="$CORPORA_DIR/$(basename "$url")"
 
 		if [ -f "$dest" ]; then

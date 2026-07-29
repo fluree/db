@@ -33,6 +33,17 @@ cd benchmarks/conversion
 | `check-correctness.sh` | calling a fast-but-wrong cell fast; skipping rdflib silently |
 | `harness/` | guessing an RSS unit; averaging away an outlier |
 
+## Any number in an older report is void
+
+Every figure produced by this harness before the EPOCHREALTIME clock landed is
+**clock-contaminated and must not be quoted**, even as dev-signal. The previous
+implementation took its timestamps with `python3 -c`, putting two interpreter
+startups — measured here at 26–40 ms the pair — *inside* every measured
+interval. On a corpus where serdi does ~10 ms of real work that is not a
+perturbation, it is most of the number, and because it was a near-constant it
+compressed every ratio toward whichever tool was slowest. Re-measure; do not
+rescale.
+
 ## Three things that are easy to get wrong, and how they are handled
 
 **Peak RSS units.** Darwin's `getrusage(2)` returns `ru_maxrss` in *bytes* where
@@ -50,6 +61,15 @@ measurement instead of by trusting this paragraph.
 was not involved, and the harness's own clock calls would be emulated. Detected
 via `sysctl.proc_translated`, stamped as `…-translated`, and disqualified from
 publication — recorded, not corrected.
+
+**Machine load.** A benchmark harness that cannot distinguish "this tool is
+slow" from "this machine was busy" is not measuring the tool. Load inflates
+every sample in the same direction, so the median moves with it and MAD does not
+correct for it — repetition does not help. The runner records load per core,
+warns when it exceeds 0.5, and marks the run non-publishable. This was found the
+same way as the others: a clean re-run reported serdi at 21 ms against a
+directly-measured ground truth of 10 ms, and the residual turned out to be
+sibling build jobs holding the load average at 10 on a 16-core box.
 
 **Checking parity.** riot validates Turtle by default and N-Triples not at all.
 Our parser does no IRI validation. A default-vs-default matrix would therefore

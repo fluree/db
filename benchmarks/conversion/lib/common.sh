@@ -33,6 +33,21 @@ info() {
 	printf '  %s\n' "$*" >&2
 }
 
+# Refuse to run on a bash too old for the features the harness depends on.
+#
+# macOS still ships bash 3.2 as /bin/bash, and the failure mode without this is
+# not a clean error: `declare -A` and `mapfile` fail in ways that leave the
+# harness half-working, and EPOCHREALTIME simply expands to nothing, which
+# would produce timings of zero rather than a complaint.
+require_bash() {
+	local want="$1" why="${2:-}"
+	if [ "${BASH_VERSINFO[0]:-0}" -lt "$want" ]; then
+		die "bash $want+ required, found ${BASH_VERSION:-unknown}.${why:+ $why.}
+  macOS ships bash 3.2 as /bin/bash; install a current one (brew install bash)
+  and run the harness under it."
+	fi
+}
+
 require_cmd() {
 	local cmd="$1" hint="${2:-}"
 	command -v "$cmd" >/dev/null 2>&1 && return 0
@@ -116,6 +131,40 @@ host_is_publishable() {
 	esac
 }
 
+# 1-minute load average, and cores, so a run can say whether the box was busy.
+#
+# Added after a re-run measured serdi at 21ms against a directly-measured
+# ground truth of 10ms. The clock fix was correct; the residual was that
+# sibling build jobs had the load average at 10 on a 16-core box. A benchmark
+# harness that cannot tell "this tool is slow" from "this machine was busy" is
+# not measuring the tool, and no amount of median-and-MAD repairs it — load
+# inflates every sample in the same direction, so the median moves with it.
+host_load1() {
+	# `uptime` output differs across platforms; the load triple is always the
+	# last three fields.
+	uptime | awk -F'load average[s]*:' '{gsub(/^[ \t]+/,"",$2); split($2,l,","); gsub(/ /,"",l[1]); print l[1]}'
+}
+
+host_cores() {
+	if command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu >/dev/null 2>&1; then
+		sysctl -n hw.ncpu
+	elif command -v nproc >/dev/null 2>&1; then
+		nproc
+	else
+		echo 1
+	fi
+}
+
+# Load per core, to 3dp. Above ~0.5 the box is doing something else and the
+# numbers are about the box, not the tools.
+host_load_per_core() {
+	awk -v l="$(host_load1)" -v c="$(host_cores)" 'BEGIN{printf "%.3f", (c>0)?l/c:l}'
+}
+
+host_is_quiet() {
+	awk -v r="$(host_load_per_core)" 'BEGIN{exit (r < 0.5) ? 0 : 1}'
+}
+
 sha256_of() {
 	local file="$1"
 	if command -v sha256sum >/dev/null 2>&1; then
@@ -157,6 +206,9 @@ verify_tool_version() {
 	want="$(jq -r --arg t "$tool" '.tools[$t].version' "$TOOLS_LOCK")"
 	warn "$tool version mismatch: lock pins $want, found:"
 	printf '%s\n' "$actual" | sed 's/^/      /' >&2
+	# Hand the caller what was actually found, so a report can name the build
+	# that was refused rather than re-print the pin it failed to match.
+	VERIFY_TOOL_ACTUAL="$actual"
 	return 1
 }
 

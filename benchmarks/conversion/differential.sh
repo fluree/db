@@ -24,6 +24,7 @@ set -euo pipefail
 # shellcheck source=lib/common.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
+require_bash 5 "EPOCHREALTIME (the measurement clock) is a bash 5 builtin"
 require_cmd jq
 ensure_dirs
 
@@ -50,11 +51,16 @@ samples() {
 	local i out=()
 	for ((i = 0; i <= RUNS; i++)); do
 		local s e
-		s=$(python3 -c 'import time;print(time.monotonic_ns())')
+		# Builtin clock, no fork. The previous `python3 -c` pair put two
+		# interpreter startups inside every interval — fatal for a
+		# DIFFERENTIAL, which subtracts two medians: the constant cancels but
+		# its jitter does not, so it inflated both MADs and made real deltas
+		# fail their own significance test.
+		s=${EPOCHREALTIME/./}
 		"$@" >/dev/null 2>&1
-		e=$(python3 -c 'import time;print(time.monotonic_ns())')
+		e=${EPOCHREALTIME/./}
 		[ "$i" -eq 0 ] && continue # warmup
-		out+=("$(awk -v s="$s" -v e="$e" 'BEGIN{printf "%.6f",(e-s)/1e9}')")
+		out+=("$(awk -v s="$s" -v e="$e" 'BEGIN{printf "%.6f",(e-s)/1e6}')")
 	done
 	printf '%s\n' "${out[@]}" | "$HARNESS" stats
 }

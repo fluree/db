@@ -41,7 +41,12 @@ for tool in "${tools[@]}"; do
 	case $rc in
 	0) printf '  %-10s %-10s ok        (%s)\n' "$tool" "$pinned" "$role" >&2 ;;
 	1)
-		printf '  %-10s %-10s MISMATCH  matrix will REFUSE this tool\n' "$tool" "$pinned" >&2
+		# Name the build that is actually installed, not the pin it failed to
+		# match — the pin is already in the lock, and "MISMATCH 6.1.0" reads as
+		# though 6.1.0 were the problem.
+		printf '  %-10s %-10s MISMATCH  found: %s\n' "$tool" "$pinned" \
+			"$(printf '%s' "${VERIFY_TOOL_ACTUAL:-unknown}" | head -1)" >&2
+		printf '                 the matrix will REFUSE this tool\n' >&2
 		exit_code=1
 		;;
 	2)
@@ -67,8 +72,12 @@ if [ "$verify_artifacts" = 1 ]; then
 		local_file="$TOOLS_DIR/$(basename "$url")"
 		if [ ! -f "$local_file" ]; then
 			info "downloading $tool …"
-			curl -sSfL --max-time 900 -o "$local_file" "$url" ||
+			# .part + mv, matching fetch-corpora.sh: an interrupted download
+			# must not leave a truncated file that the next run treats as
+			# already present and then reports as a hash mismatch.
+			curl -sSfL --max-time 900 -o "$local_file.part" "$url" ||
 				die "download failed for $tool: $url"
+			mv "$local_file.part" "$local_file"
 		fi
 		got="$(sha256_of "$local_file")"
 		if [ "$got" = "$want" ]; then

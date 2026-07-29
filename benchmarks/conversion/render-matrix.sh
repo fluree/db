@@ -28,8 +28,11 @@ echo "  Tier-2 conversion matrix — $(jq -r '.corpus' "$m")"
 echo "  ==============================================================================="
 printf '  host_class  %s\n' "$host"
 printf '  git         %s\n' "$(jq -r '.git_sha' "$m" | cut -c1-12)"
-printf '  runs        %s per cell, %s warmup discarded, %s clock\n' \
-	"$(jq -r '.runs_per_cell' "$m")" "$(jq -r '.warmup_discarded' "$m")" "$(jq -r '.clock' "$m")"
+printf '  runs        %s per cell, %s warmup discarded\n' \
+	"$(jq -r '.runs_per_cell' "$m")" "$(jq -r '.warmup_discarded' "$m")"
+printf '  clock       %s\n' "$(jq -r '.clock' "$m")"
+printf '  load        %s per core%s\n' "$(jq -r '.load_per_core // "unknown"' "$m")" \
+	"$([ "$(jq -r '.load_contaminated // false' "$m")" = true ] && printf ' — BUSY, see below')"
 printf '  eligible    %s\n' "$(jq -r '.tools_eligible | join(", ")' "$m")"
 refused=$(jq -r '.tools_refused | join(", ")' "$m")
 [ -n "$refused" ] && printf '  REFUSED     %s\n' "$refused"
@@ -37,6 +40,12 @@ refused=$(jq -r '.tools_refused | join(", ")' "$m")
 if [ "$publishable" != "true" ]; then
 	echo
 	echo "  *** DEV-SIGNAL ONLY — NOT PUBLISHABLE ***"
+	if [ "$(jq -r '.load_contaminated // false' "$m")" = true ]; then
+		echo "  The machine was BUSY during this run (load/core above 0.5). Load"
+		echo "  inflates every cell in the same direction, so the medians move with"
+		echo "  it and MAD does not correct for it. Read the ORDERING, not the"
+		echo "  timings, and re-run on an idle host before believing a magnitude."
+	fi
 	case "$host" in
 	*-translated)
 		echo "  This shell runs under binary translation. uname reports the emulated"
@@ -80,6 +89,11 @@ echo "    makes the lane's two most-cited benchmarks disagree about raptor by ~6
 echo "  * riot check_false / check_true are the same tool with validation off and"
 echo "    on. Our column currently performs NO IRI validation, so it is comparable"
 echo "    with check_false only. That asymmetry is disclosed, not averaged away."
+echo "  * OUR VALIDATE CELL becomes fillable at WAVE-3 INTEGRATION, when the"
+echo "    harness runs the integrated binary. At that point the PRIMARY comparison"
+echo "    flips to riot check_true vs our validate (per H-8), and today's"
+echo "    check_false pairing becomes the disclosed secondary. The lock already"
+echo "    carries the column so the matrix is never quietly asymmetric."
 echo "  * rapper is dormant-since-2023 and carried for historical continuity."
 echo "  * REL_MAD% is the spread of the bulk of the samples. Above ~5%, treat the"
 echo "    cell as noise and re-run on a quieter host."

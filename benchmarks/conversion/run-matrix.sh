@@ -22,6 +22,7 @@ set -euo pipefail
 # shellcheck source=lib/common.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 
+require_bash 5 "EPOCHREALTIME (the measurement clock) is a bash 5 builtin"
 require_cmd jq
 ensure_dirs
 
@@ -40,15 +41,41 @@ else
 	PUBLISHABLE=false
 fi
 
+# Was the machine idle enough to be measuring the tools rather than itself?
+LOAD_PER_CORE="$(host_load_per_core)"
+if host_is_quiet; then
+	LOAD_CONTAMINATED=false
+else
+	LOAD_CONTAMINATED=true
+	PUBLISHABLE=false
+fi
+
 printf '\nTier-2 conversion matrix\n' >&2
 printf '  corpus      %s\n' "$CORPUS" >&2
 printf '  runs        %s (first discarded as warmup)\n' "$RUNS" >&2
 printf '  host_class  %s%s\n' "$HOST_CLASS" \
 	"$([ "$PUBLISHABLE" = false ] && printf ' — DEV-SIGNAL ONLY, never publishable')" >&2
+printf '  load        %s per core (%s cores)\n' "$LOAD_PER_CORE" "$(host_cores)" >&2
+if [ "$LOAD_CONTAMINATED" = true ]; then
+	warn "the machine is BUSY (load/core $LOAD_PER_CORE). Every cell in this run is
+  inflated in the same direction, so the medians move with the load and MAD
+  does not correct for it. Treat this run as ordering-only, not as timings."
+fi
 printf '  results     %s\n\n' "$OUT" >&2
 
 ttl="$CORPORA_DIR/$CORPUS.ttl"
 nt="$CORPORA_DIR/$CORPUS.nt"
+
+# Ground-truth statement count, if the corpus ships a manifest. Every cell is
+# checked against it; a corpus without one degrades to "no count check" rather
+# than to "the check passed".
+EXPECTED_TRIPLES=""
+if [ -f "$CORPORA_DIR/$CORPUS.json" ]; then
+	EXPECTED_TRIPLES="$(jq -r '.triples // empty' "$CORPORA_DIR/$CORPUS.json")"
+	[ -n "$EXPECTED_TRIPLES" ] && info "ground truth: $EXPECTED_TRIPLES statements per cell"
+else
+	warn "no manifest for $CORPUS — statement counts cannot be checked against ground truth"
+fi
 
 # ---------------------------------------------------------------------------
 # One cell: n timed invocations of one command, plus a correctness check.
@@ -65,26 +92,45 @@ run_cell() {
 
 	local cell_out="$OUT/$tool.$mode.$syntax"
 	local converted="$cell_out.out.nt"
-	local timings=() rss_bytes=0 wall
+	local timings=() child_elapsed=() rss_bytes=0 wall
 
 	local i
 	for ((i = 0; i <= RUNS; i++)); do
 		local time_file="$cell_out.time"
 		local start end
-		start=$(python3 -c 'import time;print(time.monotonic_ns())')
+		# `EPOCHREALTIME` is a bash builtin: reading it forks NOTHING.
+		#
+		# This replaces a `python3 -c` timestamp on each side of the interval,
+		# which put TWO interpreter startups (measured here at 26-40ms the
+		# pair) INSIDE the measured region. On a corpus where serdi does ~10ms
+		# of real work that is not a perturbation, it is most of the number,
+		# and because it is a constant it compressed every ratio toward
+		# whichever tool was slowest.
+		#
+		# GNU time's own `%e` would be child-only and is what gtime is for,
+		# but it is centisecond-resolution: measured directly, `gtime -f %e`
+		# reports "0.00" for serdi on the smoke corpus. It is recorded below
+		# as a cross-check for corpora large enough to register, and is not
+		# the primary clock.
+		start=${EPOCHREALTIME/./}
 		if ! "$GNU_TIME" -v -o "$time_file" "${cmd[@]}" >"$converted" 2>"$cell_out.stderr"; then
+			end=${EPOCHREALTIME/./}
 			info "$tool/$mode/$syntax: command FAILED (see $cell_out.stderr)"
+			# Remove the partial output so the correctness gate cannot mistake
+			# a failed cell's leavings for a result.
+			rm -f "$converted"
 			jq -n --arg tool "$tool" --arg mode "$mode" --arg syntax "$syntax" \
 				--arg corpus "$CORPUS" --arg host "$HOST_CLASS" \
 				'{tool:$tool,mode:$mode,syntax:$syntax,corpus:$corpus,host_class:$host,status:"failed"}' \
 				>"$cell_out.json"
 			return 0
 		fi
-		end=$(python3 -c 'import time;print(time.monotonic_ns())')
+		end=${EPOCHREALTIME/./}
 		# Discard run 0 as warmup: page cache, JIT, dynamic linking.
 		[ "$i" -eq 0 ] && continue
-		wall=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.6f",(e-s)/1e9}')
+		wall=$(awk -v s="$start" -v e="$end" 'BEGIN{printf "%.6f",(e-s)/1e6}')
 		timings+=("$wall")
+		child_elapsed+=("$(awk '/Elapsed \(wall clock\)/{n=split($NF,p,":"); printf "%.2f", (n==3)?p[1]*3600+p[2]*60+p[3]:p[1]*60+p[2]}' "$time_file")")
 		rss_bytes="$("$HARNESS" rss "$time_file")"
 	done
 
@@ -94,6 +140,19 @@ run_cell() {
 	# --- correctness, alongside speed, not after it ---------------------
 	local out_lines
 	out_lines="$(grep -cve '^[[:space:]]*$' -e '^[[:space:]]*#' "$converted" || true)"
+
+	# Ground truth from the corpus manifest, when the corpus has one. A cell
+	# that emitted the wrong NUMBER of statements is a failed cell however
+	# fast it was, and "0 statements, 0.00s" is the fastest wrong answer
+	# available. Without this the gate happily blessed an empty file.
+	local expected="null" verdict='"ok"'
+	if [ -n "$EXPECTED_TRIPLES" ]; then
+		expected="$EXPECTED_TRIPLES"
+		if [ "$out_lines" -ne "$EXPECTED_TRIPLES" ]; then
+			verdict='"statement-count-mismatch"'
+			info "$tool/$mode/$syntax: WRONG COUNT — expected $EXPECTED_TRIPLES, got $out_lines"
+		fi
+	fi
 
 	local in_bytes median mb_s tr_s
 	in_bytes=$(wc -c <"$input" | tr -d ' ')
@@ -109,14 +168,19 @@ run_cell() {
 		--argjson rss "$rss_bytes" --argjson in_bytes "$in_bytes" \
 		--argjson out_statements "$out_lines" \
 		--argjson mb_s "$mb_s" --argjson tr_s "$tr_s" \
+		--argjson expected "$expected" --argjson verdict "$verdict" \
+		--arg child_elapsed "${child_elapsed[*]}" \
 		--arg cmd "${cmd[*]}" \
 		'{tool:$tool, mode:$mode, syntax:$syntax, corpus:$corpus,
 		  host_class:$host, publishable:$publishable,
-		  clock:"wall", wall_seconds:$stats,
+		  clock:"wall (bash EPOCHREALTIME, no subprocess in the interval)",
+		  wall_seconds:$stats,
+		  child_elapsed_seconds_crosscheck:$child_elapsed,
+		  child_elapsed_note:"GNU time %e, child-only but centisecond-resolution; corroboration only, not the primary clock",
 		  peak_rss_bytes:$rss, input_bytes:$in_bytes,
-		  out_statements:$out_statements,
+		  out_statements:$out_statements, expected_statements:$expected,
 		  mb_per_second:$mb_s, statements_per_second:$tr_s,
-		  invocation:$cmd, status:"ok"}' >"$cell_out.json"
+		  invocation:$cmd, status:$verdict}' >"$cell_out.json"
 
 	printf '  %-10s %-12s %-9s %8.3fs  %8s MB/s  %10s stmt/s  %6s stmts\n' \
 		"$tool" "$mode" "$syntax" "$median" "$mb_s" "$tr_s" "$out_lines" >&2
@@ -196,11 +260,14 @@ fi
 jq -n \
 	--arg run_id "$RUN_ID" --arg corpus "$CORPUS" --arg host "$HOST_CLASS" \
 	--argjson publishable "$PUBLISHABLE" --argjson runs "$RUNS" \
+	--argjson load_per_core "$LOAD_PER_CORE" --argjson load_contaminated "$LOAD_CONTAMINATED" \
 	--arg git_sha "$(git -C "$REPO_ROOT" rev-parse HEAD)" \
 	--argjson eligible "$(printf '%s\n' "${ELIGIBLE[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
 	--argjson refused "$(printf '%s\n' "${REFUSED[@]:-}" | jq -Rsc 'split("\n")|map(select(length>0))')" \
 	'{run_id:$run_id, corpus:$corpus, host_class:$host, publishable:$publishable,
-	  runs_per_cell:$runs, warmup_discarded:1, clock:"wall",
+	  load_per_core:$load_per_core, load_contaminated:$load_contaminated,
+	  runs_per_cell:$runs, warmup_discarded:1,
+	  clock:"wall (bash EPOCHREALTIME builtin; no subprocess inside the measured interval)",
 	  git_sha:$git_sha, tools_eligible:$eligible, tools_refused:$refused,
 	  conformance:"NOT YET WIRED — Tier-2 must refuse to emit a matrix on a conformance mismatch (§6b F8); see README Open items."}' \
 	>"$OUT/manifest.json"
