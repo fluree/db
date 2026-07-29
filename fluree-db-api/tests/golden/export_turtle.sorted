@@ -1,4 +1,4 @@
-    <http://example.org/ns/has%20space> "local name that cannot be a PN_LOCAL" ;
+    <http://example.org/ns/has\u0020space> "local name that cannot be a PN_LOCAL" ;
     a schema:Person ;
     a schema:Person ;
     ex:active "true"^^<http://www.w3.org/2001/XMLSchema#boolean> ;
@@ -16,7 +16,7 @@
     schema:name "Alice" ;
     schema:name "Bob" .
     schema:name "Subject whose IRI needs IRIREF escaping" .
-<http://example.org/ns/odd%7Ciri>
+<http://example.org/ns/odd\u007Ciri>
 @prefix ex: <http://example.org/ns/> .
 @prefix exdeep: <http://example.org/ns/deep/> .
 @prefix schema: <http://schema.org/> .

@@ -223,33 +223,110 @@ fn plain_iris_survive() {
     assert_round_trips("<http://example.org/a> <http://example.org/p> <http://example.org/o> .");
 }
 
-/// An IRI carrying a character `IRIREF` forbids cannot come from the parser —
-/// it rejects the input — but it can come from a store, which is exactly the
-/// case `export.rs` hits. The writer percent-encodes it so the output stays
-/// parseable.
-///
-/// Note what this is *not*: percent-encoding changes the IRI, so the emitted
-/// term denotes a different resource than the one handed in. That is the only
-/// available choice — the alternative is a document no parser accepts — and it
-/// matches what the exporter has always done.
-#[test]
-fn an_iri_the_grammar_forbids_is_percent_encoded_on_the_way_out() {
+/// Write one triple with `subject` as the subject, and return the document.
+fn write_subject_iri(subject: &str) -> String {
     let mut buf = Vec::new();
     {
         let mut w = NTriplesWriter::new(&mut buf);
-        let s = w.term_iri("http://example.org/a|b");
+        let s = w.term_iri(subject);
         let p = w.term_iri("http://example.org/p");
         let o = w.term_literal("v", Datatype::xsd_string(), None);
         w.emit_triple(s, p, o).unwrap();
         w.end_statement();
         w.finish().unwrap();
     }
-    let written = String::from_utf8(buf).unwrap();
-    assert!(written.contains("a%7Cb"), "{written}");
+    String::from_utf8(buf).unwrap()
+}
 
-    let reparsed = parse_conformant(&written);
-    assert_eq!(reparsed.len(), 1);
-    assert_eq!(reparsed[0].s.as_iri(), Some("http://example.org/a%7Cb"));
+fn subjects_of(document: &str) -> Vec<String> {
+    parse_conformant(document)
+        .iter()
+        .filter_map(|t| t.s.as_iri().map(str::to_string))
+        .collect()
+}
+
+/// An IRI carrying a character `IRIREF` forbids cannot come from the parser as
+/// a raw character, but it reaches a writer two ways: from a store (which is
+/// what `export.rs` does) and from a `UCHAR` in a source document. Either way
+/// the writer must emit an IRI that reads back as *the same resource*.
+#[test]
+fn an_iri_the_grammar_forbids_survives_as_the_same_iri() {
+    let written = write_subject_iri("http://example.org/a|b");
+    assert!(written.contains("a\\u007Cb"), "{written}");
+    assert_eq!(subjects_of(&written), vec!["http://example.org/a|b"]);
+}
+
+/// The bug this replaced, pinned as a property: escaping is **injective**.
+///
+/// `http://ex/a b` and `http://ex/a%20b` are two distinct resources. Under the
+/// percent-encoding this writer used to do, both emitted `http://ex/a%20b` and
+/// re-read as one — two resources merged into one, no error anywhere. Adopted
+/// from the reviewer's `zz_merge` probe.
+#[test]
+fn distinct_iris_never_merge_on_the_way_out() {
+    let mut buf = Vec::new();
+    {
+        let mut w = NTriplesWriter::new(&mut buf);
+        for iri in ["http://ex/a b", "http://ex/a%20b"] {
+            let s = w.term_iri(iri);
+            let p = w.term_iri("http://ex/p");
+            let o = w.term_iri("http://ex/o");
+            w.emit_triple(s, p, o).unwrap();
+            w.end_statement();
+        }
+        w.finish().unwrap();
+    }
+    let written = String::from_utf8(buf).unwrap();
+
+    let mut subjects = subjects_of(&written);
+    subjects.sort();
+    subjects.dedup();
+    assert_eq!(
+        subjects,
+        vec!["http://ex/a b".to_string(), "http://ex/a%20b".to_string()],
+        "two distinct IRIs must stay two: {written}"
+    );
+}
+
+/// Our own parser accepts `UCHAR` inside `IRIREF`, so a document that uses one
+/// is legal input — and must survive the writer unchanged. Adopted from the
+/// reviewer's j1/j2 probes.
+#[test]
+fn a_uchar_sourced_iri_round_trips_unchanged() {
+    let doc = "<http://ex/a\\u0020b> <http://ex/p> <http://ex/o> .\n\
+               <http://ex/x\\u003Cy> <http://ex/p> <http://ex/o> .\n";
+    let before = subjects_of(doc);
+    assert_eq!(
+        before,
+        vec!["http://ex/a b", "http://ex/x<y"],
+        "input parses"
+    );
+
+    let written = to_ntriples(doc, &WriterConfig::default());
+    assert_eq!(subjects_of(&written), before, "the writer changed the IRI");
+}
+
+/// Characters above U+009F are legal in `IRIREF` and must be written through
+/// raw, not escaped. Adopted from the reviewer's j3 probe — the earlier
+/// forbidden set included U+007F..U+009F, which the grammar does not.
+#[test]
+fn high_code_points_are_written_through_untouched() {
+    for iri in [
+        "http://ex/\u{7F}del",
+        "http://ex/\u{9F}c1",
+        "http://ex/\u{a0}nbsp",
+        "http://ex/\u{2028}sep",
+        "http://ex/\u{FFFD}",
+        "http://ex/\u{10FFFF}",
+    ] {
+        let written = write_subject_iri(iri);
+        assert_eq!(
+            subjects_of(&written),
+            vec![iri.to_string()],
+            "{:?} did not survive; wrote {written:?}",
+            iri.escape_debug().to_string()
+        );
+    }
 }
 
 /// The lexical forms `PreserveLexical` exists to keep. A writer that emitted

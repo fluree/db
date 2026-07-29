@@ -258,7 +258,10 @@ mod tests {
         assert_eq!(render("http://example.org/alice"), "ex:alice");
         assert_eq!(render("http://other.org/bob"), "<http://other.org/bob>");
         // The expanded fallback still escapes what IRIREF forbids.
-        assert_eq!(render("http://other.org/a b"), "<http://other.org/a%20b>");
+        assert_eq!(
+            render("http://other.org/a b"),
+            "<http://other.org/a\\u0020b>"
+        );
     }
 
     #[test]

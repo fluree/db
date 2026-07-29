@@ -1,7 +1,7 @@
 <http://example.org/ns/alice> <http://example.org/ns/active> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
 <http://example.org/ns/alice> <http://example.org/ns/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
 <http://example.org/ns/alice> <http://example.org/ns/deep/nested> "longest prefix wins" .
-<http://example.org/ns/alice> <http://example.org/ns/has%20space> "local name that cannot be a PN_LOCAL" .
+<http://example.org/ns/alice> <http://example.org/ns/has\u0020space> "local name that cannot be a PN_LOCAL" .
 <http://example.org/ns/alice> <http://example.org/ns/joined> "2020-01-02T03:04:05.000000Z"^^<http://www.w3.org/2001/XMLSchema#dateTime> .
 <http://example.org/ns/alice> <http://example.org/ns/knows> <http://example.org/ns/bob> .
 <http://example.org/ns/alice> <http://example.org/ns/label> "Alice"@en .
@@ -15,4 +15,4 @@
 <http://example.org/ns/bob> <http://example.org/ns/knows> <http://example.org/ns/carol> .
 <http://example.org/ns/bob> <http://schema.org/name> "Bob" .
 <http://example.org/ns/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://schema.org/Person> .
-<http://example.org/ns/odd%7Ciri> <http://schema.org/name> "Subject whose IRI needs IRIREF escaping" .
+<http://example.org/ns/odd\u007Ciri> <http://schema.org/name> "Subject whose IRI needs IRIREF escaping" .

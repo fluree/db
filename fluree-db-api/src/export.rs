@@ -1479,27 +1479,37 @@ mod tests {
     }
 
     #[test]
+    /// Export escapes IRIs with `UCHAR`, not percent-encoding — the latter
+    /// changed the IRI, merging distinct resources. See
+    /// `fluree_graph_format::write_escaped_iri` for the full argument; this
+    /// pins that the export path picks up the fixed behavior.
     fn test_escape_iri() {
         let mut buf = Vec::new();
         write_escaped_iri(&mut buf, "http://example.org/foo>bar").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "http://example.org/foo%3Ebar"
+            "http://example.org/foo\\u003Ebar"
         );
 
         let mut buf = Vec::new();
         write_escaped_iri(&mut buf, "http://example.org/a\\b<c\"d").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "http://example.org/a%5Cb%3Cc%22d"
+            "http://example.org/a\\u005Cb\\u003Cc\\u0022d"
         );
 
         let mut buf = Vec::new();
         write_escaped_iri(&mut buf, "http://example.org/a b\tc").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "http://example.org/a%20b%09c"
+            "http://example.org/a\\u0020b\\u0009c"
         );
+
+        // A percent sign is ordinary here, which is what keeps an IRI whose
+        // text really contains `%20` distinct from one containing a space.
+        let mut buf = Vec::new();
+        write_escaped_iri(&mut buf, "http://example.org/a%20b").unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "http://example.org/a%20b");
     }
 
     #[test]

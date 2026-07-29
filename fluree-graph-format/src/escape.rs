@@ -12,11 +12,15 @@ use std::io::{self, Write};
 
 /// Write an N-Triples-escaped string to `w` (without the surrounding quotes).
 ///
-/// Escapes `\`, `"`, `\n`, `\r`, `\t`, and control characters
-/// (U+0000..U+001F, U+007F..U+009F) via `\uXXXX`.
+/// Escapes `\`, `"`, `\n`, `\r`, `\t` as `ECHAR`, and every other control
+/// character (U+0000..U+001F, U+007F..U+009F) as `\uXXXX`.
 ///
 /// Turtle and TriG share this grammar for quoted literals, so the same
 /// function serves all four text syntaxes.
+///
+/// Only the four-hex `UCHAR` form appears, because `char::is_control` is the
+/// Unicode `Cc` category and every one of those code points is at most
+/// U+009F. An eight-hex branch here would be unreachable.
 pub fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
     for ch in s.chars() {
         match ch {
@@ -25,14 +29,7 @@ pub fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result
             '\n' => w.write_all(b"\\n")?,
             '\r' => w.write_all(b"\\r")?,
             '\t' => w.write_all(b"\\t")?,
-            c if c.is_control() => {
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    write!(w, "\\u{cp:04X}")?;
-                } else {
-                    write!(w, "\\U{cp:08X}")?;
-                }
-            }
+            c if c.is_control() => w.write_all(&uchar(c as u32))?,
             c => {
                 let mut buf = [0u8; 4];
                 let encoded = c.encode_utf8(&mut buf);
@@ -45,22 +42,35 @@ pub fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result
 
 /// Write an IRI with escaping per the N-Triples/Turtle `IRIREF` grammar.
 ///
-/// Disallowed characters in `IRIREF`:
-/// - ASCII control and space: U+0000..=U+0020
-/// - DEL + C1 controls: U+007F..=U+009F
-/// - Punctuation: `<`, `>`, `"`, `{`, `}`, `|`, `^`, `` ` ``, `\`
+/// ```text
+/// IRIREF ::= '<' ([^#x00-#x20<>"{}|^`\] | UCHAR)* '>'
+/// ```
 ///
-/// Those are percent-encoded from their UTF-8 bytes, so the output stays
-/// syntactically valid RDF even when the IRI handed in is not.
+/// so exactly two things may not appear literally: code points at or below
+/// U+0020, and the nine characters `<`, `>`, `"`, `{`, `}`, `|`, `^`,
+/// `` ` ``, `\`. Everything else — including U+007F..U+009F, which an earlier
+/// version of this function escaped — is legal and is written through
+/// untouched.
+///
+/// # Why `UCHAR` and not percent-encoding
+///
+/// The grammar offers `UCHAR` precisely so a forbidden character can be
+/// *spelled* without changing the IRI it denotes: `<http://ex/a b>` reads
+/// back as `http://ex/a b`, the IRI we were given.
+///
+/// Percent-encoding, which this used to do, is a different operation. It emits
+/// `http://ex/a%20b` — a **different IRI**, and one that collides with the
+/// distinct IRI a caller may separately hold as the literal text
+/// `http://ex/a%20b`. Two resources become one, silently, with no error
+/// anywhere. That is a data-loss bug rather than an escaping choice, and it
+/// was live: `fluree export` routes every IRI through here.
 pub fn write_escaped_iri<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
     for ch in iri.chars() {
-        let mut buf = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut buf);
         if is_forbidden_in_iriref(ch) {
-            for &b in encoded.as_bytes() {
-                write!(w, "%{b:02X}")?;
-            }
+            w.write_all(&uchar(ch as u32))?;
         } else {
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
             w.write_all(encoded.as_bytes())?;
         }
     }
@@ -72,24 +82,42 @@ pub fn write_escaped_iri<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
 pub fn escape_iri_into(out: &mut String, iri: &str) {
     for ch in iri.chars() {
         if is_forbidden_in_iriref(ch) {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
+            // `uchar` is ASCII by construction, so this is a valid `str`.
+            out.push_str(std::str::from_utf8(&uchar(ch as u32)).expect("ASCII"));
         } else {
             out.push(ch);
         }
     }
 }
 
-/// Whether `ch` must be percent-encoded to appear inside `<…>`.
+/// The `\uXXXX` spelling of `cp`, as six ASCII bytes.
+///
+/// Four hex digits always suffice for the callers here: the `IRIREF`
+/// forbidden set is entirely ASCII, and `char::is_control` reaches only
+/// U+009F. An eight-digit `\UXXXXXXXX` branch would be dead code, so there
+/// is not one.
+fn uchar(cp: u32) -> [u8; 6] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    debug_assert!(
+        cp <= 0xFFFF,
+        "no caller can reach a code point above U+FFFF"
+    );
+    [
+        b'\\',
+        b'u',
+        HEX[((cp >> 12) & 0xF) as usize],
+        HEX[((cp >> 8) & 0xF) as usize],
+        HEX[((cp >> 4) & 0xF) as usize],
+        HEX[(cp & 0xF) as usize],
+    ]
+}
+
+/// Whether `ch` must be written as a `UCHAR` to appear inside `<…>`.
+///
+/// The whole forbidden set is ASCII, which is what lets [`uchar`] be
+/// four-digit only.
 fn is_forbidden_in_iriref(ch: char) -> bool {
-    let cp = ch as u32;
-    cp <= 0x20
-        || (0x7F..=0x9F).contains(&cp)
-        || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+    ch as u32 <= 0x20 || matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
 }
 
 /// Write `"lexical"^^<datatype_iri>`.
@@ -135,19 +163,59 @@ mod tests {
     }
 
     #[test]
-    fn percent_encodes_what_iriref_forbids() {
+    fn uchar_escapes_what_iriref_forbids() {
         assert_eq!(
             escaped_iri("http://example.org/foo>bar"),
-            "http://example.org/foo%3Ebar"
+            "http://example.org/foo\\u003Ebar"
         );
         assert_eq!(
             escaped_iri("http://example.org/a\\b<c\"d"),
-            "http://example.org/a%5Cb%3Cc%22d"
+            "http://example.org/a\\u005Cb\\u003Cc\\u0022d"
         );
         assert_eq!(
             escaped_iri("http://example.org/a b\tc"),
-            "http://example.org/a%20b%09c"
+            "http://example.org/a\\u0020b\\u0009c"
         );
+        // Every character the grammar names, and nothing else.
+        for ch in ['<', '>', '"', '{', '}', '|', '^', '`', '\\'] {
+            let escaped = escaped_iri(&format!("x{ch}y"));
+            assert_eq!(escaped, format!("x\\u{:04X}y", ch as u32), "{ch:?}");
+        }
+    }
+
+    /// U+007F..U+009F are legal in `IRIREF` — the grammar forbids only
+    /// `#x00-#x20` plus nine punctuation characters. An earlier version
+    /// escaped this range anyway, which was over-eager rather than wrong;
+    /// leaving it alone keeps the output closer to the IRI we were handed.
+    #[test]
+    fn c1_controls_and_high_code_points_are_left_alone() {
+        for iri in [
+            "http://ex/\u{7F}x",
+            "http://ex/\u{85}y",
+            "http://ex/\u{9F}z",
+            "http://ex/\u{a0}nbsp",
+            "http://ex/\u{2028}sep",
+            "http://ex/\u{FFFD}",
+            "http://ex/\u{10FFFF}",
+        ] {
+            assert_eq!(escaped_iri(iri), iri, "{:?}", iri.escape_debug());
+        }
+    }
+
+    /// The property percent-encoding did not have. Escaping must be
+    /// **injective**: two distinct IRIs must never come out as one string.
+    ///
+    /// `http://ex/a b` and `http://ex/a%20b` are different resources. Under
+    /// percent-encoding both emitted `http://ex/a%20b` and merged, silently.
+    /// Under `UCHAR` the first is spelled `a b` and the second is
+    /// untouched, so they stay two.
+    #[test]
+    fn escaping_is_injective() {
+        let a = escaped_iri("http://ex/a b");
+        let b = escaped_iri("http://ex/a%20b");
+        assert_ne!(a, b, "two distinct IRIs collapsed onto one spelling");
+        assert_eq!(a, "http://ex/a\\u0020b");
+        assert_eq!(b, "http://ex/a%20b", "a percent sign is not special here");
     }
 
     /// The string form must agree with the writer form character for
@@ -173,8 +241,24 @@ mod tests {
         write_typed_literal(&mut buf, "a\"b", "http://example.org/dt>x").unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\"a\\\"b\"^^<http://example.org/dt%3Ex>"
+            "\"a\\\"b\"^^<http://example.org/dt\\u003Ex>"
         );
+    }
+
+    /// The literal escaper reaches only the four-hex form, because
+    /// `char::is_control` stops at U+009F. This is the guard on that claim —
+    /// if the predicate ever widens, the missing eight-hex branch becomes a
+    /// real gap rather than dead code correctly removed.
+    #[test]
+    fn every_control_character_fits_the_four_hex_form() {
+        for cp in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+            if cp.is_control() {
+                assert!(
+                    cp as u32 <= 0xFFFF,
+                    "{cp:?} is a control character above U+FFFF"
+                );
+            }
+        }
     }
 
     /// Non-ASCII passes through unescaped: `IRIREF` allows it, and
