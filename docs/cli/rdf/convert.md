@@ -14,17 +14,36 @@ fluree rdf convert dump.nt.gz --to turtle --prefixes ctx.json
 cat dump.ttl | fluree rdf convert --syntax turtle --to nquads
 ```
 
-Conversion is streaming: the parser emits into the writer and bytes leave as
-they are produced. Nothing materializes the document, so `convert big.ttl |
-head -5` costs five statements rather than a full parse, and memory stays flat
-over a large dump. The one exception is JSON-LD, which is document-at-once by
-construction — the format has no streaming form.
+Conversion into the four text syntaxes is streaming: the parser emits into the
+writer and bytes leave as they are produced. Nothing materializes the document,
+so `convert big.ttl --to nt | head -5` costs five statements rather than a full
+parse, and memory stays flat over a large dump.
+
+**JSON-LD is the exception, and it is not a small one.** The writer is
+document-at-once by construction — the format has no streaming form short of
+NDJSON, which is deferred — so the whole graph is held in memory and nothing
+reaches the output until the input is exhausted. Two consequences worth
+planning around:
+
+- **Memory scales with the document.** Measured on a 9.6 MiB Turtle corpus
+  (200k statements, one distinct subject each): peak RSS 871 MiB for JSON-LD
+  against 81 MiB for N-Triples — **~96× the input, against ~9×**. On a large
+  dump that is the difference between a conversion and an OOM.
+- **No early exit.** `convert big.ttl --to jsonld | head -5` parses the entire
+  input before writing anything, so it costs a full conversion. The pipe trick
+  only works for the streaming syntaxes.
+
+This is a documented property of the format, not a defect to be fixed here —
+the same call `riot` makes, and the same one RDF/XML will make when it lands.
+See the writer module's own notes in `fluree-graph-format::writer`.
 
 ## Formats
 
-| In | Out |
-|---|---|
-| Turtle, N-Triples | Turtle, N-Triples, N-Quads, TriG, JSON-LD |
+| In | Out | Streaming |
+|---|---|---|
+| Turtle, N-Triples | Turtle | yes, O(1) in statements |
+| Turtle, N-Triples | N-Triples, N-Quads, TriG | yes, O(1) in statements |
+| Turtle, N-Triples | JSON-LD | **no — buffers the whole document** |
 
 N-Triples is a subset of the Turtle grammar and is read by the same parser.
 N-Quads and TriG **input** waits on the quad parsers; JSON-LD input goes
@@ -61,7 +80,7 @@ $ fluree rdf convert dump.ttl
 | `--to <SYNTAX>` | Output syntax. Overrides the `-o` extension |
 | `-o, --output <FILE>` | Write to a file instead of stdout |
 | `--bnode-policy <POLICY>` | `relabel` (default) or `preserve` |
-| `--prefixes <JSON\|PATH>` | Prefixes for compaction — inline JSON or a file |
+| `--prefixes <JSON\|PATH>` | Prefixes for compaction — inline JSON or a file. Namespaces must be absolute IRIs |
 | `--pretty` | Buffered, regrouped Turtle. **Not implemented** |
 | `--syntax <SYNTAX>` | Input syntax, overriding extension and sniffing |
 | `--base <IRI>` | Base IRI for resolving relative references |
@@ -101,9 +120,26 @@ addressable identifiers rather than incidental syntax.
 
 `--bnode-policy preserve` emits the input's labels unchanged wherever they are
 legal to emit. Labels that no RDF parser would have accepted — internal mints
-from R2RML, JSON-LD or the IR itself — are relabelled into a reserved
-namespace regardless, because emitting one would produce a document that
-either fails to parse or, worse, parses as something else.
+from R2RML, JSON-LD or the IR itself — are relabelled into the reserved
+`_:fdbw-` namespace regardless, because emitting one would produce a document
+that either fails to parse or, worse, parses as something else.
+
+That reservation has a consequence you can hit: under `preserve`, an input
+that already contains a `_:fdbw-…` label is **refused**, because preserving it
+could merge a user's node with one the writer minted. The error names the label
+and the remedy:
+
+```console
+$ fluree rdf convert collide.ttl --to nt --bnode-policy preserve
+error: the output is incomplete — the writer refused an event: blank-node label
+  `fdbw-1` is inside the `_:fdbw-` namespace this writer reserves for anonymous
+  nodes; preserving it could merge it with a minted node. Relabel instead of preserving.
+  help: convert with --bnode-policy relabel, which renames every blank node and
+  cannot collide
+```
+
+`relabel` — the default — has no such failure mode, because it renames
+everything except the `_:fdb-` carve-out.
 
 ## Prefixes
 
@@ -124,6 +160,17 @@ ex:bob
 
 For JSON-LD output the same map becomes the document's `@context`, so one flag
 means one thing whichever syntax you asked for.
+
+Every namespace must be an absolute IRI. A relative or malformed one is
+refused before anything is written, rather than producing a document this
+tool's own reader would reject:
+
+```console
+$ fluree rdf convert dump.ttl --to turtle --prefixes '{"ok":"not an iri"}'
+error: --prefixes: namespace for 'ok' is not an absolute IRI: 'not an iri'
+  help: a namespace needs a scheme, like "http://example.org/" — a relative or
+  malformed one produces a document no RDF reader accepts
+```
 
 ## Exit codes
 
