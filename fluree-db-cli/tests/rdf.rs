@@ -517,7 +517,8 @@ fn profile_json_carries_the_whole_schema_and_lands_on_stderr() {
         .iter()
         .any(|p| p["phase"] == "parse"));
     assert!(v["self_calibration"]["overhead_pct"].is_number());
-    assert!(v["self_calibration"]["trusted"].is_boolean());
+    assert!(v["self_calibration"]["phases_trusted"].is_boolean());
+    assert!(v["self_calibration"]["sink_trusted"].is_boolean());
     assert!(v["self_calibration"]["clock_reads"].as_u64().unwrap() > 0);
 }
 
@@ -689,6 +690,157 @@ fn the_sink_estimate_declines_to_report_a_number_it_cannot_resolve() {
             .any(|p| p["phase"] == "sink"),
         "an unresolved sink must not occupy a phase row"
     );
+}
+
+#[test]
+fn git_sha_names_the_build_not_whatever_checkout_the_shell_is_in() {
+    // The field is "which commit produced this binary". Resolved from the
+    // working directory it answered "which commit is the shell sitting on",
+    // so running a binary from another checkout stamped the profile with a
+    // commit that had nothing to do with it — worse than no field, because a
+    // baseline would be attributed to the wrong code.
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("elsewhere");
+    std::fs::create_dir(&repo).unwrap();
+
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+    };
+    if git(&["init"]).map(|o| !o.status.success()).unwrap_or(true) {
+        return; // no usable git here; the fallback path is covered by unit tests
+    }
+    let _ = git(&["config", "user.email", "t@example.com"]);
+    let _ = git(&["config", "user.name", "T"]);
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    let _ = git(&["add", "."]);
+    if git(&["-c", "commit.gpgsign=false", "commit", "-m", "c"])
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        return;
+    }
+    let other_head = String::from_utf8(git(&["rev-parse", "--short", "HEAD"]).unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(!other_head.is_empty());
+
+    let corpus = fixture(&tmp, "valid.ttl", VALID_TURTLE);
+    let stderr = rdf_cmd()
+        .current_dir(&repo)
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&corpus)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    let reported = v["git_sha"].as_str().unwrap();
+
+    assert_ne!(
+        reported, other_head,
+        "git_sha reported the CWD's HEAD, not the build's"
+    );
+    assert!(!reported.is_empty());
+}
+
+#[test]
+fn the_sink_line_is_absent_when_nothing_reached_the_sink() {
+    // An empty document forwards no events. A floor computed from zero calls
+    // is a statement about nothing, so there is no sink line to print.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "empty.ttl", "");
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(v["sink"]["calls"], 0);
+    assert!(v["sink"]["floor_ns_per_call"].is_null());
+
+    let human = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8_lossy(&human);
+    assert!(
+        !text.contains("sink:"),
+        "no sink line for a run with no sink calls:\n{text}"
+    );
+}
+
+#[test]
+fn the_below_floor_bound_is_stated_per_call_not_as_an_aggregate() {
+    // "under 82ms" across 720,004 calls is seven orders of magnitude away from
+    // what a reader will take it to mean. The bound is ~114ns per call.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
+    let out = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("per call"), "{text}");
+
+    let json = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let per_call = v["sink"]["floor_ns_per_call"].as_u64().unwrap();
+    let aggregate = v["sink"]["floor_ns"].as_u64().unwrap();
+    let calls = v["sink"]["calls"].as_u64().unwrap();
+    assert!(
+        (1..10_000).contains(&per_call),
+        "a per-call floor of {per_call}ns is not a per-call number"
+    );
+    assert!(
+        aggregate > per_call * calls / 2,
+        "the aggregate still agrees"
+    );
+}
+
+#[test]
+fn the_trusted_verdict_is_split_so_a_gate_can_key_on_the_phases() {
+    // The combined flag went false on essentially every `count`, via the sink
+    // artifact, which made it useless for gating the phases that were fine.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(
+        v["self_calibration"]["phases_trusted"], true,
+        "the clock reads actually taken are negligible on any real corpus"
+    );
+    assert!(v["self_calibration"]["sink_trusted"].is_boolean());
 }
 
 #[test]

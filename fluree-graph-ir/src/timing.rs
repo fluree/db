@@ -48,11 +48,30 @@
 //!    divides P that is a single shape forever, and the estimate is wrong by
 //!    whatever ratio that shape differs from the mean. Measured with the
 //!    review probe: 425× over-reported when the expensive shape is the one
-//!    sampled. Fixed by *jittering* the gap — see [`SAMPLE_STRIDE`].
+//!    sampled. Mitigated by *jittering* the gap — see [`SAMPLE_STRIDE`].
 //!
 //! [`finish`](GraphSink::finish) is timed exactly and kept out of the scaled
 //! body entirely ([`SinkTiming::finish`]): it runs once, and scaling a
 //! writer's one-time flush by the sample ratio turned 50 ms into 6.4 s.
+//!
+//! # What this is not
+//!
+//! It is not a defence against a corpus built to defeat it. The sampling
+//! schedule is a deterministic function of the corpus — that is what makes two
+//! profiles of one input comparable — and both [`corpus_seed`] and the
+//! generator are public, so anyone able to choose the input can compute
+//! exactly which statements will be timed and put the expensive work
+//! elsewhere. A reviewer did precisely that and hid 315 ms of real sink cost.
+//!
+//! Reproducible and unpredictable are incompatible, and reproducible is the
+//! one a baseline needs. So the guarantee here is against *accidental*
+//! structure — the periodic corpora that occur naturally, which is what the
+//! probe found and what a fixed stride mishandles — and not against a
+//! constructed one. The floor and [`SinkTiming::relative_std_error`] bound how
+//! much an ordinary sample can be trusted; neither can see work that was
+//! deliberately placed where nobody was looking. Treat the sink estimate as an
+//! observation about a cooperating corpus, never as a measurement of an
+//! untrusted one.
 
 use crate::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::time::{Duration, Instant};
@@ -332,14 +351,22 @@ impl SinkCounts {
 /// when it was not. Choosing the offset per corpus would only move which
 /// corpora are wrong.
 ///
-/// Jitter removes the failure mode rather than relocating it: an
-/// aperiodic sampler has no residue class to be confined to, for any `P`. The
-/// draw is seeded from the corpus (see [`corpus_seed`]), so a given input
-/// still samples the same statements on every run and baselines stay
-/// reproducible.
+/// Jitter addresses the failure mode rather than relocating it: an aperiodic
+/// schedule has no residue class to be confined to, so no *naturally* periodic
+/// corpus — whatever its period — can systematically hide from it or
+/// systematically dominate it. That is the class the probe found.
 ///
-/// What remains is ordinary sampling error, which shrinks as `1/√n` in the
-/// number of sampled statements and is bounded from below by
+/// It is not unpredictable. The draw is seeded from the corpus
+/// ([`corpus_seed`]) so a given input samples the same statements on every
+/// run, which is what makes two profiles of it comparable; and since seed and
+/// generator are both public, anyone who chooses the input can replay the
+/// schedule and arrange for the expensive statements to fall in the gaps. See
+/// the module docs — that trade is deliberate, and it means the estimate
+/// describes a cooperating corpus, not an adversarial one.
+///
+/// What remains for an ordinary corpus is sampling error, which shrinks as
+/// `1/√n` in the number of sampled statements, is reported per-run as
+/// [`SinkTiming::relative_std_error`], and is bounded from below by
 /// [`SinkTiming::floor`].
 pub const SAMPLE_STRIDE: u64 = 127;
 
@@ -381,7 +408,7 @@ pub fn corpus_seed(bytes: &[u8]) -> u64 {
 /// Deliberately not a single `Duration`. The per-event body is an estimate
 /// that may not be resolvable at all; `finish` is exact; and the artifact and
 /// floor are what let a consumer judge the first two rather than trust them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SinkTiming {
     /// Estimated time inside the sink's per-event methods, with the clock
     /// artifact removed before scaling.
@@ -411,13 +438,38 @@ pub struct SinkTiming {
     pub clock_reads: u64,
     /// Measured cost of one clock pair on this host.
     pub clock_pair: Duration,
+    /// Standard error of the mean sampled statement cost, as a fraction of
+    /// that mean. `None` with fewer than two samples.
+    ///
+    /// The spread the extrapolation is riding on: a corpus of uniform
+    /// statements gives a small number, one whose statements vary wildly gives
+    /// a large one, and a large one means [`Self::body`] should be read as an
+    /// order of magnitude rather than a figure. It bounds ordinary sampling
+    /// error only — see the module docs for what it cannot see.
+    pub relative_std_error: Option<f64>,
 }
 
 impl SinkTiming {
     /// The smallest body estimate that would be reported rather than
-    /// suppressed.
+    /// suppressed: [`FLOOR_MULTIPLE`] × [`Self::artifact`].
+    ///
+    /// This is the actual threshold, not the artifact it derives from —
+    /// printing the artifact under the name "floor" understated the bar by
+    /// a factor of three.
     pub fn floor(&self) -> Duration {
         self.artifact
+            .saturating_mul(FLOOR_MULTIPLE)
+            .min(Duration::MAX)
+    }
+
+    /// The floor expressed per forwarded call: the per-event cost the sink
+    /// would have to exceed for this instrument to see it.
+    ///
+    /// The aggregate floor is the honest threshold but a useless quantity to
+    /// show a reader — "under 82 ms" across 720,004 calls sounds enormous and
+    /// means 114 ns. `None` when nothing was forwarded.
+    pub fn floor_per_call(&self) -> Option<Duration> {
+        (self.calls > 0).then(|| self.floor() / u32::try_from(self.calls).unwrap_or(u32::MAX))
     }
 
     /// Whether the per-event cost could not be resolved.
@@ -456,6 +508,14 @@ pub struct TimingSink<S> {
     sampled_calls: u64,
     /// Statements sampled, for the sampling-error picture.
     sampled_statements: u64,
+    /// Time accumulated by the statement currently being sampled, so each
+    /// sampled statement contributes one observation to the variance.
+    current_statement: Duration,
+    /// Welford running mean and sum-of-squared-deviations over per-statement
+    /// sampled costs, in nanoseconds. One-pass and numerically stable, which
+    /// a naive sum-of-squares is not at nanosecond scale.
+    welford_mean: f64,
+    welford_m2: f64,
     /// Whether the statement in flight is being timed.
     sampling: bool,
     /// Statement index at which to start sampling again.
@@ -498,6 +558,9 @@ impl<S: GraphSink> TimingSink<S> {
             sampled_time: Duration::ZERO,
             sampled_calls: 0,
             sampled_statements: 0,
+            current_statement: Duration::ZERO,
+            welford_mean: 0.0,
+            welford_m2: 0.0,
             sampling: false,
             next_sample_at: 0,
             rng: if seed == 0 {
@@ -563,6 +626,7 @@ impl<S: GraphSink> TimingSink<S> {
             sampled_statements: self.sampled_statements,
             clock_reads: self.clock_reads,
             clock_pair: self.clock_pair,
+            relative_std_error: self.relative_std_error(),
         }
     }
 
@@ -587,6 +651,32 @@ impl<S: GraphSink> TimingSink<S> {
     /// disclosure, alongside [`PhaseTimings::clock_reads`].
     pub fn clock_reads(&self) -> u64 {
         self.clock_reads
+    }
+
+    /// Fold the statement that just finished into the running variance, then
+    /// reset the per-statement accumulator.
+    ///
+    /// The observation is per *statement*, not per call: statements are what
+    /// the sampler chooses between, so they are the unit whose spread bounds
+    /// the extrapolation.
+    fn observe_statement(&mut self) {
+        let x = self.current_statement.as_nanos() as f64;
+        self.current_statement = Duration::ZERO;
+        let n = self.sampled_statements as f64;
+        let delta = x - self.welford_mean;
+        self.welford_mean += delta / n;
+        self.welford_m2 += delta * (x - self.welford_mean);
+    }
+
+    /// Relative standard error of the mean sampled statement cost.
+    fn relative_std_error(&self) -> Option<f64> {
+        let n = self.sampled_statements;
+        if n < 2 || self.welford_mean <= 0.0 {
+            return None;
+        }
+        let variance = self.welford_m2 / (n - 1) as f64;
+        let std_error = variance.sqrt() / (n as f64).sqrt();
+        Some(std_error / self.welford_mean)
     }
 
     /// Draw the next jittered gap: uniform over `0..2×SAMPLE_STRIDE - 1`, so
@@ -628,7 +718,9 @@ impl<S: GraphSink> TimingSink<S> {
         }
         let start = Instant::now();
         let out = f(&mut self.inner);
-        self.sampled_time += start.elapsed();
+        let elapsed = start.elapsed();
+        self.sampled_time += elapsed;
+        self.current_statement += elapsed;
         self.sampled_calls += 1;
         self.clock_reads += 2;
         out
@@ -640,6 +732,7 @@ impl<S: GraphSink> TimingSink<S> {
         let seen = self.counts.statements + self.counts.aborted_statements;
         if self.sampling {
             self.sampled_statements += 1;
+            self.observe_statement();
             // `seen` already counts the statement that just ended.
             #[cfg(test)]
             self.sampled_statement_indices.push(seen - 1);
@@ -1147,18 +1240,30 @@ mod tests {
         drive_discard(&mut sink, 20_000);
         let t = sink.sink_timing();
 
-        // What the uncorrected estimator would have said.
-        let uncorrected = duration_from_nanos_u128(
-            sink.sampled_time
-                .as_nanos()
-                .saturating_mul(u128::from(t.calls))
-                / u128::from(t.sampled_calls),
-        );
+        // What the uncorrected estimator would have said, versus what the
+        // corrected one computes. Compared as algebra over the same measured
+        // clock_pair rather than against a second measurement of it — two
+        // independent timings of a nanosecond-scale quantity race each other
+        // on a loaded machine, and the property under test is not a race.
+        let uncorrected = sink
+            .sampled_time
+            .as_nanos()
+            .saturating_mul(u128::from(t.calls))
+            / u128::from(t.sampled_calls);
+        let corrected = sink
+            .estimate_body_ns(t.calls, t.clock_pair.as_nanos())
+            .expect("something was sampled");
+
         assert!(
-            uncorrected > t.artifact / 2,
-            "the probe's premise: uncorrected {uncorrected:?} is artifact-scale \
-             ({:?})",
-            t.artifact
+            corrected < uncorrected,
+            "nothing was subtracted: {corrected} vs {uncorrected}"
+        );
+        let removed = uncorrected - corrected;
+        assert!(
+            removed <= t.artifact.as_nanos() + u128::from(t.calls),
+            "removed {removed}ns, more than the {}ns artifact it is allowed to \
+             remove (plus one ns per call of integer-division slack)",
+            t.artifact.as_nanos()
         );
         assert!(t.below_floor(), "and the corrected estimator declines it");
     }
@@ -1287,6 +1392,109 @@ mod tests {
         assert_eq!(t.finish, Duration::ZERO);
         assert_eq!(t.sampled_pct(), 0.0);
         assert_eq!(t.calls, 0);
+    }
+
+    #[test]
+    fn the_floor_is_the_threshold_not_the_artifact_it_derives_from() {
+        // `floor()` returning the artifact understated the actual bar by a
+        // factor of FLOOR_MULTIPLE, so a report printing it named a threshold
+        // that was not the one being applied.
+        let mut sink = TimingSink::new(DiscardSink::default());
+        drive_discard(&mut sink, 5_000);
+        let t = sink.sink_timing();
+
+        assert_eq!(t.floor(), t.artifact * FLOOR_MULTIPLE);
+        assert!(t.floor() > t.artifact);
+    }
+
+    #[test]
+    fn the_per_call_floor_is_the_aggregate_divided_by_the_calls() {
+        // The aggregate is the honest threshold and a useless thing to show:
+        // "under 82ms" across 720k calls reads as enormous and means ~114ns.
+        let mut sink = TimingSink::new(DiscardSink::default());
+        drive_discard(&mut sink, 5_000);
+        let t = sink.sink_timing();
+
+        let per_call = t.floor_per_call().expect("calls were forwarded");
+        assert!(
+            per_call < Duration::from_micros(10),
+            "a per-call floor of {per_call:?} is not a per-call quantity"
+        );
+        assert_eq!(per_call, t.floor() / u32::try_from(t.calls).unwrap());
+
+        // Nothing forwarded, nothing to divide by.
+        let empty: TimingSink<DiscardSink> = TimingSink::new(DiscardSink::default());
+        assert_eq!(empty.sink_timing().floor_per_call(), None);
+    }
+
+    #[test]
+    fn the_sampling_error_bound_is_reported_and_grows_with_dispersion() {
+        // A uniform corpus and a wildly varying one must not report the same
+        // confidence in an extrapolation from the same number of samples.
+        let mut uniform = TimingSink::new(SpinSink::new(Duration::from_micros(20)));
+        drive_discard(&mut uniform, 3_000);
+        let uniform_err = uniform
+            .sink_timing()
+            .relative_std_error
+            .expect("more than one sample");
+
+        struct Erratic {
+            statement: u64,
+            inner: DiscardSink,
+        }
+        impl GraphSink for Erratic {
+            fn on_base(&mut self, _: &str) {}
+            fn on_prefix(&mut self, _: &str, _: &str) {}
+            fn term_iri(&mut self, i: &str) -> TermId {
+                self.inner.term_iri(i)
+            }
+            fn term_blank(&mut self, l: Option<&str>) -> TermId {
+                self.inner.term_blank(l)
+            }
+            fn term_literal(&mut self, v: &str, d: Datatype, l: Option<&str>) -> TermId {
+                self.inner.term_literal(v, d, l)
+            }
+            fn term_literal_value(&mut self, v: LiteralValue, d: Datatype) -> TermId {
+                self.inner.term_literal_value(v, d)
+            }
+            fn emit_triple(&mut self, _: TermId, _: TermId, _: TermId) -> SinkResult {
+                // Two wildly different populations, alternating.
+                if self.statement.is_multiple_of(2) {
+                    spin_for(Duration::from_micros(200));
+                }
+                Ok(())
+            }
+            fn end_statement(&mut self) {
+                self.statement += 1;
+            }
+        }
+
+        let mut erratic = TimingSink::new(Erratic {
+            statement: 0,
+            inner: DiscardSink::default(),
+        });
+        drive_discard(&mut erratic, 3_000);
+        let erratic_err = erratic
+            .sink_timing()
+            .relative_std_error
+            .expect("more than one sample");
+
+        assert!(
+            erratic_err > uniform_err,
+            "a corpus whose statements vary by 200x must report a wider bound: \
+             erratic {erratic_err:.4} vs uniform {uniform_err:.4}"
+        );
+    }
+
+    #[test]
+    fn the_sampling_error_bound_needs_at_least_two_samples() {
+        let mut sink = TimingSink::new(DiscardSink::default());
+        drive_discard(&mut sink, 1);
+        assert_eq!(
+            sink.sink_timing().relative_std_error,
+            None,
+            "one observation has no spread to report"
+        );
     }
 
     #[test]

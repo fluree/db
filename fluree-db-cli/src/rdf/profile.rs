@@ -16,7 +16,7 @@
 
 use crate::rdf::syntax::{Compression, RdfSyntax, SyntaxSource};
 use fluree_bench_support::report::{print_summary, SummaryRow};
-use fluree_graph_ir::{Phase, PhaseTimings, SinkCounts, SinkTiming, FLOOR_MULTIPLE};
+use fluree_graph_ir::{Phase, PhaseTimings, SinkCounts, SinkTiming};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -91,15 +91,36 @@ fn host_class() -> String {
         .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
 }
 
-/// The build this binary came from, discovered at runtime.
+/// The commit this binary was **built from**, discovered at runtime.
 ///
-/// `git rev-parse` in the working directory, not a build script: the
-/// workspace has none and adding the first one to stamp a profile field would
-/// put a git dependency in front of every release build. The cost is one
-/// process spawn, paid only under `--profile`, and `"unknown"` is a perfectly
-/// good answer from an installed binary that is nowhere near a checkout.
+/// Precisely: `git rev-parse --short HEAD` run in the directory containing the
+/// running executable. For a `cargo build` artifact that is `target/<profile>/`
+/// inside the source checkout, so it reports the commit that produced the
+/// binary. For a binary installed anywhere outside a checkout there is no
+/// repository to ask and the answer is `"unknown"`.
+///
+/// Resolving from the executable rather than the working directory is the
+/// whole point of the field. Asking the *current directory* answers "which
+/// commit is the shell sitting on", so a binary built from one commit and run
+/// from another checkout confidently stamped the profile with a commit that
+/// had nothing to do with it — which is worse than no field, because a
+/// baseline would be attributed to the wrong code.
+///
+/// Not a build script: the workspace has none, and adding the first one to
+/// stamp a profile field would put a git dependency in front of every release
+/// build. The cost here is one process spawn, paid only under `--profile`.
 fn git_sha() -> String {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return UNKNOWN_SHA.to_string();
+    };
     std::process::Command::new("git")
+        // `-C` also makes git's upward search start here rather than at the
+        // process's cwd, which is the actual fix.
+        .arg("-C")
+        .arg(&dir)
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
@@ -107,8 +128,11 @@ fn git_sha() -> String {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| UNKNOWN_SHA.to_string())
 }
+
+/// Reported when the running binary is not inside a git checkout.
+pub const UNKNOWN_SHA: &str = "unknown";
 
 /// Peak resident set size for this process, in bytes.
 ///
@@ -127,7 +151,7 @@ fn peak_rss_bytes() -> Option<u64> {
         }
         usage
     };
-    Some(normalize_max_rss(usage.ru_maxrss as i64))
+    Some(normalize_max_rss(usage.ru_maxrss as i64, DARWIN_UNITS))
 }
 
 #[cfg(not(unix))]
@@ -135,13 +159,19 @@ fn peak_rss_bytes() -> Option<u64> {
     None
 }
 
-/// Convert a raw `ru_maxrss` to bytes for the current platform.
+/// Whether this build's `ru_maxrss` is already in bytes (Darwin) rather than
+/// kilobytes (everywhere else).
+const DARWIN_UNITS: bool = cfg!(any(target_os = "macos", target_os = "ios"));
+
+/// Convert a raw `ru_maxrss` to bytes.
 ///
-/// Split out from the syscall so the unit conversion — the part that is
-/// actually easy to get wrong — is testable without one.
-fn normalize_max_rss(raw: i64) -> u64 {
+/// `darwin_units` is a parameter rather than a `cfg!` inside the body so both
+/// branches are reachable from a test on either platform. A unit conversion
+/// that only one platform's CI ever executes is a factor of 1024 waiting to
+/// ship — which is exactly the bench lane's standing lesson about this field.
+fn normalize_max_rss(raw: i64, darwin_units: bool) -> u64 {
     let raw = raw.max(0) as u64;
-    if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
+    if darwin_units {
         raw
     } else {
         raw.saturating_mul(1024)
@@ -178,8 +208,12 @@ struct SinkInfo {
     body_ns: Option<u128>,
     /// True when the sink is cheaper than the instrument can resolve.
     below_measurement_floor: bool,
-    /// The threshold `body_ns` had to clear.
+    /// The aggregate threshold `body_ns` had to clear.
     floor_ns: u128,
+    /// The same threshold per forwarded call — the per-event cost the sink
+    /// would have to exceed to be visible at all. `null` when nothing was
+    /// forwarded.
+    floor_ns_per_call: Option<u128>,
     /// Clock cost that a scaled estimate carries: `calls × clock_pair_ns`.
     artifact_ns: u128,
     /// `finish()` — measured exactly, never scaled.
@@ -188,6 +222,9 @@ struct SinkInfo {
     sampled_calls: u64,
     sampled_statements: u64,
     sampled_pct: f64,
+    /// Standard error of the mean sampled statement cost, relative to that
+    /// mean, in percent. `null` with fewer than two sampled statements.
+    relative_std_error_pct: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -225,16 +262,26 @@ struct SelfCalibration {
     /// Large whenever the sink is cheap, which is why the sink estimate is
     /// floored rather than trusted — see the `sink` block.
     estimator_artifact_pct: f64,
-    /// The larger of the two above; the figure `trusted` gates on. They
-    /// overlap (the reads actually taken are a subset of the extrapolation),
-    /// so this is a max and not a sum.
+    /// The larger of the two above. They overlap (the reads actually taken are
+    /// a subset of the extrapolation), so this is a max and not a sum.
     overhead_pct: f64,
-    /// False when `overhead_pct` exceeds [`OVERHEAD_TRUST_LIMIT_PCT`]. When
-    /// only `estimator_artifact_pct` drove it over, the read/decompress/parse
-    /// phases are still sound — it is the sink estimate that is
-    /// instrument-dominated, and the `sink` block says whether it was
-    /// reported at all.
-    trusted: bool,
+    /// Whether the read / decompress / parse / write phases are usable as a
+    /// baseline: `measured_overhead_pct` within [`OVERHEAD_TRUST_LIMIT_PCT`].
+    ///
+    /// This is the half a Tier-1 gate should key on. It is driven only by the
+    /// clock reads the run actually took, which are negligible by
+    /// construction, so it stays true for any real corpus — and goes false for
+    /// the runs too short to measure at all.
+    phases_trusted: bool,
+    /// Whether the sink estimate is usable as a baseline:
+    /// `estimator_artifact_pct` within [`OVERHEAD_TRUST_LIMIT_PCT`].
+    ///
+    /// Separate from `phases_trusted` because it is false on essentially every
+    /// `count` run — a discard sink's extrapolated clock artifact is a large
+    /// share of a fast parse — and a single combined flag that is always false
+    /// is a flag nobody reads. A gate that keys on the phases is not affected
+    /// by the sink being unmeasurable.
+    sink_trusted: bool,
 }
 
 /// One profiled run, ready to render.
@@ -348,13 +395,15 @@ impl ProfileReport {
             sink: SinkInfo {
                 body_ns: sink.body.map(|b| b.as_nanos()),
                 below_measurement_floor: sink.below_floor(),
-                floor_ns: sink.floor().as_nanos() * u128::from(FLOOR_MULTIPLE),
+                floor_ns: sink.floor().as_nanos(),
+                floor_ns_per_call: sink.floor_per_call().map(|d| d.as_nanos()),
                 artifact_ns: sink.artifact.as_nanos(),
                 finish_ns: sink.finish.as_nanos(),
                 calls: sink.calls,
                 sampled_calls: sink.sampled_calls,
                 sampled_statements: sink.sampled_statements,
                 sampled_pct: sink.sampled_pct(),
+                relative_std_error_pct: sink.relative_std_error.map(|e| e * 100.0),
             },
             counts: CountsInfo {
                 triples: counts.triples,
@@ -377,7 +426,8 @@ impl ProfileReport {
                 measured_overhead_pct: measured_pct,
                 estimator_artifact_pct: artifact_pct,
                 overhead_pct,
-                trusted: overhead_pct <= OVERHEAD_TRUST_LIMIT_PCT,
+                phases_trusted: measured_pct <= OVERHEAD_TRUST_LIMIT_PCT,
+                sink_trusted: artifact_pct <= OVERHEAD_TRUST_LIMIT_PCT,
             },
         }
     }
@@ -445,19 +495,27 @@ impl ProfileReport {
         // The sink line is where an unresolvable number used to be printed as
         // though it were a measurement.
         let sink = &self.sink;
-        if sink.below_measurement_floor {
+        if sink.calls == 0 {
+            // Nothing was forwarded — an empty document, or a failure before
+            // the first event. There is no sink to say anything about, and a
+            // floor computed from zero calls is a statement about nothing.
+        } else if sink.below_measurement_floor {
             eprintln!(
-                "  sink: below the measurement floor — across {} calls its per-event cost \
-                 is under {}, which is where the clock's own {} stops being separable from it",
+                "  sink: below the measurement floor — under {} per call across {} calls, \
+                 which is where the clock's own {}/call stops being separable from it",
+                sink.floor_ns_per_call
+                    .map_or_else(|| "?".to_string(), human_duration),
                 sink.calls,
-                human_duration(sink.floor_ns),
-                human_duration(sink.artifact_ns),
+                human_duration(sink.artifact_ns / u128::from(sink.calls).max(1)),
             );
         } else {
             eprintln!(
-                "  sink: ~{} estimated from {:.2}% of calls (±sampling error), inside the parse phase",
+                "  sink: ~{} estimated from {:.2}% of calls{}, inside the parse phase",
                 human_duration(sink.body_ns.unwrap_or(0)),
                 sink.sampled_pct,
+                sink.relative_std_error_pct
+                    .map(|e| format!(" (±{e:.0}% sampling error)"))
+                    .unwrap_or_default(),
             );
         }
         if sink.finish_ns > 0 {
@@ -472,17 +530,22 @@ impl ProfileReport {
             "  profiler cost {:.3}% of wall ({} clock reads @ {}ns/pair)",
             cal.measured_overhead_pct, cal.clock_reads, cal.clock_pair_ns,
         );
-        if !cal.trusted {
-            // Say which part is untrustworthy. "Untrusted" stamped on a report
-            // whose read and parse phases are sound is a warning people learn
-            // to ignore.
-            let detail = if cal.estimator_artifact_pct > cal.measured_overhead_pct {
-                "the sink estimator's extrapolated clock artifact — the sink figure is \
-                 not a baseline; read, decompress and parse are unaffected"
-            } else {
-                "the profiler's own clock reads — no phase share here is usable as a baseline"
-            };
-            eprintln!("  UNTRUSTED: {:.1}% of wall is {detail}", cal.overhead_pct);
+        // Two verdicts, because they fail for different reasons and a Tier-1
+        // gate keys on the first. A single flag that is false on every `count`
+        // run is a flag nobody reads.
+        if !cal.phases_trusted {
+            eprintln!(
+                "  UNTRUSTED phases: the profiler's own clock reads are {:.1}% of wall — \
+                 no phase share here is usable as a baseline",
+                cal.measured_overhead_pct
+            );
+        }
+        if !cal.sink_trusted && sink.calls > 0 {
+            eprintln!(
+                "  UNTRUSTED sink: its extrapolated clock artifact is {:.1}% of wall — \
+                 the sink figure is not a baseline; read, decompress and parse are unaffected",
+                cal.estimator_artifact_pct
+            );
         }
     }
 }
@@ -608,6 +671,7 @@ mod tests {
             sampled_statements: 8,
             clock_reads: 48,
             clock_pair: Duration::from_nanos(20),
+            relative_std_error: Some(0.12),
         }
     }
 
@@ -656,7 +720,8 @@ mod tests {
         assert!(v["self_calibration"]["measured_overhead_pct"].is_number());
         assert!(v["self_calibration"]["estimator_artifact_pct"].is_number());
         assert!(v["self_calibration"]["overhead_pct"].is_number());
-        assert!(v["self_calibration"]["trusted"].is_boolean());
+        assert!(v["self_calibration"]["phases_trusted"].is_boolean());
+        assert!(v["self_calibration"]["sink_trusted"].is_boolean());
 
         // Added by the review: a baseline that cannot say which host or which
         // build produced it is not a baseline.
@@ -757,7 +822,7 @@ mod tests {
             noisy,
         );
         assert!(r.self_calibration.overhead_pct > OVERHEAD_TRUST_LIMIT_PCT);
-        assert!(!r.self_calibration.trusted);
+        assert!(!r.self_calibration.phases_trusted);
 
         // And a long run with a handful of reads is trusted.
         let r = ProfileReport::build(
@@ -767,7 +832,8 @@ mod tests {
             counts(),
             resolved_sink(),
         );
-        assert!(r.self_calibration.trusted);
+        assert!(r.self_calibration.phases_trusted);
+        assert!(r.self_calibration.sink_trusted);
     }
 
     #[test]
@@ -781,6 +847,7 @@ mod tests {
             sampled_statements: 0,
             clock_reads: 0,
             clock_pair: Duration::from_nanos(20),
+            relative_std_error: None,
         };
         let r = ProfileReport::build(
             &ctx(),
@@ -899,7 +966,14 @@ mod tests {
             cal.measured_overhead_pct
         );
         assert!(cal.estimator_artifact_pct > 50.0);
-        assert!(!cal.trusted, "the artifact alone must trip the marker");
+        assert!(
+            !cal.sink_trusted,
+            "the artifact alone must trip the sink verdict"
+        );
+        assert!(
+            cal.phases_trusted,
+            "…and must NOT drag the phases down with it — that is the split"
+        );
         assert_eq!(cal.overhead_pct, cal.estimator_artifact_pct);
     }
 
@@ -918,14 +992,19 @@ mod tests {
         // The one place the Darwin-bytes / Linux-kilobytes split is handled.
         // Getting it wrong is a silent factor of 1024 on one platform only.
         let raw = 4096;
-        let expected = if cfg!(any(target_os = "macos", target_os = "ios")) {
-            4096
-        } else {
-            4096 * 1024
-        };
-        assert_eq!(normalize_max_rss(raw), expected);
+        let expected = if DARWIN_UNITS { 4096 } else { 4096 * 1024 };
+        assert_eq!(normalize_max_rss(raw, DARWIN_UNITS), expected);
+        // BOTH branches, on whichever platform this runs: the conversion that
+        // only one CI executes is the one that ships wrong.
+        assert_eq!(normalize_max_rss(4096, true), 4096, "Darwin reports bytes");
+        assert_eq!(
+            normalize_max_rss(4096, false),
+            4096 * 1024,
+            "Linux reports kilobytes"
+        );
         // A negative reading (some kernels, on failure) is floored, not wrapped.
-        assert_eq!(normalize_max_rss(-1), 0);
+        assert_eq!(normalize_max_rss(-1, true), 0);
+        assert_eq!(normalize_max_rss(-1, false), 0);
     }
 
     #[test]
