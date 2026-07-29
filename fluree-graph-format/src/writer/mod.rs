@@ -125,33 +125,85 @@ pub struct WriterStats {
     /// Under statement buffering this counts bytes at commit time, for the
     /// same reason.
     pub bytes: u64,
+
+    /// Statements the producer rolled back with
+    /// [`abort_statement`](fluree_graph_ir::GraphSink::abort_statement).
+    ///
+    /// Counted whether or not the rollback could take the bytes back — an
+    /// unbuffered writer cannot, and a `--continue-on-error` run reporting
+    /// "3 statements skipped" wants to know either way.
+    pub aborted: u64,
+
+    /// Events this writer refused.
+    ///
+    /// An indexed list item against a text writer, a literal in a position
+    /// that cannot hold one, a blank-node label the policy will not emit. The
+    /// counter exists so a driver can report refusals without keeping its own
+    /// tally of the errors it has already seen — and because the *latched*
+    /// refusals that follow the first one are not separate events and must
+    /// not inflate it.
+    pub refused: u64,
 }
 
-/// A failure raised where the protocol has no error channel, held until an
-/// emission can report it.
+/// Every way this writer can have failed, held until something with a return
+/// value can report it.
 ///
-/// Two methods need this. `term_blank` returns a [`TermId`](fluree_graph_ir::TermId)
-/// and cannot refuse a label the writer must not emit; `end_statement` returns
-/// nothing and cannot report a broken pipe hit while flushing a buffered
-/// statement. Both stash here, and the next `emit_*` raises it — before
-/// anything the failure would have corrupted reaches the output.
+/// Several protocol methods have no error channel. `term_blank` returns a
+/// [`TermId`](fluree_graph_ir::TermId) and cannot refuse a label the writer
+/// must not emit; `end_statement` and `on_prefix` return nothing and cannot
+/// report a broken pipe. All of them stash here, and the next `emit_*` — or
+/// `finish`, if there is no next emission — raises it.
 ///
-/// The failure is *sticky*. The protocol says a sink that has failed once need
-/// not behave sensibly afterwards, but "predictably refuses" is a better
-/// answer than "writes the label it just refused", which is what taking the
-/// error and forgetting it would do to a producer that ignores one result.
+/// # Sticky, and `finish` sees it
+///
+/// The failure latches. The protocol says a sink that has failed once need not
+/// behave sensibly afterwards, but "predictably refuses" is a better answer
+/// than "writes the label it just refused", which is what taking the error and
+/// forgetting it would do to a producer that ignores one result.
+///
+/// It must also survive to `finish`, because a refusal can be the *last* event
+/// — a closed pipe on the final buffered statement, or a rejection nothing
+/// emits after. A `finish` returning `Ok` there would tell a driver the
+/// document was written when part of it was lost, which is the one report a
+/// converter must never make.
 #[derive(Debug, Default)]
 pub(crate) struct Deferred {
     pending: Option<SinkError>,
     failed: bool,
+    /// Distinct events refused, for [`WriterStats::refused`]. Latched
+    /// re-refusals are not events and are not counted.
+    refusals: u64,
 }
 
 impl Deferred {
-    /// Record a failure. The first one wins — it has the context.
-    pub(crate) fn set(&mut self, error: SinkError) {
+    /// Stash a failure raised where nothing can return it — an I/O error from
+    /// `end_statement` or `on_prefix`. Not counted as a refusal: the writer
+    /// did not decline anything, the output did.
+    ///
+    /// The first failure wins; it has the context.
+    pub(crate) fn stash(&mut self, error: SinkError) {
         if self.pending.is_none() {
             self.pending = Some(error);
         }
+    }
+
+    /// Stash a *refusal* raised where nothing can return it — `term_blank`
+    /// declining a label the policy will not emit.
+    pub(crate) fn stash_refusal(&mut self, error: SinkError) {
+        self.refusals += 1;
+        self.stash(error);
+    }
+
+    /// Count and latch a refusal that is being returned right now.
+    ///
+    /// Latching is the point: without it, a refusal raised from a method that
+    /// *does* return a result would be reported once and then forgotten, and
+    /// `finish` would go on to claim success for a document missing whatever
+    /// the refused event carried.
+    pub(crate) fn refuse(&mut self, message: impl Into<String>) -> SinkError {
+        self.refusals += 1;
+        self.failed = true;
+        SinkError::rejected(message)
     }
 
     /// Raise a stashed failure, if there is one, or if there ever was one.
@@ -166,6 +218,11 @@ impl Deferred {
             ));
         }
         Ok(())
+    }
+
+    /// How many distinct events were refused.
+    pub(crate) fn refusals(&self) -> u64 {
+        self.refusals
     }
 }
 

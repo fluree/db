@@ -74,12 +74,12 @@ impl WriterTerms {
             return id;
         }
         let output = match self.labeler.labelled(label) {
-            Ok(output) => output.to_string(),
+            Ok(output) => output,
             Err(e) => {
-                deferred.set(e);
+                deferred.stash_refusal(e);
                 // A placeholder that is never written: the next emit fails,
                 // and every emission after it fails too.
-                label.to_string()
+                label.into()
             }
         };
         let id = self.push(Term::blank(output));

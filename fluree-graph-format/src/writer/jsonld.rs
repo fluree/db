@@ -38,6 +38,7 @@ pub struct JsonLdWriter<W: Write> {
     /// [`GraphSink::abort_statement`]. A statement may contribute several
     /// triples, so this is not derivable from the statement counter.
     mark: usize,
+    aborted: u64,
     /// Failures raised where the protocol has no error channel.
     deferred: Deferred,
     finished: bool,
@@ -73,6 +74,7 @@ impl<W: Write> JsonLdWriter<W> {
             config: jsonld,
             statements: 0,
             mark: 0,
+            aborted: 0,
             deferred: Deferred::default(),
             finished: false,
         }
@@ -86,6 +88,8 @@ impl<W: Write> JsonLdWriter<W> {
         WriterStats {
             statements: self.statements,
             bytes: self.out.bytes(),
+            aborted: self.aborted,
+            refused: self.deferred.refusals(),
         }
     }
 
@@ -169,6 +173,7 @@ impl<W: Write> GraphSink for JsonLdWriter<W> {
         // the configuration — the one writer where that is free.
         self.statements -= (self.graph.len() - self.mark) as u64;
         self.graph.truncate(self.mark);
+        self.aborted += 1;
     }
 
     fn finish(&mut self) -> SinkResult {

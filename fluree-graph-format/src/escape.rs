@@ -251,7 +251,7 @@ mod tests {
     /// real gap rather than dead code correctly removed.
     #[test]
     fn every_control_character_fits_the_four_hex_form() {
-        for cp in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+        for cp in (0..=0x0010_FFFF_u32).filter_map(char::from_u32) {
             if cp.is_control() {
                 assert!(
                     cp as u32 <= 0xFFFF,

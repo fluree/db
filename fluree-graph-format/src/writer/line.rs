@@ -6,7 +6,7 @@
 
 use super::terms::{write_nt_term, WriterTerms};
 use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::io::Write;
 
 /// Shared machinery: the two line formats differ only in whether a graph term
@@ -15,6 +15,7 @@ struct LineCore<W: Write> {
     out: Out<W>,
     terms: WriterTerms,
     statements: u64,
+    aborted: u64,
     /// Failures raised where the protocol has no error channel.
     deferred: Deferred,
 }
@@ -25,6 +26,7 @@ impl<W: Write> LineCore<W> {
             out: Out::new(writer, config.buffer_statements),
             terms: WriterTerms::new(BlankLabeler::new(config.blank_labels)),
             statements: 0,
+            aborted: 0,
             deferred: Deferred::default(),
         }
     }
@@ -37,13 +39,7 @@ impl<W: Write> LineCore<W> {
         graph: Option<TermId>,
     ) -> SinkResult {
         self.deferred.check()?;
-        if let Some(graph) = graph {
-            if self.terms.get(graph).is_literal() {
-                return Err(SinkError::rejected(
-                    "a literal cannot name a graph; graph names are IRIs or blank nodes",
-                ));
-            }
-        }
+        self.refuse_unwritable_positions(subject, predicate, graph)?;
 
         let Self { out, terms, .. } = self;
         write_nt_term(out, terms.get(subject))?;
@@ -60,9 +56,36 @@ impl<W: Write> LineCore<W> {
         Ok(())
     }
 
+    /// Refuse a term in a position whose syntax cannot hold it.
+    ///
+    /// A literal may not be a subject, a predicate, or a graph name in any RDF
+    /// syntax. The protocol does not enforce this — `Triple` documents the
+    /// invariant without checking it — so a hand-fed producer can present one,
+    /// and writing it would produce a document no parser reads.
+    fn refuse_unwritable_positions(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        graph: Option<TermId>,
+    ) -> SinkResult {
+        for (id, position) in [
+            (Some(subject), "a subject"),
+            (Some(predicate), "a predicate"),
+            (graph, "a graph name"),
+        ] {
+            let Some(id) = id else { continue };
+            if self.terms.get(id).is_literal() {
+                return Err(self.deferred.refuse(format!(
+                    "a literal cannot be {position}; it must be an IRI or a blank node"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The `emit_list_item` refusal, shared by both formats.
-    fn refuse_list_item(&self) -> SinkResult {
-        Err(SinkError::rejected(
+    fn refuse_list_item(&mut self) -> SinkResult {
+        Err(self.deferred.refuse(
             "an indexed list item has no RDF spelling: a collection is three triples per element, \
              and this event carries one triple plus a position. Parse with \
              CollectionStyle::Spine to write collections as RDF.",
@@ -73,6 +96,8 @@ impl<W: Write> LineCore<W> {
         WriterStats {
             statements: self.statements,
             bytes: self.out.bytes(),
+            aborted: self.aborted,
+            refused: self.deferred.refusals(),
         }
     }
 }
@@ -129,17 +154,23 @@ macro_rules! line_sink_common {
             // emission to raise — which is what keeps early termination
             // working in buffered mode too.
             if let Err(e) = self.0.out.commit_statement() {
-                self.0.deferred.set(e.into());
+                self.0.deferred.stash(e.into());
             }
         }
 
         fn abort_statement(&mut self) {
             self.0.terms.end_statement();
             self.0.out.discard_statement();
+            self.0.aborted += 1;
         }
 
         fn finish(&mut self) -> SinkResult {
-            self.0.out.finish()?;
+            // Flush first, then report — a failure stashed earlier is the one
+            // with the context, and it must not be lost behind a secondary
+            // error from flushing an already-broken pipe.
+            let flushed = self.0.out.finish();
+            self.0.deferred.check()?;
+            flushed?;
             Ok(())
         }
     };
@@ -321,8 +352,10 @@ mod tests {
         let err = w
             .emit_quad(s, p, o, g)
             .expect_err("literals cannot name graphs");
-        assert!(err.to_string().contains("name a graph"), "{err}");
-        w.finish().unwrap();
+        assert!(err.to_string().contains("a graph name"), "{err}");
+        // `finish` must NOT report success after a refusal: the document is
+        // missing whatever the refused event carried.
+        assert!(w.finish().is_err(), "finish claimed a clean document");
         assert!(buf.is_empty(), "nothing was written");
     }
 
@@ -338,6 +371,106 @@ mod tests {
         let o = w.term_literal("first", Datatype::xsd_string(), None);
         let err = w.emit_list_item(s, p, o, 0).expect_err("not RDF");
         assert!(err.to_string().contains("CollectionStyle::Spine"), "{err}");
+    }
+
+    /// H-1, path 1: the pipe closes while committing the **last** buffered
+    /// statement. Nothing emits afterwards, so `finish` is the only place left
+    /// that can tell the driver the document is incomplete.
+    #[test]
+    fn finish_reports_a_broken_pipe_hit_on_the_last_buffered_statement() {
+        let config = WriterConfig::new().with_statement_buffering(true);
+        let mut w = NTriplesWriter::with_config(Closed, &config);
+
+        let s = w.term_iri("http://ex/s");
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_literal("v", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o)
+            .expect("buffered, so nothing failed yet");
+        w.end_statement();
+
+        let err = w.finish().expect_err("the last statement never landed");
+        assert!(err.is_broken_pipe(), "{err:?}");
+    }
+
+    /// H-1, path 2: a refusal is the last event. Reporting `Ok` here would
+    /// tell a driver the conversion succeeded.
+    #[test]
+    fn finish_reports_a_refusal_that_was_the_last_event() {
+        let mut buf = Vec::new();
+        let mut w = NTriplesWriter::with_config(&mut buf, &WriterConfig::default());
+        let s = w.term_iri("http://ex/s");
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_literal("kept", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o).unwrap();
+        w.end_statement();
+
+        let bad = w.term_literal("x", Datatype::xsd_string(), None);
+        assert!(w.emit_list_item(bad, p, o, 0).is_err());
+
+        let err = w.finish().expect_err("a refusal must reach finish");
+        assert!(err.to_string().contains("already refused"), "{err}");
+    }
+
+    #[test]
+    fn stats_count_aborted_statements_and_refusals() {
+        let mut buf = Vec::new();
+        let mut w = NTriplesWriter::with_config(&mut buf, &WriterConfig::default());
+        triple(&mut w, "http://ex/a", "http://ex/p", "one");
+
+        let s = w.term_iri("http://ex/b");
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_literal("two", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o).unwrap();
+        w.abort_statement();
+
+        assert!(w.emit_list_item(s, p, o, 0).is_err());
+        // The latched re-refusal is not a second event.
+        assert!(w.emit_triple(s, p, o).is_err());
+
+        let stats = w.stats();
+        assert_eq!(stats.statements, 2, "both reached the output, unbuffered");
+        assert_eq!(stats.aborted, 1);
+        assert_eq!(stats.refused, 1, "one event was refused, not two");
+    }
+
+    /// A literal cannot be a subject or a predicate in any RDF syntax. The
+    /// protocol documents the invariant on `Triple` without enforcing it, so a
+    /// hand-fed producer can present one and the writer would emit a document
+    /// no parser reads. Symmetric with the graph-name refusal.
+    #[test]
+    fn a_literal_in_an_unwritable_position_is_refused() {
+        for (position, subject_is_literal) in [("a subject", true), ("a predicate", false)] {
+            let mut buf = Vec::new();
+            let mut w = NTriplesWriter::new(&mut buf);
+            let iri = w.term_iri("http://ex/x");
+            let lit = w.term_literal("nope", Datatype::xsd_string(), None);
+            let (s, p) = if subject_is_literal {
+                (lit, iri)
+            } else {
+                (iri, lit)
+            };
+
+            let err = w
+                .emit_triple(s, p, iri)
+                .unwrap_err_or_else_message(position);
+            assert!(err.contains(position), "{err}");
+            assert!(w.finish().is_err(), "a refusal must reach finish");
+            assert!(buf.is_empty(), "nothing was written");
+        }
+    }
+
+    /// Small helper so the loop above reads as one assertion per position.
+    trait UnwrapErrMessage {
+        fn unwrap_err_or_else_message(self, position: &str) -> String;
+    }
+
+    impl UnwrapErrMessage for SinkResult {
+        fn unwrap_err_or_else_message(self, position: &str) -> String {
+            match self {
+                Ok(()) => panic!("a literal in {position} position must be refused"),
+                Err(e) => e.to_string(),
+            }
+        }
     }
 
     #[test]
@@ -463,7 +596,7 @@ mod tests {
             .expect_err("the writer stays refused");
         assert!(err.to_string().contains("already refused"), "{err}");
 
-        w.finish().unwrap();
+        assert!(w.finish().is_err(), "finish claimed a clean document");
         assert!(buf.is_empty(), "nothing reached the output");
     }
 
@@ -480,7 +613,7 @@ mod tests {
             .emit_triple(s, p, o)
             .expect_err("the reserved label must be refused");
         assert!(err.to_string().contains("reserves"), "{err}");
-        w.finish().unwrap();
+        assert!(w.finish().is_err(), "finish claimed a clean document");
         assert!(buf.is_empty(), "nothing reached the output");
     }
 }

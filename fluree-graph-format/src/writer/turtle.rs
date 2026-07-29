@@ -22,7 +22,7 @@
 use super::terms::{write_nt_term, write_ttl_predicate, write_ttl_term, WriterTerms};
 use super::{blank::BlankLabeler, Deferred, Out, WriterConfig, WriterStats};
 use crate::prefix::{write_prefix_declarations, write_turtle_iri, PrefixMap};
-use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, Term, TermId};
+use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, Term, TermId};
 use std::io::Write;
 
 /// Which graph the writer currently has open.
@@ -56,6 +56,7 @@ struct BlockCore<W: Write> {
     working: Run,
     in_statement: bool,
     statements: u64,
+    aborted: u64,
     /// Failures raised where the protocol has no error channel.
     deferred: Deferred,
 }
@@ -71,6 +72,7 @@ impl<W: Write> BlockCore<W> {
             working: Run::default(),
             in_statement: false,
             statements: 0,
+            aborted: 0,
             deferred: Deferred::default(),
         }
     }
@@ -87,7 +89,12 @@ impl<W: Write> BlockCore<W> {
         if !self.header_written {
             return Ok(());
         }
-        self.close_statement()?;
+        // A directive is a top-level thing. TriG's `wrappedGraph` holds
+        // `triplesBlock`s and nothing else, so writing `@prefix` between the
+        // braces would produce a document no TriG parser accepts. Close the
+        // block; the next quad for that graph reopens it, which the
+        // arrival-order design already does for free.
+        self.close_graph_block()?;
         write!(self.out, "@prefix {prefix}: <")?;
         crate::escape::write_escaped_iri(&mut self.out, namespace_iri)?;
         writeln!(self.out, "> .")?;
@@ -97,10 +104,16 @@ impl<W: Write> BlockCore<W> {
         Ok(())
     }
 
-    /// Terminate the open statement, if any, and close an open named-graph
-    /// block. Leaves the writer at the top level.
+    /// Terminate the open statement, if any. Leaves the writer between
+    /// statements, inside whatever block was open.
+    ///
+    /// Checks `working`, not `committed`, because a statement may be *in
+    /// flight*: `working` is what has actually been written, and outside a
+    /// statement the two are equal. Consulting `committed` alone left a
+    /// mid-statement directive unterminated, which is reachable from the
+    /// public API — a producer may call `on_prefix` at any point.
     fn close_statement(&mut self) -> SinkResult {
-        if self.committed.subject.is_some() {
+        if self.working.subject.is_some() {
             self.out.write_all(b" .\n")?;
             self.committed.subject = None;
             self.committed.predicate = None;
@@ -112,7 +125,7 @@ impl<W: Write> BlockCore<W> {
 
     fn close_graph_block(&mut self) -> SinkResult {
         self.close_statement()?;
-        if matches!(self.committed.graph, Some(Some(_))) {
+        if matches!(self.working.graph, Some(Some(_))) {
             self.out.write_all(b"}\n")?;
         }
         self.committed.graph = None;
@@ -133,13 +146,7 @@ impl<W: Write> BlockCore<W> {
         quad_capable: bool,
     ) -> SinkResult {
         self.deferred.check()?;
-        if let Some(graph) = graph {
-            if self.terms.get(graph).is_literal() {
-                return Err(SinkError::rejected(
-                    "a literal cannot name a graph; graph names are IRIs or blank nodes",
-                ));
-            }
-        }
+        self.refuse_unwritable_positions(subject, predicate, graph)?;
 
         if !self.header_written {
             write_prefix_declarations(&self.prefixes, &mut self.out)?;
@@ -241,7 +248,7 @@ impl<W: Write> BlockCore<W> {
         self.terms.end_statement();
         // No error channel here; stash for the next emission to raise.
         if let Err(e) = self.out.commit_statement() {
-            self.deferred.set(e.into());
+            self.deferred.stash(e.into());
         }
     }
 
@@ -260,9 +267,23 @@ impl<W: Write> BlockCore<W> {
         }
         self.in_statement = false;
         self.terms.end_statement();
+        self.aborted += 1;
     }
 
     fn finish(&mut self) -> SinkResult {
+        // Close the document first, whatever happened, so an unterminated
+        // statement or an open GRAPH block does not survive a failure. Then
+        // report: a failure stashed earlier is the one carrying the context,
+        // and it must not be lost behind a secondary error from writing to an
+        // already-broken pipe.
+        let closed = self.close_document();
+        self.deferred.check()?;
+        closed
+    }
+
+    /// Write everything the document still owes: the last statement's
+    /// terminator, a closing `}`, and the header if nothing was ever emitted.
+    fn close_document(&mut self) -> SinkResult {
         // A producer that never delimits statements still gets its last
         // statement written.
         if self.in_statement {
@@ -279,8 +300,31 @@ impl<W: Write> BlockCore<W> {
         Ok(())
     }
 
-    fn refuse_list_item(&self) -> SinkResult {
-        Err(SinkError::rejected(
+    /// Refuse a term in a position whose syntax cannot hold it — see the
+    /// N-Triples writer's copy for why the protocol cannot catch this.
+    fn refuse_unwritable_positions(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        graph: Option<TermId>,
+    ) -> SinkResult {
+        for (id, position) in [
+            (Some(subject), "a subject"),
+            (Some(predicate), "a predicate"),
+            (graph, "a graph name"),
+        ] {
+            let Some(id) = id else { continue };
+            if self.terms.get(id).is_literal() {
+                return Err(self.deferred.refuse(format!(
+                    "a literal cannot be {position}; it must be an IRI or a blank node"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_list_item(&mut self) -> SinkResult {
+        Err(self.deferred.refuse(
             "an indexed list item has no RDF spelling: a collection is three triples per element, \
              and this event carries one triple plus a position. Parse with \
              CollectionStyle::Spine to write collections as RDF.",
@@ -291,6 +335,8 @@ impl<W: Write> BlockCore<W> {
         WriterStats {
             statements: self.statements,
             bytes: self.out.bytes(),
+            aborted: self.aborted,
+            refused: self.deferred.refusals(),
         }
     }
 }
@@ -309,7 +355,7 @@ macro_rules! block_sink_common {
             // `on_prefix` is infallible in the protocol; a write failure here
             // is raised by the next emission or by `finish`.
             if let Err(e) = self.0.on_prefix(prefix, namespace_iri) {
-                self.0.deferred.set(e);
+                self.0.deferred.stash(e);
             }
         }
 
@@ -657,6 +703,112 @@ mod tests {
             w.end_statement();
         });
         assert!(out.contains("GRAPH _:b1 {"), "{out}");
+    }
+
+    /// M-1, adopted from the reviewer's c1 probe. TriG's `wrappedGraph` holds
+    /// statements and nothing else, so a `@prefix` written between the braces
+    /// produces a document no TriG parser accepts. The block closes first, and
+    /// the arrival-order design reopens it on the next quad for free.
+    #[test]
+    fn a_directive_arriving_inside_a_graph_block_closes_it_first() {
+        let out = write_trig(|w| {
+            quad(w, "http://ex/a", "http://ex/p", "1", Some("http://ex/g"));
+            w.on_prefix("late", "http://late/");
+            quad(w, "http://late/b", "http://ex/p", "2", Some("http://ex/g"));
+        });
+
+        let open = out.find('{').expect("a block was opened");
+        let directive = out.find("@prefix late:").expect("the directive");
+        let close = out.find('}').expect("a block was closed");
+        assert!(
+            close < directive,
+            "directive written inside a GRAPH block:\n{out}"
+        );
+        assert!(open < close, "{out}");
+
+        // Reopened afterwards, and the new prefix is in force inside it.
+        assert_eq!(out.matches("GRAPH ex:g {").count(), 2, "{out}");
+        assert!(out.contains("late:b"), "{out}");
+        assert_eq!(out.matches('}').count(), 2, "every block is closed: {out}");
+    }
+
+    /// L-1: a producer may call `on_prefix` at any point, including with a
+    /// statement in flight. The in-flight statement has already been written,
+    /// so it must be terminated before the directive — checking only the
+    /// committed run state left `ex:a ex:p \"1\"` unterminated and the
+    /// document unparseable.
+    #[test]
+    fn a_directive_arriving_mid_statement_terminates_it_first() {
+        let mut buf = Vec::new();
+        let mut w = TurtleWriter::with_config(&mut buf, &prefixed_config());
+        let s = w.term_iri("http://ex/a");
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_literal("1", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o).unwrap();
+        // No end_statement: the statement is in flight.
+        w.on_prefix("late", "http://late/");
+        w.end_statement();
+        w.finish().unwrap();
+
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("\"1\" .\n@prefix late:"),
+            "the in-flight statement must be terminated first:\n{out}"
+        );
+    }
+
+    /// A writer whose consumer can be closed part-way through, so a test can
+    /// choose *which* write fails.
+    #[derive(Clone, Default)]
+    struct Tap(std::rc::Rc<std::cell::RefCell<(Vec<u8>, bool)>>);
+
+    impl Tap {
+        fn break_pipe(&self) {
+            self.0.borrow_mut().1 = true;
+        }
+    }
+
+    impl Write for Tap {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.0.borrow_mut();
+            if state.1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ));
+            }
+            state.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// H-1, path 3: `on_prefix` returns nothing, so a write failure there has
+    /// to be stashed. If no emission follows — and a directive at the end of a
+    /// document is exactly that — `finish` is the only place left that can
+    /// report the document is incomplete.
+    #[test]
+    fn finish_reports_a_failure_stashed_by_on_prefix() {
+        let tap = Tap::default();
+        let mut w = TurtleWriter::with_config(tap.clone(), &prefixed_config());
+
+        // One statement lands cleanly, so the header is written and the
+        // directive path below is the mid-document one.
+        let s = w.term_iri("http://ex/a");
+        let p = w.term_iri("http://ex/p");
+        let o = w.term_literal("1", Datatype::xsd_string(), None);
+        w.emit_triple(s, p, o).expect("the pipe is open");
+        w.end_statement();
+
+        // Now the consumer goes away, and the next thing written is the
+        // directive — through a method that cannot report.
+        tap.break_pipe();
+        w.on_prefix("late", "http://late/");
+
+        let err = w.finish().expect_err("finish must report, not swallow");
+        assert!(err.is_broken_pipe(), "{err:?}");
     }
 
     #[test]

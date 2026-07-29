@@ -12,7 +12,6 @@
 //! through.
 
 use fluree_graph_ir::SinkError;
-use std::collections::HashMap;
 
 /// Labels that pass through [`BlankNodeLabels::Relabel`] untouched.
 const CARVE_OUT: &str = "fdb-";
@@ -71,38 +70,35 @@ pub enum BlankNodeLabels {
     Preserve,
 }
 
-/// Maps input blank-node labels to output ones under a [`BlankNodeLabels`].
+/// Decides the output label for each blank node, under a [`BlankNodeLabels`].
+///
+/// # The caller owns the mapping
+///
+/// This type is deliberately *not* a cache. [`Self::labelled`] decides a label
+/// for an input label seen for the **first time** and does not remember it:
+/// calling it twice with the same input mints twice. The caller
+/// ([`WriterTerms`](super::terms::WriterTerms)) already keys a map from input
+/// label to `TermId` in order to honor the protocol's blank-node identity
+/// rule, and that map's entry already holds the rewritten term — so a second
+/// map here would be written on every first sighting and read never, doubling
+/// the per-label memory of a blank-node-heavy document to no purpose.
 #[derive(Debug)]
 pub(crate) struct BlankLabeler {
     mode: BlankNodeLabels,
     counter: u64,
-    /// Input label → output label, for the labels that are rewritten.
-    renamed: HashMap<Box<str>, Box<str>>,
 }
 
 impl BlankLabeler {
     pub(crate) fn new(mode: BlankNodeLabels) -> Self {
-        Self {
-            mode,
-            counter: 0,
-            renamed: HashMap::new(),
-        }
+        Self { mode, counter: 0 }
     }
 
-    /// The output label for a labelled blank node.
+    /// Decide the output label for a labelled blank node seen for the first
+    /// time. See the type docs: the caller, not this, remembers the answer.
     ///
-    /// Fails only under [`BlankNodeLabels::Preserve`], for a label the writer
-    /// cannot emit verbatim without risking a silent merge or invalid syntax.
-    pub(crate) fn labelled(&mut self, input: &str) -> Result<&str, SinkError> {
-        if !self.renamed.contains_key(input) {
-            let output = self.output_label_for(input)?;
-            self.renamed.insert(input.into(), output);
-        }
-        Ok(self.renamed[input].as_ref())
-    }
-
-    /// Decide the output label for an input label seen for the first time.
-    fn output_label_for(&mut self, input: &str) -> Result<Box<str>, SinkError> {
+    /// Fails only under [`BlankNodeLabels::Preserve`], for a label that could
+    /// merge with one this writer mints.
+    pub(crate) fn labelled(&mut self, input: &str) -> Result<Box<str>, SinkError> {
         match self.mode {
             // The addressability carve-out: `_:fdb-…` are identifiers, not
             // incidental syntax. Stored, not renamed.
@@ -177,12 +173,19 @@ mod tests {
     #[test]
     fn relabelling_is_stable_per_input_label() {
         let mut l = BlankLabeler::new(BlankNodeLabels::Relabel);
-        let first = l.labelled("x").unwrap().to_string();
-        let second = l.labelled("x").unwrap().to_string();
-        assert_eq!(first, second, "one node, one label");
-
-        let other = l.labelled("y").unwrap().to_string();
+        // This type does not dedup — the caller does (see the type docs) —
+        // so the property under test is that DISTINCT inputs get distinct
+        // labels, and that a carve-out label is decided the same way twice.
+        let first = l.labelled("x").unwrap();
+        let other = l.labelled("y").unwrap();
         assert_ne!(first, other, "two nodes, two labels");
+
+        let carve = l.labelled("fdb-01ARZ").unwrap();
+        assert_eq!(
+            carve,
+            l.labelled("fdb-01ARZ").unwrap(),
+            "the carve-out decision is a function of the label alone"
+        );
     }
 
     /// The disjointness argument in [`BlankNodeLabels::Relabel`], executed: a
@@ -215,8 +218,8 @@ mod tests {
     #[test]
     fn preserve_mode_emits_input_labels_verbatim() {
         let mut l = BlankLabeler::new(BlankNodeLabels::Preserve);
-        assert_eq!(l.labelled("b1").unwrap(), "b1");
-        assert_eq!(l.labelled("fdb-01ARZ").unwrap(), "fdb-01ARZ");
+        assert_eq!(&*l.labelled("b1").unwrap(), "b1");
+        assert_eq!(&*l.labelled("fdb-01ARZ").unwrap(), "fdb-01ARZ");
         assert!(l.anonymous().starts_with(PRESERVE_MINT));
     }
 
@@ -245,16 +248,16 @@ mod tests {
         assert!(first.starts_with(PRESERVE_MINT), "{first}");
         assert!(unlexable_first_char(&first).is_none(), "{first}");
 
-        // Still bijective: a second internal mint gets its own label, and the
-        // first one keeps hers.
+        // A second internal mint gets its own label. (Stability per input
+        // label is the caller's job — `WriterTerms` keys the map — and is
+        // covered there.)
         let second = l.labelled("-b2").unwrap().to_string();
         assert_ne!(first, second);
-        assert_eq!(l.labelled("-b1").unwrap(), first);
 
         // Relabelling has no such case to handle — it never emits an input
         // label at all.
         let mut relabel = BlankLabeler::new(BlankNodeLabels::Relabel);
-        assert_eq!(relabel.labelled("-b1").unwrap(), "b1");
+        assert_eq!(&*relabel.labelled("-b1").unwrap(), "b1");
     }
 
     /// Every label either mode emits must be one a parser can read back.
