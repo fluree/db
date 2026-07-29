@@ -22,13 +22,22 @@
 //! - Always reusing literal slot 0 escapes this differential entirely. It is
 //!   caught by the `fluree-graph-ir` unit tests instead
 //!   (`literal_slots_are_reused_after_a_statement_ends`,
-//!   `the_term_table_tracks_the_widest_statement_not_the_document`). The
-//!   reason: outside the annotation path the parser emits each literal
-//!   immediately after minting it, so at most one literal id is live at a
-//!   time and slot-0-collapse is observationally equivalent here. This
-//!   differential's power is the aliasing dimension, not statement width — if
-//!   a future producer holds several literal ids at once, that changes and
-//!   this file should grow a case for it.
+//!   `the_term_table_tracks_the_widest_statement_not_the_document`).
+//!
+//!   The reason, stated precisely: **no literal is minted while another
+//!   literal id is live.** Not "one term id at a time" — the parser routinely
+//!   holds several. `parse_reified_triple` holds a possibly-literal `object`
+//!   while it mints the reifier, but the reifier grammar is `iri | BlankNode`,
+//!   so the term minted there is never a literal. Only
+//!   `parse_annotation_tail` breaks the rule, by holding `object` across an
+//!   annotation body that can mint literals of its own — and it is
+//!   unreachable from a recycling sink today (see the comment at that
+//!   function).
+//!
+//!   So slot-0-collapse is observationally equivalent here, and this
+//!   differential's power is the aliasing dimension rather than statement
+//!   width. If a producer ever mints a literal while another literal id is
+//!   live, that stops being true and this file needs a case for it.
 
 use fluree_graph_ir::{
     Datatype, Graph, GraphCollectorSink, GraphSink, LiteralValue, SinkResult, TermId,
@@ -67,6 +76,61 @@ impl GraphSink for NoRecycle {
     }
     // end_statement deliberately NOT forwarded — this is the control arm.
 }
+
+/// Records the statement-lifecycle events in order, forwarding everything to
+/// a real collector. The protocol publishes "exactly one of
+/// `end_statement`/`abort_statement` per statement", and that is a claim about
+/// the SEQUENCE, not about the resulting graph — a wrong sequence can still
+/// produce a correct graph today and corrupt a buffering sink tomorrow. So
+/// assert the sequence.
+#[derive(Default)]
+struct LoggingSink {
+    inner: GraphCollectorSink,
+    log: Vec<&'static str>,
+}
+
+impl GraphSink for LoggingSink {
+    fn on_base(&mut self, b: &str) {
+        self.inner.on_base(b);
+    }
+    fn on_prefix(&mut self, p: &str, n: &str) {
+        self.inner.on_prefix(p, n);
+    }
+    fn term_iri(&mut self, i: &str) -> TermId {
+        self.inner.term_iri(i)
+    }
+    fn term_blank(&mut self, l: Option<&str>) -> TermId {
+        self.inner.term_blank(l)
+    }
+    fn term_literal(&mut self, v: &str, d: Datatype, l: Option<&str>) -> TermId {
+        self.inner.term_literal(v, d, l)
+    }
+    fn term_literal_value(&mut self, v: LiteralValue, d: Datatype) -> TermId {
+        self.inner.term_literal_value(v, d)
+    }
+    fn emit_triple(&mut self, s: TermId, p: TermId, o: TermId) -> SinkResult {
+        self.log.push("Emit");
+        self.inner.emit_triple(s, p, o)
+    }
+    fn emit_list_item(&mut self, s: TermId, p: TermId, o: TermId, i: i32) -> SinkResult {
+        self.log.push("Emit");
+        self.inner.emit_list_item(s, p, o, i)
+    }
+    fn end_statement(&mut self) {
+        self.log.push("End");
+        self.inner.end_statement();
+    }
+    fn abort_statement(&mut self) {
+        self.log.push("Abort");
+        self.inner.abort_statement();
+    }
+}
+
+/// Two committed statements — the `@prefix` directive and one triple
+/// statement — followed by a third that fails somehow.
+const TWO_GOOD_THEN: &str = r#"@prefix ex: <http://example.org/> .
+                 ex:a ex:p "1" ; ex:q "2" .
+"#;
 
 fn rows(g: &Graph) -> Vec<String> {
     let mut v: Vec<String> = g
@@ -171,15 +235,20 @@ fn one_sink_many_parses_survives_recycling() {
 /// rejected statement would leave partial triples behind.
 #[test]
 fn failed_statement_contributes_nothing() {
-    let mut sink = GraphCollectorSink::new();
-    // Statement 1 completes (2 literals). Statement 2 emits one triple then
-    // hits a syntax error before its terminator.
-    let doc = r#"@prefix ex: <http://example.org/> .
-                 ex:a ex:p "1" ; ex:q "2" .
-                 ex:b ex:p "3" ; ex:q @@@ ."#;
-    parse(doc, &mut sink).expect_err("statement 2 must fail");
+    // Statement 3 emits one triple, then hits a lexical error at its second
+    // object — inside the statement, before its terminator.
+    let doc = format!("{TWO_GOOD_THEN}                 ex:b ex:p \"3\" ; ex:q @@@ .");
+    let mut sink = LoggingSink::default();
+    parse(&doc, &mut sink).expect_err("statement 3 must fail");
 
-    let g = sink.into_graph();
+    assert_eq!(
+        sink.log,
+        vec!["End", "Emit", "Emit", "End", "Emit", "Abort"],
+        "the failing statement emitted once and was then aborted, and neither \
+         committed statement was disturbed"
+    );
+
+    let g = sink.inner.into_graph();
     let objects: Vec<String> = g
         .iter()
         .map(|t| t.o.to_string())
@@ -189,29 +258,63 @@ fn failed_statement_contributes_nothing() {
         !objects.iter().any(|o| o.contains("\"3\"")),
         "the failed statement's triples must be rolled back, got {objects:?}"
     );
-    // …and only the failed statement is rolled back; the committed one stays.
     assert_eq!(
         objects.len(),
         2,
-        "statement 1 must survive intact: {objects:?}"
+        "statement 2 must survive intact: {objects:?}"
     );
-    assert!(objects.iter().any(|o| o.contains("\"1\"")), "{objects:?}");
-    assert!(objects.iter().any(|o| o.contains("\"2\"")), "{objects:?}");
 }
 
-/// The rollback must not fire when the statement failed before emitting —
-/// there is nothing to roll back, and a spurious `abort_statement` would
-/// discard the PREVIOUS statement (whose triples sit past the mark only
-/// until `end_statement` advances it).
+/// A statement that fails BEFORE emitting must not abort: there is nothing to
+/// roll back, and a spurious `abort_statement` would discard the previous
+/// statement, whose triples sit past the mark until `end_statement` advances
+/// it. This is the true branch of the `emit_count` guard.
+///
+/// `"strsubject"` is chosen deliberately: it LEXES fine (it is a valid string
+/// token) and is rejected by `parse_subject`, so the failure lands inside
+/// statement 3 with zero emissions — which a lexical error could not do.
 #[test]
-fn failure_before_any_emit_leaves_earlier_statements_intact() {
-    let mut sink = GraphCollectorSink::new();
-    // Statement 2 fails at its subject, before a single triple is emitted.
-    let doc = r#"@prefix ex: <http://example.org/> .
-                 ex:a ex:p "1" ; ex:q "2" .
-                 @@@ ex:p "3" ."#;
-    parse(doc, &mut sink).expect_err("statement 2 must fail");
+fn failure_before_any_emit_does_not_abort() {
+    let doc = format!("{TWO_GOOD_THEN}                 \"strsubject\" ex:p \"3\" .");
+    let mut sink = LoggingSink::default();
+    parse(&doc, &mut sink).expect_err("a literal subject must be rejected");
 
-    let g = sink.into_graph();
-    assert_eq!(g.len(), 2, "the committed statement must survive");
+    assert_eq!(
+        sink.log,
+        vec!["End", "Emit", "Emit", "End"],
+        "no Abort: the failing statement never emitted"
+    );
+    assert_eq!(
+        sink.inner.into_graph().len(),
+        2,
+        "the committed statements must survive"
+    );
+}
+
+/// The other guard: a statement that already COMMITTED at its `.` must not be
+/// aborted either. It reaches the error arm only because the one-token
+/// lookahead failed while reading the NEXT statement — the committed
+/// statement is complete and valid.
+///
+/// `@@@` is a LEXICAL error, raised while advancing past statement 2's
+/// terminator, so it surfaces from statement 2's own parse call. Before the
+/// `committed_current` guard this logged a trailing `Abort`, breaking the
+/// published "exactly one of end/abort per statement" contract (the graph
+/// survived only because the commit had already moved the sink's mark).
+#[test]
+fn lexical_error_in_lookahead_does_not_abort_the_committed_statement() {
+    let doc = format!("{TWO_GOOD_THEN}                 @@@ ex:p \"3\" .");
+    let mut sink = LoggingSink::default();
+    parse(&doc, &mut sink).expect_err("@@@ must fail to lex");
+
+    assert_eq!(
+        sink.log,
+        vec!["End", "Emit", "Emit", "End"],
+        "no Abort: statement 2 had already committed at its terminator"
+    );
+    assert_eq!(
+        sink.inner.into_graph().len(),
+        2,
+        "the committed statements must survive"
+    );
 }
