@@ -42,14 +42,32 @@ pub enum BlankNodeLabels {
     #[default]
     Relabel,
 
-    /// Emit every labelled blank node's label verbatim.
+    /// Emit every *user-written* blank-node label verbatim.
     ///
-    /// Anonymous nodes still have to be given a label, and here the input's
-    /// labels are no longer under the writer's control, so disjointness cannot
-    /// be established by construction. Mints therefore go in the reserved
-    /// `fdbw-{N}` namespace and an input label inside it is *refused* rather
-    /// than allowed to merge with a mint. This is the mode's honest cost, and
-    /// the reason it is not the default.
+    /// # What "everything" cannot include
+    ///
+    /// Two classes of label reach a writer, and only one of them was ever
+    /// written by a user.
+    ///
+    /// A label that cannot lex as a `BLANK_NODE_LABEL` is necessarily an
+    /// *internal* mint: no document could contain it, because no parser would
+    /// accept it. The IR's own anonymous nodes are exactly this — `-b{N}`,
+    /// deliberately unlexable so that in-memory they cannot collide with a
+    /// user's label. Preserving one is not possible (the output would be a
+    /// document no parser reads) and not meaningful (a user never chose it),
+    /// so it is relabelled into the reserved namespace below. Anonymous nodes
+    /// arriving as `term_blank(None)` are the same case and get the same
+    /// treatment.
+    ///
+    /// A label that *does* lex was written by a user, and is emitted
+    /// unchanged. The single exception is one already inside the reserved
+    /// `fdbw-` namespace: that one is refused rather than emitted, because
+    /// preserving it could merge it with a mint, and silently relabelling it
+    /// would break the promise the mode exists to make.
+    ///
+    /// So the guarantee is: output labels are always legal, always disjoint,
+    /// and every label a user could have written is either verbatim or a loud
+    /// error — never quietly something else.
     Preserve,
 }
 
@@ -98,12 +116,12 @@ impl BlankLabeler {
                          with a minted node. Drop --preserve-bnode-labels to relabel instead."
                     )));
                 }
-                if let Some(bad) = unlexable_first_char(input) {
-                    return Err(SinkError::rejected(format!(
-                        "blank-node label `{input}` starts with `{bad}`, which cannot begin a \
-                         BLANK_NODE_LABEL, so writing it verbatim would produce invalid RDF. \
-                         Drop --preserve-bnode-labels to relabel instead."
-                    )));
+                if unlexable_first_char(input).is_some() {
+                    // Not a user's label — no document can contain one that
+                    // will not lex. It is an internal mint, so it is minted
+                    // afresh into the reserved namespace rather than refused:
+                    // there is nothing here to preserve.
+                    return Ok(self.preserve_mint());
                 }
                 Ok(input.into())
             }
@@ -117,16 +135,20 @@ impl BlankLabeler {
     pub(crate) fn anonymous(&mut self) -> Box<str> {
         match self.mode {
             BlankNodeLabels::Relabel => self.mint(),
-            BlankNodeLabels::Preserve => {
-                self.counter += 1;
-                format!("{PRESERVE_MINT}{}", self.counter).into()
-            }
+            BlankNodeLabels::Preserve => self.preserve_mint(),
         }
     }
 
     fn mint(&mut self) -> Box<str> {
         self.counter += 1;
         format!("b{}", self.counter).into()
+    }
+
+    /// A fresh label in the namespace [`BlankNodeLabels::Preserve`] reserves
+    /// for nodes whose label the writer chooses.
+    fn preserve_mint(&mut self) -> Box<str> {
+        self.counter += 1;
+        format!("{PRESERVE_MINT}{}", self.counter).into()
     }
 }
 
@@ -208,18 +230,60 @@ mod tests {
         assert!(err.to_string().contains("reserves"), "{err}");
     }
 
-    /// The IR's in-memory anonymous mints are `-b{N}`, which is deliberately
-    /// unlexable so it cannot collide with a user label. Emitting one
-    /// verbatim would produce a document no parser accepts.
+    /// The IR's in-memory anonymous mints are `-b{N}`, deliberately unlexable
+    /// so they cannot collide with a user label in memory — and therefore
+    /// impossible to serialize.
+    ///
+    /// A label that cannot lex is *by construction* not a user's, so preserve
+    /// mode has nothing to preserve: it mints a fresh legal label instead of
+    /// refusing. Refusing would fail a document over a label its author never
+    /// wrote.
     #[test]
-    fn preserve_mode_refuses_a_label_that_cannot_be_serialized() {
+    fn preserve_mode_relabels_internal_mints_into_a_legal_namespace() {
         let mut l = BlankLabeler::new(BlankNodeLabels::Preserve);
-        let err = l.labelled("-b1").expect_err("`_:-b1` is not valid RDF");
-        assert!(err.to_string().contains("invalid RDF"), "{err}");
+        let first = l.labelled("-b1").unwrap().to_string();
+        assert!(first.starts_with(PRESERVE_MINT), "{first}");
+        assert!(unlexable_first_char(&first).is_none(), "{first}");
 
-        // Relabelling has no such problem — it never emits the input label.
+        // Still bijective: a second internal mint gets its own label, and the
+        // first one keeps hers.
+        let second = l.labelled("-b2").unwrap().to_string();
+        assert_ne!(first, second);
+        assert_eq!(l.labelled("-b1").unwrap(), first);
+
+        // Relabelling has no such case to handle — it never emits an input
+        // label at all.
         let mut relabel = BlankLabeler::new(BlankNodeLabels::Relabel);
         assert_eq!(relabel.labelled("-b1").unwrap(), "b1");
+    }
+
+    /// Every label either mode emits must be one a parser can read back.
+    #[test]
+    fn no_mode_ever_emits_a_label_that_cannot_lex() {
+        for mode in [BlankNodeLabels::Relabel, BlankNodeLabels::Preserve] {
+            let mut l = BlankLabeler::new(mode);
+            let mut emitted = Vec::new();
+            for input in ["b1", "fdb-01ARZ", "plain", "-b1", "-b2", "0leading"] {
+                if let Ok(label) = l.labelled(input) {
+                    emitted.push(label.to_string());
+                }
+            }
+            for _ in 0..3 {
+                emitted.push(l.anonymous().to_string());
+            }
+            for label in &emitted {
+                assert!(
+                    unlexable_first_char(label).is_none(),
+                    "{mode:?} emitted an unserializable label {label:?}"
+                );
+            }
+            let unique: std::collections::HashSet<&String> = emitted.iter().collect();
+            assert_eq!(
+                unique.len(),
+                emitted.len(),
+                "{mode:?} collided: {emitted:?}"
+            );
+        }
     }
 
     #[test]

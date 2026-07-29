@@ -420,6 +420,59 @@ fn preserve_mode_keeps_every_label_and_still_round_trips() {
         labels.len(),
         "identity count changed: {written}"
     );
+
+    // The two `[ ]` nodes had no label to preserve, so the writer chose one.
+    // Those choices must be legal — the re-parse above already proves that,
+    // since an illegal label would not have got this far — and disjoint from
+    // every label the document did write.
+    let user_written: HashSet<String> = ["b1", "b2", "b3", "fdb-01ARZ3NDEK", "fdb-01ARZ3NDEM"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let minted: Vec<&String> = labels.difference(&user_written).collect();
+    assert_eq!(minted.len(), 2, "one label per anonymous node: {labels:?}");
+    for label in minted {
+        assert!(
+            label.starts_with("fdbw-"),
+            "a chosen label must live in the reserved namespace: {label:?}"
+        );
+    }
+}
+
+/// The internal-mint case, end to end: the IR's own anonymous labels are
+/// `-b{N}` and cannot be serialized, so preserve mode must relabel them rather
+/// than refuse the document or emit something no parser reads. A hand-fed
+/// producer is the only way to present one — the parser cannot lex it.
+#[test]
+fn preserve_mode_relabels_an_internal_mint_and_the_output_still_parses() {
+    let config = WriterConfig::new().with_blank_labels(BlankNodeLabels::Preserve);
+    let mut buf = Vec::new();
+    {
+        let mut w = NTriplesWriter::with_config(&mut buf, &config);
+        // `-b1` is what `GraphCollectorSink` mints for an anonymous node.
+        let internal = w.term_blank(Some("-b1"));
+        let p = w.term_iri("http://ex/p");
+        let user = w.term_blank(Some("b1"));
+        w.emit_triple(internal, p, user).unwrap();
+        w.end_statement();
+        w.finish().unwrap();
+    }
+    let written = String::from_utf8(buf).unwrap();
+
+    assert!(
+        !written.contains("_:-b1"),
+        "an unserializable label reached the output: {written}"
+    );
+    let labels = blank_labels(&parse_conformant(&written));
+    assert_eq!(labels.len(), 2, "the two nodes stayed distinct: {labels:?}");
+    assert!(
+        labels.contains("b1"),
+        "the user's label survived: {labels:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l.starts_with("fdbw-")),
+        "the internal mint was relabelled into the reserved namespace: {labels:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
