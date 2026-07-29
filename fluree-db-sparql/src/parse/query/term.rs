@@ -105,7 +105,17 @@ impl super::Parser<'_> {
     /// The optional in-triple `~ reifier` tail is the RDF 1.2
     /// `ReifiedTriple` form; without it the node stays eligible for the
     /// legacy Fluree `f:t`/`f:op` history reading (decided at lowering).
+    ///
+    /// Recursion-guarded: a quoted triple's subject or object may be another
+    /// quoted triple (via `parse_subject`/`parse_object`), so each level
+    /// counts against the stream's depth ceiling. Quoted triples fully parse
+    /// before lowering rejects unsupported nesting, so the crash would occur
+    /// at parse time without this guard.
     pub(super) fn parse_quoted_triple(&mut self) -> Option<QuotedTriple> {
+        self.with_recursion_guard(Self::parse_quoted_triple_inner)
+    }
+
+    fn parse_quoted_triple_inner(&mut self) -> Option<QuotedTriple> {
         let start = self.stream.current_span();
 
         // Consume <<
@@ -251,9 +261,14 @@ impl super::Parser<'_> {
                     }
                     return Some(Verb::Path(path));
                 }
-                Err(_) => {
-                    // Restore position and try simple predicate
+                Err(msg) => {
+                    // Restore position; a simple predicate would have parsed
+                    // as an Ok(simple) path, so this is a genuine path error —
+                    // surface its message (e.g. the nesting-depth ceiling)
+                    // rather than the generic fallback below.
                     self.stream.restore(pos);
+                    self.stream.error_at_current(&msg);
+                    return None;
                 }
             }
         }
@@ -530,7 +545,13 @@ impl super::Parser<'_> {
     /// triples-block parser to fold into its BGP; the blank node itself is
     /// returned as this term (usable in object or subject position). Nested
     /// `[ … ]` lists recurse through `parse_object` → here.
+    /// Recursion-guarded: nested `[ … ]` re-enters through the object terms,
+    /// so each list counts one nesting level against the depth ceiling.
     fn parse_blank_node_property_list(&mut self, start: SourceSpan) -> Option<BlankNode> {
+        self.with_recursion_guard(|p| p.parse_blank_node_property_list_inner(start))
+    }
+
+    fn parse_blank_node_property_list_inner(&mut self, start: SourceSpan) -> Option<BlankNode> {
         // `#` is not a valid blank-node-label character (it is outside PN_CHARS),
         // so the lexer can never produce this label — a user-written `_:…` can
         // never collide with it and be accidentally joined to the synthetic node.
@@ -605,7 +626,14 @@ impl super::Parser<'_> {
     /// they add only ordinary triples (no new AST/IR/engine surface). This
     /// mirrors Fluree's Turtle ingest, which desugars collections to the
     /// same `rdf:first`/`rdf:rest` predicates.
+    /// Recursion-guarded: nested `( … )` items re-enter through the object
+    /// terms, so each collection counts one nesting level against the depth
+    /// ceiling.
     fn parse_collection(&mut self) -> Option<ObjectTerm> {
+        self.with_recursion_guard(Self::parse_collection_inner)
+    }
+
+    fn parse_collection_inner(&mut self) -> Option<ObjectTerm> {
         // `()` (with optional interior whitespace) lexes as a single Nil
         // token — the empty list is just the IRI rdf:nil.
         if self.stream.check(&TokenKind::Nil) {
@@ -1006,7 +1034,17 @@ impl super::Parser<'_> {
     /// A bare `<<( s p o )>> .` is not accepted as a statement (the enclosing
     /// triples-block requires a predicate-object list after the subject), so
     /// `tripleterm-separate-*` stay rejected.
+    ///
+    /// Recursion-guarded: in a pattern context a triple term's subject or
+    /// object may be another triple term, so each `<<(` level counts against
+    /// the stream's depth ceiling. Like quoted triples, triple terms fully
+    /// parse before lowering rejects unsupported nesting, so the crash would
+    /// occur at parse time without this guard.
     pub(super) fn parse_triple_term_value(&mut self, in_pattern: bool) -> Option<TripleTerm> {
+        self.with_recursion_guard(|p| p.parse_triple_term_value_inner(in_pattern))
+    }
+
+    fn parse_triple_term_value_inner(&mut self, in_pattern: bool) -> Option<TripleTerm> {
         let start = self.stream.current_span();
         if !self.stream.match_token(&TokenKind::TripleTermStart) {
             self.stream

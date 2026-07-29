@@ -988,4 +988,37 @@ mod tests {
             "the delete manifest must never be fetched: {reads:?}"
         );
     }
+
+    /// The stats/COUNT path: once `read_snapshot_data_files` reports delete
+    /// manifests, the fail-closed guard must refuse (default) rather than let the
+    /// over-counting `row_count` sum be returned — and proceed under the
+    /// override. This mirrors exactly what the metadata-preview consumer
+    /// (`iceberg_catalog.rs`) does with the returned flag (F-AUD-1).
+    #[tokio::test]
+    async fn stats_path_refuses_delete_manifests_unless_overridden() {
+        use crate::mor_guard::ensure_no_delete_manifests;
+
+        let list_path = "s3://b/t/metadata/snap.avro";
+        let data_manifest = "s3://b/t/metadata/m-data.avro";
+        let delete_manifest = "s3://b/t/metadata/m-del.avro";
+
+        let mut mem = crate::io::MemoryStorage::new();
+        mem.add_file(
+            list_path,
+            build_manifest_list_with_delete(data_manifest, delete_manifest),
+        );
+        mem.add_file(data_manifest, build_manifest("s3://b/t/data/f1.parquet"));
+        let snapshot = snapshot_with_list(list_path);
+
+        let (_data_files, _read, has_deletes) =
+            read_snapshot_data_files(&mem, &snapshot).await.unwrap();
+        assert!(has_deletes);
+
+        // Guard active (default): refuse.
+        let err =
+            ensure_no_delete_manifests(usize::from(has_deletes), "dw.fact", false).unwrap_err();
+        assert!(matches!(err, crate::IcebergError::MergeOnReadDeletes(_)));
+        // Operator opted out: proceed (upper-bound counts, with a logged warning).
+        assert!(ensure_no_delete_manifests(usize::from(has_deletes), "dw.fact", true).is_ok());
+    }
 }

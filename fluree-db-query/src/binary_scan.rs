@@ -2860,30 +2860,49 @@ fn resolve_subject_v3(
 }
 
 /// Resolve a string value to a string_id using persisted dict then DictNovelty.
-fn resolve_string_v3(
+/// Look up `value`'s string-dict id across the persisted and novelty dicts.
+///
+/// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
+/// allocation, so callers on hot paths (every novelty duration flake) pay
+/// nothing to distinguish it. `Err` is a real dict/mmap I/O error propagated
+/// verbatim from `find_string_id`, so a corrupt dictionary surfaces as an error
+/// instead of being conflated with a miss.
+fn find_string_id_v3(
     value: &str,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
-) -> std::io::Result<u32> {
+) -> std::io::Result<Option<u32>> {
     // 1. Persisted
     if let Some(id) = store.find_string_id(value)? {
-        return Ok(id);
+        return Ok(Some(id));
     }
     // 2. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
             if let Some(id) = dn.strings.find_string(value) {
-                return Ok(id);
+                return Ok(Some(id));
             }
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!(
-            "string not found in dict: {}",
-            &value[..value.len().min(50)]
-        ),
-    ))
+    Ok(None)
+}
+
+/// [`find_string_id_v3`] for callers that treat "not in dict" as an error,
+/// rendering a miss as `NotFound`.
+fn resolve_string_v3(
+    value: &str,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<u32> {
+    find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "string not found in dict: {}",
+                &value[..value.len().min(50)]
+            ),
+        )
+    })
 }
 
 /// Convert a FlakeValue to `(OType, o_key)` in V3 encoding.
@@ -3035,6 +3054,26 @@ fn value_to_otype_okey(
             OType::XSD_DAY_TIME_DURATION,
             ObjKey::encode_day_time_dur(d.micros()).as_u64(),
         )),
+        // Generic duration: keyed by the string-dict id of its canonical
+        // lexical form, mirroring the resolver's DurationStr arm so overlay
+        // rows key identically to indexed rows of the same value. DictNovelty
+        // never interns duration lexicals, so a canonical form absent from the
+        // persisted dict is the normal novelty-only case. That miss must
+        // surface as Unsupported: the SPOT-cursor translation lane routes only
+        // Unsupported to its raw-flake path and DROPS other error kinds, while
+        // the binary-range lane raw-routes any error — Unsupported is the one
+        // signal every lane preserves. A real dict I/O error, by contrast,
+        // propagates verbatim (not relabelled Unsupported) so a corrupt
+        // dictionary surfaces instead of silently taking the raw-flake path.
+        FlakeValue::Duration(d) => {
+            match find_string_id_v3(&d.to_canonical_string(), store, dict_novelty)? {
+                Some(str_id) => Ok((OType::XSD_DURATION, str_id as u64)),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "generic duration not in persisted dict (novelty-only); use raw flake path",
+                )),
+            }
+        }
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
         // Big numerics mirror the resolver: i64-fitting integers are inline;
         // everything else is keyed by a per-(graph, predicate) NumBig arena
@@ -3055,8 +3094,7 @@ fn value_to_otype_okey(
         }
         FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
-        // intended lane) and generic Duration (its V3 decode is a stub —
-        // the raw flake preserves the value, the binary row would not).
+        // intended lane).
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V3 overlay: {val:?}"),
@@ -3407,6 +3445,27 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
+        FlakeValue::YearMonthDuration(d) => Ok((
+            OType::XSD_YEAR_MONTH_DURATION,
+            ObjKey::encode_year_month_dur(d.months()).as_u64(),
+        )),
+        FlakeValue::DayTimeDuration(d) => Ok((
+            OType::XSD_DAY_TIME_DURATION,
+            ObjKey::encode_day_time_dur(d.micros()).as_u64(),
+        )),
+        FlakeValue::Duration(d) => {
+            // Generic durations intern their canonical lexical form in the
+            // string dict (see DecodeKind::Duration on the decode side), so a
+            // miss is a reliable "absent from base dict" signal (NotFound),
+            // like String.
+            let str_id = store
+                .find_string_id(&d.to_canonical_string())
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::NotFound, "duration value not found in V6 dict")
+                })?;
+            Ok((OType::XSD_DURATION, str_id as u64))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),

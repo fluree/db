@@ -10,7 +10,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use fluree_db_binary_index::IndexRoot;
 use fluree_db_core::serde::flakes_transport::{decode_flakes, MAGIC as FLKB_MAGIC};
-use fluree_db_core::{ContentId, ContentKind, StorageRead};
+use fluree_db_core::{ContentAddressedWrite, ContentId, ContentKind, StorageRead};
 use fluree_db_server::{
     config::{ServerRole, StorageAccessMode},
     routes::build_router,
@@ -2853,5 +2853,205 @@ async fn test_no_policy_flkb_returns_all_flakes() {
     assert!(
         !filtered_flakes.is_empty(),
         "Expected at least one flake from no-policy FLKB response"
+    );
+}
+
+// =============================================================================
+// Object endpoint: advanced index kinds (#1537)
+// =============================================================================
+
+/// The ledger-scoped advanced index kinds — planner statistics, spatial, and
+/// history sidecars — must be served through `GET /storage/objects/{cid}`
+/// byte-identically, exactly like the core index tree. This exercises the
+/// endpoint whose allowlist #1537 widens (the mount E2E tests go through
+/// `POST /storage/block`, whose allowlist is intentionally unchanged).
+#[tokio::test]
+async fn test_object_endpoint_serves_ledger_scoped_advanced_kinds() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token(&signing_key, true);
+
+    // A real ledger, so `resolve_block_ledger` finds a nameservice record.
+    let create_body = serde_json::json!({ "ledger": "advkinds:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let admin_storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+
+    for (kind, payload, expected_label) in [
+        (
+            ContentKind::StatsSketch,
+            b"hll sketch bytes".as_slice(),
+            "stats-sketch",
+        ),
+        (
+            ContentKind::SpatialIndex,
+            b"spatial index bytes".as_slice(),
+            "spatial-index",
+        ),
+        (
+            ContentKind::HistorySidecar,
+            b"history sidecar bytes".as_slice(),
+            "history-sidecar",
+        ),
+    ] {
+        // Seed the artifact exactly where the writer would put it.
+        let id = ContentId::new(kind, payload);
+        let written = admin_storage
+            .content_write_bytes(kind, "advkinds:test", payload)
+            .await
+            .unwrap_or_else(|e| panic!("seed {kind:?}: {e}"));
+        assert_eq!(
+            written.content_hash,
+            id.digest_hex(),
+            "seed hash must match the CID digest for {kind:?}"
+        );
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/v1/fluree/storage/objects/{id}?ledger=advkinds:test"
+                    ))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{kind:?} must be served through the object endpoint"
+        );
+        let kind_header = resp
+            .headers()
+            .get("X-Fluree-Content-Kind")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(kind_header, expected_label, "kind header for {kind:?}");
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        assert_eq!(
+            body.as_ref(),
+            payload,
+            "{kind:?} bytes must round-trip identically"
+        );
+    }
+}
+
+/// Graph-source artifacts are NOT served through the object endpoint yet:
+/// their addresses are keyed by graph_source_id (not a ledger id), the
+/// nameservice deliberately skips graph-source records in `lookup()`, and the
+/// token-scope semantics for multi-dependency graph sources are undecided —
+/// tracked in #1539. Pin the 404 so enabling them is a deliberate act (this
+/// test + the allowlist + #1539), not a drive-by.
+#[tokio::test]
+async fn test_object_endpoint_pins_graph_source_kinds_unserved() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token(&signing_key, true);
+
+    // Real ledger, so the 404 provably comes from the kind gate rather than
+    // from an unresolvable ledger param.
+    let create_body = serde_json::json!({ "ledger": "gshost:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let admin_storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+
+    // Even with the snapshot bytes PRESENT in storage under its gs-style id
+    // and a storage.all token, the endpoint must refuse.
+    let payload = b"bm25 snapshot bytes".as_slice();
+    let snap_id = ContentId::new(ContentKind::GraphSourceSnapshot, payload);
+    admin_storage
+        .content_write_bytes(ContentKind::GraphSourceSnapshot, "gsidx:main", payload)
+        .await
+        .expect("seed graph-source snapshot");
+
+    for ledger_param in ["gsidx:main", "gshost:test"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/v1/fluree/storage/objects/{snap_id}?ledger={ledger_param}"
+                    ))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "GraphSourceSnapshot must 404 (ledger={ledger_param}) until #1539"
+        );
+    }
+
+    // Mapping kind: same gate, no seed needed — the kind check fires first.
+    let map_id = ContentId::new(ContentKind::GraphSourceMapping, b"r2rml mapping");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/v1/fluree/storage/objects/{map_id}?ledger=gshost:test"
+                ))
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "GraphSourceMapping must 404 until #1539"
     );
 }

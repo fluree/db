@@ -68,6 +68,19 @@ follows the same pattern syntax as JSON-LD queries.
 ```
 This is equivalent to two patterns joined on an intermediate variable.
 
+**Property-position variables (the predicate is a variable):**
+```json
+"where": [
+  {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+  {"@id": "?other", "?prop": "?val"}
+]
+```
+A variable in predicate position matches any predicate and binds it — here
+`?prop` / `?val` range over every property of `?other`. The bound predicate can
+then be reused in the `insert` clause. (A leading pattern whose subject **and**
+predicate are both unbound, e.g. `{"@id": "?s", "?p": "?o"}`, scans the whole
+ledger — see the reasoning budget under [Fixpoint evaluation](#fixpoint-evaluation).)
+
 **With filters:**
 ```json
 "where": [
@@ -85,7 +98,10 @@ variable bindings.
 "insert": {"@id": "?person", "ex:grandparent": {"@id": "?gp"}}
 ```
 
-- Variables (`?person`, `?gp`) are replaced with the bound values from `where`.
+- Variables in any position — subject, **predicate**, or object — are replaced
+  with the bound values from `where`. A predicate variable lets a rule write a
+  property whose name is computed: e.g. `"insert": {"@id": "?s", "?prop": "?val"}`
+  copies every `?prop`/`?val` bound in the `where` clause onto `?s`.
 - Use `{"@id": "?var"}` for IRI/entity values; use `"?var"` directly for
   literal values.
 - Multiple triples can be generated from a single insert pattern.
@@ -331,14 +347,21 @@ This means:
 - **Recursive rules work.** A rule can produce facts that trigger itself again.
 - **Rule chaining works.** Rule A can produce facts that trigger Rule B, and
   vice versa.
-- **Termination is guaranteed** by the budget controls (max iterations, max
-  facts, max time, max memory).
+- **Termination is guaranteed** by a maximum fixpoint-iteration bound and by
+  the shared reasoning budget — a maximum derived-fact count and a maximum
+  wall-clock time, the same budget OWL2-RL uses. Hitting the budget stops
+  early and marks the result `capped` in the tracked response's `reasoning`
+  block. Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds`
+  (ledger config), `"reasoningBudget"` (query), or
+  `FLUREE_REASONING_MAX_FACTS` / `FLUREE_REASONING_MAX_SECONDS` (server).
 
 ### Execution order
 
-Rules are topologically sorted by their predicate dependencies: a rule that
-generates `ex:uncle` triples runs before a rule that consumes `ex:uncle` in its
-`where` clause. This minimizes the number of fixpoint iterations needed.
+Rules are ordered before the fixpoint by a lightweight heuristic (fewest
+predicate dependencies first). Because the fixpoint re-runs every rule each
+iteration until no new facts are produced, this ordering only affects how
+quickly the fixpoint converges — never the final set of derived facts. Rule
+chaining (rule A's output feeding rule B) works regardless of the order.
 
 ### Interaction with OWL 2 RL
 

@@ -11,6 +11,7 @@ pub mod config;
 pub mod context;
 pub mod detect;
 pub mod error;
+pub mod graph_source_display;
 pub mod input;
 pub mod output;
 pub mod remote_client;

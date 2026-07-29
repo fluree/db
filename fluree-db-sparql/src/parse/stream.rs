@@ -11,6 +11,23 @@ use crate::lex::{Token, TokenKind};
 use crate::span::SourceSpan;
 use std::sync::Arc;
 
+/// Maximum recursion depth for nested parser productions — group graph
+/// patterns, expressions, property paths, blank-node property lists, and
+/// collections all recurse through the parser, so unbounded nesting lets a
+/// small hostile query overflow the stack and abort the process (a Rust
+/// stack overflow is not catchable). Past this ceiling parsing fails with a
+/// [`DiagCode::NestingTooDeep`](crate::diag::DiagCode::NestingTooDeep)
+/// diagnostic. All productions share one counter, so mixed nesting is
+/// bounded too; it lives on the stream so it spans sub-parsers (EXISTS
+/// groups) that share it.
+pub(crate) const MAX_PARSE_DEPTH: u32 = 128;
+
+/// Maximum diagnostics collected per parse. Real queries produce a handful;
+/// the cap only bites on pathological/adversarial input, bounding error-
+/// recovery allocation to a constant. Well above any plausible legitimate
+/// error count so no real query loses diagnostics.
+pub(crate) const MAX_DIAGNOSTICS: usize = 256;
+
 /// A stream of tokens for parsing.
 ///
 /// Provides lookahead, matching, and error recovery utilities.
@@ -22,6 +39,11 @@ pub struct TokenStream {
     pos: usize,
     /// Collected diagnostics
     diagnostics: Vec<Diagnostic>,
+    /// Live recursion depth of nested parser productions, bounded by
+    /// [`MAX_PARSE_DEPTH`]. Mirrors the call stack (not the token
+    /// position), so backtracking via [`Self::restore`] needs no
+    /// snapshotting.
+    depth: u32,
 }
 
 impl TokenStream {
@@ -31,7 +53,52 @@ impl TokenStream {
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            depth: 0,
         }
+    }
+
+    /// Enter one recursion level, or refuse at [`MAX_PARSE_DEPTH`]. Callers
+    /// must pair a `true` return with [`Self::leave_recursion`] — use the
+    /// `with_recursion_guard` wrappers rather than calling this directly.
+    pub(crate) fn try_enter_recursion(&mut self) -> bool {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    /// Leave one recursion level entered via [`Self::try_enter_recursion`].
+    pub(crate) fn leave_recursion(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Run `f` one recursion level deeper, erroring past
+    /// [`MAX_PARSE_DEPTH`]. Owns both sides of the depth bookkeeping for the
+    /// `Result`-based parsers (expressions, property paths).
+    ///
+    /// On refusal it records the [`DiagCode::NestingTooDeep`] diagnostic
+    /// directly, so the specific depth code reaches the output regardless of
+    /// how the caller maps the returned `Err` string (several sites turn it
+    /// into a generic `ExpectedToken`, and the `GROUP BY`/`ORDER BY`
+    /// speculative sites drop it entirely on backtrack).
+    pub(crate) fn with_recursion_guard<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if !self.try_enter_recursion() {
+            let msg = format!("nesting exceeds the maximum depth of {MAX_PARSE_DEPTH}");
+            let span = self.current_span();
+            self.add_diagnostic(Diagnostic::error(
+                DiagCode::NestingTooDeep,
+                msg.clone(),
+                span,
+            ));
+            return Err(msg);
+        }
+        let result = f(self);
+        self.leave_recursion();
+        result
     }
 
     /// Get the current position in the stream.
@@ -54,9 +121,16 @@ impl TokenStream {
         std::mem::take(&mut self.diagnostics)
     }
 
-    /// Add a diagnostic.
+    /// Add a diagnostic, up to [`MAX_DIAGNOSTICS`]. Beyond the cap further
+    /// diagnostics are dropped: a hostile deeply-nested query that trips the
+    /// recursion ceiling would otherwise emit one heap-allocated diagnostic
+    /// per surplus token during error recovery (O(input) allocation on
+    /// attacker-controlled input). The first (most relevant) diagnostics —
+    /// including the root cause — are kept.
     pub fn add_diagnostic(&mut self, diag: Diagnostic) {
-        self.diagnostics.push(diag);
+        if self.diagnostics.len() < MAX_DIAGNOSTICS {
+            self.diagnostics.push(diag);
+        }
     }
 
     /// Check if at end of stream (only EOF remains).

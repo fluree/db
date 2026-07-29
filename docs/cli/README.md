@@ -102,7 +102,7 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 | Command | Description |
 |---------|-------------|
 | [`token`](token.md) | Create, inspect, and manage JWS tokens |
-| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status) |
+| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token) |
 
 ### Configuration
 

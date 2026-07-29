@@ -525,6 +525,24 @@ ORDER BY DESC(?total)
 1. **Read-Only:** Iceberg graph sources are read-only (no writes via Fluree)
 2. **Complex Joins:** Large joins between Fluree and Iceberg may be slow
 3. **No Full-Text Search:** Use Fluree's BM25 for text search
+4. **Merge-on-read deletes are not yet applied (fail-closed):** Fluree reads the
+   live data files of a snapshot but does **not** apply Iceberg *merge-on-read*
+   position/equality delete files. To avoid silently returning deleted rows (or
+   over-counting `COUNT(*)`/row totals), a query over a snapshot that carries
+   delete files is **refused** with a `Merge-on-read deletes not applied` error.
+   Copy-on-write deletes (the Snowflake-managed v2 default today) rewrite data
+   files and are handled correctly — this only affects tables written with
+   merge-on-read semantics (e.g. Athena `DELETE`, Flink/CDC upserts, Snowflake v3
+   deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
+   See the switch below to override.
+
+### Environment switches
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
+| `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
+| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch; `0` returns structure only. |
 
 ## Troubleshooting
 

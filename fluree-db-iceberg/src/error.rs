@@ -92,6 +92,12 @@ pub enum IcebergError {
     #[error("Scan error: {0}")]
     Scan(String),
 
+    /// Merge-on-read delete files are present but not yet applied. Raised by the
+    /// fail-closed guard (see [`crate::mor_guard`]) rather than silently
+    /// returning deleted rows / over-counting. Audit finding F-AUD-1.
+    #[error("Merge-on-read deletes not applied: {0}")]
+    MergeOnReadDeletes(String),
+
     /// Unsupported file format
     #[error("Unsupported file format: {0}")]
     UnsupportedFormat(String),
@@ -128,6 +134,10 @@ impl IcebergError {
 
     pub fn scan(msg: impl Into<String>) -> Self {
         Self::Scan(msg.into())
+    }
+
+    pub fn merge_on_read_deletes(msg: impl Into<String>) -> Self {
+        Self::MergeOnReadDeletes(msg.into())
     }
 
     pub fn unsupported_format(msg: impl Into<String>) -> Self {

@@ -4,6 +4,15 @@ This section covers operational aspects of running Fluree in production, includi
 
 ## Operation Guides
 
+### [Scaling and Resilience Architecture](scaling-and-resilience.md)
+
+How Fluree's deployment layers fit together:
+- Horizontal query scaling with replaceable, cache-warm peers
+- Independent transaction, query, and indexing capacity
+- Serverless and scale-to-zero deployment boundaries
+- Raft write availability within a region
+- Multi-cloud read distribution and disaster recovery
+
 ### [Configuration](configuration.md)
 
 Server configuration options:

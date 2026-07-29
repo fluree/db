@@ -86,6 +86,32 @@ impl Snapshot {
             .get("deleted-records")
             .and_then(|s| s.parse().ok())
     }
+
+    /// Get the total number of merge-on-read **delete files** from the snapshot
+    /// summary (`total-delete-files`), if present. A value `> 0` means the
+    /// snapshot carries position/equality delete files that Fluree does not yet
+    /// apply — see [`crate::mor_guard`].
+    pub fn total_delete_files(&self) -> Option<i64> {
+        self.summary
+            .get("total-delete-files")
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Get the total number of merge-on-read **position deletes** from the
+    /// snapshot summary (`total-position-deletes`), if present.
+    pub fn total_position_deletes(&self) -> Option<i64> {
+        self.summary
+            .get("total-position-deletes")
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Get the total number of merge-on-read **equality deletes** from the
+    /// snapshot summary (`total-equality-deletes`), if present.
+    pub fn total_equality_deletes(&self) -> Option<i64> {
+        self.summary
+            .get("total-equality-deletes")
+            .and_then(|s| s.parse().ok())
+    }
 }
 
 /// Snapshot selection criteria for time travel queries.
@@ -243,6 +269,31 @@ mod tests {
         assert_eq!(snap.operation(), Some("append"));
         assert_eq!(snap.added_records(), Some(50));
         assert_eq!(snap.deleted_records(), Some(10));
+        // This append snapshot carries no delete-file counters.
+        assert_eq!(snap.total_delete_files(), None);
+        assert_eq!(snap.total_position_deletes(), None);
+        assert_eq!(snap.total_equality_deletes(), None);
+    }
+
+    #[test]
+    fn test_mor_delete_summary_accessors() {
+        let mut summary = HashMap::new();
+        summary.insert("total-delete-files".to_string(), "2".to_string());
+        summary.insert("total-position-deletes".to_string(), "17".to_string());
+        summary.insert("total-equality-deletes".to_string(), "0".to_string());
+        let snap = Snapshot {
+            snapshot_id: 1,
+            parent_snapshot_id: None,
+            sequence_number: 1,
+            timestamp_ms: 1000,
+            manifest_list: Some("path".to_string()),
+            manifests: None,
+            summary,
+            schema_id: None,
+        };
+        assert_eq!(snap.total_delete_files(), Some(2));
+        assert_eq!(snap.total_position_deletes(), Some(17));
+        assert_eq!(snap.total_equality_deletes(), Some(0));
     }
 
     #[test]

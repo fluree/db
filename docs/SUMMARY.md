@@ -201,6 +201,7 @@
     - [TTL file format](memory/reference/ttl-format.md)
 
 - [Operations](operations/README.md)
+  - [Scaling and resilience architecture](operations/scaling-and-resilience.md)
   - [Configuration](operations/configuration.md)
   - [Running with Docker](operations/docker.md)
   - [Storage modes (memory/file/AWS/IPFS)](operations/storage.md)
