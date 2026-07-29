@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "query_id": "q009",
+  "result_hash": "3594be9fd5998ea9f286564b62fa831300380d8cdf5430137df4459a29a2ea81",
+  "rows": 9,
+  "head_rows": [
+    "Region-1\u001f5.04355468200e7",
+    "Region-2\u001f4.98388604100e7",
+    "Region-3\u001f4.90580532600e7",
+    "Region-4\u001f4.96293114000e7",
+    "Region-5\u001f5.11247053600e7",
+    "Region-6\u001f5.01382615900e7",
+    "Region-7\u001f5.03052011700e7",
+    "Region-8\u001f4.97609862300e7",
+    "Region-9\u001f5.01391589800e7"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

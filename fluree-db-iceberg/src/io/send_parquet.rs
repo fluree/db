@@ -16,12 +16,16 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use fluree_db_core::disk_cache::DiskArtifactCache;
 use tokio::runtime::Handle;
+// PR-2 phase-1 (measurement-only): `.instrument()` for the per-file cost
+// decomposition sub-spans in `read_task_small_file`. Additive/debug-level;
+// no behavior change.
+use tracing::Instrument as _;
 
 use crate::error::{IcebergError, Result};
 use crate::io::batch::ColumnBatch;
@@ -159,6 +163,56 @@ async fn read_whole_local(path: &Path, expected_size: u64) -> Option<Bytes> {
         Ok(Ok(bytes)) if bytes.len() as u64 == expected_size => Some(Bytes::from(bytes)),
         _ => None,
     }
+}
+
+/// Lever A kill switch (`FLUREE_ICEBERG_FOOTER_FROM_CACHE`, default **on**). When
+/// on, a file that is read whole anyway — a disk-cache hit, or a cheap/small file
+/// the policy fetches whole — parses its Parquet footer from those in-memory
+/// bytes instead of issuing a separate footer round-trip (measured ~190ms of two
+/// serial S3 range GETs per file, see `docs/audit/2026-07-virtual-dataset-perf/06-per-file-cost.md`).
+/// Off (`0`/`false`/`off`/`no`, trimmed + case-insensitive per the R2RML switch
+/// family) restores the byte-identical footer-first path. Read once per process
+/// (`OnceLock`, the family idiom — e.g. `catalog_session::cache_enabled` in
+/// `fluree-db-api`): set it at startup, not per query.
+fn footer_from_cache_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUREE_ICEBERG_FOOTER_FROM_CACHE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Parse Parquet metadata from a whole-file byte buffer already resident in
+/// memory — the footer is sliced out of `bytes`, so this does **no I/O**. Mirrors
+/// the validation and parse in [`SendParquetReader::read_metadata`] exactly (same
+/// footer slice `file_size - 8 - footer_len .. file_size`, same parser), differing
+/// only in that the bytes are already local.
+fn metadata_from_whole_bytes(bytes: &Bytes) -> Result<Arc<ParquetMetaData>> {
+    let file_size = bytes.len() as u64;
+    if file_size < 12 {
+        return Err(IcebergError::Storage(format!(
+            "File too small to be Parquet: {file_size} bytes"
+        )));
+    }
+    let len = bytes.len();
+    if bytes[len - 4..len] != PARQUET_MAGIC {
+        return Err(IcebergError::Storage(
+            "Invalid Parquet file: missing magic bytes".to_string(),
+        ));
+    }
+    let footer_len = u32::from_le_bytes([
+        bytes[len - 8],
+        bytes[len - 7],
+        bytes[len - 6],
+        bytes[len - 5],
+    ]) as u64;
+    let footer_start = file_size.saturating_sub(8 + footer_len) as usize;
+    let footer_bytes = bytes.slice(footer_start..len);
+    let metadata = parse_parquet_metadata_from_bytes(&footer_bytes, file_size)?;
+    Ok(Arc::new(metadata))
 }
 
 /// A [`SendIcebergStorage`] backed by a single local cache file, serving a large
@@ -368,17 +422,128 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         self.read_task_small_file(task).await
     }
 
-    /// Read a small file using sparse buffer approach.
+    /// Lever A: obtain the whole-file bytes for the cases where the disk-cache /
+    /// small-file policy reads the file whole regardless of projection, WITHOUT a
+    /// separate footer read. Returns `None` for files that take the sparse-range
+    /// path (they keep the footer-first policy in [`Self::read_task_small_file`]).
+    ///
+    /// - **A2** (disk-cache hit, any size in the small-file range): the whole file
+    ///   — and thus its footer — is served from the cached local bytes.
+    /// - **A1** (a miss on the cheap tier `<= WHOLE_FILE_MAX_BYTES`, admitted whole
+    ///   unconditionally by `admit_whole_file`'s `cheap` branch; or a
+    ///   sub-[`MIN_SPARSE_FILE_BYTES`] file with no disk cache): the file is
+    ///   fetched whole in one GET (single-flight, cached when a disk cache is
+    ///   present), then its footer is parsed from those bytes.
+    ///
+    /// A larger file with a narrow projection returns `None` — that is the
+    /// range-read tier, whose footer path is intentionally unchanged.
+    async fn try_whole_bytes_no_footer(&self, path: &str, file_size: u64) -> Result<Option<Bytes>> {
+        if let Some(dc) = self.disk_cache.filter(|dc| dc.cache.budget_bytes() > 0) {
+            let local = dc.local_path(path, file_size);
+            // A2: whole file already local — serve footer + data from disk.
+            if let Some(bytes) = read_whole_local(&local, file_size).await {
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from disk cache (whole file)"
+                );
+                return Ok(Some(bytes));
+            }
+            // A1 (cheap tier): admitted whole unconditionally, so fetch whole
+            // without the footer. Single-flight fill mirrors `read_file_for_task`.
+            if file_size <= WHOLE_FILE_MAX_BYTES {
+                let data = dc
+                    .cache
+                    .coalesced_fetch(local, || async {
+                        self.storage
+                            .read(path)
+                            .await
+                            .map(|b| b.to_vec())
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    })
+                    .await
+                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                tracing::debug!(
+                    path,
+                    file_size,
+                    "Lever A: footer+data from whole-file fetch (cheap, cached)"
+                );
+                return Ok(Some(Bytes::from(data)));
+            }
+            // Larger file, narrow projection: range-read tier (unchanged).
+            return Ok(None);
+        }
+        // No disk cache: only the sub-`MIN_SPARSE_FILE_BYTES` correctness-floor
+        // files are read whole (matches `read_file_for_task`).
+        if file_size < MIN_SPARSE_FILE_BYTES {
+            tracing::debug!(
+                path,
+                file_size,
+                "Lever A: footer+data from whole small file (no disk cache)"
+            );
+            return Ok(Some(self.storage.read(path).await?));
+        }
+        Ok(None)
+    }
+
+    /// Read a small file (`<= MAX_SPARSE_BUFFER_SIZE`).
+    //
+    // PR-2: Lever A (footer-from-cache) fast path first — when the file is read
+    // whole anyway, parse the footer from the fetched/cached bytes instead of a
+    // separate 2-round-trip footer read. Sparse-range files (larger, narrow
+    // projection) and the kill-switch-off case fall through to the unchanged
+    // footer-first path. The four `iceberg.*` sub-spans (PR-2 phase-1 counters)
+    // decompose the per-file wall; in the fast path `iceberg.read_footer` times
+    // the in-memory footer parse — the ~190ms round-trip collapsed to a parse.
     async fn read_task_small_file(&self, task: &FileScanTask) -> Result<Vec<ColumnBatch>> {
         let path = &task.data_file.file_path;
-        let metadata = self.read_metadata(path).await?;
+        let file_size = task.data_file.file_size_in_bytes as u64;
+
+        // Lever A fast path (default on; FLUREE_ICEBERG_FOOTER_FROM_CACHE=0 skips).
+        if footer_from_cache_enabled() {
+            let maybe_whole = self
+                .try_whole_bytes_no_footer(path, file_size)
+                .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
+                .await?;
+            if let Some(file_bytes) = maybe_whole {
+                // Parse+validate the footer from the in-memory bytes (no I/O).
+                // `decode_batches_arrow` re-derives it from the same bytes; this
+                // parse is the early validation and the footer-cost counter.
+                {
+                    let _footer_guard = tracing::debug_span!("iceberg.read_footer").entered();
+                    metadata_from_whole_bytes(&file_bytes)?;
+                }
+                let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
+                return crate::io::arrow_reader::decode_batches_arrow(
+                    file_bytes,
+                    &task.projected_field_ids,
+                    task.residual_filter.as_ref(),
+                    task.iceberg_schema.as_deref(),
+                    None,
+                );
+            }
+        }
+
+        // Unchanged path: footer first (range reads), then the policy-driven fetch
+        // of the projected column chunks (sparse) or the whole file.
+        let metadata = self
+            .read_metadata(path)
+            .instrument(tracing::debug_span!("iceberg.read_footer"))
+            .await?;
 
         // Resolve the projected Parquet column indices so the sparse-range read
         // fetches exactly the column chunks the Arrow reader will decode.
-        let (_, column_indices) = if let Some(ref iceberg_schema) = task.iceberg_schema {
-            build_batch_schema_with_iceberg(&metadata, iceberg_schema, &task.projected_field_ids)?
-        } else {
-            build_batch_schema(&metadata, &task.projected_field_ids)?
+        let (_, column_indices) = {
+            let _plan_guard = tracing::debug_span!("iceberg.plan_columns").entered();
+            if let Some(ref iceberg_schema) = task.iceberg_schema {
+                build_batch_schema_with_iceberg(
+                    &metadata,
+                    iceberg_schema,
+                    &task.projected_field_ids,
+                )?
+            } else {
+                build_batch_schema(&metadata, &task.projected_field_ids)?
+            }
         };
 
         let real_column_indices: Vec<usize> = column_indices
@@ -390,11 +555,13 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         // Read the file bytes via range reads for the needed column chunks.
         let file_bytes = self
             .read_file_for_task(path, task, &real_column_indices, &metadata)
+            .instrument(tracing::debug_span!("iceberg.fetch_bytes"))
             .await?;
 
         // Decode the range-read bytes with native projection + row-group pruning
         // + exact row filtering. `Bytes` is a `ChunkReader`, so the Arrow reader
         // reuses the exact bytes fetched above.
+        let _decode_guard = tracing::debug_span!("iceberg.decode").entered();
         crate::io::arrow_reader::decode_batches_arrow(
             file_bytes,
             &task.projected_field_ids,

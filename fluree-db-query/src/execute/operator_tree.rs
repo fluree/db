@@ -2550,6 +2550,15 @@ fn build_operator_tree_inner(
             let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
                 plan, fallback,
             ));
+            // PR-6: HAVING filters the grouped rows before ORDER BY (SPARQL order:
+            // WHERE → GROUP → HAVING → ORDER → LIMIT). The fused op emits exactly
+            // the projected group + aggregate vars (detect's projection check
+            // rejects any HAVING referencing an unprojected aggregate), so the
+            // HAVING expression sees only variables in the fused output — no
+            // output trim is needed.
+            if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
+                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+            }
             // The fused operator emits the final grouped result; apply ORDER BY /
             // OFFSET / LIMIT on top with the engine's own operators (exact
             // semantics on the small grouped output).
@@ -3014,12 +3023,45 @@ fn build_operator_tree_inner(
         .flat_map(Grouping::group_by_vars)
         .collect();
 
+    // WHERE-level early dedup (project away dead vars, collapse duplicate rows
+    // between joins) is sound only when downstream cannot observe row
+    // multiplicity. With a grouping phase there are two consumers to clear:
+    // every aggregate must be duplicate-insensitive (COUNT/SUM/AVG/… DISTINCT,
+    // or MIN/MAX/SAMPLE), AND nothing may read a non-key variable raw. A
+    // non-key variable surviving the grouping stage comes out as a per-group
+    // LIST (the JSON-LD grouped projection), which observes multiplicity —
+    // note `aggregates()` is empty for a dedup-only `GROUP BY ?g`, where the
+    // aggregate check alone is vacuously true. An outer SELECT DISTINCT does
+    // NOT license dedup — it dedups result rows *after* aggregation, so a
+    // plain COUNT under it still observes pre-aggregation multiplicity.
+    // Without grouping, SELECT DISTINCT is exactly the license.
+    let where_dedup_safe = match query.grouping.as_ref() {
+        Some(g) => {
+            let aggregates_ok = g
+                .aggregates()
+                .all(|spec| spec.function.duplicate_insensitive());
+            // `required_aggregate_vars` is what the grouping stage's OUTPUT must
+            // carry, so it already folds in projection, HAVING, post-binds and
+            // ORDER BY. Anything in it that is not a GROUP BY key or an
+            // aggregate output passes through raw as a grouped list.
+            let keys: HashSet<VarId> = g.group_by_vars().collect();
+            let agg_outputs: HashSet<VarId> = g.aggregates().map(|s| s.output_var).collect();
+            let no_raw_passthrough = variable_deps.as_ref().is_some_and(|d| {
+                d.required_aggregate_vars
+                    .iter()
+                    .all(|v| keys.contains(v) || agg_outputs.contains(v))
+            });
+            aggregates_ok && no_raw_passthrough
+        }
+        None => query.output.is_distinct(),
+    };
+
     let mut operator = build_where_operators_with_needed(
         &query.patterns,
         stats,
         &needed_where_vars,
         &group_by_vec,
-        query.output.is_distinct(),
+        where_dedup_safe,
         required_where_vars,
         planning,
     )?;
@@ -3424,6 +3466,14 @@ pub(crate) fn apply_solution_modifiers(
             _ => 0,
         };
         let can_topk = limit.is_some();
+        // Deliberately NO scan-side `set_topk` here, unlike the sibling branch
+        // below: the DISTINCT sits BELOW the sort on this path, so k scan rows can
+        // dedup to FEWER than k. Pruning the scan to its top-k by sort key would
+        // drop rows that dedup would have made room for, under-producing DISTINCT
+        // results — so the push-down is unsound here even though `k`/`can_topk` are
+        // computed identically to the sibling. This `SortOperator`'s own
+        // post-DISTINCT top-k stays sound; only the scan-side prune is declined
+        // (mirror of the ASC-declines note in the `else` branch below).
         let mut sort_op = if can_topk {
             SortOperator::new_topk(operator, ordering.to_vec(), k)
         } else {
@@ -3447,6 +3497,21 @@ pub(crate) fn apply_solution_modifiers(
                 (Some(limit), None) => limit,
                 _ => 0,
             };
+            // PR-5: offer the primary DESC sort key + k to the row-preserving scan
+            // below, so a single-column `ORDER BY DESC(<scan col>) LIMIT k` over an
+            // R2RML scan can read only the files that can hold the top-k. Offered
+            // only for a DESCENDING primary key (ASC declines — SPARQL orders
+            // unbound first, so a null-bearing file can't be pruned); the scan
+            // honors it ONLY if the key resolves to a single scalar scan column,
+            // else no-op. Pure optimization — this `SortOperator` remains the
+            // authority for the exact (compound) order + LIMIT.
+            if can_topk {
+                if let Some(primary) = ordering.first() {
+                    if primary.direction == crate::sort::SortDirection::Descending {
+                        operator.set_topk(primary.var, k);
+                    }
+                }
+            }
             let mut sort_op = if can_topk {
                 SortOperator::new_topk(operator, ordering.to_vec(), k)
             } else {
@@ -3498,6 +3563,70 @@ mod tests {
     use crate::sort::SortSpec;
     use fluree_db_core::Sid;
     use fluree_graph_json_ld::ParsedContext;
+
+    /// PR-5: the scan-side top-k directive offered to the child must carry
+    /// `k = LIMIT + OFFSET`, not `LIMIT` — the scan has to retain enough rows for
+    /// the OFFSET the sort above then skips, or `ORDER BY DESC … LIMIT k OFFSET m`
+    /// would silently drop the rows at positions `k+1..=k+m`. This locks the
+    /// single-owner `+offset` arithmetic against a future edit that moves or
+    /// duplicates it. (A pure `ORDER BY DESC LIMIT` with no residual filter still
+    /// pushes topk, so this arithmetic is live even though q046 has offset 0.)
+    #[test]
+    fn topk_directive_carries_limit_plus_offset() {
+        use crate::binding::Batch;
+        use crate::context::ExecutionContext;
+        use crate::error::Result as QResult;
+        use crate::operator::{BoxedOperator, Operator};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingTopkOp {
+            schema: Vec<VarId>,
+            recorded: Arc<Mutex<Option<(VarId, usize)>>>,
+        }
+        #[async_trait::async_trait]
+        impl Operator for RecordingTopkOp {
+            fn schema(&self) -> &[VarId] {
+                &self.schema
+            }
+            async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> QResult<Option<Batch>> {
+                Ok(None)
+            }
+            fn close(&mut self) {}
+            fn set_topk(&mut self, sort_var: VarId, k: usize) {
+                *self.recorded.lock().unwrap() = Some((sort_var, k));
+            }
+        }
+
+        let recorded = Arc::new(Mutex::new(None));
+        let op: BoxedOperator = Box::new(RecordingTopkOp {
+            schema: vec![VarId(0), VarId(1)],
+            recorded: Arc::clone(&recorded),
+        });
+        let planning = crate::temporal_mode::PlanningContext::current();
+        // ORDER BY DESC(?1) LIMIT 10 OFFSET 5.
+        let _tree = apply_solution_modifiers(
+            op,
+            None,
+            &[],
+            &[SortSpec::desc(VarId(1))],
+            None,
+            false,
+            Some(5),
+            Some(10),
+            false,
+            None,
+            &planning,
+        )
+        .expect("apply_solution_modifiers");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some((VarId(1), 15)),
+            "k must be LIMIT(10) + OFFSET(5) = 15, so the scan retains the offset rows the sort then skips"
+        );
+    }
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
         TriplePattern::new(

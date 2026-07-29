@@ -47,7 +47,7 @@ use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::r2rml::rewrite_patterns_for_r2rml;
+use crate::r2rml::{rewrite_patterns_for_r2rml, unsupported_subscope_error};
 use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
@@ -102,6 +102,14 @@ pub struct GraphOperator {
     /// under a GRAPH wrapper (notably an R2RML graph source) can early-terminate
     /// instead of draining the whole table into `result_buffer`.
     row_budget: Option<usize>,
+    /// Scan-side top-k directive (PR-5): `(primary DESC sort var, LIMIT+OFFSET)`,
+    /// threaded into the per-parent inner subplan exactly like `row_budget` so a
+    /// `ORDER BY DESC(<scan col>) LIMIT k` above a GRAPH wrapper (an R2RML graph
+    /// source) reaches the inner scan. Per-partition top-k is sound: any global
+    /// top-k row from partition p is among p's k largest, so the global top-k is a
+    /// subset of the union of the per-partition results (the authoritative sort
+    /// above re-selects the exact k).
+    topk: Option<(VarId, usize)>,
     /// Plan-time decision: seed the enumerated graph variable into the inner
     /// subplan. True only when the inner patterns bind the graph var in EVERY
     /// solution (required top-level triple / property path / slice-free
@@ -170,6 +178,7 @@ impl GraphOperator {
             buffer_pos: 0,
             planning,
             row_budget: None,
+            topk: None,
             seed_graph_var,
         }
     }
@@ -299,6 +308,15 @@ impl GraphOperator {
                     graph_iri, rewrite_result.unconverted_count
                 )));
             }
+            // Non-lowered sub-scope patterns (property/shortest paths,
+            // subqueries) whose bodies would evaluate against the R2RML source's
+            // empty native index and silently return no rows — fail loudly.
+            if !rewrite_result.unsupported.is_empty() {
+                return Err(unsupported_subscope_error(
+                    &graph_iri,
+                    &rewrite_result.unsupported,
+                ));
+            }
 
             std::borrow::Cow::Owned(rewrite_result.patterns)
         } else {
@@ -337,6 +355,9 @@ impl GraphOperator {
 
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
+        }
+        if let Some((sort_var, k)) = self.topk {
+            inner.set_topk(sort_var, k);
         }
         inner.open(&graph_ctx).await?;
 
@@ -489,6 +510,15 @@ impl GraphOperator {
                 graph_iri, rewrite_result.unconverted_count
             )));
         }
+        // Non-lowered sub-scope patterns (property/shortest paths, subqueries)
+        // that would silently evaluate against the R2RML source's empty native
+        // index — fail loudly rather than return a wrong empty result.
+        if !rewrite_result.unsupported.is_empty() {
+            return Err(unsupported_subscope_error(
+                &graph_iri,
+                &rewrite_result.unsupported,
+            ));
+        }
 
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
         let mut inner = build_where_operators_seeded(
@@ -504,6 +534,9 @@ impl GraphOperator {
         // across parent batches but never under-reads.
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
+        }
+        if let Some((sort_var, k)) = self.topk {
+            inner.set_topk(sort_var, k);
         }
         inner.open(&graph_ctx).await?;
 
@@ -609,6 +642,13 @@ impl Operator for GraphOperator {
         // produces parent rows that seed the correlated inner execution, which is
         // not row-preserving, so it must still yield every row the inner needs.
         self.row_budget = Some(budget);
+    }
+
+    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+        // Record the top-k directive; threaded into the per-parent inner subplan
+        // (like `row_budget`). NOT forwarded to `self.child` (the parent seed is
+        // not the scan). Per-partition top-k is sound (see the field doc).
+        self.topk = Some((sort_var, k));
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {

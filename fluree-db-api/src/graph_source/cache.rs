@@ -26,6 +26,12 @@ pub(crate) struct CachedScanFiles {
     pub estimated_row_count: i64,
     pub files_selected: usize,
     pub files_pruned: usize,
+    /// Whether the source snapshot carried merge-on-read delete files. Only ever
+    /// `true` when the fail-closed guard was overridden at plan time; carried on
+    /// the cache entry so a scan-files cache HIT (in-memory or disk) can re-refuse
+    /// if the override is later turned off, instead of silently serving a
+    /// delete-bearing file list (audit F-AUD-1, cache-arm follow-up).
+    pub has_delete_manifests: bool,
 }
 
 #[cfg(feature = "iceberg")]

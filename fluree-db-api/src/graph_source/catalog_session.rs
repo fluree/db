@@ -20,10 +20,11 @@
 //! `FLUREE_ICEBERG_LOADTABLE_CACHE=0`, restoring per-scan loads.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fluree_db_iceberg::catalog::LoadTableResponse;
 use fluree_db_iceberg::credential::VendedCredentials;
+use fluree_db_iceberg::io::S3IcebergStorage;
 
 /// Master switch for all Iceberg catalog caching. Read once from
 /// `FLUREE_ICEBERG_LOADTABLE_CACHE` (only `0`/`false`/`off` disable it). When
@@ -86,6 +87,25 @@ impl CachedLoadTable {
 pub(crate) struct IcebergCatalogSession {
     /// Pinned `loadTable` responses keyed by `(graph_source_id, namespace.table)`.
     load_tables: Mutex<HashMap<String, CachedLoadTable>>,
+    /// S3 storage clients built from each table's vended credentials, keyed the
+    /// same as `load_tables`. The session pins the loadTable RESPONSE above; this
+    /// caches the AWS SDK client built FROM those credentials so repeated scans of
+    /// one table in a query — a correlated join re-scanning a dim, or the slice-1
+    /// prefetch-then-scan — reuse one client instead of rebuilding it
+    /// (`aws_config` load + S3 client + HTTP client) per scan. Invalidated by
+    /// `store_load_table`: any fresh loadTable (including a creds-expiry reload)
+    /// drops the entry, so a client built from stale credentials is never served.
+    storages: Mutex<HashMap<String, Arc<S3IcebergStorage>>>,
+    /// Location-only snapshot pins from the loadTable-metadata cache's pointer
+    /// rung (`21-loadtable-metadata-cache.md`): that path resolves a snapshot's
+    /// `metadata_location` from disk WITHOUT a loadTable GET, so it has NO vended
+    /// credentials to store in `load_tables`. Kept in a SEPARATE map so
+    /// `cached_load_table` never hands out a credential-less entry (which would
+    /// build ambient-cred storage). `pinned_metadata_location` consults it, so a
+    /// later touch of the same table this query stays on ONE snapshot even if the
+    /// disk pointer's TTL expires between touches — the eager path then reloads
+    /// only the credentials and re-pins to this location.
+    location_pins: Mutex<HashMap<String, String>>,
 }
 
 impl IcebergCatalogSession {
@@ -108,6 +128,21 @@ impl IcebergCatalogSession {
         Some(hit.to_response())
     }
 
+    /// Whether `key` is pinned this query with unexpired credentials — the cheap
+    /// (no-clone) predicate `prefetch_tables` uses to skip re-warming a table that
+    /// is already resolved. A pinned-but-creds-expired table returns `false` (a
+    /// warm would usefully refresh it).
+    pub(crate) fn is_pinned(&self, key: &str) -> bool {
+        if !cache_enabled() {
+            return false;
+        }
+        self.load_tables
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|e| !e.creds_expired())
+    }
+
     /// The `metadata_location` pinned for `key` on its first load this query,
     /// regardless of credential freshness. A creds-expiry reload uses this to
     /// keep the query on one Iceberg snapshot even if the table commits mid-query
@@ -116,11 +151,40 @@ impl IcebergCatalogSession {
         if !cache_enabled() {
             return None;
         }
-        self.load_tables
+        // The credential-bearing pin (from an actual loadTable) is authoritative;
+        // fall back to a location-only pin from the pointer rung. They can only
+        // AGREE (the eager path re-pins to the location-pin's value), so the order
+        // is a preference, not a correctness choice.
+        if let Some(loc) = self
+            .load_tables
             .lock()
             .unwrap()
             .get(key)
             .map(|e| e.metadata_location.clone())
+        {
+            return Some(loc);
+        }
+        self.location_pins.lock().unwrap().get(key).cloned()
+    }
+
+    /// Pin ONLY the `metadata_location` for `key` (no credentials) — for the
+    /// loadTable-metadata cache's pointer rung, which serves a snapshot's metadata
+    /// from disk WITHOUT a loadTable GET. First-writer-wins (like the loadTable
+    /// pin): a later touch of the same table this query resolves the SAME snapshot
+    /// even if the disk pointer's TTL expires between touches. Deliberately does
+    /// NOT touch `load_tables`, so `cached_load_table` keeps forcing a fresh-creds
+    /// GET rather than serving a credential-less entry (ambient-cred storage). The
+    /// snapshot pin machinery's whole reason for existing (`cache_enabled` /
+    /// snapshot consistency, this module's doc). No-op when the cache is disabled.
+    pub(crate) fn pin_metadata_location(&self, key: String, metadata_location: String) {
+        if !cache_enabled() {
+            return;
+        }
+        self.location_pins
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_insert(metadata_location);
     }
 
     /// Cache a `loadTable` response for reuse by later scans of the same
@@ -132,6 +196,12 @@ impl IcebergCatalogSession {
         if !cache_enabled() {
             return;
         }
+        // Any fresh loadTable invalidates the cached S3 client for this table: a
+        // creds-expiry reload changes the vended credentials, so a client built
+        // from the previous (now-stale) credentials must be rebuilt (it would
+        // otherwise 403). The next `cached_storage` miss triggers the rebuild.
+        // On a first load there is nothing to drop; this is a no-op then.
+        self.storages.lock().unwrap().remove(&key);
         let mut lts = self.load_tables.lock().unwrap();
         match lts.get_mut(&key) {
             Some(existing) => existing.credentials = resp.credentials.clone(),
@@ -139,6 +209,28 @@ impl IcebergCatalogSession {
                 lts.insert(key, CachedLoadTable::from_response(resp));
             }
         }
+    }
+
+    /// The S3 storage client cached for `key`, if one was built and not since
+    /// invalidated by a creds refresh. A hit lets a later scan (or the slice-1
+    /// prefetch→scan) skip rebuilding the AWS SDK client. `None` when the cache is
+    /// disabled or after a fresh loadTable dropped the entry.
+    pub(crate) fn cached_storage(&self, key: &str) -> Option<Arc<S3IcebergStorage>> {
+        if !cache_enabled() {
+            return None;
+        }
+        self.storages.lock().unwrap().get(key).cloned()
+    }
+
+    /// Cache the S3 storage client built from `key`'s current pinned credentials.
+    /// Paired with `cached_storage`; `store_load_table` invalidates on a creds
+    /// refresh, so an entry here always corresponds to the currently pinned creds.
+    /// No-op when the cache is disabled.
+    pub(crate) fn store_storage(&self, key: String, storage: Arc<S3IcebergStorage>) {
+        if !cache_enabled() {
+            return;
+        }
+        self.storages.lock().unwrap().insert(key, storage);
     }
 }
 
@@ -237,6 +329,94 @@ mod tests {
         assert_eq!(
             hit.metadata_location, "s3://snap-A.json",
             "later scans read the pinned snapshot, not the reloaded one"
+        );
+    }
+
+    #[test]
+    fn location_pin_keeps_query_on_one_snapshot_across_pointer_ttl_expiry() {
+        // The loadTable-metadata cache's pointer rung serves a snapshot's metadata
+        // from disk (no loadTable GET) and PINS its location. A LATER touch of the
+        // same table this query — even after the disk pointer's TTL expired and
+        // would resolve a NEWER snapshot — must read the SAME snapshot. This is the
+        // exact two-snapshots-in-one-query bug the pin machinery prevents; before
+        // the pin was registered on the never-forced metadata path, the pointer rung
+        // could violate it.
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "FACT_INVENTORY");
+        assert_eq!(s.pinned_metadata_location(&key), None);
+
+        // Touch 1: the rung serves + pins snap-A (credential-less — metadata came
+        // from the disk caches, no vended creds).
+        s.pin_metadata_location(key.clone(), "s3://snap-A.json".to_string());
+        assert_eq!(
+            s.pinned_metadata_location(&key).as_deref(),
+            Some("s3://snap-A.json")
+        );
+        // A location-only pin must NOT masquerade as a cached loadTable response
+        // (that would build ambient-cred storage); the eager path still reloads
+        // credentials.
+        assert!(
+            s.cached_load_table(&key).is_none(),
+            "a credential-less location pin never serves as a cached loadTable"
+        );
+
+        // Touch 2's disk pointer has expired and advanced to snap-B; first-writer-
+        // wins keeps the query on snap-A.
+        s.pin_metadata_location(key.clone(), "s3://snap-B.json".to_string());
+        assert_eq!(
+            s.pinned_metadata_location(&key).as_deref(),
+            Some("s3://snap-A.json"),
+            "the query stays on the first-pinned snapshot even if the pointer advances"
+        );
+
+        // If touch 2 falls to the EAGER path, resolve_rest_load_and_storage reloads
+        // credentials and overrides its GET-observed snap-B back to the pinned
+        // snap-A (then stores it). Model that store: the query still reads snap-A,
+        // now with fresh creds.
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(3600)))),
+        );
+        let hit = s.cached_load_table(&key).expect("fresh creds now valid");
+        assert_eq!(
+            hit.metadata_location, "s3://snap-A.json",
+            "later scans read the pinned snapshot with fresh creds"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_load_table_invalidates_cached_storage_on_creds_refresh() {
+        // The session caches the S3 client built from a table's vended creds. A
+        // fresh loadTable (a creds-expiry reload) must DROP that client so a
+        // client built from stale credentials is never reused — otherwise a later
+        // scan would 403. `from_default_chain(Some(region), ..)` builds an SDK
+        // client offline (region set, ambient creds resolved lazily, no request),
+        // which is all this bookkeeping test needs.
+        let s = IcebergCatalogSession::default();
+        let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(3600)))),
+        );
+        let storage = Arc::new(
+            S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
+                .await
+                .expect("offline SDK client construction"),
+        );
+        s.store_storage(key.clone(), Arc::clone(&storage));
+        assert!(
+            s.cached_storage(&key).is_some(),
+            "storage client is cached after store"
+        );
+
+        // A fresh loadTable with rotated credentials must invalidate it.
+        s.store_load_table(
+            key.clone(),
+            &resp("s3://snap-A.json", Some(creds(Some(3600)))),
+        );
+        assert!(
+            s.cached_storage(&key).is_none(),
+            "cached S3 client must be dropped on a credential refresh, forcing a rebuild"
         );
     }
 

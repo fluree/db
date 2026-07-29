@@ -1,0 +1,6 @@
+# q036 count_orders
+# Intent: COUNT(*) per class (H5: no manifest shortcut on virtual).
+# BI lineage (BI-18): "How many orders are there?"
+# Predicates verified against enterprise.ttl — class edw:Order.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n) WHERE { ?s a edw:Order . }

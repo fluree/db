@@ -63,7 +63,15 @@ impl super::Parser<'_> {
     }
 
     /// Parse a group graph pattern (contents within { }).
+    ///
+    /// Recursion-guarded: nested groups (directly, or via OPTIONAL / GRAPH /
+    /// SERVICE / MINUS / UNION arms) re-enter this function, so it counts
+    /// one nesting level against the stream's depth ceiling.
     pub(super) fn parse_group_graph_pattern(&mut self) -> Option<GraphPattern> {
+        self.with_recursion_guard(Self::parse_group_graph_pattern_inner)
+    }
+
+    fn parse_group_graph_pattern_inner(&mut self) -> Option<GraphPattern> {
         let start = self.stream.previous_span(); // The opening brace
 
         // SPARQL grammar: GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}'

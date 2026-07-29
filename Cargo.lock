@@ -2440,6 +2440,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluree-bench-virtual"
+version = "4.1.3"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fluree-bench-support",
+ "fluree-db-api",
+ "fluree-db-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+]
+
+[[package]]
 name = "fluree-db-api"
 version = "4.1.4"
 dependencies = [
@@ -2781,6 +2801,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-tabular",
  "futures",
+ "http 1.4.0",
  "hyper-rustls 0.24.2",
  "lru 0.12.5",
  "parquet",

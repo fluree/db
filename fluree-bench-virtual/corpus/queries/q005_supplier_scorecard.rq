@@ -1,0 +1,11 @@
+# q005 supplier_scorecard
+# Intent: Dim-to-dim FK join + ORDER BY + LIMIT (H3 dims-only, H2 dims-only).
+# BI lineage (BI-04): "Rank suppliers by rating, with the region they sit in."
+# Predicates verified against enterprise.ttl — DimSupplier: name, rating, geography(->DimGeography); DimGeography: region.
+# Determinism: ORDER BY + LIMIT top-k with a unique tiebreaker appended to the sort key so the selected rows (and the result hash) are exact across engines; perf shape unchanged (still top-k over a full scan, H2 intact).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?n ?r ?region
+WHERE { ?sup a edw:Supplier ; edw:name ?n ; edw:rating ?r ; edw:geography ?g .
+        ?g edw:region ?region . }
+ORDER BY DESC(?r) ?sup
+LIMIT 20

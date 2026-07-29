@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q016",
+  "result_hash": "5f5baf0eba5d65d6c783df129ae70a04846efb082801109646d59b6c904be7f7",
+  "rows": 5000,
+  "head_rows": [
+    "ORD-000000000003\u001fDelivered",
+    "ORD-000000000003\u001fDelivered",
+    "ORD-000000000055\u001f\u0000UNBOUND",
+    "ORD-000000000107\u001fPending",
+    "ORD-000000000140\u001fInTransit",
+    "ORD-000000000140\u001fPending",
+    "ORD-000000000140\u001fReturned",
+    "ORD-000000000204\u001f\u0000UNBOUND",
+    "ORD-000000000223\u001f\u0000UNBOUND",
+    "ORD-000000000417\u001f\u0000UNBOUND",
+    "ORD-000000000436\u001fDelivered",
+    "ORD-000000000455\u001fDelivered",
+    "ORD-000000000455\u001fDelivered",
+    "ORD-000000000455\u001fReturned",
+    "ORD-000000000474\u001fInTransit",
+    "ORD-000000000474\u001fReturned",
+    "ORD-000000000493\u001fDelivered",
+    "ORD-000000000493\u001fInTransit",
+    "ORD-000000000610\u001f\u0000UNBOUND",
+    "ORD-000000000842\u001fDelivered"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q029",
+  "result_hash": "1c42f5275ef6e792949739745172e467dcc43b42b4a986ededcf67be48d38bd0",
+  "rows": 100,
+  "head_rows": [
+    "<http://data.fluree.dev/edw/event/100001>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100014>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100015>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100020>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100024>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100025>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100033>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100043>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100051>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100055>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100057>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100060>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100066>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100068>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100092>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100095>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100096>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100115>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100122>\u001fpurchase",
+    "<http://data.fluree.dev/edw/event/100146>\u001fpurchase"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

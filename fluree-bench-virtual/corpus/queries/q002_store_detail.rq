@@ -1,0 +1,7 @@
+# q002 store_detail
+# Intent: Bound-subject inspector; on a virtual target this prefix-prunes to DIM_STORE.
+# BI lineage (BI-02): "Show everything we know about a specific store."
+# Predicates verified against enterprise.ttl — subject template edw/store/{STORE_KEY}.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?p ?o
+WHERE { <http://data.fluree.dev/edw/store/1> ?p ?o . }

@@ -1,0 +1,9 @@
+# q008 revenue_by_region
+# Intent: Fact-to-dim rollup (Order->Customer->Geography); H6 agg+join, H3, H1.
+# BI lineage (BI-06): "What is total order revenue by customer region?"
+# Predicates verified against enterprise.ttl — FactOrder: orderTotal, customer(->DimCustomer); DimCustomer: geography; DimGeography: region.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?region (SUM(?tot) AS ?rev)
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:customer ?c .
+        ?c edw:geography ?g . ?g edw:region ?region . }
+GROUP BY ?region

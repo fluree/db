@@ -1,0 +1,10 @@
+# q030 web_events_in_month
+# Intent: Date-range FILTER on the 1M-row fact (H4 date control at scale).
+# BI lineage (BI-15): "Which web events happened in June 2024?"
+# Predicates verified against enterprise.ttl — FactWebEvent: eventDate.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?e ?ed
+WHERE { ?e a edw:WebEvent ; edw:eventDate ?ed .
+        FILTER(?ed >= "2024-06-01"^^<http://www.w3.org/2001/XMLSchema#date>
+            && ?ed <  "2024-07-01"^^<http://www.w3.org/2001/XMLSchema#date>) }
+LIMIT 5000

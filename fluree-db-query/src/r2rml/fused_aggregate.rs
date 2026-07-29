@@ -40,8 +40,10 @@ use async_trait::async_trait;
 use bigdecimal::num_bigint::BigInt;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use fluree_db_core::{FlakeValue, Sid};
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
-use fluree_db_r2rml::materialize::materialize_object_from_batch;
+use fluree_db_r2rml::mapping::{
+    extract_template_columns, CompiledR2rmlMapping, ObjectMap, TriplesMap,
+};
+use fluree_db_r2rml::materialize::{get_join_key_from_batch, materialize_object_from_batch};
 use fluree_db_tabular::Column;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -273,6 +275,26 @@ pub struct FusedAggregatePlan {
     aggregates: Vec<(VarId, AggregateFn)>,
 }
 
+/// PR-6 join sub-switch. `FLUREE_FUSED_R2RML_AGG_JOIN` (the standard R2RML switch
+/// spelling via [`super::env_switch_enabled`] — `0`/`false`/`off`/`no` disable
+/// it) forces the fact⋈dim fused path off; a multi-pattern (join) shape then
+/// falls back to the generic pipeline, while the proven single-table fused path
+/// is untouched. On by default. The master switch `FLUREE_FUSED_R2RML_AGG` still
+/// gates the whole fused path above this.
+fn fused_r2rml_agg_join_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_FUSED_R2RML_AGG_JOIN"))
+}
+
+/// Master fused-aggregate kill switch (the whole R2RML fold path). Standard
+/// R2RML switch spelling via [`super::env_switch_enabled`] — `0`/`false`/`off`/
+/// `no` disable it (this replaces the old bespoke `"0"|"false"` check, aligning
+/// it with the rest of the switch family). On by default.
+fn fused_r2rml_agg_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_FUSED_R2RML_AGG"))
+}
+
 /// Detect the fused shape: a single `GRAPH { triples }` block feeding an
 /// aggregation (implicit, or GROUP BY) of only `COUNT` / `SUM` / `AVG`, with no
 /// HAVING, post-binds, FILTER, ordering, or slicing. Whether the graph is
@@ -280,10 +302,7 @@ pub struct FusedAggregatePlan {
 /// map to columns) is checked at `open`.
 pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan> {
     // Kill switch (A/B and incident response): force the normal pipeline.
-    if matches!(
-        std::env::var("FLUREE_FUSED_R2RML_AGG").as_deref(),
-        Ok("0" | "false")
-    ) {
+    if !fused_r2rml_agg_enabled() {
         return None;
     }
     // ORDER BY / LIMIT / OFFSET are applied by wrapping the fused operator in the
@@ -295,20 +314,22 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
 
     // Implicit aggregation, or GROUP BY with aggregates. No HAVING, no
     // post-aggregate binds.
-    let (group_by, aggregation, having): (Vec<VarId>, _, _) = match query.grouping.as_ref()? {
-        Grouping::Implicit {
-            aggregation,
-            having,
-        } => (Vec::new(), aggregation, having),
+    let (group_by, aggregation): (Vec<VarId>, _) = match query.grouping.as_ref()? {
+        Grouping::Implicit { aggregation, .. } => (Vec::new(), aggregation),
         Grouping::Explicit {
             group_by,
             aggregation: Some(aggregation),
-            having,
-        } => (group_by.iter().copied().collect(), aggregation, having),
+            ..
+        } => (group_by.iter().copied().collect(), aggregation),
         // GROUP BY with no aggregates (DISTINCT-style) is not a fold here.
         Grouping::Explicit { .. } => return None,
     };
-    if having.is_some() || !aggregation.binds.is_empty() {
+    // PR-6: a HAVING is now allowed — it is applied by a wrapping `HavingOperator`
+    // (the operator-tree fused hook), SPARQL-ordered after the fold. The output
+    // projection check below still rejects any HAVING that lifts an aggregate not
+    // present in the SELECT projection (that query stays on the generic path — the
+    // conservative admission line). Post-aggregate BINDs are not foldable.
+    if !aggregation.binds.is_empty() {
         return None;
     }
 
@@ -642,11 +663,48 @@ fn group_kind(datatype: Option<&str>) -> Option<GKind> {
 }
 
 /// One component of a composite group key (hashable / comparable).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum GKey {
     Str(String),
     Int(i128),
     Null,
+}
+
+/// Insert a dim join-key → group-keys mapping for the fused-aggregate FK chain,
+/// declining (returns `false`) on a CONFLICTING duplicate — the same dim join-key
+/// mapping to *different* group-keys. There the generic pipeline (the reference
+/// semantics) gives the dim subject two attribute triples, so a joined fact row
+/// legitimately lands in two groups, while this single-value probe keeps one and
+/// silently under-counts; the caller must fall back (`Ok(None)`). Equal-value
+/// duplicates also decline — the fan-out under-counts even when the group-keys
+/// agree. Reachable via this stack's own #1450
+/// unverified subject-keys / name-based FK inference / hand-written mappings — SF01
+/// dims have unique PKs so the corpus can't catch it, hence a checked invariant
+/// rather than the old `last-wins` comment.
+fn insert_dim_gkeys(
+    map: &mut std::collections::HashMap<Vec<String>, Vec<GKey>>,
+    key: Vec<String>,
+    gkeys: Vec<GKey>,
+) -> bool {
+    // The FK→GKey map assumes the parent JOIN KEY is UNIQUE — true for a proper
+    // star schema (the RefObjectMap's parent columns are the dim's surrogate PK),
+    // but NOT guaranteed for a hand-written mapping whose parent columns are a
+    // non-key subset. A duplicate parent join key means the materialized inner
+    // join FANS OUT (one fact row matches multiple dim rows), which a single-entry
+    // per-key map cannot represent: conflicting group attrs would mis-attribute
+    // (last-wins), and even EQUAL group attrs would UNDER-COUNT the fan-out. So any
+    // duplicate parent key DECLINES the fused plan (caller returns `Ok(None)` →
+    // materialize), the conservative posture the whole operator takes when a shape
+    // is outside what it can fold soundly. Returns `false` on any duplicate (was
+    // previously `true` for an equal-value duplicate — that "harmless" case is a
+    // latent fan-out under-count, so it now declines too).
+    match map.get(&key) {
+        Some(_) => false,
+        None => {
+            map.insert(key, gkeys);
+            true
+        }
+    }
 }
 
 impl GroupCol {
@@ -667,6 +725,18 @@ impl GroupCol {
                     .get(row)
                     .and_then(|o| *o)
                     .map_or(GKey::Null, |i| GKey::Int(i as i128)),
+                // A Snowflake `NUMBER(n,0)` integer column arrives as a physical
+                // Decimal even when the R2RML datatype is `xsd:integer`; read the
+                // exact-integer value so it groups (else every such dim row would
+                // be dropped as a null key — the q010 `YEAR_NUM/QUARTER_NUM` case).
+                Column::Decimal { values, scale, .. } => match values.get(row).and_then(|o| *o) {
+                    Some(unscaled) if *scale == 0 => GKey::Int(unscaled),
+                    Some(unscaled) if *scale > 0 => match pow10(i64::from(*scale)) {
+                        Some(d) if unscaled % d == 0 => GKey::Int(unscaled / d),
+                        _ => GKey::Null,
+                    },
+                    _ => GKey::Null,
+                },
                 _ => GKey::Null,
             },
         }
@@ -698,6 +768,34 @@ struct Resolved {
     /// R2RML star's row-drop: the subject template columns plus every predicate's
     /// object column.
     validity_cols: Vec<String>,
+    /// The columns that must be non-null for the COUNT(*) manifest shortcut to
+    /// equal a full scan — the subject key columns **parsed from the template
+    /// string** (not the loader-only `template_columns` field) plus the object
+    /// columns. Empty means a constant subject (present on every row → the
+    /// shortcut needs no null proof). Consumed only for the bare-COUNT fast path.
+    count_non_null_cols: Vec<String>,
+    /// PR-6: `None` for the single-table fold (GROUP BY keys read straight from
+    /// the scanned fact batch via `group_cols`). `Some` for a fact⋈dim fold: the
+    /// GROUP BY keys live on a dimension reached by an FK, so they are resolved
+    /// per fact row by probing this dim lookup with the fact's FK columns. A miss
+    /// (dangling or null FK, or a dim row with a null group attribute) drops the
+    /// fact row — mirroring the R2RML/inner-join row-drop. `group_cols` still
+    /// describes the key kinds/datatypes for materializing the output binding.
+    group_resolver: Option<GroupKeyResolver>,
+}
+
+/// PR-6 fact⋈dim group-key resolver, built once at `open` by scanning the small
+/// dimension(s). Maps a fact FK key (the stringified `fact_fk_cols` values, in
+/// the RefObjectMap's join order) to the GROUP BY key tuple; an absent key means
+/// the fact row has no complete join tuple and drops from the rollup.
+struct GroupKeyResolver {
+    /// Fact-scan columns forming the probe key — the RefObjectMap child columns
+    /// of the first hop, in join-condition order.
+    fact_fk_cols: Vec<String>,
+    /// FK key → group-key GKey tuple. Only fully-non-null dim rows are inserted,
+    /// so a probe miss collapses "dangling FK" and "dim row with null group
+    /// attribute" into one drop, exactly as the inner join does.
+    map: std::collections::HashMap<Vec<String>, Vec<GKey>>,
 }
 
 /// A native `SUM(expr)` / `AVG(expr)` plan: the arithmetic expression and the
@@ -906,12 +1004,44 @@ impl Operator for FusedR2rmlAggregateOperator {
             Some(ctx.to_t)
         };
 
+        // COUNT(*) manifest shortcut: a bare COUNT — exactly one CountRows fold,
+        // no GROUP BY, no FILTER — can be answered from the Iceberg manifest
+        // record_count sum instead of decoding every data file, WHEN the provider
+        // can prove the manifest count equals a full scan: no delete manifests,
+        // and every subject/object validity column provably zero-null. Otherwise
+        // `table_row_count` returns None and the scan below runs (delete/null-
+        // correct). Gated by the same `FLUREE_FUSED_R2RML_AGG` kill switch as the
+        // whole fused path (a disabled switch fails detection, so this is never
+        // reached). The emitted binding is byte-identical to the scan+fold result
+        // (`Acc::Count(n).finalize()`).
+        if resolved.filter.is_none()
+            && resolved.group_cols.is_empty()
+            && matches!(resolved.folds.as_slice(), [Fold::CountRows])
+        {
+            let gs = resolved.pattern.graph_source_id.clone();
+            let table = resolved.table_name.clone();
+            let non_null_cols = resolved.count_non_null_cols.clone();
+            if let Some(n) = table_provider
+                .table_row_count(&gs, &table, &non_null_cols, as_of_t)
+                .await?
+            {
+                self.done = true;
+                self.state = OperatorState::Exhausted;
+                let count = Acc::Count(n).finalize();
+                return Ok(Some(Batch::new(
+                    Arc::clone(&self.schema),
+                    vec![vec![count]],
+                )?));
+            }
+        }
+
         let mut stream = table_provider
             .scan_table(
                 &resolved.pattern.graph_source_id,
                 &resolved.table_name,
                 &resolved.projection,
                 &[],
+                None,
                 as_of_t,
             )
             .await?;
@@ -987,11 +1117,26 @@ impl Operator for FusedR2rmlAggregateOperator {
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
                 } else {
-                    let key: Vec<GKey> = gcols
-                        .iter()
-                        .zip(&key_cols)
-                        .map(|(g, c)| g.key_at(*c, row))
-                        .collect();
+                    let key: Vec<GKey> = if let Some(resolver) = &resolved.group_resolver {
+                        // PR-6: the GROUP BY key lives on the dim — resolve it from
+                        // the fact's FK columns. A null/missing FK, or a dim row
+                        // with a null group attribute (never inserted), drops the
+                        // fact row, mirroring the R2RML/inner-join row-drop.
+                        let Some(fk) = get_join_key_from_batch(&resolver.fact_fk_cols, &batch, row)
+                        else {
+                            continue;
+                        };
+                        match resolver.map.get(&fk) {
+                            Some(gk) => gk.clone(),
+                            None => continue,
+                        }
+                    } else {
+                        gcols
+                            .iter()
+                            .zip(&key_cols)
+                            .map(|(g, c)| g.key_at(*c, row))
+                            .collect()
+                    };
                     groups
                         .entry(key)
                         .or_insert_with(|| folds.iter().map(Acc::for_fold).collect())
@@ -1121,9 +1266,29 @@ impl FusedR2rmlAggregateOperator {
         if rr.unconverted_count > 0 {
             return Ok(None);
         }
+        // The single-`R2rml` shape gate below also keeps this path decline-safe
+        // against non-lowered sub-scopes (`rr.unsupported`): a surviving
+        // PropertyPath/Subquery breaks the shape, so we fall back to the normal
+        // GRAPH path, which raises the loud `unsupported_subscope_error`.
         let pattern = match rr.patterns.as_slice() {
             [Pattern::R2rml(p)] => p.clone(),
-            _ => return Ok(None), // multiple scans / star not handled in slice 1
+            // PR-6: a fact→dim chain rewrites to multiple R2rml leaf patterns.
+            // Admit it as a fused aggregate over one join (gated by the join
+            // sub-switch); anything else (non-R2rml pattern present) falls back.
+            _ if fused_r2rml_agg_join_enabled() => {
+                let mut pats: Vec<&R2rmlPattern> = Vec::with_capacity(rr.patterns.len());
+                for p in &rr.patterns {
+                    match p {
+                        Pattern::R2rml(p) => pats.push(p),
+                        _ => return Ok(None),
+                    }
+                }
+                let Some(mapping) = mapping else {
+                    return Ok(None);
+                };
+                return self.resolve_join_at_open(ctx, &pats, &mapping).await;
+            }
+            _ => return Ok(None), // join sub-switch off, or non-R2rml pattern
         };
 
         // The graph is genuinely R2RML-backed here; without the mapping fall back
@@ -1149,6 +1314,11 @@ impl FusedR2rmlAggregateOperator {
             let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *gv) else {
                 return Ok(None);
             };
+            // The single-table path keeps its original behavior byte-for-byte (an
+            // un-annotated column key declines → generic). The `None → xsd:string`
+            // default is applied ONLY on the join path (`resolve_join_at_open`),
+            // where it is hash-validated; enabling it here would fuse shapes the
+            // single-table fold has not been validated for (the q022 sentinel).
             let Some(kind) = group_kind(datatype.as_deref()) else {
                 return Ok(None);
             };
@@ -1166,87 +1336,11 @@ impl FusedR2rmlAggregateOperator {
             });
         }
 
-        // Synthetic aggregate-input expressions (the desugared `SUM(expr)` args).
-        let bind_lookup: std::collections::HashMap<VarId, &Expression> =
-            self.agg_binds.iter().map(|(v, e)| (*v, e)).collect();
-
-        let mut folds = Vec::with_capacity(self.aggregates.len());
-        let mut expr_folds: Vec<ExprFold> = Vec::new();
-        for (_, func) in &self.aggregates {
-            match func {
-                AggregateFn::CountAll => folds.push(Fold::CountRows),
-                AggregateFn::Count(v) if pattern.subject_var == Some(*v) => {
-                    // COUNT of the subject counts the rows that produce a row,
-                    // which the row-validity gate already enforces.
-                    folds.push(Fold::CountRows);
-                }
-                AggregateFn::Count(v) => {
-                    let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, *v) else {
-                        return Ok(None);
-                    };
-                    projection.push(col.clone());
-                    folds.push(Fold::CountColumn(col));
-                }
-                AggregateFn::Sum(v, _) | AggregateFn::Avg(v, _) => {
-                    let is_avg = matches!(func, AggregateFn::Avg(_, _));
-                    if let Some(expr) = bind_lookup.get(v) {
-                        // Aggregate over a desugared expression: native decimal fold.
-                        if !expr_native_foldable(expr) {
-                            return Ok(None);
-                        }
-                        let mut var_cols = Vec::new();
-                        for ev in expr.referenced_vars() {
-                            let Some((col, datatype)) =
-                                Self::scalar_column_for_var(&pattern, tm, ev)
-                            else {
-                                return Ok(None);
-                            };
-                            let deck = match numeric_kind(datatype.as_deref()) {
-                                Some(NumKind::Decimal) => DecKind::Decimal,
-                                Some(NumKind::Integer) => DecKind::Integer,
-                                // floats aren't exact decimals → engine path.
-                                _ => return Ok(None),
-                            };
-                            projection.push(col.clone());
-                            var_cols.push((ev, col, deck));
-                        }
-                        // The native expr fold always finalizes as xsd:decimal.
-                        // An all-integer expression (no decimal column or
-                        // constant) would be xsd:integer in the normal pipeline,
-                        // so fall back to keep the result datatype exact.
-                        let any_decimal = var_cols
-                            .iter()
-                            .any(|(_, _, k)| matches!(k, DecKind::Decimal))
-                            || expr_has_decimal_const(expr);
-                        if !any_decimal {
-                            return Ok(None);
-                        }
-                        let index = expr_folds.len();
-                        expr_folds.push(ExprFold {
-                            expr: (*expr).clone(),
-                            var_cols,
-                        });
-                        folds.push(Fold::NumericExpr { index, is_avg });
-                    } else {
-                        // Aggregate over a bare numeric column: native fold.
-                        let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *v)
-                        else {
-                            return Ok(None);
-                        };
-                        let Some(kind) = numeric_kind(datatype.as_deref()) else {
-                            return Ok(None);
-                        };
-                        projection.push(col.clone());
-                        folds.push(Fold::Numeric {
-                            column: col,
-                            kind,
-                            is_avg,
-                        });
-                    }
-                }
-                _ => return Ok(None),
-            }
-        }
+        // Resolve the aggregate output folds against the (single) scanned TM.
+        let (folds, expr_folds) = match self.resolve_agg_folds(&pattern, tm, &mut projection) {
+            Some(x) => x,
+            None => return Ok(None),
+        };
 
         // Row-validity columns. A row participates only if the subject template
         // columns and every predicate's object column are non-null — mirroring
@@ -1261,14 +1355,29 @@ impl FusedR2rmlAggregateOperator {
         if let Some(c) = &tm.subject_map.column {
             validity_cols.push(c.clone());
         }
+        // Trap-safe subject key columns for the COUNT shortcut's null guard: parse
+        // the template STRING. `SubjectMap.template_columns` is populated only on
+        // the loader path, NOT by `TriplesMap::with_subject_template` (the
+        // fluree/db template_columns gotcha), so trusting the field would leave a
+        // fixture- or non-loader-built mapping's key columns empty and the null
+        // guard would pass vacuously. A constant/column subject has no template
+        // placeholders: a constant subject is on every row (empty set is sound —
+        // count == record_count); a column subject must itself be non-null.
+        let mut count_non_null_cols: Vec<String> = match tm.subject_map.template.as_deref() {
+            Some(t) => extract_template_columns(t),
+            None => tm.subject_map.column.iter().cloned().collect(),
+        };
         let mut obj_vars: Vec<VarId> = pattern.object_var.into_iter().collect();
         obj_vars.extend(pattern.star_bindings.iter().map(|(_, v)| *v));
         for v in obj_vars {
             let Some((col, _)) = Self::scalar_column_for_var(&pattern, tm, v) else {
                 return Ok(None);
             };
-            validity_cols.push(col);
+            validity_cols.push(col.clone());
+            count_non_null_cols.push(col);
         }
+        count_non_null_cols.sort();
+        count_non_null_cols.dedup();
         for c in &validity_cols {
             projection.push(c.clone());
         }
@@ -1310,6 +1419,453 @@ impl FusedR2rmlAggregateOperator {
             filter,
             expr_folds,
             validity_cols,
+            count_non_null_cols,
+            group_resolver: None,
+        }))
+    }
+
+    /// Resolve the aggregate output folds for `self.aggregates` against one
+    /// scanned TriplesMap (`pattern`/`tm`), appending each aggregate's value
+    /// column(s) to `projection`. `None` = an unsupported aggregate or a
+    /// non-scalar/column object map → the caller falls back. Shared by the
+    /// single-table `resolve_at_open` and the fact⋈dim `resolve_join_at_open`
+    /// (the aggregates always fold from the FACT scan in both).
+    fn resolve_agg_folds(
+        &self,
+        pattern: &R2rmlPattern,
+        tm: &TriplesMap,
+        projection: &mut Vec<String>,
+    ) -> Option<(Vec<Fold>, Vec<ExprFold>)> {
+        let bind_lookup: std::collections::HashMap<VarId, &Expression> =
+            self.agg_binds.iter().map(|(v, e)| (*v, e)).collect();
+        let mut folds = Vec::with_capacity(self.aggregates.len());
+        let mut expr_folds: Vec<ExprFold> = Vec::new();
+        for (_, func) in &self.aggregates {
+            match func {
+                AggregateFn::CountAll => folds.push(Fold::CountRows),
+                AggregateFn::Count(v) if pattern.subject_var == Some(*v) => {
+                    // COUNT of the subject counts the rows that produce a row,
+                    // which the row-validity gate already enforces.
+                    folds.push(Fold::CountRows);
+                }
+                AggregateFn::Count(v) => {
+                    let (col, _) = Self::scalar_column_for_var(pattern, tm, *v)?;
+                    projection.push(col.clone());
+                    folds.push(Fold::CountColumn(col));
+                }
+                AggregateFn::Sum(v, _) | AggregateFn::Avg(v, _) => {
+                    let is_avg = matches!(func, AggregateFn::Avg(_, _));
+                    if let Some(expr) = bind_lookup.get(v) {
+                        // Aggregate over a desugared expression: native decimal fold.
+                        if !expr_native_foldable(expr) {
+                            return None;
+                        }
+                        let mut var_cols = Vec::new();
+                        for ev in expr.referenced_vars() {
+                            let (col, datatype) = Self::scalar_column_for_var(pattern, tm, ev)?;
+                            let deck = match numeric_kind(datatype.as_deref()) {
+                                Some(NumKind::Decimal) => DecKind::Decimal,
+                                Some(NumKind::Integer) => DecKind::Integer,
+                                // floats aren't exact decimals → engine path.
+                                _ => return None,
+                            };
+                            projection.push(col.clone());
+                            var_cols.push((ev, col, deck));
+                        }
+                        // The native expr fold always finalizes as xsd:decimal; an
+                        // all-integer expression would be xsd:integer in the normal
+                        // pipeline, so fall back to keep the result datatype exact.
+                        let any_decimal = var_cols
+                            .iter()
+                            .any(|(_, _, k)| matches!(k, DecKind::Decimal))
+                            || expr_has_decimal_const(expr);
+                        if !any_decimal {
+                            return None;
+                        }
+                        let index = expr_folds.len();
+                        expr_folds.push(ExprFold {
+                            expr: (*expr).clone(),
+                            var_cols,
+                        });
+                        folds.push(Fold::NumericExpr { index, is_avg });
+                    } else {
+                        // Aggregate over a bare numeric column: native fold.
+                        let (col, datatype) = Self::scalar_column_for_var(pattern, tm, *v)?;
+                        let kind = numeric_kind(datatype.as_deref())?;
+                        projection.push(col.clone());
+                        folds.push(Fold::Numeric {
+                            column: col,
+                            kind,
+                            is_avg,
+                        });
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some((folds, expr_folds))
+    }
+
+    /// If `dim`'s subject variable is bound as an object of `fact` (a RefObjectMap
+    /// object among `fact`'s star members / object var), return that join variable
+    /// — i.e. `fact` is the child and `dim` the parent of one FK hop.
+    fn joins_via(fact: &R2rmlPattern, dim: &R2rmlPattern) -> Option<VarId> {
+        let dsv = dim.subject_var?;
+        if fact.object_var == Some(dsv) || fact.star_bindings.iter().any(|(_, v)| *v == dsv) {
+            Some(dsv)
+        } else {
+            None
+        }
+    }
+
+    /// Order the rewritten leaf patterns into a linear `fact → dim1 → … → dimk`
+    /// FK chain: each pattern ref-joins to at most one next pattern (no branch),
+    /// exactly one pattern is unreferenced (the fact/root), and the walk visits
+    /// every pattern exactly once (no cycle, not disconnected). Returns the ordered
+    /// chain and, per hop, the join variable (the next pattern's subject var).
+    /// `None` declines any non-linear shape (PR-6b constraint: linear chains only).
+    fn order_chain<'p>(pats: &[&'p R2rmlPattern]) -> Option<(Vec<&'p R2rmlPattern>, Vec<VarId>)> {
+        let n = pats.len();
+        if n < 2 {
+            return None;
+        }
+        // `next[i] = (join_var, j)`: `pats[i]` ref-joins to `pats[j]`. At most one
+        // per `i` (no branch); each `j` referenced at most once (no merge).
+        let mut next: Vec<Option<(VarId, usize)>> = vec![None; n];
+        let mut indeg = vec![0usize; n];
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                if let Some(jv) = Self::joins_via(pats[i], pats[j]) {
+                    if next[i].is_some() {
+                        return None; // branch: i joins to >1 dim
+                    }
+                    next[i] = Some((jv, j));
+                    indeg[j] += 1;
+                    if indeg[j] > 1 {
+                        return None; // merge: j referenced by >1 pattern
+                    }
+                }
+            }
+        }
+        // Exactly one root (in-degree 0).
+        let mut root = None;
+        for (i, &d) in indeg.iter().enumerate() {
+            if d == 0 {
+                if root.is_some() {
+                    return None;
+                }
+                root = Some(i);
+            }
+        }
+        let mut cur = root?;
+        let mut order = Vec::with_capacity(n);
+        let mut join_vars = Vec::with_capacity(n - 1);
+        let mut seen = vec![false; n];
+        loop {
+            if seen[cur] {
+                return None; // cycle
+            }
+            seen[cur] = true;
+            order.push(pats[cur]);
+            match next[cur] {
+                Some((jv, j)) => {
+                    join_vars.push(jv);
+                    cur = j;
+                }
+                None => break,
+            }
+        }
+        if order.len() != n {
+            return None; // disconnected
+        }
+        Some((order, join_vars))
+    }
+
+    /// PR-6 (6a): resolve a fused aggregate over a single fact→dim FK hop. `pats`
+    /// are the rewritten R2rml leaf patterns — here exactly two: the fact (chain
+    /// root, carrying the aggregate measure columns) and one dimension carrying
+    /// the GROUP BY attribute(s). Builds a [`GroupKeyResolver`] by scanning the
+    /// dim once. Declines (`Ok(None)` → generic pipeline) on any shape outside
+    /// the admitted class: != 2 patterns, a FILTER, a composite/multi FK, a
+    /// non-scalar group key, an aggregate that is not a fact column, or a
+    /// non-linear / cyclic join (see [`Self::order_chain`]).
+    async fn resolve_join_at_open(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        pats: &[&R2rmlPattern],
+        mapping: &CompiledR2rmlMapping,
+    ) -> Result<Option<Resolved>> {
+        // A FILTER over the join is out of scope (none of the target rollups carry
+        // one; HAVING is applied by a wrapping operator, not here).
+        if self.filter.is_some() {
+            return Ok(None);
+        }
+        // Order the patterns into a linear `fact → dim1 → … → dimk` chain (single
+        // ref-join per hop, no branch, no cycle). `join_vars[h]` is dim_{h+1}'s
+        // subject var — the object bound by the hop-`h` RefObjectMap.
+        let Some((chain, join_vars)) = Self::order_chain(pats) else {
+            return Ok(None);
+        };
+        let fact_p = chain[0];
+        let terminal_p = *chain.last().expect("order_chain returns ≥2 patterns");
+        let Some(fact_tm) = Self::resolve_triples_map(fact_p, mapping) else {
+            return Ok(None);
+        };
+
+        // Resolve each hop's single-column FK: `hops[h]` connects `chain[h]` →
+        // `chain[h+1]` via a RefObjectMap on `chain[h]`'s TriplesMap. Each entry is
+        // (child cols on the source table, parent join cols on the next dim, next
+        // dim's TriplesMap). The next dim's TM is the RefObjectMap's authoritative
+        // `parent_triples_map` (correct even under a shared group-attr predicate).
+        let mut hops: Vec<(Vec<String>, Vec<String>, &TriplesMap)> =
+            Vec::with_capacity(join_vars.len());
+        let mut src_tm = fact_tm;
+        for (h, &jv) in join_vars.iter().enumerate() {
+            let Some(join_pred) = Self::predicate_for_var(chain[h], jv) else {
+                return Ok(None);
+            };
+            let rom = src_tm.predicate_object_maps.iter().find_map(|pom| {
+                if pom.predicate_map.as_constant() == Some(join_pred) {
+                    if let ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                        return Some(rom);
+                    }
+                }
+                None
+            });
+            let Some(rom) = rom else {
+                return Ok(None);
+            };
+            // Single-column FK per hop (the 6b constraint).
+            if rom.join_conditions.len() != 1 {
+                return Ok(None);
+            }
+            let Some(parent_tm) = mapping.triples_maps.get(&rom.parent_triples_map) else {
+                return Ok(None);
+            };
+            hops.push((
+                rom.child_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                rom.parent_columns()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                parent_tm,
+            ));
+            src_tm = parent_tm;
+        }
+        let terminal_tm = hops.last().expect("≥1 hop for a join").2;
+
+        // GROUP BY keys resolve to scalar attribute columns on the TERMINAL dim.
+        let mut group_cols = Vec::with_capacity(self.group_by.len());
+        let mut dim_attr_cols = Vec::with_capacity(self.group_by.len());
+        for gv in &self.group_by {
+            let Some((col, datatype)) = Self::scalar_column_for_var(terminal_p, terminal_tm, *gv)
+            else {
+                return Ok(None);
+            };
+            // A column ObjectMap with no `rr:datatype` maps to `xsd:string` — the
+            // R2RML natural mapping for a string column (the un-annotated case in
+            // this schema, e.g. DimStore.STORE_NAME / DimProduct.CATEGORY). The
+            // generic materialize path produces the same string literal, so hash
+            // parity holds.
+            let dt_iri = datatype.as_deref().unwrap_or(fluree_vocab::xsd::STRING);
+            let Some(kind) = group_kind(Some(dt_iri)) else {
+                return Ok(None);
+            };
+            let Some(dt_sid) = ctx.active_snapshot.encode_iri(dt_iri) else {
+                return Ok(None);
+            };
+            dim_attr_cols.push(col.clone());
+            group_cols.push(GroupCol {
+                column: col,
+                kind,
+                dt_sid,
+            });
+        }
+        // A join fold must actually group (an implicit aggregate over a join is
+        // not this shape).
+        if group_cols.is_empty() {
+            return Ok(None);
+        }
+
+        // Aggregates fold from the FACT scan.
+        let mut projection: Vec<String> = Vec::new();
+        let Some((folds, expr_folds)) = self.resolve_agg_folds(fact_p, fact_tm, &mut projection)
+        else {
+            return Ok(None);
+        };
+
+        // Fact-side row-validity: the subject template columns, the first hop's FK
+        // child columns (a null FK ⇒ no ref triple ⇒ row drops), and every scalar
+        // measure/object column EXCEPT the first join var (a RefObjectMap object,
+        // covered by the FK cols).
+        let fact_fk_cols = hops[0].0.clone();
+        let first_join_var = join_vars[0];
+        let mut validity_cols: Vec<String> = fact_tm.subject_map.template_columns.clone();
+        if let Some(c) = &fact_tm.subject_map.column {
+            validity_cols.push(c.clone());
+        }
+        validity_cols.extend(fact_fk_cols.iter().cloned());
+        let mut fact_obj_vars: Vec<VarId> = fact_p.object_var.into_iter().collect();
+        fact_obj_vars.extend(fact_p.star_bindings.iter().map(|(_, v)| *v));
+        for v in fact_obj_vars {
+            if v == first_join_var {
+                continue;
+            }
+            let Some((col, _)) = Self::scalar_column_for_var(fact_p, fact_tm, v) else {
+                return Ok(None);
+            };
+            validity_cols.push(col);
+        }
+        for c in &validity_cols {
+            projection.push(c.clone());
+        }
+        validity_cols.sort();
+        validity_cols.dedup();
+        projection.sort();
+        projection.dedup();
+
+        let Some(fact_table) = fact_tm.table_name().map(str::to_string) else {
+            return Ok(None);
+        };
+        let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
+            QueryError::InvalidQuery("R2RML table provider not configured".to_string())
+        })?;
+        let as_of_t = if ctx.dataset.is_some() {
+            None
+        } else {
+            Some(ctx.to_t)
+        };
+        let gs = &fact_p.graph_source_id;
+
+        // PR-8 slice 1: warm the whole chain's catalog contexts CONCURRENTLY
+        // before the serial dim + fact scans below, so the per-table `loadTable`
+        // GETs overlap instead of summing (measured cold: q008's 3 GETs ~4.99s
+        // serial). Best-effort (see `prefetch_tables`); the dim scans here and the
+        // fact scan in `next_batch` share `self.session`, so one warm covers every
+        // scan in this operator.
+        if super::parallel_catalog_resolution_enabled() {
+            let mut chain_tables: Vec<String> = Vec::with_capacity(hops.len() + 1);
+            chain_tables.push(fact_table.clone());
+            for (_, _, dim_tm) in &hops {
+                if let Some(t) = dim_tm.table_name() {
+                    chain_tables.push(t.to_string());
+                }
+            }
+            table_provider.prefetch_tables(gs, &chain_tables).await;
+        }
+
+        // Build the composed group-key resolver, scanning each small dim ONCE from
+        // the terminal dim back toward the fact. A dim row is kept only when its
+        // join key AND (terminal) its group attrs / (interior) its FK-to-next are
+        // all non-null and the next hop resolved — so a fact-row probe miss folds
+        // "dangling FK at any hop" and "null group attr" into one drop, exactly as
+        // the chained inner join does.
+        //
+        // Terminal dim: its join key (last hop's parent cols) → group-key GKeys.
+        let (_, terminal_parent_cols, _) = hops.last().expect("≥1 hop");
+        let terminal_parent_cols = terminal_parent_cols.clone();
+        let Some(terminal_table) = terminal_tm.table_name().map(str::to_string) else {
+            return Ok(None);
+        };
+        let mut terminal_proj = terminal_parent_cols.clone();
+        terminal_proj.extend(dim_attr_cols.iter().cloned());
+        terminal_proj.sort();
+        terminal_proj.dedup();
+        let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
+            std::collections::HashMap::new();
+        {
+            let mut s = table_provider
+                .scan_table(gs, &terminal_table, &terminal_proj, &[], None, as_of_t)
+                .await?;
+            while let Some(batch) = s.next().await {
+                let batch = batch?;
+                let attr_cols: Vec<Option<&Column>> = group_cols
+                    .iter()
+                    .map(|g| batch.column_by_name(&g.column))
+                    .collect();
+                for row in 0..batch.num_rows {
+                    let Some(key) = get_join_key_from_batch(&terminal_parent_cols, &batch, row)
+                    else {
+                        continue;
+                    };
+                    let mut gkeys = Vec::with_capacity(group_cols.len());
+                    let mut any_null = false;
+                    for (g, c) in group_cols.iter().zip(&attr_cols) {
+                        let k = g.key_at(*c, row);
+                        if matches!(k, GKey::Null) {
+                            any_null = true;
+                            break;
+                        }
+                        gkeys.push(k);
+                    }
+                    if any_null {
+                        continue;
+                    }
+                    // Decline the fused plan on a CONFLICTING duplicate dim join-key
+                    // (see `insert_dim_gkeys` for the soundness argument).
+                    if !insert_dim_gkeys(&mut map, key, gkeys) {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        // Interior dims: compose from the hop before the terminal back to the fact.
+        // `chain[h+1]` is keyed by hop-`h`'s parent cols (its join key) and carries
+        // hop-`(h+1)`'s child cols (its FK to the next dim).
+        for h in (0..hops.len() - 1).rev() {
+            let inter_tm = hops[h].2;
+            let Some(inter_table) = inter_tm.table_name().map(str::to_string) else {
+                return Ok(None);
+            };
+            let key_cols = hops[h].1.clone();
+            let fk_next_cols = hops[h + 1].0.clone();
+            let mut proj = key_cols.clone();
+            proj.extend(fk_next_cols.iter().cloned());
+            proj.sort();
+            proj.dedup();
+            let mut next_map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
+                std::collections::HashMap::new();
+            let mut s = table_provider
+                .scan_table(gs, &inter_table, &proj, &[], None, as_of_t)
+                .await?;
+            while let Some(batch) = s.next().await {
+                let batch = batch?;
+                for row in 0..batch.num_rows {
+                    let Some(pk) = get_join_key_from_batch(&key_cols, &batch, row) else {
+                        continue;
+                    };
+                    let Some(fk_next) = get_join_key_from_batch(&fk_next_cols, &batch, row) else {
+                        continue;
+                    };
+                    if let Some(gkeys) = map.get(&fk_next) {
+                        // Same conflicting-duplicate soundness as the terminal scan.
+                        if !insert_dim_gkeys(&mut next_map, pk, gkeys.clone()) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            map = next_map;
+        }
+
+        Ok(Some(Resolved {
+            pattern: fact_p.clone(),
+            table_name: fact_table,
+            projection,
+            group_cols,
+            folds,
+            filter: None,
+            expr_folds,
+            validity_cols,
+            // The COUNT(*) manifest shortcut is single-table only.
+            count_non_null_cols: Vec::new(),
+            group_resolver: Some(GroupKeyResolver { fact_fk_cols, map }),
         }))
     }
 }
@@ -1369,6 +1925,44 @@ mod tests {
     }
 
     #[test]
+    fn dim_dup_join_key_always_declines() {
+        // The dim-scan map's soundness gate (#1490 review, HARDENED by the R-1528
+        // duplicate-parent-key item): a duplicate parent join key means the
+        // materialized join FANS OUT, which the single-entry-per-key map cannot
+        // represent — so ANY duplicate (conflicting OR equal group-keys) declines
+        // the fused plan (caller returns Ok(None) → generic pipeline). The equal-value
+        // duplicate previously kept is a latent fan-out under-count, so it now declines
+        // too. Proper star schemas have unique parent keys, so this never fires there.
+        use std::collections::HashMap;
+        let mut m: HashMap<Vec<String>, Vec<GKey>> = HashMap::new();
+        let k = vec!["1".to_string()];
+        assert!(insert_dim_gkeys(
+            &mut m,
+            k.clone(),
+            vec![GKey::Str("A".into())]
+        ));
+        // equal-value duplicate → now DECLINES (was previously kept): the fan-out
+        // the map can't represent would under-count.
+        assert!(!insert_dim_gkeys(
+            &mut m,
+            k.clone(),
+            vec![GKey::Str("A".into())]
+        ));
+        // conflicting duplicate (different attrs) → declines (mis-attribution).
+        assert!(!insert_dim_gkeys(
+            &mut m,
+            k.clone(),
+            vec![GKey::Str("B".into())]
+        ));
+        // a distinct key still inserts.
+        assert!(insert_dim_gkeys(
+            &mut m,
+            vec!["2".to_string()],
+            vec![GKey::Int(9)]
+        ));
+    }
+
+    #[test]
     fn declines_with_group_by() {
         // Slice 1 is implicit aggregation only.
         let (s, o, c) = (VarId(0), VarId(1), VarId(2));
@@ -1423,6 +2017,180 @@ mod tests {
             cypher_vocab: None,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
+    }
+
+    // PR-6: HAVING is admitted (applied by a wrapping HavingOperator) when its
+    // lifted aggregate is already in the SELECT projection.
+    #[test]
+    fn admits_having_referencing_projected_aggregate() {
+        let (s, o, g, c) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let agg = AggregateSpec {
+            function: AggregateFn::Count(o),
+            output_var: c,
+        };
+        let q = Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![g, c]),
+            patterns: vec![graph_triple(s, o)],
+            reasoning: ReasoningConfig::default(),
+            // HAVING references the projected aggregate ?c (no synthetic extra) →
+            // outs == projected → fused.
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c))),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+            cypher_vocab: None,
+        };
+        assert!(detect_fused_r2rml_aggregate(&q).is_some());
+    }
+
+    // PR-6: the conservative HAVING admission line — a HAVING that lifts an
+    // aggregate NOT in the SELECT projection makes outs ⊋ projected, so the
+    // projection check declines and the query stays on the generic path.
+    #[test]
+    fn declines_having_over_unprojected_aggregate() {
+        let (s, o, g, c, c2) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let agg = AggregateSpec {
+            function: AggregateFn::Count(o),
+            output_var: c,
+        };
+        let agg2 = AggregateSpec {
+            function: AggregateFn::Count(s),
+            output_var: c2,
+        };
+        let q = Query {
+            context: ParsedContext::default(),
+            orig_context: None,
+            output: QueryOutput::select_all(vec![g, c]),
+            patterns: vec![graph_triple(s, o)],
+            reasoning: ReasoningConfig::default(),
+            grouping: Grouping::assemble(
+                vec![g],
+                vec![agg, agg2],
+                vec![],
+                Some(Expression::Var(c2)),
+            ),
+            ordering: Vec::new(),
+            order_binds: Vec::new(),
+            limit: None,
+            offset: None,
+            post_values: None,
+            include_system_facts: false,
+            cypher_vocab: None,
+        };
+        assert!(detect_fused_r2rml_aggregate(&q).is_none());
+    }
+
+    // PR-6: the fact/dim join classifier + cycle-guard used by
+    // resolve_join_at_open. A single FK direction resolves one way; an FK loop
+    // resolves both ways, which the resolver's `(Some, Some)` arm declines.
+    #[test]
+    fn joins_via_classifies_direction_and_flags_cycle() {
+        let mut fact = R2rmlPattern::new("gs", VarId(0), None);
+        fact.star_bindings = vec![("p:fk".to_string(), VarId(1))];
+        let dim = R2rmlPattern::new("gs", VarId(1), None);
+        assert_eq!(
+            FusedR2rmlAggregateOperator::joins_via(&fact, &dim),
+            Some(VarId(1)),
+            "fact binds dim's subject as an object → join var found"
+        );
+        assert_eq!(
+            FusedR2rmlAggregateOperator::joins_via(&dim, &fact),
+            None,
+            "dim does not bind fact's subject → no reverse join"
+        );
+
+        let mut a = R2rmlPattern::new("gs", VarId(0), None);
+        a.star_bindings = vec![("p".to_string(), VarId(1))];
+        let mut b = R2rmlPattern::new("gs", VarId(1), None);
+        b.star_bindings = vec![("p".to_string(), VarId(0))];
+        assert!(FusedR2rmlAggregateOperator::joins_via(&a, &b).is_some());
+        assert!(
+            FusedR2rmlAggregateOperator::joins_via(&b, &a).is_some(),
+            "an FK loop resolves in both directions → the classifier declines it"
+        );
+    }
+
+    // PR-6b: the linear-chain ordering + its decline guards (cycle, branch).
+    #[test]
+    fn order_chain_orders_linear_and_declines_nonlinear() {
+        let star = |subj: u16, pred: &str, obj: u16| {
+            let mut p = R2rmlPattern::new("gs", VarId(subj), None);
+            p.star_bindings = vec![(pred.to_string(), VarId(obj))];
+            p
+        };
+        // fact(0)→dim1(1)→dim2(2); dim2's `attr` binds ?3 (a scalar key, no pattern).
+        let fact = star(0, "customer", 1);
+        let dim1 = star(1, "geography", 2);
+        let dim2 = star(2, "region", 3);
+        // Pass shuffled; order_chain must recover fact→dim1→dim2.
+        let (chain, jvs) =
+            FusedR2rmlAggregateOperator::order_chain(&[&dim2, &fact, &dim1]).expect("linear chain");
+        assert_eq!(
+            chain
+                .iter()
+                .map(|p| p.subject_var.unwrap())
+                .collect::<Vec<_>>(),
+            vec![VarId(0), VarId(1), VarId(2)]
+        );
+        assert_eq!(jvs, vec![VarId(1), VarId(2)], "one join var per hop");
+
+        // Cycle 0→1→2→0: no root, declines (no spin).
+        let (a, b, mut c) = (star(0, "p", 1), star(1, "p", 2), star(2, "p", 0));
+        c.star_bindings = vec![("p".to_string(), VarId(0))];
+        assert!(FusedR2rmlAggregateOperator::order_chain(&[&a, &b, &c]).is_none());
+
+        // Branch: the fact ref-joins to TWO dims → declines (not a linear chain).
+        let mut branch_fact = R2rmlPattern::new("gs", VarId(0), None);
+        branch_fact.star_bindings =
+            vec![("p1".to_string(), VarId(1)), ("p2".to_string(), VarId(2))];
+        let d1 = R2rmlPattern::new("gs", VarId(1), None);
+        let d2 = R2rmlPattern::new("gs", VarId(2), None);
+        assert!(FusedR2rmlAggregateOperator::order_chain(&[&branch_fact, &d1, &d2]).is_none());
+    }
+
+    // PR-6: an `xsd:integer` group key stored as a Snowflake `NUMBER` arrives as
+    // a physical `Column::Decimal`; the Integer reader must extract it (the q010
+    // `YEAR_NUM`/`QUARTER_NUM` 0-rows regression — a Decimal read as null key
+    // dropped every dim row).
+    #[test]
+    fn key_at_reads_integer_group_key_from_decimal() {
+        let gc = GroupCol {
+            column: "YEAR_NUM".to_string(),
+            kind: GKind::Integer,
+            dt_sid: Sid::new(2, "integer"),
+        };
+        let scale0 = Column::Decimal {
+            values: vec![Some(2024), None],
+            precision: 38,
+            scale: 0,
+        };
+        assert_eq!(gc.key_at(Some(&scale0), 0), GKey::Int(2024));
+        assert_eq!(
+            gc.key_at(Some(&scale0), 1),
+            GKey::Null,
+            "null decimal → null key"
+        );
+        // Exact-integer decimal with a non-zero scale (202400 · 10^-2 = 2024).
+        let scaled = Column::Decimal {
+            values: vec![Some(202_400)],
+            precision: 38,
+            scale: 2,
+        };
+        assert_eq!(gc.key_at(Some(&scaled), 0), GKey::Int(2024));
+        // The native integer columns still read.
+        assert_eq!(
+            gc.key_at(Some(&Column::Int64(vec![Some(7)])), 0),
+            GKey::Int(7)
+        );
+        assert_eq!(
+            gc.key_at(Some(&Column::Int32(vec![Some(3)])), 0),
+            GKey::Int(3)
+        );
     }
 
     #[test]

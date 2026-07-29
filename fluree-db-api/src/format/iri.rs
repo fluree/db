@@ -58,6 +58,15 @@ pub struct IriCompactor {
     /// (SPARQL XML/JSON, TSV/CSV) never touch it, so they must not pay this
     /// per-query construction cost — hence the `OnceLock`.
     fallback_prefixes: OnceLock<Vec<(String, String)>>,
+
+    /// When true, the `sparql_json` formatter CURIE-compacts raw graph-source
+    /// `Binding::Iri` node references (via `compact_id_iri`) instead of emitting
+    /// them verbatim, so virtual (R2RML) output matches native's `Binding::Sid`
+    /// compaction (F9). Defaults **false**: it is set true ONLY when building the
+    /// compactor for a `SparqlJson` render of a graph-source result — every other
+    /// formatter (JSON-LD/XML/typed/delimited) leaves it false and keeps raw
+    /// graph-source IRIs (that consistency follow-up is register entry F16).
+    compact_graph_source_iris: bool,
 }
 
 impl IriCompactor {
@@ -80,6 +89,7 @@ impl IriCompactor {
             reverse_terms,
             // Lazily built on first display-compaction call — see field docs.
             fallback_prefixes: OnceLock::new(),
+            compact_graph_source_iris: false,
         }
     }
 
@@ -97,7 +107,22 @@ impl IriCompactor {
             reverse_terms: HashMap::new(),
             // Empty default context → lazy build yields no fallbacks (unchanged behavior).
             fallback_prefixes: OnceLock::new(),
+            compact_graph_source_iris: false,
         }
+    }
+
+    /// Enable (or disable) CURIE-compaction of raw graph-source `Binding::Iri`
+    /// node references in the `sparql_json` formatter (F9). Builder-style; see the
+    /// `compact_graph_source_iris` field docs for the scoping rationale.
+    pub fn with_graph_source_iri_compaction(mut self, enabled: bool) -> Self {
+        self.compact_graph_source_iris = enabled;
+        self
+    }
+
+    /// True when the `sparql_json` formatter should CURIE-compact raw
+    /// graph-source `Binding::Iri` node references (see the field docs).
+    pub fn compacts_graph_source_iris(&self) -> bool {
+        self.compact_graph_source_iris
     }
 
     /// Lazily-built auto-derived fallback prefixes (see the `fallback_prefixes` field).
@@ -706,6 +731,40 @@ mod tests {
             compactor.compact_id_iri("http://example.org/lists/summer"),
             "http://example.org/lists/summer"
         );
+    }
+
+    /// F9 mechanism proof: `compact_id_iri` compacts a raw graph-source IRI
+    /// STRING purely from the query context's declared prefix — the namespace-code
+    /// map need NOT contain the vocabulary namespace. This is why the F9 fix routes
+    /// `Binding::Iri` through `compact_id_iri` (not namespace-map seeding), and why
+    /// an undeclared namespace (`rdf:type`) correctly stays a full IRI, matching
+    /// native's sparql_json output. Also covers the graph-source flag accessor.
+    #[test]
+    fn test_compact_id_iri_is_context_driven_not_namespace_map() {
+        // Namespace-code map deliberately WITHOUT the edw# vocabulary namespace.
+        let mut namespaces = HashMap::new();
+        namespaces.insert(0, String::new());
+        namespaces.insert(2, xsd::NS.to_string());
+        // Context DECLARES edw: (as a SPARQL PREFIX / @context would).
+        let context =
+            ParsedContext::parse(None, &json!({ "edw": "http://ns.fluree.dev/edw#" })).unwrap();
+        let compactor = IriCompactor::new(Arc::new(namespaces), &context);
+
+        assert_eq!(
+            compactor.compact_id_iri("http://ns.fluree.dev/edw#name"),
+            "edw:name"
+        );
+        // Undeclared namespace stays full (rdf:type parity with native).
+        assert_eq!(
+            compactor.compact_id_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+        );
+
+        // Graph-source flag: default false, builder flips it.
+        assert!(!compactor.compacts_graph_source_iris());
+        assert!(IriCompactor::new(Arc::new(HashMap::new()), &context)
+            .with_graph_source_iri_compaction(true)
+            .compacts_graph_source_iris());
     }
 
     /// With BOTH `@base` and `@vocab` set to distinct namespaces, each governs

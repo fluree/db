@@ -250,6 +250,7 @@ impl R2rmlTableProvider for EphemeralR2rmlProvider {
         table_name: &str,
         projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
         self.scan_provisional_table(table_name, projection).await
@@ -378,6 +379,7 @@ mod tests {
             table: &str,
             _projection: &[String],
             _filters: &[ScanFilter],
+            _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
             _as_of_t: Option<i64>,
         ) -> QResult<ColumnBatchStream> {
             let batches = self.tables.get(table).cloned().unwrap_or_default();

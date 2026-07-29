@@ -1,0 +1,9 @@
+# q018 large_payments_by_tender
+# Intent: Single-table fact GROUP BY with a double-money FILTER (H4 double).
+# BI lineage (BI-11): "What are large payments (over $4000) by tender type?"
+# Predicates verified against enterprise.ttl — FactPayment: tenderType, amount.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?tender (COUNT(?p) AS ?n) (SUM(?amt) AS ?tot)
+WHERE { ?p a edw:Payment ; edw:tenderType ?tender ; edw:amount ?amt .
+        FILTER(?amt > 4000) }
+GROUP BY ?tender

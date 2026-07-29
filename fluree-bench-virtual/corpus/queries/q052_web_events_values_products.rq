@@ -1,0 +1,9 @@
+# q052 web_events_values_products
+# Intent: VALUES over a 1M-row fact (H8 second VALUES case).
+# BI lineage (BI-25): "Which event types hit a watch-list of products (VALUES form)?"
+# Predicates verified against enterprise.ttl — FactWebEvent: product, eventType.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?et
+WHERE { VALUES ?p { <http://data.fluree.dev/edw/product/10> <http://data.fluree.dev/edw/product/20> }
+         ?e a edw:WebEvent ; edw:product ?p ; edw:eventType ?et . }
+LIMIT 5000

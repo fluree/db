@@ -88,14 +88,27 @@ pub trait Operator: Send + Sync {
     ///
     /// **Default = ABSORB** (no-op). An operator forwards a budget to its
     /// children only by explicitly overriding this, and only when it is
-    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`.
-    /// Row-dropping / reordering / materializing operators (`Bind`, `Filter`,
-    /// `Sort`, `Distinct`, `GroupAggregate`, hash-join build) absorb, so a
-    /// budget never leaks past a boundary where it would be unsound.
+    /// row- and order-preserving — `Project`, `Offset` (+offset), `Limit`,
+    /// and (switch-gated, F17) `Bind` (1:1, order-preserving) and `Union`
+    /// (to *each* branch — a single branch may supply all `budget` rows, so
+    /// the whole budget is forwarded, not split). Row-dropping / reordering /
+    /// materializing operators (`Filter`, `Sort`, `Distinct`, `GroupAggregate`,
+    /// hash-join build) absorb, so a budget never leaks past a boundary where
+    /// it would be unsound.
     ///
     /// Set **before** `open()`. Consult only at batch/leaflet boundaries —
     /// never inside fused per-row/per-group loops (hot-loop purity).
     fn set_row_budget(&mut self, _budget: usize) {}
+
+    /// Offer a scan-side top-k directive (PR-5): a single-column DESC `ORDER BY
+    /// <sort_var> LIMIT k` sits directly above a row-preserving operator chain
+    /// down to a single R2RML scan. Default no-op; only the R2RML scan honors it
+    /// (and only when `sort_var` resolves to a scalar scan column). Order-
+    /// preserving pass-through operators forward it to their child so it reaches
+    /// the scan. It is a pure optimization — a scan may then read only the files
+    /// that can hold the top-k — and never changes results (the `Sort` above is
+    /// authoritative). Set **before** `open()`.
+    fn set_topk(&mut self, _sort_var: VarId, _k: usize) {}
 
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)

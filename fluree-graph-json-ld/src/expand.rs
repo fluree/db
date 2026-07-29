@@ -202,6 +202,7 @@ fn parse_node_value(
     idx: &[JsonValue],
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
+    guard_depth(idx)?;
     let type_val = entry.and_then(|e| e.type_.as_ref());
     let id_val = entry.and_then(|e| e.id.as_deref());
 
@@ -525,6 +526,39 @@ fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
     node_map.get("@context").or_else(|| node_map.get("context"))
 }
 
+/// Maximum expansion depth for nested JSON-LD values. Expansion recurses
+/// over the value tree through [`expand_node_internal`] and
+/// [`parse_node_value`], and while text inputs are already bounded by
+/// serde_json's default 128-level deserialization recursion limit, a
+/// programmatically built `JsonValue` bypasses that — without this guard,
+/// deep nesting would overflow the stack and abort the process (a Rust
+/// stack overflow is not catchable).
+///
+/// This bounds recursion frames, not user-visible nesting levels: `@list`/
+/// `@set` container chains add two frames per level and so are refused at
+/// ~64 levels rather than 128. See [`guard_depth`].
+pub(crate) const MAX_EXPAND_DEPTH: usize = 128;
+
+/// Refuse recursion past [`MAX_EXPAND_DEPTH`]. The `idx` path vector gains at
+/// least one element on each recursion edge (an array index or property key,
+/// directly or in the immediate caller), so its length bounds the depth. Both
+/// recursion entry points ([`expand_node_internal`] and [`parse_node_value`])
+/// call this, so the `@list`/`@set` self-recursion in `parse_node_value` —
+/// which never re-enters `expand_node_internal` — is bounded too.
+///
+/// The bound is on `idx` entries (recursion frames), not user-visible nesting
+/// levels, and the two are not the same: a plain node chain adds one entry per
+/// level, so it reaches `MAX_EXPAND_DEPTH` levels, but each `@list`/`@set`
+/// container level adds two (the property key, then the container marker), so
+/// container chains are refused at roughly half that — ~64 user-visible levels.
+/// A container-chain rejection near 64 is expected, not a bug.
+fn guard_depth(idx: &[JsonValue]) -> Result<()> {
+    if idx.len() > MAX_EXPAND_DEPTH {
+        return Err(JsonLdError::NestingTooDeep);
+    }
+    Ok(())
+}
+
 /// Internal node expansion
 fn expand_node_internal(
     node_map: &JsonValue,
@@ -532,6 +566,7 @@ fn expand_node_internal(
     idx: &[JsonValue],
     strict: bool,
 ) -> Result<JsonValue> {
+    guard_depth(idx)?;
     match node_map {
         JsonValue::Array(arr) => {
             let expanded: Result<Vec<JsonValue>> = arr
@@ -1000,5 +1035,109 @@ mod tests {
 
         let foo = &obj["https:example.com/ns/foo"][0];
         assert_eq!(foo["@id"], "?s");
+    }
+
+    // =========================================================================
+    // Expansion depth ceiling
+    // =========================================================================
+
+    /// A node nested `depth` levels via a single property chain.
+    fn nested_nodes(depth: usize) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({"http://example.org/child": value});
+        }
+        value
+    }
+
+    /// A `@list` (or `@set`) chain nested `depth` levels — each level is a
+    /// single-key container object, which recurses through `parse_node_value`
+    /// WITHOUT re-entering `expand_node_internal`.
+    fn nested_containers(depth: usize, key: &str) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({"http://example.org/p": {key: value}});
+        }
+        value
+    }
+
+    /// A `@list`/`@set` nested DIRECTLY inside another, with NO property key
+    /// between levels: a single outer property key, then `depth` bare container
+    /// wrappers. Unlike [`nested_containers`], nothing re-enters
+    /// `expand_node_internal` between levels, so the chain self-recurses purely
+    /// within `parse_node_value` and only that function's own guard can stop it.
+    fn direct_container_chain(depth: usize, key: &str) -> JsonValue {
+        let mut value = json!({"@id": "http://example.org/leaf"});
+        for _ in 0..depth {
+            value = json!({key: value});
+        }
+        json!({"http://example.org/p": value})
+    }
+
+    /// Realistic nesting well below the ceiling expands unchanged.
+    #[test]
+    fn nesting_below_the_ceiling_expands() {
+        crate::expand(&nested_nodes(100)).expect("below-ceiling nesting must expand");
+    }
+
+    /// A programmatically built value bypasses serde_json's deserialization
+    /// recursion limit, so expansion itself must refuse deep nesting with a
+    /// clean error instead of overflowing the stack. (Depth is kept moderate
+    /// only because dropping the test fixture itself recurses per level —
+    /// serde_json's `Value` has no iterative Drop; expansion's guard stops
+    /// at the ceiling regardless.)
+    #[test]
+    fn deeply_nested_programmatic_value_errors_cleanly() {
+        let err = crate::expand(&nested_nodes(2_000)).expect_err("expected depth error");
+        assert!(
+            matches!(err, JsonLdError::NestingTooDeep),
+            "expected NestingTooDeep, got: {err}"
+        );
+    }
+
+    /// `@list` / `@set` chains recurse through `parse_node_value` without
+    /// re-entering `expand_node_internal`, so its own depth guard must refuse
+    /// them rather than let the stack overflow.
+    #[test]
+    fn deeply_nested_containers_error_cleanly() {
+        for key in ["@list", "@set"] {
+            let err = crate::expand(&nested_containers(2_000, key)).expect_err("expected error");
+            assert!(
+                matches!(err, JsonLdError::NestingTooDeep),
+                "expected NestingTooDeep for {key}, got: {err}"
+            );
+        }
+    }
+
+    /// A `@list`/`@set` nested directly inside itself with no property key
+    /// between levels recurses purely within `parse_node_value`, never
+    /// re-entering `expand_node_internal`. Only the `parse_node_value` guard
+    /// stops it — the property-keyed `nested_containers` chain is caught one
+    /// level up in `expand_node_internal`, so without this case that guard is
+    /// uncovered and a refactor could delete it while every other depth test
+    /// stays green.
+    #[test]
+    fn deeply_nested_direct_containers_error_cleanly() {
+        for key in ["@list", "@set"] {
+            let err =
+                crate::expand(&direct_container_chain(2_000, key)).expect_err("expected error");
+            assert!(
+                matches!(err, JsonLdError::NestingTooDeep),
+                "expected NestingTooDeep for direct {key} chain, got: {err}"
+            );
+        }
+    }
+
+    /// Text input is already bounded by serde_json's default deserialization
+    /// recursion limit — the shield the expansion guard backs up. Pin it so a
+    /// dependency change that drops the default is caught.
+    #[test]
+    fn deeply_nested_text_is_rejected_at_deserialization() {
+        let text = format!("{}1{}", "{\"a\":".repeat(200), "}".repeat(200));
+        let err = serde_json::from_str::<JsonValue>(&text).expect_err("expected depth error");
+        assert!(
+            err.to_string().contains("recursion limit"),
+            "expected serde_json recursion-limit error, got: {err}"
+        );
     }
 }

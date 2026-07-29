@@ -1,0 +1,6 @@
+# q037 count_web_events
+# Intent: COUNT(*) over the largest fact (H5 worst case).
+# BI lineage (BI-18): "How many web events are there?"
+# Predicates verified against enterprise.ttl — class edw:WebEvent.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (COUNT(*) AS ?n) WHERE { ?s a edw:WebEvent . }

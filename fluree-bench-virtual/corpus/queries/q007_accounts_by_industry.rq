@@ -1,0 +1,8 @@
+# q007 accounts_by_industry
+# Intent: Single-dimension GROUP BY + COUNT (fused-agg eligible).
+# BI lineage (BI-05): "How are our accounts distributed across industries?"
+# Predicates verified against enterprise.ttl — DimAccount: industry.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?ind (COUNT(?a) AS ?n)
+WHERE { ?a a edw:Account ; edw:industry ?ind . }
+GROUP BY ?ind

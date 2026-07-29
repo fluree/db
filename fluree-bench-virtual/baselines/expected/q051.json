@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q051",
+  "result_hash": "9d65c8ed6a9061343a9067e2ec591a57e90e768eeaf7e6abfe82b7fae3c62f20",
+  "rows": 247,
+  "head_rows": [
+    "361\u001fStore 101",
+    "361\u001fStore 185",
+    "361\u001fStore 206",
+    "361\u001fStore 296",
+    "361\u001fStore 44",
+    "362\u001fStore 102",
+    "362\u001fStore 181",
+    "362\u001fStore 208",
+    "362\u001fStore 263",
+    "362\u001fStore 298",
+    "362\u001fStore 405",
+    "362\u001fStore 454",
+    "362\u001fStore 49",
+    "362\u001fStore 92",
+    "363\u001fStore 143",
+    "363\u001fStore 225",
+    "363\u001fStore 371",
+    "363\u001fStore 392",
+    "363\u001fStore 402",
+    "363\u001fStore 435"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

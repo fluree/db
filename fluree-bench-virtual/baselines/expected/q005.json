@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q005",
+  "result_hash": "4caf3f8be18c4f7f615513fc15b019b4ffaa0a8bd87bf37ac042e336f2560cd4",
+  "rows": 20,
+  "head_rows": [
+    "Supplier 1089\u001f4.97000000000e0\u001fRegion-8",
+    "Supplier 1126\u001f4.97000000000e0\u001fRegion-8",
+    "Supplier 1165\u001f4.99000000000e0\u001fRegion-9",
+    "Supplier 1228\u001f4.99000000000e0\u001fRegion-9",
+    "Supplier 1270\u001f4.98000000000e0\u001fRegion-8",
+    "Supplier 1287\u001f4.97000000000e0\u001fRegion-9",
+    "Supplier 1400\u001f4.97000000000e0\u001fRegion-7",
+    "Supplier 1432\u001f4.97000000000e0\u001fRegion-6",
+    "Supplier 1552\u001f5.00000000000e0\u001fRegion-9",
+    "Supplier 1668\u001f4.99000000000e0\u001fRegion-9",
+    "Supplier 1715\u001f4.98000000000e0\u001fRegion-4",
+    "Supplier 1738\u001f4.99000000000e0\u001fRegion-7",
+    "Supplier 1797\u001f4.99000000000e0\u001fRegion-4",
+    "Supplier 220\u001f4.97000000000e0\u001fRegion-8",
+    "Supplier 369\u001f4.98000000000e0\u001fRegion-2",
+    "Supplier 388\u001f4.99000000000e0\u001fRegion-1",
+    "Supplier 473\u001f4.99000000000e0\u001fRegion-8",
+    "Supplier 538\u001f4.97000000000e0\u001fRegion-6",
+    "Supplier 63\u001f4.97000000000e0\u001fRegion-1",
+    "Supplier 672\u001f4.99000000000e0\u001fRegion-8"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KX6P6KH3RQGQH6T6PZGES9XH",
+    "commit": "e4f24f12e"
+  }
+}

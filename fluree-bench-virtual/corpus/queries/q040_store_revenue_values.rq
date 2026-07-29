@@ -1,0 +1,8 @@
+# q040 store_revenue_values
+# Intent: VALUES-constrained subject; H8 (VALUES not lowered -> full scan on virtual).
+# BI lineage (BI-19): "What is order revenue for three specific stores (VALUES form)?"
+# Predicates verified against enterprise.ttl — FactOrder: store, orderTotal.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?store ?tot
+WHERE { VALUES ?store { <http://data.fluree.dev/edw/store/1> <http://data.fluree.dev/edw/store/2> <http://data.fluree.dev/edw/store/3> }
+         ?o a edw:Order ; edw:store ?store ; edw:orderTotal ?tot . }

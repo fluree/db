@@ -315,3 +315,72 @@ async fn sparql_12_syntax_checks_rejected() {
         "unexpected error: {err}"
     );
 }
+
+/// Fan-in fixture for the grouped-list dedup regression: three `?a`s collapse
+/// onto one `?b`, so `?a` dying mid-chain is what WHERE-level early dedup
+/// would otherwise use to collapse rows.
+async fn seed_fanin(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let ctx = context_ex_schema();
+    let insert = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:a1", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:a2", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:a3", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:a4", "ex:p1": {"@id": "ex:b2"}},
+            {"@id": "ex:b1", "ex:p2": 10},
+            {"@id": "ex:b2", "ex:p2": [20, 30]}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("seed insert should succeed")
+        .ledger
+}
+
+/// The grouped list is a duplicate-SENSITIVE consumer: a duplicate-insensitive
+/// aggregate (`max`) licenses WHERE-level early dedup for itself, but a
+/// non-key variable projected alongside it still comes back as a per-group
+/// multiset. Companion to `jsonld_groupby_ungrouped_select_projects_grouped_list`,
+/// which has no fan-in and so cannot catch this.
+#[tokio::test]
+async fn jsonld_grouped_list_keeps_duplicates_under_insensitive_aggregate() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_fanin(&fluree, "query/grouped-list-dedup:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?x", "(as (max ?x) ?m)"],
+        "where": [{"@id": "?a", "ex:p1": "?b"}, {"@id": "?b", "ex:p2": "?x"}]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(rows, json!([[[10, 10, 10, 20, 30], 30]]));
+}
+
+/// A dedup-only `GROUP BY` has an EMPTY aggregate set, so an
+/// "all aggregates are duplicate-insensitive" check passes vacuously. The
+/// grouped list must still keep its duplicates.
+#[tokio::test]
+async fn jsonld_grouped_list_keeps_duplicates_without_aggregation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_fanin(&fluree, "query/grouped-list-no-agg:main").await;
+    let ctx = context_ex_schema();
+
+    let query = json!({
+        "@context": ctx,
+        "select": ["?b", "?x"],
+        "where": [{"@id": "?a", "ex:p1": "?b"}, {"@id": "?b", "ex:p2": "?x"}],
+        "groupBy": ["?b"]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &query)
+        .await
+        .expect("query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(rows, json!([["ex:b1", [10, 10, 10]], ["ex:b2", [20, 30]]]));
+}

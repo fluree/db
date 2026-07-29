@@ -43,6 +43,7 @@ members = [
     "fluree-db-mcp",
     "fluree-bench-support",
     "fluree-bench-alloc",
+    "fluree-bench-virtual",
     "fluree-db-consensus",
 ]
 exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]

@@ -60,6 +60,15 @@ pub struct UnionOperator {
     output_rows_emitted: usize,
     max_emitted_batch_len: usize,
     pending_output_rows: usize,
+    /// F17: advisory row budget from a top-of-tree `LIMIT`, forwarded to *each*
+    /// branch operator tree (any single branch may supply all `budget` rows, so
+    /// the whole budget is passed, not split). Set before `open()` via
+    /// `set_row_budget`; `None` = unbudgeted (full branch drain).
+    row_budget: Option<usize>,
+    /// F17 secondary lever: set once the buffered output meets `row_budget`, so
+    /// the union stops building further branches and pulling further input rows
+    /// (the consuming LIMIT will not take more). Reset in `open`.
+    budget_met: bool,
 }
 
 impl UnionOperator {
@@ -113,6 +122,8 @@ impl UnionOperator {
             output_rows_emitted: 0,
             max_emitted_batch_len: 0,
             pending_output_rows: 0,
+            row_budget: None,
+            budget_met: false,
         }
     }
 
@@ -217,6 +228,16 @@ impl Operator for UnionOperator {
         &self.effective_schema
     }
 
+    fn set_row_budget(&mut self, budget: usize) {
+        // F17: forward the LIMIT budget to each branch (applied per branch build
+        // in `next_batch`). Sound because the consuming LIMIT truncates the
+        // branch concatenation to `budget`, so a branch stopping at `budget` rows
+        // can never drop a row the LIMIT would keep. Switch-gated for OFF-parity.
+        if crate::r2rml::union_budget_enabled() {
+            self.row_budget = Some(budget);
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
@@ -224,6 +245,7 @@ impl Operator for UnionOperator {
         self.current_input_batch = None;
         self.current_input_row = 0;
         self.input_exhausted = false;
+        self.budget_met = false;
         self.input_batches_seen = 0;
         self.input_rows_seen = 0;
         self.branch_execs = 0;
@@ -245,7 +267,7 @@ impl Operator for UnionOperator {
 
         loop {
             if self.pending_output_rows >= ctx.batch_size
-                || (self.input_exhausted && self.pending_output_rows > 0)
+                || ((self.input_exhausted || self.budget_met) && self.pending_output_rows > 0)
             {
                 let batch = self
                     .take_output_batch(ctx.batch_size)?
@@ -253,7 +275,10 @@ impl Operator for UnionOperator {
                 return Ok(Some(batch));
             }
 
-            if self.input_exhausted {
+            // Stop once the child is drained OR the row budget is met (F17 lever):
+            // in both cases there is nothing more to produce, only the buffer to
+            // drain (handled above).
+            if self.input_exhausted || self.budget_met {
                 self.state = OperatorState::Exhausted;
                 return Ok(None);
             }
@@ -307,6 +332,13 @@ impl Operator for UnionOperator {
                     &self.planning,
                 )?;
 
+                // F17: give each freshly-built branch tree the LIMIT budget so
+                // its scan caps its materialize window at `budget` rows instead
+                // of draining the whole table. Re-applied per branch (each branch
+                // independently gets the full budget); no cross-branch decrement.
+                if let Some(b) = self.row_budget {
+                    branch_op.set_row_budget(b);
+                }
                 branch_op.open(ctx).await?;
                 while let Some(batch) = branch_op.next_batch(ctx).await? {
                     ctx.check_cancelled()?;
@@ -322,6 +354,47 @@ impl Operator for UnionOperator {
                     ctx.check_cancelled()?;
                 }
                 branch_op.close();
+
+                // F17 secondary lever: once the buffered output meets the row
+                // budget, stop building further branches (and pulling further
+                // input rows) — the consuming LIMIT will not take more, so it is
+                // pure waste. SOUND on two counts: (1) a budget reaches the union
+                // ONLY when every operator between it and the LIMIT is
+                // row/order-preserving (Sort, Distinct, GroupAggregate, … ABSORB
+                // the budget), so the consumer wants an arbitrary k-subset
+                // (rows_only) and any `budget` buffered rows are a valid answer;
+                // (2) the check fires only when the budget is actually MET — an
+                // under-filled branch (fewer than `budget` rows so far) does NOT
+                // trip it, so a rare branch-1 still lets branch-2 run and add its
+                // rows. Whole-query correctness holds for a correlated union too:
+                // once `budget` rows exist, no later input row is needed either.
+                //
+                // COUPLING (read before "simplifying" the budget path): count (1)
+                // rests entirely on the forward/absorb classification documented at
+                // `Operator::set_row_budget` — a budget only reaches this union under
+                // row/order-preserving operators. An operator author who FORWARDS a
+                // budget through an order-SENSITIVE operator would silently break
+                // count (1) here, not the forwarding site. That classification is the
+                // load-bearing contract; it lives in the trait doc, so this lever
+                // stays sound only as long as the doc's absorb list does.
+                //
+                // One operator is neither pure-forward nor pure-absorb in that
+                // taxonomy: `GraphOperator` ABSORBS w.r.t. its own `self.child` but
+                // threads the budget into the per-parent-batch CORRELATED INNER
+                // subplan (`graph.rs`), a route the absorb-list framing above does
+                // not name. A union inside a `GRAPH` scope therefore receives a
+                // budget by that path. It stays sound because each parent batch
+                // rebuilds the inner tree with a FRESH budget and every inner row
+                // flows up to the same downstream LIMIT — so the buffered rows are
+                // still a valid k-subset — but that is a second, subtler argument
+                // than count (1) above, so verify it there when touching `graph.rs`.
+                if self
+                    .row_budget
+                    .is_some_and(|b| self.pending_output_rows >= b)
+                {
+                    self.budget_met = true;
+                    break;
+                }
             }
         }
     }
@@ -546,5 +619,254 @@ mod tests {
         }
 
         fn close(&mut self) {}
+    }
+
+    // ---- F17: UNION / BIND row-budget forwarding ----
+    //
+    // These cover the forwarding CONTRACT hermetically: BIND forwards a budget to
+    // its child (the reclassification that unblocks q029), and the absorb boundary
+    // (Sort / Distinct receive a budget but do NOT forward it — so an ORDER BY /
+    // DISTINCT above a union means the union is never budgeted and declines for
+    // free). The union stores a forwarded budget and re-applies it per branch.
+    //
+    // The per-branch SCAN early-stop, the real q029 ON==OFF byte-identical result,
+    // and nested-union recursion are covered by the live q029 gate — only the R2RML
+    // scan honors `row_budget`, and union branches are pattern-built with no
+    // hermetic mock-scan injection point, so scan early-stop cannot be observed
+    // without Iceberg.
+
+    struct BudgetRecorder {
+        received: Arc<std::sync::Mutex<Option<usize>>>,
+        schema: Arc<[VarId]>,
+        state: OperatorState,
+    }
+
+    #[async_trait]
+    impl Operator for BudgetRecorder {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            self.state = OperatorState::Open;
+            Ok(())
+        }
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(None)
+        }
+        fn close(&mut self) {
+            self.state = OperatorState::Closed;
+        }
+        fn set_row_budget(&mut self, budget: usize) {
+            *self.received.lock().unwrap() = Some(budget);
+        }
+    }
+
+    fn budget_recorder(received: &Arc<std::sync::Mutex<Option<usize>>>) -> BudgetRecorder {
+        BudgetRecorder {
+            received: Arc::clone(received),
+            schema: Arc::from(vec![VarId(0)].into_boxed_slice()),
+            state: OperatorState::Created,
+        }
+    }
+
+    #[test]
+    fn bind_forwards_row_budget_to_child() {
+        use crate::bind::BindOperator;
+        use crate::ir::expression::Expression;
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let mut bind = BindOperator::new(
+            Box::new(budget_recorder(&received)),
+            VarId(1),
+            Expression::Const(FlakeValue::Long(42)),
+            vec![],
+        );
+        bind.set_row_budget(7);
+        // BIND is 1:1 / order-preserving → forwards the budget to the scan below.
+        assert_eq!(*received.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn sort_absorbs_row_budget() {
+        use crate::sort::{SortOperator, SortSpec};
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let mut sort = SortOperator::new(
+            Box::new(budget_recorder(&received)),
+            vec![SortSpec::asc(VarId(0))],
+        );
+        sort.set_row_budget(7);
+        // ORDER BY must rank every row → absorbs; a union under it is never budgeted.
+        assert_eq!(*received.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn distinct_absorbs_row_budget() {
+        use crate::distinct::DistinctOperator;
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let mut distinct = DistinctOperator::new(Box::new(budget_recorder(&received)));
+        distinct.set_row_budget(7);
+        // DISTINCT may need > k raw rows to yield k unique → absorbs.
+        assert_eq!(*received.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn union_stores_forwarded_row_budget() {
+        let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let child: BoxedOperator = Box::new(TestEmptyWithSchema {
+            schema: child_schema,
+        });
+        let mut op = UnionOperator::new(
+            child,
+            vec![vec![], vec![]],
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(9);
+        // Stored (switch default-on); re-applied to each branch build in next_batch.
+        assert_eq!(op.row_budget, Some(9));
+    }
+
+    #[tokio::test]
+    async fn union_budget_preserves_limit_result() {
+        use crate::limit::LimitOperator;
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // One seed row; branches emit {10,20} and {30} → a 3-row union.
+        let child: BoxedOperator = Box::new(ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![VarId(0)],
+            vec![vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]],
+        ));
+        let branches = vec![
+            vec![Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![
+                    vec![Binding::lit(FlakeValue::Long(10), Sid::new(2, "long"))],
+                    vec![Binding::lit(FlakeValue::Long(20), Sid::new(2, "long"))],
+                ],
+            }],
+            vec![Pattern::Values {
+                vars: vec![VarId(1)],
+                rows: vec![vec![Binding::lit(
+                    FlakeValue::Long(30),
+                    Sid::new(2, "long"),
+                )]],
+            }],
+        ];
+        let union = UnionOperator::new(
+            child,
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        // LIMIT 2 forwards budget = 2 into the union (→ each branch build). The
+        // result stays the correct first 2 rows: the F17 forwarding path preserves
+        // correctness (scan early-stop is the live q029 gate).
+        let mut limit = LimitOperator::new(Box::new(union), 2);
+        limit.open(&ctx).await.unwrap();
+        let mut total = 0;
+        while let Some(b) = limit.next_batch(&ctx).await.unwrap() {
+            total += b.len();
+        }
+        assert_eq!(total, 2);
+    }
+
+    // ---- F17 secondary lever: budget-met branch/input skip ----
+    //
+    // Build a 2-branch union over a single unit-seed input row, with Values
+    // branches of known cardinality, and assert the branch BUILD count
+    // (`branch_execs`) — the observable for "branch-2 was skipped". Values
+    // branches ignore the forwarded budget, so branch-1 produces its full row
+    // set and the lever's `pending >= budget` check is what gates branch-2.
+
+    fn unit_seed_child() -> BoxedOperator {
+        Box::new(ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![VarId(0)],
+            vec![vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]],
+        ))
+    }
+
+    fn two_values_branches(b1: &[i64], b2: &[i64]) -> Vec<Vec<Pattern>> {
+        let mk = |vals: &[i64]| Pattern::Values {
+            vars: vec![VarId(1)],
+            rows: vals
+                .iter()
+                .map(|v| vec![Binding::lit(FlakeValue::Long(*v), Sid::new(2, "long"))])
+                .collect(),
+        };
+        vec![vec![mk(b1)], vec![mk(b2)]]
+    }
+
+    async fn run_union(mut op: UnionOperator, ctx: &ExecutionContext<'_>) -> (usize, usize) {
+        op.open(ctx).await.unwrap();
+        let mut total = 0;
+        while let Some(b) = op.next_batch(ctx).await.unwrap() {
+            total += b.len();
+        }
+        (op.branch_execs, total)
+    }
+
+    #[tokio::test]
+    async fn lever_budget_met_skips_later_branch() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        // branch-1 yields 2 rows == budget 2 → branch-2 must never be built.
+        let branches = two_values_branches(&[10, 20], &[30]);
+        let mut op = UnionOperator::new(
+            unit_seed_child(),
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(2);
+        let (branch_execs, total) = run_union(op, &ctx).await;
+        assert_eq!(
+            branch_execs, 1,
+            "branch-2 must be skipped once branch-1 fills the budget"
+        );
+        assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn lever_underfilled_branch_still_runs_later_branch() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        // branch-1 yields 2 < budget 3 → branch-2 IS built and drained (total 3).
+        let branches = two_values_branches(&[10, 20], &[30]);
+        let mut op = UnionOperator::new(
+            unit_seed_child(),
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(3);
+        let (branch_execs, total) = run_union(op, &ctx).await;
+        assert_eq!(
+            branch_execs, 2,
+            "an under-filled branch-1 must not skip branch-2"
+        );
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn lever_absent_budget_runs_all_branches() {
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        // No budget set → the lever never trips; both branches always run.
+        let branches = two_values_branches(&[10, 20], &[30]);
+        let op = UnionOperator::new(
+            unit_seed_child(),
+            branches,
+            None,
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        let (branch_execs, total) = run_union(op, &ctx).await;
+        assert_eq!(branch_execs, 2, "without a budget both branches always run");
+        assert_eq!(total, 3);
     }
 }
