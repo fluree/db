@@ -84,49 +84,93 @@ fluree rdf count dump.ttl --time | tee counts.txt
 
 ## Profiling
 
-`--profile` reports where the time went, by phase.
+`--profile` reports where the time went, by phase. Note the `=`:
+`--profile=json`, not `--profile json` — the flag's value must be attached,
+because a space-separated optional value could not be told apart from the
+input filename.
 
 ```console
-$ fluree rdf count dbpedia.ttl --profile
-  ┌────────────┬──────────────┬──────────────┐
-  │ phase      │           ms │       % wall │
-  ├────────────┼──────────────┼──────────────┤
-  │ read       │        41.20 │         4.10 │
-  │ parse      │       952.60 │        94.80 │
-  │ sink (est) │        11.30 │         1.12 │
-  └────────────┴──────────────┴──────────────┘
+$ fluree rdf count corpus.ttl --profile
+  ┌──────────┬──────────────┬──────────────┐
+  │ phase    │           ms │       % wall │
+  ├──────────┼──────────────┼──────────────┤
+  │ read     │         1.73 │         0.07 │
+  │ parse    │      2481.16 │        99.81 │
+  └──────────┴──────────────┴──────────────┘
 
-  count dbpedia.ttl · turtle · 512.00 MiB
-  wall 1.00s · 11.0ms unattributed · 4823119 statements · 4.82M/s
-  profiler overhead 0.001% of wall (8 clock reads @ 42ns/pair)
-  sink phase is estimated from 0.78% of calls; shares are of wall clock, and
-  sink time runs inside parse
+  count corpus.ttl · turtle · 5.38 MiB · macos-aarch64
+  wall 2.49s (input → parse; excludes startup and fingerprinting) · 3.1ms unattributed
+  240000 triples · 96.5K/s · 120001 grammar statements · peak RSS 58.05 MiB
+  sink: below the measurement floor — across 720004 calls its per-event cost is
+  under 79.9ms, which is where the clock's own 26.6ms stops being separable from it
+  profiler cost 0.009% of wall (11481 clock reads @ 37ns/pair)
 ```
 
-Three things in that report are worth understanding:
+Four things in that report are worth understanding.
 
-- **The `sink` phase is an estimate.** Timing every sink call would take two
-  clock reads per event, and on these verbs a clock read costs more than the
-  work it measures — the profile would be reporting its own overhead. So
-  events are counted exactly and timed on a sample of statements, then
-  scaled. The row is labelled `(est)` and the sample rate is printed.
-- **Shares are of wall clock, not of the phase sum.** Time nobody claimed —
-  process startup, hashing under `--profile` without `--no-hash` — shows up
-  as the `unattributed` figure instead of being redistributed into the
-  phases that did run.
-- **The profiler prices its own instrument.** It measures the cost of a clock
-  read on the host, multiplies by the number it took, and prints the result
-  as a share of the run. Above 2% the report is marked `UNTRUSTED` and should
-  not be used as a baseline.
+**The sink usually cannot be measured, and says so.** Timing every sink call
+would take two clock reads per event, and on these verbs a clock read costs
+*more than the work it measures* — a bracketed discard-sink call is about
+20 ns, of which 19 ns is the clock. So events are counted exactly and timed
+on a sample of statements, the clock's own cost is subtracted from that
+sample before it is scaled up, and if what remains does not clear three times
+the extrapolated clock artifact the tool reports "below the measurement
+floor" rather than a number. That is not the same as zero: the sink's cost is
+unresolved, not absent. Resolving it needs a differential run (time the same
+corpus with and without the sink's work) — or a sink expensive enough to
+clear the floor, which a real serializer is.
 
-`--profile=json` emits the same run as one JSON document on stderr, carrying
-the tool version, host and thread count, corpus fingerprint, per-phase
-nanoseconds and shares, event counts, rates, and the self-calibration block.
-The `schema` field is `fluree.rdf.profile.v1`.
+**A costly `finish()` is measured exactly.** A writer's flush runs once, so it
+is timed directly and never passed through the sample scaling, and it appears
+on its own line.
+
+**Shares are of wall clock, not of the phase sum,** so time nobody claimed
+shows up as `unattributed` instead of being redistributed into the phases
+that did run. The measured window runs from the first byte of input handling
+to the end of parsing: it excludes process startup, and it excludes the
+SHA-256 fingerprint, which is computed after the clock stops. Pass
+`--no-hash` to skip that pass entirely.
+
+**The profiler prices its own instrument.** It measures what a clock read
+costs on this host and reports two figures: what the reads it actually took
+cost the run, and what the clock artifact carried by a *scaled* sink estimate
+would come to. If either exceeds 2% of wall the report is marked `UNTRUSTED`,
+and the line says which one — an artifact-driven warning leaves the read,
+decompress and parse phases perfectly sound.
+
+`--profile=json` emits the same run as one JSON document on stderr. Beyond the
+phase array it carries the tool version and the git SHA it was built from, the
+host class, thread count and peak RSS, the corpus fingerprint, event counts,
+rates, a `sink` block (including `body_ns: null` when unresolved), and the
+self-calibration block. The `schema` field is `fluree.rdf.profile.v1`.
 
 ```bash
 fluree rdf count dump.ttl --profile=json --no-hash 2> run.json
 ```
+
+Set `FLUREE_BENCH_HOST_CLASS` to name the machine class for baseline
+comparison; it defaults to `{os}-{arch}`, which does not distinguish two
+different cloud instance types. Absolute timings may only be diffed between
+runs whose `host_class` matches.
+
+## Memory
+
+Input is read into memory in one pass, so peak RSS scales with the input —
+but not by a fixed multiple, because most of the excess is the parser's IRI
+cache, and that grows with the number of *distinct* IRIs rather than with
+bytes.
+
+Measured on this CLI over a 20 MiB Turtle corpus:
+
+| Corpus shape | Peak RSS / input bytes |
+|---|---|
+| Every subject distinct | ~6.2× |
+| 100 subjects, reused | ~2.4× |
+
+Plus a fixed ~25 MiB for the binary and runtime. At the 4 GiB input cap that
+is roughly 10–25 GB depending on shape, which is worth knowing before pointing
+this at a large dump on a small machine. Streaming and chunked reading land
+with the parallel conversion pipeline; until then, split large inputs.
 
 ## Exit codes
 
@@ -144,4 +188,5 @@ parsing error text.
 
 Input is read into memory in one pass and is capped at 4 GiB, because the
 parser addresses token spans with 32-bit offsets. Chunked reading of larger
-inputs, and of streams, lands with the parallel conversion pipeline.
+inputs, and of streams, lands with the parallel conversion pipeline. See
+[Memory](#memory) for what that costs in RSS.

@@ -18,7 +18,6 @@
 use crate::cli::RdfCommonArgs;
 use crate::error::CliResult;
 use crate::rdf::diagnostic::{self, Diagnostic};
-use crate::rdf::profile::{ProfileReport, RunContext};
 use crate::rdf::{self, exit_document_invalid};
 use colored::Colorize;
 use fluree_graph_ir::PhaseTimings;
@@ -49,7 +48,7 @@ struct CheckReport {
     /// document the trouble started, measured in statements rather than
     /// bytes. Turtle counts a directive as a statement (`statement ::=
     /// directive | triples '.'`), so a file's `@prefix` block is included.
-    statements: u64,
+    grammar_statements: u64,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -74,7 +73,7 @@ pub fn run(common: &RdfCommonArgs, format: CheckFormat, quiet: bool) -> CliResul
                 input: loaded.input.display(),
                 syntax: loaded.resolved.syntax.as_str(),
                 ok,
-                statements: outcome.counts.statements,
+                grammar_statements: outcome.counts.statements,
                 diagnostics,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -82,30 +81,7 @@ pub fn run(common: &RdfCommonArgs, format: CheckFormat, quiet: bool) -> CliResul
         CheckFormat::Table => print_table(&loaded.input.display(), &diagnostics, ok, quiet),
     }
 
-    if let Some(format) = common.profile {
-        let ctx = RunContext {
-            verb: "check",
-            input: loaded.input.display(),
-            syntax: loaded.resolved.syntax,
-            syntax_source: loaded.resolved.source,
-            compression: loaded.resolved.compression,
-            bytes_on_wire: loaded.bytes_on_wire,
-            bytes_decoded: loaded.text.len() as u64,
-            sha256: (!common.no_hash).then(|| crate::rdf::profile::sha256_hex(&loaded.text)),
-        };
-        ProfileReport::build(
-            &ctx,
-            &timings,
-            wall,
-            outcome.counts,
-            outcome.sink_estimate,
-            outcome.sink_clock_reads,
-            outcome.sink_sampled_pct,
-        )
-        .emit(format)?;
-    } else if common.time {
-        rdf::count::print_timing(wall, outcome.counts.emitted(), loaded.text.len() as u64);
-    }
+    rdf::report_run(common, "check", &loaded, &outcome, &timings, wall)?;
 
     if ok {
         Ok(())
@@ -114,28 +90,34 @@ pub fn run(common: &RdfCommonArgs, format: CheckFormat, quiet: bool) -> CliResul
     }
 }
 
+/// Human diagnostics, on **stderr**.
+///
+/// riot puts parse errors on stderr and so does `fluree rdf count`; a `check`
+/// that put them on stdout would be the one verb in the group whose failure
+/// output lands in a redirect. `--format json` still goes to stdout — that one
+/// is a document a script consumes, not a message.
 fn print_table(input: &str, diagnostics: &[Diagnostic], ok: bool, quiet: bool) {
     for d in diagnostics {
         match (d.line, d.column) {
             (Some(line), Some(column)) => {
-                println!(
+                eprintln!(
                     "{} {input}:{line}:{column}: {}",
                     "error:".red().bold(),
                     d.message
                 );
             }
-            _ => println!("{} {input}: {}", "error:".red().bold(), d.message),
+            _ => eprintln!("{} {input}: {}", "error:".red().bold(), d.message),
         }
         if let (Some(snippet), Some(caret)) = (d.snippet.as_ref(), d.caret()) {
-            println!("  {snippet}");
-            println!("  {caret}");
+            eprintln!("  {snippet}");
+            eprintln!("  {caret}");
         }
     }
 
     // The clean case is the one a script runs a thousand times; under
     // --quiet the exit code is the whole answer.
     if ok && !quiet {
-        println!("{} {input}: no syntax errors", "ok:".green().bold());
+        eprintln!("{} {input}: no syntax errors", "ok:".green().bold());
     }
 }
 
@@ -150,7 +132,7 @@ mod tests {
             input: "d.ttl".to_string(),
             syntax: "turtle",
             ok: false,
-            statements: 12,
+            grammar_statements: 12,
             diagnostics: vec![diagnostic::from_turtle_error(
                 &fluree_graph_turtle::TurtleError::parse(5, "unexpected"),
                 "abc\ndef\n",
@@ -159,7 +141,7 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&report).unwrap();
         assert_eq!(v["schema"], CHECK_SCHEMA);
         assert_eq!(v["ok"], false);
-        assert_eq!(v["statements"], 12);
+        assert_eq!(v["grammar_statements"], 12);
         assert_eq!(v["syntax"], "turtle");
         assert_eq!(v["diagnostics"][0]["line"], 2);
         assert_eq!(v["diagnostics"][0]["column"], 2);
@@ -175,7 +157,7 @@ mod tests {
             input: "d.ttl".to_string(),
             syntax: "turtle",
             ok: true,
-            statements: 3,
+            grammar_statements: 3,
             diagnostics: Vec::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&report).unwrap();

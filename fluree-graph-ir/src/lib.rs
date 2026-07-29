@@ -68,6 +68,9 @@ pub use sink::{
     GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId, PROTOCOL_QUAD_EVENTS,
 };
 pub use term::{BlankId, LiteralValue, Term};
-pub use timing::{clock_pair_cost, Phase, PhaseTimings, SinkCounts, TimingSink};
+pub use timing::{
+    clock_pair_cost, corpus_seed, Phase, PhaseTimings, SinkCounts, SinkTiming, TimingSink,
+    FLOOR_MULTIPLE, SAMPLE_STRIDE,
+};
 pub use triple::Triple;
 pub use xsd_double::{canonical_xsd_double, push_canonical_xsd_double, write_canonical_xsd_double};

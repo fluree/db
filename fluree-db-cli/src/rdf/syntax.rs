@@ -349,7 +349,18 @@ pub fn resolve(
 /// error naming the flag rather than a parse error fifty lines in.
 fn sniff(head: &[u8]) -> Option<RdfSyntax> {
     let text = std::str::from_utf8(head).ok()?;
-    let trimmed = text.trim_start();
+    // A UTF-8 BOM is not part of any RDF grammar, but plenty of editors write
+    // one. Stepping over it here only affects *identification*: the parser
+    // still sees the BOM and still gets to reject it, which is its call to
+    // make. Without this, a BOM'd file with no extension fails as "could not
+    // determine the syntax", which points at the wrong problem.
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    // An empty document is the empty graph in every syntax — there is nothing
+    // to identify and nothing to get wrong. Refusing it would make
+    // `fluree rdf check < /dev/null` exit 2 while an empty `.ttl` file exits 0.
+    if trimmed.is_empty() {
+        return Some(RdfSyntax::Turtle);
+    }
     let mut chars = trimmed.chars();
     match chars.next()? {
         '<' if trimmed.starts_with("<?xml") || trimmed.starts_with("<rdf:") => {

@@ -16,7 +16,7 @@
 
 use crate::rdf::syntax::{Compression, RdfSyntax, SyntaxSource};
 use fluree_bench_support::report::{print_summary, SummaryRow};
-use fluree_graph_ir::{clock_pair_cost, Phase, PhaseTimings, SinkCounts};
+use fluree_graph_ir::{Phase, PhaseTimings, SinkCounts, SinkTiming, FLOOR_MULTIPLE};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -63,10 +63,89 @@ pub struct RunContext {
 struct HostInfo {
     os: &'static str,
     arch: &'static str,
+    /// Comparability class for baselines. Two runs may only be diffed on
+    /// absolute timings when this matches.
+    ///
+    /// From `FLUREE_BENCH_HOST_CLASS` when set — a CI runner or a named
+    /// instance type has an identity that `{os}-{arch}` does not capture —
+    /// otherwise derived, so the field is never absent.
+    host_class: String,
     /// Cores this host offers. Reported alongside `threads_used` so a
     /// single-threaded number is never mistaken for a saturated one.
     available_parallelism: usize,
     threads_used: usize,
+    /// Peak resident set size for the process, in bytes, normalized across
+    /// platforms. `None` where it cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_rss_bytes: Option<u64>,
+}
+
+/// Environment variable naming the host's comparability class.
+pub const HOST_CLASS_ENV: &str = "FLUREE_BENCH_HOST_CLASS";
+
+/// The host class for this run.
+fn host_class() -> String {
+    std::env::var(HOST_CLASS_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH))
+}
+
+/// The build this binary came from, discovered at runtime.
+///
+/// `git rev-parse` in the working directory, not a build script: the
+/// workspace has none and adding the first one to stamp a profile field would
+/// put a git dependency in front of every release build. The cost is one
+/// process spawn, paid only under `--profile`, and `"unknown"` is a perfectly
+/// good answer from an installed binary that is nowhere near a checkout.
+fn git_sha() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Peak resident set size for this process, in bytes.
+///
+/// `ru_maxrss` is the one field here that means different things on different
+/// kernels: bytes on Darwin, kilobytes on Linux. Normalizing it in exactly one
+/// place is the bench lane's standing lesson — a factor of 1024 that only
+/// appears on one platform is not a bug anyone catches by reading a number.
+#[cfg(unix)]
+fn peak_rss_bytes() -> Option<u64> {
+    // SAFETY: `getrusage` fills a caller-provided struct and touches nothing
+    // else; the zeroed struct is a valid target for it.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {
+            return None;
+        }
+        usage
+    };
+    Some(normalize_max_rss(usage.ru_maxrss as i64))
+}
+
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> Option<u64> {
+    None
+}
+
+/// Convert a raw `ru_maxrss` to bytes for the current platform.
+///
+/// Split out from the syscall so the unit conversion — the part that is
+/// actually easy to get wrong — is testable without one.
+fn normalize_max_rss(raw: i64) -> u64 {
+    let raw = raw.max(0) as u64;
+    if cfg!(target_os = "macos") || cfg!(target_os = "ios") {
+        raw
+    } else {
+        raw.saturating_mul(1024)
+    }
 }
 
 #[derive(Serialize)]
@@ -90,13 +169,36 @@ struct PhaseEntry {
     estimated: bool,
 }
 
+/// The sink's own story, kept out of `phases` because the interesting answer
+/// is often "this could not be measured", which is not a duration.
+#[derive(Serialize)]
+struct SinkInfo {
+    /// Estimated per-event cost. `null` when below the measurement floor —
+    /// which is not the same as zero, and must not be read as zero.
+    body_ns: Option<u128>,
+    /// True when the sink is cheaper than the instrument can resolve.
+    below_measurement_floor: bool,
+    /// The threshold `body_ns` had to clear.
+    floor_ns: u128,
+    /// Clock cost that a scaled estimate carries: `calls × clock_pair_ns`.
+    artifact_ns: u128,
+    /// `finish()` — measured exactly, never scaled.
+    finish_ns: u128,
+    calls: u64,
+    sampled_calls: u64,
+    sampled_statements: u64,
+    sampled_pct: f64,
+}
+
 #[derive(Serialize)]
 struct CountsInfo {
     triples: u64,
     quads: u64,
     list_items: u64,
     reified: u64,
-    statements: u64,
+    /// Turtle `statement` productions, directives included — deliberately not
+    /// called "statements", because it is not the triple count.
+    grammar_statements: u64,
     terms_iri: u64,
     terms_blank: u64,
     terms_literal: u64,
@@ -105,7 +207,9 @@ struct CountsInfo {
 
 #[derive(Serialize)]
 struct RatesInfo {
-    statements_per_sec: f64,
+    /// Triples per second, over every emitted edge (triples, quads, list
+    /// items, reifiers) — the same quantity `fluree rdf count` prints.
+    triples_per_sec: f64,
     decoded_mib_per_sec: f64,
 }
 
@@ -113,14 +217,24 @@ struct RatesInfo {
 struct SelfCalibration {
     clock_reads: u64,
     clock_pair_ns: u128,
+    /// Wall clock the instrument actually consumed: the clock reads it took,
+    /// priced at the measured rate. This is the profiler's distortion of the
+    /// run, and it is small by construction.
+    measured_overhead_pct: f64,
+    /// Clock cost embedded in a sink estimate scaled to the full call count.
+    /// Large whenever the sink is cheap, which is why the sink estimate is
+    /// floored rather than trusted — see the `sink` block.
+    estimator_artifact_pct: f64,
+    /// The larger of the two above; the figure `trusted` gates on. They
+    /// overlap (the reads actually taken are a subset of the extrapolation),
+    /// so this is a max and not a sum.
     overhead_pct: f64,
-    /// False when `overhead_pct` exceeds [`OVERHEAD_TRUST_LIMIT_PCT`]: the
-    /// instrument is a large enough share of the measurement that the phase
-    /// breakdown is not usable as a baseline.
+    /// False when `overhead_pct` exceeds [`OVERHEAD_TRUST_LIMIT_PCT`]. When
+    /// only `estimator_artifact_pct` drove it over, the read/decompress/parse
+    /// phases are still sound — it is the sink estimate that is
+    /// instrument-dominated, and the `sink` block says whether it was
+    /// reported at all.
     trusted: bool,
-    /// Percentage of sink calls that were actually timed, backing the
-    /// estimated `sink` phase.
-    sink_sampled_pct: f64,
 }
 
 /// One profiled run, ready to render.
@@ -128,14 +242,28 @@ struct SelfCalibration {
 pub struct ProfileReport {
     schema: &'static str,
     tool_version: &'static str,
+    /// Commit this binary was built from, read at runtime. `"unknown"` when
+    /// there is no checkout to ask.
+    git_sha: String,
     verb: &'static str,
     host: HostInfo,
     corpus: CorpusInfo,
+    /// The measured window: from the first byte of input handling to the end
+    /// of parsing.
+    ///
+    /// It does **not** cover process startup and argument parsing, which
+    /// happen before the window opens, nor the SHA-256 fingerprint, which is
+    /// computed after it closes — so `--profile` without `--no-hash` costs
+    /// real time that appears in neither this figure nor `unattributed_ns`.
+    /// That is deliberate: hashing is the profiler's cost, not the pipeline's,
+    /// and charging it to a phase would make the profile describe itself.
     wall_ns: u128,
-    /// Wall clock not attributed to any phase — process startup, hashing,
-    /// allocator warmup. Left visible rather than folded into the phases.
+    /// Wall clock *inside the window* that no phase claimed: syntax
+    /// resolution, allocation, scheduling. Left visible rather than
+    /// redistributed into the phases that did run.
     unattributed_ns: u128,
     phases: Vec<PhaseEntry>,
+    sink: SinkInfo,
     counts: CountsInfo,
     rates: RatesInfo,
     self_calibration: SelfCalibration,
@@ -153,12 +281,10 @@ impl ProfileReport {
         timings: &PhaseTimings,
         wall: Duration,
         counts: SinkCounts,
-        sink_estimate: Duration,
-        sink_clock_reads: u64,
-        sink_sampled_pct: f64,
+        sink: SinkTiming,
     ) -> Self {
         let mut timings = timings.clone();
-        timings.set(Phase::Sink, sink_estimate);
+        timings.set(Phase::Sink, sink.reportable());
 
         let phases: Vec<PhaseEntry> = Phase::ALL
             .into_iter()
@@ -179,25 +305,33 @@ impl ProfileReport {
             .map(|p| timings.elapsed(p).as_nanos())
             .sum();
 
-        let clock_reads = timings.clock_reads() + sink_clock_reads;
-        let clock_pair = clock_pair_cost();
-        let overhead_ns = (clock_reads as u128) * clock_pair.as_nanos() / 2;
+        let clock_reads = timings.clock_reads() + sink.clock_reads;
+        let clock_pair = sink.clock_pair;
         let wall_ns = wall.as_nanos();
-        let overhead_pct = pct(overhead_ns as f64, wall_ns as f64);
+
+        // Two different overheads, and conflating them is what let a sink
+        // phase that was 98% clock ship marked "trusted".
+        let measured_ns = u128::from(clock_reads) * clock_pair.as_nanos() / 2;
+        let measured_pct = pct(measured_ns as f64, wall_ns as f64);
+        let artifact_pct = pct(sink.artifact.as_nanos() as f64, wall_ns as f64);
+        let overhead_pct = measured_pct.max(artifact_pct);
 
         let secs = wall.as_secs_f64();
         Self {
             schema: PROFILE_SCHEMA,
             tool_version: env!("CARGO_PKG_VERSION"),
+            git_sha: git_sha(),
             verb: ctx.verb,
             host: HostInfo {
                 os: std::env::consts::OS,
                 arch: std::env::consts::ARCH,
+                host_class: host_class(),
                 available_parallelism: std::thread::available_parallelism()
                     .map_or(1, std::num::NonZeroUsize::get),
                 // `check` and `count` parse on the calling thread. The
                 // parallel pipeline reports its real width here.
                 threads_used: 1,
+                peak_rss_bytes: peak_rss_bytes(),
             },
             corpus: CorpusInfo {
                 input: ctx.input.clone(),
@@ -211,27 +345,39 @@ impl ProfileReport {
             wall_ns,
             unattributed_ns: wall_ns.saturating_sub(sequential),
             phases,
+            sink: SinkInfo {
+                body_ns: sink.body.map(|b| b.as_nanos()),
+                below_measurement_floor: sink.below_floor(),
+                floor_ns: sink.floor().as_nanos() * u128::from(FLOOR_MULTIPLE),
+                artifact_ns: sink.artifact.as_nanos(),
+                finish_ns: sink.finish.as_nanos(),
+                calls: sink.calls,
+                sampled_calls: sink.sampled_calls,
+                sampled_statements: sink.sampled_statements,
+                sampled_pct: sink.sampled_pct(),
+            },
             counts: CountsInfo {
                 triples: counts.triples,
                 quads: counts.quads,
                 list_items: counts.list_items,
                 reified: counts.reified,
-                statements: counts.statements,
+                grammar_statements: counts.statements,
                 terms_iri: counts.terms_iri,
                 terms_blank: counts.terms_blank,
                 terms_literal: counts.terms_literal,
                 prefixes: counts.prefixes,
             },
             rates: RatesInfo {
-                statements_per_sec: rate(counts.emitted() as f64, secs),
+                triples_per_sec: rate(counts.emitted() as f64, secs),
                 decoded_mib_per_sec: rate(ctx.bytes_decoded as f64 / (1024.0 * 1024.0), secs),
             },
             self_calibration: SelfCalibration {
                 clock_reads,
                 clock_pair_ns: clock_pair.as_nanos(),
+                measured_overhead_pct: measured_pct,
+                estimator_artifact_pct: artifact_pct,
                 overhead_pct,
                 trusted: overhead_pct <= OVERHEAD_TRUST_LIMIT_PCT,
-                sink_sampled_pct,
             },
         }
     }
@@ -268,39 +414,76 @@ impl ProfileReport {
         print_summary("phase", &rows);
 
         eprintln!(
-            "  {} {} · {} · {}",
+            "  {} {} · {} · {} · {}",
             self.verb,
             self.corpus.input,
             self.corpus.syntax,
             human_bytes(self.corpus.bytes_decoded),
+            self.host.host_class,
         );
         eprintln!(
-            "  wall {} · {} unattributed · {} statements · {}",
+            "  wall {} (input → parse; excludes startup{}) · {} unattributed",
             human_duration(self.wall_ns),
+            if self.corpus.sha256.is_some() {
+                " and fingerprinting"
+            } else {
+                ""
+            },
             human_duration(self.unattributed_ns),
-            self.counts.triples + self.counts.quads + self.counts.list_items,
-            human_rate(self.rates.statements_per_sec),
         );
+        eprintln!(
+            "  {} triples · {} · {} grammar statements{}",
+            self.counts.triples + self.counts.quads + self.counts.list_items + self.counts.reified,
+            human_rate(self.rates.triples_per_sec),
+            self.counts.grammar_statements,
+            self.host
+                .peak_rss_bytes
+                .map(|b| format!(" · peak RSS {}", human_bytes(b)))
+                .unwrap_or_default(),
+        );
+
+        // The sink line is where an unresolvable number used to be printed as
+        // though it were a measurement.
+        let sink = &self.sink;
+        if sink.below_measurement_floor {
+            eprintln!(
+                "  sink: below the measurement floor — across {} calls its per-event cost \
+                 is under {}, which is where the clock's own {} stops being separable from it",
+                sink.calls,
+                human_duration(sink.floor_ns),
+                human_duration(sink.artifact_ns),
+            );
+        } else {
+            eprintln!(
+                "  sink: ~{} estimated from {:.2}% of calls (±sampling error), inside the parse phase",
+                human_duration(sink.body_ns.unwrap_or(0)),
+                sink.sampled_pct,
+            );
+        }
+        if sink.finish_ns > 0 {
+            eprintln!(
+                "  sink finish: {} (measured exactly, not scaled)",
+                human_duration(sink.finish_ns)
+            );
+        }
+
         let cal = &self.self_calibration;
         eprintln!(
-            "  profiler overhead {:.3}% of wall ({} clock reads @ {}ns/pair){}",
-            cal.overhead_pct,
-            cal.clock_reads,
-            cal.clock_pair_ns,
-            if cal.trusted {
-                String::new()
+            "  profiler cost {:.3}% of wall ({} clock reads @ {}ns/pair)",
+            cal.measured_overhead_pct, cal.clock_reads, cal.clock_pair_ns,
+        );
+        if !cal.trusted {
+            // Say which part is untrustworthy. "Untrusted" stamped on a report
+            // whose read and parse phases are sound is a warning people learn
+            // to ignore.
+            let detail = if cal.estimator_artifact_pct > cal.measured_overhead_pct {
+                "the sink estimator's extrapolated clock artifact — the sink figure is \
+                 not a baseline; read, decompress and parse are unaffected"
             } else {
-                format!(
-                    " — UNTRUSTED, above the {OVERHEAD_TRUST_LIMIT_PCT}% limit; \
-                     phase shares are not usable as a baseline"
-                )
-            }
-        );
-        eprintln!(
-            "  sink phase is estimated from {:.2}% of calls; \
-             shares are of wall clock, and sink time runs inside parse",
-            cal.sink_sampled_pct,
-        );
+                "the profiler's own clock reads — no phase share here is usable as a baseline"
+            };
+            eprintln!("  UNTRUSTED: {:.1}% of wall is {detail}", cal.overhead_pct);
+        }
     }
 }
 
@@ -410,15 +593,35 @@ mod tests {
         }
     }
 
+    /// A sink whose cost was resolvable: body well over the floor.
+    fn resolved_sink() -> SinkTiming {
+        SinkTiming {
+            body: Some(Duration::from_millis(5)),
+            finish: Duration::ZERO,
+            artifact: Duration::from_micros(60),
+            calls: 3_000,
+            sampled_calls: 24,
+            sampled_statements: 8,
+            clock_reads: 48,
+            clock_pair: Duration::from_nanos(20),
+        }
+    }
+
+    /// A sink too cheap to measure — the `count` case.
+    fn unresolved_sink() -> SinkTiming {
+        SinkTiming {
+            body: None,
+            ..resolved_sink()
+        }
+    }
+
     fn report() -> ProfileReport {
         ProfileReport::build(
             &ctx(),
             &timings(),
             Duration::from_millis(100),
             counts(),
-            Duration::from_millis(5),
-            120,
-            1.5,
+            resolved_sink(),
         )
     }
 
@@ -443,10 +646,23 @@ mod tests {
         assert_eq!(v["corpus"]["sha256"], "abc123");
         assert!(v["wall_ns"].as_u64().unwrap() > 0);
         assert_eq!(v["counts"]["triples"], 1000);
-        assert!(v["rates"]["statements_per_sec"].as_f64().unwrap() > 0.0);
-        assert!(v["self_calibration"]["clock_reads"].as_u64().unwrap() >= 120);
+        assert_eq!(v["counts"]["grammar_statements"], 500);
+        assert!(v["rates"]["triples_per_sec"].as_f64().unwrap() > 0.0);
+        assert!(v["self_calibration"]["clock_reads"].as_u64().unwrap() >= 48);
+        assert!(v["self_calibration"]["measured_overhead_pct"].is_number());
+        assert!(v["self_calibration"]["estimator_artifact_pct"].is_number());
         assert!(v["self_calibration"]["overhead_pct"].is_number());
         assert!(v["self_calibration"]["trusted"].is_boolean());
+
+        // Added by the review: a baseline that cannot say which host or which
+        // build produced it is not a baseline.
+        assert!(!v["host"]["host_class"].as_str().unwrap().is_empty());
+        assert!(!v["git_sha"].as_str().unwrap().is_empty());
+        // And the sink block, which carries the answer `phases` cannot.
+        assert_eq!(v["sink"]["below_measurement_floor"], false);
+        assert!(v["sink"]["floor_ns"].is_number());
+        assert!(v["sink"]["artifact_ns"].is_number());
+        assert_eq!(v["sink"]["calls"], 3000);
     }
 
     #[test]
@@ -494,9 +710,7 @@ mod tests {
             &t,
             Duration::from_millis(100),
             counts(),
-            Duration::from_millis(5),
-            10,
-            1.0,
+            resolved_sink(),
         );
         let sink = r.phases.iter().find(|p| p.phase == "sink").unwrap();
         assert_eq!(sink.ns, Duration::from_millis(5).as_nanos());
@@ -517,9 +731,7 @@ mod tests {
             &sparse,
             Duration::from_millis(100),
             counts(),
-            Duration::ZERO,
-            0,
-            0.0,
+            unresolved_sink(),
         );
         assert_eq!(r.unattributed_ns, Duration::from_millis(90).as_nanos());
     }
@@ -529,14 +741,16 @@ mod tests {
         // A microsecond-scale run with a large clock-read count: the
         // instrument is most of the measurement and the report has to say so
         // rather than print confident shares.
+        let noisy = SinkTiming {
+            clock_reads: 10_000,
+            ..unresolved_sink()
+        };
         let r = ProfileReport::build(
             &ctx(),
             &PhaseTimings::start(),
             Duration::from_micros(10),
             counts(),
-            Duration::ZERO,
-            10_000,
-            50.0,
+            noisy,
         );
         assert!(r.self_calibration.overhead_pct > OVERHEAD_TRUST_LIMIT_PCT);
         assert!(!r.self_calibration.trusted);
@@ -547,25 +761,31 @@ mod tests {
             &timings(),
             Duration::from_secs(10),
             counts(),
-            Duration::ZERO,
-            20,
-            1.0,
+            resolved_sink(),
         );
         assert!(r.self_calibration.trusted);
     }
 
     #[test]
     fn a_zero_length_run_reports_zeroes_rather_than_dividing_by_zero() {
+        let empty = SinkTiming {
+            body: None,
+            finish: Duration::ZERO,
+            artifact: Duration::ZERO,
+            calls: 0,
+            sampled_calls: 0,
+            sampled_statements: 0,
+            clock_reads: 0,
+            clock_pair: Duration::from_nanos(20),
+        };
         let r = ProfileReport::build(
             &ctx(),
             &PhaseTimings::start(),
             Duration::ZERO,
             SinkCounts::default(),
-            Duration::ZERO,
-            0,
-            0.0,
+            empty,
         );
-        assert_eq!(r.rates.statements_per_sec, 0.0);
+        assert_eq!(r.rates.triples_per_sec, 0.0);
         assert_eq!(r.rates.decoded_mib_per_sec, 0.0);
         assert_eq!(r.self_calibration.overhead_pct, 0.0);
     }
@@ -579,9 +799,7 @@ mod tests {
             &timings(),
             Duration::from_millis(100),
             counts(),
-            Duration::ZERO,
-            0,
-            0.0,
+            resolved_sink(),
         );
         let v = serde_json::to_value(r).unwrap();
         assert!(
@@ -589,6 +807,141 @@ mod tests {
             "an absent fingerprint must be absent, not null — a consumer \
              should not have to distinguish the two"
         );
+    }
+
+    #[test]
+    fn an_unresolvable_sink_is_reported_as_such_and_not_as_zero() {
+        // The correction the review forced: when the sink is cheaper than the
+        // clock, the report must say it could not be measured. A `body_ns` of
+        // 0 would read as "the sink is free", which is a different claim.
+        let r = ProfileReport::build(
+            &ctx(),
+            &timings(),
+            Duration::from_millis(100),
+            counts(),
+            unresolved_sink(),
+        );
+        let v = serde_json::to_value(r).unwrap();
+
+        assert_eq!(v["sink"]["below_measurement_floor"], true);
+        assert!(
+            v["sink"]["body_ns"].is_null(),
+            "unresolved must be null, never 0: {}",
+            v["sink"]["body_ns"]
+        );
+        // And it does not appear as a phase row pretending to be a measurement.
+        assert!(
+            !v["phases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["phase"] == "sink"),
+            "an unresolved sink must not occupy a phase row"
+        );
+    }
+
+    #[test]
+    fn a_measured_finish_reaches_the_sink_phase_even_when_the_body_does_not() {
+        // A writer's flush is exact. It must survive the body being suppressed
+        // — otherwise suppressing an unresolvable estimate would also throw
+        // away the one sink number that *was* measured.
+        let sink = SinkTiming {
+            body: None,
+            finish: Duration::from_millis(7),
+            ..resolved_sink()
+        };
+        let r = ProfileReport::build(
+            &ctx(),
+            &timings(),
+            Duration::from_millis(100),
+            counts(),
+            sink,
+        );
+        let v = serde_json::to_value(r).unwrap();
+
+        assert_eq!(v["sink"]["finish_ns"], 7_000_000u64);
+        let row = v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["phase"] == "sink")
+            .expect("finish alone still earns the row");
+        assert_eq!(row["ns"], 7_000_000u64);
+    }
+
+    #[test]
+    fn a_large_estimator_artifact_marks_the_run_untrusted_on_its_own() {
+        // The `>2%` marker exists for exactly this: the wall cost of the clock
+        // reads actually taken is negligible, but the artifact carried by the
+        // *scaled* estimate is most of the run. Before the fix only the first
+        // was counted, so the marker could never fire on a `count`.
+        let sink = SinkTiming {
+            artifact: Duration::from_millis(60),
+            clock_reads: 40,
+            ..unresolved_sink()
+        };
+        let r = ProfileReport::build(
+            &ctx(),
+            &timings(),
+            Duration::from_millis(100),
+            counts(),
+            sink,
+        );
+        let cal = &r.self_calibration;
+
+        assert!(
+            cal.measured_overhead_pct < OVERHEAD_TRUST_LIMIT_PCT,
+            "the reads actually taken are cheap: {}%",
+            cal.measured_overhead_pct
+        );
+        assert!(cal.estimator_artifact_pct > 50.0);
+        assert!(!cal.trusted, "the artifact alone must trip the marker");
+        assert_eq!(cal.overhead_pct, cal.estimator_artifact_pct);
+    }
+
+    #[test]
+    fn host_class_is_the_env_override_when_set_and_derived_otherwise() {
+        let derived = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        // Not asserted against the live env var: this process may be running
+        // under one. The derivation is the part worth pinning.
+        assert!(derived.contains('-'));
+        assert!(!host_class().is_empty(), "the field is never absent");
+        assert_eq!(HOST_CLASS_ENV, "FLUREE_BENCH_HOST_CLASS");
+    }
+
+    #[test]
+    fn max_rss_is_normalized_to_bytes_per_platform() {
+        // The one place the Darwin-bytes / Linux-kilobytes split is handled.
+        // Getting it wrong is a silent factor of 1024 on one platform only.
+        let raw = 4096;
+        let expected = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            4096
+        } else {
+            4096 * 1024
+        };
+        assert_eq!(normalize_max_rss(raw), expected);
+        // A negative reading (some kernels, on failure) is floored, not wrapped.
+        assert_eq!(normalize_max_rss(-1), 0);
+    }
+
+    #[test]
+    fn peak_rss_is_readable_on_this_platform() {
+        if cfg!(unix) {
+            let rss = peak_rss_bytes().expect("getrusage works on unix");
+            assert!(
+                rss > 1024 * 1024,
+                "a running test process holds more than a MiB: {rss}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_sha_is_always_a_usable_string() {
+        // Either a real short SHA from the surrounding checkout, or the
+        // documented fallback — never empty, so a consumer need not branch.
+        let sha = git_sha();
+        assert!(!sha.is_empty());
+        assert!(!sha.contains('\n'), "{sha:?}");
     }
 
     #[test]

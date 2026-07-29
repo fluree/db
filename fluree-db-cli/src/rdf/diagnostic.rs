@@ -36,7 +36,15 @@ pub struct Diagnostic {
     /// with what a terminal shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<usize>,
-    /// The parser's message, without the position prefix it formats in.
+    /// The problem, in one line.
+    ///
+    /// The lexer's messages are not one line: they arrive as a rendered block
+    /// with their own `3 | …` source excerpt and their own caret, plus an
+    /// `at line 3, column 16` suffix. Rendered as-is beside this module's
+    /// snippet and caret, that produced two excerpts, two carets, and the
+    /// position three times. Everything but the first line is dropped, and the
+    /// trailing position clause with it, because [`Self::line`] and
+    /// [`Self::column`] carry that already.
     pub message: String,
     /// The source line the offset falls on.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,9 +76,9 @@ impl Diagnostic {
 pub fn from_turtle_error(err: &TurtleError, source: &str) -> Diagnostic {
     let (offset, message) = match err {
         TurtleError::Lexer { position, message } | TurtleError::Parse { position, message } => {
-            (Some(*position), message.clone())
+            (Some(*position), single_line(message))
         }
-        other => (None, other.to_string()),
+        other => (None, single_line(&other.to_string())),
     };
 
     let Some(offset) = offset else {
@@ -92,6 +100,35 @@ pub fn from_turtle_error(err: &TurtleError, source: &str) -> Diagnostic {
         column: Some(column),
         message,
         snippet: Some(snippet),
+    }
+}
+
+/// Reduce a parser message to its first line, minus any trailing position.
+///
+/// The lexer pre-renders a whole diagnostic block into its message string. All
+/// of it after the first line duplicates what this module renders from the
+/// offset, and duplicates it *differently* — its excerpt is numbered, this
+/// one is indented — so the two together read as two separate errors.
+fn single_line(message: &str) -> String {
+    let first = message.lines().next().unwrap_or_default().trim_end();
+    strip_position_clause(first).to_string()
+}
+
+/// Drop a trailing `at line N, column N` — the caller renders the position.
+fn strip_position_clause(s: &str) -> &str {
+    const AT_LINE: &str = " at line ";
+    let Some(idx) = s.rfind(AT_LINE) else {
+        return s;
+    };
+    let tail = &s[idx + AT_LINE.len()..];
+    let Some((line, column)) = tail.split_once(", column ") else {
+        return s;
+    };
+    let numeric = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    if numeric(line) && numeric(column) {
+        s[..idx].trim_end()
+    } else {
+        s
     }
 }
 
@@ -220,6 +257,37 @@ mod tests {
         let src = "ex:a ex:b ??\r\n";
         let d = from_turtle_error(&TurtleError::parse(src.find("??").unwrap(), "bad"), src);
         assert_eq!(d.snippet.as_deref(), Some("ex:a ex:b ??"));
+    }
+
+    #[test]
+    fn a_prerendered_lexer_block_is_reduced_to_one_line() {
+        // What the lexer actually produces: its own numbered excerpt, its own
+        // caret, and the position in the text. Rendered whole beside this
+        // module's snippet and caret it read as two errors at two positions.
+        let raw = "unexpected character '?' at line 3, column 16\n  |\n3 | ex:bob ex:name ?? .\n  |                ^";
+        let d = from_turtle_error(&TurtleError::lexer(52, raw), DOC);
+
+        assert_eq!(d.message, "unexpected character '?'");
+        assert!(!d.message.contains('\n'), "{:?}", d.message);
+        assert!(!d.message.contains("line 3"), "{:?}", d.message);
+        assert!(!d.message.contains('^'), "{:?}", d.message);
+    }
+
+    #[test]
+    fn a_message_that_merely_mentions_a_line_keeps_its_words() {
+        // Only a trailing `at line N, column N` is a position clause. Prose
+        // that happens to contain "line" must survive intact.
+        assert_eq!(
+            strip_position_clause("bad thing at line start"),
+            "bad thing at line start"
+        );
+        assert_eq!(strip_position_clause("no clause here"), "no clause here");
+        assert_eq!(strip_position_clause("oops at line 4, column 9"), "oops");
+        // A malformed clause is left alone rather than half-stripped.
+        assert_eq!(
+            strip_position_clause("oops at line four, column nine"),
+            "oops at line four, column nine"
+        );
     }
 
     #[test]

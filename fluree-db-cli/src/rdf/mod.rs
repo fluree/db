@@ -21,8 +21,8 @@ pub mod syntax;
 use crate::cli::{RdfAction, RdfCommonArgs};
 use crate::error::{CliError, CliResult, EXIT_ERROR};
 use fluree_graph_ir::{
-    Datatype, GraphSink, LiteralValue, Phase, PhaseTimings, SinkCounts, SinkResult, TermId,
-    TimingSink,
+    Datatype, GraphSink, LiteralValue, Phase, PhaseTimings, SinkCounts, SinkResult, SinkTiming,
+    TermId, TimingSink,
 };
 use fluree_graph_turtle::{ParserOptions, TurtleError};
 use input::RdfInput;
@@ -31,6 +31,13 @@ use syntax::Resolved;
 
 /// Dispatch an `rdf` subcommand.
 pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
+    let common = match action {
+        RdfAction::Convert { common, .. }
+        | RdfAction::Check { common, .. }
+        | RdfAction::Count { common } => common,
+    };
+    reject_profile_space_form(common)?;
+
     match action {
         RdfAction::Convert {
             common,
@@ -41,6 +48,36 @@ pub fn run(action: &RdfAction, quiet: bool) -> CliResult<()> {
         RdfAction::Check { common, format } => check::run(common, *format, quiet),
         RdfAction::Count { common } => count::run(common, quiet),
     }
+}
+
+/// Catch `--profile json` (space) and say what was meant.
+///
+/// `--profile` takes an optional value, so clap can only accept it attached:
+/// `--profile=json`. Written with a space, clap gives `--profile` its default
+/// value and hands `json` to the positional input — and the verb then goes
+/// looking for a file called `json`. The "no such file" that follows is true
+/// and useless.
+///
+/// The ambiguity is real and not clap's fault: with a space-separated optional
+/// value, `fluree rdf count --profile data.ttl` could not be told apart from a
+/// format named `data.ttl`. So the form stays attached-only, and this turns
+/// the confusing failure into an instruction.
+fn reject_profile_space_form(common: &RdfCommonArgs) -> CliResult<()> {
+    let Some(input) = common.input.as_deref() else {
+        return Ok(());
+    };
+    if common.profile.is_none() || input.exists() {
+        return Ok(());
+    }
+    let name = input.as_os_str().to_string_lossy();
+    if !["json", "human"].contains(&name.as_ref()) {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!(
+        "`--profile` takes its format attached: `--profile={name}`, not `--profile {name}`\n  \
+         {} written with a space, '{name}' is read as the input file, and no such file exists",
+        colored::Colorize::bold(colored::Colorize::cyan("help:")),
+    )))
 }
 
 /// A sink that accepts every event and keeps nothing.
@@ -194,12 +231,10 @@ pub(crate) fn floor_char_boundary(s: &str, mut index: usize) -> usize {
 pub struct ParseOutcome {
     /// Events seen, counted exactly.
     pub counts: SinkCounts,
-    /// Estimated time inside the sink (sampled — see [`TimingSink`]).
-    pub sink_estimate: Duration,
-    /// Clock reads the sink decorator made, for overhead disclosure.
-    pub sink_clock_reads: u64,
-    /// Share of sink calls that were timed.
-    pub sink_sampled_pct: f64,
+    /// What can honestly be said about the sink's cost — which, for the
+    /// discard sink these verbs use, is usually "less than this instrument can
+    /// resolve". See [`SinkTiming`].
+    pub sink: SinkTiming,
     /// The failure, if the document did not parse.
     ///
     /// Returned rather than raised because the two callers want opposite
@@ -221,7 +256,10 @@ pub fn parse_document(
     base: Option<&str>,
     timings: &mut PhaseTimings,
 ) -> CliResult<ParseOutcome> {
-    let mut sink = TimingSink::new(DiscardSink::new());
+    // Seeding the sampler from the corpus keeps repeat profiles of one input
+    // comparable while leaving no fixed pattern for a periodic corpus to
+    // alias against.
+    let mut sink = TimingSink::with_corpus(DiscardSink::new(), text.as_bytes());
 
     timings.enter(Phase::Parse);
     let result = fluree_graph_turtle::parse_with_prefixes_base_options(
@@ -240,11 +278,45 @@ pub fn parse_document(
 
     Ok(ParseOutcome {
         counts: sink.counts(),
-        sink_estimate: sink.estimated_sink_time(),
-        sink_clock_reads: sink.clock_reads(),
-        sink_sampled_pct: sink.sampled_pct(),
+        sink: sink.sink_timing(),
         error: result.err(),
     })
+}
+
+/// Emit `--profile` or `--time` for a finished run.
+///
+/// Shared by every verb, and called on the failure path as well as the success
+/// one: a profile that only appears when the document was valid is a profile
+/// you cannot use to find out why the broken one was slow. The counts it
+/// reports are then the counts up to the failure, which is what the diagnostic
+/// beside it already says.
+pub fn report_run(
+    common: &RdfCommonArgs,
+    verb: &'static str,
+    loaded: &Loaded,
+    outcome: &ParseOutcome,
+    timings: &PhaseTimings,
+    wall: Duration,
+) -> CliResult<()> {
+    if let Some(format) = common.profile {
+        let ctx = profile::RunContext {
+            verb,
+            input: loaded.input.display(),
+            syntax: loaded.resolved.syntax,
+            syntax_source: loaded.resolved.source,
+            compression: loaded.resolved.compression,
+            bytes_on_wire: loaded.bytes_on_wire,
+            bytes_decoded: loaded.text.len() as u64,
+            // Hashing happens here, after `wall` was taken — see the
+            // `wall_ns` docs for what the measured window covers.
+            sha256: (!common.no_hash).then(|| profile::sha256_hex(&loaded.text)),
+        };
+        profile::ProfileReport::build(&ctx, timings, wall, outcome.counts, outcome.sink)
+            .emit(format)?;
+    } else if common.time {
+        count::print_timing(wall, outcome.counts.emitted(), loaded.text.len() as u64);
+    }
+    Ok(())
 }
 
 /// Terminate with exit code 1 — "the document is bad" — after the command has
@@ -264,6 +336,53 @@ mod tests {
 
     fn parse(doc: &str) -> ParseOutcome {
         parse_document(doc, None, &mut PhaseTimings::start()).unwrap()
+    }
+
+    fn args_with(input: Option<&str>, profile: Option<profile::ProfileFormat>) -> RdfCommonArgs {
+        RdfCommonArgs {
+            input: input.map(std::path::PathBuf::from),
+            syntax: None,
+            base: None,
+            time: false,
+            profile,
+            no_hash: false,
+        }
+    }
+
+    #[test]
+    fn profile_written_with_a_space_is_explained_rather_than_read_as_a_file() {
+        // `--profile json` leaves clap holding `json` as the positional input,
+        // and the verb then reports that no file called `json` exists. True,
+        // and no help at all.
+        let err = reject_profile_space_form(&args_with(
+            Some("json"),
+            Some(profile::ProfileFormat::Human),
+        ))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--profile=json"), "{msg}");
+        assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn the_space_form_guard_does_not_fire_on_ordinary_inputs() {
+        // A real input alongside --profile is the normal case.
+        assert!(reject_profile_space_form(&args_with(
+            Some("data.ttl"),
+            Some(profile::ProfileFormat::Json)
+        ))
+        .is_ok());
+        // A file genuinely named `json` is read, not second-guessed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("json");
+        std::fs::write(&path, "<a> <b> <c> .\n").unwrap();
+        assert!(reject_profile_space_form(&RdfCommonArgs {
+            input: Some(path),
+            ..args_with(None, Some(profile::ProfileFormat::Human))
+        })
+        .is_ok());
+        // And without --profile the word `json` is just a missing file.
+        assert!(reject_profile_space_form(&args_with(Some("json"), None)).is_ok());
     }
 
     #[test]

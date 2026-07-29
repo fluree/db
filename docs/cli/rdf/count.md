@@ -17,17 +17,23 @@ cat dump.ttl | fluree rdf count --syntax turtle
 
 ```console
 $ fluree rdf count dump.ttl
-triples: 4823119
-terms: 9106238 (iri 812, blank 4102, literal 9101324)
-prefixes: 14
+triples: 240000
+terms: 480001 (iri 120001, blank 0, literal 360000)
+grammar statements: 120001
+prefixes: 1
 ```
+
+`triples` is the RDF edge count — the number other tools report for the same
+file. `grammar statements` is Turtle's `statement` production, which counts
+directives and counts a whole predicate-object list as one; the two differ by
+design and are never both called "statements".
 
 Under `-q` the output is the bare total and nothing else, for capturing in a
 shell variable:
 
 ```console
 $ fluree rdf count -q dump.ttl
-4823119
+240000
 ```
 
 Lines for quads, list items, and reified triples appear only when the count
@@ -70,9 +76,9 @@ written with rather than being canonicalized.
 
 ```console
 $ fluree rdf count dump.ttl --time
-triples: 4823119
+triples: 240000
 ...
-  4,823,119 in 1.02s (4,728,548 statements/s, 501.3 MiB/s)
+  240,000 triples in 2.49s (96,514 triples/s, 2.2 MiB/s)
 ```
 
 For a breakdown by phase — how much of that was I/O, decompression, and
@@ -96,6 +102,6 @@ far it got instead:
 
 ```console
 $ fluree rdf count broken.ttl
-error: broken.ttl:3:8: unexpected token
-  counted 2 statement(s) before the document stopped parsing
+error: broken.ttl:3:16: unexpected character '?'
+  counted 1 triple(s) before the document stopped parsing
 ```

@@ -2785,8 +2785,12 @@ pub enum UpstreamAction {
 /// verb — the same reason [`PolicyArgs`] is flattened across query and
 /// transaction commands.
 ///
-/// `--quiet` is deliberately absent: it is a global flag on [`Cli`] and
-/// declaring it again here would collide. The verbs read `cli.quiet`.
+/// `--quiet` is deliberately absent, and not because it could not go here:
+/// it is `global = true` on [`Cli`], so clap already accepts it at any
+/// position — `fluree -q rdf count f.ttl` and `fluree rdf count -q f.ttl`
+/// both work — and propagates it to every subcommand's matches. Redeclaring
+/// it would add a second argument with the same name for no behavior. The
+/// verbs read `cli.quiet`, threaded through `run()`.
 #[derive(Args, Debug, Clone)]
 pub struct RdfCommonArgs {
     /// Input file. `-` or no argument reads stdin. `.gz` / `.zst` inputs

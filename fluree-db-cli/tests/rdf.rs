@@ -83,7 +83,7 @@ fn check_accepts_a_valid_turtle_file() {
         .arg(&path)
         .assert()
         .success()
-        .stdout(predicate::str::contains("no syntax errors"));
+        .stderr(predicate::str::contains("no syntax errors"));
 }
 
 #[test]
@@ -95,10 +95,12 @@ fn check_rejects_a_broken_turtle_file_with_exit_1_and_a_located_diagnostic() {
         .arg(&path)
         .assert()
         .code(EXIT_DOCUMENT_INVALID)
-        // line:column, the offending line, and a caret under it.
-        .stdout(predicate::str::contains("broken.ttl:3:16"))
-        .stdout(predicate::str::contains("ex:bob ex:name ?? ."))
-        .stdout(predicate::str::contains("^"));
+        // line:column, the offending line, and a caret under it — on stderr,
+        // where riot and `count` put theirs.
+        .stderr(predicate::str::contains("broken.ttl:3:16"))
+        .stderr(predicate::str::contains("ex:bob ex:name ?? ."))
+        .stderr(predicate::str::contains("^"))
+        .stdout(predicate::str::is_empty());
 }
 
 #[test]
@@ -119,7 +121,7 @@ fn check_reads_stdin_when_no_file_is_named() {
         .write_stdin(VALID_TURTLE)
         .assert()
         .success()
-        .stdout(predicate::str::contains("<stdin>"));
+        .stderr(predicate::str::contains("<stdin>"));
 }
 
 #[test]
@@ -186,7 +188,7 @@ fn check_json_format_reports_the_diagnostic_with_offsets() {
     assert_eq!(v["diagnostics"][0]["column"], 16);
     assert!(v["diagnostics"][0]["offset"].as_u64().unwrap() > 0);
     assert_eq!(
-        v["statements"], 2,
+        v["grammar_statements"], 2,
         "the `@prefix` directive plus the one triple statement that parsed \
          before the failure — Turtle counts a directive as a statement"
     );
@@ -213,7 +215,8 @@ fn check_under_quiet_says_nothing_on_success_and_still_exits_0() {
         .arg(&path)
         .assert()
         .success()
-        .stdout(predicate::str::is_empty());
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
 }
 
 // ============================================================================
@@ -322,9 +325,7 @@ fn count_time_writes_to_stderr_so_stdout_stays_pipeable() {
         VALID_TURTLE_TRIPLES.to_string()
     );
     assert!(
-        String::from_utf8(out.stderr)
-            .unwrap()
-            .contains("statements/s"),
+        String::from_utf8(out.stderr).unwrap().contains("triples/s"),
         "the timing footer belongs on stderr"
     );
 }
@@ -506,6 +507,10 @@ fn profile_json_carries_the_whole_schema_and_lands_on_stderr() {
     );
     assert!(v["wall_ns"].as_u64().unwrap() > 0);
     assert_eq!(v["counts"]["triples"], VALID_TURTLE_TRIPLES);
+    assert!(v["counts"]["grammar_statements"].as_u64().unwrap() > 0);
+    assert!(!v["host"]["host_class"].as_str().unwrap().is_empty());
+    assert!(!v["git_sha"].as_str().unwrap().is_empty());
+    assert!(v["sink"]["below_measurement_floor"].is_boolean());
     assert!(v["phases"]
         .as_array()
         .unwrap()
@@ -634,8 +639,8 @@ fn profile_human_prints_a_table_to_stderr() {
         .success()
         .stderr(predicate::str::contains("phase"))
         .stderr(predicate::str::contains("% wall"))
-        .stderr(predicate::str::contains("profiler overhead"))
-        .stderr(predicate::str::contains("sink phase is estimated"));
+        .stderr(predicate::str::contains("profiler cost"))
+        .stderr(predicate::str::contains("sink:"));
 }
 
 #[test]
@@ -652,6 +657,119 @@ fn profile_works_on_check_as_well_as_count() {
         .clone();
     let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
     assert_eq!(v["verb"], "check");
+}
+
+#[test]
+fn the_sink_estimate_declines_to_report_a_number_it_cannot_resolve() {
+    // The estimator's headline correction. `count`'s sink is a discard sink
+    // that costs less per call than the clock used to measure it, so the
+    // honest answer is "below the measurement floor" — and specifically not
+    // zero, which would read as "the sink is free".
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "valid.ttl", &VALID_TURTLE.repeat(400));
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    assert_eq!(v["sink"]["below_measurement_floor"], true);
+    assert!(v["sink"]["body_ns"].is_null(), "{}", v["sink"]["body_ns"]);
+    assert!(v["sink"]["artifact_ns"].as_u64().unwrap() > 0);
+    assert!(v["sink"]["calls"].as_u64().unwrap() > 1_000);
+    assert!(
+        !v["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["phase"] == "sink"),
+        "an unresolved sink must not occupy a phase row"
+    );
+}
+
+#[test]
+fn profiling_a_broken_document_still_emits_the_profile() {
+    // Why a corpus was slow is worth knowing whether or not it parsed.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "broken.ttl", BROKEN_TURTLE);
+    let stderr = rdf_cmd()
+        .args(["rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID)
+        .get_output()
+        .stderr
+        .clone();
+
+    let json_start = stderr
+        .iter()
+        .position(|b| *b == b'{')
+        .expect("a profile document must be present alongside the diagnostic");
+    let v: serde_json::Value = serde_json::from_slice(&stderr[json_start..]).unwrap();
+    assert_eq!(v["verb"], "count");
+    assert_eq!(v["counts"]["triples"], 1, "the counts up to the failure");
+}
+
+#[test]
+fn profile_written_with_a_space_says_so_instead_of_hunting_for_a_file() {
+    rdf_cmd()
+        .args(["rdf", "count", "--profile", "json"])
+        .assert()
+        .code(EXIT_USAGE)
+        .stderr(predicate::str::contains("--profile=json"));
+}
+
+#[test]
+fn empty_input_exits_0_whether_it_is_a_file_or_a_pipe() {
+    // These disagreed: an empty `.ttl` parsed to nothing and exited 0, while
+    // empty stdin had no syntax to resolve and exited 2. An empty document is
+    // the empty graph in every syntax.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(&tmp, "empty.ttl", "");
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .arg(&path)
+        .assert()
+        .success();
+
+    rdf_cmd()
+        .args(["rdf", "check"])
+        .write_stdin("")
+        .assert()
+        .success();
+
+    let mut cmd = rdf_cmd();
+    cmd.args(["-q", "rdf", "count"]).write_stdin("");
+    assert_eq!(stdout_of(&mut cmd).trim(), "0");
+}
+
+#[test]
+fn a_byte_order_mark_does_not_defeat_syntax_detection() {
+    // A BOM'd file with no extension used to fail as "could not determine the
+    // syntax", pointing at the wrong problem. Identification steps over it;
+    // whether the *parser* accepts a BOM is the parser's call, not this one's.
+    let tmp = TempDir::new().unwrap();
+    let path = fixture(
+        &tmp,
+        "bom_noext",
+        "\u{feff}<http://e/s> <http://e/p> \"o\" .\n",
+    );
+    let stderr = rdf_cmd()
+        .args(["-q", "rdf", "count", "--profile=json", "--no-hash"])
+        .arg(&path)
+        .assert()
+        .get_output()
+        .stderr
+        .clone();
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(
+        !text.contains("--syntax"),
+        "the BOM must not be reported as an unknown syntax: {text}"
+    );
 }
 
 // ============================================================================

@@ -15,22 +15,44 @@
 //!   it from the outside, so both the Turtle and JSON-LD parsers are measured
 //!   without either of them knowing.
 //!
-//! # Why the sink is sampled and not stopwatched
+//! # Why the sink is sampled, and what that costs
 //!
 //! The obvious implementation — bracket every forwarded call with
 //! `Instant::now()` — is the one that cannot be trusted. A `sink` phase for a
 //! parse that emits ten million triples would take twenty million clock reads,
-//! and on the counting sinks used by `check`/`count` a clock read costs more
-//! than the work it is measuring, so the profile would report a phase
-//! breakdown of its own overhead.
+//! and on the counting sinks used by `check`/`count` a clock read costs *more
+//! than the work it is measuring*: measured on an M-series host, a bracketed
+//! `DiscardSink` call costs 20.3 ns of which ~19 ns is the clock pair. A
+//! fully-bracketed profile of that sink reports, almost entirely, itself.
 //!
-//! So: **count on every call, take clocks only at statement boundaries.**
-//! Counters are integer increments with no clock at all. Timing runs on one
-//! statement in [`SAMPLE_STRIDE`], where the decorator does bracket each
-//! forwarded call, and the measured cost is scaled by the call ratio to
-//! estimate the whole run. The estimate is marked as an estimate everywhere it
-//! surfaces, and [`clock_pair_cost`] lets a caller price its own instrument and
-//! disclose the overhead rather than assert it is negligible.
+//! So: **count on every call, take clocks on a sample of statements.**
+//! Counters are integer increments with no clock at all. On a sampled
+//! statement the decorator brackets each forwarded call, and the measured cost
+//! is scaled by the call ratio.
+//!
+//! That estimator has three failure modes, and all three are handled here
+//! rather than left for a reader to discover:
+//!
+//! 1. **The clock is inside the sample.** Scaling raw sampled time multiplies
+//!    the clock artifact along with the work. [`SinkTiming`] subtracts
+//!    `sampled_calls × clock_pair_cost` *before* scaling, and publishes the
+//!    extrapolated artifact ([`SinkTiming::artifact`]) so a consumer can see
+//!    how much of the run the instrument could account for.
+//! 2. **Small differences are unresolvable.** Below
+//!    [`FLOOR_MULTIPLE`]× the artifact, a scaled estimate is indistinguishable
+//!    from calibration error. [`SinkTiming::body`] is `None` there —
+//!    "below the measurement floor", not a number.
+//! 3. **Periodic corpora alias against a fixed stride.** A corpus whose
+//!    statement shapes repeat with period P, sampled every 127 statements,
+//!    shows the sampler only the residues of P that 127 reaches; when 127
+//!    divides P that is a single shape forever, and the estimate is wrong by
+//!    whatever ratio that shape differs from the mean. Measured with the
+//!    review probe: 425× over-reported when the expensive shape is the one
+//!    sampled. Fixed by *jittering* the gap — see [`SAMPLE_STRIDE`].
+//!
+//! [`finish`](GraphSink::finish) is timed exactly and kept out of the scaled
+//! body entirely ([`SinkTiming::finish`]): it runs once, and scaling a
+//! writer's one-time flush by the sample ratio turned 50 ms into 6.4 s.
 
 use crate::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::time::{Duration, Instant};
@@ -246,9 +268,16 @@ pub struct SinkCounts {
     pub list_items: u64,
     /// `emit_reified_triple` calls (RDF 1.2 reifiers).
     pub reified: u64,
-    /// Statements that ended successfully.
+    /// *Grammar* statements that ended successfully — Turtle's
+    /// `statement ::= directive | triples '.'`, so a `@prefix` line counts as
+    /// one and a `s p o1, o2 ; q o3 .` line also counts as one while emitting
+    /// three triples.
+    ///
+    /// Deliberately not the same quantity as [`Self::triples`], and never
+    /// labelled just "statements" at a user boundary: the two differ by both
+    /// directives and predicate-object lists.
     pub statements: u64,
-    /// Statements rolled back by `abort_statement`.
+    /// Grammar statements rolled back by `abort_statement`.
     pub aborted_statements: u64,
     /// `term_iri` calls. Producers cache IRI ids, so this counts *mints*, not
     /// occurrences.
@@ -265,7 +294,9 @@ pub struct SinkCounts {
 }
 
 impl SinkCounts {
-    /// Total RDF statements emitted: triples, quads, list items, reifiers.
+    /// Total RDF triples emitted, counting quads, list items and reifiers —
+    /// everything that becomes an edge in the graph. This is the number a user
+    /// means by "how big is this file", and the one `fluree rdf count` prints.
     pub fn emitted(&self) -> u64 {
         self.triples + self.quads + self.list_items + self.reified
     }
@@ -276,7 +307,7 @@ impl SinkCounts {
     }
 
     /// Total forwarded calls — the denominator for the sink-time estimate.
-    fn calls(&self) -> u64 {
+    pub fn calls(&self) -> u64 {
         self.emitted()
             + self.terms()
             + self.statements
@@ -286,13 +317,129 @@ impl SinkCounts {
     }
 }
 
-/// Time one statement in this many, when sampling sink dispatch.
+/// Mean number of statements between sampled ones.
 ///
-/// Prime on purpose. A document is often structurally periodic — N triples per
-/// subject, repeated — and a power-of-two stride can land on the same position
-/// within every period and sample one shape of statement forever. A prime
-/// stride walks the period instead.
+/// The gap is *jittered*, not fixed: after each sampled statement the next one
+/// is drawn uniformly from `1..2×SAMPLE_STRIDE`, so the mean gap is this value
+/// and no gap is predictable from the last.
+///
+/// A fixed stride cannot survive a periodic corpus. Sampling every `k`
+/// statements of a corpus whose shapes repeat with period `P` reaches only
+/// `P / gcd(k, P)` of the `P` shapes; a prime `k` makes that all of them
+/// *unless `k` divides `P`*, and then it is exactly one shape, forever. The
+/// review probe built that corpus — one fat statement per 127 — and measured a
+/// 425× over-report when the fat shape was the sampled one and a complete miss
+/// when it was not. Choosing the offset per corpus would only move which
+/// corpora are wrong.
+///
+/// Jitter removes the failure mode rather than relocating it: an
+/// aperiodic sampler has no residue class to be confined to, for any `P`. The
+/// draw is seeded from the corpus (see [`corpus_seed`]), so a given input
+/// still samples the same statements on every run and baselines stay
+/// reproducible.
+///
+/// What remains is ordinary sampling error, which shrinks as `1/√n` in the
+/// number of sampled statements and is bounded from below by
+/// [`SinkTiming::floor`].
 pub const SAMPLE_STRIDE: u64 = 127;
+
+/// How many times the instrument artifact an estimate must exceed before it is
+/// reported as a number rather than as "below the measurement floor".
+///
+/// Three is the review's bound. Below it, a scaled estimate is within the
+/// error of the calibration that was subtracted from it, and reporting it
+/// would be reporting the instrument.
+pub const FLOOR_MULTIPLE: u32 = 3;
+
+/// Derive a deterministic sampling seed from a corpus.
+///
+/// FNV-1a over the head of the document plus its length: cheap enough to run
+/// unconditionally (no relation to the optional `--no-hash` fingerprint, which
+/// is a SHA-256 over the whole input), and stable, so re-running a profile on
+/// the same corpus samples the same statements and produces a comparable
+/// number.
+pub fn corpus_seed(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x1000_0000_01b3;
+    // A 4 KiB head is plenty to separate corpora, and bounds the cost on a
+    // multi-gigabyte input.
+    let head = &bytes[..bytes.len().min(4096)];
+    let mut hash = FNV_OFFSET;
+    for byte in head {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    for byte in (bytes.len() as u64).to_le_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// What a [`TimingSink`] can honestly say about the sink it wrapped.
+///
+/// Deliberately not a single `Duration`. The per-event body is an estimate
+/// that may not be resolvable at all; `finish` is exact; and the artifact and
+/// floor are what let a consumer judge the first two rather than trust them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SinkTiming {
+    /// Estimated time inside the sink's per-event methods, with the clock
+    /// artifact removed before scaling.
+    ///
+    /// `None` when the estimate does not clear [`FLOOR_MULTIPLE`]× [`Self::floor`]
+    /// — the sink is cheap enough that this instrument cannot separate its cost
+    /// from its own. Callers must render that as "below the measurement floor",
+    /// never as zero: the cost is unresolved, not absent.
+    pub body: Option<Duration>,
+    /// Time inside [`GraphSink::finish`], measured exactly.
+    ///
+    /// Kept out of [`Self::body`] because it runs once: folding it into the
+    /// sampled body would scale a writer's one-time flush by the sample ratio.
+    /// Zero when the measurement is within a clock pair of nothing — a sink
+    /// whose `finish` just returns `Ok(())` has no flush cost to report.
+    pub finish: Duration,
+    /// Clock cost embedded in an estimate scaled to the full call count:
+    /// `calls × clock_pair_cost`. The resolution limit of the instrument.
+    pub artifact: Duration,
+    /// Total forwarded calls.
+    pub calls: u64,
+    /// Calls that were actually timed.
+    pub sampled_calls: u64,
+    /// Statements that were sampled.
+    pub sampled_statements: u64,
+    /// `Instant::now()` calls the decorator made.
+    pub clock_reads: u64,
+    /// Measured cost of one clock pair on this host.
+    pub clock_pair: Duration,
+}
+
+impl SinkTiming {
+    /// The smallest body estimate that would be reported rather than
+    /// suppressed.
+    pub fn floor(&self) -> Duration {
+        self.artifact
+    }
+
+    /// Whether the per-event cost could not be resolved.
+    pub fn below_floor(&self) -> bool {
+        self.body.is_none()
+    }
+
+    /// What to attribute to the sink phase: the resolvable body plus the exact
+    /// finish. Zero when neither resolved — pair with [`Self::below_floor`] so
+    /// "unresolved" is never rendered as "free".
+    pub fn reportable(&self) -> Duration {
+        self.body.unwrap_or(Duration::ZERO) + self.finish
+    }
+
+    /// Share of forwarded calls that were timed.
+    pub fn sampled_pct(&self) -> f64 {
+        if self.calls == 0 {
+            return 0.0;
+        }
+        (self.sampled_calls as f64 / self.calls as f64) * 100.0
+    }
+}
 
 /// Wraps any [`GraphSink`] to count its events and estimate its dispatch cost.
 ///
@@ -303,26 +450,70 @@ pub const SAMPLE_STRIDE: u64 = 127;
 pub struct TimingSink<S> {
     inner: S,
     counts: SinkCounts,
-    /// Measured dispatch time over sampled statements only.
+    /// Measured dispatch time over sampled statements only, `finish` excluded.
     sampled_time: Duration,
-    /// Calls made during sampled statements — the numerator's denominator.
+    /// Calls made during sampled statements — the estimate's denominator.
     sampled_calls: u64,
+    /// Statements sampled, for the sampling-error picture.
+    sampled_statements: u64,
     /// Whether the statement in flight is being timed.
     sampling: bool,
+    /// Statement index at which to start sampling again.
+    next_sample_at: u64,
+    /// xorshift64 state, seeded from the corpus.
+    rng: u64,
+    /// `finish()` cost, measured exactly and never scaled.
+    finish_time: Duration,
+    /// Cost of one clock pair on this host, measured once at construction so
+    /// the correction and the disclosure use the same number.
+    clock_pair: Duration,
     clock_reads: u64,
+    /// Which statements were sampled. Test-only: the sampler's distribution is
+    /// the property under test and there is no way to observe it from outside.
+    #[cfg(test)]
+    sampled_statement_indices: Vec<u64>,
 }
 
 impl<S: GraphSink> TimingSink<S> {
-    /// Wrap `inner`.
+    /// Wrap `inner`, sampling from a fixed seed.
+    ///
+    /// Prefer [`TimingSink::with_corpus`] where the input is known: a
+    /// corpus-derived seed keeps a given input sampling the same statements
+    /// across runs, which is what makes two profiles of it comparable.
     pub fn new(inner: S) -> Self {
-        Self {
+        Self::with_seed(inner, 0x9e37_79b9_7f4a_7c15)
+    }
+
+    /// Wrap `inner`, seeding the sampler from the corpus about to be parsed.
+    pub fn with_corpus(inner: S, corpus: &[u8]) -> Self {
+        Self::with_seed(inner, corpus_seed(corpus))
+    }
+
+    /// Wrap `inner` with an explicit sampling seed.
+    pub fn with_seed(inner: S, seed: u64) -> Self {
+        // xorshift64 is dead at zero.
+        let mut sink = Self {
             inner,
             counts: SinkCounts::default(),
             sampled_time: Duration::ZERO,
             sampled_calls: 0,
-            sampling: true, // the first statement is always sampled
+            sampled_statements: 0,
+            sampling: false,
+            next_sample_at: 0,
+            rng: if seed == 0 {
+                0xdead_beef_cafe_f00d
+            } else {
+                seed
+            },
+            finish_time: Duration::ZERO,
+            clock_pair: clock_pair_cost(),
             clock_reads: 0,
-        }
+            #[cfg(test)]
+            sampled_statement_indices: Vec::new(),
+        };
+        sink.next_sample_at = sink.draw_gap();
+        sink.sampling = sink.next_sample_at == 0;
+        sink
     }
 
     /// Events counted so far. Exact.
@@ -330,33 +521,85 @@ impl<S: GraphSink> TimingSink<S> {
         self.counts
     }
 
-    /// Estimated total time spent inside the wrapped sink.
+    /// What can honestly be said about the wrapped sink's cost.
     ///
-    /// Sampled dispatch time scaled by the ratio of all forwarded calls to
-    /// sampled ones. Zero when nothing was sampled. This is an estimate and
-    /// callers must present it as one.
-    pub fn estimated_sink_time(&self) -> Duration {
-        if self.sampled_calls == 0 {
-            return Duration::ZERO;
+    /// The correction, in order: subtract the clock pair the decorator itself
+    /// added to each *sampled* call, scale what is left by the call ratio, and
+    /// refuse to report the result at all unless it clears
+    /// [`FLOOR_MULTIPLE`]× the artifact that scaling would have carried.
+    pub fn sink_timing(&self) -> SinkTiming {
+        let calls = self.counts.calls();
+        let clock_ns = self.clock_pair.as_nanos();
+        let artifact_ns = clock_ns.saturating_mul(u128::from(calls));
+
+        let body = self.estimate_body_ns(calls, clock_ns).and_then(|ns| {
+            let floor = artifact_ns.saturating_mul(u128::from(FLOOR_MULTIPLE));
+            (ns >= floor).then(|| duration_from_nanos_u128(ns))
+        });
+
+        // The same rule, applied to the one exact measurement. `finish` is a
+        // single bracketed call, so its floor is a single clock pair rather
+        // than a scaled one: a sink whose `finish` is `Ok(())` measures tens
+        // of nanoseconds, and reporting that as a flush cost would put the
+        // clock back in the report through the one door left open.
+        let finish_floor = clock_ns.saturating_mul(u128::from(FLOOR_MULTIPLE));
+        let finish = if self.finish_time.as_nanos() >= finish_floor {
+            self.finish_time
+        } else {
+            Duration::ZERO
+        };
+
+        SinkTiming {
+            body,
+            finish,
+            artifact: duration_from_nanos_u128(artifact_ns),
+            calls,
+            sampled_calls: self.sampled_calls,
+            sampled_statements: self.sampled_statements,
+            clock_reads: self.clock_reads,
+            clock_pair: self.clock_pair,
         }
-        let scale = self.counts.calls() as f64 / self.sampled_calls as f64;
-        Duration::from_nanos((self.sampled_time.as_nanos() as f64 * scale) as u64)
     }
 
-    /// Fraction of forwarded calls that were actually timed, in percent.
-    /// A run whose sample is tiny should say so next to the estimate.
-    pub fn sampled_pct(&self) -> f64 {
-        let calls = self.counts.calls();
-        if calls == 0 {
-            return 0.0;
+    /// Sampled time net of the decorator's own clock cost, scaled to the full
+    /// call count. `None` when nothing was sampled.
+    fn estimate_body_ns(&self, calls: u64, clock_ns: u128) -> Option<u128> {
+        if self.sampled_calls == 0 {
+            return None;
         }
-        (self.sampled_calls as f64 / calls as f64) * 100.0
+        // Every sampled call paid for one clock pair that the sink did not.
+        // Subtracting before scaling is the whole correction: scaling first
+        // multiplies the artifact by the same ratio as the work.
+        let sampled_artifact = clock_ns.saturating_mul(u128::from(self.sampled_calls));
+        let net = self
+            .sampled_time
+            .as_nanos()
+            .saturating_sub(sampled_artifact);
+        Some(net.saturating_mul(u128::from(calls)) / u128::from(self.sampled_calls))
     }
 
     /// Clock reads this decorator made — the other half of the overhead
     /// disclosure, alongside [`PhaseTimings::clock_reads`].
     pub fn clock_reads(&self) -> u64 {
         self.clock_reads
+    }
+
+    /// Draw the next jittered gap: uniform over `0..2×SAMPLE_STRIDE - 1`, so
+    /// the mean gap between sampled statements is [`SAMPLE_STRIDE`].
+    fn draw_gap(&mut self) -> u64 {
+        self.next_u64() % (2 * SAMPLE_STRIDE - 1)
+    }
+
+    /// xorshift64. Not cryptographic and does not need to be — it needs to be
+    /// cheap enough to run at every statement boundary and to have no period
+    /// a corpus could share.
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
     }
 
     /// Unwrap, returning the sink that was being measured.
@@ -390,7 +633,18 @@ impl<S: GraphSink> TimingSink<S> {
     /// statement boundary.
     fn roll_sample(&mut self) {
         let seen = self.counts.statements + self.counts.aborted_statements;
-        self.sampling = seen.is_multiple_of(SAMPLE_STRIDE);
+        if self.sampling {
+            self.sampled_statements += 1;
+            // `seen` already counts the statement that just ended.
+            #[cfg(test)]
+            self.sampled_statement_indices.push(seen - 1);
+        }
+        if seen >= self.next_sample_at {
+            self.sampling = true;
+            self.next_sample_at = seen + 1 + self.draw_gap();
+        } else {
+            self.sampling = false;
+        }
     }
 }
 
@@ -484,12 +738,13 @@ impl<S: GraphSink> GraphSink for TimingSink<S> {
     }
 
     fn finish(&mut self) -> SinkResult {
-        // Always timed: `finish` runs once and is where a writing sink flushes,
-        // which is exactly the cost worth knowing.
+        // Always timed, and into its OWN accumulator. `finish` runs once — it
+        // is where a writing sink flushes — so it belongs in no sample: a
+        // 50 ms flush routed through the sampled body came back out the other
+        // side of the call-ratio scaling as 6.4 seconds.
         let start = Instant::now();
         let out = self.inner.finish();
-        self.sampled_time += start.elapsed();
-        self.sampled_calls += 1;
+        self.finish_time += start.elapsed();
         self.clock_reads += 2;
         out
     }
@@ -515,6 +770,14 @@ pub fn clock_pair_cost() -> Duration {
         std::hint::black_box(t.elapsed());
     }
     start.elapsed() / ROUNDS
+}
+
+/// `Duration` from a `u128` nanosecond count, saturating rather than wrapping.
+///
+/// Every quantity here is derived by multiplying a measured time by a call
+/// count, so the arithmetic is done in `u128` and only narrowed at the edge.
+fn duration_from_nanos_u128(ns: u128) -> Duration {
+    Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -615,6 +878,151 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Estimator fixtures.
+    //
+    // The three sinks below are the review probe's, reduced to what a unit
+    // test needs: the cheap sink the estimator got wrong, a sink with real
+    // measurable work, and the periodic corpus that defeats a fixed stride.
+    // Original probe: scratchpad/sink_bias_probe.rs from the `fluree rdf`
+    // adversarial review.
+    // ------------------------------------------------------------------
+
+    /// The CLI's `DiscardSink`: accepts everything, keeps nothing. Costs less
+    /// per call than the clock used to measure it.
+    #[derive(Default)]
+    struct DiscardSink {
+        next: u32,
+    }
+
+    impl DiscardSink {
+        fn mint(&mut self) -> TermId {
+            self.next = self.next.wrapping_add(1);
+            TermId::new(self.next)
+        }
+    }
+
+    impl GraphSink for DiscardSink {
+        fn on_base(&mut self, _: &str) {}
+        fn on_prefix(&mut self, _: &str, _: &str) {}
+        fn term_iri(&mut self, _: &str) -> TermId {
+            self.mint()
+        }
+        fn term_blank(&mut self, _: Option<&str>) -> TermId {
+            self.mint()
+        }
+        fn term_literal(&mut self, _: &str, _: Datatype, _: Option<&str>) -> TermId {
+            self.mint()
+        }
+        fn term_literal_value(&mut self, _: LiteralValue, _: Datatype) -> TermId {
+            self.mint()
+        }
+        fn emit_triple(&mut self, _: TermId, _: TermId, _: TermId) -> SinkResult {
+            Ok(())
+        }
+    }
+
+    /// Burns a fixed, real amount of CPU per emitted triple — the sink the
+    /// estimator is supposed to be able to measure.
+    struct SpinSink {
+        per_call: Duration,
+        inner: DiscardSink,
+    }
+
+    impl SpinSink {
+        fn new(per_call: Duration) -> Self {
+            Self {
+                per_call,
+                inner: DiscardSink::default(),
+            }
+        }
+    }
+
+    /// Busy-wait. A `sleep` this short is dominated by scheduler granularity;
+    /// spinning actually costs the CPU time the test is asserting about.
+    fn spin_for(d: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < d {
+            std::hint::spin_loop();
+        }
+    }
+
+    impl GraphSink for SpinSink {
+        fn on_base(&mut self, _: &str) {}
+        fn on_prefix(&mut self, _: &str, _: &str) {}
+        fn term_iri(&mut self, i: &str) -> TermId {
+            self.inner.term_iri(i)
+        }
+        fn term_blank(&mut self, l: Option<&str>) -> TermId {
+            self.inner.term_blank(l)
+        }
+        fn term_literal(&mut self, v: &str, d: Datatype, l: Option<&str>) -> TermId {
+            self.inner.term_literal(v, d, l)
+        }
+        fn term_literal_value(&mut self, v: LiteralValue, d: Datatype) -> TermId {
+            self.inner.term_literal_value(v, d)
+        }
+        fn emit_triple(&mut self, _: TermId, _: TermId, _: TermId) -> SinkResult {
+            spin_for(self.per_call);
+            Ok(())
+        }
+    }
+
+    /// Expensive on exactly one statement residue mod [`SAMPLE_STRIDE`] — the
+    /// shape a fixed stride either locks onto or never sees.
+    struct PeriodicSink {
+        hot_residue: u64,
+        statement: u64,
+        inner: DiscardSink,
+    }
+
+    impl PeriodicSink {
+        fn new(hot_residue: u64) -> Self {
+            Self {
+                hot_residue,
+                statement: 0,
+                inner: DiscardSink::default(),
+            }
+        }
+    }
+
+    impl GraphSink for PeriodicSink {
+        fn on_base(&mut self, _: &str) {}
+        fn on_prefix(&mut self, _: &str, _: &str) {}
+        fn term_iri(&mut self, i: &str) -> TermId {
+            self.inner.term_iri(i)
+        }
+        fn term_blank(&mut self, l: Option<&str>) -> TermId {
+            self.inner.term_blank(l)
+        }
+        fn term_literal(&mut self, v: &str, d: Datatype, l: Option<&str>) -> TermId {
+            self.inner.term_literal(v, d, l)
+        }
+        fn term_literal_value(&mut self, v: LiteralValue, d: Datatype) -> TermId {
+            self.inner.term_literal_value(v, d)
+        }
+        fn emit_triple(&mut self, _: TermId, _: TermId, _: TermId) -> SinkResult {
+            if self.statement % SAMPLE_STRIDE == self.hot_residue {
+                spin_for(Duration::from_micros(5));
+            }
+            Ok(())
+        }
+        fn end_statement(&mut self) {
+            self.statement += 1;
+        }
+    }
+
+    /// One triple per statement, against any sink.
+    fn drive_discard<S: GraphSink>(sink: &mut TimingSink<S>, statements: u64) {
+        let s = sink.term_iri("http://example.org/s");
+        let p = sink.term_iri("http://example.org/p");
+        for _ in 0..statements {
+            let o = sink.term_literal("v", Datatype::xsd_string(), None);
+            sink.emit_triple(s, p, o).unwrap();
+            sink.end_statement();
+        }
+    }
+
     #[test]
     fn counts_every_event_class_exactly() {
         let mut sink = TimingSink::new(GraphCollectorSink::new());
@@ -680,28 +1088,206 @@ mod tests {
              per-call timing wearing a hat",
             sink.clock_reads()
         );
+        let sampled_pct = sink.sink_timing().sampled_pct();
+        assert!(sampled_pct < 5.0, "sampled {sampled_pct}% of calls");
+    }
+
+    #[test]
+    fn a_cheap_sink_is_reported_as_below_the_floor_not_as_a_number() {
+        // THE bug this estimator shipped with. A `DiscardSink` costs less per
+        // call than the clock pair used to measure it — the review probe put
+        // the bracketed call at 20.3 ns against a ~19 ns clock — so a raw
+        // scaled estimate was ~98% instrument. It must decline to answer.
+        let mut sink = TimingSink::new(DiscardSink::default());
+        drive_discard(&mut sink, 20_000);
+        let t = sink.sink_timing();
+
         assert!(
-            sink.sampled_pct() < 5.0,
-            "sampled {}% of calls",
-            sink.sampled_pct()
+            t.below_floor(),
+            "a sink cheaper than the clock reported {:?}, floor {:?}",
+            t.body,
+            t.floor()
+        );
+        assert_eq!(t.reportable(), Duration::ZERO);
+        assert!(t.artifact > Duration::ZERO);
+        assert!(t.calls > 60_000);
+    }
+
+    #[test]
+    fn a_sink_far_above_the_floor_is_reported_as_a_number() {
+        // The estimator has to still work when there is something to measure.
+        // 40 µs per statement over 2_000 statements is ~80 ms of real work,
+        // orders above any clock artifact.
+        let mut sink = TimingSink::new(SpinSink::new(Duration::from_micros(40)));
+        drive_discard(&mut sink, 2_000);
+        let t = sink.sink_timing();
+
+        let body = t.body.expect("real work must clear the floor");
+        assert!(body > t.floor(), "{body:?} vs floor {:?}", t.floor());
+        // Within 3× of the truth is all a 1-in-127 sample promises.
+        let truth = Duration::from_micros(40) * 2_000;
+        let ratio = body.as_secs_f64() / truth.as_secs_f64();
+        assert!(
+            (0.33..3.0).contains(&ratio),
+            "estimate {body:?} vs truth {truth:?} (ratio {ratio:.2})"
         );
     }
 
     #[test]
-    fn the_first_statement_is_always_sampled_so_short_runs_still_report() {
-        // A three-statement document is shorter than the stride; without the
-        // always-sample-the-first rule its sink estimate would be a flat zero.
-        let mut sink = TimingSink::new(GraphCollectorSink::new());
-        drive(&mut sink, 3);
-        assert!(sink.clock_reads() > 0);
-        assert!(sink.sampled_pct() > 0.0);
+    fn the_clock_artifact_is_subtracted_before_scaling_not_after() {
+        // Order matters: scaling first multiplies the artifact by the same
+        // ~127× the work gets, which is how 0.6 ms of clock reads became a
+        // 76 ms "sink phase".
+        let mut sink = TimingSink::new(DiscardSink::default());
+        drive_discard(&mut sink, 20_000);
+        let t = sink.sink_timing();
+
+        // What the uncorrected estimator would have said.
+        let uncorrected = duration_from_nanos_u128(
+            sink.sampled_time
+                .as_nanos()
+                .saturating_mul(u128::from(t.calls))
+                / u128::from(t.sampled_calls),
+        );
+        assert!(
+            uncorrected > t.artifact / 2,
+            "the probe's premise: uncorrected {uncorrected:?} is artifact-scale \
+             ({:?})",
+            t.artifact
+        );
+        assert!(t.below_floor(), "and the corrected estimator declines it");
     }
 
     #[test]
-    fn estimated_sink_time_is_zero_when_nothing_was_forwarded() {
+    fn a_costly_finish_is_measured_exactly_and_never_scaled() {
+        // A writer's flush runs once. Routed through the sampled body it came
+        // back out multiplied by the call ratio: 50 ms → 6.4 s.
+        struct SlowFinish(DiscardSink);
+        impl GraphSink for SlowFinish {
+            fn on_base(&mut self, _: &str) {}
+            fn on_prefix(&mut self, _: &str, _: &str) {}
+            fn term_iri(&mut self, i: &str) -> TermId {
+                self.0.term_iri(i)
+            }
+            fn term_blank(&mut self, l: Option<&str>) -> TermId {
+                self.0.term_blank(l)
+            }
+            fn term_literal(&mut self, v: &str, d: Datatype, l: Option<&str>) -> TermId {
+                self.0.term_literal(v, d, l)
+            }
+            fn term_literal_value(&mut self, v: LiteralValue, d: Datatype) -> TermId {
+                self.0.term_literal_value(v, d)
+            }
+            fn emit_triple(&mut self, a: TermId, b: TermId, c: TermId) -> SinkResult {
+                self.0.emit_triple(a, b, c)
+            }
+            fn finish(&mut self) -> SinkResult {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            }
+        }
+
+        let mut sink = TimingSink::new(SlowFinish(DiscardSink::default()));
+        drive_discard(&mut sink, 5_000);
+        sink.finish().unwrap();
+        let t = sink.sink_timing();
+
+        assert!(
+            t.finish >= Duration::from_millis(20) && t.finish < Duration::from_millis(200),
+            "finish must be the measured 20ms, not a scaled multiple: {:?}",
+            t.finish
+        );
+        // And it is not hiding inside the body estimate.
+        assert!(
+            t.body.is_none_or(|b| b < Duration::from_millis(20)),
+            "finish leaked into the scaled body: {:?}",
+            t.body
+        );
+    }
+
+    #[test]
+    fn a_no_op_finish_reports_no_flush_cost() {
+        // `DiscardSink::finish` is the default `Ok(())`. Timing it yields tens
+        // of nanoseconds of clock, and reporting that as a flush would put the
+        // instrument back into the report through the one exactly-measured
+        // door.
+        let mut sink = TimingSink::new(DiscardSink::default());
+        drive_discard(&mut sink, 500);
+        sink.finish().unwrap();
+        assert_eq!(sink.sink_timing().finish, Duration::ZERO);
+    }
+
+    #[test]
+    fn sampling_survives_a_corpus_periodic_at_the_stride() {
+        // The probe's adversarial shape: expensive work on exactly one residue
+        // mod 127. A fixed 127-stride either locks onto that residue (425×
+        // over-report) or never sees it. Jitter means the sampled set is not a
+        // residue class at all, so neither happens.
+        let expensive_residue = 0u64;
+        let mut sink = TimingSink::new(PeriodicSink::new(expensive_residue));
+        drive_discard(&mut sink, 127 * 60);
+
+        let sampled = sink.sampled_statement_indices.clone();
+        assert!(sampled.len() > 20, "sanity: {} samples", sampled.len());
+
+        let residues: std::collections::HashSet<u64> =
+            sampled.iter().map(|i| i % SAMPLE_STRIDE).collect();
+        assert!(
+            residues.len() > 10,
+            "the sample collapsed onto {} residue class(es) — a fixed stride in \
+             disguise: {residues:?}",
+            residues.len()
+        );
+    }
+
+    #[test]
+    fn the_same_corpus_samples_the_same_statements_every_run() {
+        // Reproducibility is what makes two profiles of one corpus comparable.
+        let indices = |seed: u64| {
+            let mut sink = TimingSink::with_seed(DiscardSink::default(), seed);
+            drive_discard(&mut sink, 2_000);
+            sink.sampled_statement_indices.clone()
+        };
+        let seed = corpus_seed(b"@prefix ex: <http://e/> .\nex:a ex:b \"c\" .\n");
+        assert_eq!(indices(seed), indices(seed));
+        // …and a different corpus samples differently, which is the point.
+        let other = corpus_seed(b"<http://e/s> <http://e/p> <http://e/o> .\n");
+        assert_ne!(seed, other);
+        assert_ne!(indices(seed), indices(other));
+    }
+
+    #[test]
+    fn the_mean_sampling_gap_is_the_stride() {
+        let mut sink = TimingSink::new(DiscardSink::default());
+        let statements = 127 * 200;
+        drive_discard(&mut sink, statements);
+        let n = sink.sink_timing().sampled_statements;
+        let mean_gap = statements as f64 / n as f64;
+        assert!(
+            (mean_gap - SAMPLE_STRIDE as f64).abs() < 25.0,
+            "mean gap {mean_gap:.1} is not ~{SAMPLE_STRIDE}"
+        );
+    }
+
+    #[test]
+    fn nothing_forwarded_means_no_estimate_rather_than_a_zero() {
         let sink: TimingSink<GraphCollectorSink> = TimingSink::new(GraphCollectorSink::new());
-        assert_eq!(sink.estimated_sink_time(), Duration::ZERO);
-        assert_eq!(sink.sampled_pct(), 0.0);
+        let t = sink.sink_timing();
+        assert!(t.below_floor());
+        assert_eq!(t.body, None);
+        assert_eq!(t.finish, Duration::ZERO);
+        assert_eq!(t.sampled_pct(), 0.0);
+        assert_eq!(t.calls, 0);
+    }
+
+    #[test]
+    fn corpus_seed_is_stable_and_separates_inputs() {
+        assert_eq!(corpus_seed(b"abc"), corpus_seed(b"abc"));
+        assert_ne!(corpus_seed(b"abc"), corpus_seed(b"abd"));
+        // Length participates, so a prefix is not its own seed.
+        assert_ne!(corpus_seed(b"abc"), corpus_seed(b"abcabc"));
+        // An empty corpus still produces a usable (non-panicking) seed.
+        let _ = corpus_seed(b"");
     }
 
     #[test]

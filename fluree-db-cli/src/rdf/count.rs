@@ -20,7 +20,6 @@
 use crate::cli::RdfCommonArgs;
 use crate::error::CliResult;
 use crate::rdf::diagnostic;
-use crate::rdf::profile::{ProfileReport, RunContext};
 use crate::rdf::{self, exit_document_invalid};
 use colored::Colorize;
 use fluree_graph_ir::PhaseTimings;
@@ -44,9 +43,12 @@ pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
         };
         eprintln!("{} {where_}: {}", "error:".red().bold(), d.message);
         eprintln!(
-            "  counted {} statement(s) before the document stopped parsing",
+            "  counted {} triple(s) before the document stopped parsing",
             counts.emitted()
         );
+        // Profile the failed run too — the reason a broken corpus was slow is
+        // as worth having as the reason a good one was.
+        rdf::report_run(common, "count", &loaded, &outcome, &timings, wall)?;
         return Err(exit_document_invalid());
     }
 
@@ -71,54 +73,30 @@ pub fn run(common: &RdfCommonArgs, quiet: bool) -> CliResult<()> {
             counts.terms_blank,
             counts.terms_literal
         );
+        println!("grammar statements: {}", counts.statements);
         println!("prefixes: {}", counts.prefixes);
     }
 
-    if let Some(format) = common.profile {
-        let ctx = RunContext {
-            verb: "count",
-            input: loaded.input.display(),
-            syntax: loaded.resolved.syntax,
-            syntax_source: loaded.resolved.source,
-            compression: loaded.resolved.compression,
-            bytes_on_wire: loaded.bytes_on_wire,
-            bytes_decoded: loaded.text.len() as u64,
-            sha256: (!common.no_hash).then(|| rdf::profile::sha256_hex(&loaded.text)),
-        };
-        ProfileReport::build(
-            &ctx,
-            &timings,
-            wall,
-            counts,
-            outcome.sink_estimate,
-            outcome.sink_clock_reads,
-            outcome.sink_sampled_pct,
-        )
-        .emit(format)?;
-    } else if common.time {
-        print_timing(wall, counts.emitted(), loaded.text.len() as u64);
-    }
-
-    Ok(())
+    rdf::report_run(common, "count", &loaded, &outcome, &timings, wall)
 }
 
-/// The one-line `--time` footer: elapsed, statement rate, byte rate.
+/// The one-line `--time` footer: elapsed, triple rate, byte rate.
 ///
 /// Shared with `check`, and on stderr for the same reason the profile is —
 /// `fluree rdf count f.ttl --time | …` must keep piping the count.
-pub fn print_timing(wall: Duration, statements: u64, bytes: u64) {
+pub fn print_timing(wall: Duration, triples: u64, bytes: u64) {
     let secs = wall.as_secs_f64();
     let (rate, mib) = if secs > 0.0 {
         (
-            statements as f64 / secs,
+            triples as f64 / secs,
             bytes as f64 / (1024.0 * 1024.0) / secs,
         )
     } else {
         (0.0, 0.0)
     };
     eprintln!(
-        "  {} in {} ({} statements/s, {mib:.1} MiB/s)",
-        format_count(statements),
+        "  {} triples in {} ({} triples/s, {mib:.1} MiB/s)",
+        format_count(triples),
         format_duration(wall),
         format_count(rate as u64),
     );
