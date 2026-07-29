@@ -760,8 +760,19 @@ fn advance_state(
 struct PrefixCheck {
     /// Whether any non-whitespace data byte has been seen.
     data_started: bool,
-    /// Whether we're at the start of a line (or only whitespace so far on this line).
-    at_line_start: bool,
+    /// Whether the next byte could begin a token — true at the start of
+    /// input and after any whitespace.
+    ///
+    /// Turtle has no line structure, so this is deliberately NOT "at the start
+    /// of a line". A directive written mid-line —
+    /// `ex:a ex:p "1" . @prefix ex: <...> .` — is an ordinary document and
+    /// just as corrupting to chunk, because only the first chunk carries the
+    /// redefinition. Anchoring to column 0 let exactly that through.
+    ///
+    /// Being in `ScanState::Normal` is what keeps a keyword inside a literal
+    /// or a comment from matching; this flag only decides *where in the token
+    /// stream* a match may begin.
+    at_token_start: bool,
     /// Current match position into one of the keywords.
     match_pos: usize,
     /// Which keyword we're trying to match (index into KEYWORDS).
@@ -777,7 +788,7 @@ impl PrefixCheck {
     fn new() -> Self {
         Self {
             data_started: false,
-            at_line_start: true,
+            at_token_start: true,
             match_pos: 0,
             match_keyword: usize::MAX,
             awaiting_delimiter: false,
@@ -802,22 +813,21 @@ impl PrefixCheck {
             // Not a delimiter — false alarm (e.g. "BASELINE"), reset.
             self.match_keyword = usize::MAX;
             self.match_pos = 0;
-            self.at_line_start = false;
+            self.at_token_start = false;
             self.data_started = true;
             return Ok(());
         }
 
         match b {
-            b'\n' | b'\r' => {
-                self.at_line_start = true;
+            // Any whitespace ends a token and opens the next. A keyword has
+            // none internally, so an in-flight match is abandoned here.
+            b'\n' | b'\r' | b' ' | b'\t' => {
+                self.at_token_start = true;
                 self.match_pos = 0;
                 self.match_keyword = usize::MAX;
             }
-            b' ' | b'\t' if self.at_line_start => {
-                // Still at line start, leading whitespace.
-            }
             _ => {
-                if self.at_line_start && self.match_pos == 0 {
+                if self.at_token_start && self.match_pos == 0 {
                     // Try to start matching a keyword.
                     for (i, kw) in KEYWORDS.iter().enumerate() {
                         if b == kw[0] {
@@ -828,13 +838,13 @@ impl PrefixCheck {
                                 // but handle for correctness).
                                 self.awaiting_delimiter = true;
                             }
-                            self.at_line_start = false;
+                            self.at_token_start = false;
                             self.data_started = true;
                             return Ok(());
                         }
                     }
                     // No keyword match — just data.
-                    self.at_line_start = false;
+                    self.at_token_start = false;
                     self.data_started = true;
                 } else if self.match_keyword < KEYWORDS.len() {
                     let kw = KEYWORDS[self.match_keyword];
@@ -850,10 +860,10 @@ impl PrefixCheck {
                         self.match_keyword = usize::MAX;
                         self.match_pos = 0;
                     }
-                    self.at_line_start = false;
+                    self.at_token_start = false;
                     self.data_started = true;
                 } else {
-                    self.at_line_start = false;
+                    self.at_token_start = false;
                     self.data_started = true;
                 }
             }
@@ -2552,6 +2562,37 @@ ex:carol ex:name \"Carol\" .\n";
         let (prefix, ranges) = chunk_in_memory(&ttl, 100).expect("splits");
         assert_eq!(ranges.len(), 1, "one statement is one chunk");
         crate::parse_to_json(&format!("{prefix}{}", &ttl[ranges[0].clone()])).unwrap();
+    }
+
+    #[test]
+    fn a_mid_line_directive_is_detected_like_any_other() {
+        // Turtle has no line structure: `ex:a ex:p "1" . @prefix ex: <...> .`
+        // is a perfectly ordinary document, and the redefinition is just as
+        // corrupting mid-line as it is at column 0 — only chunk 0 carries it,
+        // so every later chunk resolves `ex:` against the header binding.
+        let ttl = "@prefix ex: <http://first.example/> .\n\
+                   ex:a ex:p \"1\" . @prefix ex: <http://second.example/> . ex:b ex:p \"2\" .\n\
+                   ex:c ex:p \"3\" .\n";
+
+        assert!(
+            matches!(
+                chunk_in_memory(ttl, 10),
+                Err(SplitError::PrefixAfterData { .. })
+            ),
+            "a mid-line directive evaded detection; later chunks would resolve \
+             ex: against the header binding and be silently wrong"
+        );
+    }
+
+    #[test]
+    fn a_directive_keyword_inside_a_literal_is_not_a_directive() {
+        // The other side of the same coin: detection must be state-aware, so
+        // the word inside a string is just a word.
+        let ttl = "@prefix ex: <http://example.org/> .\n\
+                   ex:a ex:p \"see @prefix ex: <http://evil.example/> . for details\" .\n\
+                   ex:b ex:p \"2\" .\n";
+        let (_, ranges) = chunk_in_memory(ttl, 10).expect("a literal is not a directive");
+        assert!(!ranges.is_empty());
     }
 
     #[test]
