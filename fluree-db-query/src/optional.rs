@@ -116,13 +116,18 @@ pub trait OptionalBuilder: Send + Sync {
         Ok(None)
     }
 
-    /// Whether this builder takes the batched single-seed hash-join path — i.e.
+    /// Whether this builder WILL take the batched single-seed hash-join path — i.e.
     /// `build_batch` can collapse the correlated inner into ONE scan over the
     /// distinct correlation tuples. When true, the OptionalOperator may COALESCE
     /// the whole (bounded) driving side into one seed (PR-4d) so the inner is
-    /// scanned once rather than once per outer batch. Default: false — a per-row
-    /// builder gains nothing from coalescing and must keep streaming.
-    fn supports_seed_coalescing(&self) -> bool {
+    /// scanned once rather than once per outer batch. Implementations must
+    /// mirror their `build_batch` admission gates against `ctx`: returning
+    /// true and then declining at `build_batch` time would buffer up to the
+    /// coalesce cap of driving rows only to fall back per-row anyway —
+    /// delaying the fallback, defeating an early LIMIT, and inflating
+    /// memory. Default: false — a per-row builder gains nothing from
+    /// coalescing and must keep streaming.
+    fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
         false
     }
 
@@ -426,6 +431,33 @@ impl PatternOptionalBuilder {
 
 #[async_trait]
 impl OptionalBuilder for PatternOptionalBuilder {
+    /// The batched lane probes each required row independently (a pure
+    /// per-row restriction by the correlation tuple), so concatenating
+    /// required batches changes nothing but probe granularity: ONE sorted
+    /// subject-set pass instead of one per incoming batch. Upstream
+    /// per-row joins emit 1-row batches, and a chain of these OPTIONALs
+    /// re-fragments its own output — without coalescing the KB `p.p`
+    /// pipeline ran ~2k probe calls of 2-4 subjects each.
+    ///
+    /// True only when `build_batch`'s own admission gates hold, so the
+    /// operator never buffers the driving side just to fall back per-row.
+    fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if ctx.is_multi_ledger() || self.pattern.dtc.is_some() || self.subject_left_col().is_none()
+        {
+            return false;
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return false;
+        };
+        let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
+            return false;
+        };
+        !matches!(
+            subject_probe_lane_plan(ctx, store, &pred_sid),
+            Err(_) | Ok(ProbeLanePlan::Decline)
+        )
+    }
+
     fn build(
         &self,
         required_batch: &Batch,
@@ -803,6 +835,35 @@ impl GroupedPatternOptionalBuilder {
 
 #[async_trait]
 impl OptionalBuilder for GroupedPatternOptionalBuilder {
+    /// Like [`PatternOptionalBuilder`]: the grouped batched lane probes each
+    /// required row independently (per-subject star probes), so coalescing
+    /// the required stream only changes probe granularity — one sorted
+    /// subject-set pass per predicate instead of one per incoming batch.
+    /// Per-row joins upstream emit 1-row batches, and a chain of OPTIONALs
+    /// re-fragments its own output; without coalescing the KB `p.p`
+    /// pipeline ran hundreds of 2-4-subject probes per predicate.
+    ///
+    /// True only when `build_batch`'s admission gates hold for EVERY
+    /// grouped triple, so the operator never buffers the driving side
+    /// just to fall back per-row.
+    fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if ctx.is_multi_ledger() || self.triples.iter().any(|tp| tp.dtc.is_some()) {
+            return false;
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return false;
+        };
+        self.triples.iter().all(|triple| {
+            let Some(pred_sid) = try_normalize_pred_sid(store, &triple.p) else {
+                return false;
+            };
+            !matches!(
+                subject_probe_lane_plan(ctx, store, &pred_sid),
+                Err(_) | Ok(ProbeLanePlan::Decline)
+            )
+        })
+    }
+
     fn build(
         &self,
         required_batch: &Batch,
@@ -1171,7 +1232,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
     /// exactly when every inner pattern is hash-join-safe, so the OptionalOperator
     /// may coalesce the whole driving side into one seed (one inner scan) rather
     /// than one scan per outer batch. Mirrors `build_batch`'s own admission gate.
-    fn supports_seed_coalescing(&self) -> bool {
+    fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
         self.inner_patterns
             .iter()
             .all(inner_pattern_is_hash_join_safe)
@@ -1626,28 +1687,7 @@ pub struct AnnotationValueOptionalBuilder {
     /// for exactly one query run against one snapshot/overlay/`to_t`, so
     /// the maps cannot go stale; without this cache a 54k-row result
     /// re-drained the whole sidecar ~55 times (once per required batch).
-    maps: std::sync::Mutex<Option<Arc<AnnotationSidecarMaps>>>,
-}
-
-/// The three `f:reifies*` lookups, drained once and hash-indexed.
-struct AnnotationSidecarMaps {
-    s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
-    ann_preds: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
-    ann_objs: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>>,
-}
-
-impl AnnotationSidecarMaps {
-    fn matches(
-        &self,
-        ann: &fluree_db_core::Sid,
-        p: &fluree_db_core::Sid,
-        o: &fluree_db_core::Sid,
-    ) -> bool {
-        self.ann_preds
-            .get(ann)
-            .is_some_and(|preds| preds.contains(p))
-            && self.ann_objs.get(ann).is_some_and(|objs| objs.contains(o))
-    }
+    maps: std::sync::Mutex<Option<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>>>,
 }
 
 impl AnnotationValueOptionalBuilder {
@@ -1715,55 +1755,24 @@ impl AnnotationValueOptionalBuilder {
         &self,
         ctx: &ExecutionContext<'_>,
         view: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> Result<Arc<AnnotationSidecarMaps>> {
+    ) -> Result<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>> {
         if let Some(m) = self.maps.lock().expect("sidecar maps lock").clone() {
             return Ok(m);
         }
-        let subj_pairs = self.drain_pairs(&self.r_subj, ctx, view).await?;
-        let mut s_to_anns: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-        for (ann, s) in subj_pairs {
-            s_to_anns.entry(s).or_default().push(ann);
-        }
-        let mut ann_preds: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-        for (ann, pred) in self.drain_pairs(&self.r_pred, ctx, view).await? {
-            ann_preds.entry(ann).or_default().push(pred);
-        }
-        let mut ann_objs: HashMap<fluree_db_core::Sid, Vec<fluree_db_core::Sid>> = HashMap::new();
-        for (ann, obj) in self.drain_pairs(&self.r_obj, ctx, view).await? {
-            ann_objs.entry(ann).or_default().push(obj);
-        }
-        let built = Arc::new(AnnotationSidecarMaps {
-            s_to_anns,
-            ann_preds,
-            ann_objs,
-        });
+        let built = Arc::new(
+            crate::annotation_edge_probe::AnnotationSidecarMaps::build(
+                &self.r_subj,
+                &self.r_pred,
+                &self.r_obj,
+                self.stats.clone(),
+                &self.planning,
+                ctx,
+                view,
+            )
+            .await?,
+        );
         *self.maps.lock().expect("sidecar maps lock") = Some(built.clone());
         Ok(built)
-    }
-
-    /// Normalize a binding to a raw `Sid` (decoding late-materialized
-    /// subjects through the graph view). `None` for unbound/poisoned or
-    /// non-ref bindings — such a position matches no `f:reifies*` row.
-    fn binding_sid(
-        b: &Binding,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> Result<Option<fluree_db_core::Sid>> {
-        match b {
-            Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
-            Binding::EncodedSid { s_id, .. } => {
-                let view = view.ok_or_else(|| {
-                    QueryError::execution(
-                        "annotation optional probe: encoded subject with no binary graph view",
-                    )
-                })?;
-                view.resolve_subject_sid(*s_id).map(Some).map_err(|e| {
-                    QueryError::execution(format!(
-                        "annotation optional probe: resolve encoded subject {s_id}: {e}"
-                    ))
-                })
-            }
-            _ => Ok(None),
-        }
     }
 
     fn row_sid(
@@ -1777,74 +1786,10 @@ impl AnnotationValueOptionalBuilder {
         match pos {
             EdgePos::Const(sid) => Ok(Some(sid.clone())),
             EdgePos::Var(v) => match batch.get(row, *v) {
-                Some(b) => Self::binding_sid(b, view),
+                Some(b) => crate::annotation_edge_probe::binding_sid(b, view),
                 None => Ok(None),
             },
         }
-    }
-
-    /// Drain one reifies triple's whole predicate through a planned scan,
-    /// yielding `(reifier Sid, object Sid)` pairs. Non-ref objects (a
-    /// literal-valued reified edge) are skipped — the probe only matches
-    /// ref positions, mirroring `EdgePos::from_term`.
-    async fn drain_pairs(
-        &self,
-        triple: &TriplePattern,
-        ctx: &ExecutionContext<'_>,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> Result<Vec<(fluree_db_core::Sid, fluree_db_core::Sid)>> {
-        let ann_v = match &triple.s {
-            Ref::Var(v) => *v,
-            _ => {
-                return Err(QueryError::execution(
-                    "annotation optional probe: reifies subject must be the reifier var",
-                ))
-            }
-        };
-        let o_v = match &triple.o {
-            Term::Var(v) => Some(*v),
-            _ => None,
-        };
-        let mut op = crate::execute::build_where_operators_seeded(
-            None,
-            std::slice::from_ref(&Pattern::Triple(triple.clone())),
-            self.stats.clone(),
-            None,
-            &self.planning,
-        )?;
-        op.open(ctx).await?;
-        let mut out = Vec::new();
-        while let Some(batch) = op.next_batch(ctx).await? {
-            ctx.check_cancelled()?;
-            for r in 0..batch.len() {
-                let Some(ann) = batch
-                    .get(r, ann_v)
-                    .map(|b| Self::binding_sid(b, view))
-                    .transpose()?
-                    .flatten()
-                else {
-                    continue;
-                };
-                let obj = match o_v {
-                    Some(v) => batch
-                        .get(r, v)
-                        .map(|b| Self::binding_sid(b, view))
-                        .transpose()?
-                        .flatten(),
-                    // Constant object (typed relationship / fixed endpoint):
-                    // the scan already filtered to it; record the constant.
-                    None => match &triple.o {
-                        Term::Sid(sid) => Some(sid.clone()),
-                        _ => None,
-                    },
-                };
-                if let Some(obj) = obj {
-                    out.push((ann, obj));
-                }
-            }
-        }
-        op.close();
-        Ok(out)
     }
 }
 
@@ -1885,9 +1830,13 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
             let key = (
                 self.row_sid(&self.s_src, required_batch, row, view)?,
                 self.row_sid(&self.p_src, required_batch, row, view)?,
-                self.row_sid(&self.o_src, required_batch, row, view)?,
             );
-            let (Some(s), Some(p), Some(o)) = key else {
+            let o =
+                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view);
+            let ((Some(s), Some(p)), false) = (
+                key,
+                matches!(o, crate::group_aggregate::GroupKeyOwned::Absent),
+            ) else {
                 pending.push((row, Vec::new()));
                 continue;
             };
@@ -2498,7 +2447,7 @@ impl Operator for OptionalOperator {
                 let coalesce = optional_seed_coalesce_enabled()
                     && !optional_hash_join_disabled()
                     && !ctx.is_multi_ledger()
-                    && self.optional_builder.supports_seed_coalescing();
+                    && self.optional_builder.supports_seed_coalescing(ctx);
                 let next = if coalesce {
                     self.pull_coalesced_required(ctx).await?
                 } else {
@@ -3546,7 +3495,7 @@ mod tests {
                     .collect(),
             ))
         }
-        fn supports_seed_coalescing(&self) -> bool {
+        fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
             true
         }
         fn schema(&self) -> &[VarId] {
@@ -3651,22 +3600,5 @@ mod tests {
         );
         // Left-join preserves every driving row (all OPTIONAL misses).
         assert_eq!(out_rows, 6, "every driving row survives the left join");
-    }
-
-    #[test]
-    fn annotation_sidecar_maps_preserve_multi_target_values() {
-        let ann = Sid::new(1, "ann");
-        let p1 = Sid::new(2, "p1");
-        let p2 = Sid::new(2, "p2");
-        let o1 = Sid::new(3, "o1");
-        let o2 = Sid::new(3, "o2");
-        let maps = AnnotationSidecarMaps {
-            s_to_anns: HashMap::new(),
-            ann_preds: HashMap::from([(ann.clone(), vec![p1.clone(), p2.clone()])]),
-            ann_objs: HashMap::from([(ann.clone(), vec![o1.clone(), o2.clone()])]),
-        };
-
-        assert!(maps.matches(&ann, &p1, &o1));
-        assert!(maps.matches(&ann, &p2, &o2));
     }
 }
