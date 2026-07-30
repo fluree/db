@@ -29,11 +29,11 @@
           "note": "riot's DEFAULT is check-on for Turtle and check-off for N-Triples. Recording this mode alone would compare a validating Turtle run against a non-validating N-Triples one — see §6b F3."
         },
         "check_false": {
-          "flags_disclosed": ["--output=NT", "--check=false"],
-          "note": "Uniform no-validation. Comparable with our column until W-h8 lands."
+          "flags_disclosed": ["--output=NT", "--nocheck"],
+          "note": "Uniform no-validation. Comparable with our --nocheck column. NOTE: Jena 6.x takes bare --check/--nocheck; the 5.x --check=BOOL spelling makes riot read the value as a FILENAME and fail, which is how this was caught."
         },
         "check_true": {
-          "flags_disclosed": ["--output=NT", "--check=true"],
+          "flags_disclosed": ["--output=NT", "--check"],
           "note": "Uniform validation. Becomes the primary cell once our --nocheck/validate split exists."
         }
       },

@@ -234,10 +234,10 @@ for tool in "${ELIGIBLE[@]}"; do
 	riot)
 		xmx="$(jq -r '.tools.riot.jvm.xmx' "$TOOLS_LOCK")"
 		export JVM_ARGS="$xmx"
-		run_cell riot check_false ttl "$ttl" riot --output=NT --check=false "$ttl"
-		run_cell riot check_true ttl "$ttl" riot --output=NT --check=true "$ttl"
-		run_cell riot check_false nt "$nt" riot --output=NT --check=false "$nt"
-		run_cell riot check_true nt "$nt" riot --output=NT --check=true "$nt"
+		run_cell riot check_false ttl "$ttl" riot --output=NT --nocheck "$ttl"
+		run_cell riot check_true ttl "$ttl" riot --output=NT --check "$ttl"
+		run_cell riot check_false nt "$nt" riot --output=NT --nocheck "$nt"
+		run_cell riot check_true nt "$nt" riot --output=NT --check "$nt"
 		;;
 	serdi)
 		run_cell serdi default ttl "$ttl" serdi -o ntriples "$ttl"
