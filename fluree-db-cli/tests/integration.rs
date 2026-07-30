@@ -1577,6 +1577,42 @@ fn config_list_empty() {
 }
 
 #[test]
+fn manifest_emits_machine_readable_surface() {
+    let tmp = TempDir::new().unwrap();
+    // Needs no .fluree/ directory — pure introspection of the clap tree.
+    let assert = fluree_cmd(&tmp).arg("__manifest").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest is JSON");
+
+    assert_eq!(manifest["manifest_version"], 1);
+    assert_eq!(manifest["name"], "fluree");
+    assert!(manifest["version"].as_str().is_some_and(|v| !v.is_empty()));
+
+    let paths: Vec<Vec<&str>> = manifest["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            c["path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    // The surface dependent repos teach.
+    assert!(paths.contains(&vec!["query"]));
+    assert!(paths.contains(&vec!["remote", "add"]));
+    assert!(paths.contains(&vec!["auth", "login"]));
+    assert!(paths.contains(&vec!["model", "access", "enable"]));
+    // Hidden machine commands never leak into the teachable surface.
+    assert!(paths
+        .iter()
+        .all(|p| p.iter().all(|seg| !seg.starts_with("__"))));
+}
+
+#[test]
 fn config_list_redacts_credentials_unless_revealed() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();

@@ -948,6 +948,19 @@ pub enum Commands {
         shell: clap_complete::Shell,
     },
 
+    /// Emit a machine-readable manifest of this binary's CLI surface (JSON)
+    ///
+    /// Hidden machine plumbing: generated from the clap definitions (command
+    /// paths, flags, value enums, positionals, compiled features — no help
+    /// text), published as a release asset, and consumed by CI in dependent
+    /// repos to validate the `fluree ...` strings they ship.
+    #[command(name = "__manifest", hide = true)]
+    Manifest {
+        /// Write to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// Manage JWS tokens for authentication
     Token {
         #[command(subcommand)]

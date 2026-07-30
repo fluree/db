@@ -20,6 +20,7 @@ pub mod insert;
 pub mod list;
 pub mod load;
 pub mod log;
+pub mod manifest;
 pub mod mcp;
 pub mod memory;
 pub mod model;

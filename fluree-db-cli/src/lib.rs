@@ -539,6 +539,8 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             Ok(())
         }
 
+        Commands::Manifest { output } => commands::manifest::run(output.as_deref()),
+
         Commands::Token { action } => commands::token::run(action),
 
         Commands::Remote { action } => {
