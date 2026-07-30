@@ -100,15 +100,28 @@ impl WriterTerms {
 
     /// Record the producer's declaration.
     ///
-    /// Only meaningful before the first term is minted — a producer that
-    /// changes its mind mid-document would be invalidating ids it already
-    /// handed out — so a late declaration is refused in debug builds and
-    /// ignored in release, which keeps the safe scope rather than adopting the
-    /// unsafe one.
+    /// Re-declaring the scope already in force is a no-op at any point, and
+    /// that is not a leniency — it is a shape the protocol has to support.
+    /// `--continue-on-error` re-enters the reader at every resync point, so a
+    /// recovering line-format run declares statement scope once per surviving
+    /// fragment, against a sink that is already holding terms. Asserting on the
+    /// second declaration turned a legitimate producer into a debug-build
+    /// panic; the integration found it, not the unit tests, because nothing on
+    /// either branch alone drove a producer that re-enters.
+    ///
+    /// What stays refused is a CHANGE of scope once terms exist. That one would
+    /// invalidate ids already handed out — the whole hazard this declaration
+    /// exists to keep on the producer's side of the line — so it fails loudly
+    /// in debug builds and is ignored in release, which keeps the safe scope
+    /// rather than adopting the unsafe one.
     pub(crate) fn set_scope(&mut self, scope: TermScope) {
+        if scope == self.scope {
+            return;
+        }
         debug_assert!(
             self.session.is_empty() && self.scoped.is_empty(),
-            "term scope declared after {} term(s) were already minted",
+            "term scope CHANGED to {scope:?} after {} term(s) were already minted \
+             — ids handed out under the old scope would be invalidated",
             self.session.len() + self.scoped.len(),
         );
         if self.session.is_empty() && self.scoped.is_empty() {
@@ -402,6 +415,31 @@ mod tests {
             slots(&terms),
             (0, 5),
             "the table holds the widest statement"
+        );
+    }
+
+    #[test]
+    fn a_producer_that_re_enters_may_re_declare_the_scope_it_already_declared() {
+        // `--continue-on-error` re-enters the reader at every resync point, so
+        // a recovering line-format run declares statement scope once per
+        // surviving fragment — against a sink that is already holding terms
+        // from the fragments before it. This is the shape that turned an
+        // over-strict assertion into a debug-build panic on a legitimate run,
+        // and neither branch's tests drove it alone: the writers had no
+        // recovering producer, and recovery had no declaring reader until the
+        // two met.
+        let mut terms = table(TermScope::Statement);
+        for _ in 0..5 {
+            terms.set_scope(TermScope::Statement);
+            terms.iri("http://ex/s");
+            terms.iri("http://ex/p");
+            terms.literal("v", Datatype::xsd_string(), None);
+            terms.end_statement();
+        }
+        assert_eq!(
+            slots(&terms),
+            (0, 3),
+            "re-declaring the scope in force must not disturb the table"
         );
     }
 
