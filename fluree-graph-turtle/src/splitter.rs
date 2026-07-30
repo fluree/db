@@ -2215,6 +2215,23 @@ mod tests {
         ),
         ("no trailing newline", "ex:a ex:p \"x\" ."),
         ("empty", ""),
+        // Both STOP_LONG masks were mutable with the whole suite green: no
+        // fixture put an escape inside a long string, so nothing noticed if
+        // the scanner stopped tracking backslashes there. A missed escape ends
+        // the literal early and the cut lands INSIDE it — on the scanner bulk
+        // import runs.
+        (
+            "escape before a long-single close",
+            "ex:a ex:p '''trailing backslash \\\\''' .\nex:b ex:p \"y\" .\n",
+        ),
+        (
+            "escape before a long-double close",
+            "ex:a ex:p \"\"\"trailing backslash \\\\\"\"\" .\nex:b ex:p \"y\" .\n",
+        ),
+        (
+            "escaped quote inside a long string",
+            "ex:a ex:p \"\"\"a \\\" b . c\"\"\" .\nex:b ex:p \"y\" .\n",
+        ),
     ];
 
     #[test]
@@ -2232,6 +2249,44 @@ mod tests {
         assert!(ranges.len() > 1, "a 3 MB document should chunk");
         assert_eq!(ranges.first().unwrap().start, prefix.len());
         assert_eq!(ranges.last().unwrap().end, ttl.len());
+    }
+
+    /// Adopted from review-scan's probe (`scanmut/zz_adversarial_scan.rs`).
+    ///
+    /// The cap had no regression guard: deleting the one line that applies it
+    /// left the whole suite green, because every other test's document is
+    /// smaller than the cap. This one is not, and it pins the property that
+    /// actually matters — the in-memory path and the file path must reach the
+    /// SAME verdict, rather than the in-memory one silently succeeding by
+    /// tokenizing the entire document.
+    #[test]
+    fn an_oversized_header_behaves_the_same_on_both_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut doc = String::new();
+        let mut i = 0;
+        while doc.len() < PREFIX_SCAN_SIZE + 4096 {
+            doc.push_str(&format!("@prefix p{i}: <http://example.org/ns{i}/> .\n"));
+            i += 1;
+        }
+        doc.push_str("p0:a p0:p \"data\" .\n");
+
+        let path = dir.path().join("bigheader.ttl");
+        std::fs::write(&path, &doc).unwrap();
+
+        let (file_prefix, _) = extract_prefix_block(&path).expect("file path extracts a block");
+        assert!(
+            file_prefix.len() <= PREFIX_SCAN_SIZE,
+            "the file path read past the cap: {}",
+            file_prefix.len()
+        );
+        if let Ok((mem_prefix, _)) = chunk_in_memory(&doc, 8 * 1024 * 1024) {
+            assert_eq!(
+                mem_prefix.len(),
+                file_prefix.len(),
+                "in-memory prefix block differs from the file path's — the cap \
+                 is not being applied identically"
+            );
+        }
     }
 
     #[test]
@@ -2279,6 +2334,44 @@ mod tests {
                 scan_with_fast_path(head),
                 scan_byte_at_a_time(head),
                 "prefix of length {cut} scanned differently"
+            );
+        }
+    }
+
+    #[test]
+    fn every_mask_matches_what_its_state_branches_on() {
+        // The table has seven masks and the contract test covered one. The
+        // other six were guarded only by the differential fixtures, which is
+        // exactly where the missing long-string escape cases were — the two
+        // holes compound, and a mutable mask on the string states cuts a chunk
+        // INSIDE a literal on the scanner bulk import runs.
+        for b in 0u8..=255 {
+            let stops = |m: u8| STOP[b as usize] & m != 0;
+            assert_eq!(
+                stops(STOP_SHORT_DOUBLE),
+                matches!(b, b'"' | b'\\' | b'\n' | b'\r'),
+                "short double-quoted string, byte {b:?}"
+            );
+            assert_eq!(
+                stops(STOP_SHORT_SINGLE),
+                matches!(b, b'\'' | b'\\' | b'\n' | b'\r'),
+                "short single-quoted string, byte {b:?}"
+            );
+            assert_eq!(
+                stops(STOP_LONG_DOUBLE),
+                matches!(b, b'"' | b'\\'),
+                "long double-quoted string, byte {b:?}"
+            );
+            assert_eq!(
+                stops(STOP_LONG_SINGLE),
+                matches!(b, b'\'' | b'\\'),
+                "long single-quoted string, byte {b:?}"
+            );
+            assert_eq!(stops(STOP_IRI), b == b'>', "iri, byte {b:?}");
+            assert_eq!(
+                stops(STOP_COMMENT),
+                matches!(b, b'\n' | b'\r'),
+                "comment, byte {b:?}"
             );
         }
     }

@@ -143,9 +143,34 @@ impl<S: GraphSink> GraphSink for PrefixRecorder<S> {
 /// What a recovering parse skipped.
 #[derive(Debug, Default)]
 pub struct Recovery {
-    /// One per skipped statement, in document order, positioned against the
-    /// whole document rather than the fragment that failed.
+    /// One per recovery EVENT, in document order, positioned against the whole
+    /// document rather than the fragment that failed.
+    ///
+    /// Not one per statement lost: resync scans to the next terminator, so a
+    /// failing statement without one takes its neighbours with it. See
+    /// [`swallowed`](Self::swallowed).
     pub skipped: Vec<Diagnostic>,
+    /// Resyncs that consumed more than the line that failed.
+    pub swallowed: Vec<Swallowed>,
+}
+
+/// A resync that ran past the failing statement into following content.
+///
+/// Recovery finds the next statement TERMINATOR and resumes there. A failing
+/// statement that has no terminator of its own — junk text, a truncated line —
+/// therefore ends at the terminator of the statement AFTER it, and that
+/// statement is consumed without ever being parsed, diagnosed or counted.
+///
+/// Reported because the alternative is a run that says "1 statement skipped"
+/// having dropped two, with stderr byte-identical to the honest case. The
+/// count cannot be fixed — the swallowed bytes were never parsed, so nothing
+/// knows how many statements they held — but the span can be shown.
+#[derive(Debug)]
+pub struct Swallowed {
+    /// Bytes consumed beyond the failing statement's own line.
+    pub bytes: usize,
+    /// 1-based line the parse resumed at.
+    pub resume_line: usize,
 }
 
 impl Recovery {
@@ -170,6 +195,7 @@ pub fn parse_recovering<S: GraphSink>(
     text: &str,
     source: RdfSyntax,
     base: Option<&str>,
+    options: ParserOptions,
     sink: &mut PrefixRecorder<S>,
 ) -> CliResult<Recovery> {
     let mut recovery = Recovery::default();
@@ -191,14 +217,20 @@ pub fn parse_recovering<S: GraphSink>(
                 sink,
                 &prefixes,
                 effective_base,
-                ParserOptions::conformant().with_dialect(fluree_graph_turtle::Dialect::TriG),
+                options.with_dialect(fluree_graph_turtle::Dialect::TriG),
             ),
-            _ => fluree_graph_turtle::parse_with_prefixes_base_options(
+            // Named rather than a catch-all, so a syntax added later has to
+            // choose a reader here instead of inheriting Turtle's by default.
+            RdfSyntax::Turtle
+            | RdfSyntax::JsonLd
+            | RdfSyntax::RdfXml
+            | RdfSyntax::RdfJson
+            | RdfSyntax::Jelly => fluree_graph_turtle::parse_with_prefixes_base_options(
                 fragment,
                 sink,
                 &prefixes,
                 effective_base,
-                ParserOptions::conformant(),
+                options,
             ),
         };
 
@@ -224,6 +256,16 @@ pub fn parse_recovering<S: GraphSink>(
             // Nothing parseable remains.
             return Ok(recovery);
         };
+        // Did the resync cross into a following line's content? If it did, that
+        // content was consumed without being parsed — the failing statement had
+        // no terminator of its own, so the scan ran to the next one, which
+        // belongs to the statement after it.
+        if let Some(bytes) = crossed_into_following_content(text, error_at, resume) {
+            recovery.swallowed.push(Swallowed {
+                bytes,
+                resume_line: text[..resume].lines().count().max(1),
+            });
+        }
         if resume <= offset {
             // Cannot happen — `next_statement_boundary` scans forward from
             // `error_at >= offset` — but a resync that failed to advance would
@@ -235,6 +277,21 @@ pub fn parse_recovering<S: GraphSink>(
             return Ok(recovery);
         }
     }
+}
+
+/// Bytes of following-line content a resync consumed, if it consumed any.
+///
+/// The span from the error to the resume point covers the failing statement.
+/// If it also contains a line break with real content after it, the scan ran
+/// past the failing line and into the next statement — which is the case that
+/// loses data silently.
+fn crossed_into_following_content(text: &str, error_at: usize, resume: usize) -> Option<usize> {
+    let span = text.get(error_at..resume)?;
+    let after_break = span.find('\n').map(|nl| &span[nl + 1..])?;
+    if after_break.trim().is_empty() {
+        return None;
+    }
+    Some(after_break.len())
 }
 
 /// Byte offset a parse error points at, when it has one.
@@ -269,8 +326,14 @@ mod tests {
         let config = WriterConfig::new().with_statement_buffering(true);
         let writer = NTriplesWriter::with_config(Vec::new(), &config);
         let mut sink = PrefixRecorder::new(writer);
-        let recovery = parse_recovering(ttl, RdfSyntax::Turtle, None, &mut sink)
-            .expect("recovery must not fail");
+        let recovery = parse_recovering(
+            ttl,
+            RdfSyntax::Turtle,
+            None,
+            ParserOptions::conformant(),
+            &mut sink,
+        )
+        .expect("recovery must not fail");
         let mut writer = sink.into_inner();
         writer.finish().ok();
         (String::from_utf8(writer.into_inner()).unwrap(), recovery)

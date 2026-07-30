@@ -437,7 +437,9 @@ pub fn parse_into<S: GraphSink>(
 /// a correctness requirement and not a simplification.
 pub fn parse_into_parallel<S: GraphSink>(
     text: &str,
+    source: RdfSyntax,
     base: Option<&str>,
+    options: ParserOptions,
     sink: S,
     config: parallel::ParallelConfig,
     timings: &mut PhaseTimings,
@@ -445,7 +447,7 @@ pub fn parse_into_parallel<S: GraphSink>(
     let mut sink = TimingSink::with_corpus(sink, text.as_bytes());
 
     timings.enter(Phase::Parse);
-    let outcome = parallel::convert_parallel(text, base, &mut sink, config);
+    let outcome = parallel::convert_parallel(text, base, &mut sink, source, options, config);
     let finished = sink.finish();
     timings.finish();
 

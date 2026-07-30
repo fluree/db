@@ -308,6 +308,7 @@ fn run_parallel(
         &mut out,
         loaded.resolved.syntax,
         target,
+        rdf::verb_options(common.nocheck),
         writer_config,
         config,
         ranges,
@@ -453,6 +454,7 @@ fn run_recovering(
         &loaded.text,
         loaded.resolved.syntax,
         common.base.as_deref(),
+        rdf::verb_options(common.nocheck),
         &mut sink,
     );
     timings.finish();
@@ -496,6 +498,22 @@ fn run_recovering(
             _ => loaded.input.display(),
         };
         eprintln!("{} {where_}: {}", "skipped:".yellow().bold(), d.message);
+    }
+
+    // A resync that ran past the failing line consumed the statement after it
+    // without parsing, diagnosing or counting it. The count above cannot be
+    // corrected — nothing parsed those bytes, so nothing knows how many
+    // statements they held — but staying silent about it is what made a run
+    // that lost three statements report two, with stderr byte-identical to the
+    // honest case. Its own line, so the honest case stays byte-stable.
+    for s in recovery.swallowed.iter().filter(|_| human_stderr) {
+        eprintln!(
+            "{} resync consumed {} more byte(s) and resumed at line {} — content \
+             there was never parsed, so it is not in the count above",
+            "note:".cyan().bold(),
+            s.bytes,
+            s.resume_line,
+        );
     }
 
     // Recovery is exactly when profiling matters — resync re-parses from each
