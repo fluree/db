@@ -23,7 +23,7 @@ use crate::rdf::syntax::{split_compression, RdfSyntax};
 use crate::rdf::writer::{is_writable, AnyWriter};
 use crate::rdf::{self, destination, diagnostic, exit_document_invalid};
 use colored::Colorize;
-use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig, WriterStats};
+use fluree_graph_format::{BlankNodeLabels, PrefixMap, WriterConfig};
 use fluree_graph_ir::{GraphSink, Phase, PhaseTimings, SinkError};
 use std::io::Write;
 use std::path::Path;
@@ -238,7 +238,7 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
         .map_err(|e| CliError::Usage(format!("sink error: {e}")))?;
 
     if let Some(err) = &run.outcome.error {
-        report_parse_failure(&loaded, err, stats);
+        report_parse_failure(&loaded, err, stats.statements);
         rdf::report_run(common, "convert", &loaded, &run.outcome, &timings, wall)?;
         return Err(exit_document_invalid());
     }
@@ -357,18 +357,12 @@ fn run_parallel(
     flushed.map_err(|e| CliError::Usage(format!("cannot write output: {e}")))?;
 
     if let Some(err) = &outcome.error {
-        let d = diagnostic::from_turtle_error(err, &loaded.text);
-        eprintln!(
-            "{} {}: {}",
-            "error:".red().bold(),
-            loaded.input.display(),
-            d.message
-        );
-        eprintln!(
-            "  wrote {} statement(s) before the document stopped parsing — the output is a \
-             prefix of the conversion, not the whole of it",
-            outcome.statements
-        );
+        // The same report the serial path gives, from the same function. It
+        // used to be a second copy that omitted the position, so one document
+        // failed with `file.ttl:120002:19:` at `--parallelism 1` and a bare
+        // `file.ttl:` at 8 — a difference in the diagnostic caused by a flag
+        // that is documented never to be a correctness decision.
+        report_parse_failure(loaded, err, outcome.statements);
         return Err(exit_document_invalid());
     }
 
@@ -890,10 +884,16 @@ fn is_broken_pipe(
     in_parse || at_finish || at_flush
 }
 
+/// Report a parse failure that stopped the conversion, for either path.
+///
+/// Shared rather than written twice: `statements` is a count rather than the
+/// serial path's [`WriterStats`](fluree_graph_format::WriterStats) precisely so
+/// the parallel path — which has no single writer to ask — can call it, instead
+/// of keeping a near-copy that drifted apart at the position.
 fn report_parse_failure(
     loaded: &rdf::Loaded,
     err: &fluree_graph_turtle::TurtleError,
-    stats: WriterStats,
+    statements: u64,
 ) {
     let d = diagnostic::from_turtle_error(err, &loaded.text);
     let where_ = match (d.line, d.column) {
@@ -902,9 +902,8 @@ fn report_parse_failure(
     };
     eprintln!("{} {where_}: {}", "error:".red().bold(), d.message);
     eprintln!(
-        "  wrote {} statement(s) before the document stopped parsing — the output is a \
-         prefix of the conversion, not the whole of it",
-        stats.statements
+        "  wrote {statements} statement(s) before the document stopped parsing — the output \
+         is a prefix of the conversion, not the whole of it"
     );
 }
 

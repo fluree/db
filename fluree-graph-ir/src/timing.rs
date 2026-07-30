@@ -92,8 +92,16 @@ pub enum Phase {
     ///
     /// Single-threaded and whole-document, so it is the parallel path's Amdahl
     /// term: it runs to completion before the first worker starts and no
-    /// thread count touches it. It exists only when the run chunks — a serial
-    /// run reports zero.
+    /// thread count touches it.
+    ///
+    /// It measures the ATTEMPT, not the outcome. A run that never tries —
+    /// `--parallelism 1`, an input under the size gate — reports zero. A run
+    /// that tries and then falls back to serial, because a mid-file directive
+    /// or an oversized header makes the document unchunkable, reports what the
+    /// attempt cost while also reporting `threads_used: 1`. That pairing is
+    /// not a contradiction to be explained away: the scan really did run, and
+    /// on a fallback it is pure overhead, which is exactly the case worth
+    /// being able to see.
     ///
     /// It has its own lane because it went unattributed for a whole bucket and
     /// turned out to be 43% of the wall at 16 threads. Time that no lane owns

@@ -497,6 +497,7 @@ pub fn convert_parallel<S: GraphSink>(
                         index,
                         prefix_block,
                         &text[range.clone()],
+                        range.start,
                         base,
                         source,
                         options,
@@ -616,6 +617,7 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                         index,
                         prefix_block,
                         &text[range.clone()],
+                        range.start,
                         base,
                         source,
                         syntax,
@@ -753,6 +755,39 @@ impl std::fmt::Display for ParallelFailure {
     }
 }
 
+/// Move a chunk-local error position into the whole document.
+///
+/// A worker parses `prefix_block + body`, so the offset its parser reports is
+/// an offset into that synthesized document. Rendered against the real file it
+/// names a line inside the chunk — off by however many lines preceded the
+/// chunk — which is worse than saying nothing, and saying nothing is what the
+/// parallel path did: the serial path reported `file.ttl:120002:19: …` and the
+/// parallel path reported `file.ttl: …` on the same document.
+///
+/// The map is exact both sides of the seam. The prelude is a verbatim copy of
+/// the document's own header, so an offset inside it is already a document
+/// offset; an offset past it is `chunk start + (offset − prelude length)`.
+/// Only the parse result goes through here — a failure to build the writer
+/// carries a placeholder `0` that is not a position and must not be rendered
+/// as one.
+fn relocate(
+    error: fluree_graph_turtle::TurtleError,
+    prefix_len: usize,
+    doc_offset: usize,
+) -> fluree_graph_turtle::TurtleError {
+    use fluree_graph_turtle::TurtleError as E;
+    let moved = |pos: usize| match pos.checked_sub(prefix_len) {
+        Some(in_body) => doc_offset + in_body,
+        None => pos,
+    };
+    match error {
+        E::Lexer { position, message } => E::lexer(moved(position), message),
+        E::Parse { position, message } => E::parse(moved(position), message),
+        // No position to move.
+        other => other,
+    }
+}
+
 /// One chunk's bytes, ready to concatenate.
 struct ChunkBytes {
     index: usize,
@@ -776,6 +811,7 @@ fn write_chunk(
     index: usize,
     prefix_block: &str,
     body: &str,
+    doc_offset: usize,
     base: Option<&str>,
     source: RdfSyntax,
     syntax: RdfSyntax,
@@ -871,6 +907,7 @@ fn write_chunk(
         parse_nanos,
         error: result
             .err()
+            .map(|e| relocate(e, prefix_block.len(), doc_offset))
             .or_else(|| finish.err().map(fluree_graph_turtle::TurtleError::Sink)),
     }
 }
@@ -880,6 +917,7 @@ fn parse_chunk(
     index: usize,
     prefix_block: &str,
     body: &str,
+    doc_offset: usize,
     base: Option<&str>,
     source: RdfSyntax,
     options: ParserOptions,
@@ -928,7 +966,9 @@ fn parse_chunk(
     ChunkResult {
         index,
         graph: sink.into_inner().into_graph(),
-        error: result.err(),
+        error: result
+            .err()
+            .map(|e| relocate(e, prefix_block.len(), doc_offset)),
         parse_nanos,
     }
 }

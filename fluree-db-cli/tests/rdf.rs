@@ -2763,6 +2763,149 @@ fn a_serial_run_reports_no_chunk_phase() {
     assert!(!phases.contains(&"chunk"), "phases: {phases:?}");
 }
 
+/// 120,000 statements with one that does not parse, far enough in to land in
+/// a late chunk.
+///
+/// Past the chunker's one-megabyte header scan as well, and that is not
+/// incidental: the scan TOKENIZES what it reads, so a document that fails to
+/// lex inside the first megabyte cannot be chunked at all and the whole run
+/// falls back to serial — testing the path this fixture exists to reach.
+fn corpus_with_a_late_error() -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..120_000 {
+        if i == 90_000 {
+            ttl.push_str("ex:bad ex:p ?? .\n");
+        }
+        ttl.push_str(&format!(
+            "ex:s{i} ex:name \"person {i}\" ; ex:age {} .\n",
+            i % 90
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_parallel_parse_failure_is_located_like_a_serial_one() {
+    // A worker parses `prefix block + its chunk`, so the offset a failing
+    // chunk reports is an offset into that synthesized document — on this
+    // fixture it names a line about 60,000 short. Rendering it against the
+    // real file would be worse than saying nothing, and saying nothing is
+    // what the parallel path did: the serial run pointed at
+    // `late-error.ttl:90002:13` and the parallel run at `late-error.ttl`.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "late-error.ttl", &corpus_with_a_late_error());
+
+    let mut reports = Vec::new();
+    for threads in ["1", "8"] {
+        let assert = rdf_cmd()
+            .args(["--parallelism", threads, "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt"])
+            .arg("-o")
+            .arg(tmp.path().join(format!("out{threads}.nt")))
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+        let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+        // Line 1 is the header, then 90,000 statements, then this one; the
+        // `?` sits at column 13.
+        assert!(
+            stderr.contains("late-error.ttl:90002:13:"),
+            "--parallelism {threads} did not anchor the failure in the document: {stderr}"
+        );
+        reports.push(stderr);
+    }
+    assert_eq!(
+        reports[0], reports[1],
+        "the two widths described the same failure differently"
+    );
+}
+
+/// A header past the chunker's one-megabyte prefix scan, over a body big
+/// enough to clear the parallel gate.
+///
+/// Directives beyond the scan window are indistinguishable, to the chunker,
+/// from directives after data — so this is an unchunkable document that is
+/// nevertheless perfectly legal Turtle and must still convert.
+fn oversized_header_corpus() -> String {
+    // `splitter::PREFIX_SCAN_SIZE`, which is private. Restated rather than
+    // exported: the test needs a header the scan cannot finish, and any value
+    // at or above the real one gives that.
+    const PREFIX_SCAN_SIZE: usize = 1024 * 1024;
+    let mut ttl = String::new();
+    let mut n = 0;
+    while ttl.len() < PREFIX_SCAN_SIZE + 4096 {
+        ttl.push_str(&format!("@prefix p{n}: <http://example.org/ns{n}/> .\n"));
+        n += 1;
+    }
+    for i in 0..60_000 {
+        ttl.push_str(&format!(
+            "p0:s{i} p0:name \"a literal wide enough to push the body past the gate {i}\" .\n"
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_run_that_falls_back_to_serial_still_reports_what_the_attempt_cost() {
+    // `threads_used: 1` beside a non-zero `chunk` lane is not a contradiction
+    // in the profile: the scan really did run, found the document unchunkable,
+    // and the run then converted serially. On a fallback that time is pure
+    // overhead — the one case where the lane's number is most worth having —
+    // and `Phase::Chunk` used to document itself as "a serial run reports
+    // zero", which makes this pairing read as a bug in the profile instead.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "bighdr.ttl", &oversized_header_corpus());
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["-q", "--parallelism", "8", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    assert_eq!(
+        v["host"]["threads_used"], 1,
+        "reason: {}",
+        v["host"]["parallel_reason"]
+    );
+    let chunk_ns = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase"] == "chunk")
+        .and_then(|p| p["ns"].as_u64());
+    assert!(
+        chunk_ns.is_some_and(|ns| ns > 0),
+        "the attempt that forced the fallback was charged to nobody: {}",
+        v["phases"]
+    );
+
+    // And the document converted, which is the point of falling back rather
+    // than refusing.
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().lines().count(),
+        60_000
+    );
+}
+
 // ============================================================================
 // --continue-on-error
 // ============================================================================
