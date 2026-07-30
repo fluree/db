@@ -1,4 +1,4 @@
-# RESULTS — DuckDB-vs-Fluree A/B
+# RESULTS — external-engine A/B (Fluree vs DuckDB, the first external engine)
 
 All rows follow `PROTOCOL.md`. Substrate B (local MinIO + Iceberg REST fixture, unpartitioned SF0.1) is the engine-pure headline substrate; harness v0.3 (fresh-process/rep, peak RSS, full-result-drain); N=5, median of steady-state reps 2..N with rep1 (cold-catalog first touch) noted separately. DuckDB's comparable cold number is `wall + setup` (query + ATTACH/OAuth). Engines: DuckDB v1.5.5 (`arch -arm64`); Fluree shipped-main and Fluree-with-#1528 (filter-over-join fusion), git-commit-stamped per row. Formatting: one paragraph per line.
 
@@ -32,7 +32,7 @@ WARM (secondary; Fluree disk cache persists; DuckDB has no cross-process cache s
 
 Correctness (both engines, all reps): p1 COUNT=180000 (1 row); p2 top category Beauty=346602 over 10 categories. main and #1528 are equal within noise on p1/p2 (the #1528 fix is targeted to filter-over-join; p1/p2 carry no such filter — no regression; the clean pass tightens the prior contaminated p2 #1528 = 628 ms to 516 ms).
 
-CLEAN VERDICTS: p1 (bare COUNT, metadata-vs-metadata) — near-tie cold (DuckDB 220 ms vs Fluree ~230 ms; DuckDB marginally ahead by ~1.04x), Fluree wins WARM decisively (2 ms vs ~220 ms via the count-manifest shortcut #1478; DuckDB re-attaches every fresh process). p2 (join rollup, integer SUM) — DuckDB wins COLD ~1.8x (294 ms vs ~516-559 ms), Fluree wins WARM ~2x (124-140 ms vs ~294 ms). Fluree carries ~1.5-2x the RSS on p2 (106 vs 63 MB cold). Verdict is cache-protocol-dependent for p1/p2 (per PROTOCOL.md §2, TRUE-COLD is primary).
+CLEAN MEASUREMENTS: p1 (bare COUNT, metadata-vs-metadata) — near-tie cold (DuckDB 220 ms vs Fluree ~230 ms; DuckDB faster by ~1.04x), Fluree faster WARM (2 ms vs ~220 ms via the count-manifest shortcut #1478; DuckDB re-attaches every fresh process). p2 (join rollup, integer SUM) — DuckDB faster COLD by ~1.8x (294 ms vs ~516-559 ms), Fluree faster WARM by ~2x (124-140 ms vs ~294 ms). Fluree carries ~1.5-2x the RSS on p2 (106 vs 63 MB cold). The comparison is cache-protocol-dependent for p1/p2 (per PROTOCOL.md §2, TRUE-COLD is primary).
 
 The prior baseline p1/p2 rows (load-contaminated, loadavg ~19) are retained below for provenance.
 
@@ -56,7 +56,7 @@ WARM (secondary; Fluree disk cache persists; DuckDB has no cross-process cache s
 
 † p1/p2 captured under heavy sibling load (loadavg ~19) — LOAD-CONTAMINATED; Wave A replaces them. All rows correctness-matched (p1 COUNT=180000; p2 top Beauty=346602 over 10 categories; p3 Consumer/Enterprise/SMB = 10788/2639/2683).
 
-HEADLINE (protocol-invariant, stands): #1528 filter-over-join fusion collapses p3 from shipped-main's 12.6 s cold / 10.6 s warm (~600-785 MB) to 473 ms cold / 139 ms warm (147-175 MB) — ~27x cold / ~76x warm, ~5x leaner. Against DuckDB (352 ms cold / ~220 ms warm), fused Fluree p3 is a near-tie cold and BEATS DuckDB warm. The earlier "43x DuckDB win on p3" was purely the shipped binary lacking filter-over-join fusion. main and #1528 are identical on p1/p2 (the fix is targeted; no regression).
+KEY MEASUREMENT (protocol-invariant): #1528 filter-over-join fusion reduces p3 from shipped-main's 12.6 s cold / 10.6 s warm (~600-785 MB) to 473 ms cold / 139 ms warm (147-175 MB) — ~27x cold / ~76x warm faster, ~5x leaner. Against DuckDB (352 ms cold / ~220 ms warm), fused Fluree p3 is a near-tie cold and faster warm; on shipped-main (without the fusion) Fluree is ~43x slower than DuckDB on p3 cold — a named gap that the #1528 engine work closes. main and #1528 are identical on p1/p2 (the fix is targeted; no regression).
 
 ---
 

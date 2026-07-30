@@ -1,6 +1,6 @@
 # Substrate B — local engine-pure Iceberg fixture
 
-A locally-controlled, catalog-fronted Iceberg substrate both engines read, so DuckDB-vs-Fluree data-scan numbers are engine-pure (no Snowflake network variance, no vended-credential path, no many-small-files fan-out). This is where the headline A/B numbers come from. See `../PROTOCOL.md` §1.
+A locally-controlled, catalog-fronted Iceberg substrate both engines read, so the data-scan numbers are engine-pure (no Snowflake network variance, no vended-credential path, no many-small-files fan-out). This is where the headline A/B numbers come from. See `../PROTOCOL.md` §1.
 
 ## Stack
 

@@ -1,10 +1,12 @@
-# PROTOCOL — DuckDB-vs-Fluree A/B (binding rules)
+# PROTOCOL — external-engine A/B (binding rules)
 
-This is the condensed, binding rule-set for the A/B program. It supersedes any looser wording elsewhere. Formatting: one paragraph per line for clean diffs.
+> **NOTICE.** This benchmark harness invokes an independently installed DuckDB CLI binary as an external process, solely for comparative performance measurement. No DuckDB source code, binaries, extensions, or platform components are included in, linked into, distributed with, or incorporated into this repository or any Fluree product. DuckDB® is a trademark of its owner; references here are nominative — identifying the third-party product being measured — and imply no affiliation or endorsement. Version, configuration, and full protocol are disclosed for reproducibility.
 
-## 0. Thesis under test
+This is the condensed, binding rule-set for the external-engine A/B program. It supersedes any looser wording elsewhere. The harness is engine-agnostic; external engines are adapters in `harness/engines/`. The first external engine measured is DuckDB. Formatting: one paragraph per line for clean diffs.
 
-Fluree's virtual (R2RML-over-Iceberg) query path should at least MATCH DuckDB per comparable query on the same physical files. Every DuckDB win beyond measurement noise is treated as a NAMED ENGINE GAP with a query shape attached — not a vibe. Graph-native shapes DuckDB cannot express (`?s ?p ?o` crawls, property paths) stay Fluree-only regression members and are the honest "graph wins by expressiveness" counterweight; they are never scored as A/B wins/losses.
+## 0. Reference point under test
+
+Fluree's virtual (R2RML-over-Iceberg) query path is measured against the external engine per comparable query on the same physical files; the reference point is that Fluree should be at least on par. Any shortfall beyond measurement noise is recorded as a NAMED ENGINE GAP with a query shape attached — a factual measurement, not a verdict — and where Fluree lags it is reported with equal plainness. Graph-native shapes the SQL engine cannot express (`?s ?p ?o` crawls, property paths) stay Fluree-only regression members (a capability difference, not an A/B score).
 
 ## 1. Substrate (same physical files)
 
