@@ -64,21 +64,46 @@ pub(crate) struct WriterTerms {
     literal_slots: Vec<u32>,
     /// How far into `literal_slots` the statement in flight has consumed.
     literal_cursor: usize,
-    /// Which statement each `scoped` slot was minted in, and which statement
-    /// is in flight. Debug builds only: this is what turns "the producer lied
-    /// about its scope" from silent corruption into a panic that names it.
+    /// Which statement is in flight. Debug builds only, and stamped into each
+    /// statement-scoped id as it is minted — see [`GEN_SHIFT`].
     #[cfg(debug_assertions)]
-    scoped_generation: Vec<u64>,
-    #[cfg(debug_assertions)]
-    generation: u64,
+    generation: u32,
 }
 
 /// Marks an id as addressing the session region rather than the recycled one.
 ///
 /// The top bit, which no real index can reach: the parser refuses documents
 /// past 4 GiB and every term needs at least one byte, so a table cannot hold
-/// 2^31 entries in the first place.
+/// 2^31 entries in the first place. That argument covers the parser and not
+/// every possible producer, so [`WriterTerms::push_session`] asserts it rather
+/// than assuming it.
 const SESSION_TAG: u32 = 1 << 31;
+
+/// Debug-only: which statement a statement-scoped id was minted in, carried in
+/// the ID rather than beside the slot.
+///
+/// Stamping the slot caught only half the violation it was written for. A
+/// producer that caches an id across `end_statement` is detectable when the
+/// next statement is NARROWER — the slot keeps its old stamp and the read
+/// fails. When the next statement is at least as wide, which is the common
+/// case, the slot has already been re-minted and carries the current stamp, so
+/// the stale id read as fresh and the writer emitted the wrong term with no
+/// complaint. The reviewer's probe named it exactly: `SUBJECT-TWO` written
+/// where the producer meant `SUBJECT-ONE`.
+///
+/// Moving the stamp onto the id fixes that, because a stale id carries the
+/// generation it was minted in no matter what has happened to its slot since.
+/// Seven bits wrap every 128 statements, so an id cached across exactly a
+/// multiple of 128 statements still slips through; that is a debug-build
+/// heuristic catching an API misuse, not a soundness mechanism, and 24 bits of
+/// index (16.7M slots for the widest single statement) is the more valuable
+/// half of the split.
+#[cfg(debug_assertions)]
+const GEN_SHIFT: u32 = 24;
+#[cfg(debug_assertions)]
+const GEN_MASK: u32 = 0x7F << GEN_SHIFT;
+#[cfg(debug_assertions)]
+const INDEX_MASK: u32 = (1 << GEN_SHIFT) - 1;
 
 impl WriterTerms {
     pub(crate) fn new(labeler: BlankLabeler) -> Self {
@@ -91,8 +116,6 @@ impl WriterTerms {
             blank_ids: HashMap::new(),
             literal_slots: Vec::new(),
             literal_cursor: 0,
-            #[cfg(debug_assertions)]
-            scoped_generation: Vec::new(),
             #[cfg(debug_assertions)]
             generation: 0,
         }
@@ -135,12 +158,22 @@ impl WriterTerms {
             return &self.session[(raw & !SESSION_TAG) as usize];
         }
         #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.scoped_generation[raw as usize], self.generation,
-            "term id {raw} was minted in an earlier statement and its slot has been \
-             recycled — the producer declared TermScope::Statement and then cached an \
-             id across end_statement()",
-        );
+        {
+            let stamped = (raw & GEN_MASK) >> GEN_SHIFT;
+            debug_assert_eq!(
+                stamped,
+                self.generation & 0x7F,
+                "term id {} was minted in statement {} and read in statement {} — the \
+                 producer declared TermScope::Statement and then cached an id across \
+                 end_statement(), so this read resolves to whatever later term took \
+                 the slot",
+                raw & INDEX_MASK,
+                stamped,
+                self.generation & 0x7F,
+            );
+            return &self.scoped[(raw & INDEX_MASK) as usize];
+        }
+        #[cfg(not(debug_assertions))]
         &self.scoped[raw as usize]
     }
 
@@ -235,6 +268,17 @@ impl WriterTerms {
 
     /// Session region: grows for the document, addressed with the tag bit.
     fn push_session(&mut self, term: Term) -> TermId {
+        // The "no table can hold 2^31 entries" argument is about the parser's
+        // 4 GiB input cap, and this table serves producers that are not the
+        // parser. Assert it rather than inherit it: past this point the tag bit
+        // would collide with a real index and session ids would start reading
+        // as statement-scoped ones.
+        debug_assert!(
+            (self.session.len() as u32) < SESSION_TAG,
+            "session term table reached {} entries, where the tag bit stops being \
+             free — ids from here would alias the statement-scoped region",
+            self.session.len(),
+        );
         let id = TermId::new(self.session.len() as u32 | SESSION_TAG);
         self.session.push(term);
         id
@@ -249,13 +293,17 @@ impl WriterTerms {
             self.scoped[slot] = term;
         } else {
             self.scoped.push(term);
-            #[cfg(debug_assertions)]
-            self.scoped_generation.push(0);
         }
         #[cfg(debug_assertions)]
         {
-            self.scoped_generation[slot] = self.generation;
+            debug_assert!(
+                slot as u32 <= INDEX_MASK,
+                "statement-scoped slot {slot} does not fit in {GEN_SHIFT} bits of index — \
+                 a single statement this wide needs a different id layout",
+            );
+            return TermId::new(slot as u32 | ((self.generation & 0x7F) << GEN_SHIFT));
         }
+        #[cfg(not(debug_assertions))]
         TermId::new(slot as u32)
     }
 
