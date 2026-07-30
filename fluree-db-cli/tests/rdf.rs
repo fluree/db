@@ -14,7 +14,11 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Exit code for a document that did not parse.
-const EXIT_DOCUMENT_INVALID: i32 = 1;
+/// Bound to the CLI's own contract rather than restated as a literal: these
+/// tests assert the documented "the document is bad" code, so if
+/// `EXIT_ERROR` ever moves they move with it instead of quietly checking a
+/// number the binary no longer returns.
+const EXIT_DOCUMENT_INVALID: i32 = fluree_db_cli::error::EXIT_ERROR;
 /// Exit code for an invocation that was wrong.
 const EXIT_USAGE: i32 = 2;
 
@@ -3030,12 +3034,20 @@ fn the_profile_records_the_load_average() {
 // input over the parallel threshold piped to `head` hung, which is the default
 // path.
 //
-// Restoring the pre-fix receiver shape — the receiver borrowed from outside the
-// scope closure, so nothing can drop it before the join — makes the matrix
-// below fail at `--parallelism 4 × immediate close` in 10s while the `-o FILE`
-// control still passes. Keeping that ownership but dropping the shutdown flag
-// does *not* hang: the flag governs how promptly workers stop, the ownership
-// governs whether they stop at all.
+// Two mechanisms keep this live, and the reviewer's four-way mutation table is
+// the reason to describe them carefully: receiver ownership (the receiver is
+// borrowed from outside the scope closure, so nothing can drop it before the
+// join) and the shutdown flag. EITHER ONE ALONE SUFFICES — remove ownership and
+// the suite still passes, remove the flag and it still passes — and only
+// removing BOTH hangs. Restoring the pre-fix receiver shape on its own makes
+// the matrix below fail at `--parallelism 4 × immediate close` in 10s while the
+// `-o FILE` control still passes.
+//
+// So: either mechanism alone suffices; keep both; the mutation that proves it
+// removes both. The earlier phrasing here — "the flag governs how promptly
+// workers stop, the ownership governs whether they stop at all" — reads as
+// though the flag were a mere optimization, which invites deleting a second
+// liveness guarantee that a single-mutation test can never catch.
 
 /// `ParallelPlan::MIN_PARALLEL_BYTES`: below this an input converts serially
 /// whatever `--parallelism` says, so a fixture under it tests the wrong path.
@@ -3251,10 +3263,23 @@ fn a_mid_file_directive_falls_back_to_serial_rather_than_refusing() {
 
     let text = std::fs::read_to_string(&out).unwrap();
     assert_eq!(text.lines().count(), 80_001, "every statement converted");
+    // TWO, not one, and the difference is the #1565 parser fix.
+    //
+    // The trailing statement is `ex:z ex:p "z" .`, so BOTH its subject and its
+    // predicate sit after the rebinding and must denote the new namespace.
+    // Before #1565 only the subject moved: `ex:z` is a span the document had
+    // never used, while `ex:p` had been expanded 80,000 times already and came
+    // back from the span cache under the OLD binding. Counting one occurrence
+    // was counting the bug.
     assert_eq!(
         text.matches("second.example").count(),
-        1,
-        "the redefinition must apply to the statement after it"
+        2,
+        "the rebinding must reach the repeated predicate span, not just the fresh subject"
+    );
+    assert!(
+        text.ends_with("<http://second.example/z> <http://second.example/p> \"z\" .\n"),
+        "last line was: {:?}",
+        text.lines().next_back()
     );
 
     // And the reason is reported rather than implicit.

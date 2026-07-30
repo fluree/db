@@ -559,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn list_items_land_in_the_default_graph_because_the_protocol_has_no_quad_form() {
+    fn list_items_without_a_graph_land_in_the_default_graph() {
         // What this guarantees, precisely: the ROUTING of today's
         // `emit_list_item` is pinned, so it cannot start going somewhere else
         // unnoticed. What it does NOT do is notice a new quad-shaped event

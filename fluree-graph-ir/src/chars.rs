@@ -296,6 +296,16 @@ pub fn simple_escape(c: char) -> Option<char> {
 /// that because it gates on `is_hex_digit` while scanning, but a caller that
 /// slices first and converts second would inherit it. Gating HERE is what
 /// makes the two readers agree, which is the whole point of sharing this.
+///
+/// # Callers that slice raw bytes
+///
+/// `hex` is a `&str`, so this function cannot be handed a partial UTF-8
+/// sequence — but a caller that slices the RAW BYTES of a document to build it
+/// can panic before ever reaching here. Both current readers slice a `&str` at
+/// positions their own scanners produced, so the panic class is structurally
+/// out of reach for them; a third reader working over `&[u8]` would have to
+/// bound its slice itself. Stated because the guarantee lives at the call
+/// site, not in this signature.
 pub fn unicode_escape_value(hex: &str) -> Option<char> {
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
