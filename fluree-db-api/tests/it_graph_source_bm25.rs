@@ -1632,3 +1632,86 @@ async fn bm25_incremental_sync_matches_full_resync() {
         "the newly inserted document never reached the incremental index: {a_docs:?}"
     );
 }
+
+/// The narrowing has to reduce the work the engine does, not merely the rows it
+/// hands back. `bm25_incremental_sync_matches_full_resync` pins correctness and
+/// the `scope_tests` unit tests pin the shape of the generated clause, but
+/// neither would notice if the `values` binding were applied as a post-filter
+/// over a full scan — which is exactly the regression that would quietly undo
+/// the point of scoping the query.
+///
+/// Measured against a corpus large enough that a full scan cannot be mistaken
+/// for a narrow one, on an **indexed** ledger because that is what the sync
+/// path meets in practice: novelty holds only commits since the last index
+/// build, and everything older is in leaflets that a bound subject can seek
+/// into. Fuel on the indexed corpus is flat in corpus size when scoped and
+/// linear when not.
+#[tokio::test]
+async fn scoped_indexing_query_narrows_the_indexed_scan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/fuel:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    const CORPUS: usize = 400;
+    let docs: Vec<_> = (0..CORPUS)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:doc{i}"),
+                "@type": "ex:Doc",
+                "ex:title": format!("document number {i} with some filler text")
+            })
+        })
+        .collect();
+    fluree
+        .insert(
+            ledger0,
+            &json!({ "@context": { "ex":"http://example.org/" }, "@graph": docs }),
+        )
+        .await
+        .unwrap();
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+
+    let full = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    // The same clause `scope_indexing_query_to_subjects` builds: the single
+    // object-form select variable bound to the affected IRIs, as full IRIs.
+    let mut scoped = full.clone();
+    scoped.as_object_mut().unwrap().insert(
+        "values".to_string(),
+        json!(["?x", [{ "@id": "http://example.org/doc7" }]]),
+    );
+
+    // Strip the flat 1.000 `QUERY_FLOOR_MICRO_FUEL` charged at query entry —
+    // it is the same for both and would otherwise dominate the comparison.
+    let work = |v: Option<f64>| v.expect("tracked query reported no fuel") - 1.0;
+
+    let full_work = work(
+        support::query_jsonld_tracked(&fluree, &ledger, &full)
+            .await
+            .expect("full indexing query failed")
+            .fuel,
+    );
+    let scoped_work = work(
+        support::query_jsonld_tracked(&fluree, &ledger, &scoped)
+            .await
+            .expect("scoped indexing query failed")
+            .fuel,
+    );
+
+    // One subject out of 400 measures ~270x at the time of writing. The bound
+    // is deliberately loose: it pins the order of magnitude, so it survives
+    // unrelated changes to the fuel schedule but fails outright if the
+    // narrowing stops reaching the scan.
+    assert!(
+        scoped_work * 20.0 < full_work,
+        "scoping one subject out of {CORPUS} did not narrow the indexed scan: \
+         scoped {scoped_work} vs full {full_work} (fuel above the query floor)"
+    );
+}
