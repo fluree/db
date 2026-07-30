@@ -1580,7 +1580,7 @@ fn config_list_empty() {
 fn manifest_emits_machine_readable_surface() {
     let tmp = TempDir::new().unwrap();
     // Needs no .fluree/ directory — pure introspection of the clap tree.
-    let assert = fluree_cmd(&tmp).arg("__manifest").assert().success();
+    let assert = fluree_cmd(&tmp).arg("manifest").assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&stdout).expect("manifest is JSON");
 
@@ -1606,10 +1606,9 @@ fn manifest_emits_machine_readable_surface() {
     assert!(paths.contains(&vec!["remote", "add"]));
     assert!(paths.contains(&vec!["auth", "login"]));
     assert!(paths.contains(&vec!["model", "access", "enable"]));
-    // Hidden machine commands never leak into the teachable surface.
-    assert!(paths
-        .iter()
-        .all(|p| p.iter().all(|seg| !seg.starts_with("__"))));
+    // Hidden machine commands (this one included) never leak into the
+    // teachable surface.
+    assert!(!paths.contains(&vec!["manifest"]));
 }
 
 #[test]
@@ -1620,7 +1619,12 @@ fn config_list_redacts_credentials_unless_revealed() {
     // A remote with a stored bearer token — the shape `remote add --token`
     // and `auth login` persist (access + refresh tokens).
     fluree_cmd(&tmp)
-        .args(["config", "set", "remotes.origin.auth.token", "sekrit-access"])
+        .args([
+            "config",
+            "set",
+            "remotes.origin.auth.token",
+            "sekrit-access",
+        ])
         .assert()
         .success();
     fluree_cmd(&tmp)

@@ -23,7 +23,8 @@ fn docs_dir() -> PathBuf {
 }
 
 /// Non-hidden top-level subcommands (hidden ones — deprecated shims,
-/// machine plumbing like `__manifest` — are not documentable surface).
+/// machine plumbing like the hidden `manifest` command — are not documentable
+/// surface).
 fn visible_top_level() -> Vec<clap::Command> {
     Cli::command()
         .get_subcommands()

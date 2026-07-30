@@ -1,4 +1,4 @@
-//! `fluree __manifest` — machine-readable manifest of this binary's CLI
+//! `fluree manifest` — machine-readable manifest of this binary's CLI
 //! surface, generated from the clap definitions so it cannot drift from the
 //! binary. Hidden: consumed by CI in dependent repos (fluree/solo,
 //! fluree/claude-plugins) to validate the `fluree ...` command strings they
@@ -26,8 +26,7 @@ pub fn run(output: Option<&Path>) -> CliResult<()> {
     let manifest = build_manifest();
     // Infallible: a serde_json::Value has no non-string keys or fallible
     // serializers.
-    let rendered =
-        serde_json::to_string_pretty(&manifest).expect("manifest Value serializes");
+    let rendered = serde_json::to_string_pretty(&manifest).expect("manifest Value serializes");
     match output {
         Some(path) => {
             std::fs::write(path, rendered)
@@ -183,12 +182,13 @@ mod tests {
     #[test]
     fn manifest_excludes_hidden_commands() {
         let m = manifest();
-        for p in paths(&m) {
-            assert!(
-                !p.iter().any(|seg| seg.starts_with("__")),
-                "hidden machine command leaked into manifest: {p:?}"
-            );
-        }
+        let ps = paths(&m);
+        // This command is itself hidden, so it must not appear in its own
+        // output — the canary for hidden-command exclusion in general.
+        assert!(
+            !ps.contains(&vec!["manifest".to_string()]),
+            "hidden machine command leaked into manifest"
+        );
     }
 
     #[test]
@@ -235,7 +235,10 @@ mod tests {
             .iter()
             .filter_map(|f| f["long"].as_str())
             .collect();
-        assert!(globals.contains(&"memory-budget-mb"), "globals: {globals:?}");
+        assert!(
+            globals.contains(&"memory-budget-mb"),
+            "globals: {globals:?}"
+        );
     }
 
     #[test]

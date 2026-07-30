@@ -953,8 +953,10 @@ pub enum Commands {
     /// Hidden machine plumbing: generated from the clap definitions (command
     /// paths, flags, value enums, positionals, compiled features — no help
     /// text), published as a release asset, and consumed by CI in dependent
-    /// repos to validate the `fluree ...` strings they ship.
-    #[command(name = "__manifest", hide = true)]
+    /// repos to validate the `fluree ...` strings they ship. Named without a
+    /// `__` prefix because clap_complete's bash generator uses `__` as its
+    /// command-path separator and panics on such names.
+    #[command(hide = true)]
     Manifest {
         /// Write to a file instead of stdout
         #[arg(long, short = 'o')]
