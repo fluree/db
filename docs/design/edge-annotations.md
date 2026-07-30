@@ -179,6 +179,14 @@ Multi-source default-graph datasets (`from: [g1, g2]`) wrap each expanded chain 
 
 A rel var whose properties are read anywhere (`r.prop`, `properties(r)`, …) lowers to this REQUIRED chain — unreified edges do not match, per Cypher's relationship semantics. Value-only rel vars keep the plain base triple + OPTIONAL probe so unreified edges match with a synthesized relationship value.
 
+#### Buffering and the sweep ceiling
+
+**Both probe lanes are pipeline breakers.** `next_batch` runs the probe to completion before emitting the first row, so a query with a small `LIMIT` over a large driving side pays the full probe rather than stopping early. This is inherited behavior — the arena lane has always buffered — but the hash lane adds a sweep of the *base* edges on top of it, so the over-read is larger there. `PlanningContext` carries no limit, so a LIMIT-aware gate would need real plumbing; until then, treat the buffering as the lane's cost model rather than an oversight.
+
+`base_sweep_bounded` caps that sweep at `BASE_SWEEP_MAX_ROWS = 20_000_000` rows, measured as the predicate's flake count for a typed relationship and `stats.total_property_flakes()` (the whole default graph) for an untyped one. The number is a **backstop against pathological graphs, not a tuned optimum**: the lane was validated at ~190k reified edges over 72k nodes, so 20M is roughly 100× the measured scale, chosen as the point where one sequential sweep (tens of millions of rows through a planned scan) stops being obviously cheaper than the per-row probes it replaces. Nothing between the validated scale and the ceiling has been measured; a future tuner wanting a defensible value should benchmark the sweep against the nested-loop alternative at 1M/5M/20M and set the crossover from data.
+
+One sharp edge inside the sweep: `keep_all` disables the driving-subject filter entirely if **any single** driving row leaves the subject unbound, flipping the sweep from "filtered to the driving subjects" to "every base edge in the graph." That is correct — an unbound subject can match any edge — but it is a cliff, not a gradient, and it is not visible from the gate names.
+
 ## See also
 
 - [Edge annotations (concept doc)](../concepts/edge-annotations.md) — the user-facing surface.

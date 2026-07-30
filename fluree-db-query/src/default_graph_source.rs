@@ -275,6 +275,10 @@ impl DefaultGraphSourceOperator {
         &self,
         shape: &crate::annotation_edge_probe::AnnotationEdgeShape,
     ) -> bool {
+        // Backstop against pathological graphs, not a tuned optimum: ~100x
+        // the validated scale (~190k reified edges / 72k nodes). See
+        // docs/design/edge-annotations.md ("Buffering and the sweep
+        // ceiling") for the derivation and what to measure to replace it.
         const BASE_SWEEP_MAX_ROWS: u64 = 20_000_000;
         let Some(stats) = self.stats.as_deref() else {
             return true;
