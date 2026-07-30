@@ -37,7 +37,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | `-q, --quiet` | Suppress non-essential output |
 | `--no-color` | Disable colored output (also respects `NO_COLOR` env var) |
 | `--config <PATH>` | Path to config file |
-| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: 60% of system RAM). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. Set this to cap memory use; auto-detected thread count shrinks to fit it. |
+| `--memory-budget-mb <MB>` | Memory budget in MB for bulk import (0 = auto: **80% of system RAM** — sized for a dedicated machine). Affects chunk size, concurrency, and run budget when creating a ledger with `--from`. On a machine running anything else (IDE, Docker, a demo recorder), always pass an explicit budget — the auto default assumes it owns the box and can OOM a co-resident workload. Auto-detected thread count shrinks to fit the budget. |
 | `--parallelism <N>` | Number of parallel parse threads for bulk import (0 = auto: most logical cores, capped to fit the memory budget; explicit values honored as-is, floored at 1). Used when creating a ledger with `--from`. |
 | `-h, --help` | Print help |
 | `-V, --version` | Print version |
