@@ -1164,8 +1164,6 @@ impl ChunkSource {
                     }
                     // The channel closed. That is either a finished read or a
                     // dead reader, and only the join distinguishes them.
-                    // The channel closed. That is either a finished read or a
-                    // dead reader, and only the join distinguishes them.
                     None => {
                         reader.join().map_err(|e| {
                             ImportError::NoChunks(format!("streaming read failed: {e}"))
