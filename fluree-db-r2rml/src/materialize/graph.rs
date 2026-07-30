@@ -570,6 +570,18 @@ pub struct MaterializationPlan {
     pub emit_order: Vec<String>,
     /// TriplesMap IRIs to pre-index before emission.
     pub preindex: HashSet<String>,
+    /// Topological WAVES over `emit_order` for the streaming index-during-emit
+    /// driver (O5(c)). Each inner `Vec` is a set of TriplesMaps that share no
+    /// foreign-key parent→child edge, so they can be scanned and emitted
+    /// concurrently; every non-preindex foreign-key parent appears in a strictly
+    /// earlier wave than the children that reference it. Because a parent's
+    /// key → subject index is built DURING its own single emit scan
+    /// (index-during-emit), a non-preindex parent is scanned exactly once for the
+    /// build — the double read (separate pre-index pass + emit pass) is eliminated.
+    /// Pre-indexed parents (cyclic / self-referential) are resident before wave 0
+    /// and impose no wave constraint. Flattening `waves` in order yields a valid
+    /// emit order equivalent (same triple set) to `emit_order`.
+    pub waves: Vec<Vec<String>>,
 }
 
 /// Compute the [`MaterializationPlan`] for a mapping.
@@ -577,11 +589,66 @@ pub fn plan(mapping: &CompiledR2rmlMapping) -> MaterializationPlan {
     let (order, cyclic) = dependency_order(mapping);
     let mut preindex: HashSet<String> = cyclic.iter().cloned().collect();
     preindex.extend(self_referential(mapping));
-    let emit_order = order.into_iter().chain(cyclic).collect();
+    let emit_order: Vec<String> = order.into_iter().chain(cyclic).collect();
+    let waves = dependency_waves(mapping, &emit_order, &preindex);
     MaterializationPlan {
         emit_order,
         preindex,
+        waves,
     }
+}
+
+/// Partition `emit_order` into topological waves for the index-during-emit driver
+/// (see [`MaterializationPlan::waves`]). A table's wave is one past the latest wave
+/// of any foreign-key parent whose index is built during emit (a non-preindex
+/// parent); pre-indexed parents (already resident before wave 0) and self-edges
+/// impose no constraint. `emit_order` must already be a valid dims-first order, so
+/// every parent's wave is finalized before its child is visited.
+fn dependency_waves(
+    mapping: &CompiledR2rmlMapping,
+    emit_order: &[String],
+    preindex: &HashSet<String>,
+) -> Vec<Vec<String>> {
+    // The only edges that gate a wave: a non-preindex foreign-key parent of a
+    // child (a pre-indexed parent is available before any wave, so it constrains
+    // nothing). Self-edges and edges to unknown parents are ignored.
+    let mut fk_parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    for tm in mapping.triples_maps.values() {
+        for pom in &tm.predicate_object_maps {
+            if let ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                let parent = rom.parent_triples_map.as_str();
+                if parent != tm.iri
+                    && !preindex.contains(parent)
+                    && mapping.triples_maps.contains_key(parent)
+                {
+                    fk_parents.entry(tm.iri.as_str()).or_default().push(parent);
+                }
+            }
+        }
+    }
+    // depth(c) = 0 if c has no non-preindex parent, else 1 + max(depth of them).
+    // Processing in emit_order (topological) guarantees each parent's depth exists.
+    let mut depth: HashMap<&str, usize> = HashMap::new();
+    for iri in emit_order {
+        let d = fk_parents
+            .get(iri.as_str())
+            .map(|ps| {
+                ps.iter()
+                    .map(|p| depth.get(p).copied().unwrap_or(0) + 1)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        depth.insert(iri.as_str(), d);
+    }
+    let max_depth = depth.values().copied().max().unwrap_or(0);
+    let mut waves: Vec<Vec<String>> = vec![Vec::new(); max_depth + 1];
+    // Preserve emit_order within each wave for deterministic dispatch.
+    for iri in emit_order {
+        waves[depth[iri.as_str()]].push(iri.clone());
+    }
+    waves.retain(|w| !w.is_empty());
+    waves
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +698,63 @@ pub fn enumerate_from_batches(
                 emit_batch(tm, batch, &parents, observer, &mut stats)?;
             }
         }
+    }
+    Ok(stats)
+}
+
+/// Enumerate a mapping following the WAVE schedule with index-during-emit — the
+/// shape the streaming parallel driver (`drive_virtual_import`, O5(c)) follows:
+/// each non-preindex foreign-key parent is indexed DURING its own single emit scan
+/// (no separate pre-index pass), children in later waves read the completed parent
+/// indexes, and only cyclic / self-referential parents are pre-indexed up front.
+/// Provided here over in-memory batches so the wave scheduling can be verified
+/// against the [`enumerate_from_batches`] reference for triple-set identity without
+/// a provider or a runtime. Produces the SAME triple set as `enumerate_from_batches`
+/// because both index every parent before its children emit — only the mechanics of
+/// WHEN the index is built differ (lazy-during-single-pass vs wave-local).
+pub fn enumerate_by_waves(
+    mapping: &CompiledR2rmlMapping,
+    batches: &HashMap<String, Vec<ColumnBatch>>,
+    observer: &mut dyn TripleObserver,
+) -> R2rmlResult<MaterializeStats> {
+    let mut parents = ParentIndexSet::new(mapping)?;
+    let materialization = plan(mapping);
+
+    // Fallback: fully pre-index cyclic / self-referential parents up front (they
+    // cannot be indexed during a single forward emit scan). Acyclic schemas index
+    // nothing here.
+    for tm_iri in &materialization.preindex {
+        if let (Some(tm), Some(tm_batches)) =
+            (mapping.triples_maps.get(tm_iri), batches.get(tm_iri))
+        {
+            for batch in tm_batches {
+                parents.index_batch(tm, batch)?;
+            }
+        }
+    }
+
+    let mut stats = MaterializeStats::default();
+    for wave in &materialization.waves {
+        // Index this wave's non-preindex parents into a wave-local set DURING their
+        // own emit scan; the cumulative `parents` (earlier waves + fallback) stays
+        // frozen for the wave's emits — no table in a wave depends on another in it.
+        let mut wave_local = parents.split_empty();
+        for tm_iri in wave {
+            let Some(tm) = mapping.triples_maps.get(tm_iri) else {
+                continue;
+            };
+            let index_here =
+                !materialization.preindex.contains(tm_iri) && parents.is_parent(tm_iri);
+            if let Some(tm_batches) = batches.get(tm_iri) {
+                for batch in tm_batches {
+                    if index_here {
+                        wave_local.index_batch(tm, batch)?;
+                    }
+                    emit_batch(tm, batch, &parents, observer, &mut stats)?;
+                }
+            }
+        }
+        parents.merge_from(wave_local);
     }
     Ok(stats)
 }
@@ -1099,6 +1223,225 @@ mod tests {
         assert!(
             format!("{err}").contains("no join conditions"),
             "got: {err}"
+        );
+    }
+
+    // ------- wave scheduling (O5(c)) -------
+
+    /// A two-level chain Region → Country → City: Country is BOTH a child (of
+    /// Region) and a parent (of City), so it must land in its own wave between them.
+    fn chain_mapping() -> CompiledR2rmlMapping {
+        let mut region = TriplesMap::new("<#Region>", "dw.region");
+        region.subject_map =
+            SubjectMap::template("http://ex.org/region/{r_key}").with_class("http://ex.org/Region");
+
+        let mut country = TriplesMap::new("<#Country>", "dw.country");
+        country.subject_map = SubjectMap::template("http://ex.org/country/{c_key}")
+            .with_class("http://ex.org/Country");
+        country.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/inRegion"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Region>",
+                "region_key",
+                "r_key",
+            )),
+        }];
+
+        let mut city = TriplesMap::new("<#City>", "dw.city");
+        city.subject_map =
+            SubjectMap::template("http://ex.org/city/{y_key}").with_class("http://ex.org/City");
+        city.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/inCountry"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                "<#Country>",
+                "country_key",
+                "c_key",
+            )),
+        }];
+
+        CompiledR2rmlMapping::new(vec![city, country, region]) // reversed insertion
+    }
+
+    fn chain_batches() -> HashMap<String, Vec<ColumnBatch>> {
+        let region_schema = Arc::new(BatchSchema::new(vec![field(
+            "r_key",
+            FieldType::Int64,
+            false,
+            1,
+        )]));
+        let region =
+            ColumnBatch::new(region_schema, vec![Column::Int64(vec![Some(1), Some(2)])]).unwrap();
+
+        let country_schema = Arc::new(BatchSchema::new(vec![
+            field("c_key", FieldType::Int64, false, 1),
+            field("region_key", FieldType::Int64, true, 2),
+        ]));
+        // country 10 → region 1 (match); country 20 → region 9 (dangling).
+        let country = ColumnBatch::new(
+            country_schema,
+            vec![
+                Column::Int64(vec![Some(10), Some(20)]),
+                Column::Int64(vec![Some(1), Some(9)]),
+            ],
+        )
+        .unwrap();
+
+        let city_schema = Arc::new(BatchSchema::new(vec![
+            field("y_key", FieldType::Int64, false, 1),
+            field("country_key", FieldType::Int64, true, 2),
+        ]));
+        // city 100 → country 10 (match); city 200 → country 99 (dangling).
+        let city = ColumnBatch::new(
+            city_schema,
+            vec![
+                Column::Int64(vec![Some(100), Some(200)]),
+                Column::Int64(vec![Some(10), Some(99)]),
+            ],
+        )
+        .unwrap();
+
+        let mut m = HashMap::new();
+        m.insert("<#Region>".to_string(), vec![region]);
+        m.insert("<#Country>".to_string(), vec![country]);
+        m.insert("<#City>".to_string(), vec![city]);
+        m
+    }
+
+    #[test]
+    fn waves_layer_parents_strictly_before_children() {
+        // Star: Customer (parent) in an earlier wave than Order (child).
+        let star = plan(&star_mapping());
+        let wave_of = |p: &MaterializationPlan, iri: &str| {
+            p.waves.iter().position(|w| w.iter().any(|t| t == iri))
+        };
+        assert!(
+            wave_of(&star, "<#Customer>") < wave_of(&star, "<#Order>"),
+            "parent must be an earlier wave than child: {:?}",
+            star.waves
+        );
+        // Two-level chain: Region < Country < City, three distinct waves.
+        let chain = plan(&chain_mapping());
+        assert!(wave_of(&chain, "<#Region>") < wave_of(&chain, "<#Country>"));
+        assert!(wave_of(&chain, "<#Country>") < wave_of(&chain, "<#City>"));
+        assert_eq!(
+            chain.waves.len(),
+            3,
+            "chain has three waves: {:?}",
+            chain.waves
+        );
+    }
+
+    #[test]
+    fn waves_flatten_to_all_tables_once() {
+        let chain = plan(&chain_mapping());
+        let mut flat: Vec<String> = chain.waves.iter().flatten().cloned().collect();
+        flat.sort();
+        let mut expected = chain.emit_order.clone();
+        expected.sort();
+        assert_eq!(flat, expected, "waves must cover emit_order exactly once");
+    }
+
+    #[test]
+    fn wave_scheduling_matches_reference_triples() {
+        // The wave schedule (index-during-emit) must produce the identical triple
+        // multiset and stats as the reference dims-first enumerator, on fixtures
+        // with FK parents — including a parent that is also a child (the chain).
+        for (name, mapping, batches) in [
+            ("star", star_mapping(), star_batches()),
+            ("chain", chain_mapping(), chain_batches()),
+        ] {
+            let (ref_triples, ref_stats) = run(&mapping, &batches);
+            let mut collector = NTriplesCollector::default();
+            let wave_stats = enumerate_by_waves(&mapping, &batches, &mut collector).unwrap();
+            assert_eq!(
+                collector.sorted_unique(),
+                ref_triples,
+                "{name}: wave schedule triple set must match the reference"
+            );
+            assert_eq!(
+                wave_stats, ref_stats,
+                "{name}: wave schedule stats must match"
+            );
+        }
+        // The chain must actually resolve both FK levels (proves index-during-emit
+        // built Country's index before City emitted, and Region's before Country).
+        let mut c = NTriplesCollector::default();
+        enumerate_by_waves(&chain_mapping(), &chain_batches(), &mut c).unwrap();
+        let triples = c.sorted_unique();
+        assert!(triples
+            .iter()
+            .any(|t| t.contains("/country/10>") && t.contains("inRegion")));
+        assert!(triples
+            .iter()
+            .any(|t| t.contains("/city/100>") && t.contains("inCountry")));
+    }
+
+    #[test]
+    fn cyclic_tables_fall_back_to_preindex_and_resolve() {
+        // A ↔ B mutual foreign keys: both land in `preindex` (the fallback), and the
+        // wave schedule still emits identical triples to the reference (the fallback
+        // pre-indexes both up front; no index-during-emit for either).
+        let mut a = TriplesMap::new("<#A>", "dw.a");
+        a.subject_map = SubjectMap::template("http://ex.org/a/{id}").with_class("http://ex.org/A");
+        a.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/toB"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#B>", "b_ref", "id")),
+        }];
+        let mut b = TriplesMap::new("<#B>", "dw.b");
+        b.subject_map = SubjectMap::template("http://ex.org/b/{id}").with_class("http://ex.org/B");
+        b.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/toA"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#A>", "a_ref", "id")),
+        }];
+        let mapping = CompiledR2rmlMapping::new(vec![a, b]);
+
+        let plan = plan(&mapping);
+        assert!(
+            plan.preindex.contains("<#A>") && plan.preindex.contains("<#B>"),
+            "a mutual FK cycle must fall back to pre-indexing both tables: {:?}",
+            plan.preindex
+        );
+
+        let a_schema = Arc::new(BatchSchema::new(vec![
+            field("id", FieldType::Int64, false, 1),
+            field("b_ref", FieldType::Int64, true, 2),
+        ]));
+        let a_batch = ColumnBatch::new(
+            a_schema,
+            vec![
+                Column::Int64(vec![Some(1)]),
+                Column::Int64(vec![Some(2)]), // A/1 → B/2
+            ],
+        )
+        .unwrap();
+        let b_schema = Arc::new(BatchSchema::new(vec![
+            field("id", FieldType::Int64, false, 1),
+            field("a_ref", FieldType::Int64, true, 2),
+        ]));
+        let b_batch = ColumnBatch::new(
+            b_schema,
+            vec![
+                Column::Int64(vec![Some(2)]),
+                Column::Int64(vec![Some(1)]), // B/2 → A/1
+            ],
+        )
+        .unwrap();
+        let mut batches = HashMap::new();
+        batches.insert("<#A>".to_string(), vec![a_batch]);
+        batches.insert("<#B>".to_string(), vec![b_batch]);
+
+        let (ref_triples, ref_stats) = run(&mapping, &batches);
+        let mut collector = NTriplesCollector::default();
+        let wave_stats = enumerate_by_waves(&mapping, &batches, &mut collector).unwrap();
+        assert_eq!(
+            collector.sorted_unique(),
+            ref_triples,
+            "cyclic: wave schedule must match the reference triple set"
+        );
+        assert_eq!(wave_stats, ref_stats);
+        assert_eq!(
+            ref_stats.ref_triples, 2,
+            "both cyclic FK edges must resolve"
         );
     }
 }
