@@ -91,7 +91,7 @@ def exec_query(tgt, bound_sql, is_iceberg, sink_path, timeout_s):
     script += preamble(tgt)
     script += ".output %s\n" % sink_path
     script += bound_sql.strip().rstrip(";") + ";\n"
-    cmd = ["/usr/bin/time", "-l"] + tgt.get("arch_prefix", []) + [tgt["bin"]]
+    cmd = common.time_argv() + tgt.get("arch_prefix", []) + [tgt["bin"]]
     out, err_txt, rc, timed_out, proc_ms = common.run_capped(cmd, script, None, timeout_s)
     if timed_out:
         return {"wall_ms": None, "setup_ms": None, "proc_ms": proc_ms, "rss": None,

@@ -1,13 +1,24 @@
-"""Engine-neutral helpers shared by the adapters: capped subprocess execution and the
-resource/timer parsers. Nothing here is specific to any engine."""
+"""Engine-neutral helpers shared by the adapters: capped subprocess execution, the
+/usr/bin/time invocation, and the resource/timer parsers. Portable across macOS (BSD time)
+and Linux (GNU time). Nothing here is specific to any engine."""
 import os
+import platform
 import re
 import signal
 import subprocess
 import time
 
-TIMER_RE = re.compile(r"real\s+([0-9.]+)")                 # duckdb ".timer" line
-RSS_RE = re.compile(r"(\d+)\s+maximum resident set size")  # /usr/bin/time -l (bytes on macOS)
+TIMER_RE = re.compile(r"real\s+([0-9.]+)")                          # duckdb ".timer" line
+RSS_BYTES_RE = re.compile(r"(\d+)\s+maximum resident set size")     # BSD/macOS `time -l` (bytes)
+RSS_KB_RE = re.compile(r"[Mm]aximum resident set size \(kbytes\):\s*(\d+)")  # GNU `time -v` (KB)
+
+
+def time_argv():
+    """The /usr/bin/time invocation for this OS. GNU time (Linux) uses -v and reports RSS in
+    KB; BSD time (macOS) uses -l and reports RSS in bytes. parse_rss() normalizes both to bytes."""
+    if platform.system() == "Linux":
+        return ["/usr/bin/time", "-v"]
+    return ["/usr/bin/time", "-l"]
 
 
 def parse_reals(text):
@@ -15,8 +26,14 @@ def parse_reals(text):
 
 
 def parse_rss(text):
-    m = RSS_RE.search(text)
-    return int(m.group(1)) if m else None
+    """Peak RSS in BYTES, from either BSD `time -l` (bytes) or GNU `time -v` (KB)."""
+    m = RSS_BYTES_RE.search(text)
+    if m:
+        return int(m.group(1))
+    m = RSS_KB_RE.search(text)
+    if m:
+        return int(m.group(1)) * 1024
+    return None
 
 
 def run_capped(cmd, input_text, cwd, timeout_s, env=None):

@@ -62,7 +62,7 @@ def run_cli(tgt, rq_text, mode, timeout_s):
     env.update(tgt.get("env", {}))
     if mode == "cold":
         clear_cache()
-    cmd = ["/usr/bin/time", "-l", tgt["fluree_bin"], "query", "--config", tgt["config"],
+    cmd = common.time_argv() + [tgt["fluree_bin"], "query", "--config", tgt["config"],
            "--connection", "--sparql", "--format", "json", "--track-time", "-e", q]
     out, err_txt, rc, timed_out, proc_ms = common.run_capped(cmd, None, None, timeout_s, env)
     rss = common.parse_rss(err_txt)
@@ -85,7 +85,7 @@ def run_cli(tgt, rq_text, mode, timeout_s):
 def run_live(tgt, corpus_id, mode, timeout_s):
     """One fresh vbench exec-one process against a live catalog target."""
     cold_flag = ["--cold"] if mode == "cold" else []
-    cmd = ["/usr/bin/time", "-l", tgt["vbench_bin"], "exec-one",
+    cmd = common.time_argv() + [tgt["vbench_bin"], "exec-one",
            "--query", corpus_id, "--target", tgt["target"]] + cold_flag
     out, err_txt, rc, timed_out, proc_ms = common.run_capped(
         cmd, None, tgt.get("vbench_cwd"), timeout_s)
