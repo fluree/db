@@ -59,6 +59,22 @@ impl ParallelConfig {
     /// overhead saves.
     pub const DEFAULT_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 
+    /// How many bytes of converted output may wait to be written.
+    ///
+    /// Every worker needs room for one chunk's output or the pool serializes,
+    /// and N-Triples output runs several times its Turtle input — so the floor
+    /// is `workers × chunk_bytes × 4`, and the ceiling stops a wide pool on
+    /// large chunks from reserving a gigabyte. The clamp only binds at extremes:
+    /// 16 workers on 2.3 MB chunks want 147 MB and get it.
+    pub fn output_budget_bytes(&self, workers: usize) -> usize {
+        const FLOOR: usize = 32 * 1024 * 1024;
+        const CEILING: usize = 256 * 1024 * 1024;
+        let want = (workers as u64)
+            .saturating_mul(self.chunk_bytes)
+            .saturating_mul(4);
+        (want as usize).clamp(FLOOR, CEILING)
+    }
+
     /// Size chunks so every worker gets several, without going under a floor
     /// where per-chunk overhead dominates.
     pub fn for_input(workers: usize, input_len: usize) -> Self {
@@ -123,6 +139,69 @@ pub fn can_chunk_input(syntax: RdfSyntax) -> bool {
         syntax,
         RdfSyntax::Turtle | RdfSyntax::NTriples | RdfSyntax::NQuads
     )
+}
+
+/// A byte budget for converted output waiting to be written.
+///
+/// The channel bounds how many CHUNKS are in flight, which is not a bound on
+/// memory: one chunk's N-Triples output is several times its Turtle input, and
+/// the reorder buffer is unbounded besides — an early chunk that finishes last
+/// parks every later chunk in `pending` with nothing to cap the pile. At 16
+/// workers on a 4 million triple corpus that was ~200 MB of buffered output and
+/// a run sitting near a gigabyte.
+///
+/// Workers wait here before taking work, never while holding a finished chunk.
+/// That ordering is what makes it deadlock-free: the writer never waits on this
+/// budget, so it always drains, so the bytes a waiting worker needs released
+/// are always on their way out.
+struct OutputBudget {
+    limit: usize,
+    held: std::sync::Mutex<usize>,
+    room: std::sync::Condvar,
+}
+
+impl OutputBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            held: std::sync::Mutex::new(0),
+            room: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Block until the budget is under its limit. `false` means shut down.
+    ///
+    /// Under-limit rather than room-for-one-more, because a chunk's output size
+    /// is unknown until it has been produced. The overshoot is therefore one
+    /// chunk per worker, which is exactly the memory the pool needs to work at
+    /// all.
+    fn wait_for_room(&self, shutdown: &std::sync::atomic::AtomicBool) -> bool {
+        let mut held = self.held.lock().unwrap();
+        while *held >= self.limit {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            // Timed, so a worker cannot miss the shutdown flag being set
+            // between the check above and the wait below.
+            let (next, _) = self
+                .room
+                .wait_timeout(held, std::time::Duration::from_millis(50))
+                .unwrap();
+            held = next;
+        }
+        !shutdown.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn charge(&self, bytes: usize) {
+        *self.held.lock().unwrap() += bytes;
+    }
+
+    fn release(&self, bytes: usize) {
+        let mut held = self.held.lock().unwrap();
+        *held = held.saturating_sub(bytes);
+        drop(held);
+        self.room.notify_all();
+    }
 }
 
 /// Renames a collector's anonymous mints into a per-chunk namespace.
@@ -476,16 +555,27 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
     // Capacity >= workers so a worker can always deposit and never blocks
     // holding the chunk the writer is waiting for.
     let (tx, rx) = std::sync::mpsc::sync_channel::<ChunkBytes>(workers.max(2));
+    let budget = OutputBudget::new(config.output_budget_bytes(workers));
 
     std::thread::scope(|scope| -> Result<ParallelOutcome, ParallelFailure> {
         let next = &next;
         let shutdown = &shutdown;
+        let budget = &budget;
 
         for _ in 0..workers {
             let tx = tx.clone();
             scope.spawn(move || {
                 loop {
                     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    // Wait for room BEFORE taking work, never while holding a
+                    // finished chunk. A worker that blocked with output in hand
+                    // could be holding the very chunk the writer is waiting
+                    // for, which is the deadlock this pool has already had
+                    // once; waiting here cannot, because a waiting worker holds
+                    // nothing.
+                    if !budget.wait_for_room(shutdown) {
                         break;
                     }
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -501,9 +591,12 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                         syntax,
                         writer_config,
                     );
+                    let produced_bytes = produced.bytes.len();
+                    budget.charge(produced_bytes);
                     // A closed receiver is the other half of the same signal:
                     // the writer is gone, so there is nothing left to do.
                     if tx.send(produced).is_err() {
+                        budget.release(produced_bytes);
                         break;
                     }
                 }
@@ -533,6 +626,11 @@ pub fn convert_parallel_bytes<W: std::io::Write>(
                 if first_error.is_none() {
                     first_error = ready.error;
                 }
+                // Released here, not when the chunk is dropped: this iteration
+                // owns the last reference to those bytes, and a worker blocked
+                // on the budget should be freed the moment the memory is
+                // reclaimable rather than one loop later.
+                budget.release(ready.bytes.len());
                 if let Err(e) = out.write_all(&ready.bytes) {
                     // Terminate the pool before anything else. Setting the flag
                     // stops workers that have not yet blocked; dropping the
@@ -638,9 +736,19 @@ fn write_chunk(
     syntax: RdfSyntax,
     writer_config: &fluree_graph_format::WriterConfig,
 ) -> ChunkBytes {
-    let mut doc = String::with_capacity(prefix_block.len() + body.len());
-    doc.push_str(prefix_block);
-    doc.push_str(body);
+    // Only copy when there is a prelude to prepend. The line formats have no
+    // directives, so their prefix block is empty and every chunk was being
+    // copied into a fresh String to no purpose — ~80 MB of pointless copying on
+    // a 4 million triple N-Triples corpus, which is also the case where the
+    // chunks are biggest.
+    let doc: std::borrow::Cow<'_, str> = if prefix_block.is_empty() {
+        std::borrow::Cow::Borrowed(body)
+    } else {
+        let mut owned = String::with_capacity(prefix_block.len() + body.len());
+        owned.push_str(prefix_block);
+        owned.push_str(body);
+        std::borrow::Cow::Owned(owned)
+    };
 
     // Preserve, because the labels reaching the writer are already the final
     // ones: `DeterministicBlanks` has done the renaming that makes them
