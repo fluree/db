@@ -714,28 +714,72 @@ pub fn accumulate(
             fresh.host.describe(),
         ));
     }
+    // Revision identity is compared as a whole, INCLUDING absence. Requiring
+    // both sides `Some` left a two-step laundering path: one pass with no git
+    // reset the accumulator's sha to `None`, and the next pass at any revision
+    // then sailed through a guard that needed two `Some`s to fire. A sample
+    // whose revision is unknowable is precisely the one that cannot be pooled
+    // safely, so `None` vs `Some` is drift like any other. Both-absent stays
+    // fine — a tarball or container build has nothing to disagree about.
     if !opts.allow_revision_drift {
-        if let (Some(prev_sha), Some(fresh_sha)) = (&prev.git_sha, &fresh.git_sha) {
-            if !prev_sha.is_empty() && !fresh_sha.is_empty() && prev_sha != fresh_sha {
-                return Err(format!(
-                    "refusing to accumulate across revisions: existing samples were captured at \
-                     {prev_sha}, this run at {fresh_sha}. Pooling them mixes pre- and \
-                     post-change populations, relabels every sample as {fresh_sha}, and can widen \
-                     the MAD enough to hide the change being measured. Pass \
-                     --allow-revision-drift if the difference is genuinely irrelevant."
-                ));
-            }
+        let norm = |s: &Option<String>| s.clone().filter(|v| !v.is_empty());
+        let (prev_sha, fresh_sha) = (norm(&prev.git_sha), norm(&fresh.git_sha));
+        if prev_sha != fresh_sha {
+            let describe = |s: &Option<String>| {
+                s.clone()
+                    .unwrap_or_else(|| "an unknown revision (no git)".to_string())
+            };
+            return Err(format!(
+                "refusing to accumulate across revisions: existing samples were captured at {}, \
+                 this run at {}. Pooling them mixes populations, relabels every sample as the \
+                 latter, and can widen the MAD enough to hide the change being measured. Pass \
+                 --allow-revision-drift if the difference is genuinely irrelevant.",
+                describe(&prev_sha),
+                describe(&fresh_sha),
+            ));
         }
     }
-    for id in prev.entries.keys() {
-        if !fresh.entries.contains_key(id) {
-            continue;
-        }
-        if let Some(detail) = corpus_refusal(prev.corpus_for(id), fresh.corpus_for(id)) {
-            return Err(format!(
-                "refusing to accumulate for {id}: {detail}. Samples over different inputs cannot \
-                 be pooled into one median/MAD."
-            ));
+
+    // Corpus identity is checked over the UNION of scenario ids, not the
+    // intersection. Checking only the overlap left the carry-forward path
+    // below free to re-insert a prev-only entry into a file whose file-level
+    // corpus is `fresh`'s — silently relabelling samples that were measured
+    // against something else. Same defect class as `(Some, None)`, one path
+    // over.
+    let ids: BTreeSet<&String> = prev.entries.keys().chain(fresh.entries.keys()).collect();
+    let mut carried_corpus: BTreeMap<String, CorpusInfo> = BTreeMap::new();
+    for id in ids {
+        let prev_resolved = prev.corpus_for(id);
+        let fresh_resolved = fresh.corpus_for(id);
+        if prev.entries.contains_key(id) && fresh.entries.contains_key(id) {
+            if let Some(detail) = corpus_refusal(prev_resolved, fresh_resolved) {
+                return Err(format!(
+                    "refusing to accumulate for {id}: {detail}. Samples over different inputs \
+                     cannot be pooled into one median/MAD."
+                ));
+            }
+        } else if prev.entries.contains_key(id) {
+            // Carried forward, not re-measured. Preserve the identity it had
+            // rather than letting it inherit the new file-level corpus.
+            match (prev_resolved, fresh_resolved) {
+                (Some(p), f) if Some(&p.sha256) != f.map(|c| &c.sha256) => {
+                    carried_corpus.insert(id.clone(), p.clone());
+                }
+                (None, Some(f)) => {
+                    // Nothing to stamp: "explicitly no corpus" cannot be
+                    // expressed through inheritance, so the entry would claim
+                    // an identity its samples never had.
+                    return Err(format!(
+                        "refusing to accumulate: {id} is carried forward with no recorded corpus, \
+                         but this run declares a file-level corpus '{}' (sha256:{}) that it would \
+                         silently inherit. Start a new accumulation instead of retro-labelling \
+                         existing samples.",
+                        f.name,
+                        short_hash(&f.sha256),
+                    ));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -761,9 +805,15 @@ pub fn accumulate(
                 samples.push(entry.mean_ns);
                 entry.noise = Some(NoiseStats::from_samples(samples));
             }
-            // Not rerun this pass: carry the previous entry forward whole.
+            // Not rerun this pass: carry the previous entry forward whole,
+            // stamping the corpus it actually resolved to so the new
+            // file-level block can't relabel it.
             _ => {
-                out.entries.insert(id.clone(), prev_entry.clone());
+                let mut carried = prev_entry.clone();
+                if let Some(c) = carried_corpus.get(id) {
+                    carried.corpus = Some(c.clone());
+                }
+                out.entries.insert(id.clone(), carried);
             }
         }
     }
@@ -2401,16 +2451,30 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_allows_a_matching_or_absent_revision() {
-        // Same sha: normal loop. Absent sha (no git): nothing to compare.
+    fn accumulate_allows_a_matching_revision() {
         let mut prev = file_of("local", vec![("g/q1/small", entry(1000.0))]);
         let mut fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
         prev.git_sha = Some("aaaaaaa".into());
         fresh.git_sha = Some("aaaaaaa".into());
         assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
+    }
 
+    /// Revision identity now includes ABSENCE (R2). One-sided `None` used to be
+    /// waved through, and that is the laundering step: a no-git pass reset the
+    /// accumulator's sha and reopened the gate for every pass after it.
+    #[test]
+    fn one_sided_missing_revision_is_drift() {
+        let mut prev = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        let mut fresh = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        prev.git_sha = Some("aaaaaaa".into());
+        fresh.git_sha = None;
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
+        assert!(err.contains("unknown revision"), "{err}");
+
+        // ...and the mirror direction.
         prev.git_sha = None;
-        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
+        fresh.git_sha = Some("aaaaaaa".into());
+        assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_err());
     }
 
     #[test]
@@ -2422,6 +2486,111 @@ mod tests {
         let prev = file_of("local", vec![("g/q1/small", prev_entry)]);
         let fresh = file_of("local", vec![("g/q1/small", fresh_entry)]);
         assert!(accumulate(&prev, &fresh, &AccumulateOptions::default()).is_ok());
+    }
+
+    /// bplatz residual R1. The corpus guard only walked the INTERSECTION, but
+    /// the carry-forward arm re-inserts prev-only entries into a file whose
+    /// file-level corpus is `fresh`'s — so an entry that was inheriting prev's
+    /// corpus silently resolves against a different one, samples unchanged.
+    ///
+    /// His repro: prev = {q1, q2} under file-level corpus A, a pass that reran
+    /// only q3 under corpus B.
+    #[test]
+    fn carried_forward_entries_keep_their_own_corpus() {
+        let mut prev = file_of(
+            "local",
+            vec![("g/q1/small", entry(1000.0)), ("g/q2/small", entry(2000.0))],
+        );
+        prev.corpus = Some(corpus(b"A"));
+        let mut fresh = file_of("local", vec![("g/q3/small", entry(3000.0))]);
+        fresh.corpus = Some(corpus(b"B"));
+
+        let merged = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap();
+
+        // q2 was measured under A and must still resolve to A, not to the new
+        // file-level B it would otherwise inherit.
+        assert_eq!(
+            merged.corpus_for("g/q2/small").map(|c| &c.sha256),
+            prev.corpus_for("g/q2/small").map(|c| &c.sha256),
+            "carried-forward entry was relabelled to the fresh corpus"
+        );
+        assert_eq!(merged.entries["g/q2/small"].mean_ns, 2000.0, "same samples");
+        // The scenario the fresh pass actually measured keeps B.
+        assert_eq!(
+            merged.corpus_for("g/q3/small").map(|c| &c.sha256),
+            fresh.corpus.as_ref().map(|c| &c.sha256)
+        );
+    }
+
+    #[test]
+    fn carrying_forward_into_a_newly_declared_corpus_refuses() {
+        // prev declared no corpus anywhere; fresh introduces a file-level one.
+        // The carried entries would inherit an identity their samples never
+        // had, and "explicitly none" is not expressible via inheritance — so
+        // there is nothing to stamp and the merge must refuse.
+        let prev = file_of(
+            "local",
+            vec![("g/q1/small", entry(1000.0)), ("g/q2/small", entry(2000.0))],
+        );
+        let mut fresh = file_of("local", vec![("g/q3/small", entry(3000.0))]);
+        fresh.corpus = Some(corpus(b"B"));
+
+        let err = accumulate(&prev, &fresh, &AccumulateOptions::default()).unwrap_err();
+        assert!(
+            err.contains("g/q1/small") || err.contains("g/q2/small"),
+            "{err}"
+        );
+    }
+
+    /// bplatz residual R2. The guard required both sides `Some` and the merge
+    /// took `fresh`'s `git_sha`, so ONE no-git pass reset the accumulator and
+    /// reopened the gate for every pass after it — the MAD-widening case the
+    /// guard exists for, reached in two steps instead of one.
+    #[test]
+    fn a_no_git_pass_cannot_launder_a_revision_change() {
+        let mut p1 = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        p1.git_sha = Some("aaaaaaa".into());
+
+        // Pass 2: no git available.
+        let mut p2 = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        p2.git_sha = None;
+        let after_no_git = accumulate(&p1, &p2, &AccumulateOptions::default());
+        // Pass 3: a different revision, with a wildly different measurement.
+        let mut p3 = file_of("local", vec![("g/q1/small", entry(5000.0))]);
+        p3.git_sha = Some("ccccccc".into());
+
+        match after_no_git {
+            // Either the no-git pass itself refuses...
+            Err(e) => assert!(e.contains("revision"), "{e}"),
+            // ...or it is accepted, in which case the NEXT pass at a different
+            // revision must not be.
+            Ok(merged) => {
+                let err = accumulate(&merged, &p3, &AccumulateOptions::default()).unwrap_err();
+                assert!(err.contains("revision"), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_all_no_git_accumulation_still_works() {
+        // No git anywhere (tarball, container): nothing to disagree about.
+        let mut p1 = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        let mut p2 = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        p1.git_sha = None;
+        p2.git_sha = None;
+        assert!(accumulate(&p1, &p2, &AccumulateOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn revision_drift_override_still_covers_the_none_case() {
+        let mut p1 = file_of("local", vec![("g/q1/small", entry(1000.0))]);
+        p1.git_sha = Some("aaaaaaa".into());
+        let mut p2 = file_of("local", vec![("g/q1/small", entry(1010.0))]);
+        p2.git_sha = None;
+        let allowed = AccumulateOptions {
+            allow_revision_drift: true,
+        };
+        assert!(accumulate(&p1, &p2, &allowed).is_ok());
     }
 
     #[test]
