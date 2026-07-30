@@ -614,7 +614,8 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
     ///
     /// So storing the resolved form is not an incidental convenience of the
     /// directive parser; it is what makes this comparison the right one. Both
-    /// cases are pinned in `tests/prefix_redefinition.rs`.
+    /// cases are pinned in `tests/prefix_redefinition_adversarial.rs` (A1 and
+    /// A2) — they need a moving `@base`, which the other file never varies.
     fn bind_prefix(&mut self, prefix: String, namespace: String) {
         let rebinds = self
             .prefixes
@@ -626,6 +627,15 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             // entries, but finding them means scanning every key, so we drop
             // them all. A rebind is rare enough that paying O(cache) once
             // beats making the common path cleverer.
+            //
+            // To be exact about the trade, since "scanning every key" could be
+            // read as the reason: `retain` scans every key too, so the cost is
+            // the same order either way. What a `retain` would buy is keeping
+            // OTHER prefixes warm after a rebind; what it costs is a predicate
+            // that has to be right — the keys are span texts like `ex:name`,
+            // so the obvious `k.starts_with(prefix)` evicts `ex:name` when `e`
+            // rebinds, and the correct form has to compare up to the colon.
+            // Simplicity over post-rebind hit rate, not cost over cost.
             self.prefixed_term_cache.clear();
         }
     }

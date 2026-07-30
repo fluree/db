@@ -35,15 +35,26 @@ use fluree_graph_turtle::splitter::{
 use std::io::Write;
 
 /// 4000 statements with a redefinition of `e:` exactly half way through.
+///
+/// The OBJECT is the load-bearing part, and an earlier version of this corpus
+/// did not have it. Subjects are `e:s{i}`, a distinct span every time, so no
+/// prefixed name is ever looked up twice and the expansion cache is never
+/// consulted for a span it already holds — which is the only way the bug can
+/// show. With a literal object, the carrier-chunk assertion below passed
+/// against a parser with the fix entirely removed: it proved nothing.
+///
+/// `e:tag` repeats on every line, so it is cached under the FIRST binding and
+/// then requested again after the rebinding. That is the whole defect in one
+/// term.
 fn write_corpus(path: &std::path::Path, n: usize) {
     let mut f = std::fs::File::create(path).unwrap();
     writeln!(f, "@prefix e: <http://a/> .").unwrap();
     for i in 0..n / 2 {
-        writeln!(f, "e:s{i} <http://p/> \"v\" .").unwrap();
+        writeln!(f, "e:s{i} <http://p/> e:tag .").unwrap();
     }
     writeln!(f, "@prefix e: <http://b/> .").unwrap();
     for i in n / 2..n {
-        writeln!(f, "e:s{i} <http://p/> \"v\" .").unwrap();
+        writeln!(f, "e:s{i} <http://p/> e:tag .").unwrap();
     }
 }
 
@@ -98,6 +109,11 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
     let seeded: Vec<(String, String)> = prelude.prefixes.to_vec();
     let mut wrong_in_carrier = 0usize;
     let mut wrong_after_carrier = 0usize;
+    // The object side is what distinguishes the fix. `e:tag` is cached under
+    // the first binding; after the rebinding, a stale cache serves the old
+    // expansion for the same span. Counted only inside the carrier chunk,
+    // because only there has the parser actually SEEN the redefinition.
+    let mut stale_objects_in_carrier = 0usize;
     for (idx, text) in &chunks {
         let doc = format!("{block}{text}");
         let mut sink = GraphCollectorSink::new();
@@ -109,18 +125,32 @@ fn streaming_reader_accepts_a_mid_file_redefinition() {
                 .next()
                 .and_then(|d| d.parse().ok())
                 .unwrap_or(usize::MAX);
-            if n >= 2000 && n != usize::MAX && !s.starts_with("http://b/") {
+            let post_redefinition = n >= 2000 && n != usize::MAX;
+            if post_redefinition && !s.starts_with("http://b/") {
                 if *idx == carrier[0] {
                     wrong_in_carrier += 1;
                 } else {
                     wrong_after_carrier += 1;
                 }
             }
+            if post_redefinition && *idx == carrier[0] && t.o.as_iri() == Some("http://a/tag") {
+                stale_objects_in_carrier += 1;
+            }
         }
     }
     println!(
         "post-redefinition subjects still on the OLD namespace: \
          in carrier chunk = {wrong_in_carrier}, in later chunks = {wrong_after_carrier}"
+    );
+    println!("post-redefinition objects still resolving to http://a/tag inside the carrier chunk = {stale_objects_in_carrier}");
+
+    // THE assertion that distinguishes the fix. Without it, `e:tag` after the
+    // rebinding is served from the cache under the OLD namespace: this count
+    // is greater than zero (verified by reverting the parser to merge-base).
+    // With it, every one of them resolves to the new namespace.
+    assert_eq!(
+        stale_objects_in_carrier, 0,
+        "a prefixed name reused across the rebinding must follow it, not the cache"
     );
 
     // The fix repairs the carrier chunk. Later chunks remain broken — the PR
