@@ -97,10 +97,19 @@ fn the_parser_hands_over_its_own_allocation_and_never_the_copying_path() {
         sink.shared_calls
     );
 
-    // Two owners at receipt: the producer's, and the clone this sink just made
-    // of the same allocation. Exactly two, and not more, is what says the
-    // producer hands the term over BEFORE inserting it into its own cache —
-    // that ordering is why the clone is free rather than a race with a copy.
+    // Two owners at receipt: the producer's, and the clone this sink just made.
+    // What that pins is that the sink and the producer hold ONE allocation
+    // rather than two copies of the same bytes.
+    //
+    // It does not pin an ordering, and an earlier version of this comment
+    // claimed it did — that the producer hands the term over before caching it,
+    // as though that were a choice made carefully. It is forced: the cache maps
+    // the IRI to the TermId, and the TermId does not exist until this call
+    // returns. Dressing a fact that cannot vary as a decision is the kind of
+    // sentence that makes a reader trust the next claim less.
+    //
+    // The count also cannot see whether the producer allocates a SECOND Arc for
+    // its cache key afterwards — that is what term_sharing_witness.rs measures.
     assert!(
         sink.owners_at_receipt.iter().all(|&n| n == 2),
         "a storing sink and the producer should be the only two owners of one \
