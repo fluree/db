@@ -334,10 +334,11 @@ def run_fluree_cli(tgt, tgt_id, pair_id, modes, runs, timeout_s, out_fh):
             out, err_txt, rc, timed_out, proc_ms = _run_capped(cmd, None, None, timeout_s, env)
             rss = _parse_rss(err_txt)
             wall, rows = None, None
-            # CLI prints "(N rows, X.Xms)" under 1s, "(N rows, X.XXs)" at/over 1s.
-            m = re.search(r"\((\d+)\s+rows,\s+([0-9.]+)(ms|s)\)", out + err_txt)
+            # CLI prints "(N rows, X.Xms)" under 1s, "(N rows, X.XXs)" at/over 1s; N carries
+            # a thousands-separator comma at >=1000 rows (e.g. "(1,100 rows, 194.1ms)").
+            m = re.search(r"\(([\d,]+)\s+rows,\s+([0-9.]+)(ms|s)\)", out + err_txt)
             if m:
-                rows = int(m.group(1))
+                rows = int(m.group(1).replace(",", ""))
                 wall = float(m.group(2)) * (1000.0 if m.group(3) == "s" else 1.0)
             ok = rc == 0 and wall is not None and not timed_out
             extra = {"proc_wall_ms": round(proc_ms, 1)}

@@ -1,26 +1,57 @@
 {
-  "_doc": "First-wave pair classification + substrate routing (lead ruling 2026-07-28). shape=single_table runs DuckDB on substrate A (duckdb-iceberg-sf01) alongside fluree. shape=join runs DuckDB on the parquet floor (duckdb-parquet-sf01, labeled asymmetric-substrate) alongside fluree on substrate A, PLUS one capped remote attempt on duckdb-iceberg-sf01-nopushdown (hard-cap 180s -> DNF). The results table keys on the per-row `substrate` field. SUM(double) pairs compare with numeric tolerance, not hash.",
+  "_doc": "Pair classification + per-pair equivalence rules (PROTOCOL §6-§7). gate: exact (int/string multiset), tolerance (numeric cells compared with relative tolerance for float reassociation), rows_only (unordered LIMIT -> row count only). sum_is_double flags float aggregates. shape: single_table | join. Wave-1 (p1-p3) + Wave-C (cq*/crt_*).",
   "pairs": {
     "p1_count_fact": {
-      "shape": "single_table",
-      "fluree_corpus": "q036",
-      "sum_is_double": false,
-      "duckdb_substrate": "iceberg_rest",
-      "note": "Bare COUNT(*). Metadata-only on BOTH engines on substrate A (DuckDB iceberg manifest stats; Fluree count-manifest shortcut, PR #1478). FAIR metadata-vs-metadata pair on the shared catalog -- only incomparable in local-parquet floor mode."
+      "shape": "single_table", "gate": "exact", "sum_is_double": false, "fluree_corpus": "q036",
+      "note": "Bare COUNT(*) on FACT_ORDER. Metadata-vs-metadata on the shared catalog (DuckDB iceberg manifest stats; Fluree count-manifest shortcut #1478)."
     },
     "p2_category_rollup": {
-      "shape": "join",
-      "fluree_corpus": null,
-      "sum_is_double": false,
-      "duckdb_substrate": "parquet_local + one capped iceberg_rest_nopushdown attempt",
-      "note": "fact_order_line JOIN dim_product. SUM(quantity) is integer. Needs a corpus .rq before the fluree leg can run. Hits the bloom gap on plain substrate A."
+      "shape": "join", "gate": "exact", "sum_is_double": false,
+      "note": "FACT_ORDER_LINE JOIN DIM_PRODUCT, units by category, is_current filter. SUM(quantity) integer."
     },
     "p3_open_tickets_by_segment": {
-      "shape": "join",
-      "fluree_corpus": null,
-      "sum_is_double": false,
-      "duckdb_substrate": "parquet_local + one capped iceberg_rest_nopushdown attempt",
-      "note": "fact_support_ticket JOIN dim_customer, FILTER status != 'Closed'. COUNT(*) only. Needs a corpus .rq before the fluree leg can run. Hits the bloom gap on plain substrate A."
+      "shape": "join", "gate": "exact", "sum_is_double": false,
+      "note": "FACT_SUPPORT_TICKET JOIN DIM_CUSTOMER, open (status != Closed) tickets by segment. FILTER-over-join shape; the #1528 fusion discriminator. COUNT only."
+    },
+    "cq038_count_current_customers": {
+      "shape": "single_table", "gate": "exact", "sum_is_double": false, "fluree_corpus": "q038",
+      "note": "Un-fused filtered COUNT over DIM_CUSTOMER WHERE is_current. Headline DuckDB-win prediction (Fluree declines to full materialize)."
+    },
+    "cq014_channel_mix": {
+      "shape": "single_table", "gate": "tolerance", "sum_is_double": true, "fluree_corpus": "q014",
+      "note": "Fused single-table COUNT + SUM(order_total double) by channel. Fluree-competitive prediction."
+    },
+    "cq027_web_events_by_type_device": {
+      "shape": "single_table", "gate": "exact", "sum_is_double": false, "fluree_corpus": "q027",
+      "note": "Largest single-table fused grouped COUNT (1M rows) by type+device. Fluree best-case prediction."
+    },
+    "cq008_revenue_by_region": {
+      "shape": "join", "gate": "tolerance", "sum_is_double": true, "fluree_corpus": "q008",
+      "note": "Fused fact->dim->dim rollup SUM(order_total double) by region (3-table star chain, trivially ordered)."
+    },
+    "cq040_store_values": {
+      "shape": "single_table", "gate": "tolerance", "sum_is_double": false, "fluree_corpus": "q040",
+      "note": "VALUES/IN store constraint. Fluree ?store IRI reduced to trailing store_key for compare; raw order_total (double) cells compared numerically. DuckDB-win prediction (VALUES not lowered on virtual)."
+    },
+    "cq016_orders_optional_shipment": {
+      "shape": "join", "gate": "rows_only", "sum_is_double": false, "fluree_corpus": "q016",
+      "note": "OPTIONAL (LEFT JOIN) fact-to-fact, unordered LIMIT 5000 -> row count only. DuckDB-win prediction (OPTIONAL swallows the LIMIT budget on virtual)."
+    },
+    "cq046_orders_top10": {
+      "shape": "single_table", "gate": "tolerance", "sum_is_double": false, "fluree_corpus": "q046",
+      "note": "DESC top-k with a unique tiebreaker (exact top-10). order_total double compared numerically. Fluree-competitive prediction (99.9% file prune)."
+    },
+    "crt_join_reorder": {
+      "shape": "join", "gate": "exact", "sum_is_double": false,
+      "note": "RT: 4-table join with two selective dim filters (OrderLine->order->customer[Enterprise], OrderLine->product[current]). DuckDB's hash-join-reorder strength. SUM(quantity) integer."
+    },
+    "crt_minmax": {
+      "shape": "single_table", "gate": "tolerance", "sum_is_double": false,
+      "note": "RT: MIN/MAX of order_total. Answerable from Iceberg column stats; DuckDB-wins-now / Fluree-should-win-later. MIN/MAX deterministic (actual values), numeric compare."
+    },
+    "crt_highcard_groupby": {
+      "shape": "single_table", "gate": "exact", "sum_is_double": false,
+      "note": "RT: high-cardinality GROUP BY (~customer count groups) over the 1M-row fact; run at normal memory AND with DuckDB memory_limit pinned LOW (spill candidate). customer_key IS NOT NULL matches SPARQL UNBOUND-omit. Large result fully materialized+sorted."
     }
   }
 }
