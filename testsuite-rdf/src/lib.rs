@@ -382,10 +382,24 @@ mod tests {
     }
 
     /// A failing test NOT in the register must fail the suite.
+    ///
+    /// Driven in `IngestDefault` mode, and it has to be. This test needs a
+    /// suite run that genuinely FAILS, and in `Conformant` mode there is no
+    /// longer such a run: every RDF 1.1 suite is at 100% with an empty
+    /// register, so the assertion had nothing left to assert and the check
+    /// itself started failing the moment the last register emptied.
+    ///
+    /// The ingest default is the right substitute rather than a workaround.
+    /// Its failures are a DESIGN property — indexed list items and
+    /// canonicalized numerics are deliberately lossy as RDF, which is why that
+    /// mode is reported and never gated — so this test is anchored to
+    /// something that cannot be "fixed" out from under it, unlike a parser
+    /// defect that someone is actively trying to remove.
     #[test]
     fn an_unregistered_failure_fails_the_suite() {
-        let err = check_testsuite(&RDF11_TURTLE, ParseMode::Conformant, &[])
-            .expect_err("the known failures must fail an empty register");
+        let err = check_testsuite(&RDF11_TURTLE, ParseMode::IngestDefault, &[]).expect_err(
+            "the ingest default's known conformance failures must fail an empty register",
+        );
         let msg = format!("{err:#}");
         assert!(
             msg.contains("failing test(s)"),
