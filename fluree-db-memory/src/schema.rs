@@ -77,6 +77,11 @@ pub fn memory_schema_jsonld() -> Value {
                 "rdfs:range": { "@id": "xsd:dateTime" }
             },
             {
+                "@id": "mem:updatedAt",
+                "@type": "rdf:Property",
+                "rdfs:range": { "@id": "xsd:dateTime" }
+            },
+            {
                 "@id": "mem:rationale",
                 "@type": "rdf:Property",
                 "rdfs:range": { "@id": "xsd:string" }
@@ -132,6 +137,10 @@ pub fn memory_to_jsonld(mem: &crate::types::Memory) -> Value {
 
     if let Some(b) = &mem.branch {
         obj.insert("mem:branch".to_string(), json!(b));
+    }
+
+    if let Some(u) = &mem.updated_at {
+        obj.insert("mem:updatedAt".to_string(), json!(u));
     }
 
     if let Some(r) = &mem.rationale {

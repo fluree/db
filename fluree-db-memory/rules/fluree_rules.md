@@ -58,3 +58,7 @@ Repo-scoped memories are a shared team asset committed to git. Before `memory_ad
 - **One insight, within the cap.** Split bundles; tighten prose. Tags are lowercase keywords from stable vocabulary (crate/module names, topics) — not effort codenames.
 
 When an effort ends, ask: "what did we learn that the code and docs can't show?" Store only that. See `docs/memory/guides/hygiene-and-auditing.md` for the full rubric and the audit procedure.
+
+## Checkpoint audits
+
+When an effort branch is about to be reviewed or merged, call `memory_audit` and reconcile what it finds. That checkpoint is when effort notes become authoritative — retire the narration, update or drop refs the branch moved, and capture the durable residue while you still remember it. Doing it later means doing it from a diff instead of from memory. The audit flags what looks wrong; the five tests in `docs/memory/guides/hygiene-and-auditing.md` decide what to do about it.

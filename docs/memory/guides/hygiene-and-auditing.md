@@ -104,6 +104,18 @@ Repeatable on any repo with a committed memory file.
    formatting stays canonical), run the store's own health checks, and commit with an
    audit summary so the next audit can diff against a known-good baseline.
 
+## Tooling
+
+`memory_audit` (MCP) and [`fluree memory audit`](../cli/audit.md) (CLI) automate steps 1 and 2 — the
+extract and the mechanical pre-pass — and add two signals a manual pass tends to miss: refs whose
+files have commits newer than the memory's last write or re-verification, and files the current
+branch changed that no memory covers (step 5's gap pass, from the other direction).
+
+The audit is read-only and deliberately stops there. Every flag is a signal, not a verdict, and the
+judgment pass — the five tests, and the KEEP/REWRITE/MERGE/DELETE/RESCOPE call that follows — stays
+with the reviewer or agent. Acting on the findings means `update` (which also stamps a re-verification
+when it changes nothing), `forget`, and `add`.
+
 ## Keeping it healthy
 
 - **Write memories as residue, not narration.** At the end of an effort, ask "what did

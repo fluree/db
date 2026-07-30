@@ -196,19 +196,51 @@ fn repo_memory_blocks_are_well_formed() {
             );
         }
 
-        assert_eq!(
-            count_typed_created(block),
-            1,
-            "{id}: exactly one mem:createdAt required"
+        let created = typed_dates(block, "createdAt");
+        assert_eq!(created.len(), 1, "{id}: exactly one mem:createdAt required");
+
+        // `updatedAt` is stamped by every update, including the no-field update
+        // that means "re-verified at HEAD" — so a block carries zero or one.
+        let updated = typed_dates(block, "updatedAt");
+        assert!(
+            updated.len() <= 1,
+            "{id}: at most one mem:updatedAt allowed, found {}",
+            updated.len()
         );
+        for line in created.iter().chain(updated.iter()) {
+            assert!(
+                is_datetime_literal_line(line),
+                "{id}: {line:?} is not a `\"<RFC 3339>\"^^xsd:dateTime` literal"
+            );
+        }
     }
 }
 
-fn count_typed_created(block: &str) -> usize {
+/// Trimmed lines carrying a `mem:<prop>` timestamp within one block.
+fn typed_dates<'a>(block: &'a str, prop: &str) -> Vec<&'a str> {
+    let needle = format!("mem:{prop} \"");
     block
         .lines()
-        .filter(|l| l.trim_start().starts_with("mem:createdAt \""))
-        .count()
+        .map(str::trim)
+        .filter(|l| l.starts_with(needle.as_str()))
+        .collect()
+}
+
+/// Whether a timestamp line is a typed `xsd:dateTime` literal whose value has
+/// the RFC 3339 `YYYY-MM-DDThh:mm:ss` shape.
+fn is_datetime_literal_line(line: &str) -> bool {
+    let Some(rest) = line.split_once(" \"").map(|(_, r)| r) else {
+        return false;
+    };
+    let Some((value, tail)) = rest.split_once('"') else {
+        return false;
+    };
+    let typed = tail.trim_start().starts_with("^^xsd:dateTime");
+    let shaped = value.len() >= 19
+        && value.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[10] == b'T';
+    typed && shaped
 }
 
 fn capitalize(s: &str) -> String {

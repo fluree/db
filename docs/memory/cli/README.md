@@ -10,6 +10,7 @@ The `fluree memory` subcommands, alphabetically-ish.
 | [`update`](update.md) | Update an existing memory in place |
 | [`forget`](forget.md) | Retract a memory permanently |
 | [`status`](status.md) | Summary of the store (totals, tags, kinds) |
+| [`audit`](audit.md) | Check the store against the hygiene rubric (narration, stale refs, coverage) |
 | [`export` / `import`](export-import.md) | Round-trip memories as JSON |
 | [`mcp-install`](mcp-install.md) | Install MCP config for an IDE |
 

@@ -1,4 +1,22 @@
-use crate::types::{Memory, MemoryStatus, RecallResult, ScoredMemory};
+use crate::types::{Memory, MemoryStatus, RecallResult, ScoredMemory, MAX_CONTENT_LENGTH};
+use std::path::Path;
+
+/// Artifact refs of `memory` that do not resolve under `repo_root`.
+///
+/// A pure filesystem check on the handful of memories actually being returned —
+/// no git, no walk of the store. `repo_root` is `None` for a ledger-only store,
+/// where refs cannot be resolved and so are never reported stale.
+fn stale_refs(memory: &Memory, repo_root: Option<&Path>) -> Vec<String> {
+    let Some(root) = repo_root else {
+        return Vec::new();
+    };
+    memory
+        .artifact_refs
+        .iter()
+        .filter(|r| !root.join(r).exists())
+        .cloned()
+        .collect()
+}
 
 /// Format a memory for human-readable text output.
 pub fn format_text(memory: &Memory) -> String {
@@ -26,7 +44,11 @@ pub fn format_text(memory: &Memory) -> String {
 }
 
 /// Format a recall result for human-readable text output.
-pub fn format_recall_text(result: &RecallResult) -> String {
+///
+/// `repo_root` is the project root that `refs` resolve against; refs that no
+/// longer exist there are called out so the reader knows the memory has drifted
+/// from the code it points at.
+pub fn format_recall_text(result: &RecallResult, repo_root: Option<&Path>) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Recall: \"{}\" ({} matches)\n\n",
@@ -45,6 +67,9 @@ pub fn format_recall_text(result: &RecallResult) -> String {
         if !scored.memory.tags.is_empty() {
             out.push_str(&format!("   Tags: {}\n", scored.memory.tags.join(", ")));
         }
+        for r in stale_refs(&scored.memory, repo_root) {
+            out.push_str(&format!("   \u{26a0} stale ref: {r}\n"));
+        }
         out.push('\n');
     }
 
@@ -57,15 +82,36 @@ pub fn format_json(memory: &Memory) -> serde_json::Value {
 }
 
 /// Format a recall result as JSON.
-pub fn format_recall_json(result: &RecallResult) -> serde_json::Value {
-    serde_json::to_value(result).unwrap_or(serde_json::Value::Null)
+///
+/// Each result entry gains a `stale_refs` array when some of its refs no longer
+/// resolve under `repo_root`. The marker lives on the result entry, not inside
+/// the serialized `Memory`, so the stored record round-trips unchanged.
+pub fn format_recall_json(result: &RecallResult, repo_root: Option<&Path>) -> serde_json::Value {
+    let mut value = serde_json::to_value(result).unwrap_or(serde_json::Value::Null);
+
+    let entries = value
+        .get_mut("memories")
+        .and_then(serde_json::Value::as_array_mut);
+    if let Some(entries) = entries {
+        for (entry, scored) in entries.iter_mut().zip(&result.memories) {
+            let stale = stale_refs(&scored.memory, repo_root);
+            if stale.is_empty() {
+                continue;
+            }
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("stale_refs".to_string(), serde_json::json!(stale));
+            }
+        }
+    }
+
+    value
 }
 
 /// Format memories as an XML context block for LLM injection.
 ///
 /// This is the format that agents receive when they call the `memory_recall` MCP tool.
-pub fn format_context(memories: &[ScoredMemory]) -> String {
-    format_context_paged(memories, 0, None, memories.len(), false, None)
+pub fn format_context(memories: &[ScoredMemory], repo_root: Option<&Path>) -> String {
+    format_context_paged(memories, 0, None, memories.len(), false, None, repo_root)
 }
 
 /// Format memories as an XML context block with pagination metadata.
@@ -79,6 +125,8 @@ pub fn format_context(memories: &[ScoredMemory]) -> String {
 /// `has_more` indicates that additional results may be available at `offset + shown`.
 /// `next_score` is the BM25 score of the first result not returned, giving the LLM a
 /// signal for whether it's worth requesting the next page.
+/// `repo_root` resolves `refs`; a memory whose refs no longer exist there carries a
+/// `stale-refs` attribute so the agent can see the memory has drifted from the code.
 pub fn format_context_paged(
     memories: &[ScoredMemory],
     offset: usize,
@@ -86,14 +134,21 @@ pub fn format_context_paged(
     total_store: usize,
     has_more: bool,
     next_score: Option<f64>,
+    repo_root: Option<&Path>,
 ) -> String {
     let mut out = String::new();
     out.push_str("<memory-context>\n");
 
     for scored in memories {
         let mem = &scored.memory;
+        let stale = stale_refs(mem, repo_root);
+        let stale_attr = if stale.is_empty() {
+            String::new()
+        } else {
+            format!(" stale-refs=\"{}\"", xml_escape(&stale.join(",")))
+        };
         out.push_str(&format!(
-            "  <memory id=\"{}\" kind=\"{}\" score=\"{:.1}\">\n",
+            "  <memory id=\"{}\" kind=\"{}\" score=\"{:.1}\"{stale_attr}>\n",
             mem.id, mem.kind, scored.score
         ));
         out.push_str(&format!(
@@ -152,6 +207,104 @@ pub fn format_context_paged(
     }
 
     out.push_str("</memory-context>");
+    out
+}
+
+/// Cap on memories listed in an audit render, so a large store cannot flood a
+/// context window. The counts in the header still describe the whole scope.
+const AUDIT_LIST_CAP: usize = 100;
+
+/// Format an audit report as compact markdown.
+///
+/// The header restates the rubric because the reader — usually an agent at a
+/// PR-ready checkpoint — has to supply the judgment the flags can't: the flags
+/// say what looks off, the five tests say what "good" is.
+pub fn format_audit_markdown(report: &crate::audit::AuditReport) -> String {
+    let mut out = String::new();
+
+    let scope_line = if report.scope == "all" {
+        format!("all scopes ({} memories)", report.total_memories)
+    } else {
+        format!(
+            "branch `{}` vs `{}` ({} of {} memories in scope)",
+            report.scope,
+            report.base_ref,
+            report.entries.len(),
+            report.total_memories
+        )
+    };
+    out.push_str(&format!("## Memory audit — {scope_line}\n"));
+    out.push_str("T1 durable — true at HEAD, not progress or status.\n");
+    out.push_str("T2 shared — any contributor is the audience; no personal or session state.\n");
+    out.push_str("T3 non-derivable — beats grep, git log, and the docs.\n");
+    out.push_str("T4 actionable — a reader does something differently.\n");
+    out.push_str(&format!(
+        "T5 well-formed — one insight, within {MAX_CONTENT_LENGTH} chars, refs that resolve, lowercase tags.\n"
+    ));
+    out.push_str(
+        "Act with memory_update (same id; an update that changes no field means \"re-verified at \
+         HEAD\"), memory_forget, or memory_add. Flags are signals, not verdicts — read the memory \
+         first.\n",
+    );
+
+    // A branch audit with no diff saw only the memories tagged with this branch
+    // — say so, or "0 in scope" reads as a clean bill of health.
+    if report.scope != "all" && report.coverage.is_none() {
+        out.push_str(&format!(
+            "\nNote: `git merge-base {} HEAD` did not resolve here, so scope is limited to \
+             memories captured on this branch and there is no coverage section.\n",
+            report.base_ref
+        ));
+    }
+
+    let flagged = report.entries.iter().filter(|e| !e.is_clean()).count();
+    out.push_str(&format!(
+        "\n### Memories — {flagged} of {} flagged, {} listed (flagged first)\n",
+        report.entries.len(),
+        report.entries.len().min(AUDIT_LIST_CAP)
+    ));
+    if report.entries.is_empty() {
+        out.push_str("- (nothing in scope)\n");
+    }
+    for entry in report.entries.iter().take(AUDIT_LIST_CAP) {
+        let flags = entry.flags();
+        let flags = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", flags.join("] ["))
+        };
+        out.push_str(&format!(
+            "- {}{flags} refs: {}\n",
+            entry.id,
+            entry.refs_status()
+        ));
+    }
+    if report.entries.len() > AUDIT_LIST_CAP {
+        out.push_str(&format!(
+            "- … {} more not listed; narrow the scope to see them\n",
+            report.entries.len() - AUDIT_LIST_CAP
+        ));
+    }
+
+    if let Some(coverage) = &report.coverage {
+        if !coverage.unreferenced_changed_files.is_empty() {
+            out.push_str(
+                "\n### Changed on this branch with no memory coverage — capture only what \
+                 code/docs can't show:\n",
+            );
+            for f in &coverage.unreferenced_changed_files {
+                out.push_str(&format!("- {f}\n"));
+            }
+            if coverage.truncated {
+                out.push_str(&format!(
+                    "- … list capped at {} of {} changed files\n",
+                    crate::audit::MAX_UNREFERENCED_FILES,
+                    coverage.changed_files
+                ));
+            }
+        }
+    }
+
     out
 }
 
@@ -296,6 +449,7 @@ mod tests {
             artifact_refs: vec!["Cargo.toml".to_string()],
             branch: Some("main".to_string()),
             created_at: "2026-02-21T12:00:00Z".to_string(),
+            updated_at: None,
             rationale: None,
             alternatives: None,
         }
@@ -317,10 +471,65 @@ mod tests {
             memory: sample_memory(),
             score: 15.0,
         }];
-        let ctx = format_context(&scored);
+        let ctx = format_context(&scored, None);
         assert!(ctx.starts_with("<memory-context>"));
         assert!(ctx.ends_with("</memory-context>"));
         assert!(ctx.contains("score=\"15.0\""));
+    }
+
+    #[test]
+    fn stale_refs_marked_in_every_recall_form() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+
+        let mut mem = sample_memory();
+        mem.artifact_refs = vec!["Cargo.toml".to_string(), "src/gone.rs".to_string()];
+        let scored = vec![ScoredMemory {
+            memory: mem,
+            score: 9.0,
+        }];
+        let result = RecallResult {
+            query: "q".to_string(),
+            memories: scored.clone(),
+            total_count: 1,
+        };
+
+        let text = format_recall_text(&result, Some(dir.path()));
+        assert!(text.contains("\u{26a0} stale ref: src/gone.rs"));
+        assert!(
+            !text.contains("stale ref: Cargo.toml"),
+            "a ref that resolves must not be flagged"
+        );
+
+        let json = format_recall_json(&result, Some(dir.path()));
+        assert_eq!(
+            json["memories"][0]["stale_refs"],
+            serde_json::json!(["src/gone.rs"])
+        );
+
+        let ctx = format_context(&scored, Some(dir.path()));
+        assert!(ctx.contains("stale-refs=\"src/gone.rs\""));
+    }
+
+    #[test]
+    fn no_stale_markers_without_a_repo_root() {
+        let mut mem = sample_memory();
+        mem.artifact_refs = vec!["src/gone.rs".to_string()];
+        let scored = vec![ScoredMemory {
+            memory: mem,
+            score: 9.0,
+        }];
+        let result = RecallResult {
+            query: "q".to_string(),
+            memories: scored.clone(),
+            total_count: 1,
+        };
+
+        assert!(!format_recall_text(&result, None).contains("stale ref"));
+        assert!(format_recall_json(&result, None)["memories"][0]
+            .get("stale_refs")
+            .is_none());
+        assert!(!format_context(&scored, None).contains("stale-refs"));
     }
 
     #[test]
@@ -378,6 +587,7 @@ mod tests {
                 artifact_refs: vec![],
                 branch: None,
                 created_at: "2026-03-01T10:00:00Z".to_string(),
+                updated_at: None,
                 rationale: None,
                 alternatives: None,
             },
@@ -410,6 +620,7 @@ mod tests {
                 artifact_refs: vec![],
                 branch: None,
                 created_at: "2026-03-01T10:00:00Z".to_string(),
+                updated_at: None,
                 rationale: None,
                 alternatives: None,
             },

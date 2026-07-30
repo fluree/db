@@ -1850,6 +1850,31 @@ pub enum MemoryAction {
     /// Show memory store status
     Status,
 
+    /// Audit the memory store against the hygiene rubric
+    ///
+    /// Flags effort narration, unportable paths, over-cap content, bad tags,
+    /// refs that no longer resolve or whose files changed after the memory did,
+    /// and files this branch changed that no memory covers. Read-only — act on
+    /// the findings with `update`, `forget`, and `add`.
+    ///
+    /// Examples:
+    ///   fluree memory audit
+    ///   fluree memory audit --base develop
+    ///   fluree memory audit --all --format json
+    Audit {
+        /// Audit every memory instead of just this branch's
+        #[arg(long)]
+        all: bool,
+
+        /// Base ref the branch is compared against
+        #[arg(long, default_value = fluree_db_memory::DEFAULT_BASE_REF)]
+        base: String,
+
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
     /// Export all memories as JSON
     Export,
 
