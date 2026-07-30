@@ -1,0 +1,6 @@
+# Generated run artifacts (raw JSONL lives in the local working set; RESULTS.md is the committed summary)
+harness/out/
+__pycache__/
+*.pyc
+# Local, generated fluree home (registered per-machine; not portable)
+substrate/fluree-home/

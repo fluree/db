@@ -1,0 +1,26 @@
+{
+  "_doc": "First-wave pair classification + substrate routing (lead ruling 2026-07-28). shape=single_table runs DuckDB on substrate A (duckdb-iceberg-sf01) alongside fluree. shape=join runs DuckDB on the parquet floor (duckdb-parquet-sf01, labeled asymmetric-substrate) alongside fluree on substrate A, PLUS one capped remote attempt on duckdb-iceberg-sf01-nopushdown (hard-cap 180s -> DNF). The results table keys on the per-row `substrate` field. SUM(double) pairs compare with numeric tolerance, not hash.",
+  "pairs": {
+    "p1_count_fact": {
+      "shape": "single_table",
+      "fluree_corpus": "q036",
+      "sum_is_double": false,
+      "duckdb_substrate": "iceberg_rest",
+      "note": "Bare COUNT(*). Metadata-only on BOTH engines on substrate A (DuckDB iceberg manifest stats; Fluree count-manifest shortcut, PR #1478). FAIR metadata-vs-metadata pair on the shared catalog -- only incomparable in local-parquet floor mode."
+    },
+    "p2_category_rollup": {
+      "shape": "join",
+      "fluree_corpus": null,
+      "sum_is_double": false,
+      "duckdb_substrate": "parquet_local + one capped iceberg_rest_nopushdown attempt",
+      "note": "fact_order_line JOIN dim_product. SUM(quantity) is integer. Needs a corpus .rq before the fluree leg can run. Hits the bloom gap on plain substrate A."
+    },
+    "p3_open_tickets_by_segment": {
+      "shape": "join",
+      "fluree_corpus": null,
+      "sum_is_double": false,
+      "duckdb_substrate": "parquet_local + one capped iceberg_rest_nopushdown attempt",
+      "note": "fact_support_ticket JOIN dim_customer, FILTER status != 'Closed'. COUNT(*) only. Needs a corpus .rq before the fluree leg can run. Hits the bloom gap on plain substrate A."
+    }
+  }
+}
