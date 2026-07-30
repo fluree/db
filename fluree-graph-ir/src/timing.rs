@@ -1531,12 +1531,22 @@ mod tests {
     fn the_sampling_error_bound_is_reported_and_grows_with_dispersion() {
         // A uniform corpus and a wildly varying one must not report the same
         // confidence in an extrapolation from the same number of samples.
-        let mut uniform = TimingSink::new(SpinSink::new(Duration::from_micros(20)));
-        drive_discard(&mut uniform, 3_000);
-        let uniform_err = uniform
-            .sink_timing()
-            .relative_std_error
-            .expect("more than one sample");
+        // Both arms are measured as the MINIMUM over three trials. Contention
+        // only ever adds dispersion — a preempted statement is indistinguishable
+        // from a slow one — so the minimum is each arm's least-corrupted
+        // estimate. Comparing single trials made this test flaky on a loaded
+        // machine: one unlucky pause in the uniform arm could out-disperse a
+        // corpus that genuinely varies by 200x.
+        let uniform_err = (0..3)
+            .map(|_| {
+                let mut uniform = TimingSink::new(SpinSink::new(Duration::from_micros(20)));
+                drive_discard(&mut uniform, 3_000);
+                uniform
+                    .sink_timing()
+                    .relative_std_error
+                    .expect("more than one sample")
+            })
+            .fold(f64::INFINITY, f64::min);
 
         struct Erratic {
             statement: u64,
@@ -1569,15 +1579,19 @@ mod tests {
             }
         }
 
-        let mut erratic = TimingSink::new(Erratic {
-            statement: 0,
-            inner: DiscardSink::default(),
-        });
-        drive_discard(&mut erratic, 3_000);
-        let erratic_err = erratic
-            .sink_timing()
-            .relative_std_error
-            .expect("more than one sample");
+        let erratic_err = (0..3)
+            .map(|_| {
+                let mut erratic = TimingSink::new(Erratic {
+                    statement: 0,
+                    inner: DiscardSink::default(),
+                });
+                drive_discard(&mut erratic, 3_000);
+                erratic
+                    .sink_timing()
+                    .relative_std_error
+                    .expect("more than one sample")
+            })
+            .fold(f64::INFINITY, f64::min);
 
         assert!(
             erratic_err > uniform_err,
