@@ -25,7 +25,7 @@
 //! - **A3** relative `@base` resolution (Turtle) — closed
 //! - **B**  directive keyword case, both directions (Turtle) — closed
 //! - **C**  IRI / language-tag validation — the H-8 workstream — closed for
-//!   Turtle and N-Triples; the TriG members are the last live entries
+//!   Turtle, N-Triples and TriG
 //! - **D**  boolean keyword vs longhand IR duality (Turtle) — closed
 //! - **E**  no strict N-Triples reader, so the NT suites ran through the
 //!   Turtle parser and a negative test whose document is valid Turtle could
@@ -34,9 +34,11 @@
 //! - **F**  TriG eval blocked on an N-Quads reader — closed by that same
 //!   reader, with no TriG change
 //!
-//! Two workstreams closed the last two causes from opposite directions: the
+//! Two workstreams closed the last causes from opposite directions: the
 //! strict line reader (M2) closed E and F, and term validation (H-8) closed C.
-//! So the live taxonomy is C, with entries in the TriG register only.
+//! Every cause is now closed and every register is EMPTY — all four RDF 1.1
+//! suites score 100%. The both-way policing is what keeps that honest: a
+//! single regression re-populates a register or fails the suite.
 //!
 //! Baseline: rdf-tests submodule @ efccbc6b8, captured 2026-07-28 against the
 //! `feat/graphsink-protocol` base (#1552).
@@ -95,23 +97,22 @@ pub const RDF11_NTRIPLES: &[&str] = &[
     // `turtle-syntax-bad-lang-01`. Both readers call the same predicates.
 ];
 
-/// RDF 1.1 TriG — 4 known failures out of 356, all cause C.
+/// RDF 1.1 TriG — CLEAN, 356/356.
 pub const RDF11_TRIG: &[&str] = &[
-    // C — IRI / language-tag validation (H-8), the exact four-test shape the
-    // Turtle suite has: three ill-formed IRIs behind `\uXXXX` escapes and one
-    // bad language tag.
+    // EMPTY, and it closed the way the Turtle register did — from two
+    // directions that had to meet.
     //
-    // Cause F (eval blocked on an N-Quads reader) is closed: the reader landed
-    // and the eval family cleared with no TriG change. Precisely — because the
-    // earlier wording here overstated it — all 143 POSITIVE `TestTrigEval`
-    // tests pass, and 144 of the 147 eval-family tests do. The 3 that remain
-    // are `TestTrigNegativeEval`, and they are listed right below as cause C:
-    // they are ill-formed-IRI tests, not eval-machinery tests, which is why
-    // they did not clear with the reader.
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-syntax-bad-lang-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-trig/manifest.ttl#trig-eval-bad-03",
+    // Cause F (eval blocked on an N-Quads reader) went first: the strict line
+    // reader landed and the whole eval family cleared with no TriG change.
+    // That left four `TestTrigNegativeEval` entries which were never eval
+    // failures at all — three ill-formed IRIs behind `\uXXXX` escapes and one
+    // bad language tag, the exact four-test shape the Turtle suite had.
+    //
+    // Cause C then closed them: term validation reaches TriG because the TriG
+    // parser is the Turtle grammar with a dialect flag, so the same
+    // `ParserOptions::validate` scan runs over graph-block content. Nothing
+    // TriG-specific was needed, which is the argument for one grammar with a
+    // dialect knob rather than a second parser.
 ];
 
 /// RDF 1.1 N-Quads — CLEAN, 87/87.
