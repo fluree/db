@@ -257,27 +257,47 @@ done
 
 # --- our own column ---------------------------------------------------------
 #
-# Four rows, because our column is the only one with a checking dimension AND
-# the only one that parallelizes Turtle:
+# Our column is the only one with a checking dimension AND the only one that
+# parallelizes Turtle, so it needs the most rows — and the worker count has to
+# be in the row NAME, because it is not in the command line by default.
 #
-#   validate   the default: IRI and language-tag validation on. Comparable with
-#              riot --check=true, which is the parity pairing H-8 defines.
-#   nocheck    validation off. Comparable with riot --check=false.
-#   parallel   --parallelism 8, labelled separately and never merged into the
-#              serial rows. No other tool in this matrix parallelizes Turtle, so
-#              there is nothing to compare it against — it is our own ceiling,
-#              not a win over anyone.
+# `--parallelism` defaults to 0, which the CLI reads as "as many as this host
+# has". A cell that passes no parallelism flag is therefore not a serial cell;
+# on this 16-core host it is a 16-worker cell, and the first version of this
+# matrix labelled two such rows `validate` and `nocheck` and presented them
+# opposite single-threaded competitors. Every row below states its worker count.
+#
+#   serial-*   --parallelism 1. The only rows comparable with serdi, rapper,
+#              oxigraph and riot, all of which are single-threaded here.
+#   auto-*     no flag: what a user gets, at this host's core count. Ours alone.
+#   par8-*     --parallelism 8, a fixed count so the row means the same thing on
+#              a different host. Ours alone.
+#
+# The checking dimension crosses that: `validate` is the default (IRI and
+# language-tag validation on, comparable with riot --check), `nocheck` turns it
+# off (comparable with riot --nocheck).
+#
+# The auto and par8 rows are never averaged with the serial rows and never
+# presented as a win over anyone: no other tool in this matrix parallelizes
+# Turtle, so they are our own ceiling, not a comparison.
 FLUREE_BIN="${FLUREE_BIN:-$REPO_ROOT/target/release/fluree}"
 if [ -x "$FLUREE_BIN" ]; then
 	if ! "$FLUREE_BIN" rdf convert "$ttl" --to ntriples >/dev/null 2>&1; then
 		info "fluree rdf convert did not run — our cells deferred (see $FLUREE_BIN rdf convert --help)"
 	else
-		run_cell fluree validate ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples
-		run_cell fluree validate nt "$nt" "$FLUREE_BIN" rdf convert "$nt" --to ntriples
-		run_cell fluree nocheck ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck
-		run_cell fluree nocheck nt "$nt" "$FLUREE_BIN" rdf convert "$nt" --to ntriples --nocheck
-		# Parallel rows are OURS ALONE — labelled, never averaged with the
-		# serial rows, and never presented as a competitor comparison.
+		run_cell fluree serial-validate ttl "$ttl" \
+			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --parallelism 1
+		run_cell fluree serial-validate nt "$nt" \
+			"$FLUREE_BIN" rdf convert "$nt" --to ntriples --parallelism 1
+		run_cell fluree serial-nocheck ttl "$ttl" \
+			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck --parallelism 1
+		run_cell fluree serial-nocheck nt "$nt" \
+			"$FLUREE_BIN" rdf convert "$nt" --to ntriples --nocheck --parallelism 1
+		# Parallel rows are OURS ALONE — labelled with their worker count,
+		# never averaged with the serial rows.
+		run_cell fluree auto-validate ttl "$ttl" "$FLUREE_BIN" rdf convert "$ttl" --to ntriples
+		run_cell fluree auto-nocheck ttl "$ttl" \
+			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --nocheck
 		run_cell fluree par8-validate ttl "$ttl" \
 			"$FLUREE_BIN" rdf convert "$ttl" --to ntriples --parallelism 8
 		run_cell fluree par8-nocheck ttl "$ttl" \
