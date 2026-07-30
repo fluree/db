@@ -2404,6 +2404,135 @@ fn the_profile_reports_whether_terms_were_validated() {
     assert_eq!(v["validated"], serde_json::json!(false));
 }
 
+/// Two statements whose language tags are not language tags. Small, because
+/// the site that reads it is serial whatever the document's size.
+const BAD_LANG_PAIR: &str = "@prefix ex: <http://example.org/> .\n\
+                             ex:a ex:p \"one\"@1 .\n\
+                             ex:b ex:p \"two\"@1 .\n";
+
+/// The same defect, past the parallel gate.
+///
+/// Every statement lexes and parses; only term validation rejects them, which
+/// is exactly what `--nocheck` turns off. Sized past the gate on purpose: the
+/// flag was honoured on the serial path and hardcoded away everywhere else, so
+/// a fixture under the gate would have exercised the one site that worked.
+fn bad_langtag_corpus() -> String {
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..60_000 {
+        ttl.push_str(&format!(
+            "ex:s{i} ex:p \"a literal wide enough to reach the parallel threshold {i}\"@1 .\n"
+        ));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate — it would \
+         convert serially and prove nothing about the parallel site",
+        ttl.len()
+    );
+    ttl
+}
+
+/// The three places `convert` can reach a parser. `--nocheck` reached one.
+#[derive(Copy, Clone)]
+enum ParseSite {
+    /// `rdf::parse_into`, which honoured the flag all along.
+    Serial,
+    /// `write_chunk`, once per worker.
+    Parallel,
+    /// `parse_recovering`, once per resync.
+    Recovery,
+}
+
+impl ParseSite {
+    const ALL: [Self; 3] = [Self::Serial, Self::Parallel, Self::Recovery];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Serial => "--parallelism 1",
+            Self::Parallel => "--parallelism 8",
+            Self::Recovery => "--continue-on-error",
+        }
+    }
+
+    fn command(self, input: &Path, nocheck: bool) -> Command {
+        let mut cmd = rdf_cmd();
+        match self {
+            Self::Serial => cmd.args(["--parallelism", "1"]),
+            Self::Parallel => cmd.args(["--parallelism", "8"]),
+            Self::Recovery => &mut cmd,
+        };
+        cmd.args(["rdf", "convert"]).arg(input).args(["--to", "nt"]);
+        if matches!(self, Self::Recovery) {
+            cmd.arg("--continue-on-error");
+        }
+        if nocheck {
+            cmd.arg("--nocheck");
+        }
+        cmd
+    }
+}
+
+#[test]
+fn nocheck_reaches_every_parse_site() {
+    // `--nocheck` was threaded into `rdf::parse_into` and built from nothing
+    // at the other three sites, so above the 4 MiB gate the same document
+    // exited 0 at `--parallelism 1` and 1 at `--parallelism 8`. The flag is
+    // documented never to be a correctness decision, and that is one.
+    let tmp = TempDir::new().unwrap();
+    let big = fixture(&tmp, "bad-lang-big.ttl", &bad_langtag_corpus());
+    let small = fixture(&tmp, "bad-lang-small.ttl", BAD_LANG_PAIR);
+
+    for site in ParseSite::ALL {
+        // Recovery is serial by construction, so its site needs no bulk — and
+        // without `--nocheck` it resyncs once per bad statement, which on the
+        // big fixture would be 60,000 re-parses.
+        let input = match site {
+            ParseSite::Recovery => &small,
+            _ => &big,
+        };
+        site.command(input, true)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("skipped").not());
+        site.command(input, false)
+            .assert()
+            .code(EXIT_DOCUMENT_INVALID);
+        let _ = site.name();
+    }
+}
+
+#[test]
+fn nocheck_converts_identically_at_every_width() {
+    // Agreeing on the exit code is not enough. `--nocheck` turns off a check,
+    // not a parser, so the two widths must produce the same document — the
+    // failure this guards against is a parallel path that accepts the file by
+    // reading it with different options rather than the same ones.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "bad-lang.ttl", &bad_langtag_corpus());
+
+    let mut produced: Vec<Vec<u8>> = Vec::new();
+    for threads in ["1", "8"] {
+        let out = tmp.path().join(format!("out{threads}.nt"));
+        rdf_cmd()
+            .args(["--parallelism", threads, "-q", "rdf", "convert"])
+            .arg(&input)
+            .args(["--to", "nt", "--nocheck"])
+            .arg("-o")
+            .arg(&out)
+            .assert()
+            .success();
+        produced.push(std::fs::read(&out).unwrap());
+    }
+    // Compared by hand rather than with assert_eq!, which would print two
+    // twenty-megabyte vectors on failure.
+    assert!(
+        produced[0] == produced[1],
+        "--nocheck produced different documents at 1 and 8 workers ({} vs {} bytes)",
+        produced[0].len(),
+        produced[1].len()
+    );
+}
+
 /// A BOM-prefixed document is ordinary input, not an error. Windows editors
 /// emit them and riot eats them.
 #[test]
@@ -3044,6 +3173,109 @@ fn every_skip_is_located_in_the_original_document() {
         .stderr(predicate::str::contains("partly.ttl:5:"));
 }
 
+/// Four lines: a header, a good statement, junk carrying no terminator of its
+/// own, and the statement whose terminator the resync therefore runs to.
+const UNTERMINATED_JUNK: &str = "@prefix ex: <http://example.org/> .\n\
+                                 ex:a ex:p \"1\" .\n\
+                                 junk with no terminator\n\
+                                 ex:c ex:p \"3\" .\n";
+
+/// The same document with the junk terminated, so the resync stops at the
+/// junk's own `.` and takes nothing with it.
+const TERMINATED_JUNK: &str = "@prefix ex: <http://example.org/> .\n\
+                               ex:a ex:p \"1\" .\n\
+                               junk with a terminator .\n\
+                               ex:c ex:p \"3\" .\n";
+
+/// Convert with `--continue-on-error` and return `(stdout, stderr)`.
+fn recover(input: &Path) -> (String, String) {
+    let assert = rdf_cmd()
+        .args(["rdf", "convert"])
+        .arg(input)
+        .args(["--to", "nt", "--continue-on-error"])
+        .assert()
+        .code(EXIT_DOCUMENT_INVALID);
+    (
+        String::from_utf8(assert.get_output().stdout.clone()).unwrap(),
+        String::from_utf8(assert.get_output().stderr.clone()).unwrap(),
+    )
+}
+
+#[test]
+fn a_resync_that_swallows_the_next_statement_says_so() {
+    // Recovery resumes at the next statement TERMINATOR, so junk without one
+    // ends at the terminator belonging to the statement AFTER it — which is
+    // then never parsed, never diagnosed and never counted. The run reported
+    // "1 statement(s) skipped" having lost two, with stderr byte-identical to
+    // the honest case, and being identical is what made it undetectable.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(&tmp, "unterminated.ttl", UNTERMINATED_JUNK));
+
+    // The loss is real: `ex:c` never reaches the output, and the count says
+    // one. That count cannot be repaired — nothing parsed those bytes, so
+    // nothing knows how many statements they held.
+    assert_eq!(out.lines().count(), 1, "{out}");
+    assert!(stderr.contains("1 statement(s) skipped"), "{stderr}");
+
+    // So the span is reported instead, on its own line.
+    assert!(
+        stderr.contains("note:"),
+        "a resync that lost a statement said nothing about it: {stderr}"
+    );
+    // `ex:c ex:p "3" .` is 15 bytes.
+    assert!(
+        stderr.contains("consumed 15 more byte(s)"),
+        "the note must name how much it swallowed, not merely that it did: {stderr}"
+    );
+    assert!(
+        stderr.contains("resumed at line 4"),
+        "the note must name where the parse picked up again: {stderr}"
+    );
+}
+
+#[test]
+fn a_resync_that_stops_at_its_own_terminator_stays_silent() {
+    // The negative control, and the reason the note has a line of its own: a
+    // run that lost only what it reported keeps exactly the stderr it always
+    // had. A note here would be noise on every recoverable document.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(&tmp, "terminated.ttl", TERMINATED_JUNK));
+
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(stderr.contains("1 statement(s) skipped"), "{stderr}");
+    assert!(
+        !stderr.contains("note:") && !stderr.contains("resync consumed"),
+        "the honest case grew a note it did not need: {stderr}"
+    );
+}
+
+#[test]
+fn the_swallowed_span_stops_where_the_parse_resumed() {
+    // The span is the statement the resync ate, not everything after the
+    // error. What follows the resume point on the SAME line survives, and
+    // reporting it as lost would be a second wrong number in place of the
+    // first one.
+    let tmp = TempDir::new().unwrap();
+    let (out, stderr) = recover(&fixture(
+        &tmp,
+        "tail.ttl",
+        "@prefix ex: <http://example.org/> .\n\
+         ex:a ex:p \"1\" .\n\
+         junk with no terminator\n\
+         ex:c ex:p \"3\" . ex:d ex:p \"4\" .\n",
+    ));
+
+    assert!(
+        stderr.contains("consumed 15 more byte(s)") && stderr.contains("resumed at line 4"),
+        "{stderr}"
+    );
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(
+        out.contains("\"4\""),
+        "the statement after the resume point was reported lost, and was not: {out}"
+    );
+}
+
 // ============================================================================
 // the three-layered parallel differential
 // ============================================================================
@@ -3546,6 +3778,106 @@ fn a_file_destination_completes_at_every_parallelism() {
             "{case}: a live destination must receive the whole document"
         );
     }
+}
+
+/// A corpus whose N-Triples output runs many times its Turtle input, with a
+/// statement that lexes but does not parse early in the second chunk.
+///
+/// Both properties are load-bearing. The expansion — every prefixed name blows
+/// up to a ~200-byte IRI — is what lets the handful of chunks that can be in
+/// flight at once exceed the output budget's 32 MiB floor; without it the
+/// budget never binds, no worker ever waits, and the case under test does not
+/// arise. And the bad statement must LEX, because the chunker tokenizes the
+/// first megabyte looking for the header: a lexical error there makes the
+/// document unchunkable and the whole run falls back to serial.
+fn output_heavy_corpus_with_a_parse_error() -> String {
+    let ns = format!("http://example.org/{}/", "a".repeat(180));
+    let mut ttl = format!("@prefix ex: <{ns}> .\n");
+    for i in 0..200_000 {
+        if i == 12_000 {
+            // Three tokens, all valid; the object is simply missing.
+            ttl.push_str("ex:bad ex:p .\n");
+        }
+        ttl.push_str(&format!("ex:s{i} ex:p ex:o{i} .\n"));
+    }
+    assert!(
+        ttl.len() > MIN_PARALLEL_BYTES,
+        "the fixture is {} bytes, under the {MIN_PARALLEL_BYTES}-byte gate",
+        ttl.len()
+    );
+    ttl
+}
+
+#[test]
+fn a_parse_error_wakes_workers_waiting_on_the_output_budget() {
+    // The third way out of the reassembly loop, and the one that woke nobody.
+    // The writer is the only thread that releases budget, and it leaves three
+    // ways: every chunk written, a write failure, and a parse error that cuts
+    // the document short with bytes still charged. Only the first two
+    // signalled, so a worker waiting for room waited for a release that could
+    // never come and `thread::scope` joined it forever — the dead-destination
+    // deadlock again, reached through the memory bound instead of the channel.
+    //
+    // Getting a worker INTO that wait is the whole difficulty. With a fast
+    // destination the writer drains faster than the pool fills, the budget
+    // never binds, and this passes without exercising anything: that is
+    // exactly what a first attempt against `-o FILE` did. So the destination
+    // here is a pipe drained more slowly than the pool produces. The writer
+    // stalls on the pipe, the workers run ahead until the budget is full, and
+    // they are parked in `wait_for_room` when the erroring chunk is written.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(
+        &tmp,
+        "budget.ttl",
+        &output_heavy_corpus_with_a_parse_error(),
+    );
+
+    let mut child = spawn_convert(&input, "8", None);
+    let stdout = child.stdout.take().unwrap();
+    // ~2 MB/s, against a debug-build pool that manages several times that. The
+    // ratio is the only thing that matters and it fails safe: on a machine so
+    // loaded that the pool drops below the reader, the budget simply never
+    // fills and this passes without having exercised the wait. It cannot go
+    // red for being slow — only for not finishing at all.
+    let drain = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0usize;
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        total
+    });
+
+    let (code, stderr) = wait_bounded(child, "parse error under a saturated output budget");
+    let read = drain.join().expect("the drain thread must not panic");
+
+    assert_eq!(
+        code,
+        Some(EXIT_DOCUMENT_INVALID),
+        "a cut-short document must exit as an invalid one. stderr: {stderr}"
+    );
+    // Line 1 is the header, then 12,000 statements, then this one.
+    assert!(
+        stderr.contains("budget.ttl:12002:13:"),
+        "the run ended, but not on the parse error: {stderr}"
+    );
+    // Without this the fixture could be silently converting on the serial
+    // path, where there are no workers and nothing to deadlock.
+    assert!(
+        !stderr.contains("converting serially"),
+        "the fixture was not chunked, so no worker ever ran: {stderr}"
+    );
+    assert!(
+        read > 0,
+        "nothing was written before the failure, so the writer never stalled \
+         on the pipe and the budget never filled"
+    );
 }
 
 #[test]
