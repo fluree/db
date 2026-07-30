@@ -23,7 +23,8 @@
 
 use fluree_graph_ir::chars::{is_pn_chars, is_pn_chars_u, simple_escape, unicode_escape_value};
 use fluree_graph_ir::{Datatype, GraphSink, TermId};
-use fluree_vocab::iri::is_absolute_iri;
+use fluree_vocab::iri::{iri_violation, IriViolation};
+use fluree_vocab::lang::language_tag_violation;
 
 use crate::error::{Result, TurtleError};
 
@@ -271,11 +272,24 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
             }
         }
 
-        if !is_absolute_iri(&out) {
-            return Err(self.err(format!(
-                "`{out}` is a relative IRI; {} has no base, so every IRI must be absolute",
-                self.dialect.name()
-            )));
+        // One rule, two readers. The Turtle parser runs `iri_violation` over
+        // every resolved IRI under `ParserOptions::validate`; this reader runs
+        // the same predicate unconditionally, because the line grammars have
+        // no base and no ingest fast path to protect — an N-Triples document
+        // is either a set of RDF terms or it is not one.
+        //
+        // It has to happen HERE, after the loop, rather than in the loop's
+        // character check above: ` ` is legal source that expands to a
+        // space, so the byte scan cannot see it and only the expanded string
+        // can be judged. That is the gap this closes.
+        if let Some(violation) = iri_violation(&out) {
+            return Err(self.err(match violation {
+                IriViolation::NotAbsolute => format!(
+                    "`{out}` is a relative IRI; {} has no base, so every IRI must be absolute",
+                    self.dialect.name()
+                ),
+                other => format!("`{out}` is not an IRI: {other}"),
+            }));
         }
         Ok(out)
     }
@@ -436,27 +450,28 @@ impl<'a, 'i, S: GraphSink> Reader<'a, 'i, S> {
     }
 
     /// `LANGTAG ::= '@' [a-zA-Z]+ ('-' [a-zA-Z0-9]+)*`
+    ///
+    /// The scanner DELIMITS and the shared predicate DECIDES. Taking a maximal
+    /// run of the tag alphabet and then judging it with
+    /// `language_tag_violation` is what keeps this reader and the Turtle
+    /// parser on one rule — a hand-rolled acceptance loop here was a second
+    /// implementation of the same production, and two implementations of one
+    /// grammar drift.
+    ///
+    /// The run is a superset of `LANGTAG`, so every ill-formed tag reaches the
+    /// predicate rather than being cut short by the scan and reported as a
+    /// different error. `-` and the alphanumerics are the whole alphabet, and
+    /// none of `.`, `<`, `"` or whitespace is in it, so the delimiter is
+    /// exactly where the tag ends.
     fn langtag(&mut self) -> Result<String> {
         let start = self.pos;
-        let mut saw_alpha = false;
-        while matches!(self.peek(), Some(c) if c.is_ascii_alphabetic()) {
-            saw_alpha = true;
+        while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == b'-') {
             self.pos += 1;
         }
-        if !saw_alpha {
-            return Err(self.err("a language tag must begin with letters"));
+        let tag = &self.input[start..self.pos];
+        if let Some(violation) = language_tag_violation(tag) {
+            return Err(self.err(format!("`{tag}` is not a language tag: {violation}")));
         }
-        while self.peek() == Some(b'-') {
-            self.pos += 1;
-            let mut saw = false;
-            while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric()) {
-                saw = true;
-                self.pos += 1;
-            }
-            if !saw {
-                return Err(self.err("a language subtag must not be empty"));
-            }
-        }
-        Ok(self.input[start..self.pos].to_string())
+        Ok(tag.to_string())
     }
 }

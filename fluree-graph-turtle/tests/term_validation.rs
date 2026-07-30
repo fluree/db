@@ -529,3 +529,86 @@ fn with_no_base_escaped_iris_are_still_checked() {
         assert!(err.to_string().contains("not allowed in an IRI"), "{err}");
     }
 }
+
+// ============================================================================
+// The strict line reader's half — two readers, one rule
+// ============================================================================
+//
+// The Turtle parser validates under `ParserOptions::validate`; the strict
+// N-Triples/N-Quads reader validates unconditionally. What matters is that
+// both reach the SAME predicates in `fluree-vocab`, because a second
+// hand-rolled implementation of `LANGTAG` or of the IRIREF exclusion set is
+// two implementations of one grammar, and two implementations drift.
+//
+// These pin the reader's side of that. `fluree-vocab` unit-tests the
+// predicates themselves; what only the reader can answer is that they are
+// reached at all, and on the expanded value rather than the source bytes.
+
+use fluree_graph_turtle::{parse_nquads, parse_ntriples};
+
+fn nt(doc: &str) -> Result<usize, TurtleError> {
+    let mut sink = GraphCollectorSink::new();
+    parse_ntriples(doc, &mut sink)?;
+    Ok(sink.into_graph().len())
+}
+
+fn nq(doc: &str) -> Result<usize, TurtleError> {
+    let mut sink = fluree_graph_ir::DatasetCollectorSink::new();
+    parse_nquads(doc, &mut sink)?;
+    Ok(sink.into_dataset().len())
+}
+
+/// F7, verified against the reader rather than assumed: the line grammars
+/// carry no base machinery, so a relative IRI has nothing to resolve against
+/// and `NotAbsolute` is genuinely reachable here. In Turtle the same reference
+/// resolves against the in-scope base and never reaches the predicate.
+#[test]
+fn a_relative_iri_is_not_absolute_because_a_line_format_has_no_base() {
+    let err = nt("<s> <http://p/> <http://o/> .\n").unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("relative IRI") && text.contains("N-Triples"),
+        "expected the no-base explanation, got: {text}"
+    );
+    assert!(
+        nq("<http://s/> <http://p/> <http://o/> <g> .\n").is_err(),
+        "the graph label position is an IRI position too"
+    );
+}
+
+/// The gap this wiring closed. ` ` is legal SOURCE — the byte scan cannot
+/// object to it — and expands to a space, which is in the IRIREF exclusion
+/// set. Before the shared predicate ran on the expanded value, the reader
+/// checked only absoluteness and accepted this.
+#[test]
+fn an_escape_that_expands_to_a_forbidden_character_is_caught() {
+    let err = nt("<http://example.org/a\\u0020b> <http://p/> <http://o/> .\n").unwrap_err();
+    assert!(
+        err.to_string().contains("is not an IRI"),
+        "expected the shared predicate's verdict, got: {err}"
+    );
+    // The unescaped form is caught earlier, by the scan, with its own message.
+    assert!(nt("<http://example.org/a b> <http://p/> <http://o/> .\n").is_err());
+    // And a well-formed escape still parses.
+    assert_eq!(
+        nt("<http://example.org/a\\u0062> <http://p/> <http://o/> .\n").unwrap(),
+        1
+    );
+}
+
+/// The language-tag production is the shared predicate's, not a second loop.
+/// `"string"@1` is the W3C case (`nt-syntax-bad-lang-01`).
+#[test]
+fn language_tags_go_through_the_shared_predicate() {
+    for bad in ["\"s\"@1", "\"s\"@en-", "\"s\"@"] {
+        let doc = format!("<http://s/> <http://p/> {bad} .\n");
+        assert!(
+            nt(&doc).is_err(),
+            "`{bad}` is not a language tag, but the reader accepted it"
+        );
+    }
+    for good in ["\"s\"@en", "\"s\"@en-GB-oed", "\"s\"@x-whatever-42"] {
+        let doc = format!("<http://s/> <http://p/> {good} .\n");
+        assert_eq!(nt(&doc).unwrap(), 1, "`{good}` is a valid language tag");
+    }
+}
