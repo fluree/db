@@ -69,6 +69,20 @@ impl RdfInput {
     }
 }
 
+/// How many bytes the input is expected to hold, when that is knowable.
+///
+/// `None` for stdin and for anything that is not a regular file — a pipe has
+/// no length, and a character device's reported length is not a promise about
+/// how much it will produce. Only a regular file's size is used to size the
+/// buffer, which keeps a bogus length from turning into a bogus reservation.
+pub fn size_hint(input: &RdfInput) -> Option<u64> {
+    let RdfInput::File(path) = input else {
+        return None;
+    };
+    let meta = std::fs::metadata(path).ok()?;
+    meta.is_file().then(|| meta.len())
+}
+
 /// Open the input as a buffered byte stream, undecoded.
 ///
 /// Decompression is deliberately not layered on here: for a pipe the magic
@@ -95,16 +109,32 @@ pub fn open_reader(input: &RdfInput) -> CliResult<Box<dyn BufRead + Send>> {
 /// length check afterwards, so an oversized input is refused after reading
 /// 4 GiB instead of after allocating however much more was behind it.
 ///
+/// `expected` is the input's length when it has one; it is a sizing hint and
+/// never a promise. The `take` wrapper is what makes it necessary: it erases
+/// the `File` specialization `read_to_end` uses to reserve the buffer once,
+/// leaving the generic doubling path — which on a 280 MB document allocates a
+/// 512 MB buffer and peaks at 768 MB copying its way there. Reserving the real
+/// length costs two allocations and no copy. A file that grows past its own
+/// metadata still reads correctly; the `Vec` simply grows for the tail.
+///
 /// Time is attributed to [`Phase::Read`].
 pub fn read_all_guarded(
     reader: &mut dyn BufRead,
+    expected: Option<u64>,
     timings: &mut PhaseTimings,
     what: &str,
 ) -> CliResult<Vec<u8>> {
     const LIMIT: u64 = fluree_graph_turtle::error::MAX_INPUT_BYTES as u64;
 
     timings.enter(Phase::Read);
-    let mut buf = Vec::new();
+    // Clamped at the refusal limit: past it the read is going to be refused
+    // anyway, and reserving what an oversized file claims is how a length that
+    // is wrong — or a file that is sparse — becomes an allocation failure
+    // instead of the error message this function exists to produce.
+    let mut buf = match expected {
+        Some(len) => Vec::with_capacity(len.min(LIMIT + 1) as usize),
+        None => Vec::new(),
+    };
     let read = reader
         .take(LIMIT + 1)
         .read_to_end(&mut buf)
@@ -189,7 +219,7 @@ pub struct Decoded {
 pub fn read_decoded(input: &RdfInput, timings: &mut PhaseTimings) -> CliResult<Decoded> {
     let what = input.display();
     let mut reader = open_reader(input)?;
-    let raw = read_all_guarded(reader.as_mut(), timings, &what)?;
+    let raw = read_all_guarded(reader.as_mut(), size_hint(input), timings, &what)?;
     // The magic bytes are just the head of what was read — no separate peek.
     let compression = crate::rdf::syntax::resolve_compression(input.path(), &raw);
     let bytes_on_wire = raw.len() as u64;
@@ -384,6 +414,48 @@ mod tests {
             timings.elapsed(Phase::Decompress),
             std::time::Duration::ZERO
         );
+    }
+
+    #[test]
+    fn the_size_hint_is_a_hint_and_never_a_promise() {
+        // Both directions of wrong, because the hint only sizes the buffer:
+        // too small and the `Vec` grows for the tail, too large and the extra
+        // capacity is never touched. Either way the bytes are all there.
+        let doc = "<a> <b> <c> .\n".repeat(1000);
+        for hint in [
+            None,
+            Some(0),
+            Some(1),
+            Some(doc.len() as u64),
+            Some(1 << 20),
+        ] {
+            let mut reader = std::io::Cursor::new(doc.as_bytes());
+            let out = read_all_guarded(&mut reader, hint, &mut PhaseTimings::start(), "test")
+                .expect("reads");
+            assert_eq!(out.len(), doc.len(), "hint {hint:?} changed what was read");
+            assert_eq!(out, doc.as_bytes(), "hint {hint:?} corrupted the read");
+        }
+    }
+
+    #[test]
+    fn only_a_regular_file_offers_a_size_hint() {
+        // Stdin is a pipe: no length to hint with, and a device's reported
+        // length is not a promise about what it will produce.
+        assert_eq!(size_hint(&RdfInput::Stdin), None);
+        assert_eq!(
+            size_hint(&RdfInput::File(PathBuf::from("/nonexistent"))),
+            None
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(size_hint(&RdfInput::File(dir.path().to_path_buf())), None);
+
+        let path = dir.path().join("input.ttl");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"<a> <b> <c> .\n")
+            .unwrap();
+        assert_eq!(size_hint(&RdfInput::File(path)), Some(14));
     }
 
     #[test]
