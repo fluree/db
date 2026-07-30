@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_differential_fastpath.rs"]
+mod it_differential_fastpath;
 #[path = "it_query_agent_json.rs"]
 mod it_query_agent_json;
 #[path = "it_query_aggregates.rs"]
@@ -15,6 +17,8 @@ mod it_query_datatype;
 mod it_query_explain_native;
 #[path = "it_query_expression_semantics.rs"]
 mod it_query_expression_semantics;
+#[path = "it_query_filter_scope.rs"]
+mod it_query_filter_scope;
 #[path = "it_query_fuel_bound_object.rs"]
 mod it_query_fuel_bound_object;
 #[path = "it_query_fulltext.rs"]

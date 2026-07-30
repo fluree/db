@@ -25,6 +25,67 @@ use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use fluree_vocab::{geo_names, xsd_names};
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
+
+/// R3-B: the query memory budget in bytes for the in-memory join-build / aggregate
+/// fold guards, computed ONCE per process. `FLUREE_QUERY_MEMORY_BUDGET_BYTES`
+/// overrides (0 disables the guard); otherwise ~78% of the detected container /
+/// system memory limit, or an 8 GiB absolute fallback if detection fails. On the
+/// 10240 MB query Lambda (its cgroup limit) this is ~8 GiB — aborting typed ~2 GiB
+/// before the hard `Runtime.OutOfMemory`.
+pub fn query_memory_budget_bytes() -> usize {
+    use std::sync::OnceLock;
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        if let Ok(v) = std::env::var("FLUREE_QUERY_MEMORY_BUDGET_BYTES") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                return n; // explicit override; 0 disables the guard
+            }
+        }
+        const FALLBACK: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+        match detect_container_memory_bytes() {
+            Some(total) => total / 100 * 78,
+            None => FALLBACK,
+        }
+    })
+}
+
+/// R3-B: conservative per-binding byte estimate for the approximate memory-budget
+/// accounting (a `Binding` is a small enum, occasionally with a heap `String`;
+/// over-counting is safe — a too-tight budget only aborts a query already near OOM).
+pub const BINDING_EST_BYTES: usize = 64;
+/// R3-B: conservative per-group overhead estimate (key bindings + aggregate state).
+pub const GROUP_EST_BYTES: usize = 128;
+
+/// Best-effort container/system memory limit (cgroup v2 → cgroup v1 →
+/// `/proc/meminfo`). `None` where none is readable (e.g. macOS dev), where the
+/// caller uses the absolute fallback. A cgroup "unlimited" sentinel (non-numeric
+/// `max`, or an absurd v1 value) reads as undetectable so the guard uses the
+/// fallback, not a bogus huge budget.
+fn detect_container_memory_bytes() -> Option<usize> {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            return Some(n); // numeric v2 limit; "max" (unlimited) falls through
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            if n < (1usize << 62) {
+                return Some(n);
+            }
+        }
+    }
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let rest = rest.trim().strip_suffix("kB").unwrap_or(rest).trim();
+                if let Ok(kb) = rest.parse::<usize>() {
+                    return Some(kb * 1024);
+                }
+            }
+        }
+    }
+    None
+}
 use std::sync::{Arc, Mutex};
 
 /// Key for the per-query constant→`s_id` memo.
@@ -146,6 +207,11 @@ pub struct ExecutionContext<'a> {
     /// `false`. Surfaced through `opts.includeSystemFacts: true` on
     /// JSON-LD queries.
     pub include_system_facts: bool,
+    /// `@vocab` prefix a Cypher query was lowered against (from
+    /// `Query::cypher_vocab`). Used by `labels()`/`type()`/`keys()`
+    /// evaluation to compact IRIs the way `db.labels()` does: strip the
+    /// vocab prefix, otherwise return the full IRI.
+    pub cypher_vocab: Option<Arc<str>>,
     /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
     /// IRI template over the FK join columns is rendered directly from the child
     /// row's FK columns, skipping the parent-table scan and its referential
@@ -248,6 +314,14 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
+    /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
+    /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
+    /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
+    /// reuses the parent lookup instead of re-scanning it — the q031 seam. Keyed
+    /// with `graph_source_id`, so a query-wide share across R2RML operators is
+    /// safe. `Arc<Mutex<…>>` so derived per-graph contexts share it and the context
+    /// stays `Send + Sync`.
+    pub r2rml_parent_memo: crate::r2rml::R2rmlParentMemo,
     /// Per-query memo: translated + resolved overlay ops per
     /// `(graph, order, predicate)` — see
     /// [`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache).
@@ -310,6 +384,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -326,6 +401,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -364,6 +440,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -380,6 +457,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -422,6 +500,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store,
             binary_g_id: db.g_id,
@@ -438,6 +517,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -469,6 +549,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -485,6 +566,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -515,6 +597,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -531,6 +614,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -563,6 +647,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: QueryCancellation::disabled(),
             strict_bind_errors: false,
             include_system_facts: false,
+            cypher_vocab: None,
             trust_fk_refs: false,
             binary_store: None,
             binary_g_id: 0,
@@ -579,6 +664,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             const_sid_cache: ConstSidCache::default(),
+            r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }
@@ -673,6 +759,61 @@ impl<'a> ExecutionContext<'a> {
             Some(reason) => Err(QueryError::Cancelled { reason }),
             None => Ok(()),
         }
+    }
+
+    /// Record `bytes` of retained query memory into the query-scoped counter shared by
+    /// this context and every per-graph context derived from it (the derived contexts
+    /// clone the same cancellation handle). Called where a buffering post-scan operator
+    /// grows a retained structure; [`checkpoint`](Self::checkpoint) enforces the budget.
+    #[inline]
+    pub fn record_alloc(&self, bytes: usize) {
+        self.cancellation.record_alloc(bytes);
+    }
+
+    /// Release `bytes` previously recorded via [`record_alloc`](Self::record_alloc)
+    /// for an allocation with a provable drop point (e.g. a materialized scan window
+    /// that has been emitted and is about to drop). Saturating. Only valid for
+    /// non-persistent allocations — persistent join/aggregate/lookup buffers must
+    /// never be released. See [`QueryCancellation::release`].
+    #[inline]
+    pub fn release(&self, bytes: usize) {
+        self.cancellation.release(bytes);
+    }
+
+    /// Retained query memory recorded so far via [`record_alloc`](Self::record_alloc).
+    #[inline]
+    pub fn mem_used(&self) -> usize {
+        self.cancellation.allocated_bytes()
+    }
+
+    /// Cooperative checkpoint: the single guard the buffering post-scan operators
+    /// (hash-join build, GROUP BY fold, fused dim-map build) poll at batch granularity.
+    /// Aborts if the query was cancelled/timed out, or if the recorded retained memory
+    /// has crossed the budget.
+    ///
+    /// Cancellation is checked first, so an external timeout or RSS-watchdog signal
+    /// maps to [`QueryError::Cancelled`] (408 at the API boundary) while an
+    /// engine-detected memory overrun maps to the distinct
+    /// [`QueryError::MemoryBudgetExceeded`] (507) — a caller can tell "over memory"
+    /// from "over time". The budget is the handle's pinned ceiling when set, else the
+    /// process default ([`query_memory_budget_bytes`]); 0 disables it.
+    #[inline]
+    pub fn checkpoint(&self) -> Result<(), QueryError> {
+        self.check_cancelled()?;
+        let budget = self
+            .cancellation
+            .memory_limit()
+            .unwrap_or_else(query_memory_budget_bytes);
+        if budget != 0 {
+            let used = self.cancellation.allocated_bytes();
+            if used > budget {
+                return Err(QueryError::MemoryBudgetExceeded {
+                    used_bytes: used,
+                    budget_bytes: budget,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Enable strict bind error handling.
@@ -1070,6 +1211,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1086,6 +1228,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
@@ -1127,6 +1270,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1143,6 +1287,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             const_sid_cache: self.const_sid_cache.clone(),
+            r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
         }
@@ -1180,6 +1325,7 @@ impl<'a> ExecutionContext<'a> {
             cancellation: self.cancellation.clone(),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
+            cypher_vocab: self.cypher_vocab.clone(),
             trust_fk_refs: self.trust_fk_refs,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
@@ -1198,11 +1344,22 @@ impl<'a> ExecutionContext<'a> {
             // This per-graph context switches to `graph`'s own store/snapshot
             // (see `binary_store`/`active_snapshot` above) while clearing
             // `multi_ledger`, so the single-ledger const→s_id fast path DOES run
-            // here — against a different store than the parent. A fresh memo is
-            // mandatory: sharing the parent's would alias an s_id resolved in one
-            // graph/store into another. (`with_active_graph`/`with_default_graph`
-            // keep the same store, so they correctly share the parent's memo.)
+            // here — against a different store than the parent. A fresh
+            // `const_sid_cache` is mandatory: its key is the const IRI ALONE
+            // (store-implicit), so sharing the parent's would alias an s_id
+            // resolved in one graph/store into another.
             const_sid_cache: ConstSidCache::default(),
+            // The R2RML parent-lookup memo, by contrast, is SAFE to share here
+            // (F19): its key carries `graph_source_id` + `as_of_t`
+            // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
+            // one graph source can never be served for another — the store switch
+            // that forces a fresh `const_sid_cache` cannot alias the memo. Sharing
+            // lets PR-8b's query-scoped memo survive a correlated inner-join
+            // rebuilt across a `with_graph_ref` boundary (SERVICE / multi-source
+            // default R2RML), the one path `with_active_graph`'s clone doesn't
+            // cover. (`with_active_graph`/`with_default_graph` keep the same store,
+            // so they share BOTH caches.)
+            r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
         }

@@ -27,12 +27,81 @@ mod provider;
 mod rewrite;
 
 pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOperator};
-pub use operator::R2rmlScanOperator;
+pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
     ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
-    ScanCmpOp, ScanFilter, ScanValue,
+    ScanCmpOp, ScanFilter, ScanTopK, ScanValue,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, rewrite_patterns_for_r2rml, unsupported_subscope_error,
     R2rmlRewriteResult,
 };
+
+/// Read an on/off environment switch that defaults to **on**. Only `0`, `false`,
+/// `off`, or `no` (trimmed, case-insensitive) disable it — the single falsy
+/// spelling set for the whole R2RML switch family, so individual switches can't
+/// drift. (`env_flag_enabled` in `fluree-db-api`'s `graph_source::crawl` and the
+/// `FLUREE_ICEBERG_FOOTER_FROM_CACHE` switch in `fluree-db-iceberg` mirror these
+/// spellings; they can't share this symbol across the crate boundary.) Call
+/// sites cache the result in a per-switch `OnceLock` — set switches at process
+/// startup, not per query.
+pub(crate) fn env_switch_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// F17: whether `UnionOperator` and `BindOperator` forward a top-of-tree `LIMIT`
+/// row budget down toward the scan (UNION to each branch — a single branch may
+/// supply all `k` rows; BIND straight to its child, being 1:1/order-preserving).
+/// Both forwards are categorically sound; the switch exists for differential
+/// hygiene, so an OFF run is byte-identical to pre-F17. Default on;
+/// `FLUREE_R2RML_UNION_BUDGET=0|false|off|no` disables. Read once (process-wide).
+pub(crate) fn union_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_UNION_BUDGET"))
+}
+
+/// T1.3: whether `DatasetOperator` forwards a top-of-tree `LIMIT` row budget /
+/// `ORDER BY … LIMIT` top-k into each member's inner subtree. Every chat SPARQL is
+/// executed as a `FROM <ledger>` dataset query (the single-view path rejects
+/// SPARQL), so it routes through `DatasetOperator`; without forwarding, a bare
+/// `LIMIT 20` never reaches the R2RML scan and the whole table is materialized.
+/// Mirrors `GraphOperator`'s wrapper forwarding (the same directive-threading
+/// pattern) — the dataset wrapper was the one wrapper on that path that lacked it.
+/// Categorically sound: the consuming `LIMIT` truncates the member concatenation
+/// to `budget`, and each member's own `Sort`/`Distinct` still absorb the budget
+/// (no-op) where present, so this only removes the wrapper's artificial block. The
+/// switch exists for differential hygiene: OFF is byte-identical to pre-T1.3.
+/// Default on; `FLUREE_R2RML_DATASET_BUDGET=0|false|off|no` disables. Read once.
+pub(crate) fn dataset_budget_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_DATASET_BUDGET"))
+}
+
+/// Whether a multi-table query may warm its per-table catalog contexts
+/// (`loadTable` GET + metadata) CONCURRENTLY before the serial scan loop, so the
+/// per-table GETs overlap instead of summing (PR-8 slice 1). Default on;
+/// `FLUREE_R2RML_PARALLEL_CATALOG=0|false|off|no` restores serial resolution.
+/// Cached in a `OnceLock` — set at process startup, not per query.
+pub(crate) fn parallel_catalog_resolution_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_PARALLEL_CATALOG"))
+}
+
+/// Whether numeric (double / decimal) FILTER predicates may be pushed to the
+/// Iceberg scan for file / row-group pruning (PR-7). Default on;
+/// `FLUREE_ICEBERG_NUMERIC_STATS=0|false|off|no` reverts to leaving them with the
+/// in-engine FILTER only, independently of the shipped int/date/string pushdown.
+/// Gating at the single push site (`to_scan_value`) keeps the iceberg-side
+/// widening inert when off — no numeric `LiteralValue` is ever produced, so the
+/// new `stat_bounds` arms and FLBA-decimal relax are never exercised. Cached in a
+/// `OnceLock` — set at process startup, not per query.
+pub(crate) fn iceberg_numeric_stats_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_ICEBERG_NUMERIC_STATS"))
+}

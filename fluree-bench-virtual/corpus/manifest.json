@@ -288,7 +288,11 @@
       ],
       "order_sensitive": "none",
       "timeout_s": 180,
-      "subsets": []
+      "subsets": [],
+      "expected_status": {
+        "native": "ok",
+        "virtual": "error"
+      }
     },
     {
       "id": "q014",
@@ -1167,6 +1171,409 @@
       "subsets": [
         "smoke"
       ]
+    },
+    {
+      "id": "q055",
+      "file": "queries/q055_wildcard_peek.rq",
+      "bi_question": "BI-explore-1: Let me see what's in here.",
+      "tags": [
+        "wildcard",
+        "exploration"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": 5,
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q056",
+      "file": "queries/q056_triple_count.rq",
+      "bi_question": "BI-explore-2: How big is this dataset (total triples)?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": 1,
+      "order_sensitive": "none",
+      "timeout_s": 300,
+      "subsets": []
+    },
+    {
+      "id": "q057",
+      "file": "queries/q057_distinct_predicates.rq",
+      "bi_question": "BI-explore-3: What properties exist in this dataset?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "distinct"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        100
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "hash_gate": "rows_only"
+    },
+    {
+      "id": "q058",
+      "file": "queries/q058_class_census.rq",
+      "bi_question": "BI-explore-4: How many of each kind of thing are there?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate",
+        "group_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        30
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q059",
+      "file": "queries/q059_predicate_histogram.rq",
+      "bi_question": "BI-explore-5: Which fields dominate the data?",
+      "tags": [
+        "wildcard",
+        "exploration",
+        "count",
+        "aggregate",
+        "group_by",
+        "order_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT",
+        "DIM_CUSTOMER",
+        "DIM_DATE",
+        "DIM_EMPLOYEE",
+        "DIM_GEOGRAPHY",
+        "DIM_PRODUCT",
+        "DIM_STORE",
+        "DIM_SUPPLIER",
+        "FACT_GL_JOURNAL",
+        "FACT_INVENTORY_SNAPSHOT",
+        "FACT_ORDER",
+        "FACT_ORDER_LINE",
+        "FACT_PAYMENT",
+        "FACT_SHIPMENT",
+        "FACT_SUPPORT_TICKET",
+        "FACT_WEB_EVENT"
+      ],
+      "class": "exploration",
+      "expected_rows": [
+        1,
+        10
+      ],
+      "order_sensitive": "by_keys",
+      "timeout_s": 180,
+      "subsets": []
+    },
+    {
+      "id": "q060",
+      "file": "queries/q060_stores_by_channel_type_dataset.rq",
+      "bi_question": "BI-01: How many stores do we have by channel and store type? (C5 dataset-path family-A)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_STORE"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        2,
+        40
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q061",
+      "file": "queries/q061_current_customers_by_segment_dataset.rq",
+      "bi_question": "BI-13: How are current customers distributed across segments? (C5 dataset-path family-B over-count trap)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_CUSTOMER"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        2,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q062",
+      "file": "queries/q062_onhand_sum_by_store_dataset.rq",
+      "bi_question": "BI-16: What is total on-hand inventory by store? (C5 dataset-path family-C, fact-dim SUM)",
+      "tags": [
+        "aggregate",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_INVENTORY_SNAPSHOT",
+        "DIM_STORE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q063",
+      "file": "queries/q063_accounts_by_industry_ordered_dataset.rq",
+      "bi_question": "BI-05: Accounts by industry, ranked, skipping the top 2. (C5 dataset-path family-A, ORDER BY + OFFSET)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star",
+        "order_by"
+      ],
+      "tables": [
+        "DIM_ACCOUNT"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        40
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q064",
+      "file": "queries/q064_products_by_category_shared_predicate_dataset.rq",
+      "bi_question": "How many products are in each category? (E1 shared-predicate class-fusion; mirrors deployed Product-by-category)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "bgp_star"
+      ],
+      "tables": [
+        "DIM_PRODUCT"
+      ],
+      "class": "dims-only",
+      "expected_rows": [
+        1,
+        60
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 120,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q065",
+      "file": "queries/q065_orders_by_current_customer_segment_dataset.rq",
+      "bi_question": "How many orders per segment, from current customers only? (E2 join+flag slice-1.5; deployed #1/#2 dim-flag join analogue)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "join",
+        "fk_chain"
+      ],
+      "tables": [
+        "FACT_ORDER",
+        "DIM_CUSTOMER"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        20
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q066",
+      "file": "queries/q066_shipments_by_year_and_method_dataset.rq",
+      "bi_question": "How many shipments per (year, ship method)? (W4-2 MIXED fact+dim GROUP BY keys \u2014 shipMethod on the fact, yearNum on the date dim; round-3b #7 shape, COUNT-only for a deterministic hash)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "join",
+        "fk_chain",
+        "mixed_group_keys"
+      ],
+      "tables": [
+        "FACT_SHIPMENT",
+        "DIM_DATE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [
+        "smoke"
+      ],
+      "exec_path": "from"
+    },
+    {
+      "id": "q067",
+      "file": "queries/q067_tickets_by_year_and_priority_dataset.rq",
+      "bi_question": "How many tickets and total CSAT per (year, priority)? (W4-2 MIXED fact+dim GROUP BY keys with an integer SUM \u2014 priority on the fact, yearNum on the date dim, csatScore is xsd:integer so the SUM is hash-deterministic)",
+      "tags": [
+        "aggregate",
+        "count",
+        "group_by",
+        "join",
+        "fk_chain",
+        "mixed_group_keys"
+      ],
+      "tables": [
+        "FACT_SUPPORT_TICKET",
+        "DIM_DATE"
+      ],
+      "class": "fact-touching",
+      "expected_rows": [
+        1,
+        500
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
+    },
+    {
+      "id": "q068",
+      "file": "queries/q068_orderline_detail_crawl_dataset.rq",
+      "bi_question": "Show everything about the line-1 order lines (const-object folded onto a `?s ?p ?o` crawl). W4-1b folded-crawl EXECUTION coverage \u2014 the shape that returned zero triples under the ship-blocker; also the ex:order parent-lookup F-16 telemetry probe.",
+      "tags": [
+        "wildcard",
+        "exploration"
+      ],
+      "tables": [
+        "FACT_ORDER_LINE",
+        "FACT_ORDER",
+        "DIM_PRODUCT"
+      ],
+      "class": "exploration",
+      "hash_gate": "rows_only",
+      "expected_rows": [
+        1,
+        200
+      ],
+      "order_sensitive": "none",
+      "timeout_s": 180,
+      "subsets": [],
+      "exec_path": "from"
     }
   ]
 }

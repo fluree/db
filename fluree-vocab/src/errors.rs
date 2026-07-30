@@ -136,6 +136,22 @@ pub const STORAGE_READ: &str = "err:storage/ReadFailure";
 /// Storage write failure
 pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
 
+/// Object storage denied a read (S3 403 / `AccessDenied`).
+///
+/// Distinct from the policy-layer [`ACCESS_DENIED`]: this is the external
+/// object store (S3/GCS) refusing a read of an Iceberg data/metadata/manifest
+/// file, not a Fluree policy decision. Because S3 also returns `AccessDenied`
+/// for a missing object when the caller lacks `s3:ListBucket`, this means the
+/// credentials lack access **or** the object was moved/removed.
+pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
+
+/// The catalog authorized the table but vended no storage credentials while the
+/// source is configured to require them (`vended_credentials = true`).
+///
+/// Fail-closed signal: the query/preview is refused rather than silently
+/// downgrading to ambient (process-default) AWS credentials.
+pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
+
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";
 

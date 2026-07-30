@@ -2,6 +2,9 @@
 # Intent: Subquery (AVG of per-product sums); H8 non-lowered on virtual.
 # BI lineage (BI-08): "Which products sell above the average units-per-product?"
 # Predicates verified against enterprise.ttl — FactOrderLine: quantity, product; DimProduct: name, isCurrent.
+# PR-0/0a: a subquery inside a GRAPH-over-R2RML scope now ERRORS loudly on
+#   virtual targets (was silently 0 rows — F2, same root as q051); native still returns rows.
+#   Manifest: expected_status = {native: ok, virtual: error}.
 PREFIX edw: <http://ns.fluree.dev/edw#>
 SELECT ?pn ?u
 WHERE {

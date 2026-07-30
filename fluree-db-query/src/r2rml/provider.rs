@@ -36,9 +36,11 @@ pub enum ScanCmpOp {
 /// A literal value for a pushed-down scan filter.
 ///
 /// Limited to types that prune safely against Iceberg column min/max bounds and
-/// that the Arrow row filter can evaluate: date/int/bool, plus strings
-/// (lexicographic, e.g. equality on a name/code column). Decimal / float
-/// predicates are left to the in-engine FILTER.
+/// that the Arrow row filter can evaluate: date/int/bool, strings (lexicographic,
+/// e.g. equality on a name/code column), plus double and decimal — the last two
+/// gated by `FLUREE_ICEBERG_NUMERIC_STATS` and only ever produced from a numeric
+/// FILTER predicate (see `to_scan_value`). A missed push is never wrong: the
+/// in-engine FILTER remains the authority.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanValue {
     Bool(bool),
@@ -47,6 +49,18 @@ pub enum ScanValue {
     Date(i32),
     /// UTF-8 string (byte-lexicographic order matches Parquet stats + xsd:string).
     Str(String),
+    /// An `xsd:double`/`xsd:float` value — pushed against a physically-`double`
+    /// column only (see `build_iceberg_filter`). NaN bounds never over-prune (the
+    /// Iceberg compare treats a NaN operand as incomparable → keep).
+    Double(f64),
+    /// A decimal value as its unscaled i128 + precision/scale (mirrors
+    /// `LiteralValue::Decimal`). Carries the LITERAL's scale; the column's scale
+    /// may differ and is normalized during comparison.
+    Decimal {
+        unscaled: i128,
+        precision: u8,
+        scale: i8,
+    },
     /// A raw column value recovered by reversing a subject template (bound-subject
     /// pushdown). The physical type is unknown here — it is resolved against the
     /// Iceberg field type when the pushdown predicate is built, and the pushdown is
@@ -87,6 +101,24 @@ pub struct ScanFilter {
     pub column: String,
     pub op: ScanCmpOp,
     pub value: ScanValue,
+}
+
+/// A scan-side top-k directive for a single-column **DESCENDING** `ORDER BY …
+/// LIMIT k` directly above a single-table R2RML scan (PR-5). The scan reads files
+/// in `upper_bound(sort_column)`-DESC order, keeps a running k-th bound, and stops
+/// once no unread file can beat it — reading far fewer than the whole table.
+///
+/// A pure perf optimization: the scan still streams a strict SUPERSET of the true
+/// top-k (it only skips files that provably cannot contribute), and the
+/// authoritative `SortOperator` above applies the exact (compound) order + LIMIT.
+/// Ignored by the provider unless `sort_column` resolves to a pushable scalar
+/// column of the scanned table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanTopK {
+    /// The primary DESC sort column (an R2RML-mapped table column name).
+    pub sort_column: String,
+    /// How many top rows the bound must retain — the query's `LIMIT + OFFSET`.
+    pub k: usize,
 }
 
 /// Provider for compiled R2RML mappings.
@@ -168,12 +200,17 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     /// `filters` are conservative pushdown predicates (resolved to columns) for
     /// Iceberg file pruning. Implementations may ignore them (correctness is
     /// preserved by the in-engine FILTER) but honoring them skips data files.
+    /// `topk`, when set, is a single-column DESC `ORDER BY … LIMIT` directive
+    /// (PR-5): the implementation MAY read only the files that can hold the top-k
+    /// and stream a superset of them; ignoring it is always correct (the sort
+    /// above is authoritative).
     async fn scan_table(
         &self,
         graph_source_id: &str,
         table_name: &str,
         projection: &[String],
         filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
 
@@ -201,6 +238,19 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     ) -> Result<Option<u64>> {
         let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
         Ok(None)
+    }
+
+    /// Warm the per-query catalog session + caches for a known set of tables
+    /// CONCURRENTLY, so a following *serial* scan loop (which resolves one table
+    /// per `scan_table`) overlaps the per-table `loadTable` GETs instead of
+    /// summing them. Side-effect-only: returns nothing, and a resolution failure
+    /// here MUST be swallowed by the implementation — the real scan re-resolves
+    /// and surfaces any error — so this only ever removes latency, never changes
+    /// results or error behavior. Callers gate it on
+    /// [`super::parallel_catalog_resolution_enabled`]. The default is a no-op (a
+    /// provider without a remote catalog has nothing to warm).
+    async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        let _ = (graph_source_id, table_names);
     }
 }
 
@@ -250,6 +300,7 @@ impl R2rmlTableProvider for NoOpR2rmlProvider {
         _table_name: &str,
         _projection: &[String],
         _filters: &[ScanFilter],
+        _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream> {
         Err(crate::error::QueryError::Internal(format!(

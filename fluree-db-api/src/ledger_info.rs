@@ -995,20 +995,70 @@ fn is_secret_config_key(key: &str) -> bool {
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
 }
 
-/// Recursively replace secret-bearing scalar values with `"[redacted]"`.
+/// True iff `v` is EXACTLY `{"secret_ref": "<string>"}` — the wire shape of
+/// `ConfigValue::SecretRef`. Strict (a single key named `secret_ref` with a
+/// string value) so that any OTHER object shape under a secret key falls through
+/// to normal, fail-closed redaction rather than being blanket-preserved.
+fn is_secret_ref_object(v: &JsonValue) -> bool {
+    match v {
+        JsonValue::Object(m) => {
+            m.len() == 1 && matches!(m.get("secret_ref"), Some(JsonValue::String(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Keys inside a secret-keyed reference object that identify where the secret
+/// comes from rather than what it is (the `ConfigValue::Dynamic` wire shape);
+/// their string values are preserved during subtree redaction.
+const SECRET_REF_SAFE_KEYS: &[&str] = &["env_var", "java_property"];
+
+fn is_secret_ref_safe_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SECRET_REF_SAFE_KEYS.iter().any(|s| *s == lower)
+}
+
+/// Recursively replace secret-bearing values with `"[redacted]"`.
 ///
-/// A secret held as an env-var reference object (`{"env_var": "...",
-/// "default_val": "..."}`) keeps its `env_var` name (safe, aids debugging) while
-/// the inline `default_val` fallback is masked by the recursive walk. Returns
-/// `true` when anything was redacted.
-fn redact_json_secrets(value: &mut JsonValue) -> bool {
+/// A scalar under a secret key is masked outright. A container under a secret
+/// key is redacted with inverted strictness by [`redact_secret_subtree`]:
+/// every scalar leaf inside is masked except reference-identifier strings
+/// (`env_var`, `java_property` — safe, they aid debugging), so a secret held
+/// as `{"env_var": "...", "default_val": "..."}` keeps its `env_var` name
+/// while the inline `default_val` fallback is masked, and a secret hidden in
+/// an unrecognized container shape (`{"token": ["..."]}`) cannot escape. The
+/// one container preserved whole is a clean `{"secret_ref": "..."}` reference
+/// (see [`is_secret_ref_object`]) — an opaque pointer, not a secret itself.
+/// Returns `true` when anything was redacted.
+///
+/// Value-level form of [`redact_graph_source_config`], for callers that
+/// already hold a parsed JSON tree.
+pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
     let mut redacted = false;
     match value {
         JsonValue::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if is_secret_config_key(k) && !v.is_object() && !v.is_array() && !v.is_null() {
-                    *v = JsonValue::String("[redacted]".to_string());
-                    redacted = true;
+                if is_secret_config_key(k) {
+                    if is_secret_ref_object(v) {
+                        // A secret *reference* is not a secret (same policy as
+                        // env-var names, which the redactor deliberately keeps):
+                        // the opaque ref stays visible for display and solo
+                        // consumes it. Leave it intact and do NOT recurse — its
+                        // lone `secret_ref` key is not on the allowlist anyway.
+                    } else if v.is_object() || v.is_array() {
+                        // Any OTHER container under a secret key (e.g. an
+                        // env-var `Dynamic`, or an unrecognized shape) is
+                        // redacted fail-closed: every scalar leaf is masked
+                        // except reference-identifier strings (`env_var`,
+                        // `java_property`).
+                        if redact_secret_subtree(v) {
+                            redacted = true;
+                        }
+                    } else if !v.is_null() {
+                        // Scalar under a secret key → redact.
+                        *v = JsonValue::String("[redacted]".to_string());
+                        redacted = true;
+                    }
                 } else if redact_json_secrets(v) {
                     redacted = true;
                 }
@@ -1022,6 +1072,37 @@ fn redact_json_secrets(value: &mut JsonValue) -> bool {
             }
         }
         _ => {}
+    }
+    redacted
+}
+
+/// Redact every scalar leaf beneath a secret-keyed container, keeping only
+/// reference-identifier strings ([`SECRET_REF_SAFE_KEYS`]) and nulls.
+fn redact_secret_subtree(value: &mut JsonValue) -> bool {
+    let mut redacted = false;
+    match value {
+        JsonValue::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_secret_ref_safe_key(k) && v.is_string() {
+                    continue;
+                }
+                if redact_secret_subtree(v) {
+                    redacted = true;
+                }
+            }
+        }
+        JsonValue::Array(arr) => {
+            for v in arr.iter_mut() {
+                if redact_secret_subtree(v) {
+                    redacted = true;
+                }
+            }
+        }
+        JsonValue::Null => {}
+        _ => {
+            *value = JsonValue::String("[redacted]".to_string());
+            redacted = true;
+        }
     }
     redacted
 }
@@ -1054,7 +1135,7 @@ pub fn redact_graph_source_config(config: &str) -> String {
 // ============================================================================
 
 /// Human-readable label for a graph-source type (e.g. `"Iceberg"`, `"R2RML"`).
-fn graph_source_type_label(source_type: &GraphSourceType) -> String {
+pub fn graph_source_type_label(source_type: &GraphSourceType) -> String {
     match source_type {
         GraphSourceType::Bm25 => "BM25".to_string(),
         GraphSourceType::Vector => "Vector".to_string(),
@@ -1395,11 +1476,11 @@ pub fn build_virtual_ledger_info(
     }
 }
 
-/// Thin (redacted) metadata view for a graph source that is not a virtual
-/// R2RML/Iceberg dataset (BM25 / Vector / Geo / Unknown). Preserves the
-/// historical `/info` stub shape but routes the config through
-/// [`redact_graph_source_config`] so no secret can leak.
-fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
+/// Thin (redacted) metadata view of a graph-source record. Routes the config
+/// through [`redact_graph_source_config`] so no secret can leak; the historical
+/// `/info` stub shape for sources that are not virtual R2RML/Iceberg datasets
+/// (BM25 / Vector / Geo / Unknown).
+pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
     let mut obj = json!({
         "name": record.name,
         "branch": record.branch,
@@ -1415,10 +1496,13 @@ fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
     if !record.dependencies.is_empty() {
         obj["dependencies"] = json!(record.dependencies);
     }
-    if !record.config.is_empty() && record.config != "{}" {
+    if !record.config.is_empty() {
         let redacted = redact_graph_source_config(&record.config);
         if let Ok(parsed) = serde_json::from_str::<JsonValue>(&redacted) {
-            obj["config"] = parsed;
+            let empty_object = parsed.as_object().is_some_and(serde_json::Map::is_empty);
+            if !empty_object {
+                obj["config"] = parsed;
+            }
         }
     }
 
@@ -1533,7 +1617,18 @@ async fn fetch_virtual_table_row_counts(
     let catalog: Arc<RestCatalogClient> = match cache.rest_client(&client_fp) {
         Some(c) => c,
         None => {
-            let auth_provider = match auth.create_provider_arc() {
+            // Hydrate any SecretRef auth INSIDE the miss arm — after `client_fp`
+            // was computed over the raw config (same ordering discipline as the
+            // scan path). Best-effort: a resolver failure just omits counts, like
+            // every other failure in this display-only path.
+            let hydrated_auth = match auth.hydrate(fluree.secret_resolver()).await {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::debug!(error = %e, "virtual ledger-info: auth secret resolution failed; counts omitted");
+                    return (HashMap::new(), None);
+                }
+            };
+            let auth_provider = match hydrated_auth.create_provider_arc() {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
@@ -2056,6 +2151,20 @@ pub struct LedgerInfoBuilder<'a> {
     options: LedgerInfoOptions,
 }
 
+/// T1.2 routing decision (pure): serve `/info` stats from the metadata-only
+/// graph-source path — not native full-stats — iff the id resolves to an **empty
+/// genesis ledger shell** (`ledger_t == 0`) **AND** a graph source is registered
+/// under it. That is the shape of a virtual (query-in-place) Iceberg/R2RML
+/// dataset: an empty native shell whose data lives in the backing tables. Native
+/// full-stats over such a shell federates into a full-table scan of every backing
+/// table — the `get_data_model` 900s runaway. The empty-shell gate keeps a real
+/// native ledger (`t > 0`), a non-graph-source id, and the exotic hybrid that has
+/// BOTH committed flakes AND graph sources all on the complete native path, so
+/// nothing is under-reported.
+const fn serve_virtual_stats_from_metadata(ledger_t: i64, graph_source_registered: bool) -> bool {
+    ledger_t == 0 && graph_source_registered
+}
+
 impl<'a> LedgerInfoBuilder<'a> {
     /// Create a new builder (called by `Fluree::ledger_info()`).
     pub(crate) fn new(fluree: &'a Fluree, ledger_id: String) -> Self {
@@ -2151,6 +2260,29 @@ impl<'a> LedgerInfoBuilder<'a> {
             }
             Err(e) => return Err(e),
         };
+
+        // T1.2: reroute an empty-shell virtual dataset's stats to the metadata-only
+        // graph-source path, so `/info` (e.g. MCP `get_data_model`) reads counts
+        // from Iceberg manifests + the mapping instead of scanning every backing
+        // table (the 900s runaway). The graph-source lookup runs ONLY for an empty
+        // shell (`t == 0`) — no extra work on the native hot path — and a lookup
+        // failure falls through to native (fail-safe). See
+        // `serve_virtual_stats_from_metadata` for the precise predicate.
+        let graph_source = if ledger.t() == 0 {
+            self.fluree
+                .nameservice()
+                .lookup_graph_source(&self.ledger_id)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if serve_virtual_stats_from_metadata(ledger.t(), graph_source.is_some()) {
+            if let Some(gs) = graph_source {
+                return build_graph_source_info(self.fluree, &gs).await;
+            }
+        }
 
         // Optional API-level cache: when ledger caching is enabled, a global LeafletCache
         // exists with a single memory budget (TinyLFU). We store ledger-info response
@@ -2248,6 +2380,24 @@ impl<'a> LedgerInfoBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T1.2 routing predicate — the empty-shell gate that decides native
+    /// full-stats vs the metadata-only graph-source path. Covers the team-lead's
+    /// (a)/(b)/(e) cases as a truth table (the wiring in `execute` then does the
+    /// async graph-source lookup only when the shell qualifies).
+    #[test]
+    fn serve_virtual_stats_only_for_empty_shell_graph_source() {
+        // (a) empty genesis shell (t==0) + a registered graph source = a virtual
+        // dataset → metadata path (fixes the get_data_model runaway).
+        assert!(serve_virtual_stats_from_metadata(0, true));
+        // (b) pure native ledger (no graph source) → native full-stats, unchanged.
+        assert!(!serve_virtual_stats_from_metadata(0, false));
+        assert!(!serve_virtual_stats_from_metadata(42, false));
+        // (e) hybrid: a ledger with committed native data (t>0) that ALSO has a
+        // graph source registered → native path, so its real flakes are never
+        // under-reported by the manifest-only path.
+        assert!(!serve_virtual_stats_from_metadata(42, true));
+    }
 
     #[test]
     fn test_compute_selectivity() {
@@ -2709,6 +2859,52 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_graph_source_config_masks_secret_keyed_array() {
+        let config = r#"{"auth":{"token":["tok-1","tok-2"]},"table":"ns.t"}"#;
+        let redacted = redact_graph_source_config(config);
+        assert!(
+            !redacted.contains("tok-1"),
+            "array secret leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("tok-2"),
+            "array secret leaked: {redacted}"
+        );
+        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("ns.t"));
+    }
+
+    #[test]
+    fn test_redact_graph_source_config_masks_unrecognized_secret_object_shape() {
+        let config = r#"{"auth":{"client_secret":{"value":"s3cret-inner",
+            "env_var":"POLARIS_SECRET","nested":{"deep":"s3cret-deep"}}}}"#;
+        let redacted = redact_graph_source_config(config);
+        assert!(
+            !redacted.contains("s3cret-inner"),
+            "object-wrapped secret leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("s3cret-deep"),
+            "nested object secret leaked: {redacted}"
+        );
+        assert!(
+            redacted.contains("POLARIS_SECRET"),
+            "env var name should survive: {redacted}"
+        );
+    }
+
+    #[test]
+    fn test_generic_gs_info_omits_empty_config_regardless_of_whitespace() {
+        for empty in ["", "{}", "{ }", "{\n}"] {
+            let info = build_generic_graph_source_info(&virtual_record(empty));
+            assert!(
+                info.get("config").is_none(),
+                "empty config {empty:?} should be omitted: {info}"
+            );
+        }
+    }
+
+    #[test]
     fn test_redact_graph_source_config_noop_for_nonsecret_is_byte_identical() {
         // A BM25 config has no secret keys -> returned unchanged (preserves the
         // exact `gs_record_to_jsonld` output the existing test locks in).
@@ -2801,6 +2997,10 @@ mod tests {
 
         const SENTINEL_A: &str = "sentinel-secret-value-AAAA";
         const SENTINEL_B: &str = "sentinel-secret-value-BBBB";
+        // A secret REFERENCE is not a secret; it must stay visible after redaction
+        // (same policy as env-var names). Chosen so it shares no substring with the
+        // sentinels above.
+        const VISIBLE_REF: &str = "vault://team/ref-ID-VISIBLE";
 
         let auths: Vec<AuthConfig> = vec![
             AuthConfig::None,
@@ -2823,6 +3023,17 @@ mod tests {
                     default_val: Some(SENTINEL_A.to_string()),
                 },
                 scope: Some("PRINCIPAL_ROLE:ALL".to_string()),
+                audience: None,
+            },
+            // SecretRef under the `client_secret` secret key: the opaque ref must
+            // survive redaction (a reference is not a secret).
+            AuthConfig::OAuth2ClientCredentials {
+                token_url: "https://c.example.com/tokens".to_string(),
+                client_id: ConfigValue::literal("svc-client"),
+                client_secret: ConfigValue::SecretRef {
+                    secret_ref: VISIBLE_REF.to_string(),
+                },
+                scope: None,
                 audience: None,
             },
         ];
@@ -2867,6 +3078,13 @@ mod tests {
                 assert!(
                     redacted.contains("MY_SECRET"),
                     "env var name lost: {redacted}"
+                );
+            }
+            // A SecretRef's opaque reference survives (it is not a secret).
+            if stored.contains(VISIBLE_REF) {
+                assert!(
+                    redacted.contains(VISIBLE_REF),
+                    "secret ref must stay visible on redaction: {redacted}"
                 );
             }
         }

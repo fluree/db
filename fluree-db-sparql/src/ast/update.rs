@@ -84,6 +84,96 @@ pub enum UpdateOperation {
     /// INSERT/DELETE with WHERE clause (Modify operation)
     /// Boxed to reduce enum size (Modify is ~288 bytes vs ~56 for others)
     Modify(Box<Modify>),
+    /// `LOAD [SILENT] <source> [INTO GRAPH <into>]` (SPARQL 1.1 Update §3.1.4)
+    Load(Load),
+    /// `CLEAR [SILENT] (GRAPH <iri> | DEFAULT | NAMED | ALL)` (§3.1.5)
+    Clear(GraphMgmtRef),
+    /// `DROP [SILENT] (GRAPH <iri> | DEFAULT | NAMED | ALL)` (§3.1.5)
+    Drop(GraphMgmtRef),
+    /// `CREATE [SILENT] GRAPH <iri>` (§3.1.5)
+    Create(Create),
+    /// `ADD [SILENT] <from> TO <to>` (§3.2.5)
+    Add(GraphTransfer),
+    /// `COPY [SILENT] <from> TO <to>` (§3.2.3)
+    Copy(GraphTransfer),
+    /// `MOVE [SILENT] <from> TO <to>` (§3.2.4)
+    Move(GraphTransfer),
+}
+
+/// A `GraphRefAll` reference — the target of `CLEAR`/`DROP`.
+///
+/// Grammar (SPARQL 1.1 Update): `GraphRefAll ::= GRAPH iri | DEFAULT | NAMED | ALL`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphRefAll {
+    /// A specific named graph: `GRAPH <iri>`
+    Graph(Iri),
+    /// The default graph: `DEFAULT`
+    Default,
+    /// All named graphs (not the default): `NAMED`
+    Named,
+    /// The default graph and every named graph: `ALL`
+    All,
+}
+
+/// A `GraphOrDefault` reference — the source/destination of `ADD`/`COPY`/`MOVE`.
+///
+/// Grammar: `GraphOrDefault ::= DEFAULT | GRAPH? iri` (the `GRAPH` keyword is
+/// optional before the IRI).
+#[derive(Clone, Debug, PartialEq)]
+pub enum GraphOrDefault {
+    /// The default graph: `DEFAULT`
+    Default,
+    /// A specific named graph: `[GRAPH] <iri>`
+    Graph(Iri),
+}
+
+/// `LOAD [SILENT] <source> [INTO GRAPH <into>]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Load {
+    /// `SILENT` suppresses the "could not fetch" error (making the op a no-op).
+    pub silent: bool,
+    /// The remote RDF document IRI to load.
+    pub source: Iri,
+    /// Optional destination named graph (`INTO GRAPH <into>`); `None` loads
+    /// into the default graph.
+    pub into: Option<Iri>,
+    /// Source span.
+    pub span: SourceSpan,
+}
+
+/// `CLEAR [SILENT] GraphRefAll` / `DROP [SILENT] GraphRefAll`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphMgmtRef {
+    /// `SILENT` suppresses the "graph does not exist" error.
+    pub silent: bool,
+    /// The graph(s) to clear/drop.
+    pub target: GraphRefAll,
+    /// Source span.
+    pub span: SourceSpan,
+}
+
+/// `CREATE [SILENT] GRAPH <iri>`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Create {
+    /// `SILENT` suppresses the "graph already exists" error.
+    pub silent: bool,
+    /// The named graph to create.
+    pub graph: Iri,
+    /// Source span.
+    pub span: SourceSpan,
+}
+
+/// `ADD [SILENT] from TO to` / `COPY ...` / `MOVE ...`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphTransfer {
+    /// `SILENT` suppresses the "source graph does not exist" error.
+    pub silent: bool,
+    /// The source graph.
+    pub from: GraphOrDefault,
+    /// The destination graph.
+    pub to: GraphOrDefault,
+    /// Source span.
+    pub span: SourceSpan,
 }
 
 /// INSERT DATA operation.

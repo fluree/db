@@ -1,0 +1,18 @@
+# q064 products_by_category_shared_predicate_dataset
+# Intent: E1 shared-predicate group-by. `edw:category` is a PLAIN column on BOTH
+#   DIM_PRODUCT (edw:Product, .../product/{PRODUCT_KEY}) and FACT_SUPPORT_TICKET
+#   (edw:SupportTicket, .../ticket/{TICKET_KEY}) — disjoint subject templates.
+#   Before E1, the shared predicate made class_fusion_is_safe refuse to fuse the
+#   `a edw:Product` type into the star, emitting a 2-pattern shape (star + a
+#   separate class-only scan) that failed the fused single-pattern gate → decline
+#   → materialize. E1 fuses it to a single DIM_PRODUCT scan. This mirrors the
+#   deployed Product-by-category timeout (#7/#10).
+# BI lineage: "How many products are in each category?" (dataset path)
+# Predicates verified against enterprise.ttl — DimProduct: category (a plain column
+#   shared with FactSupportTicket).
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?cat (COUNT(?p) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?p a edw:Product ; edw:category ?cat . }
+GROUP BY ?cat

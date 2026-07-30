@@ -584,7 +584,9 @@ impl NumericAcc {
 /// inputs. Matches IEEE-754 decimal128 precision (34 digits) — well past
 /// xsd:double's ~17 digits of precision but small enough to keep output
 /// compact for typical financial / scientific aggregates.
-const AVG_DECIMAL_PRECISION: u64 = 34;
+// Shared with the AVG fast path (fast_predicate_scalar_agg), whose integer
+// lane must produce byte-identical decimal output to finalize_avg.
+pub(crate) const AVG_DECIMAL_PRECISION: u64 = 34;
 
 /// Best-effort `BigInt → f64`. Saturates at infinity for out-of-range values.
 fn bigint_to_f64(b: &BigInt) -> f64 {
@@ -736,8 +738,18 @@ fn agg_count_distinct(values: &[Binding]) -> Binding {
 /// is encountered. Result datatype follows XPath numeric promotion.
 fn agg_sum(values: &[Binding]) -> Binding {
     let mut acc = NumericAcc::new();
-    for v in values.iter().filter_map(binding_to_numeric) {
-        acc.add(v);
+    for v in values {
+        // A bound non-numeric group member (bnode/IRI/string) is a type error:
+        // SUM poisons to unbound rather than summing over the numeric subset
+        // (SPARQL §18.5.1; agg-err-01). Unbound/Poisoned members contribute
+        // nothing and do not poison.
+        if matches!(v, Binding::Unbound | Binding::Poisoned) {
+            continue;
+        }
+        match binding_to_numeric(v) {
+            Some(n) => acc.add(n),
+            None => return Binding::Unbound,
+        }
     }
     acc.finalize_sum()
 }
@@ -749,8 +761,16 @@ fn agg_sum(values: &[Binding]) -> Binding {
 /// xsd:double inputs collapse the accumulator to f64 and yield xsd:double.
 fn agg_avg(values: &[Binding]) -> Binding {
     let mut acc = NumericAcc::new();
-    for v in values.iter().filter_map(binding_to_numeric) {
-        acc.add(v);
+    for v in values {
+        // Same poison rule as SUM: a bound non-numeric member is a type error
+        // (AVG unbinds), not a silently-skipped value (agg-err-01).
+        if matches!(v, Binding::Unbound | Binding::Poisoned) {
+            continue;
+        }
+        match binding_to_numeric(v) {
+            Some(n) => acc.add(n),
+            None => return Binding::Unbound,
+        }
     }
     acc.finalize_avg()
 }

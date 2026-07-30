@@ -373,6 +373,11 @@ impl crate::Fluree {
         turtle: String,
         snapshot: Option<i64>,
     ) -> Result<ValidateR2rmlResponse> {
+        // Resolve any SecretRef auth up front. A missing resolver is a host
+        // wiring fault (not a mapping problem), so it fails closed here rather
+        // than degrading to a per-table TableNotFound diagnostic.
+        let conn = self.hydrate_conn(conn).await?;
+
         let compiled = match compile_for_validate(&turtle) {
             Ok(compiled) => compiled,
             Err(response) => return Ok(response),

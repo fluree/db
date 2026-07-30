@@ -231,11 +231,12 @@ pub fn row_group_can_contain(
             let Some(&col_idx) = field_id_to_leaf.get(field_id) else {
                 return true;
             };
-            let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
+            let col = row_group.column(col_idx);
+            let Some(stats) = prunable_stats(col) else {
                 return true;
             };
             let lit = value.to_typed_value();
-            let (lower, upper) = stat_bounds(stats, &lit);
+            let (lower, upper) = stat_bounds(stats, &lit, column_decimal(col));
             bounds_can_contain(*op, &lit, lower, upper)
         }
         Expression::In {
@@ -244,12 +245,14 @@ pub fn row_group_can_contain(
             let Some(&col_idx) = field_id_to_leaf.get(field_id) else {
                 return true;
             };
-            let Some(stats) = prunable_stats(row_group.column(col_idx)) else {
+            let col = row_group.column(col_idx);
+            let Some(stats) = prunable_stats(col) else {
                 return true;
             };
+            let decimal = column_decimal(col);
             values.iter().any(|v| {
                 let lit = v.to_typed_value();
-                let (lower, upper) = stat_bounds(stats, &lit);
+                let (lower, upper) = stat_bounds(stats, &lit, decimal);
                 bounds_can_contain(ComparisonOp::Eq, &lit, lower, upper)
             })
         }
@@ -259,16 +262,18 @@ pub fn row_group_can_contain(
 }
 
 /// Statistics usable for row-group pruning, or `None` (→ keep the row group
-/// conservatively) when the column has no statistics or is a Decimal type.
+/// conservatively) when the column has no statistics or is a decimal in a
+/// non-prunable physical encoding.
 ///
-/// [`stat_bounds`] keys purely on the Parquet *physical* variant. A decimal
-/// stored as INT32/INT64 holds unscaled integers, so comparing a scaled query
+/// [`stat_bounds`] reads decimal bounds from `FIXED_LEN_BYTE_ARRAY` statistics
+/// (big-endian two's-complement unscaled bytes) using the column's scale, which
+/// is the encoding the Iceberg spec mandates. A decimal stored as INT32/INT64
+/// holds unscaled integers whose stats are indistinguishable from a real int
+/// column without threading the logical scale, so comparing a scaled query
 /// literal (`5`) against unscaled bounds (`[500, 504]` for `Decimal(_, 2)`) could
-/// prune a row group that actually matches. The Iceberg spec currently mandates
-/// `fixed_len_byte_array` for decimals — whose statistics already fall through to
-/// the conservative `(None, None)` — so this guard is defensive rather than a live
-/// bug, keeping correctness off the implicit encoding assumption (fluree/db#1406
-/// review).
+/// prune a row group that actually matches — so those are DECLINED (fluree/db
+/// #1406), with a debug breadcrumb for anyone investigating why an off-spec
+/// writer's decimal filters don't prune.
 fn prunable_stats(col: &ColumnChunkMetaData) -> Option<&Statistics> {
     let info = col.column_descr().self_type().get_basic_info();
     let is_decimal = info.converted_type() == parquet::basic::ConvertedType::DECIMAL
@@ -276,17 +281,44 @@ fn prunable_stats(col: &ColumnChunkMetaData) -> Option<&Statistics> {
             info.logical_type(),
             Some(parquet::basic::LogicalType::Decimal { .. })
         );
-    if is_decimal {
+    if is_decimal
+        && col.column_descr().physical_type() != parquet::basic::Type::FIXED_LEN_BYTE_ARRAY
+    {
+        tracing::debug!(
+            column = col.column_descr().name(),
+            "decimal stats declined: non-FLBA physical encoding"
+        );
         return None;
     }
     col.statistics()
 }
 
+/// The `(precision, scale)` of a decimal column, from its Parquet primitive type
+/// descriptor. Reached only via the FLBA-decimal arm of [`stat_bounds`] (entered
+/// only for a decimal literal against FLBA statistics), so it is called only on
+/// real decimal columns; `None` if the descriptor's precision/scale don't fit.
+fn column_decimal(col: &ColumnChunkMetaData) -> Option<(u8, i8)> {
+    let d = col.column_descr();
+    let precision = u8::try_from(d.type_precision()).ok()?;
+    let scale = i8::try_from(d.type_scale()).ok()?;
+    Some((precision, scale))
+}
+
 /// Extract a Parquet row-group column's min/max as `TypedValue`s coerced to the
 /// same variant as `like` (the predicate literal). Only the pushdown-supported
-/// physical types are read (bool / int32 / int64, including int32-backed dates);
-/// anything else yields `(None, None)` so pruning stays conservative.
-fn stat_bounds(stats: &Statistics, like: &TypedValue) -> (Option<TypedValue>, Option<TypedValue>) {
+/// physical types are read (bool / int32 / int64, including int32-backed dates;
+/// float / double; and FLBA-backed decimal); anything else yields `(None, None)`
+/// so pruning stays conservative.
+///
+/// `col_decimal` is the column's `(precision, scale)`, needed to decode FLBA
+/// decimal bounds at the COLUMN's scale (not the literal's). Float min/max are
+/// read raw; a NaN bound is neutralized downstream by the NaN-safe
+/// [`TypedValue::lt`]/[`TypedValue::le`], keeping pruning a strict superset.
+fn stat_bounds(
+    stats: &Statistics,
+    like: &TypedValue,
+    col_decimal: Option<(u8, i8)>,
+) -> (Option<TypedValue>, Option<TypedValue>) {
     match (stats, like) {
         (Statistics::Boolean(s), TypedValue::Boolean(_)) => (
             s.min_opt().map(|&v| TypedValue::Boolean(v)),
@@ -305,6 +337,29 @@ fn stat_bounds(stats: &Statistics, like: &TypedValue) -> (Option<TypedValue>, Op
             s.min_opt().map(|&v| TypedValue::Int64(v)),
             s.max_opt().map(|&v| TypedValue::Int64(v)),
         ),
+        // Float / double min/max read raw; NaN bounds are handled by the
+        // NaN-safe compare (a NaN operand → incomparable → keep).
+        (Statistics::Double(s), TypedValue::Float64(_)) => (
+            s.min_opt().map(|&v| TypedValue::Float64(v)),
+            s.max_opt().map(|&v| TypedValue::Float64(v)),
+        ),
+        (Statistics::Float(s), TypedValue::Float32(_)) => (
+            s.min_opt().map(|&v| TypedValue::Float32(v)),
+            s.max_opt().map(|&v| TypedValue::Float32(v)),
+        ),
+        // FLBA-backed decimal: min/max are big-endian two's-complement unscaled
+        // bytes carrying the COLUMN's scale (`col_decimal`), which the query
+        // literal's scale may differ from — `decimal_cmp` normalizes them.
+        (Statistics::FixedLenByteArray(s), TypedValue::Decimal { .. }) => {
+            let Some((precision, scale)) = col_decimal else {
+                return (None, None);
+            };
+            let type_str = format!("decimal({precision}, {scale})");
+            let decode = |b: &parquet::data_type::FixedLenByteArray| {
+                decode_by_type_string(b.data(), Some(type_str.as_str())).ok()
+            };
+            (s.min_opt().and_then(&decode), s.max_opt().and_then(&decode))
+        }
         // UTF-8 string min/max. Parquet stats are valid bounds even when the
         // writer truncates them (min truncated down, max up), so lexicographic
         // pruning stays conservative. Non-UTF-8 bytes fall through to no bound.
@@ -839,6 +894,392 @@ mod tests {
             &lt_m,
             meta.row_group(1),
             &field_to_col
+        ));
+    }
+
+    /// Two DOUBLE row groups with disjoint ranges: rg0 = [1.0, 3.0], rg1 = [100.0, 102.0].
+    fn two_row_group_double_parquet() -> bytes::Bytes {
+        use parquet::data_type::DoubleType;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let schema = Arc::new(parse_message_type("message s { REQUIRED DOUBLE v; }").unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            for vals in [[1.0f64, 2.0, 3.0], [100.0, 101.0, 102.0]] {
+                let mut rg = writer.next_row_group().unwrap();
+                let mut col = rg.next_column().unwrap().unwrap();
+                col.typed::<DoubleType>()
+                    .write_batch(&vals, None, None)
+                    .unwrap();
+                col.close().unwrap();
+                rg.close().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn row_group_pruning_uses_double_stats() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(two_row_group_double_parquet()).unwrap();
+        let meta = reader.metadata();
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let cmp = |op, v: f64| Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op,
+            value: LiteralValue::Float64(v),
+        };
+
+        // v >= 50.0: rg0 (max 3.0) pruned, rg1 kept.
+        let ge = cmp(ComparisonOp::GtEq, 50.0);
+        assert!(!row_group_can_contain(
+            &ge,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(&ge, meta.row_group(1), &field_to_col));
+
+        // v < 50.0: rg0 kept, rg1 pruned.
+        let lt = cmp(ComparisonOp::Lt, 50.0);
+        assert!(row_group_can_contain(&lt, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(
+            &lt,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // v == 2.0: only rg0 can contain it.
+        let eq = cmp(ComparisonOp::Eq, 2.0);
+        assert!(row_group_can_contain(&eq, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(
+            &eq,
+            meta.row_group(1),
+            &field_to_col
+        ));
+    }
+
+    /// Two FLBA(16) DECIMAL(38,3) row groups (unscaled big-endian): rg0 =
+    /// [1.000, 9.990], rg1 = [20.000, 30.000]. The column scale is 3; the query
+    /// literals below carry scale 2 to exercise the cross-scale compare.
+    fn flba_decimal_parquet() -> bytes::Bytes {
+        use parquet::basic::{LogicalType, Repetition, Type as PhysicalType};
+        use parquet::data_type::{FixedLenByteArray, FixedLenByteArrayType};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type;
+
+        let col_type = Type::primitive_type_builder("v", PhysicalType::FIXED_LEN_BYTE_ARRAY)
+            .with_repetition(Repetition::REQUIRED)
+            .with_length(16)
+            .with_logical_type(Some(LogicalType::Decimal {
+                scale: 3,
+                precision: 38,
+            }))
+            .with_precision(38)
+            .with_scale(3)
+            .build()
+            .unwrap();
+        let schema = Arc::new(
+            Type::group_type_builder("s")
+                .with_fields(vec![Arc::new(col_type)])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(WriterProperties::builder().build());
+        let flba = |unscaled: i128| FixedLenByteArray::from(unscaled.to_be_bytes().to_vec());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            for vals in [[1000i128, 5000, 9990], [20000, 25000, 30000]] {
+                let arr: Vec<FixedLenByteArray> = vals.iter().map(|&u| flba(u)).collect();
+                let mut rg = writer.next_row_group().unwrap();
+                let mut col = rg.next_column().unwrap().unwrap();
+                col.typed::<FixedLenByteArrayType>()
+                    .write_batch(&arr, None, None)
+                    .unwrap();
+                col.close().unwrap();
+                rg.close().unwrap();
+            }
+            writer.close().unwrap();
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn row_group_pruning_uses_flba_decimal_stats() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(flba_decimal_parquet()).unwrap();
+        let meta = reader.metadata();
+        assert_eq!(meta.num_row_groups(), 2);
+        // The FLBA-decimal column is now admitted for pruning (was declined).
+        assert!(prunable_stats(meta.row_group(0).column(0)).is_some());
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        let cmp = |op, unscaled: i128, scale: i8| Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op,
+            value: LiteralValue::Decimal {
+                unscaled,
+                precision: 38,
+                scale,
+            },
+        };
+
+        // v = 9.99 (scale 2) == 9.990 (rg0 max, scale 3): rg0 boundary-equal kept;
+        // rg1 (min 20.000) pruned. Cross-scale equality keep.
+        let eq = cmp(ComparisonOp::Eq, 999, 2);
+        assert!(row_group_can_contain(&eq, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(
+            &eq,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // v = 15.00 (scale 2) falls in the gap between the groups: BOTH pruned —
+        // the positive "it actually prunes" decimal case (would silently no-prune
+        // without the `TypedValue::lt/le` Decimal arm).
+        let eq_gap = cmp(ComparisonOp::Eq, 1500, 2);
+        assert!(!row_group_can_contain(
+            &eq_gap,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &eq_gap,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // v >= 25.00 (scale 2): rg0 (max 9.990) pruned, rg1 (max 30.000) kept.
+        let ge = cmp(ComparisonOp::GtEq, 2500, 2);
+        assert!(!row_group_can_contain(
+            &ge,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(&ge, meta.row_group(1), &field_to_col));
+
+        // v < 15.00 (scale 2): rg0 kept, rg1 (min 20.000) pruned.
+        let lt = cmp(ComparisonOp::Lt, 1500, 2);
+        assert!(row_group_can_contain(&lt, meta.row_group(0), &field_to_col));
+        assert!(!row_group_can_contain(
+            &lt,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // v > 9.99 (strict, scale 2): rg0 upper 9.990 == 9.99 → not strictly
+        // greater → rg0 pruned. Boundary-strict prune.
+        let gt = cmp(ComparisonOp::Gt, 999, 2);
+        assert!(!row_group_can_contain(
+            &gt,
+            meta.row_group(0),
+            &field_to_col
+        ));
+
+        // Same-scale (scale 3) literal also prunes: v = 5.000 → only rg0.
+        let eq3 = cmp(ComparisonOp::Eq, 5000, 3);
+        assert!(row_group_can_contain(
+            &eq3,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &eq3,
+            meta.row_group(1),
+            &field_to_col
+        ));
+    }
+
+    #[test]
+    fn row_group_pruning_int_coerced_scale0_decimal() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        // Mirrors PR-7's integer→decimal coercion: an integer FILTER literal
+        // pushed against a decimal column as an EXACT scale-0 decimal (q019 shape:
+        // `?deb > 1000000` on the scale-3 money column, decimal_cmp normalizing).
+        let reader = SerializedFileReader::new(flba_decimal_parquet()).unwrap();
+        let meta = reader.metadata();
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        // rg0 = [1.000, 9.990], rg1 = [20.000, 30.000].
+        let dec0 = |op, unscaled: i128| Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op,
+            value: LiteralValue::Decimal {
+                unscaled,
+                precision: 38,
+                scale: 0,
+            },
+        };
+
+        // Positive prune: v = 15 (15.000) falls in the gap → BOTH groups pruned.
+        let eq15 = dec0(ComparisonOp::Eq, 15);
+        assert!(!row_group_can_contain(
+            &eq15,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(!row_group_can_contain(
+            &eq15,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // In-bounds keep: v = 5 (5.000) is within rg0's [1.000, 9.990] → kept.
+        let eq5 = dec0(ComparisonOp::Eq, 5);
+        assert!(row_group_can_contain(
+            &eq5,
+            meta.row_group(0),
+            &field_to_col
+        ));
+
+        // Range (q019 shape): v > 15 → rg0 (max 9.990) pruned, rg1 (max 30) kept.
+        let gt15 = dec0(ComparisonOp::Gt, 15);
+        assert!(!row_group_can_contain(
+            &gt15,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &gt15,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // Rescale-overflow → keep: a scale-0 literal so large that normalizing to
+        // the column's scale 3 overflows i128 → decimal_cmp None → conservative keep.
+        let huge = dec0(ComparisonOp::Eq, i128::MAX);
+        assert!(row_group_can_contain(
+            &huge,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &huge,
+            meta.row_group(1),
+            &field_to_col
+        ));
+
+        // Switch-off revert form (pre-PR-7): an Int64 literal against a decimal
+        // column is NOT pruned — stat_bounds has no Int64-vs-FLBA arm → keep.
+        let int_lit = Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op: ComparisonOp::Gt,
+            value: LiteralValue::Int64(15),
+        };
+        assert!(row_group_can_contain(
+            &int_lit,
+            meta.row_group(0),
+            &field_to_col
+        ));
+        assert!(row_group_can_contain(
+            &int_lit,
+            meta.row_group(1),
+            &field_to_col
+        ));
+    }
+
+    /// One INT32-backed DECIMAL(9,2) row group holding 5.00..5.04 (unscaled
+    /// [500, 502, 504]). INT32/INT64-backed decimals are off-spec and DECLINED.
+    fn int32_decimal_parquet() -> bytes::Bytes {
+        use parquet::basic::{LogicalType, Repetition, Type as PhysicalType};
+        use parquet::data_type::Int32Type;
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::types::Type;
+
+        let col_type = Type::primitive_type_builder("v", PhysicalType::INT32)
+            .with_repetition(Repetition::REQUIRED)
+            .with_logical_type(Some(LogicalType::Decimal {
+                scale: 2,
+                precision: 9,
+            }))
+            .with_precision(9)
+            .with_scale(2)
+            .build()
+            .unwrap();
+        let schema = Arc::new(
+            Type::group_type_builder("s")
+                .with_fields(vec![Arc::new(col_type)])
+                .build()
+                .unwrap(),
+        );
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            let mut rg = writer.next_row_group().unwrap();
+            let mut col = rg.next_column().unwrap().unwrap();
+            col.typed::<Int32Type>()
+                .write_batch(&[500, 502, 504], None, None)
+                .unwrap();
+            col.close().unwrap();
+            rg.close().unwrap();
+            writer.close().unwrap();
+        }
+        bytes::Bytes::from(buf)
+    }
+
+    #[test]
+    fn row_group_pruning_declines_int_backed_decimal() {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let reader = SerializedFileReader::new(int32_decimal_parquet()).unwrap();
+        let meta = reader.metadata();
+        // The INT32-backed decimal is declined: no prunable stats.
+        assert!(prunable_stats(meta.row_group(0).column(0)).is_none());
+
+        let field_to_col = HashMap::from([(1i32, 0usize)]);
+        // v = 100.00: the column holds only 5.00..5.04, so a scale-aware compare
+        // WOULD prune — but the decline keeps the row group conservatively.
+        let eq = Expression::Comparison {
+            field_id: 1,
+            column: "v".to_string(),
+            op: ComparisonOp::Eq,
+            value: LiteralValue::Decimal {
+                unscaled: 10000,
+                precision: 9,
+                scale: 2,
+            },
+        };
+        assert!(row_group_can_contain(&eq, meta.row_group(0), &field_to_col));
+    }
+
+    #[test]
+    fn bounds_can_contain_keeps_on_nan_bound() {
+        // A NaN bound must never prune (the F15 strict-superset invariant): a NaN
+        // operand makes the compare incomparable → `unwrap_or(true)` keeps.
+        let lit = TypedValue::Float64(5.0);
+        // column >= 5.0 with a NaN upper bound.
+        assert!(bounds_can_contain(
+            ComparisonOp::GtEq,
+            &lit,
+            Some(TypedValue::Float64(1.0)),
+            Some(TypedValue::Float64(f64::NAN)),
+        ));
+        // column <= 5.0 with a NaN lower bound.
+        assert!(bounds_can_contain(
+            ComparisonOp::LtEq,
+            &lit,
+            Some(TypedValue::Float64(f64::NAN)),
+            Some(TypedValue::Float64(10.0)),
+        ));
+        // Equality with a NaN bound also keeps.
+        assert!(bounds_can_contain(
+            ComparisonOp::Eq,
+            &lit,
+            Some(TypedValue::Float64(f64::NAN)),
+            Some(TypedValue::Float64(f64::NAN)),
         ));
     }
 }

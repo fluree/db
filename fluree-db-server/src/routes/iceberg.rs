@@ -529,6 +529,75 @@ async fn iceberg_catalog_preview_local(
     .await
 }
 
+/// Request body for `POST /v1/fluree/iceberg/catalog/verify`
+#[derive(Deserialize)]
+pub struct IcebergVerifyRequest {
+    #[serde(flatten)]
+    pub connection: IcebergConnectionRequest,
+    /// Table identifier (`"NAMESPACE.NAME"`, byte-for-byte catalog casing).
+    pub table: String,
+}
+
+/// Verify that the connection's resolved credentials can READ a table's storage
+/// (the onboarding "Test" probe). Read-only: creates no graph source, writes
+/// nothing; it goes through the engine's own credential + storage path and proves
+/// both the `metadata/` and `data/` S3 prefixes are readable.
+///
+/// POST /v1/fluree/iceberg/catalog/verify
+pub async fn iceberg_catalog_verify(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    iceberg_catalog_verify_local(state, request)
+        .await
+        .into_response()
+}
+
+async fn iceberg_catalog_verify_local(
+    state: Arc<AppState>,
+    request: Request,
+) -> Result<impl IntoResponse> {
+    let headers = FlureeHeaders::from_headers(request.headers())?;
+    let request_id = extract_request_id(&headers.raw, &state.telemetry_config);
+    let trace_id = extract_trace_id(&headers.raw);
+    let req: IcebergVerifyRequest = parse_iceberg_body(request).await?;
+
+    let span = create_request_span(
+        "iceberg:catalog:verify",
+        request_id.as_deref(),
+        trace_id.as_deref(),
+        Some(&req.table),
+        None,
+        None,
+    );
+    async move {
+        guard_connection_urls(
+            req.connection.catalog_uri.as_deref(),
+            req.connection.oauth2_token_url.as_deref(),
+            req.connection.s3_endpoint.as_deref(),
+        )?;
+        let conn = build_iceberg_connection(&req.connection)?;
+
+        let report = state
+            .fluree
+            .verify_iceberg_storage_access(conn, &req.table)
+            .await
+            .map_err(ServerError::Api)?;
+
+        tracing::info!(
+            status = "success",
+            table = %req.table,
+            credential_source = report.credential_source,
+            data_files_listed = report.data_files_listed,
+            data_probe_skipped = report.data_probe_skipped,
+            "iceberg storage access verified"
+        );
+        Ok((StatusCode::OK, Json(report)))
+    }
+    .instrument(span)
+    .await
+}
+
 // =============================================================================
 // Deterministic R2RML generation (metadata-only; creates no graph source).
 // =============================================================================
@@ -881,6 +950,40 @@ mod tests {
         // The flattened connection builds a REST connection carrying the scope.
         let conn = build_iceberg_connection(&req.connection).unwrap();
         assert!(conn.is_rest());
+    }
+
+    #[test]
+    fn verify_request_flattens_connection_and_table() {
+        // The flattened connection fields must deserialize alongside `table`, and
+        // build a REST connection carrying the OAuth2 scope.
+        let body = serde_json::json!({
+            "mode": "rest",
+            "catalog_uri": "https://catalog.example.com",
+            "warehouse": "wh1",
+            "oauth2_token_url": "https://catalog.example.com/v1/oauth/tokens",
+            "oauth2_client_secret": "pat",
+            "oauth2_scope": "session:role:ICEBERG_READER",
+            "table": "DW.DIM_STORE"
+        });
+        let req: IcebergVerifyRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.table, "DW.DIM_STORE");
+        assert_eq!(req.connection.warehouse.as_deref(), Some("wh1"));
+
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_rest());
+    }
+
+    #[test]
+    fn verify_request_direct_mode_builds_direct_connection() {
+        let body = serde_json::json!({
+            "mode": "direct",
+            "table_location": "s3://bucket/warehouse/ns/table",
+            "table": "ns.table"
+        });
+        let req: IcebergVerifyRequest = serde_json::from_value(body).unwrap();
+        assert_eq!(req.table, "ns.table");
+        let conn = build_iceberg_connection(&req.connection).unwrap();
+        assert!(conn.is_direct());
     }
 
     #[test]

@@ -6,8 +6,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Library only. No bins, no benches in this crate — see <workspace>/BENCHMARKING.md
-# for the chassis design and per-crate `benches/` for the actual benches.
+# Library + one small CLI (`bench-baseline`, capture/compare). No benches in
+# this crate — see <workspace>/BENCHMARKING.md and per-crate `benches/`.
+
+[[bin]]
+name = "bench-baseline"
+path = "src/bin/bench_baseline.rs"
 
 [features]
 default = []
@@ -24,6 +28,11 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+# Corpus identity hashing for baseline entries (`meta::CorpusInfo`). Already a
+# workspace dependency — BLAKE3 would hash faster but is not in the tree, and a
+# corpus is hashed once per capture.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # Bench helpers are themselves trivially testable; small criterion dep is OK

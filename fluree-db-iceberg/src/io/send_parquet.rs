@@ -185,6 +185,46 @@ fn footer_from_cache_enabled() -> bool {
     })
 }
 
+/// T2.3 kill switch (`FLUREE_ICEBERG_ROWGROUP_PARALLELISM`, default **on**). When
+/// on, a large file whose scan granted it a row-group concurrency > 1 decodes its
+/// surviving row groups across that many blocking tasks instead of one, so a
+/// single-file table (which the file-level fan-out pins at concurrency 1) uses the
+/// idle cores. Off (`0`/`false`/`off`/`no`) restores the byte-identical sequential
+/// single-thread decode. Read once per process (`OnceLock`, the family idiom).
+fn rowgroup_parallelism_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(
+        || match std::env::var("FLUREE_ICEBERG_ROWGROUP_PARALLELISM") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            ),
+            Err(_) => true,
+        },
+    )
+}
+
+/// Split `n` row-group indices `0..n` into `parts` contiguous chunks as evenly as
+/// possible (earlier chunks get the remainder). Each chunk is decoded by one
+/// blocking task; row groups are independently decodable, so the union of the
+/// chunks' rows equals a sequential decode's rows (order-independent for a scan).
+fn split_row_groups(n: usize, parts: usize) -> Vec<Vec<usize>> {
+    let parts = parts.clamp(1, n.max(1));
+    let base = n / parts;
+    let rem = n % parts;
+    let mut chunks = Vec::with_capacity(parts);
+    let mut start = 0usize;
+    for p in 0..parts {
+        let len = base + usize::from(p < rem);
+        if len == 0 {
+            break;
+        }
+        chunks.push((start..start + len).collect());
+        start += len;
+    }
+    chunks
+}
+
 /// Parse Parquet metadata from a whole-file byte buffer already resident in
 /// memory — the footer is sliced out of `bytes`, so this does **no I/O**. Mirrors
 /// the validation and parse in [`SendParquetReader::read_metadata`] exactly (same
@@ -300,6 +340,13 @@ pub struct SendParquetReader<'a, S: SendIcebergStorage> {
     storage: &'a S,
     footer_cache: Option<&'a ParquetFooterCache>,
     disk_cache: Option<DiskCacheRef<'a>>,
+    /// T2.3: how many of this file's row groups to decode CONCURRENTLY. `1`
+    /// (the default) is the sequential single-thread decode. The scan sets this
+    /// to `max(1, available_parallelism / file_concurrency)` so a single-file
+    /// table (file concurrency 1) reclaims the idle cores while a many-file scan
+    /// (already saturating cores via the file fan-out) stays at 1 — no
+    /// oversubscription.
+    rowgroup_concurrency: usize,
 }
 
 impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
@@ -309,6 +356,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             storage,
             footer_cache: None,
             disk_cache: None,
+            rowgroup_concurrency: 1,
         }
     }
 
@@ -318,6 +366,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             storage,
             footer_cache: Some(cache),
             disk_cache: None,
+            rowgroup_concurrency: 1,
         }
     }
 
@@ -340,7 +389,17 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 cache: disk_cache,
                 dir: cache_dir,
             }),
+            rowgroup_concurrency: 1,
         }
+    }
+
+    /// T2.3: set how many of a large file's row groups to decode concurrently.
+    /// The scan passes `max(1, available_parallelism / file_concurrency)`; `1`
+    /// (or the `FLUREE_ICEBERG_ROWGROUP_PARALLELISM` switch off) keeps the
+    /// sequential single-thread decode.
+    pub fn with_rowgroup_concurrency(mut self, n: usize) -> Self {
+        self.rowgroup_concurrency = n.max(1);
+        self
     }
 
     /// Read the Parquet file metadata (footer) using range reads.
@@ -520,6 +579,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     task.residual_filter.as_ref(),
                     task.iceberg_schema.as_deref(),
                     None,
+                    None,
                 );
             }
         }
@@ -568,6 +628,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             task.residual_filter.as_ref(),
             task.iceberg_schema.as_deref(),
             None,
+            None,
         )
     }
 
@@ -606,6 +667,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     iceberg_schema,
                     runtime,
                     None,
+                    self.rowgroup_concurrency,
                 )
                 .await;
             }
@@ -642,6 +704,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         iceberg_schema,
                         runtime,
                         None,
+                        self.rowgroup_concurrency,
                     )
                     .await;
                 }
@@ -659,6 +722,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             iceberg_schema,
             runtime,
             None,
+            self.rowgroup_concurrency,
         )
         .await
     }
@@ -684,11 +748,66 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
         max_rows: Option<usize>,
+        rowgroup_concurrency: usize,
     ) -> Result<Vec<ColumnBatch>> {
-        // Run the sync Arrow decode in a blocking context: native projection +
-        // row-group pruning + row filtering over the range-backed reader
-        // (skipped row groups' column chunks are never fetched).
-        let result = tokio::task::spawn_blocking(move || {
+        // T2.3: decode this file's row groups across up to `rowgroup_concurrency`
+        // blocking tasks (each a contiguous slice of the row groups) when the scan
+        // granted concurrency > 1 — a single-file table otherwise decodes on ONE
+        // core while the other vCPUs sit idle. Row groups are independently
+        // decodable, so the union of the tasks' rows equals a sequential decode's
+        // (order-independent for a scan). Declines to the sequential single-thread
+        // decode for: the switch off; a bounded `max_rows` peek (decline (v) — a
+        // small budget wants only the first row group, so parallelizing would
+        // decode groups a sequential read would skip); and a single row group.
+        if rowgroup_concurrency > 1 && max_rows.is_none() && rowgroup_parallelism_enabled() {
+            // One footer read to size the fan and honor the single-group decline.
+            let num_row_groups = {
+                let storage = Arc::clone(&storage);
+                let path = path.clone();
+                let runtime = runtime.clone();
+                tokio::task::spawn_blocking(move || {
+                    let cr = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+                    crate::io::arrow_reader::read_num_row_groups(cr)
+                })
+                .await
+                .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))??
+            };
+            let n_tasks = rowgroup_concurrency.min(num_row_groups);
+            if n_tasks > 1 {
+                let mut handles = Vec::with_capacity(n_tasks);
+                for chunk in split_row_groups(num_row_groups, n_tasks) {
+                    let storage = Arc::clone(&storage);
+                    let path = path.clone();
+                    let projected = projected_field_ids.clone();
+                    let residual = residual_filter.clone();
+                    let schema = iceberg_schema.clone();
+                    let runtime = runtime.clone();
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let cr = RangeBackedChunkReader::new(storage, path, file_size, runtime);
+                        crate::io::arrow_reader::decode_batches_arrow(
+                            cr,
+                            &projected,
+                            residual.as_ref(),
+                            schema.as_deref(),
+                            None,
+                            Some(&chunk),
+                        )
+                    }));
+                }
+                let mut out = Vec::new();
+                for h in handles {
+                    out.extend(h.await.map_err(|e| {
+                        IcebergError::Storage(format!("Blocking task failed: {e}"))
+                    })??);
+                }
+                return Ok(out);
+            }
+        }
+
+        // Sequential decode (default / declined): native projection + row-group
+        // pruning + row filtering over the range-backed reader (skipped row
+        // groups' column chunks are never fetched).
+        tokio::task::spawn_blocking(move || {
             let chunk_reader = RangeBackedChunkReader::new(storage, path, file_size, runtime);
             crate::io::arrow_reader::decode_batches_arrow(
                 chunk_reader,
@@ -696,12 +815,11 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 residual_filter.as_ref(),
                 iceberg_schema.as_deref(),
                 max_rows,
+                None,
             )
         })
         .await
-        .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?;
-
-        result
+        .map_err(|e| IcebergError::Storage(format!("Blocking task failed: {e}")))?
     }
 
     /// Read at most `max_rows` rows from the **first row group** of the task's
@@ -738,6 +856,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             task.iceberg_schema.clone(),
             Handle::current(),
             Some(max_rows),
+            1,
         )
         .await
     }
@@ -1149,6 +1268,56 @@ mod tests {
             out.extend(extract(col).iter().cloned());
         }
         out
+    }
+
+    /// T2.3 parity: the parallel decode partitions a file's row groups across
+    /// tasks by index, so decoding subset `[0]` then subset `[1]` and concatenating
+    /// yields EXACTLY the full sequential decode's rows (row groups are
+    /// independently decodable). An empty subset decodes nothing (a task whose
+    /// slice contains no surviving groups).
+    #[test]
+    fn rowgroup_subset_decode_partitions_the_file() {
+        use crate::io::arrow_reader::decode_batches_arrow;
+        use crate::io::batch::Column;
+        let id_of = |batches: &[ColumnBatch]| {
+            flatten(batches, 0, |c| match c {
+                Column::Int64(v) => v.as_slice(),
+                _ => panic!("id not Int64"),
+            })
+        };
+        let bytes = multitype_parquet(); // row group 0 = ids [1, 2], row group 1 = id [3]
+
+        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None).unwrap();
+        assert_eq!(id_of(&full), vec![Some(1), Some(2), Some(3)]);
+
+        let rg0 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[0])).unwrap();
+        let rg1 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[1])).unwrap();
+        let mut combined = id_of(&rg0);
+        combined.extend(id_of(&rg1));
+        assert_eq!(
+            combined,
+            id_of(&full),
+            "subset [0] ++ subset [1] must equal the full sequential decode"
+        );
+
+        let empty = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[])).unwrap();
+        assert_eq!(empty.iter().map(|b| b.num_rows).sum::<usize>(), 0);
+    }
+
+    #[test]
+    fn split_row_groups_partitions_indices_evenly() {
+        assert_eq!(split_row_groups(5, 2), vec![vec![0, 1, 2], vec![3, 4]]);
+        assert_eq!(
+            split_row_groups(6, 3),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5]]
+        );
+        // Parts are capped to the group count; a single group never fans.
+        assert_eq!(split_row_groups(2, 4), vec![vec![0], vec![1]]);
+        assert_eq!(split_row_groups(1, 3), vec![vec![0]]);
+        // Union == 0..n with no overlap.
+        let mut all: Vec<usize> = split_row_groups(7, 3).into_iter().flatten().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..7).collect::<Vec<_>>());
     }
 
     /// End-to-end decode round-trip: asserts the exact decoded values across all

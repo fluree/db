@@ -185,8 +185,11 @@ pub struct BinaryScanOperator {
     store: Option<Arc<BinaryIndexStore>>,
     g_id: GraphId,
     cursor: Option<BinaryCursor>,
-    /// Pre-computed p_id → Sid (all predicates, done once at open).
-    p_sids: Vec<Sid>,
+    /// Persisted p_id → Sid table, shared from the store's per-instance cache.
+    p_sids: Arc<[Sid]>,
+    /// Novelty-only predicate overrides keyed by ephemeral p_id, populated
+    /// during overlay translation (ephemeral ids sit above the persisted range).
+    p_sids_ephemeral: HashMap<u32, Sid>,
     /// Cached s_id → Sid for amortized IRI resolution.
     sid_cache: HashMap<u64, Sid>,
     /// Whether predicate is a variable (for internal predicate filtering).
@@ -723,7 +726,8 @@ impl BinaryScanOperator {
             store: None,
             g_id: 0,
             cursor: None,
-            p_sids: Vec::new(),
+            p_sids: Vec::new().into(),
+            p_sids_ephemeral: HashMap::new(),
             sid_cache: HashMap::new(),
             p_is_var,
             include_system_facts: false,
@@ -1138,6 +1142,9 @@ impl BinaryScanOperator {
     /// Resolve p_id → Sid (pre-computed, O(1)).
     #[inline]
     fn resolve_p_id(&self, p_id: u32) -> Sid {
+        if let Some(sid) = self.p_sids_ephemeral.get(&p_id) {
+            return sid.clone();
+        }
         self.p_sids
             .get(p_id as usize)
             .cloned()
@@ -1170,8 +1177,12 @@ impl BinaryScanOperator {
         if self.include_system_facts {
             return false;
         }
-        let Some(sid) = self.p_sids.get(p_id as usize) else {
-            return false;
+        let sid = match self.p_sids_ephemeral.get(&p_id) {
+            Some(sid) => sid,
+            None => match self.p_sids.get(p_id as usize) {
+                Some(sid) => sid,
+                None => return false,
+            },
         };
         // Always hide `f:reifies*` regardless of graph.
         if fluree_db_core::is_reserved_reifies_predicate(sid) {
@@ -1774,21 +1785,14 @@ impl Operator for BinaryScanOperator {
             return self.open_range_fallback(ctx).await;
         }
 
-        // Pre-compute p_id → Sid table.
-        let mut p_sids = Vec::new();
         let store = self.store.as_ref().ok_or_else(|| {
             QueryError::Internal(
                 "BinaryScanOperator::open: no binary_store on ExecutionContext".into(),
             )
         })?;
         let store_ref = store.as_ref();
-        for p_id in 0u32.. {
-            match store_ref.resolve_predicate_iri(p_id) {
-                Some(iri) => p_sids.push(store_ref.encode_iri(iri)),
-                None => break,
-            }
-        }
-        self.p_sids = p_sids;
+        // Persisted p_id → Sid table, built once per store instance.
+        self.p_sids = Arc::clone(store_ref.p_sid_table());
 
         // Extract bound terms in snapshot namespace space and build the persisted-ID filter
         // by translating through full IRIs into store namespace space.
@@ -2204,14 +2208,10 @@ impl Operator for BinaryScanOperator {
                 }
             };
 
-            // Extend p_sids table with novelty-only predicates so that ephemeral
-            // p_ids from overlay ops can be decoded back to Sids during row binding.
+            // Record novelty-only predicates so that ephemeral p_ids from
+            // overlay ops can be decoded back to Sids during row binding.
             for (sid, ep_id) in &translated.ephemeral_preds {
-                let idx = *ep_id as usize;
-                if idx >= self.p_sids.len() {
-                    self.p_sids.resize(idx + 1, Sid::new(0, ""));
-                }
-                self.p_sids[idx] = sid.clone();
+                self.p_sids_ephemeral.insert(*ep_id, sid.clone());
             }
 
             if !translated.ops.is_empty() {
@@ -2394,7 +2394,8 @@ impl Operator for BinaryScanOperator {
         self.range_iter = None;
         self.store = None;
         self.sid_cache.clear();
-        self.p_sids.clear();
+        self.p_sids = Vec::new().into();
+        self.p_sids_ephemeral.clear();
         self.unresolved_bound_subject_iri = None;
         self.state = OperatorState::Closed;
     }
@@ -2533,11 +2534,16 @@ pub fn translate_overlay_flakes_with_untranslated(
         ) {
             Ok(op) => ops.push(op),
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::Unsupported {
-                    untranslated.push(flake.clone());
-                } else {
-                    tracing::warn!(error = %e, "failed to translate overlay flake to V3");
+                // Keep the raw flake for ALL failure kinds (mirrors the
+                // range-provider keep-raw path, binary_range.rs:78-98). A
+                // non-Unsupported failure (NotFound from a stale/detached
+                // DictNovelty, InvalidData) still signals degraded dict state
+                // worth investigating, but must not cost data — the untranslated
+                // post-pass emits it as a materialized row.
+                if e.kind() != std::io::ErrorKind::Unsupported {
+                    tracing::warn!(error = %e, "failed to translate overlay flake to V3; keeping as raw");
                 }
+                untranslated.push(flake.clone());
             }
         },
     );
@@ -2746,8 +2752,8 @@ pub(crate) fn translate_one_flake_v3_pub(
     // Predicate: persisted → ephemeral (keyed by Sid to avoid namespace decode issues).
     //
     // For novelty-only predicates (not present in the persisted predicate dictionary),
-    // we allocate ephemeral p_ids and later extend `p_sids` so decode produces the
-    // original Sid (in snapshot namespace space).
+    // we allocate ephemeral p_ids and later record them in `p_sids_ephemeral` so
+    // decode produces the original Sid (in snapshot namespace space).
     let p_id = match store.sid_to_p_id(&flake.p) {
         Some(id) => id,
         None => runtime_small_dicts
@@ -2860,30 +2866,49 @@ fn resolve_subject_v3(
 }
 
 /// Resolve a string value to a string_id using persisted dict then DictNovelty.
-fn resolve_string_v3(
+/// Look up `value`'s string-dict id across the persisted and novelty dicts.
+///
+/// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
+/// allocation, so callers on hot paths (every novelty duration flake) pay
+/// nothing to distinguish it. `Err` is a real dict/mmap I/O error propagated
+/// verbatim from `find_string_id`, so a corrupt dictionary surfaces as an error
+/// instead of being conflated with a miss.
+fn find_string_id_v3(
     value: &str,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
-) -> std::io::Result<u32> {
+) -> std::io::Result<Option<u32>> {
     // 1. Persisted
     if let Some(id) = store.find_string_id(value)? {
-        return Ok(id);
+        return Ok(Some(id));
     }
     // 2. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
             if let Some(id) = dn.strings.find_string(value) {
-                return Ok(id);
+                return Ok(Some(id));
             }
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!(
-            "string not found in dict: {}",
-            &value[..value.len().min(50)]
-        ),
-    ))
+    Ok(None)
+}
+
+/// [`find_string_id_v3`] for callers that treat "not in dict" as an error,
+/// rendering a miss as `NotFound`.
+fn resolve_string_v3(
+    value: &str,
+    store: &BinaryIndexStore,
+    dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+) -> std::io::Result<u32> {
+    find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "string not found in dict: {}",
+                &value[..value.len().min(50)]
+            ),
+        )
+    })
 }
 
 /// Convert a FlakeValue to `(OType, o_key)` in V3 encoding.
@@ -3035,6 +3060,26 @@ fn value_to_otype_okey(
             OType::XSD_DAY_TIME_DURATION,
             ObjKey::encode_day_time_dur(d.micros()).as_u64(),
         )),
+        // Generic duration: keyed by the string-dict id of its canonical
+        // lexical form, mirroring the resolver's DurationStr arm so overlay
+        // rows key identically to indexed rows of the same value. DictNovelty
+        // never interns duration lexicals, so a canonical form absent from the
+        // persisted dict is the normal novelty-only case. That miss must
+        // surface as Unsupported: the SPOT-cursor translation lane routes only
+        // Unsupported to its raw-flake path and DROPS other error kinds, while
+        // the binary-range lane raw-routes any error — Unsupported is the one
+        // signal every lane preserves. A real dict I/O error, by contrast,
+        // propagates verbatim (not relabelled Unsupported) so a corrupt
+        // dictionary surfaces instead of silently taking the raw-flake path.
+        FlakeValue::Duration(d) => {
+            match find_string_id_v3(&d.to_canonical_string(), store, dict_novelty)? {
+                Some(str_id) => Ok((OType::XSD_DURATION, str_id as u64)),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "generic duration not in persisted dict (novelty-only); use raw flake path",
+                )),
+            }
+        }
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
         // Big numerics mirror the resolver: i64-fitting integers are inline;
         // everything else is keyed by a per-(graph, predicate) NumBig arena
@@ -3055,8 +3100,7 @@ fn value_to_otype_okey(
         }
         FlakeValue::Decimal(_) => find_numbig_okey(val, store, numbig_ctx),
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
-        // intended lane) and generic Duration (its V3 decode is a stub —
-        // the raw flake preserves the value, the binary row would not).
+        // intended lane).
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V3 overlay: {val:?}"),
@@ -3407,6 +3451,27 @@ pub(crate) fn value_to_otype_okey_simple(
             OType::XSD_G_MONTH_DAY,
             ObjKey::encode_g_month_day(g.month(), g.day()).as_u64(),
         )),
+        FlakeValue::YearMonthDuration(d) => Ok((
+            OType::XSD_YEAR_MONTH_DURATION,
+            ObjKey::encode_year_month_dur(d.months()).as_u64(),
+        )),
+        FlakeValue::DayTimeDuration(d) => Ok((
+            OType::XSD_DAY_TIME_DURATION,
+            ObjKey::encode_day_time_dur(d.micros()).as_u64(),
+        )),
+        FlakeValue::Duration(d) => {
+            // Generic durations intern their canonical lexical form in the
+            // string dict (see DecodeKind::Duration on the decode side), so a
+            // miss is a reliable "absent from base dict" signal (NotFound),
+            // like String.
+            let str_id = store
+                .find_string_id(&d.to_canonical_string())
+                .map_err(|e| Error::other(format!("find_string_id: {e}")))?
+                .ok_or_else(|| {
+                    Error::new(ErrorKind::NotFound, "duration value not found in V6 dict")
+                })?;
+            Ok((OType::XSD_DURATION, str_id as u64))
+        }
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!("unsupported FlakeValue variant for V6 fast-path: {val:?}"),

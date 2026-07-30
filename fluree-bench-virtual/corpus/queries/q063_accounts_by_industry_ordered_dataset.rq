@@ -1,0 +1,17 @@
+# q063 accounts_by_industry_ordered_dataset
+# Intent: C5 dataset-path (FROM <gs>) family-A COUNT with ORDER BY + OFFSET —
+#         exercises the sort + offset wrapper around the fused single-table
+#         aggregate on the query_from path (a new route through the shared
+#         graph-source wrapper: detect admits ORDER BY/OFFSET and wraps the fused op).
+# BI lineage (BI-05): "Accounts by industry, most-common first, skipping the top 2." (dataset path)
+# Predicates verified against enterprise.ttl — DimAccount: industry.
+# Determinism: total order (count desc, industry asc) makes the OFFSET-truncated
+#   set deterministic, so hash_gate=full holds.
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?ind (COUNT(?a) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?a a edw:Account ; edw:industry ?ind . }
+GROUP BY ?ind
+ORDER BY DESC(?n) ?ind
+OFFSET 2

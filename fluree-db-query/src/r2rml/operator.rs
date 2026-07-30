@@ -65,6 +65,78 @@ pub type ParentLookup = HashMap<Vec<String>, RdfTerm>;
 /// Composite key for caching a parent lookup: `(parent_tm_iri, sorted_parent_join_cols)`.
 type LookupCacheKey = (String, Vec<String>);
 
+/// Query-scoped key for the cross-operator-rebuild parent-lookup memo (PR-8b):
+/// `(graph_source_id, parent_tm_iri, sorted_parent_join_cols, as_of_t)`. Unlike
+/// the per-operator [`LookupCacheKey`], this memo is shared across ALL R2RML
+/// operators in a query, so the key MUST carry `graph_source_id` (two sources can
+/// hold a same-named table — no cross-source pollution) and `as_of_t` (cheap
+/// insurance: the per-query snapshot pin should keep it constant, but a
+/// query-wide share must not alias two snapshots). This is also what makes the F19
+/// `with_graph_ref` memo-share sound: a referenced graph shares the one memo Arc,
+/// but its parent lookups stay keyed under its own `graph_source_id` — so removing
+/// that component would silently merge two stores' lookups (see `context.rs`).
+pub type R2rmlParentMemoKey = (String, String, Vec<String>, Option<i64>);
+
+/// The query-scoped parent-lookup memo (PR-8b). Extends PR-4's per-operator
+/// [`LookupCacheKey`] cache to a lifetime that survives the operator REBUILD an
+/// inner join with an interposed non-pushable FILTER + LIMIT performs per driving
+/// batch — which resets the per-operator cache (the q031 seam). Sharing is valid:
+/// a lookup's content is fixed by its key at a stable `as_of_t`.
+///
+/// `total_rows` bounds accumulation query-wide: a query-scoped cache can hold many
+/// parents where a single operator's cache held at most its own, so an insert that
+/// would exceed the total cap is refused — the caller falls through to a per-batch
+/// rebuild for that key — keeping memory bounded (per-entry is already ≤ one
+/// window via the q015 fact-as-parent guard).
+#[derive(Default)]
+pub struct R2rmlParentMemoInner {
+    map: HashMap<R2rmlParentMemoKey, Arc<ParentLookup>>,
+    total_rows: usize,
+}
+
+impl R2rmlParentMemoInner {
+    fn get(&self, key: &R2rmlParentMemoKey) -> Option<Arc<ParentLookup>> {
+        self.map.get(key).cloned()
+    }
+
+    /// Cache `lookup` under `key` unless it would push the memo past `total_cap`
+    /// rows. Returns whether the entry is now cached. A key already present is
+    /// treated as cached (idempotent).
+    fn try_insert(
+        &mut self,
+        key: R2rmlParentMemoKey,
+        lookup: &Arc<ParentLookup>,
+        total_cap: usize,
+    ) -> bool {
+        if self.map.contains_key(&key) {
+            return true;
+        }
+        let rows = lookup.len();
+        if self.total_rows.saturating_add(rows) > total_cap {
+            return false;
+        }
+        self.total_rows += rows;
+        self.map.insert(key, Arc::clone(lookup));
+        true
+    }
+}
+
+/// Shared, query-scoped parent-lookup memo — see [`R2rmlParentMemoInner`].
+pub type R2rmlParentMemo = std::sync::Arc<std::sync::Mutex<R2rmlParentMemoInner>>;
+
+/// Query-scoped parent-memo total-rows cap, as a multiple of the materialize
+/// window. Per-entry is already ≤ one window (the q015 fact-as-parent guard); this
+/// bounds the SUM across a query's parents. Default 2×; env
+/// `FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS`.
+fn parent_memo_total_cap_rows() -> usize {
+    let mult = std::env::var("FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+    mult.saturating_mul(materialize_window_rows())
+}
+
 /// A child-templated `RefObjectMap` shortcut: render the parent subject IRI
 /// directly from the child row's own FK columns via the parent's subject
 /// template, with NO scan of the parent table.
@@ -145,17 +217,23 @@ fn materialize_window_rows() -> usize {
 }
 
 /// Whether LIMIT early-termination (row-budget) pushdown into the scan is
-/// enabled. Read once from `FLUREE_R2RML_LIMIT_PUSHDOWN` (only `0`/`false`/`off`
-/// disable it); disabling restores full-window materialization under a LIMIT.
+/// enabled. Read once from `FLUREE_R2RML_LIMIT_PUSHDOWN` (family falsy
+/// spellings, [`super::env_switch_enabled`]); disabling restores full-window
+/// materialization under a LIMIT.
 fn limit_pushdown_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_LIMIT_PUSHDOWN") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_LIMIT_PUSHDOWN"))
+}
+
+/// Whether a single-column DESC `ORDER BY … LIMIT` may push a scan-side top-k
+/// directive into the R2RML scan (PR-5), so it reads only the files that can hold
+/// the top-k. Read once from `FLUREE_R2RML_TOPK_PUSHDOWN` (family falsy
+/// spellings); off restores the full-materialize top-k (scan streams every row,
+/// the `SortOperator` keeps k). Gating in `set_topk` means off ⇒ no directive ⇒
+/// the scan takes its normal path (a full revert).
+fn topk_pushdown_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_TOPK_PUSHDOWN"))
 }
 
 /// How a window of produced rows is combined with the buffered child rows.
@@ -187,7 +265,11 @@ struct TmStream {
     tm_iri: String,
     stream: ColumnBatchStream,
     exhausted: bool,
-    parent_lookups: HashMap<LookupCacheKey, ParentLookup>,
+    /// Parent (dimension) lookups for this TriplesMap's RefObjectMap POMs, keyed
+    /// by `(parent TriplesMap IRI, join_cols)` ([`LookupCacheKey`]). `Arc`-shared
+    /// so a lookup memoized on the operator's `parent_lookup_cache` (PR-4) is
+    /// reused across child batches without a re-scan or a clone.
+    parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>>,
     /// Child-templated ref shortcuts for RefObjectMap POMs whose parent scan was
     /// skipped (trusted browse crawl only). Keyed identically to `parent_lookups`;
     /// a given `LookupCacheKey` populates exactly one of the two maps.
@@ -205,6 +287,54 @@ struct ScanProgress {
     tms: Vec<TmStream>,
     tm_idx: usize,
     window_rows: usize,
+}
+
+/// Whether PR-3 star TriplesMap-set pruning is enabled. Read once from
+/// `FLUREE_R2RML_STAR_TM_PRUNE` (family falsy spellings,
+/// [`super::env_switch_enabled`]). When on, a same-subject star resolves only
+/// TriplesMaps that supply EVERY star predicate — a provably-empty prune of the
+/// shared-base-predicate fan-out (a map missing a member produces no complete
+/// star row). Off ⇒ today's base-predicate-only resolution.
+fn star_tm_prune_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_STAR_TM_PRUNE"))
+}
+
+/// PR-3 star resolution prune: whether a TriplesMap can contribute to a star,
+/// combining fix (a) and fix (b'). Both are provably-empty prunes.
+///
+/// - **(a)** every predicate in `star_required_preds` must have a PredicateObjectMap
+///   here — a same-subject star needs every member bound, and a map missing one
+///   produces no complete star row (materialization is per-map, no cross-map join
+///   for members). This prune preserves the pre-existing star-*formation* gap
+///   (F10 in `04-findings-register.md`): required members split across
+///   template-sharing maps already produce zero star rows, so pruning every map
+///   is result-identical; the future fix lives in the rewrite (refuse to fuse
+///   when no single map covers all members).
+/// - **(b')** when `prune_class` is set (only when template-disjoint; see
+///   [`R2rmlPattern::class_prune_hint`]), the map must declare that class.
+///
+/// Empty `star_required_preds` + `None` `prune_class` (switch off / not a star) ⇒
+/// always `true`, i.e. today's behavior.
+fn tm_passes_star_prune(
+    tm: &TriplesMap,
+    star_required_preds: &[String],
+    prune_class: Option<&str>,
+) -> bool {
+    let has_all_preds = star_required_preds.iter().all(|p| {
+        tm.predicate_object_maps
+            .iter()
+            .any(|pom| pom.predicate_map.as_constant() == Some(p.as_str()))
+    });
+    if !has_all_preds {
+        return false;
+    }
+    if let Some(class) = prune_class {
+        if !tm.classes().iter().any(|c| c.as_str() == class) {
+            return false;
+        }
+    }
+    true
 }
 
 /// R2RML scan operator for `Pattern::R2rml`.
@@ -235,6 +365,27 @@ pub struct R2rmlScanOperator {
     /// Only UNFILTERED scans are cached — a filtered scan may return a pruned
     /// subset, which the filter-agnostic key must never replay for another scan.
     scan_cache: HashMap<(String, Vec<String>), Arc<Vec<ColumnBatch>>>,
+    /// PR-4: cross-child-batch parent-lookup memoization. A correlated join
+    /// (OPTIONAL / ref) re-enters `build_progress` per child batch; without this
+    /// the (dimension) parent tables are re-scanned every batch (q008: 123+
+    /// parent scans, DNF → 8 scans with the memo). Keyed like `parent_lookups`:
+    /// `(parent TriplesMap IRI, join_cols)` — the TM IRI, NOT the parent table
+    /// name. Two parent TMs over one table can render different subject IRIs
+    /// from the same join key (different subject templates), so a table-name
+    /// key would replay the wrong lookup; don't "simplify" the key. The key
+    /// deterministically fixes the parent projection at a stable `as_of_t`, so
+    /// a memoized lookup is valid for every later batch. Bounded: a lookup
+    /// larger than one materialize window is NOT retained (a fact-as-parent
+    /// falls through to today's per-batch build) so the cache can't OOM. Gated
+    /// by `FLUREE_R2RML_PARENT_MEMO`. (q050 is NOT fixed by this: its
+    /// correlated OPTIONAL rebuilds the whole operator per row, resetting any
+    /// operator-scoped cache — that's PR-4b.)
+    parent_lookup_cache: HashMap<LookupCacheKey, Arc<ParentLookup>>,
+    /// Whether cross-batch parent memoization is on for this operator. Read once
+    /// from `parent_memo_enabled()` at construction (per-operator, not a global
+    /// `OnceLock`), so a test can drive both regimes deterministically in one
+    /// process and production still honors `FLUREE_R2RML_PARENT_MEMO`.
+    parent_memo: bool,
     /// LIMIT early-termination budget: the max output rows a downstream `LIMIT`
     /// needs from this operator. `None` = unbounded. Set only when this is the
     /// topmost row-preserving scan (a scan feeding a join/FILTER never receives
@@ -244,6 +395,13 @@ pub struct R2rmlScanOperator {
     row_budget: Option<usize>,
     /// Output rows emitted so far, counted against `row_budget`.
     emitted: usize,
+    /// Scan-side top-k directive (PR-5): `(primary DESC sort var, LIMIT+OFFSET)`,
+    /// set by a `SortOperator` for a `ORDER BY DESC(<scan col>) LIMIT k` directly
+    /// above this scan. Resolved to the sort column against the mapping at scan
+    /// time ([`Self::resolve_topk_directive`]); `None` = no pushdown (full scan +
+    /// the authoritative sort above). Only ever consulted for the main table scan,
+    /// never a parent/dimension lookup.
+    topk: Option<(VarId, usize)>,
     /// A scan-local FILTER the planner folded into this scan (see
     /// [`R2rmlPattern::consumed_filter`]). Applied to each output batch with the
     /// same evaluator the dropped `FilterOperator` would use, so results are
@@ -321,8 +479,11 @@ impl R2rmlScanOperator {
             pending: VecDeque::new(),
             progress: None,
             scan_cache: HashMap::new(),
+            parent_lookup_cache: HashMap::new(),
+            parent_memo: parent_memo_enabled(),
             row_budget: None,
             emitted: 0,
+            topk: None,
             consumed_filter,
             state: OperatorState::Created,
         }
@@ -374,6 +535,41 @@ impl R2rmlScanOperator {
         !self.pattern.star_bindings.is_empty() || !self.pattern.star_constraints.is_empty()
     }
 
+    /// F-16: whether a pattern is a FOLDED crawl wildcard (W4-1b: `?s ?p ?o`
+    /// plus same-subject const-object constraints) whose every constraint is a
+    /// scalar. Only such a pattern may keep the `trust_fk_refs` FK-template ref
+    /// shortcut: a scalar constraint checks a scalar column and never relaxes a
+    /// ref, while an IRI (or any non-scalar) constraint on a ref predicate would
+    /// be satisfied by the templated render of a DANGLING FK — the shortcut
+    /// skips exactly the parent scan that would have dropped that subject, so
+    /// re-enabling it there would over-match (catch #11). Var star members
+    /// (`star_bindings`) also disqualify: they are fixed-predicate star shapes,
+    /// not the crawl fold.
+    fn folded_wildcard_all_scalar(pattern: &R2rmlPattern) -> bool {
+        pattern.predicate_var.is_some()
+            && pattern.star_bindings.is_empty()
+            && !pattern.star_constraints.is_empty()
+            && pattern
+                .star_constraints
+                .iter()
+                .all(|(_, c)| matches!(c, crate::r2rml::ObjectConstant::Scalar(_)))
+    }
+
+    /// The `trust_fk_refs` FK-template ref-shortcut admission (the seam the
+    /// parent-lookup build consults; see the comment at the call site). A
+    /// pattern qualifies when trust is on, it is a plain OR scalar-folded true
+    /// wildcard, and no predicate filter narrows it. Extracted so the composed
+    /// predicate is pinned by `f16_ref_template_shortcut_fires_for_scalar_folded`
+    /// — the production build calls THIS fn, so the test exercises the real
+    /// admission, not a copy.
+    fn ref_template_shortcut_enabled(trust_fk_refs: bool, pattern: &R2rmlPattern) -> bool {
+        let star_free = pattern.star_bindings.is_empty() && pattern.star_constraints.is_empty();
+        trust_fk_refs
+            && (star_free || Self::folded_wildcard_all_scalar(pattern))
+            && pattern.predicate_filter.is_none()
+            && pattern.object_var.is_some()
+    }
+
     /// True for a pure `rdf:type`/subject-only pattern: no object var, no
     /// predicate filter, no star members. Such a pattern derives only the subject
     /// (its `rr:class` constraint is enforced by TriplesMap selection), so it
@@ -390,6 +586,49 @@ impl R2rmlScanOperator {
     /// table columns for the given TriplesMap, producing scan filters. A
     /// variable maps to a column via its predicate IRI; only plain `rr:column`
     /// scalar object maps are pushable (see [`value_pushdown_column`]).
+    /// Resolve the stored top-k directive (`(sort_var, k)`) to a [`crate::r2rml::ScanTopK`]
+    /// for THIS table scan, or `None` (→ full scan) when the sort var doesn't map
+    /// to exactly one scalar pushdown column of `triples_map` — the same soundness
+    /// gate `build_scan_filters` uses. The scan-side prune uses only this primary
+    /// column; the `SortOperator` above still applies the exact compound order +
+    /// LIMIT, so a `None` here is only a missed optimization, never wrong.
+    fn resolve_topk_directive(&self, triples_map: &TriplesMap) -> Option<crate::r2rml::ScanTopK> {
+        let (sort_var, k) = self.topk?;
+        // SOUNDNESS (heap feed): decline when a residual filter the operator
+        // enforces after the scan is present — the heap would see pre-filter rows.
+        if topk_residual_filter_present(&self.pattern) {
+            return None;
+        }
+        let pred_iri = if Some(sort_var) == self.pattern.object_var {
+            self.pattern.predicate_filter.as_deref()
+        } else {
+            self.pattern
+                .star_bindings
+                .iter()
+                .find(|(_, v)| *v == sort_var)
+                .map(|(p, _)| p.as_str())
+        }?;
+        let mut matching = triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+        let (Some(pom), None) = (matching.next(), matching.next()) else {
+            // Decline observably (PR-7's decline-breadcrumb convention, #1495
+            // review): a mapping with duplicate predicates silently loses the
+            // scan-side top-k otherwise, with nothing in the logs.
+            tracing::debug!(
+                predicate = %pred_iri,
+                "r2rml topk declined: sort predicate does not map to exactly one POM"
+            );
+            return None;
+        };
+        let col = value_pushdown_column(&pom.object_map)?;
+        Some(crate::r2rml::ScanTopK {
+            sort_column: col.to_string(),
+            k,
+        })
+    }
+
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
         let mut out = Vec::new();
         for pd in &self.pattern.scan_filters {
@@ -433,18 +672,20 @@ impl R2rmlScanOperator {
             &self.pattern.object_constant,
             self.pattern.predicate_filter.as_deref(),
         ) {
-            let mut matching = triples_map
-                .predicate_object_maps
-                .iter()
-                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
-            if let (Some(pom), None) = (matching.next(), matching.next()) {
-                if let Some(col) = value_pushdown_column(&pom.object_map) {
-                    out.push(crate::r2rml::ScanFilter {
-                        column: col.to_string(),
-                        op: crate::r2rml::ScanCmpOp::Eq,
-                        value: value.clone(),
-                    });
-                }
+            push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
+        }
+
+        // W4-1 PRIMARY: a scalar constant-object member of a same-subject star
+        // (`?ol ex:orderLineKey "1"; ?ol ex:order ?ord`) lands in `star_constraints`,
+        // not the base `object_constant`, so without this it was enforced ONLY
+        // residually — the whole FACT was read and filtered post-scan (the round-3b
+        // point-lookup fanned into a full 120 M-row scan). Push each scalar star
+        // constraint as a scan filter under the same soundness gate, so a constant
+        // key equality prunes the scan even alongside other predicates. IRI/decimal/
+        // double constraints stay operator-enforced only (not pushable here).
+        for (pred_iri, constant) in &self.pattern.star_constraints {
+            if let crate::r2rml::ObjectConstant::Scalar(value) = constant {
+                push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
             }
         }
 
@@ -485,7 +726,7 @@ impl R2rmlScanOperator {
         &self,
         triples_map: &TriplesMap,
         batches: &[ColumnBatch],
-        parent_lookups: &HashMap<LookupCacheKey, ParentLookup>,
+        parent_lookups: &HashMap<LookupCacheKey, Arc<ParentLookup>>,
         ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Vec<Vec<(VarId, Binding)>>> {
@@ -580,6 +821,34 @@ impl R2rmlScanOperator {
             .clone();
         let child_schema = self.child.schema().to_vec();
 
+        // PR-3 fix (a): a same-subject star requires every member predicate bound,
+        // so only TriplesMaps supplying ALL star predicates can contribute — prune
+        // the shared-base-predicate fan-out (a map missing a member produces no
+        // complete star row, so this is a provably-empty prune, result-preserving).
+        // Computed before the resolution closure, which borrows `self.pattern`.
+        let star_prune_on = star_tm_prune_enabled();
+        // F-16/catch-#10: the all-preds prune argument holds only for FIXED-predicate
+        // stars (a map missing a member yields no complete star row). A folded crawl
+        // WILDCARD emits per-(p,o) across co-subject maps, so a map lacking the
+        // folded constraint predicate can still contribute rows — pruning it would
+        // drop those rows for vertically-partitioned subjects (F10-class mappings).
+        let star_required_preds: Vec<String> =
+            if star_prune_on && self.pattern.predicate_var.is_none() && self.has_star_members() {
+                self.pattern_predicates()
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        // PR-3 fix (b'): resolution-only class prune (template-disjoint; see
+        // `R2rmlPattern::class_prune_hint`). Gated by the same switch as fix (a).
+        let prune_class: Option<String> = if star_prune_on {
+            self.pattern.class_prune_hint.clone()
+        } else {
+            None
+        };
+
         // Resolve the TriplesMap(s) for this pattern (same for every child row).
         let triples_maps: Vec<&TriplesMap> = if let Some(ref tm_iri) = self.pattern.triples_map_iri
         {
@@ -608,6 +877,12 @@ impl R2rmlScanOperator {
                         if !has_pred {
                             return false;
                         }
+                    }
+                    // PR-3 fix (a) all-members-intersection + fix (b') class prune
+                    // (both provably-empty; see `tm_passes_star_prune`). Inputs are
+                    // empty/None when the switch is off or this is not a star.
+                    if !tm_passes_star_prune(tm, &star_required_preds, prune_class.as_deref()) {
+                        return false;
                     }
                     // subject_constant prune: a bound subject IRI can only come
                     // from a TriplesMap whose template subject can PRODUCE it, and
@@ -642,6 +917,22 @@ impl R2rmlScanOperator {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
 
+        // PR-8 slice 1: warm every TriplesMap table's catalog context CONCURRENTLY
+        // before the serial per-map scan loop below, so a multi-table pattern's
+        // per-table `loadTable` GETs overlap instead of summing. Best-effort (see
+        // `prefetch_tables`); a single-table pattern is a no-op inside it.
+        if super::parallel_catalog_resolution_enabled() {
+            let mut tm_tables: Vec<String> = Vec::with_capacity(triples_maps.len());
+            for tm in &triples_maps {
+                if let Some(t) = tm.table_name() {
+                    tm_tables.push(t.to_string());
+                }
+            }
+            table_provider
+                .prefetch_tables(&self.pattern.graph_source_id, &tm_tables)
+                .await;
+        }
+
         // Join vars (pattern-produced vars the child already binds) are the same
         // for every TriplesMap of this pattern.
         let join_vars: Vec<VarId> = self
@@ -670,7 +961,21 @@ impl R2rmlScanOperator {
             // Determine projection columns. For a same-subject star, project the
             // union of columns needed for every star predicate so the whole star
             // is satisfied by one scan.
-            let projection: Vec<String> = if !self.has_star_members() {
+            let projection: Vec<String> = if self.pattern.predicate_var.is_some() {
+                // Variable-predicate wildcard (`?s ?p ?o`): materialize EVERY POM, so
+                // project ALL columns. A W4-1b-folded crawl wildcard ALSO carries
+                // star_constraints, but those are a subject-level existence filter,
+                // not a projection restriction — `columns_for_predicate(None)` already
+                // covers the constraint predicates' columns too. (Without this branch a
+                // folded wildcard fell into the `has_star_members` else below and
+                // projected ONLY the constraint column, dropping every other POM's
+                // value so `?p`/`?o` never materialized.)
+                triples_map
+                    .columns_for_predicate(None)
+                    .into_iter()
+                    .map(std::string::ToString::to_string)
+                    .collect()
+            } else if !self.has_star_members() {
                 if self.is_subject_only_pattern() {
                     // rdf:type / subject-only pattern: only the subject columns are
                     // load-bearing. Projecting every POM column (the
@@ -730,8 +1035,26 @@ impl R2rmlScanOperator {
             // would defeat the LIMIT. A budgeted scan is the topmost
             // row-preserving scan, so it stops after ~a batch and gains little
             // from cross-batch reuse anyway.
-            let cacheable =
-                scan_cache_enabled() && scan_filters.is_empty() && self.row_budget.is_none();
+            //
+            // A top-k scan (PR-5) ALSO bypasses the cache: it returns a pruned
+            // file SUBSET, and the cache key `(table, projection)` does not carry
+            // the directive — replaying that subset for a later FULL scan of the
+            // same table+projection would silently drop rows (the exact silent-
+            // wrong class the differential's second-scan case guards).
+            //
+            // The bypass keys on the STORED directive (`self.topk`), NOT the
+            // resolved one: when `resolve_topk_directive` DECLINES (a residual
+            // filter, below), `self.topk` is still `Some` so `cacheable` is false,
+            // but `main_scan_topk` is `None` so the scan runs FULL. That full scan
+            // then merely skips the cache — a missed optimization, never wrong. The
+            // load-bearing invariant is one-directional: NO path that could return
+            // a pruned subset (`self.topk.is_some()`) is ever cacheable, so a
+            // pruned result can never poison the `(table, projection)` cache.
+            let main_scan_topk = self.resolve_topk_directive(triples_map);
+            let cacheable = scan_cache_enabled()
+                && scan_filters.is_empty()
+                && self.row_budget.is_none()
+                && self.topk.is_none();
             let cache_key = (table_name.to_string(), projection.clone());
             let stream: ColumnBatchStream = if !cacheable {
                 table_provider
@@ -740,6 +1063,7 @@ impl R2rmlScanOperator {
                         table_name,
                         &projection,
                         &scan_filters,
+                        main_scan_topk.as_ref(),
                         as_of_t,
                     )
                     .await?
@@ -752,10 +1076,11 @@ impl R2rmlScanOperator {
                         table_name,
                         &projection,
                         &scan_filters,
+                        main_scan_topk.as_ref(),
                         as_of_t,
                     )
                     .await?;
-                match collect_scan_capped(fresh, materialize_window_rows()).await? {
+                match collect_scan_capped(fresh, materialize_window_rows(), ctx).await? {
                     CollectedScan::Complete(batches) => {
                         let arc = Arc::new(batches);
                         self.scan_cache.insert(cache_key, Arc::clone(&arc));
@@ -770,7 +1095,8 @@ impl R2rmlScanOperator {
             // Build parent lookup tables for RefObjectMap POMs that pass the
             // predicate filter. Parent (dimension) tables are small and consumed
             // whole into the lookup, so they are not streamed.
-            let mut parent_lookups: HashMap<LookupCacheKey, ParentLookup> = HashMap::new();
+            let parent_memo = self.parent_memo;
+            let mut parent_lookups: HashMap<LookupCacheKey, Arc<ParentLookup>> = HashMap::new();
             let mut ref_shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
             // Trusted browse crawl (`trust_fk_refs`) over the injected TRUE-wildcard
             // scan (`?s ?p ?o`): render RefObjectMap objects by templating the
@@ -780,33 +1106,46 @@ impl R2rmlScanOperator {
             // `?s <ref> ?o` join) or a star/predicate-list crawl keeps the scan +
             // dangling-FK semantics and its subject set — a ref used as a subject
             // filter must not be relaxed to a match.
-            let ref_template_shortcut = ctx.trust_fk_refs
-                && !self.has_star_members()
-                && self.pattern.predicate_filter.is_none()
-                && self.pattern.object_var.is_some();
-            let star_preds = self.pattern_predicates();
-            let filtered_poms: Vec<_> = triples_map
-                .predicate_object_maps
-                .iter()
-                .filter(|pom| {
-                    if self.has_star_members() {
-                        pom.predicate_map
-                            .as_constant()
-                            .is_some_and(|p| star_preds.contains(&p))
-                    } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
-                        pom.predicate_map.as_constant() == Some(pred_filter.as_str())
-                    } else if self.pattern.object_var.is_none() {
-                        // rdf:type / subject-only pattern: no POM is load-bearing
-                        // (the parent scans it would trigger are pure dead work, as
-                        // subject-only materialization never reads object/parent
-                        // values). The all-POMs branch below is for a TRUE wildcard
-                        // `?s ?p ?o`, where `?p`/`?o` range over every predicate.
-                        false
-                    } else {
-                        true
-                    }
-                })
-                .collect();
+            //
+            // F-16/catch-#10+#11 carve-out: a FOLDED crawl wildcard (W4-1b — the
+            // same true-wildcard shape plus same-subject const-object constraints)
+            // keeps the shortcut ONLY when every folded constraint is a scalar: a
+            // scalar constraint checks a scalar column and never touches a ref,
+            // while an IRI constraint on a ref predicate would be satisfied by the
+            // templated render of a DANGLING FK (the shortcut skips the parent
+            // scan that would have dropped it) — an over-match. Non-scalar
+            // constraints keep the shortcut off and take the sound parent-scan
+            // path.
+            let ref_template_shortcut =
+                Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
+            // Scoped so `star_preds` (which borrows `self`) is released before the
+            // parent-lookup loop mutates `self.parent_lookup_cache` (PR-4).
+            let filtered_poms: Vec<_> = {
+                let star_preds = self.pattern_predicates();
+                triples_map
+                    .predicate_object_maps
+                    .iter()
+                    .filter(|pom| {
+                        if self.pattern.predicate_var.is_none() && self.has_star_members() {
+                            pom.predicate_map
+                                .as_constant()
+                                .is_some_and(|p| star_preds.contains(&p))
+                        } else if let Some(ref pred_filter) = self.pattern.predicate_filter {
+                            pom.predicate_map.as_constant() == Some(pred_filter.as_str())
+                        } else if self.pattern.object_var.is_none() {
+                            // rdf:type / subject-only pattern: no POM is load-bearing
+                            // (the parent scans it would trigger are pure dead work,
+                            // as subject-only materialization never reads
+                            // object/parent values). The all-POMs branch below is for
+                            // a TRUE wildcard `?s ?p ?o`, where `?p`/`?o` range over
+                            // every predicate.
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect()
+            };
 
             for pom in &filtered_poms {
                 // Cancellation checkpoint before each FK-parent scan: a subject
@@ -831,6 +1170,50 @@ impl R2rmlScanOperator {
                         || ref_shortcuts.contains_key(&lookup_key)
                     {
                         continue;
+                    }
+
+                    // PR-4: reuse a parent lookup memoized in an earlier child batch
+                    // (skips the parent-table re-scan — the q008 fix). The key
+                    // `(parent_tm, join_cols)` fixes the projection and the lookup
+                    // content at a stable `as_of_t`, so a prior batch's lookup is
+                    // valid here. The ref-shortcut path below never populates the
+                    // cache, and the shortcut-vs-scan choice is query-stable, so a
+                    // cached scan-lookup is never mixed with a shortcut key.
+                    if parent_memo {
+                        if let Some(cached) = self.parent_lookup_cache.get(&lookup_key) {
+                            parent_lookups.insert(lookup_key, Arc::clone(cached));
+                            continue;
+                        }
+                    }
+
+                    // PR-8b: reuse a parent lookup memoized by an EARLIER OPERATOR
+                    // INSTANCE this query. An inner join with an interposed
+                    // non-pushable FILTER + LIMIT rebuilds this R2RML operator per
+                    // driving batch, resetting `self.parent_lookup_cache` above (the
+                    // q031 seam); this query-scoped memo — keyed with
+                    // `graph_source_id` + `as_of_t`, so a cross-operator/cross-source
+                    // share can't alias — survives the rebuild. On a hit, seed the
+                    // per-operator cache too so later batches of THIS instance take
+                    // the fast local path.
+                    if parent_memo {
+                        let as_of_t = if ctx.dataset.is_some() {
+                            None
+                        } else {
+                            Some(ctx.to_t)
+                        };
+                        let ctx_key: R2rmlParentMemoKey = (
+                            self.pattern.graph_source_id.clone(),
+                            rom.parent_triples_map.clone(),
+                            parent_join_cols.clone(),
+                            as_of_t,
+                        );
+                        let hit = ctx.r2rml_parent_memo.lock().unwrap().get(&ctx_key);
+                        if let Some(cached) = hit {
+                            self.parent_lookup_cache
+                                .insert(lookup_key.clone(), Arc::clone(&cached));
+                            parent_lookups.insert(lookup_key, cached);
+                            continue;
+                        }
                     }
 
                     let parent_tm = match mapping.get(&rom.parent_triples_map) {
@@ -893,12 +1276,50 @@ impl R2rmlScanOperator {
                             parent_table,
                             &parent_projection,
                             &[],
+                            None,
                             as_of_t,
                         )
                         .await?;
-                    let parent_batches = collect_stream(parent_stream).await?;
+                    let parent_batches = collect_stream(parent_stream, ctx).await?;
 
-                    let lookup = build_parent_lookup(parent_tm, &parent_join_cols, parent_batches)?;
+                    let lookup = Arc::new(build_parent_lookup(
+                        parent_tm,
+                        &parent_join_cols,
+                        parent_batches,
+                    )?);
+                    // Memoize across child batches unless the lookup exceeds one
+                    // materialize window — a fact-as-parent (q015) is used for this
+                    // batch but NOT retained, falling through to today's per-batch
+                    // rebuild so the cache can't grow unbounded. The window is
+                    // env-tunable (`FLUREE_R2RML_MATERIALIZE_WINDOW_ROWS`), so
+                    // raising it also raises what each memo key may retain —
+                    // intentional (both bound the same working-set notion), but a
+                    // window bump knowingly buys a bigger cache.
+                    if parent_memo && lookup.len() <= materialize_window_rows() {
+                        self.parent_lookup_cache
+                            .insert(lookup_key.clone(), Arc::clone(&lookup));
+                        // PR-8b: also publish to the query-scoped memo so a later
+                        // operator rebuild reuses it. Refused (silently falling
+                        // through to a per-batch rebuild) if it would push the memo
+                        // past its total-rows cap — bounding cross-parent
+                        // accumulation the per-operator cache never had.
+                        let as_of_t = if ctx.dataset.is_some() {
+                            None
+                        } else {
+                            Some(ctx.to_t)
+                        };
+                        let ctx_key: R2rmlParentMemoKey = (
+                            self.pattern.graph_source_id.clone(),
+                            rom.parent_triples_map.clone(),
+                            parent_join_cols.clone(),
+                            as_of_t,
+                        );
+                        ctx.r2rml_parent_memo.lock().unwrap().try_insert(
+                            ctx_key,
+                            &lookup,
+                            parent_memo_total_cap_rows(),
+                        );
+                    }
                     parent_lookups.insert(lookup_key, lookup);
                 }
             }
@@ -1046,26 +1467,42 @@ impl R2rmlScanOperator {
 
 /// Drain a [`ColumnBatchStream`] fully into a vector. Used for small dimension
 /// (parent) tables whose entire contents become a lookup.
-async fn collect_stream(mut stream: ColumnBatchStream) -> Result<Vec<ColumnBatch>> {
+async fn collect_stream(
+    mut stream: ColumnBatchStream,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Vec<ColumnBatch>> {
     let mut out = Vec::new();
-    while let Some(batch) = stream.next().await {
-        out.push(batch?);
+    loop {
+        // T3.1a: cancellation checkpoint before decoding the next batch, so a
+        // deadline/abort stops a parent-dimension drain mid-sweep instead of
+        // materializing the whole table into the lookup first. (The main
+        // streaming scan already polls per-batch in `next_batch`; this closes the
+        // collect-into-lookup helpers that drained a scan without a checkpoint.)
+        ctx.check_cancelled()?;
+        match stream.next().await {
+            Some(batch) => out.push(batch?),
+            None => break,
+        }
     }
     Ok(out)
 }
 
 /// Whether the correlated inner-scan cache is enabled. Read once from
-/// `FLUREE_R2RML_SCAN_CACHE` (only `0`/`false`/`off` disable it); disabling
-/// restores the per-child-batch re-scan behavior.
+/// `FLUREE_R2RML_SCAN_CACHE` (family falsy spellings,
+/// [`super::env_switch_enabled`]); disabling restores the per-child-batch
+/// re-scan behavior.
 fn scan_cache_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_SCAN_CACHE") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_SCAN_CACHE"))
+}
+
+/// Whether PR-4 cross-batch parent-lookup memoization is enabled. Read once from
+/// `FLUREE_R2RML_PARENT_MEMO` (family falsy spellings,
+/// [`super::env_switch_enabled`]). Off ⇒ today's per-child-batch parent-lookup
+/// rebuild.
+fn parent_memo_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_PARENT_MEMO"))
 }
 
 /// Outcome of trying to fully collect an inner scan for caching.
@@ -1081,10 +1518,17 @@ enum CollectedScan {
 /// reaches `cap` with more remaining (→ `Overflow`, too large to cache). The cap
 /// equals one materialize window, so a cached inner never exceeds the resident
 /// footprint a single scan window already materializes.
-async fn collect_scan_capped(mut stream: ColumnBatchStream, cap: usize) -> Result<CollectedScan> {
+async fn collect_scan_capped(
+    mut stream: ColumnBatchStream,
+    cap: usize,
+    ctx: &ExecutionContext<'_>,
+) -> Result<CollectedScan> {
     let mut collected = Vec::new();
     let mut rows = 0usize;
     while rows < cap {
+        // T3.1a: cancellation checkpoint before decoding the next cached-inner
+        // batch (bounded by the materialize window, but still a large drain).
+        ctx.check_cancelled()?;
         match stream.next().await {
             Some(batch) => {
                 let batch = batch?;
@@ -1325,6 +1769,21 @@ fn value_pushdown_column(om: &ObjectMap) -> Option<&str> {
     }
 }
 
+/// Whether a pattern carries a RESIDUAL filter — one the operator enforces per
+/// row AFTER the scan emits (a folded `consumed_filter`, a constant object or
+/// subject, or a same-subject star existence constraint). The scan-side top-k
+/// heap is fed the scan's EMITTED rows; a residual filter means those include
+/// rows that don't survive to the result, so the k-th bound would ride too high
+/// and prune files whose qualifying rows belong in the true top-k. When true, the
+/// top-k pushdown MUST be declined (→ full sort). Pushed `scan_filters` are NOT
+/// residual — the reader applies them, so the emitted batch is already filtered.
+fn topk_residual_filter_present(pattern: &R2rmlPattern) -> bool {
+    pattern.consumed_filter.is_some()
+        || pattern.object_constant.is_some()
+        || pattern.subject_constant.is_some()
+        || !pattern.star_constraints.is_empty()
+}
+
 /// Datatype IRI declared by an ObjectMap, if any (column/template/constant).
 fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
     use fluree_db_r2rml::mapping::ConstantValue;
@@ -1339,6 +1798,108 @@ fn object_map_datatype(om: &ObjectMap) -> Option<&str> {
     }
 }
 
+/// The xsd integer-family datatypes: types whose canonical lexical form of an
+/// integer value carries no decimal point, so a decimal-free integer string is the
+/// column's exact rendering. Only these admit the string→`Int` scan-filter coercion
+/// (`coerce_scalar_for_pushdown`); `xsd:decimal`/`double` render with a fractional
+/// part, so their lexical↔numeric relationship is scale-dependent and not coerced.
+fn is_xsd_integer_datatype(iri: &str) -> bool {
+    use fluree_vocab::xsd;
+    matches!(
+        iri,
+        xsd::INTEGER
+            | xsd::LONG
+            | xsd::INT
+            | xsd::SHORT
+            | xsd::BYTE
+            | xsd::UNSIGNED_LONG
+            | xsd::UNSIGNED_INT
+            | xsd::UNSIGNED_SHORT
+            | xsd::UNSIGNED_BYTE
+            | xsd::NON_NEGATIVE_INTEGER
+            | xsd::POSITIVE_INTEGER
+    )
+}
+
+/// Coerce a scalar constant to the [`ScanValue`] that soundly prunes `om`'s column,
+/// or `None` to DECLINE the push (leaving the operator's residual check the sole
+/// authority — a declined push is never wrong, only unpruned).
+///
+/// SOUNDNESS (the W4-1 hard requirement): the residual
+/// [`rdf_term_eq_object_constant`] compares a `Scalar(Str)` constant LEXICALLY
+/// against the column's materialized rendering, so a pushed file-prune filter is
+/// admissible only when its match-set PROVABLY covers that residual match-set. The
+/// one coercion performed — a string literal against a declared xsd-integer column —
+/// fires ONLY when the string round-trips canonically (`n.to_string() == s`): then
+/// lexical-eq ⟺ integer-eq and an `Int(n)` equality prunes exactly the residual's
+/// rows. Non-canonical forms (`"01"`, `"1.0"`, a non-numeric string) are ambiguous
+/// and DECLINED. A value already carrying a pushable, residual-matched type
+/// (`Int`/`Bool`/`Date`) pushes as-is; a string against any non-integer column
+/// pushes as-is too — a string column prunes lexicographically, and the reader
+/// safely ignores a string filter on a numeric physical column (pre-existing).
+fn coerce_scalar_for_pushdown(
+    value: &crate::r2rml::ScanValue,
+    om: &ObjectMap,
+) -> Option<crate::r2rml::ScanValue> {
+    use crate::r2rml::ScanValue;
+    match value {
+        ScanValue::Str(s) => {
+            if object_map_datatype(om).is_some_and(is_xsd_integer_datatype) {
+                match s.parse::<i64>() {
+                    // Canonical round-trip ⇒ lexical-eq ⟺ integer-eq; otherwise the
+                    // coercion is ambiguous and could over-prune vs the residual.
+                    Ok(n) if n.to_string() == *s => Some(ScanValue::Int(n)),
+                    _ => None,
+                }
+            } else {
+                Some(ScanValue::Str(s.clone()))
+            }
+        }
+        // Already a pushable, type-matched value; the residual uses the same
+        // semantics for these variants.
+        ScanValue::Int(_) | ScanValue::Bool(_) | ScanValue::Date(_) => Some(value.clone()),
+        // Double/Decimal/TemplateKey never wrap a Scalar object constant (a numeric
+        // object routes to ObjectConstant::Double/Decimal, operator-enforced only),
+        // so these are unreachable here; push as-is defensively — never wrong.
+        ScanValue::Double(_) | ScanValue::Decimal { .. } | ScanValue::TemplateKey(_) => {
+            Some(value.clone())
+        }
+    }
+}
+
+/// Push an `Eq` scan filter for a scalar constant-object equality on `pred_iri`,
+/// applying the [`coerce_scalar_for_pushdown`] soundness gate. Shared by the base
+/// `object_constant` (single-predicate `?s pred const`) and the `star_constraints`
+/// (a constant-object member of a same-subject star, e.g. `?ol …key "1"; ?ol ?p ?o`)
+/// so both classes of constant key-equality prune the scan identically. A file-level
+/// prune is only sound when the predicate maps to EXACTLY ONE scalar object map
+/// backed by one column (else a row could match via an unpruned column); otherwise
+/// no filter is pushed and the operator's residual check remains the authority.
+fn push_scalar_eq_filter(
+    out: &mut Vec<crate::r2rml::ScanFilter>,
+    triples_map: &TriplesMap,
+    pred_iri: &str,
+    value: &crate::r2rml::ScanValue,
+) {
+    let mut matching = triples_map
+        .predicate_object_maps
+        .iter()
+        .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+    let (Some(pom), None) = (matching.next(), matching.next()) else {
+        return;
+    };
+    let Some(col) = value_pushdown_column(&pom.object_map) else {
+        return;
+    };
+    if let Some(v) = coerce_scalar_for_pushdown(value, &pom.object_map) {
+        out.push(crate::r2rml::ScanFilter {
+            column: col.to_string(),
+            op: crate::r2rml::ScanCmpOp::Eq,
+            value: v,
+        });
+    }
+}
+
 /// Materialize the object term for one POM at a table row, resolving a
 /// RefObjectMap through the pre-built parent lookup. Free fn so it runs off the
 /// operator inside a rayon worker.
@@ -1346,7 +1907,7 @@ fn materialize_pom_object(
     pom: &PredicateObjectMap,
     iceberg_batch: &ColumnBatch,
     table_row_idx: usize,
-    parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
 ) -> Result<Option<RdfTerm>> {
     if let ObjectMap::RefObjectMap(ref rom) = pom.object_map {
@@ -1420,7 +1981,7 @@ fn materialize_pom_object(
 /// precomputed canonical string (see [`decimal_canonical_of`]); an exact lexical
 /// match (the common same-scale case) then skips the per-row `BigDecimal` parse,
 /// while a scale variant (`"9.990"` vs `"9.99"`) falls back to the numeric compare.
-fn rdf_term_eq_object_constant_cached(
+pub(crate) fn rdf_term_eq_object_constant_cached(
     term: &RdfTerm,
     constant: &crate::r2rml::ObjectConstant,
     numeric_column: bool,
@@ -1469,6 +2030,21 @@ fn rdf_term_eq_object_constant_cached(
                 ScanValue::Date(days) => {
                     fluree_db_core::Date::parse(v).is_ok_and(|d| d.days_since_epoch() == *days)
                 }
+                // Double / Decimal `ScanValue`s only ever reach the scan as
+                // FILTER pushdowns, never wrapped in a `Scalar` object constant
+                // (a numeric object routes to `ObjectConstant::Double`/`Decimal`
+                // above). These arms exist for match exhaustiveness; should one be
+                // reached, match loosely by value so it can never be WRONG.
+                ScanValue::Double(f) => v.parse::<f64>().is_ok_and(|x| x == *f),
+                ScanValue::Decimal {
+                    unscaled, scale, ..
+                } => {
+                    let d = bigdecimal::BigDecimal::new(
+                        num_bigint::BigInt::from(*unscaled),
+                        i64::from(*scale),
+                    );
+                    v.parse::<bigdecimal::BigDecimal>().is_ok_and(|x| x == d)
+                }
                 // A TemplateKey is only ever a reversed subject-key filter, never
                 // an object constant, so it never matches an object term.
                 ScanValue::TemplateKey(_) => false,
@@ -1486,7 +2062,7 @@ fn subject_term_matches_iri(term: &RdfTerm, want: &str) -> bool {
 /// The constant's precomputed `BigDecimal::to_string()`, for an
 /// `ObjectConstant::Decimal` — computed once per scan so the hot per-row match
 /// can skip re-parsing. `None` for any other constant.
-fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
+pub(crate) fn decimal_canonical_of(constant: &crate::r2rml::ObjectConstant) -> Option<String> {
     match constant {
         crate::r2rml::ObjectConstant::Decimal(d) => Some(d.to_string()),
         _ => None,
@@ -1517,7 +2093,7 @@ fn decimal_lexical_eq_int(v: &str, n: i64) -> bool {
 /// type, so an integer constant may match a decimal lexical form. Only a plain
 /// `rr:column` object qualifies — anything else does not push a scan filter (see
 /// [`value_pushdown_column`]), so the strict lexical match already suffices.
-fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
+pub(crate) fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bool {
     let ObjectMap::Column { column, .. } = &pom.object_map else {
         return false;
     };
@@ -1527,6 +2103,49 @@ fn object_column_is_numeric(pom: &PredicateObjectMap, batch: &ColumnBatch) -> bo
     )
 }
 
+/// Whether the current row's subject satisfies EVERY folded `star_constraint` — each
+/// constraint predicate must yield at least one object equal to its constant. The
+/// E2 / W4-1b constant-object existence filter, shared by the fixed-predicate star
+/// branch and the folded-wildcard subject pre-check. `star_constraint_canon` is the
+/// per-constraint precomputed decimal canonical (parallel to `star_constraints`).
+#[allow(clippy::too_many_arguments)]
+fn row_passes_star_constraints(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    table_row_idx: usize,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+    star_constraint_canon: &[Option<String>],
+) -> Result<bool> {
+    for ((pred, required), canon) in pattern.star_constraints.iter().zip(star_constraint_canon) {
+        let mut matched = false;
+        for pom in triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
+        {
+            if let Some(t) = materialize_pom_object(
+                pom,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+            )? {
+                let numeric = object_column_is_numeric(pom, iceberg_batch);
+                if rdf_term_eq_object_constant_cached(&t, required, numeric, canon.as_deref()) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Materialize one column batch into produced variable assignments (subject +
 /// object vars) — the per-batch unit of the parallel scan. Mirrors the previous
 /// per-row logic (star cross product, subject-only, single-object).
@@ -1534,7 +2153,7 @@ fn materialize_batch(
     pattern: &R2rmlPattern,
     triples_map: &TriplesMap,
     iceberg_batch: &ColumnBatch,
-    parent_lookups: &HashMap<(String, Vec<String>), ParentLookup>,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
@@ -1571,7 +2190,15 @@ fn materialize_batch(
         }
         let subject_binding = encoder.encode(&subject_term);
 
-        if !pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty() {
+        // A fixed-predicate same-subject star (extra star_bindings and/or folded
+        // const-object star_constraints). A variable-predicate WILDCARD is excluded
+        // here even when it carries folded star_constraints (W4-1b): it must reach
+        // the wildcard POM loop below to bind ?p/?o, so its star_constraints are
+        // applied as a subject-level existence pre-check there — this fixed-predicate
+        // path never binds a predicate var and would emit a subject-only row.
+        if pattern.predicate_var.is_none()
+            && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
+        {
             let mut members: Vec<(VarId, &str)> = Vec::new();
             if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
             {
@@ -1610,40 +2237,18 @@ fn materialize_batch(
             // Fused constant-object constraints: the row survives only when each
             // predicate produces at least one object equal to its constant. This
             // is an existence filter (produces no var), enforced by the operator.
-            if row_ok {
-                for ((pred, required), canon) in
-                    pattern.star_constraints.iter().zip(&star_constraint_canon)
-                {
-                    let mut matched = false;
-                    for pom in triples_map
-                        .predicate_object_maps
-                        .iter()
-                        .filter(|p| p.predicate_map.as_constant() == Some(pred.as_str()))
-                    {
-                        if let Some(t) = materialize_pom_object(
-                            pom,
-                            iceberg_batch,
-                            table_row_idx,
-                            parent_lookups,
-                            ref_shortcuts,
-                        )? {
-                            let numeric = object_column_is_numeric(pom, iceberg_batch);
-                            if rdf_term_eq_object_constant_cached(
-                                &t,
-                                required,
-                                numeric,
-                                canon.as_deref(),
-                            ) {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !matched {
-                        row_ok = false;
-                        break;
-                    }
-                }
+            if row_ok
+                && !row_passes_star_constraints(
+                    pattern,
+                    triples_map,
+                    iceberg_batch,
+                    table_row_idx,
+                    parent_lookups,
+                    ref_shortcuts,
+                    &star_constraint_canon,
+                )?
+            {
+                row_ok = false;
             }
             if !row_ok {
                 continue;
@@ -1747,6 +2352,27 @@ fn materialize_batch(
             }
             continue;
         };
+
+        // W4-1b: a folded crawl wildcard carries const-object members as
+        // `star_constraints`. Apply them as a SUBJECT existence pre-check before
+        // emitting any (p,o) row: keep this subject's wildcard rows only when every
+        // constraint predicate yields its constant — the same existence filter the
+        // standalone joined key scan enforced. Empty (a no-op) for a plain wildcard;
+        // a fixed-predicate star with constraints took the star branch above, so only
+        // a folded wildcard reaches here with a non-empty set.
+        if !pattern.star_constraints.is_empty()
+            && !row_passes_star_constraints(
+                pattern,
+                triples_map,
+                iceberg_batch,
+                table_row_idx,
+                parent_lookups,
+                ref_shortcuts,
+                &star_constraint_canon,
+            )?
+        {
+            continue;
+        }
 
         for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
             pattern
@@ -1929,6 +2555,16 @@ impl Operator for R2rmlScanOperator {
         }
     }
 
+    fn set_topk(&mut self, sort_var: VarId, k: usize) {
+        // Record the DESC top-k directive; it is resolved to a scan column against
+        // the mapping at scan time and honored only for the main table scan. Like
+        // `row_budget`, do NOT forward to the child — an inner correlated scan must
+        // still produce every row the join needs; only a topmost scan is eligible.
+        if topk_pushdown_enabled() {
+            self.topk = Some((sort_var, k));
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         // Open child first
         self.child.open(ctx).await?;
@@ -2071,6 +2707,7 @@ impl Operator for R2rmlScanOperator {
         self.pending.clear();
         self.progress = None;
         self.scan_cache.clear();
+        self.parent_lookup_cache.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -2084,7 +2721,167 @@ impl Operator for R2rmlScanOperator {
 mod tests {
     use super::*;
     use crate::r2rml::{ObjectConstant, ScanValue};
+    use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
     use fluree_db_r2rml::materialize::RdfTerm;
+
+    /// T3.1a: a cancelled query must stop a parent-dimension drain up front
+    /// (return `Cancelled`) instead of materializing the whole table into the
+    /// lookup. Without the checkpoint the empty stream would drain to `Ok`.
+    #[tokio::test]
+    async fn collect_stream_bails_on_cancelled_query() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        assert!(matches!(
+            collect_stream(stream, &ctx).await,
+            Err(QueryError::Cancelled { .. })
+        ));
+    }
+
+    /// T3.1a: same checkpoint on the capped cached-inner drain.
+    #[tokio::test]
+    async fn collect_scan_capped_bails_on_cancelled_query() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let cancellation = QueryCancellation::new();
+        cancellation.cancel();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation);
+        let stream: ColumnBatchStream = Box::pin(futures::stream::empty());
+        assert!(matches!(
+            collect_scan_capped(stream, 1000, &ctx).await,
+            Err(QueryError::Cancelled { .. })
+        ));
+    }
+
+    /// PR-5 soundness: the top-k pushdown must be declined whenever the scan
+    /// carries a residual filter the operator enforces after emitting rows —
+    /// otherwise the heap is fed pre-filter values and could prune files whose
+    /// qualifying rows belong in the true top-k (silently dropping rows). A pure
+    /// value scan (q046 shape) is eligible; a folded FILTER, a constant
+    /// object/subject, or a same-subject star existence constraint declines.
+    #[test]
+    fn topk_declines_on_residual_filter() {
+        let base = R2rmlPattern::new("gs:main", VarId(1), Some(VarId(2)))
+            .with_predicate("http://ex/orderTotal");
+        assert!(
+            !topk_residual_filter_present(&base),
+            "pure value scan is eligible"
+        );
+
+        let mut folded_filter = base.clone();
+        folded_filter.consumed_filter = Some(crate::ir::Expression::Var(VarId(7)));
+        assert!(topk_residual_filter_present(&folded_filter));
+
+        let mut const_object = base.clone();
+        const_object.object_constant = Some(ObjectConstant::Iri("http://ex/x".to_string()));
+        assert!(topk_residual_filter_present(&const_object));
+
+        let mut bound_subject = base.clone();
+        bound_subject.subject_constant = Some("http://ex/o/1".to_string());
+        assert!(topk_residual_filter_present(&bound_subject));
+
+        let mut star_constraint = base.clone();
+        star_constraint.star_constraints = vec![(
+            "http://ex/isCurrent".to_string(),
+            ObjectConstant::Scalar(ScanValue::Bool(true)),
+        )];
+        assert!(topk_residual_filter_present(&star_constraint));
+    }
+
+    fn pom(pred: &str, col: &str) -> PredicateObjectMap {
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant(pred),
+            object_map: ObjectMap::column(col),
+        }
+    }
+
+    // PR-3 fix (a): a star resolves only TriplesMaps that supply EVERY star
+    // predicate. A map with a distinguishing member is kept; one missing it is
+    // pruned (case a); a map legitimately supplying all members is kept (case c).
+    #[test]
+    fn star_prune_requires_all_member_predicates() {
+        let store = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_predicate_object(pom("http://ex/name", "store_name"))
+            .with_predicate_object(pom("http://ex/channel", "channel"));
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom("http://ex/name", "full_name"));
+        let required = vec![
+            "http://ex/name".to_string(),
+            "http://ex/channel".to_string(),
+        ];
+        // case (c): DIM_STORE supplies name AND channel -> kept.
+        assert!(tm_passes_star_prune(&store, &required, None));
+        // case (a): DIM_CUSTOMER has name but not channel -> pruned (dead work).
+        assert!(!tm_passes_star_prune(&customer, &required, None));
+    }
+
+    #[test]
+    fn parent_memo_refuses_insert_past_total_cap() {
+        // PR-8b review: the total-rows cap must REFUSE an insert that would exceed it
+        // (the caller then falls back to a per-batch rebuild for that key), while an
+        // already-present key stays idempotent. The cap is passed directly to keep
+        // the test env-hermetic (no FLUREE_R2RML_PARENT_MEMO_TOTAL_WINDOWS).
+        let mut memo = R2rmlParentMemoInner::default();
+        let lookup = |n: usize| -> std::sync::Arc<ParentLookup> {
+            let mut m = ParentLookup::new();
+            for i in 0..n {
+                m.insert(vec![i.to_string()], RdfTerm::iri(format!("http://ex/{i}")));
+            }
+            std::sync::Arc::new(m)
+        };
+        let key = |s: &str| -> R2rmlParentMemoKey {
+            (
+                "gs".to_string(),
+                s.to_string(),
+                vec!["id".to_string()],
+                None,
+            )
+        };
+        assert!(memo.try_insert(key("A"), &lookup(2), 3)); // 2 <= 3
+        assert!(memo.try_insert(key("A"), &lookup(2), 3)); // same key, idempotent
+        assert!(!memo.try_insert(key("B"), &lookup(2), 3)); // 2 + 2 = 4 > 3 -> refused
+        assert!(memo.try_insert(key("C"), &lookup(1), 3)); // 2 + 1 = 3 fits exactly
+        assert!(!memo.try_insert(key("D"), &lookup(1), 3)); // at cap -> refused
+    }
+
+    // PR-3 fix (b'): with a (template-disjoint) class prune, only class-declaring
+    // maps survive resolution; the class's own scan enforces membership.
+    #[test]
+    fn star_prune_class_keeps_only_declaring_maps() {
+        let store = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(pom("http://ex/name", "store_name"));
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom("http://ex/name", "full_name"));
+        let name = vec!["http://ex/name".to_string()];
+        assert!(tm_passes_star_prune(&store, &name, Some("http://ex/Store")));
+        assert!(!tm_passes_star_prune(
+            &customer,
+            &name,
+            Some("http://ex/Store")
+        ));
+    }
+
+    // PR-3 fix (d): switch off (empty inputs) reproduces today's fan-out — every
+    // map passes the prune regardless of its predicates or class.
+    #[test]
+    fn star_prune_noop_when_inputs_empty() {
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom("http://ex/name", "full_name"));
+        assert!(tm_passes_star_prune(&customer, &[], None));
+    }
 
     #[test]
     fn build_ref_shortcut_accepts_only_child_templatable_single_col() {
@@ -2300,6 +3097,191 @@ mod tests {
         );
     }
 
+    // W4-1 SECONDARY (the hard requirement): a pushed filter's match-set must
+    // PROVABLY cover the residual's. The residual (`rdf_term_eq_object_constant`,
+    // `Scalar(Str)` arm) compares LEXICALLY, so a string literal coerces to `Int`
+    // ONLY when it round-trips canonically (lexical-eq ⟺ integer-eq); every
+    // ambiguous form declines the push so the residual — never wrong — stays sole
+    // authority. These are the refutation cases (residual-matches-but-would-mismatch
+    // and non-numeric-vs-numeric are never over-pruned).
+    #[test]
+    fn w4_1_coerce_string_to_int_only_when_canonical() {
+        use crate::r2rml::ScanValue;
+        use fluree_db_r2rml::mapping::ObjectMap;
+
+        let int_col = ObjectMap::column_typed("K", fluree_vocab::xsd::INTEGER);
+        let long_col = ObjectMap::column_typed("K", fluree_vocab::xsd::LONG);
+        let str_untyped = ObjectMap::column("NAME"); // no rr:datatype → xsd:string
+        let str_typed = ObjectMap::column_typed("NAME", fluree_vocab::xsd::STRING);
+        let dec_col = ObjectMap::column_typed("AMT", fluree_vocab::xsd::DECIMAL);
+
+        // Canonical integer string against an integer column → coerced (prunes).
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &int_col),
+            Some(ScanValue::Int(1))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("-5".into()), &long_col),
+            Some(ScanValue::Int(-5))
+        );
+
+        // REFUTATION — non-canonical / non-integer against an integer column DECLINE
+        // (never over-prune vs the lexical residual): "01" (leading zero), "1.0"
+        // (fraction), "+1" (sign form), " 1" (space), "abc" (non-numeric), "-0"
+        // (parses to 0 whose canonical render "0" ≠ "-0", so the pushed Int would
+        // prune rows the lexical residual keeps), and a >i64 value (parse overflow).
+        for s in [
+            "01",
+            "1.0",
+            "+1",
+            " 1",
+            "abc",
+            "",
+            "-0",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                coerce_scalar_for_pushdown(&ScanValue::Str(s.into()), &int_col),
+                None,
+                "non-canonical {s:?} against an integer column must DECLINE the push"
+            );
+        }
+
+        // A string against a string column pushes AS-IS (lexicographic prune matches
+        // the residual's lexical compare) — no coercion, incl. non-canonical forms.
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &str_untyped),
+            Some(ScanValue::Str("1".into()))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("01".into()), &str_typed),
+            Some(ScanValue::Str("01".into()))
+        );
+        // A string against a DECIMAL column is not coerced (scale-dependent lexical
+        // relationship) → pushed as-is; the reader safely ignores a string filter on
+        // a numeric physical column (no prune, never wrong).
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Str("1".into()), &dec_col),
+            Some(ScanValue::Str("1".into()))
+        );
+
+        // Already-typed, residual-matched values push as-is.
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Int(7), &int_col),
+            Some(ScanValue::Int(7))
+        );
+        assert_eq!(
+            coerce_scalar_for_pushdown(&ScanValue::Bool(true), &str_untyped),
+            Some(ScanValue::Bool(true))
+        );
+    }
+
+    // W4-1 PRIMARY dispatch: the shared push helper resolves a scalar key equality
+    // to a single scalar pushdown column and applies the coercion gate, declining
+    // on a duplicate-predicate (unsound file-prune) or a non-column object map.
+    #[test]
+    fn w4_1_push_scalar_eq_filter_resolution_and_gate() {
+        use crate::r2rml::{ScanCmpOp, ScanValue};
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let tm = TriplesMap::new("#OrderLine", "FACT_ORDER_LINE")
+            .with_subject_template("http://ex/ol/{ORDER_LINE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+                object_map: ObjectMap::column_typed("ORDER_LINE_KEY", fluree_vocab::xsd::INTEGER),
+            });
+
+        // Canonical key equality → one coerced Int filter on the mapped column.
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("1".into()),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].column, "ORDER_LINE_KEY");
+        assert!(matches!(out[0].op, ScanCmpOp::Eq));
+        assert_eq!(out[0].value, ScanValue::Int(1));
+
+        // Non-canonical → declined (coercion gate).
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("01".into()),
+        );
+        assert!(out.is_empty());
+
+        // Duplicate predicate (two POMs) → not a sound single-column prune → declined.
+        let tm_dup = tm.clone().with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+            object_map: ObjectMap::column("ORDER_LINE_KEY_ALT"),
+        });
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm_dup,
+            "http://ex/orderLineKey",
+            &ScanValue::Str("1".into()),
+        );
+        assert!(out.is_empty());
+
+        // A value-transforming (template) object map is not pushable → declined.
+        let tm_tmpl = TriplesMap::new("#X", "T").with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/p"),
+            object_map: ObjectMap::template("PRE-{C}", vec!["C".to_string()]),
+        });
+        let mut out = Vec::new();
+        push_scalar_eq_filter(
+            &mut out,
+            &tm_tmpl,
+            "http://ex/p",
+            &ScanValue::Str("1".into()),
+        );
+        assert!(out.is_empty());
+    }
+
+    // W4-1 PRIMARY end-to-end: a scalar constant-object member of a same-subject
+    // star (`?ol …key "1"; ?ol ex:order ?ord`) lands in `star_constraints` and now
+    // produces a scan filter, so the multi-predicate point-lookup prunes the FACT
+    // scan (was residual-only → full read). The residual guard stays intact.
+    #[test]
+    fn w4_1_star_constraint_pushes_scan_filter() {
+        use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
+        use crate::seed::EmptyOperator;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        let tm = TriplesMap::new("#OrderLine", "FACT_ORDER_LINE")
+            .with_subject_template("http://ex/ol/{ORDER_LINE_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/orderLineKey"),
+                object_map: ObjectMap::column_typed("ORDER_LINE_KEY", fluree_vocab::xsd::INTEGER),
+            })
+            .with_predicate_object(pom("http://ex/order", "ORDER_KEY"));
+
+        // ?ol ex:order ?ord (the star base) + ?ol ex:orderLineKey "1" (folded const).
+        let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+        pattern.predicate_filter = Some("http://ex/order".to_string());
+        pattern.star_constraints = vec![(
+            "http://ex/orderLineKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Str("1".to_string())),
+        )];
+        // The star constraint is a residual filter regardless of the push (the
+        // operator still enforces it post-scan) — the push is an optimization on top.
+        assert!(topk_residual_filter_present(&pattern));
+
+        let op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+        let filters = op.build_scan_filters(&tm);
+        let key = filters
+            .iter()
+            .find(|f| f.column == "ORDER_LINE_KEY")
+            .expect("the folded key equality must now push a scan filter");
+        assert!(matches!(key.op, ScanCmpOp::Eq));
+        assert_eq!(key.value, ScanValue::Int(1));
+    }
+
     #[test]
     fn numeric_and_date_object_matching() {
         use bigdecimal::BigDecimal;
@@ -2458,7 +3440,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -2500,7 +3482,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -2533,6 +3515,203 @@ mod tests {
             }),
             "the data POM row must survive alongside the type row: {rows:?}"
         );
+    }
+
+    // W4-1b SHIP-BLOCKER regression (lambda-audit-2): a FOLDED crawl wildcard carries
+    // const-object members as star_constraints. Before the execution fix,
+    // has_star_members()==true routed it into the fixed-predicate star materialize,
+    // which emitted a subject-only row and NEVER bound ?p/?o. It must instead behave
+    // as a wildcard whose SUBJECT is filtered by the constraint: satisfied → all
+    // (p,o) rows; violated → the subject drops entirely.
+    #[test]
+    fn w4_1b_folded_wildcard_emits_po_rows_under_star_constraint() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let tm = TriplesMap::new("#Store", "DIM_STORE")
+            .with_subject_template("http://ex/store/{STORE_KEY}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: fluree_db_r2rml::mapping::PredicateMap::constant(
+                    "http://ex/storeKey",
+                ),
+                object_map: ObjectMap::column("STORE_KEY"),
+            });
+        let batch = single_col_batch("STORE_KEY", vec![Some(7)]);
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let encoder = LiteralEncoder::build(&tm, &snapshot);
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
+        let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
+
+        // `?s ?p ?o` with a folded const-object constraint storeKey==7 (SATISFIED):
+        // behaves exactly like the plain wildcard — data POM row + rdf:type row, each
+        // binding ?p AND ?o (this is what the ship-blocker broke).
+        let mut pass =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        pass.star_constraints = vec![(
+            "http://ex/storeKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(7)),
+        )];
+        let rows =
+            materialize_batch(&pass, &tm, &batch, &lookups, &shortcuts, &encoder).expect("mat");
+        assert_eq!(
+            rows.len(),
+            2,
+            "satisfied → wildcard emits (p,o): data POM + type row, NOT a subject-only row: {rows:?}"
+        );
+        // The folded wildcard must emit the SAME (p,o) triples the UNFOLDED wildcard
+        // does when the subject satisfies the constraint (lambda-audit-2: assert the
+        // bindings, not just the count — a count alone could pass on two subject-only
+        // rows from some other path). Mirrors var_subject_wildcard_emits_rdf_type_rows.
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == "http://ex/storeKey"))
+                    .unwrap_or(false)
+                    && find(r, VarId(2)).is_some()
+            }),
+            "data POM row must bind ?p=storeKey AND ?o: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| {
+                find(r, VarId(1))
+                    .map(|b| matches!(b, Binding::Iri(s) if &**s == fluree_vocab::rdf::TYPE))
+                    .unwrap_or(false)
+                    && find(r, VarId(2)).map(iri_of).as_deref() == Some("http://ex/Store")
+            }),
+            "rdf:type row must bind ?p=rdf:type AND ?o=Store: {rows:?}"
+        );
+
+        // Same wildcard, constraint storeKey==8 (VIOLATED) → the subject drops.
+        let mut fail =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        fail.star_constraints = vec![(
+            "http://ex/storeKey".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(8)),
+        )];
+        let rows =
+            materialize_batch(&fail, &tm, &batch, &lookups, &shortcuts, &encoder).expect("mat");
+        assert!(
+            rows.is_empty(),
+            "violated → no rows (subject filtered by the star_constraint): {rows:?}"
+        );
+    }
+
+    /// F-16/catch-#11: the `trust_fk_refs` shortcut re-enable for a folded crawl
+    /// wildcard is SCALAR-GATED. A scalar-constrained fold qualifies; an IRI
+    /// constraint (which a dangling-FK template render would falsely satisfy),
+    /// a mixed set, a fixed-predicate star (`star_bindings`), a plain wildcard
+    /// (no constraints — governed by `!has_star_members()`, not this helper),
+    /// and a non-wildcard all DISQUALIFY.
+    #[test]
+    fn f16_folded_wildcard_all_scalar_gate() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        let scalar = |p: &str| (p.to_string(), ObjectConstant::Scalar(ScanValue::Int(7)));
+        let iri = |p: &str| {
+            (
+                p.to_string(),
+                ObjectConstant::Iri("http://ex/order/5".to_string()),
+            )
+        };
+
+        // Folded wildcard, all-scalar → qualifies.
+        let mut pass =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        pass.star_constraints = vec![scalar("http://ex/lineNumber")];
+        assert!(R2rmlScanOperator::folded_wildcard_all_scalar(&pass));
+
+        // IRI constraint → disqualified (dangling-FK over-match hazard).
+        let mut ref_c = pass.clone();
+        ref_c.star_constraints = vec![iri("http://ex/order")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&ref_c));
+
+        // Mixed scalar + IRI → disqualified (every constraint must be scalar).
+        let mut mixed = pass.clone();
+        mixed.star_constraints = vec![scalar("http://ex/lineNumber"), iri("http://ex/order")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&mixed));
+
+        // Fixed-predicate star member present → not the crawl fold.
+        let mut star = pass.clone();
+        star.star_bindings = vec![("http://ex/qty".to_string(), VarId(3))];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&star));
+
+        // Plain wildcard (no constraints) → not this helper's business.
+        let plain =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&plain));
+
+        // Fixed-predicate pattern (no predicate_var) → disqualified.
+        let mut fixed = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
+        fixed.star_constraints = vec![scalar("http://ex/lineNumber")];
+        assert!(!R2rmlScanOperator::folded_wildcard_all_scalar(&fixed));
+    }
+
+    /// Task #17 — the F-16 closure evidence: the SHORTCUT FIRES (not merely the
+    /// flag) for a scalar-folded crawl wildcard under `trust_fk_refs`. The
+    /// production parent-lookup build consults `ref_template_shortcut_enabled`
+    /// (this exact fn) and, when true, inserts the `build_ref_shortcut` result
+    /// instead of scanning the parent — so admission==true AND
+    /// build_ref_shortcut==Some together pin the fire condition for the folded
+    /// shape. The corpus cannot exercise this seam: SPARQL queries run via
+    /// `query_from` where `trust_fk_refs` is always false (the shortcut is a
+    /// browse-crawl-API feature), so a regression here is perf-silent to q068.
+    #[test]
+    fn f16_ref_template_shortcut_fires_for_scalar_folded() {
+        use crate::r2rml::{ObjectConstant, ScanValue};
+        // The ref side: single-column templated FK — shortcut-eligible (the
+        // deployed `edw:order` → FactOrder shape).
+        let parent = TriplesMap::new("#Order", "FACT_ORDER")
+            .with_subject_template("http://ex/order/{ORDER_KEY}");
+        let rom = RefObjectMap::new("#Order", "ORDER_KEY", "ORDER_KEY");
+        assert!(
+            build_ref_shortcut(&parent, &rom).is_some(),
+            "single-col templated FK must be shortcut-eligible"
+        );
+
+        // Scalar-folded crawl wildcard + trust ON → admission true ⇒ with the
+        // eligible ref above, the build inserts the shortcut (no parent scan).
+        let mut folded =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        folded.star_constraints = vec![(
+            "http://ex/lineNumber".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(1)),
+        )];
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &folded
+        ));
+
+        // Iri-folded → admission false (sound parent-scan path; catch #11).
+        let mut iri_folded = folded.clone();
+        iri_folded.star_constraints = vec![(
+            "http://ex/order".to_string(),
+            ObjectConstant::Iri("http://ex/order/5".to_string()),
+        )];
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true,
+            &iri_folded
+        ));
+
+        // Trust OFF (the chat/`query_from` path) → admission false regardless.
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            false, &folded
+        ));
+
+        // Plain wildcard + trust ON → admission true (pre-existing behavior,
+        // unchanged by the F-16 amendment).
+        let plain =
+            R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &plain
+        ));
+
+        // Fixed-predicate star + trust ON → admission false (star shapes keep
+        // parent-scan + dangling-FK semantics; unchanged).
+        let mut star = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(2)));
+        star.star_constraints = vec![(
+            "http://ex/lineNumber".to_string(),
+            ObjectConstant::Scalar(ScanValue::Int(1)),
+        )];
+        assert!(!R2rmlScanOperator::ref_template_shortcut_enabled(
+            true, &star
+        ));
     }
 
     /// A templated (non-constant) predicate binds `?p` from the row when the
@@ -2589,7 +3768,7 @@ mod tests {
 
         let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
         let encoder = LiteralEncoder::build(&tm, &snapshot);
-        let lookups: HashMap<(String, Vec<String>), ParentLookup> = HashMap::new();
+        let lookups: HashMap<(String, Vec<String>), Arc<ParentLookup>> = HashMap::new();
         let shortcuts: HashMap<LookupCacheKey, RefShortcut> = HashMap::new();
 
         let rows = materialize_batch(&pattern, &tm, &batch, &lookups, &shortcuts, &encoder)
@@ -2608,6 +3787,364 @@ mod tests {
             assert!(
                 !(find(row, VarId(2)).is_some() && find(row, VarId(1)).is_none()),
                 "no solution may bind ?o while leaving ?p unbound: {row:?}"
+            );
+        }
+    }
+
+    // PR-4: the cross-child-batch parent-lookup memoization, CI-enforced. Drives
+    // `build_progress` N times (as a correlated join / a multi-batch child stream
+    // does) against a scan-COUNTING provider: with the memo ON the DIM parent is
+    // scanned exactly once; with it OFF the parent is re-scanned every batch
+    // (today's fan-out — the q008 DNF class). A future refactor that drops the
+    // cache (e.g. reintroduces the parent-scan-per-batch bypass) trips this.
+    #[test]
+    fn parent_lookup_memoized_across_child_batches() {
+        use crate::context::ExecutionContext;
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CountingProvider {
+            scans: Mutex<HashMap<String, usize>>,
+        }
+        fn one_row(col: &str, field_id: i32) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: col.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id,
+            }]));
+            ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap()
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for CountingProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                *self
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .entry(table_name.to_string())
+                    .or_default() += 1;
+                // The parent ("customers") is consumed to build the lookup, so it
+                // must carry its join column ID; the main ("orders") stream is only
+                // stored by build_progress, so its content is irrelevant here.
+                let batch = if table_name == "customers" {
+                    one_row("ID", 1)
+                } else {
+                    one_row("CUST_ID", 2)
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        // orders --edw:customer (RefObjectMap)--> customers.
+        let orders = TriplesMap::new("#Order", "orders")
+            .with_subject_template("http://ex/order/{ORDER_KEY}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("edw:customer"),
+                object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                    "#Customer",
+                    "CUST_ID",
+                    "ID",
+                )),
+            });
+        let customers = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://ex/customer/{ID}");
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]));
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+
+        // Returns (parent "customers" scans, child "orders" scans).
+        let table_scans = |memo: bool| -> (usize, usize) {
+            let provider = CountingProvider::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+
+                let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+                pattern.predicate_filter = Some("edw:customer".to_string());
+                let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+                op.mapping = Some(Arc::clone(&mapping));
+                op.parent_memo = memo;
+
+                for _ in 0..5 {
+                    futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))
+                        .expect("build_progress");
+                }
+            } // ctx (and its borrow of `provider`) dropped before reading the tally.
+            let scans = provider.scans.lock().unwrap();
+            let count = |table: &str| scans.get(table).copied().unwrap_or(0);
+            (count("customers"), count("orders"))
+        };
+
+        let (parent_on, child_on) = table_scans(true);
+        let (parent_off, child_off) = table_scans(false);
+        assert_eq!(
+            parent_on, 1,
+            "memo ON: DIM parent scanned exactly once across 5 child batches"
+        );
+        assert_eq!(
+            parent_off, 5,
+            "memo OFF: DIM parent re-scanned every batch (today's fan-out)"
+        );
+        // The memo must change PARENT behavior only. The child ("orders") scan
+        // is already deduped across batches by the pre-existing `scan_cache`
+        // (unfiltered inner scans, `FLUREE_R2RML_SCAN_CACHE`), so it is 1 in
+        // BOTH regimes — the parent memo neither helps nor hurts the child path.
+        assert_eq!(
+            child_on, 1,
+            "memo ON: child scanned once total (scan_cache, not the parent memo)"
+        );
+        assert_eq!(
+            child_off, child_on,
+            "memo OFF: identical child scan count — the memo affects parents only"
+        );
+    }
+
+    // PR-8b shared test rig: a scan-counting provider + an orders→customers
+    // RefObjectMap mapping. `customers` (the DIM parent) carries its join column;
+    // `orders` (the child) is content-irrelevant (only stored, never lookup-built).
+    #[cfg(test)]
+    mod pr8b {
+        use super::*;
+        use crate::context::ExecutionContext;
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+            TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Mutex;
+
+        #[derive(Debug, Default)]
+        struct CountingProvider {
+            scans: Mutex<HashMap<String, usize>>,
+        }
+        fn one_row(col: &str, field_id: i32) -> ColumnBatch {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: col.to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id,
+            }]));
+            ColumnBatch::new(schema, vec![Column::Int64(vec![Some(1)])]).unwrap()
+        }
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for CountingProvider {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                *self
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .entry(table_name.to_string())
+                    .or_default() += 1;
+                let batch = if table_name == "customers" {
+                    one_row("ID", 1)
+                } else {
+                    one_row("CUST_ID", 2)
+                };
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+        fn mapping() -> Arc<CompiledR2rmlMapping> {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{ORDER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("edw:customer"),
+                    object_map: ObjectMap::RefObjectMap(RefObjectMap::new(
+                        "#Customer",
+                        "CUST_ID",
+                        "ID",
+                    )),
+                });
+            let customers = TriplesMap::new("#Customer", "customers")
+                .with_subject_template("http://ex/customer/{ID}");
+            Arc::new(CompiledR2rmlMapping::new(vec![orders, customers]))
+        }
+        fn build_once(ctx: &ExecutionContext<'_>, mapping: &Arc<CompiledR2rmlMapping>, gs: &str) {
+            let mut pattern = R2rmlPattern::new(gs, VarId(0), Some(VarId(1)));
+            pattern.predicate_filter = Some("edw:customer".to_string());
+            let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+            op.mapping = Some(Arc::clone(mapping));
+            op.parent_memo = true;
+            futures::executor::block_on(op.build_progress(ctx, Batch::single_empty()))
+                .expect("build_progress");
+            // `op` dropped here → its per-operator `parent_lookup_cache` is gone; only
+            // the query-scoped ctx memo persists across the next `build_once`.
+        }
+
+        // The q031 seam: an inner join with an interposed FILTER + LIMIT rebuilds the
+        // R2RML operator per driving batch. PR-4's per-operator cache is reset by
+        // that rebuild; the query-scoped ctx memo (PR-8b) must survive — a FRESH
+        // operator each iteration against ONE ctx ⇒ the DIM parent is scanned once,
+        // not once per rebuild. (Distinct from `parent_lookup_memoized_across_child_batches`,
+        // which reuses ONE operator across batches.)
+        #[test]
+        fn parent_lookup_survives_operator_rebuild() {
+            let mapping = mapping();
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let vars = VarRegistry::new();
+            let provider = CountingProvider::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                for _ in 0..5 {
+                    build_once(&ctx, &mapping, "gs:main");
+                }
+            }
+            assert_eq!(
+                provider
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .get("customers")
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "ctx memo survives the operator rebuild: parent scanned once across 5 rebuilds"
+            );
+        }
+
+        // F19 residual fix: a correlated inner join rebuilt across a `with_graph_ref`
+        // boundary (SERVICE / multi-source default R2RML) must ALSO keep the memo.
+        // `with_graph_ref` switches store, so it re-creates `const_sid_cache` fresh —
+        // but the parent-memo key is store-disambiguated (graph_source_id + as_of_t),
+        // so it now CLONES the memo Arc. Deriving the ctx per rebuild via
+        // `with_graph_ref` therefore scans the DIM parent ONCE, not once per rebuild.
+        // (Before the fix, `with_graph_ref` used `R2rmlParentMemo::default()` and this
+        // asserted 5 — the `with_active_graph`-only coverage missed this path.)
+        #[test]
+        fn parent_memo_survives_with_graph_ref_rebuild() {
+            use crate::dataset::GraphRef;
+            let mapping = mapping();
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let vars = VarRegistry::new();
+            let no_overlay = fluree_db_core::NoOverlay;
+            let graph = GraphRef::new(&snapshot, 0, &no_overlay, snapshot.t, "test/main");
+            let provider = CountingProvider::default();
+            {
+                let mut base = ExecutionContext::new(&snapshot, &vars);
+                base.r2rml_table_provider = Some(&provider);
+                for _ in 0..5 {
+                    let gctx = base.with_graph_ref(&graph);
+                    build_once(&gctx, &mapping, "gs:main");
+                }
+            }
+            assert_eq!(
+                provider
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .get("customers")
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "with_graph_ref shares the parent memo: parent scanned once across 5 rebuilds"
+            );
+        }
+
+        // A query-scoped memo shared across R2RML operators must NOT cross-pollute
+        // two graph sources holding a same-named parent table: the key carries
+        // `graph_source_id`, so `gs:A` and `gs:B` each scan `customers` once.
+        #[test]
+        fn parent_memo_isolated_by_graph_source() {
+            let mapping = mapping();
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+            let vars = VarRegistry::new();
+            let provider = CountingProvider::default();
+            {
+                let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                ctx.r2rml_table_provider = Some(&provider);
+                build_once(&ctx, &mapping, "gs:A");
+                build_once(&ctx, &mapping, "gs:B");
+            }
+            assert_eq!(
+                provider.scans.lock().unwrap().get("customers").copied().unwrap_or(0),
+                2,
+                "two graph sources ⇒ two parent scans (graph_source_id in the key, no cross-source pollution)"
+            );
+        }
+
+        // PR-5 cache-poison guard: a top-k scan returns a PRUNED file subset, so it
+        // must never populate/replay the per-operator scan_cache — a later full scan
+        // of the same (table, projection) must see FULL results, not the subset.
+        // Proven by scan COUNT across repeated batches: WITHOUT topk the main table
+        // is cached (scanned once); WITH topk it is re-scanned each batch (the
+        // `cacheable = … && self.topk.is_none()` bypass held). This is the test that
+        // keeps the bypass true across future refactors.
+        #[test]
+        fn topk_scan_bypasses_scan_cache() {
+            let orders = TriplesMap::new("#Order", "orders")
+                .with_subject_template("http://ex/order/{ORDER_KEY}")
+                .with_predicate_object(PredicateObjectMap {
+                    predicate_map: PredicateMap::constant("edw:orderTotal"),
+                    object_map: ObjectMap::column("ORDER_TOTAL"),
+                });
+            let mapping = Arc::new(CompiledR2rmlMapping::new(vec![orders]));
+
+            fn orders_scans(topk: bool, mapping: &Arc<CompiledR2rmlMapping>) -> usize {
+                let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+                let vars = VarRegistry::new();
+                let provider = CountingProvider::default();
+                {
+                    let mut ctx = ExecutionContext::new(&snapshot, &vars);
+                    ctx.r2rml_table_provider = Some(&provider);
+                    let mut pattern = R2rmlPattern::new("gs:main", VarId(0), Some(VarId(1)));
+                    pattern.predicate_filter = Some("edw:orderTotal".to_string());
+                    let mut op = R2rmlScanOperator::new(Box::new(EmptyOperator::new()), pattern);
+                    op.mapping = Some(Arc::clone(mapping));
+                    if topk {
+                        op.topk = Some((VarId(1), 10));
+                    }
+                    for _ in 0..3 {
+                        futures::executor::block_on(op.build_progress(&ctx, Batch::single_empty()))
+                            .expect("build_progress");
+                    }
+                }
+                let count = provider
+                    .scans
+                    .lock()
+                    .unwrap()
+                    .get("orders")
+                    .copied()
+                    .unwrap_or(0);
+                count
+            }
+
+            assert_eq!(
+                orders_scans(false, &mapping),
+                1,
+                "no topk: the main scan is cached and replayed across batches"
+            );
+            assert_eq!(
+                orders_scans(true, &mapping),
+                3,
+                "topk: the main scan bypasses the cache each batch — a pruned subset is never cached"
             );
         }
     }

@@ -49,8 +49,23 @@ pub struct SubqueryPattern {
     /// joined). SPARQL 1.1 §18.2 sub-`SELECT`s are always uncorrelated and set
     /// this; the executor then never seeds the inner query per parent row (which
     /// would correlate it / let an inner LIMIT apply per row). JSON-LD subqueries
-    /// default to `false`, preserving their per-row-seeding (LATERAL) behavior.
+    /// default to `false` (per-row seeding). Note this is NOT a pure LATERAL pin:
+    /// per-row mode seeds only the self-produced correlation vars (`join_keys`)
+    /// and RECONCILES the OPTIONAL/UNION-produced ones (`reconcile_vars`) at merge
+    /// (Family B, W3C join-scope-1) instead of pinning them — so an OPTIONAL/UNION
+    /// -bound correlation var of an existing JSON-LD `["query"]` subquery now
+    /// joins per §18.4 rather than being forced to the parent value. See
+    /// `SubqueryOperator::reconcile_vars`.
     pub uncorrelated: bool,
+    /// Correlation variables with EXPLICIT lateral-import semantics — Cypher's
+    /// `CALL (p) { … }` scope clause. A pinned var is always seeded to the
+    /// parent's value in per-row mode (never left to the Family-B reconcile,
+    /// even when the body binds it only via OPTIONAL — openCypher defines the
+    /// import as a per-row binding), and a pinned var the body does not itself
+    /// produce forces per-row evaluation (evaluate-once + hash-join cannot
+    /// retain zero-match parents). Empty for SPARQL/JSON-LD subqueries, whose
+    /// correlation semantics are inferred (§18.2/§18.4).
+    pub pinned_vars: Vec<VarId>,
 }
 
 impl SubqueryPattern {
@@ -66,7 +81,15 @@ impl SubqueryPattern {
             order_binds: Vec::new(),
             grouping: None,
             uncorrelated: false,
+            pinned_vars: Vec::new(),
         }
+    }
+
+    /// Pin explicit lateral-import variables (Cypher `CALL (p)`); see
+    /// [`Self::pinned_vars`].
+    pub fn with_pinned_vars(mut self, pinned: Vec<VarId>) -> Self {
+        self.pinned_vars = pinned;
+        self
     }
 
     /// Mark this subquery as uncorrelated (SPARQL 1.1 §18.2 — evaluated

@@ -15,7 +15,7 @@ use crate::{
     Tracker, TrackingOptions, TransactResultRef,
 };
 use fluree_db_ledger::IndexConfig;
-use fluree_db_transact::{CommitOpts, TxnOpts};
+use fluree_db_transact::{CommitOpts, Txn, TxnOpts};
 
 // ============================================================================
 // GraphTransactBuilder
@@ -100,6 +100,48 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// against an unlocked snapshot would require.
     pub fn sparql_update(mut self, sparql: &'g str) -> Self {
         self.core.set_sparql_update(sparql);
+        self
+    }
+
+    // -- Graph-management operations (non-SPARQL surface for the SPARQL 1.1
+    //    Update graph-management verbs; share the `Txn` IR and staging path) --
+
+    /// Retract every flake in the named graph `iri` — the transact-builder
+    /// analog of `CLEAR GRAPH <iri>`. Indistinguishable from [`Self::drop_graph`]
+    /// in Fluree's model (roadmap D-6).
+    pub fn clear_graph(mut self, iri: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::clear_graph(iri));
+        self
+    }
+
+    /// Drop the named graph `iri` (retract all of its flakes). `DROP ≡ CLEAR`
+    /// in Fluree's additive-only registry model (roadmap D-6).
+    pub fn drop_graph(mut self, iri: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::drop_graph(iri));
+        self
+    }
+
+    /// Copy all flakes from named graph `from` into named graph `to`, replacing
+    /// `to`'s prior contents — the transact-builder analog of `COPY <from> TO
+    /// <to>`. A `from == to` copy is a no-op.
+    pub fn copy_graph(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::copy_graph(from, to));
+        self
+    }
+
+    /// Move all flakes from named graph `from` into named graph `to` (copy +
+    /// retract the source) — the transact-builder analog of `MOVE <from> TO
+    /// <to>`. A `from == to` move is a no-op.
+    pub fn move_graph(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::move_graph(from, to));
+        self
+    }
+
+    /// Merge all flakes from named graph `from` into named graph `to`, keeping
+    /// `to`'s prior contents — the transact-builder analog of `ADD <from> TO
+    /// <to>`. A `from == to` add is a no-op.
+    pub fn add_graph(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.core.set_pre_built_txn(Txn::add_graph(from, to));
         self
     }
 

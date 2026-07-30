@@ -151,6 +151,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(iceberg::iceberg_catalog_preview),
         )
         .route(
+            "/iceberg/catalog/verify",
+            post(iceberg::iceberg_catalog_verify),
+        )
+        .route(
             "/iceberg/r2rml/generate",
             post(iceberg::iceberg_r2rml_generate),
         )

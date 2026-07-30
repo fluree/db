@@ -597,6 +597,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     reasoning: self.reasoning_config()?,
                     post_values,
                     include_system_facts: false,
+                    cypher_vocab: None,
                 })
             }
             QueryBody::Construct(construct_query) => self.lower_construct(construct_query),

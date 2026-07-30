@@ -1,0 +1,8 @@
+# q056 triple_count
+# Intent: The universal second query — "how big is this dataset?".
+# BI lineage (BI-explore-2): total number of triples across everything.
+# Exploration family: predicate-less COUNT(*) = SUM over every TriplesMap of
+# (valid rows x predicate-object-maps per row). NOT a single resolved table, so
+# the COUNT(*) manifest-record-count shortcut cannot apply on the virtual target.
+SELECT (COUNT(*) AS ?n)
+WHERE { ?s ?p ?o }

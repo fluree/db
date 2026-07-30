@@ -206,6 +206,22 @@ pub fn parse_group_graph_pattern(
         .ok_or_else(|| "Failed to parse group graph pattern".to_string())
 }
 
+/// Parse a SPARQL 1.2 triple-term value `<<( s p o )>>` from a token
+/// stream, for the expression parser's `BIND(<<( … )>> AS ?v)` /
+/// `FILTER(… <<( … )>> …)` forms. Expects the stream positioned at the
+/// opening `<<(`. Blank nodes are rejected — a triple term used in an
+/// expression is a value, not a pattern (negative `bindbnode-tripleterm`).
+/// The specific diagnostic is recorded on the shared stream; the returned
+/// error string is only the coarse Result-level fallback.
+pub fn parse_triple_term_value(
+    stream: &mut super::stream::TokenStream,
+) -> Result<crate::ast::annotation::TripleTerm, String> {
+    let mut parser = Parser::new(stream);
+    parser
+        .parse_triple_term_value(false)
+        .ok_or_else(|| "Failed to parse triple term".to_string())
+}
+
 /// The SPARQL parser.
 struct Parser<'a> {
     stream: &'a mut super::stream::TokenStream,
@@ -253,6 +269,30 @@ impl<'a> Parser<'a> {
             pending_bnpl_triples: Vec::new(),
             pending_bnpl_patterns: Vec::new(),
         }
+    }
+
+    /// Run `f` one recursion level deeper, emitting a
+    /// [`DiagCode::NestingTooDeep`] diagnostic and returning `None` past the
+    /// stream's depth ceiling. Owns both sides of the depth bookkeeping for
+    /// the diagnostic-based pattern/term parsers; the `Result`-based
+    /// expression and path parsers use
+    /// [`TokenStream::with_recursion_guard`](super::stream::TokenStream::with_recursion_guard).
+    fn with_recursion_guard<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if !self.stream.try_enter_recursion() {
+            let span = self.stream.current_span();
+            self.stream.add_diagnostic(Diagnostic::error(
+                DiagCode::NestingTooDeep,
+                format!(
+                    "query nesting exceeds the maximum depth of {}",
+                    super::stream::MAX_PARSE_DEPTH
+                ),
+                span,
+            ));
+            return None;
+        }
+        let result = f(self);
+        self.stream.leave_recursion();
+        result
     }
 
     /// Parse a complete SPARQL query or update request.
@@ -311,7 +351,16 @@ impl<'a> Parser<'a> {
                 break;
             }
             match &self.stream.peek().kind {
-                TokenKind::KwInsert | TokenKind::KwDelete | TokenKind::KwWith => {
+                TokenKind::KwInsert
+                | TokenKind::KwDelete
+                | TokenKind::KwWith
+                | TokenKind::KwLoad
+                | TokenKind::KwClear
+                | TokenKind::KwDrop
+                | TokenKind::KwCreate
+                | TokenKind::KwAdd
+                | TokenKind::KwCopy
+                | TokenKind::KwMove => {
                     let operation = self.parse_update_operation()?;
 
                     // Cross-op bnode-label scope validation.

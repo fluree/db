@@ -130,9 +130,17 @@ pub struct DatalogRule {
     pub filters: Vec<RuleFilter>,
     /// Triple patterns in the insert clause (head)
     pub insert_patterns: Vec<RuleTriplePattern>,
-    /// Predicates this rule depends on (from where patterns)
+    /// Constant predicates this rule reads (from where-pattern `Sid`
+    /// predicates only — variable predicates contribute nothing). NOT
+    /// load-bearing despite the name: it only feeds the execution-order sort
+    /// heuristic in `compute_execution_order`, and since the fixpoint re-runs
+    /// every rule to convergence, that ordering affects convergence speed, not
+    /// the result. A rule with only variable predicates therefore sorts as
+    /// zero-dependency (first), which is harmless.
     pub depends_on: Vec<Sid>,
-    /// Predicates this rule generates (from insert patterns)
+    /// Constant predicates this rule writes (from insert patterns). Currently
+    /// has no readers anywhere in the workspace; kept for symmetry with
+    /// `depends_on` and potential future dependency-aware scheduling.
     pub generates: Vec<Sid>,
 }
 

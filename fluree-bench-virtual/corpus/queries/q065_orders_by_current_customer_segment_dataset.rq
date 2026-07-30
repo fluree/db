@@ -1,0 +1,20 @@
+# q065 orders_by_current_customer_segment_dataset
+# Intent: E2 join+flag slice-1.5. Order⋈Customer with a DIM flag `?c edw:isCurrent true`
+#   on the joined DimCustomer, grouped by the customer segment. Before E2 the join
+#   fold declined on ANY star_constraints (the blanket O1 guard) → materialize. E2
+#   APPLIES the dim flag while building the FK→GKey map: a non-current customer's
+#   join key never enters the map, so its orders drop, and the fold keeps ONLY
+#   current-customer orders — the CONSTRAINED count. Mirrors the deployed #1/#2
+#   dim-flag join timeout. The oracle IS the constrained count, so this doubles as
+#   the join-path over-count trap (a silent fuse-without-the-flag would count ALL
+#   orders by segment and fail this member).
+# BI lineage: "How many orders per segment, from current customers only?" (dataset path)
+# Predicates verified against enterprise.ttl — FactOrder: customer(->DimCustomer);
+#   DimCustomer: isCurrent (xsd:boolean), segment.
+# Exec path: query_from() with FROM <enterprise-sf01-v:main> (the deployed solo shape).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?seg (COUNT(?o) AS ?n)
+FROM <enterprise-sf01-v:main>
+WHERE { ?o a edw:Order ; edw:customer ?c .
+        ?c edw:isCurrent true ; edw:segment ?seg . }
+GROUP BY ?seg

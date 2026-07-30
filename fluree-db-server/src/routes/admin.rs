@@ -300,6 +300,7 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     // upload flow for size-capped clients. `direct_max_bytes` only gates the
     // choice when `presigned-put` is also offered.
     let mut import_modes = vec!["direct"];
+    let mut source_upload = false;
     if config.import_presign_enabled {
         // `presigned-put` (single PUT) and `multipart-put` (parts) are minted by
         // the same `/import-upload` endpoint; the server picks per-archive by
@@ -307,13 +308,27 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         // available for archives over the single-PUT 5 GiB ceiling.
         import_modes.push("presigned-put");
         import_modes.push("multipart-put");
+        // `source-upload`: the mint endpoint also accepts raw source data
+        // (`source_kind: "source"` + `filename`) and runs the bulk-import
+        // pipeline server-side — the same formats as `fluree create --from`.
+        // Not offered on Raft-replicated servers (the pipeline publishes
+        // nameservice heads outside the replicated log).
+        source_upload = crate::routes::import::source_import_supported(&state);
+        if source_upload {
+            import_modes.push("source-upload");
+        }
     }
-    doc["import"] = serde_json::json!({
+    let mut import_doc = serde_json::json!({
         "modes": import_modes,
         "direct_max_bytes": config.import_direct_max_bytes,
         "multipart_threshold_bytes": config.import_multipart_threshold_bytes,
         "multipart_part_size_bytes": config.import_multipart_part_size_bytes,
     });
+    if source_upload {
+        import_doc["source_formats"] =
+            serde_json::json!(crate::routes::import::advertised_source_formats());
+    }
+    doc["import"] = import_doc;
 
     // Advertise server-wide serving capabilities so clients can negotiate
     // query-shipping vs peer (block-fetch) mode before authenticating.

@@ -1064,6 +1064,7 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             post_values: None,
             include_system_facts: false,
+            cypher_vocab: None,
         }
     }
 

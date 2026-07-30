@@ -2607,11 +2607,13 @@ fn annotation_on_literal_object_parses_cleanly() {
 }
 
 #[test]
-fn triple_term_outside_rdf_reifies_is_rejected() {
-    assert_parse_error(
-        &format!("{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"),
-        "object of rdf:reifies",
-    );
+fn triple_term_outside_rdf_reifies_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): a bare `<<( s p o )>>` triple-term
+    // value in object position for a non-`rdf:reifies` predicate now parses
+    // (W3C `basic-tripleterm-02`); evaluation is rejected at lower time.
+    assert_parses(&format!(
+        "{EX_PREFIX}SELECT * WHERE {{ ?ann ex:foo <<( ex:a ex:b ex:c )>> . }}"
+    ));
 }
 
 #[test]
@@ -2701,26 +2703,25 @@ fn interleaved_reifiers_and_blocks_follow_attachment_rule() {
 // ----- Existing legacy `<< s p ?o >> f:t ?t` form regression check ---------
 
 #[test]
-fn rdf_reifies_in_insert_data_is_rejected_with_clear_error() {
-    // The rdf:reifies + triple-term form is WHERE-only in v1.
-    // SPARQL UPDATE uses the `~ {| |}` form instead.
-    assert_parse_error(
-        &format!(
-            "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
-        ),
-        "object of rdf:reifies",
-    );
+fn rdf_reifies_triple_term_in_insert_data_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): the ground triple-term value parses;
+    // it is rejected at lower time (transact reports the deferred feature),
+    // not at parse. (Cf. the WHERE-only executable `rdf:reifies` form.)
+    assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}INSERT DATA {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }}"
+    ));
 }
 
 #[test]
-fn rdf_reifies_in_insert_template_is_rejected_with_clear_error() {
-    assert_parse_error(
-        &format!(
-            "{RDF_PREFIX}{EX_PREFIX}\
-             INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
-        ),
-        "object of rdf:reifies",
-    );
+fn rdf_reifies_triple_term_in_insert_template_parses_then_defers() {
+    // Accept-then-defer (D-1, PR-W2BC): a triple-term value is accepted in
+    // an INSERT template regardless of predicate and rejected at lower time,
+    // not at parse. (The executable `rdf:reifies` reifier form is WHERE-only;
+    // here `<<( … )>>` is a plain deferred triple-term value.)
+    assert_parses(&format!(
+        "{RDF_PREFIX}{EX_PREFIX}\
+         INSERT {{ _:ann rdf:reifies <<( ex:a ex:b ex:c )>> }} WHERE {{ ?s ?p ?o }}"
+    ));
 }
 
 #[test]
@@ -2802,8 +2803,13 @@ fn annotation_block_with_path_verb_parses() {
 fn standalone_triple_term_still_rejected() {
     // W3C NEGATIVE tripleterm-separate-01: `<<( ?s ?p ?o )>> .` — a
     // bare triple term is a value, not a statement (contrast the
-    // standalone REIFIED triple, which is valid).
-    assert_parse_error("SELECT * WHERE { <<( ?s ?p ?o )>> . }", "unexpected token");
+    // standalone REIFIED triple, which is valid). Now that triple-term
+    // *values* are accepted (D-1), the subject parses but the missing
+    // predicate-object list is rejected with a targeted message.
+    assert_parse_error(
+        "SELECT * WHERE { <<( ?s ?p ?o )>> . }",
+        "a bare triple term is not a statement",
+    );
 }
 
 #[test]
@@ -3362,20 +3368,25 @@ fn test_single_trailing_semicolon_after_update_is_legal() {
 
 #[test]
 fn test_cross_operation_bnode_label_reuse_rejected() {
-    // W3C syntax-update-54: a blank node label is scoped to one operation;
-    // reusing it in a later operation of the same request is an error.
+    // W3C syntax-update-54: a blank node label in GROUND DATA is scoped to one
+    // operation; reusing it in a later INSERT DATA / DELETE DATA of the same
+    // request is a syntax error.
     assert_parse_error(
         "PREFIX : <http://www.example.org/> \
          INSERT DATA { _:b1 :p :o } ; INSERT DATA { _:b1 :p :o }",
         "blank node label",
     );
-    // Template reuse across Modify operations is the same violation.
-    assert_parse_error(
+    // Template bnode reuse across MODIFY (INSERT/DELETE ... WHERE) operations is
+    // NOT a violation — template blank nodes are per-solution/per-operation
+    // (CONSTRUCT-style), so the two `_:b1` denote DISTINCT nodes. W3C's approved
+    // positive tests `insert-where-same-bnode`/`-2` require this to parse and
+    // execute successfully.
+    let ast = assert_parses(
         "PREFIX : <http://www.example.org/> \
          INSERT { _:b1 :p ?o } WHERE { ?s :q ?o } ; \
          INSERT { _:b1 :p ?o } WHERE { ?s :q ?o }",
-        "blank node label",
     );
+    assert_eq!(update_request(&ast).operations.len(), 2);
     // Reuse *within* one operation stays legal.
     let ast = assert_parses(
         "PREFIX : <http://www.example.org/> \
@@ -3418,4 +3429,126 @@ fn test_cross_operation_delete_side_bnode_labels_are_independent() {
          INSERT DATA { _:b1 :p :o } ; DELETE WHERE { _:b1 :flag \"a\" }",
     );
     assert_eq!(update_request(&ast).operations.len(), 2);
+}
+
+// =============================================================================
+// Recursion depth ceiling
+// =============================================================================
+
+/// Depth used for the adversarial shapes: far past the 128 ceiling and well
+/// past any plausible stack limit (unguarded recursion overflows at a few
+/// thousand frames), so it proves the no-overflow property without the
+/// wasted cost of a 100k-token input.
+const DOS_DEPTH: usize = 10_000;
+
+/// Every recursion lane records a `NestingTooDeep` (S010) diagnostic —
+/// the pattern/term parsers directly, the `Result`-based expression and path
+/// parsers via the guard's source emission — so match on the code.
+fn assert_depth_error(query: &str) {
+    let result = parse(query);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagCode::NestingTooDeep),
+        "expected a NestingTooDeep diagnostic, got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| format!("{}: {}", d.code, d.message))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn nested_groups(depth: usize) -> String {
+    format!("ASK {}{}", "{ ".repeat(depth), "} ".repeat(depth))
+}
+
+/// The ceiling is inclusive: groups nested exactly MAX_PARSE_DEPTH deep
+/// parse, one deeper fails with the NestingTooDeep diagnostic.
+#[test]
+fn group_nesting_at_the_ceiling_parses() {
+    let depth = crate::parse::stream::MAX_PARSE_DEPTH as usize;
+    assert_parses(&nested_groups(depth));
+    assert_depth_error(&nested_groups(depth + 1));
+}
+
+/// Each construct family that recurses through the parser must fail cleanly
+/// at adversarial depth instead of overflowing the stack: nested groups,
+/// parenthesized expressions, stacked unary operators, blank-node property
+/// lists, collections, and grouped property paths.
+#[test]
+fn deeply_nested_constructs_do_not_overflow_the_stack() {
+    assert_depth_error(&nested_groups(DOS_DEPTH));
+    assert_depth_error(&format!(
+        "ASK {{ FILTER{}1{} }}",
+        "(".repeat(DOS_DEPTH),
+        ")".repeat(DOS_DEPTH)
+    ));
+    assert_depth_error(&format!("ASK {{ FILTER({}true) }}", "!".repeat(DOS_DEPTH)));
+    assert_depth_error(&format!(
+        "ASK {{ {}1{} }}",
+        "[ <u:p> ".repeat(DOS_DEPTH),
+        " ]".repeat(DOS_DEPTH)
+    ));
+    assert_depth_error(&format!(
+        "ASK {{ <u:s> <u:p> {}1{} }}",
+        "( ".repeat(DOS_DEPTH),
+        " )".repeat(DOS_DEPTH)
+    ));
+    assert_depth_error(&format!(
+        "ASK {{ ?s {}<u:p>{} ?o }}",
+        "(".repeat(DOS_DEPTH),
+        ")".repeat(DOS_DEPTH)
+    ));
+    // RDF-star quoted triple `<< s p o >>` nested via the subject position.
+    assert_depth_error(&format!(
+        "ASK {{ {}<u:a> <u:b> <u:c>{} <u:p> <u:o> }}",
+        "<< ".repeat(DOS_DEPTH),
+        " >> <u:p> <u:o>".repeat(DOS_DEPTH - 1)
+    ));
+    // RDF 1.2 triple term `<<( s p o )>>` nested via the subject position
+    // (permitted in pattern context, so it recurses at parse time).
+    assert_depth_error(&format!(
+        "ASK {{ ?s ?p {}<u:a> <u:b> <u:c>{} }}",
+        "<<( ".repeat(DOS_DEPTH),
+        " <u:p> <u:o> )>>".repeat(DOS_DEPTH)
+    ));
+}
+
+/// Error recovery on a deeply-nested hostile query must not accumulate one
+/// diagnostic per surplus token: the count is capped, bounding diagnostic
+/// memory to a constant regardless of input size.
+#[test]
+fn deeply_nested_input_diagnostics_are_capped() {
+    let result = parse(&nested_groups(DOS_DEPTH));
+    assert!(
+        result.diagnostics.len() <= crate::parse::stream::MAX_DIAGNOSTICS,
+        "diagnostics ({}) exceeded the cap ({})",
+        result.diagnostics.len(),
+        crate::parse::stream::MAX_DIAGNOSTICS
+    );
+}
+
+/// All constructs share one depth counter, so mixed nesting is bounded even
+/// when no single family exceeds the ceiling on its own.
+#[test]
+fn mixed_construct_nesting_shares_the_ceiling() {
+    let half = (crate::parse::stream::MAX_PARSE_DEPTH / 2 + 1) as usize;
+    assert_depth_error(&format!(
+        "ASK {}FILTER{}1{}{}",
+        "{ ".repeat(half),
+        "(".repeat(half),
+        ")".repeat(half),
+        "} ".repeat(half)
+    ));
+}
+
+/// Realistic wide-but-shallow queries are unaffected: sibling constructs at
+/// the same level do not accumulate depth.
+#[test]
+fn sibling_nesting_does_not_accumulate_depth() {
+    let unions = "UNION { ?s <u:p> [ <u:q> ( 1 2 ) ] } "
+        .repeat(crate::parse::stream::MAX_PARSE_DEPTH as usize * 2);
+    assert_parses(&format!("ASK {{ {{ ?s <u:p> ?o }} {unions} }}"));
 }

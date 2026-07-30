@@ -155,6 +155,18 @@ pub(crate) async fn encode_and_write_root(
     })
 }
 
+/// Load the previous index root and return its sealed annotation arena, if
+/// any. Best-effort: any load/decode failure degrades to `None` (the caller
+/// stays in scan-fallback rather than failing the rebuild).
+async fn load_prev_annotation_index(
+    content_store: &dyn fluree_db_core::storage::ContentStore,
+    prev_root_id: &ContentId,
+) -> Option<fluree_db_core::AnnotationIndexRoot> {
+    let prev_bytes = content_store.get(prev_root_id).await.ok()?;
+    let prev_root = IndexRoot::decode(&prev_bytes).ok()?;
+    prev_root.annotation_index
+}
+
 /// Compute garbage CIDs by diffing the previous root's reachable CAS set
 /// against the new root's reachable CAS set.
 ///
@@ -249,6 +261,11 @@ pub(crate) struct Fir6Inputs {
     ///   from this state because the indexer has no way to
     ///   recover the missing history.
     pub attachment_events: Option<crate::config::AttachmentEventCoverage>,
+    /// The previous index root's CID (`NsRecord.index_head_id`), when one
+    /// exists. Lets the `Augment` arena arm recover the base arena's event
+    /// history from the prior root — without it a full rebuild under
+    /// `Augment` coverage silently drops a previously-sealed arena.
+    pub prev_index_root_id: Option<ContentId>,
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -407,15 +424,87 @@ pub(crate) async fn encode_and_write_root_v6(
             // is empty by construction.
             debug_assert!(result.replaced_leaf_cids.is_empty());
         }
-        Some(AttachmentEventCoverage::Augment(_)) => {
-            tracing::warn!(
-                ledger_id = %inputs.ledger_id,
-                "full-rebuild path received Augment coverage but has no \
-                 base arena to merge with; cannot prove history \
-                 completeness. Leaving annotation_index=None — the next \
-                 incremental pass with running overlay coverage will \
-                 seal an authoritative arena."
-            );
+        Some(AttachmentEventCoverage::Augment(events)) => {
+            // A full rebuild starts from scratch, but the *previous root*
+            // may carry a sealed arena whose event history plus the
+            // Augment delta is complete — the same merge contract the
+            // incremental Phase 3d applies. Without recovering it here, a
+            // full reindex under `Augment` coverage silently drops a
+            // previously-sealed arena (and the sticky bit then blocks the
+            // bootstrap scan from ever resealing).
+            let prev_arena = match inputs.prev_index_root_id.as_ref() {
+                Some(prev_id) => load_prev_annotation_index(content_store, prev_id).await,
+                None => None,
+            };
+            match prev_arena {
+                Some(prev) => {
+                    let reader =
+                        fluree_db_binary_index::annotation_arena::AnnotationArenaReader::new(
+                            &prev,
+                            content_store,
+                        );
+                    match reader.collect_all_forward_events().await {
+                        Ok(mut merged) => {
+                            merged.extend(events);
+                            // Full-tuple sort + dedup: an event indexed by a
+                            // prior pass may also still sit in the running
+                            // overlay's delta.
+                            merged.sort();
+                            merged.dedup();
+                            merged.retain(|(_, _, t, _)| *t <= job_t);
+                            // `previous_index: None`: the prior arena's blobs
+                            // stay reachable from the previous root and follow
+                            // the same old-generation GC lifecycle as every
+                            // other replaced artifact of a full rebuild.
+                            // Identical re-sealed leaves re-derive the same
+                            // CIDs, so nothing is duplicated.
+                            let result =
+                                crate::build::annotation_arena::build_and_persist_annotation_arena(
+                                    content_store,
+                                    None,
+                                    merged,
+                                )
+                                .await?;
+                            if let Some(ref ann) = result.new_index {
+                                debug_assert!(
+                                    ann.max_t <= job_t,
+                                    "AnnotationIndexRoot.max_t ({}) must not exceed \
+                                     IndexRoot.index_t ({})",
+                                    ann.max_t,
+                                    job_t
+                                );
+                            }
+                            if result.new_index.is_some() {
+                                root.had_annotation_arena = true;
+                            }
+                            root.annotation_index = result.new_index;
+                            tracing::debug!(
+                                ledger_id = %inputs.ledger_id,
+                                "full-rebuild resealed annotation arena from previous \
+                                 root's arena + Augment delta"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                ledger_id = %inputs.ledger_id,
+                                error = %e,
+                                "failed to read previous arena events for Augment \
+                                 merge; leaving annotation_index=None (scan-fallback)"
+                            );
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        ledger_id = %inputs.ledger_id,
+                        "full-rebuild path received Augment coverage but has no \
+                         base arena to merge with; cannot prove history \
+                         completeness. Leaving annotation_index=None — the next \
+                         incremental pass with running overlay coverage will \
+                         seal an authoritative arena."
+                    );
+                }
+            }
         }
         Some(AttachmentEventCoverage::Unknown) | None => {
             // Non-annotation ledger fast path or scan-fallback state.

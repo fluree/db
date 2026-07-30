@@ -217,7 +217,7 @@ The `--all` flag sets events, storage, read, and write access for all ledgers.
 
 ## See Also
 
-- [auth](auth.md) - Store/manage tokens on remotes
+- [auth](auth.md) - Store/manage tokens on remotes (`fluree auth token` prints the stored access token for scripting)
 - [remote](remote.md) - Configure remote servers
 - [Authentication](../security/authentication.md) - Auth model, modes, and token claims
 - [fetch](fetch.md) - Fetch from remotes (requires auth token)

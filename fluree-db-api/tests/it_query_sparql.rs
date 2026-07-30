@@ -4729,7 +4729,9 @@ async fn sparql_float_divided_by_integer_promotes() {
         .await
         .expect("float / integer query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
-    assert_eq!(jsonld, json!([[2.5]]));
+    // xsd:float(10) / 4 = 2.5; xsd:float has no bare-number JSON form (unlike
+    // xsd:double), so it round-trips as an explicit typed literal preserving the type.
+    assert_eq!(jsonld, json!([[{"@value": "2.5", "@type": "xsd:float"}]]));
 }
 
 #[tokio::test]
@@ -6532,4 +6534,75 @@ async fn sparql_no_base_keeps_relative_iris_verbatim() {
         normalize_rows(&json!([["Bob"]])),
         "without BASE, relative IRIs match verbatim: {j}"
     );
+}
+
+/// Fixture for WHERE-level early-dedup semantics: a 2-hop chain where the
+/// first hop fans in (two ?a rows reach the same ?b), so the intermediate
+/// relation carries duplicate ?b rows once ?a is projected away.
+///
+///   a1 --p1--> b1 --p2--> {10, 20}
+///   a2 --p1--> b1
+///
+/// Chain rows for `?a :p1 ?b . ?b :p2 ?x`: (a1,b1,10) (a1,b1,20) (a2,b1,10)
+/// (a2,b1,20) — COUNT(?x) = 4, COUNT(DISTINCT ?x) = 2.
+async fn seed_chain_fan_in(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [
+            {"@id": "ex:a1", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:a2", "ex:p1": {"@id": "ex:b1"}},
+            {"@id": "ex:b1", "ex:p2": [10, 20]}
+        ]
+    });
+    fluree
+        .insert(ledger0, &insert)
+        .await
+        .expect("insert chain fixture")
+        .ledger
+}
+
+/// A duplicate-sensitive aggregate (`COUNT` without DISTINCT) must see full
+/// row multiplicity even when the query is `SELECT DISTINCT` and a WHERE var
+/// (?a) dies mid-chain. The WHERE-level early-dedup optimization must NOT
+/// fire here: outer DISTINCT dedups *result* rows after aggregation and says
+/// nothing about pre-aggregation multiplicity.
+#[tokio::test]
+async fn sparql_select_distinct_with_plain_count_keeps_multiplicity() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_chain_fan_in(&fluree, "it/sparql:dedup-count").await;
+
+    let q = r"PREFIX ex: <http://example.org/ns/>
+        SELECT DISTINCT (COUNT(?x) AS ?c)
+        WHERE { ?a ex:p1 ?b . ?b ex:p2 ?x }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("distinct + plain count");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        j,
+        json!([[4]]),
+        "COUNT(?x) must count all 4 chain rows — early dedup of the \
+         intermediate (?b) relation would wrongly halve it: {j}"
+    );
+}
+
+/// COUNT(DISTINCT ?x) over the same fan-in chain: 2 distinct values. This is
+/// the shape where WHERE-level early dedup IS sound (every aggregate is
+/// duplicate-insensitive) and collapses the duplicate ?b intermediate rows.
+#[tokio::test]
+async fn sparql_count_distinct_chain_fan_in() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_chain_fan_in(&fluree, "it/sparql:dedup-count-distinct").await;
+
+    let q = r"PREFIX ex: <http://example.org/ns/>
+        SELECT (COUNT(DISTINCT ?x) AS ?c)
+        WHERE { ?a ex:p1 ?b . ?b ex:p2 ?x }";
+    let r = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("count distinct over chain");
+    let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(j, json!([[2]]), "2 distinct ?x values: {j}");
 }

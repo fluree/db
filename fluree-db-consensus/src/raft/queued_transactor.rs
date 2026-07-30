@@ -489,6 +489,7 @@ impl Committer for QueuedTransactor {
                     flake_count: record.flake_count as usize,
                 },
                 tally: record.tally.map(Into::into),
+                cypher_return: None,
             }),
             SubmissionOutcome::CachedFailure(record) => Err(failure_from_poison(&record)),
         }
@@ -852,6 +853,7 @@ fn transaction_receipt_from(
             flake_count,
         },
         tally,
+        cypher_return: None,
     })
 }
 

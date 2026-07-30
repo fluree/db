@@ -283,6 +283,13 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
 /// - dict-backed strings/IRIs (`LEX_ID`/`IRI_REF`, tag `10`): ids are assigned
 ///   by insertion order, not lexicographic value order;
 /// - lang strings (tag `11`);
+/// - `XSD_DURATION`: although it sits inside the `is_temporal()` range, generic
+///   `xsd:duration` has no total order and is stored as a string-dict id of its
+///   canonical lexical (see `fluree-db-indexer/.../resolver.rs`, "General
+///   xsd:duration has no total order — store as canonical string"), so its
+///   `o_key` is insertion-ordered like any other dict-backed type. The inline
+///   `xsd:yearMonthDuration`/`xsd:dayTimeDuration` subtypes are separate
+///   `o_type`s outside this range and are unaffected;
 /// - `GEO_POINT` (packed lat/long — not a linear value order) and `BLANK_NODE`;
 /// - overflow big numerics / JSON / vector arena handles (equality-only).
 ///
@@ -292,10 +299,13 @@ pub fn cursor_projection_otype_okey() -> ColumnProjection {
 pub const fn is_post_desc_orderable(o_type: u16) -> bool {
     let ot = OType::from_u16(o_type);
     // XSD_BOOLEAN (0x0002), the signed/unsigned/constrained integers and floats
-    // (is_numeric: 0x0003..=0x0012), and the temporal + duration range
-    // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D). Excludes GEO_POINT
-    // (0x001E), BLANK_NODE (0x001F), and every dict-backed/lang/arena type.
-    o_type == OType::XSD_BOOLEAN.as_u16() || ot.is_numeric() || ot.is_temporal()
+    // (is_numeric: 0x0003..=0x0012), and the order-preserving temporal types
+    // (is_temporal: XSD_DATE 0x0013..=XSD_DURATION 0x001D, minus XSD_DURATION
+    // which is dict-backed). Excludes GEO_POINT (0x001E), BLANK_NODE (0x001F),
+    // and every dict-backed/lang/arena type.
+    o_type == OType::XSD_BOOLEAN.as_u16()
+        || ot.is_numeric()
+        || (ot.is_temporal() && o_type != OType::XSD_DURATION.as_u16())
 }
 
 // ---------------------------------------------------------------------------
@@ -3716,12 +3726,27 @@ impl Operator for FastPathOperator {
 
         if let Some(compute) = self.compute.take() {
             if let Some(batch) = compute(ctx)? {
+                // Kept for existing span-capture consumers (it_minmax_fast_path_fired
+                // asserts on this message + `label`).
                 tracing::debug!(label = self.label, "fast path produced result");
+                // EXPLAIN seed (PR-1): structured runtime Proceed on the
+                // fluree::fastpath target.
+                crate::fast_path_outcome::stamp_fast_path(
+                    self.label,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
                 self.state = OperatorState::Open;
                 self.fallback = Some(Box::new(PrecomputedSingleBatchOperator::new(batch)));
                 return Ok(());
             }
             tracing::debug!(label = self.label, "fast path declined; running fallback");
+            // EXPLAIN seed (PR-1): structured runtime Fallback(GateDeclined).
+            crate::fast_path_outcome::stamp_fast_path(
+                self.label,
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                ),
+            );
         }
 
         let Some(fallback) = &mut self.fallback else {

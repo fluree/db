@@ -30,7 +30,7 @@ use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
-use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap};
 use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
@@ -243,11 +243,45 @@ pub fn rewrite_patterns_for_r2rml(
         }
     }
 
+    // PR-F20: RefObjectMap-target resolution prune. Before emitting stars, find
+    // subjects `?o` bound SOLELY as one RefObjectMap object (parent class C) whose
+    // downstream star can be constrained to C-declaring maps — killing the
+    // shared-predicate fan-out (`?p edw:name` resolving to all name-bearing dims).
+    // Computed once over this scope (`class_group_subjects` captured BEFORE the
+    // star loop mutates `class_groups`); consumed in the star loop. Gated by
+    // `FLUREE_R2RML_REF_TARGET_PRUNE`.
+    let ref_prune_targets = if ref_target_prune_enabled() {
+        let class_group_subjects: Vec<VarId> = class_groups.iter().map(|(s, _)| *s).collect();
+        compute_ref_prune_targets(
+            &star_groups,
+            &result_patterns,
+            &class_group_subjects,
+            mapping,
+        )
+    } else {
+        std::collections::HashMap::new()
+    };
+
     // Emit star groups. Single-member groups stay on the normal single-object
     // path; multi-member groups with distinct object vars merge into one scan.
     // A same-subject `rdf:type` is fused into the base by setting its
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
+    //
+    // Fusing is unconditional, which assumes some single TriplesMap covers all
+    // members: required members split across template-sharing maps yield zero
+    // star rows (materialization is per-map — no cross-map member join), where
+    // a per-member plan would subject-join them. Recorded as F10 in
+    // `04-findings-register.md`; the fix is to refuse to fuse when no map
+    // covers every member.
+    // W4-1b: const-object members whose subject has a co-located crawl wildcard are
+    // folded onto that wildcard as star_constraints AFTER the class-fusion loop
+    // below, so W4-1's pushdown prunes the crawl scan instead of reading the whole
+    // fact and inner-joining a standalone key scan. Collected here and applied after
+    // class fusion, because attaching star_constraints now would make
+    // `is_standalone_wildcard` false and SKIP the wildcard class fusion (a full
+    // TriplesMap fan-out — worse than the OOM this fix targets).
+    let mut deferred_wildcard_constraints: Vec<(VarId, Vec<R2rmlPattern>)> = Vec::new();
     for (subject, members) in star_groups {
         // Split into object-var members (produce bindings) and constant-object
         // members (equality existence constraints fused into the same scan).
@@ -255,10 +289,26 @@ pub fn rewrite_patterns_for_r2rml(
             members.into_iter().partition(|m| m.object_var.is_some());
 
         if var_members.is_empty() {
-            // No var-object base to fuse the constraints onto: each constant-object
-            // pattern is already correct as its own standalone scan.
-            for m in const_members {
-                result_patterns.push(Pattern::R2rml(m));
+            // No var-object base to fuse the constraints onto. W4-1b: if this subject
+            // has EXACTLY ONE co-located crawl wildcard (`?s ?p ?o`) and every const
+            // member is a foldable (predicate, object-constant) equality, DEFER them
+            // onto the wildcard (below) so the crawl scan prunes; otherwise each
+            // const-object pattern stays a standalone scan (the pre-W4-1b behavior —
+            // no regression when the shape is ambiguous or has no wildcard).
+            let wildcard_count = result_patterns
+                .iter()
+                .filter(|p| matches!(p, Pattern::R2rml(rp) if is_crawl_wildcard(rp, subject)))
+                .count();
+            let all_foldable = !const_members.is_empty()
+                && const_members
+                    .iter()
+                    .all(|m| m.predicate_filter.is_some() && m.object_constant.is_some());
+            if wildcard_count == 1 && all_foldable {
+                deferred_wildcard_constraints.push((subject, const_members));
+            } else {
+                for m in const_members {
+                    result_patterns.push(Pattern::R2rml(m));
+                }
             }
             continue;
         }
@@ -284,6 +334,28 @@ pub fn rewrite_patterns_for_r2rml(
 
         let mut base = var_members.remove(0);
         fuse_class_if_safe(&mut base, &mut class_groups, subject, mapping);
+        // PR-F20: if no query-declared class fused/pinned this star, but its
+        // subject is a provable RefObjectMap object (invariant A+B, precomputed),
+        // constrain resolution to the FK parent's class via the same
+        // resolution-only `class_prune_hint`. `class_prune_hint` never touches
+        // rdf:type materialization, so no class row is fabricated.
+        //
+        // V1 restriction: SINGLE-predicate star only (`var_members` empty ⇒ the
+        // lone base predicate, and no constant-object constraints) — exactly
+        // q031's `?p edw:name ?pn`. The (A)+(B) argument DOES extend to a
+        // multi-predicate `?p`-star (every map that could supply any of `?p`'s
+        // star rows must share the parent's subject template, and (B) proves only
+        // class-C maps do so safely — so constraining to C drops nothing), but the
+        // widening ships later with that argument written out and its own tests.
+        if var_members.is_empty()
+            && star_constraints.is_empty()
+            && base.class_filter.is_none()
+            && base.class_prune_hint.is_none()
+        {
+            if let Some(class) = ref_prune_targets.get(&subject) {
+                base.class_prune_hint = Some(class.clone());
+            }
+        }
         base.star_bindings = var_members
             .into_iter()
             .map(|m| {
@@ -323,6 +395,38 @@ pub fn rewrite_patterns_for_r2rml(
         if !fused {
             for m in members {
                 result_patterns.push(Pattern::R2rml(m));
+            }
+        }
+    }
+
+    // W4-1b: fold the deferred const-object members onto their crawl wildcard as
+    // star_constraints, now that the class-fusion loop above has run. The finder
+    // TOLERATES the `class_filter`/`type_var` that fusion may have set (unlike
+    // `is_standalone_wildcard`), so both mutations compose on the one wildcard.
+    // W4-1's `build_scan_filters` then pushes each scalar star_constraint as an
+    // Iceberg scan filter, pruning the crawl scan to the matching subject(s)
+    // instead of a full fact read joined to a standalone key scan. Semantically the
+    // star_constraint is the same existence filter the standalone join was (subject
+    // kept iff the constraint column equals the constant). If the wildcard is gone
+    // (defensive — fusion never removes it), re-emit the members standalone.
+    for (subject, const_members) in deferred_wildcard_constraints {
+        match result_patterns
+            .iter()
+            .position(|p| matches!(p, Pattern::R2rml(rp) if is_crawl_wildcard(rp, subject)))
+        {
+            Some(idx) => {
+                if let Pattern::R2rml(rp) = &mut result_patterns[idx] {
+                    for m in const_members {
+                        if let (Some(pred), Some(obj)) = (m.predicate_filter, m.object_constant) {
+                            rp.star_constraints.push((pred, obj));
+                        }
+                    }
+                }
+            }
+            None => {
+                for m in const_members {
+                    result_patterns.push(Pattern::R2rml(m));
+                }
             }
         }
     }
@@ -373,17 +477,12 @@ pub fn rewrite_patterns_for_r2rml(
 }
 
 /// Whether scan-local FILTER consumption is enabled. Read once from
-/// `FLUREE_R2RML_FILTER_CONSUMPTION` (only `0`/`false`/`off` disable it). The
-/// kill switch keeps the FILTER in the plan (no LIMIT flow) for A/B validation.
+/// `FLUREE_R2RML_FILTER_CONSUMPTION` (family falsy spellings,
+/// [`super::env_switch_enabled`]). The kill switch keeps the FILTER in the plan
+/// (no LIMIT flow) for A/B validation.
 fn filter_consumption_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_FILTER_CONSUMPTION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_FILTER_CONSUMPTION"))
 }
 
 /// Move scan-local top-level FILTERs into the single R2RML scan's
@@ -572,14 +671,51 @@ fn const_object(value: &FlakeValue) -> Option<ObjectConstant> {
     }
 }
 
+/// Convert a FILTER comparison's constant literal to a prunable `ScanValue`.
+/// Integer / boolean / date / string always push. Double and decimal push only
+/// when `FLUREE_ICEBERG_NUMERIC_STATS` is on (PR-7) — this is the single gate for
+/// numeric pushdown, so with it off no numeric `LiteralValue` reaches the reader
+/// and the iceberg-side numeric widening stays inert. Anything else (refs,
+/// big-integers beyond i128, temporal beyond date, …) stays with the in-engine
+/// FILTER.
 fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
     match value {
         FlakeValue::Long(n) => Some(ScanValue::Int(*n)),
         FlakeValue::Boolean(b) => Some(ScanValue::Bool(*b)),
         FlakeValue::Date(d) => Some(ScanValue::Date(d.days_since_epoch())),
         FlakeValue::String(s) => Some(ScanValue::Str(s.clone())),
+        FlakeValue::Double(f) if crate::r2rml::iceberg_numeric_stats_enabled() => {
+            Some(ScanValue::Double(*f))
+        }
+        FlakeValue::Decimal(d) if crate::r2rml::iceberg_numeric_stats_enabled() => {
+            scan_value_from_bigdecimal(d)
+        }
         _ => None,
     }
+}
+
+/// Decompose a `BigDecimal` into `ScanValue::Decimal { unscaled, precision, scale }`.
+/// Normalizes first (so `9.99` and `9.990` decompose identically), then reads the
+/// unscaled mantissa and base-10 exponent. Returns `None` if the unscaled value
+/// exceeds i128 or the scale exceeds i8 — those stay with the in-engine FILTER.
+fn scan_value_from_bigdecimal(bd: &bigdecimal::BigDecimal) -> Option<ScanValue> {
+    use num_traits::ToPrimitive;
+    // value = unscaled * 10^-scale. Normalize so scale-equivalent forms (9.99 vs
+    // 9.990) decompose identically.
+    let (unscaled_bi, scale) = bd.normalized().as_bigint_and_exponent();
+    let scale = i8::try_from(scale).ok()?;
+    let unscaled = unscaled_bi.to_i128()?;
+    // precision is cosmetic for pruning (`decimal_cmp` ignores it); derive it from
+    // the unscaled magnitude so it is self-consistent across scale-equivalent
+    // forms, clamped to the decimal128 max.
+    let precision = u8::try_from(unscaled.unsigned_abs().checked_ilog10().unwrap_or(0) + 1)
+        .unwrap_or(38)
+        .clamp(1, 38);
+    Some(ScanValue::Decimal {
+        unscaled,
+        precision,
+        scale,
+    })
 }
 
 /// The subject var of a regular-predicate R2RML pattern that can join a
@@ -653,10 +789,70 @@ fn fuse_class_if_safe(
         return;
     };
     if !mapping.is_some_and(|m| class_fusion_is_safe(m, &class, base_pred)) {
+        // Strong fusion (every base-predicate map declares the class) failed —
+        // some OTHER TriplesMap carries the base predicate without the class.
+        if let Some(m) = mapping {
+            // E1: a SHARED base predicate is still safely fusable to a single scan
+            // when (i) at least one class-declaring map co-locates the base
+            // predicate (so resolution has a (class, predicate) map to scan) AND
+            // (ii) every non-class map is subject-template DISJOINT from the class
+            // maps (`wildcard_class_fusion_is_safe`) — so no dropped predicate map
+            // shares a class-instance subject and no binding is lost. Then a fused
+            // scan equals the pre-fusion class-join, and — unlike the weaker
+            // `class_prune_hint` below — it COLLAPSES the separate class scan back
+            // into the star. This is the round-2 `ex:category` fix: `category` is a
+            // plain column on SupportTicket AND Product (a different class, disjoint
+            // `.../ticket/{k}` vs `.../product/{k}` templates); the old refusal
+            // emitted a 2-pattern shape (star + class scan) that failed the fused
+            // single-pattern gate → decline → materialize the fact. Distinct from
+            // strong fusion, which needs no disjointness because it already proved
+            // every base-predicate map is a class map (nothing to drop).
+            if class_declares_predicate(m, &class, base_pred)
+                && wildcard_class_fusion_is_safe(m, &class)
+            {
+                class_groups.remove(idx);
+                base.class_filter = Some(class);
+                return;
+            }
+            // PR-3 fix (b'): the class lives in a DIFFERENT TriplesMap than the base
+            // predicate (no class map co-locates it — the vertically partitioned
+            // shape). We must NOT fuse (that would resolve zero maps and silently
+            // drop rows). But if the class-declaring maps are subject-template
+            // DISJOINT from every other map, we can still prune the star's
+            // resolution fan-out to class-declaring maps as a RESOLUTION-ONLY hint:
+            // the class stays its own scan joined on the subject, and disjointness
+            // guarantees a pruned map's subjects could never survive that join.
+            // Leaves `class_groups` untouched, so the standalone class scan is still
+            // emitted.
+            if wildcard_class_fusion_is_safe(m, &class) {
+                base.class_prune_hint = Some(class);
+            }
+        }
         return;
     }
     class_groups.remove(idx);
     base.class_filter = Some(class);
+}
+
+/// Whether at least one TriplesMap declares BOTH `class_iri` and `base_predicate`
+/// — i.e. a (class, predicate) map exists for `resolve_triples_map` to select.
+/// Combined with [`wildcard_class_fusion_is_safe`] (subject-template disjointness),
+/// this admits fusing a SHARED base predicate: the class's own map carries it while
+/// another class's disjoint-subject map also declares the predicate (correctly
+/// excluded by the class filter). Distinct from [`class_fusion_is_safe`], which
+/// requires EVERY base-predicate map to declare the class.
+fn class_declares_predicate(
+    mapping: &CompiledR2rmlMapping,
+    class_iri: &str,
+    base_predicate: &str,
+) -> bool {
+    mapping.triples_maps.values().any(|tm| {
+        tm.classes().iter().any(|c| c == class_iri)
+            && tm
+                .predicate_object_maps
+                .iter()
+                .any(|pom| pom.predicate_map.as_constant() == Some(base_predicate))
+    })
 }
 
 /// Whether fusing `class_iri` into the star for `base_predicate` preserves the
@@ -687,21 +883,142 @@ fn class_fusion_is_safe(
     saw_predicate_map
 }
 
+/// PR-F20 kill switch: `FLUREE_R2RML_REF_TARGET_PRUNE` (default ON). When off,
+/// the RefObjectMap-target resolution prune never fires — byte-identical to the
+/// pre-F20 shared-predicate fan-out.
+fn ref_target_prune_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_REF_TARGET_PRUNE"))
+}
+
+/// PR-F20: the single class C a constant predicate `P` references as a
+/// RefObjectMap parent, if unambiguous. Scans the mapping for a RefObjectMap POM
+/// whose predicate is `P`; returns its parent TriplesMap's sole `rr:class`.
+/// Returns `None` if `P` is not a RefObjectMap, the parent is missing, the parent
+/// declares ≠1 class, or two RefObjectMaps for `P` disagree on the parent class
+/// (ambiguous → decline).
+fn ref_target_class(mapping: &CompiledR2rmlMapping, predicate: &str) -> Option<String> {
+    let mut found: Option<String> = None;
+    for tm in mapping.triples_maps.values() {
+        for pom in &tm.predicate_object_maps {
+            if pom.predicate_map.as_constant() != Some(predicate) {
+                continue;
+            }
+            let ObjectMap::RefObjectMap(rom) = &pom.object_map else {
+                // The same predicate also has a non-ref object map → not a clean
+                // FK, decline rather than guess.
+                return None;
+            };
+            let parent = mapping.triples_maps.get(&rom.parent_triples_map)?;
+            let classes = parent.classes();
+            if classes.len() != 1 {
+                return None;
+            }
+            match &found {
+                None => found = Some(classes[0].clone()),
+                Some(prev) if *prev == classes[0] => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
+}
+
+/// PR-F20: compute the RefObjectMap-target resolution prune targets for one BGP
+/// scope. A star subject `?o` qualifies for a `class_prune_hint` derived from its
+/// FK parent's class C iff (invariant A, join-var provenance) `?o`'s ONLY binding
+/// in the scope is exactly ONE RefObjectMap star member (unique parent class C),
+/// and (invariant B, template-disjointness) `wildcard_class_fusion_is_safe(mapping,
+/// C)` holds.
+///
+/// Conservative first cut (single-required-ref): `?o` DECLINES if it is the object
+/// of a second star member, PRODUCED by any other pattern in `other_patterns`, or
+/// carries a standalone class assertion (`class_group_subjects`). "Produced by"
+/// uses [`Pattern::produced_vars`] deliberately (NOT `referenced_vars`): a pattern
+/// that only *constrains* `?o` — `FILTER`, `MINUS`, `(NOT) EXISTS` — never rebinds
+/// it, so it must not decline (filters can't change `?o`'s provenance). `produced_vars`
+/// DOES surface the two binding sources a naive triple-scan misses: a `BIND(expr AS
+/// ?o)` target and a property-path endpoint. A `?o` in predicate position is itself
+/// produced by whatever pattern carries it, so it lands here too. The (B) check is
+/// mandatory — it must not rest on this dataset's templates happening to be disjoint
+/// (the F10 vertical-partition trap).
+///
+/// **Soundness under a CROSS-SCOPE pre-bound `?o`** (invisible to this in-scope
+/// scan — seeded by an outer pattern / cross-graph join / `VALUES` outside the
+/// GRAPH block): the prune stays sound by CONJUNCTION. `?o` still appears as the
+/// required RefObjectMap member in this scope, so the scan of that member restricts
+/// `?o` to actual FK objects of the parent (class C); a pre-bound non-C `?o` yields
+/// no FK row and its whole solution dies — identically whether or not the sibling
+/// `?o <pred>` star is pruned to C. So pruning cannot drop a row the un-pruned plan
+/// would keep. (Tested in-scope by the live q031 ON/OFF parity; the cross-scope
+/// variant is not expressible at this static-analysis layer — see the sketch.)
+fn compute_ref_prune_targets(
+    star_groups: &[(VarId, Vec<R2rmlPattern>)],
+    other_patterns: &[Pattern],
+    class_group_subjects: &[VarId],
+    mapping: Option<&CompiledR2rmlMapping>,
+) -> std::collections::HashMap<VarId, String> {
+    let mut out = std::collections::HashMap::new();
+    let Some(mapping) = mapping else {
+        return out;
+    };
+    // Object-var occurrence count + RefObjectMap parent class, across all star
+    // members. `None` in `ref_target` marks a var seen as an object with a
+    // non-ref/ambiguous binding (declines).
+    let mut obj_count: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    let mut ref_target: std::collections::HashMap<VarId, Option<String>> =
+        std::collections::HashMap::new();
+    for (_subject, members) in star_groups {
+        for m in members {
+            let Some(ov) = m.object_var else { continue };
+            *obj_count.entry(ov).or_insert(0) += 1;
+            let cls = m
+                .predicate_filter
+                .as_deref()
+                .and_then(|p| ref_target_class(mapping, p));
+            match ref_target.get(&ov) {
+                None => {
+                    ref_target.insert(ov, cls);
+                }
+                Some(Some(prev)) if cls.as_ref() == Some(prev) => {}
+                Some(_) => {
+                    ref_target.insert(ov, None);
+                }
+            }
+        }
+    }
+    // Invariant-A pollution: any var a pattern in this scope BINDS (produces)
+    // outside its lone FK member, or a standalone class assertion, declines the
+    // prune. `produced_vars` (not `referenced_vars`) so FILTER/MINUS/EXISTS
+    // constraints on `?o` do NOT decline, while BIND targets and path endpoints do.
+    let mut polluted: std::collections::HashSet<VarId> =
+        class_group_subjects.iter().copied().collect();
+    for p in other_patterns {
+        polluted.extend(p.produced_vars());
+    }
+    for (ov, cls) in &ref_target {
+        let Some(class) = cls else { continue };
+        if obj_count.get(ov) == Some(&1)
+            && !polluted.contains(ov)
+            && wildcard_class_fusion_is_safe(mapping, class)
+        {
+            out.insert(*ov, class.clone());
+        }
+    }
+    out
+}
+
 /// Whether wildcard→class fusion is enabled. Read once from
-/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (only `0`/`false`/`off`/`no` disable it).
+/// `FLUREE_R2RML_CRAWL_CLASS_FUSION` (family falsy spellings,
+/// [`super::env_switch_enabled`]; `fluree-db-api`'s `crawl::env_flag_enabled`
+/// parses this same variable and must keep the same spellings).
 /// The master crawl kill-switch (`crawl::crawl_expand_enabled`) is COUPLED to
 /// this: expand-on + fusion-off would route a browse through the UNFUSED crawl
 /// (a 16-table fan-out + shared-catalog 429 storm — worse than today's fast
 /// empty result), so disabling fusion also disables crawl expansion there.
 fn wildcard_class_fusion_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FLUREE_R2RML_CRAWL_CLASS_FUSION") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    })
+    *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_R2RML_CRAWL_CLASS_FUSION"))
 }
 
 /// A standalone variable-predicate wildcard scan (`?s ?p ?o`) on `subject`:
@@ -716,6 +1033,20 @@ fn is_standalone_wildcard(rp: &R2rmlPattern, subject: VarId) -> bool {
         && rp.class_filter.is_none()
         && rp.star_bindings.is_empty()
         && rp.star_constraints.is_empty()
+}
+
+/// A co-located crawl wildcard (`?s ?p ?o`) for W4-1b constraint folding: like
+/// [`is_standalone_wildcard`] but TOLERATES an already-set `class_filter` (the
+/// wildcard class fusion runs first) and `star_constraints` (an earlier fold), so
+/// the finder still matches the wildcard after class fusion has constrained it. It
+/// still requires a true variable-predicate wildcard with no predicate filter and
+/// no star bindings, so a fixed-predicate star or non-crawl scan never matches.
+fn is_crawl_wildcard(rp: &R2rmlPattern, subject: VarId) -> bool {
+    rp.subject_var == Some(subject)
+        && rp.predicate_var.is_some()
+        && rp.object_var.is_some()
+        && rp.predicate_filter.is_none()
+        && rp.star_bindings.is_empty()
 }
 
 /// A standalone projected-type scan (`?s a ?type`) on `subject` with no class
@@ -1294,7 +1625,9 @@ mod tests {
         assert!(consumed_of(&patterns).is_none());
     }
 
-    use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, TriplesMap};
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, TriplesMap,
+    };
 
     const CLASS: &str = "http://example.org/Person";
     const PRED: &str = "http://example.org/name";
@@ -1316,6 +1649,307 @@ mod tests {
             .with_predicate_object(pom(PRED, "name"));
         let mapping = CompiledR2rmlMapping::new(vec![tm]);
         assert!(class_fusion_is_safe(&mapping, CLASS, PRED));
+    }
+
+    // PR-3 fix (b'): a star base pattern for `subject`, with `pred` as its base.
+    fn star_base(subject: VarId, pred: &str) -> R2rmlPattern {
+        let mut base = R2rmlPattern::new("gs", subject, Some(VarId(99)));
+        base.predicate_filter = Some(pred.to_string());
+        base
+    }
+
+    // E1: a shared base predicate (`name` on the class's map AND another,
+    // disjoint-subject map) now FUSES to a single scan — the class map co-locates
+    // the predicate and the non-class map is subject-template disjoint, so the
+    // class filter drops nothing. (Before E1 this refused strong fusion and set a
+    // weaker `class_prune_hint`, leaving a separate class scan — the round-2
+    // two-scan shape.) This is the q001 shared-member / `ex:category` fix.
+    #[test]
+    fn class_fusion_when_shared_predicate_disjoint_colocated() {
+        let store = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(PRED, "store_name"));
+        let customer = TriplesMap::new("#Customer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom(PRED, "full_name"));
+        let mapping = CompiledR2rmlMapping::new(vec![store, customer]);
+        let subject = VarId(1);
+        let mut base = star_base(subject, PRED);
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
+        )];
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        // Fused to one scan: class filter set, no separate class scan, no hint.
+        assert_eq!(base.class_filter.as_deref(), Some(CLASS));
+        assert_eq!(base.class_prune_hint, None);
+        assert_eq!(class_groups.len(), 0, "class scan collapsed into the star");
+    }
+
+    // E1: the round-2 `ex:category` shape verbatim — a PLAIN shared column on two
+    // classes with disjoint subject templates. Grouping SupportTicket by category
+    // (base predicate = category) must FUSE to a single SupportTicket scan; the
+    // Product map, which also carries category, is excluded by the class filter and
+    // is subject-disjoint so nothing is dropped.
+    #[test]
+    fn class_fusion_shared_category_across_two_classes() {
+        const TICKET_CLASS: &str = "http://ex/SupportTicket";
+        const PRODUCT_CLASS: &str = "http://ex/Product";
+        const CATEGORY: &str = "http://ex/category";
+        let ticket = TriplesMap::new("#Ticket", "fact_support_ticket")
+            .with_subject_template("http://ex/ticket/{k}")
+            .with_class(TICKET_CLASS)
+            .with_predicate_object(pom(CATEGORY, "CATEGORY"))
+            .with_predicate_object(pom("http://ex/csat", "CSAT_SCORE"));
+        let product = TriplesMap::new("#Product", "dim_product")
+            .with_subject_template("http://ex/product/{k}")
+            .with_class(PRODUCT_CLASS)
+            .with_predicate_object(pom(CATEGORY, "CATEGORY"));
+        let mapping = CompiledR2rmlMapping::new(vec![ticket, product]);
+        // Strong fusion refuses (Product has category but not SupportTicket)...
+        assert!(!class_fusion_is_safe(&mapping, TICKET_CLASS, CATEGORY));
+        // ...but the disjoint-colocated path admits the fuse.
+        let subject = VarId(1);
+        let mut base = star_base(subject, CATEGORY);
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(TICKET_CLASS)],
+        )];
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        assert_eq!(base.class_filter.as_deref(), Some(TICKET_CLASS));
+        assert_eq!(base.class_prune_hint, None);
+        assert_eq!(class_groups.len(), 0, "one scan, category group-by fuses");
+    }
+
+    // PR-3 fix (b') soundness — the vertical-partition COUNTEREXAMPLE. Class in one
+    // TM, the star's predicate in another, SAME subject template ⇒ overlapping
+    // prefixes ⇒ pruning would drop rows the class-scan join keeps. `class_prune_hint`
+    // must stay unset so the base map is not pruned.
+    #[test]
+    fn class_prune_hint_refused_under_vertical_partition() {
+        let store_attrs = TriplesMap::new("#StoreAttrs", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_predicate_object(pom(PRED, "store_name"));
+        let store_class = TriplesMap::new("#StoreClass", "dim_store_class")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class(CLASS);
+        let mapping = CompiledR2rmlMapping::new(vec![store_attrs, store_class]);
+        let subject = VarId(1);
+        let mut base = star_base(subject, PRED);
+        let mut class_groups = vec![(
+            subject,
+            vec![R2rmlPattern::new("gs", subject, None).with_class(CLASS)],
+        )];
+        fuse_class_if_safe(&mut base, &mut class_groups, subject, Some(&mapping));
+        assert_eq!(base.class_filter, None, "must not fuse");
+        assert_eq!(
+            base.class_prune_hint, None,
+            "overlapping subject templates ⇒ pruning unsound ⇒ hint refused"
+        );
+    }
+
+    // ---- PR-F20: RefObjectMap-target resolution prune (invariants A + B) ----
+
+    const NAME: &str = "http://ex/name";
+    const PRODUCT_PRED: &str = "http://ex/product";
+    const PRODUCT_CLASS: &str = "http://ex/Product";
+    const INV_CLASS: &str = "http://ex/InventorySnapshot";
+
+    fn ref_pom(pred: &str, parent_tm: &str) -> PredicateObjectMap {
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant(pred),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new(parent_tm, "FK", "PK")),
+        }
+    }
+
+    // A star member (used as `?subj <pred> ?obj`): its `object_var`/`predicate_filter`
+    // are what `compute_ref_prune_targets` reads.
+    fn member(subj: VarId, pred: &str, obj: VarId) -> R2rmlPattern {
+        let mut m = R2rmlPattern::new("gs", subj, Some(obj));
+        m.predicate_filter = Some(pred.to_string());
+        m
+    }
+
+    // The q031 mapping shape: a fact TM with a RefObjectMap `product` → DimProduct,
+    // DimProduct (class Product, maps `name`), and a second `name`-bearing dim with a
+    // DISJOINT subject template (the shared-predicate fan-out target).
+    fn q031_mapping() -> CompiledR2rmlMapping {
+        let product = TriplesMap::new("#DimProduct", "dim_product")
+            .with_subject_template("http://ex/product/{k}")
+            .with_class(PRODUCT_CLASS)
+            .with_predicate_object(pom(NAME, "product_name"));
+        let customer = TriplesMap::new("#DimCustomer", "dim_customer")
+            .with_subject_template("http://ex/customer/{k}")
+            .with_predicate_object(pom(NAME, "full_name"));
+        let fact = TriplesMap::new("#Fact", "fact_inv")
+            .with_subject_template("http://ex/inv/{k}")
+            .with_class(INV_CLASS)
+            .with_predicate_object(ref_pom(PRODUCT_PRED, "#DimProduct"));
+        CompiledR2rmlMapping::new(vec![product, customer, fact])
+    }
+
+    // `?inv product ?p . ?p name ?pn` — ?p is bound SOLELY as the DimProduct FK
+    // object, so its `name` star is prunable to the Product class.
+    fn q031_star_groups() -> Vec<(VarId, Vec<R2rmlPattern>)> {
+        vec![
+            (VarId(0), vec![member(VarId(0), PRODUCT_PRED, VarId(1))]), // ?inv product ?p
+            (VarId(1), vec![member(VarId(1), NAME, VarId(2))]),         // ?p name ?pn
+        ]
+    }
+
+    #[test]
+    fn f20_ref_prune_fires_on_clean_fk_object() {
+        let m = q031_mapping();
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[], &[], Some(&m));
+        assert_eq!(
+            out.get(&VarId(1)).map(String::as_str),
+            Some(PRODUCT_CLASS),
+            "?p's name star is pruned to the FK parent's class"
+        );
+    }
+
+    #[test]
+    fn f20_declines_when_p_referenced_by_values() {
+        // VALUES ?p { … } could bind ?p to a non-Product IRI → decline.
+        let m = q031_mapping();
+        let values = Pattern::Values {
+            vars: vec![VarId(1)],
+            rows: vec![],
+        };
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[values], &[], Some(&m));
+        assert!(out.is_empty(), "VALUES-bound ?p must decline");
+    }
+
+    #[test]
+    fn f20_declines_when_p_referenced_by_union() {
+        // A UNION branch binding ?p → decline (referenced_vars surfaces it).
+        let m = q031_mapping();
+        let union = Pattern::Union(vec![vec![Pattern::Values {
+            vars: vec![VarId(1)],
+            rows: vec![],
+        }]]);
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[union], &[], Some(&m));
+        assert!(out.is_empty(), "UNION-bound ?p must decline");
+    }
+
+    #[test]
+    fn f20_declines_on_second_object_binding() {
+        // ?p is the object of a second (non-ref) star member → not a lone FK → decline.
+        let mut sg = q031_star_groups();
+        sg.push((
+            VarId(3),
+            vec![member(VarId(3), "http://ex/other", VarId(1))],
+        ));
+        let m = q031_mapping();
+        let out = compute_ref_prune_targets(&sg, &[], &[], Some(&m));
+        assert!(out.is_empty(), "a second binding of ?p must decline");
+    }
+
+    #[test]
+    fn f20_declines_on_different_parent_second_ref() {
+        // ?p is the object of two RefObjectMaps with DIFFERENT parents → ambiguous class.
+        let store = TriplesMap::new("#DimStore", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_class("http://ex/Store")
+            .with_predicate_object(pom(NAME, "store_name"));
+        let product = TriplesMap::new("#DimProduct", "dim_product")
+            .with_subject_template("http://ex/product/{k}")
+            .with_class(PRODUCT_CLASS)
+            .with_predicate_object(pom(NAME, "product_name"));
+        let fact = TriplesMap::new("#Fact", "fact_inv")
+            .with_subject_template("http://ex/inv/{k}")
+            .with_class(INV_CLASS)
+            .with_predicate_object(ref_pom(PRODUCT_PRED, "#DimProduct"))
+            .with_predicate_object(ref_pom("http://ex/store", "#DimStore"));
+        let m = CompiledR2rmlMapping::new(vec![store, product, fact]);
+        let sg = vec![
+            (
+                VarId(0),
+                vec![
+                    member(VarId(0), PRODUCT_PRED, VarId(1)),
+                    member(VarId(0), "http://ex/store", VarId(1)),
+                ],
+            ),
+            (VarId(1), vec![member(VarId(1), NAME, VarId(2))]),
+        ];
+        let out = compute_ref_prune_targets(&sg, &[], &[], Some(&m));
+        assert!(out.is_empty(), "different-parent second ref must decline");
+    }
+
+    #[test]
+    fn f20_declines_under_template_sharing_invariant_b() {
+        // A second map SHARES DimProduct's subject template AND maps `name` — the
+        // F10 vertical-partition trap. `wildcard_class_fusion_is_safe(Product)` is
+        // false → decline (condition B, mandatory).
+        let product = TriplesMap::new("#DimProduct", "dim_product")
+            .with_subject_template("http://ex/product/{k}")
+            .with_class(PRODUCT_CLASS)
+            .with_predicate_object(pom(NAME, "product_name"));
+        let product_extra = TriplesMap::new("#DimProductExtra", "dim_product_extra")
+            .with_subject_template("http://ex/product/{k}") // SAME template, no class
+            .with_predicate_object(pom(NAME, "alt_name"));
+        let fact = TriplesMap::new("#Fact", "fact_inv")
+            .with_subject_template("http://ex/inv/{k}")
+            .with_class(INV_CLASS)
+            .with_predicate_object(ref_pom(PRODUCT_PRED, "#DimProduct"));
+        let m = CompiledR2rmlMapping::new(vec![product, product_extra, fact]);
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[], &[], Some(&m));
+        assert!(
+            out.is_empty(),
+            "template-sharing map ⇒ condition B fails ⇒ decline (would drop split rows)"
+        );
+    }
+
+    #[test]
+    fn f20_declines_when_p_carries_a_class_assertion() {
+        // ?p a SomeClass in the query (a class_groups subject) → the class path owns
+        // it; the ref-prune must not also fire. Decline.
+        let m = q031_mapping();
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[], &[VarId(1)], Some(&m));
+        assert!(
+            out.is_empty(),
+            "a class assertion on ?p must decline the ref-prune"
+        );
+    }
+
+    #[test]
+    fn f20_declines_on_bind_target() {
+        // BIND(expr AS ?p) produces ?p (arbitrary IRI) → decline. `produced_vars`
+        // surfaces the Bind TARGET, which a naive triple-object scan would miss.
+        let m = q031_mapping();
+        let bind = Pattern::Bind {
+            var: VarId(1),
+            expr: Expression::Var(VarId(5)),
+        };
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[bind], &[], Some(&m));
+        assert!(out.is_empty(), "a BIND target ?p must decline");
+    }
+
+    #[test]
+    fn f20_filter_on_p_does_not_decline() {
+        // A FILTER referencing ?p CONSTRAINS but never binds it — provenance is
+        // unchanged, so the prune must STILL fire (produced_vars(Filter) is empty).
+        use crate::ir::expression::Function;
+        let m = q031_mapping();
+        let filter = Pattern::Filter(Expression::Call {
+            func: Function::IsIri,
+            args: vec![Expression::Var(VarId(1))],
+        });
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[filter], &[], Some(&m));
+        assert_eq!(
+            out.get(&VarId(1)).map(String::as_str),
+            Some(PRODUCT_CLASS),
+            "a FILTER on ?p must not decline the prune"
+        );
+    }
+
+    #[test]
+    fn f20_declines_when_switch_off_is_handled_by_caller() {
+        // Sanity: with the mapping absent, compute is a no-op (the caller also gates
+        // on `ref_target_prune_enabled`). Documents the two off-ramps.
+        let out = compute_ref_prune_targets(&q031_star_groups(), &[], &[], None);
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -1510,6 +2144,111 @@ mod tests {
         assert_eq!(type_var.class_filter.as_deref(), Some(CLASS));
     }
 
+    // W4-1b: a same-subject const-object member (`?ol orderLineKey "1"`) FOLDS onto
+    // the co-located crawl wildcard as a star_constraint instead of a separate joined
+    // key scan — so W4-1's build_scan_filters push prunes the crawl scan. It must
+    // COMPOSE with the wildcard class fusion (the gate's ordering catch): the wildcard
+    // carries BOTH class_filter AND the star_constraint, and no standalone key scan
+    // remains. The round-3b 071cd59f point-lookup detail-crawl shape.
+    #[test]
+    fn w4_1b_const_object_folds_onto_crawl_wildcard_composing_with_class() {
+        use fluree_db_core::{FlakeValue, LedgerSnapshot};
+        const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+        const KEY_PRED: &str = "http://example.org/orderLineKey";
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let tm = TriplesMap::new("#OL", "fact_order_line")
+            .with_subject_template("http://example.org/ol/{k}")
+            .with_class(CLASS)
+            .with_predicate_object(pom(KEY_PRED, "ORDER_LINE_KEY"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        // `?ol ?p ?o` (wildcard) + `?ol a CLASS` + `?ol orderLineKey "1"` (crawl).
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Var(VarId(1)),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(RDF_TYPE.into()),
+                Term::Iri(CLASS.into()),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(KEY_PRED.into()),
+                Term::Value(FlakeValue::String("1".into())),
+            )),
+        ];
+        let pats: Vec<R2rmlPattern> = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            true,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect();
+        let wildcard = pats
+            .iter()
+            .find(|p| p.predicate_var.is_some())
+            .expect("wildcard present");
+        assert_eq!(
+            wildcard.class_filter.as_deref(),
+            Some(CLASS),
+            "class fused onto the wildcard: {pats:?}"
+        );
+        assert_eq!(wildcard.star_constraints.len(), 1, "one folded constraint");
+        assert_eq!(wildcard.star_constraints[0].0, KEY_PRED);
+        assert!(
+            matches!(
+                &wildcard.star_constraints[0].1,
+                ObjectConstant::Scalar(ScanValue::Str(s)) if s == "1"
+            ),
+            "const-object folded as a scalar star_constraint: {:?}",
+            wildcard.star_constraints[0].1
+        );
+        assert!(
+            !pats
+                .iter()
+                .any(|p| p.predicate_filter.as_deref() == Some(KEY_PRED)),
+            "the standalone orderLineKey scan must be folded away, not joined: {pats:?}"
+        );
+    }
+
+    // W4-1b: the crawl-wildcard finder tolerates an already-set class_filter /
+    // star_constraints (unlike is_standalone_wildcard) but still requires a true
+    // variable-predicate wildcard with no predicate filter and no star bindings.
+    #[test]
+    fn is_crawl_wildcard_tolerates_class_and_constraints() {
+        let subject = VarId(0);
+        let mut w = R2rmlPattern::new("gs", subject, Some(VarId(2))).with_predicate_var(VarId(1));
+        assert!(is_crawl_wildcard(&w, subject));
+        w.class_filter = Some(CLASS.to_string());
+        w.star_constraints = vec![(
+            "p".to_string(),
+            ObjectConstant::Scalar(ScanValue::Str("1".into())),
+        )];
+        assert!(
+            is_crawl_wildcard(&w, subject),
+            "tolerates class_filter + star_constraints"
+        );
+        assert!(
+            !is_standalone_wildcard(&w, subject),
+            "is_standalone_wildcard does NOT (its emptiness checks)"
+        );
+        // A fixed-predicate star is not a crawl wildcard.
+        let fixed = R2rmlPattern::new("gs", subject, Some(VarId(2))).with_predicate("p");
+        assert!(!is_crawl_wildcard(&fixed, subject));
+        // Wrong subject.
+        assert!(!is_crawl_wildcard(&w, VarId(9)));
+    }
+
     #[test]
     fn wildcard_fusion_refused_when_reasoning_active() {
         let pats = rewrite_crawl(&single_class_mapping(), true, false);
@@ -1638,6 +2377,79 @@ mod tests {
         );
     }
 
+    /// PR-3 fix (a) LOAD-BEARING INVARIANT: a same-subject star fuses only
+    /// REQUIRED BGP members. An OPTIONAL member recurses to its own scope
+    /// (`Pattern::Optional`, rewrite.rs:150) and must NEVER enter `star_bindings`,
+    /// because fix (a) prunes any TriplesMap lacking a star predicate — if an
+    /// OPTIONAL predicate were fused in, maps that legitimately lack it would be
+    /// dropped, silently losing rows. This test trips loudly if a future
+    /// optional-star-member feature ever violates that assumption.
+    #[test]
+    fn optional_star_member_is_not_fused_into_star() {
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let tm = TriplesMap::new("#Store", "dim_store")
+            .with_subject_template("http://ex/store/{k}")
+            .with_predicate_object(pom("http://ex/name", "store_name"))
+            .with_predicate_object(pom("http://ex/storeType", "store_type"))
+            .with_predicate_object(pom("http://ex/channel", "channel"));
+        let mapping = CompiledR2rmlMapping::new(vec![tm]);
+        // Required star: name + storeType. OPTIONAL: channel.
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri("http://ex/name".into()),
+                Term::Var(VarId(1)),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri("http://ex/storeType".into()),
+                Term::Var(VarId(2)),
+            )),
+            Pattern::Optional(vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri("http://ex/channel".into()),
+                Term::Var(VarId(3)),
+            ))]),
+        ];
+        let result = rewrite_patterns_for_r2rml(
+            &patterns,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            false,
+        );
+        // The OPTIONAL stays a separate scope.
+        assert!(
+            result
+                .patterns
+                .iter()
+                .any(|p| matches!(p, Pattern::Optional(_))),
+            "OPTIONAL must remain a separate scope: {:?}",
+            result.patterns
+        );
+        // A required star formed (name+storeType) but the OPTIONAL channel is NOT
+        // in any star's bindings/constraints/base.
+        for p in &result.patterns {
+            if let Pattern::R2rml(rp) = p {
+                let touches_channel = rp.predicate_filter.as_deref() == Some("http://ex/channel")
+                    || rp
+                        .star_bindings
+                        .iter()
+                        .any(|(pred, _)| pred == "http://ex/channel")
+                    || rp
+                        .star_constraints
+                        .iter()
+                        .any(|(pred, _)| pred == "http://ex/channel");
+                assert!(
+                    !touches_channel,
+                    "OPTIONAL member must not be fused into a star: {rp:?}"
+                );
+            }
+        }
+    }
+
     /// PR-0/0a: a non-lowered sub-scope that would evaluate against the R2RML
     /// source's empty native index (property/shortest path, subquery) is
     /// recorded in `unsupported` so the caller errors loudly instead of
@@ -1722,5 +2534,34 @@ mod tests {
             "first-seen order must be preserved: {msg}"
         );
         assert!(msg.contains("gs:main"), "names the graph source: {msg}");
+    }
+
+    #[test]
+    fn bigdecimal_decomposes_scale_insensitively() {
+        use std::str::FromStr;
+        let bd = |s: &str| bigdecimal::BigDecimal::from_str(s).unwrap();
+        // 9.99 and 9.990 are the SAME value → identical decomposition (the exact
+        // cross-scale shape the pruning layer must then compare correctly).
+        let want = Some(ScanValue::Decimal {
+            unscaled: 999,
+            precision: 3,
+            scale: 2,
+        });
+        assert_eq!(scan_value_from_bigdecimal(&bd("9.99")), want);
+        assert_eq!(scan_value_from_bigdecimal(&bd("9.990")), want);
+        // Trailing-zero integer forms also normalize to one representation.
+        assert_eq!(
+            scan_value_from_bigdecimal(&bd("100")),
+            scan_value_from_bigdecimal(&bd("100.00"))
+        );
+        // Negative value.
+        assert_eq!(
+            scan_value_from_bigdecimal(&bd("-0.05")),
+            Some(ScanValue::Decimal {
+                unscaled: -5,
+                precision: 1,
+                scale: 2,
+            })
+        );
     }
 }

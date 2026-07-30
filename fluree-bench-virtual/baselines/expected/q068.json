@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "query_id": "q068",
+  "result_hash": "e17f734937ad9e6434d8df7b2d569647d266506d3b8355b8a2b6b9687495302f",
+  "rows": 200,
+  "head_rows": [
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>",
+    "1\u001f<http://ns.fluree.dev/edw#lineNumber>"
+  ],
+  "blessed_from": {
+    "target": "native-sf01",
+    "run_id": "01KXSDYKA901PGKPSVV3T42Z0H",
+    "commit": "ece51d618"
+  }
+}

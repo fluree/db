@@ -12,6 +12,16 @@ on:
   schedule:
     - cron: "0 7 * * *" # 07:00 UTC daily
   workflow_dispatch:
+    inputs:
+      capture_samples:
+        description: >-
+          Repeat runs to fold into the captured baseline. 1 is a single
+          measurement with no noise estimate; >= 5 records a median + MAD, which
+          is what a baseline intended to GATE on shared runners needs — the
+          compare gate widens each budget to 3*MAD/median, and ubuntu-latest
+          flap is the whole reason the per-PR compare is advisory today.
+        required: false
+        default: "1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,6 +49,10 @@ jobs:
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
+      # Baseline is host_class=local, so the nightly compare treats time and
+      # memory as advisory until a ci-* baseline is committed (bench-capture).
+      # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
+      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
     steps:
       - name: Free disk space
         run: |
@@ -72,3 +86,90 @@ jobs:
       # broken setup, missing API surface).
       - name: Smoke-run benches at tiny scale
         run: cargo bench --workspace -- --test
+
+      # Real per-bench compare of the captured subset against the committed
+      # baseline (the nightly perf-regression gate). `if: always()` so it runs
+      # even when an unrelated workspace bench trips the smoke step above.
+      # Follow-up (ROADMAP.md §7 cost caveat): the full workspace compare at
+      # +medium against a phase post-baseline needs the 45-min cap raised or the
+      # workflow split, so it is deliberately NOT wired here yet.
+      - name: Compare captured subset against committed baseline
+        if: always()
+        run: |
+          rm -rf target/fluree-bench-mem target/fluree-bench-meta
+          cargo bench -p fluree-db-api --bench query_overlay_matrix
+          cargo bench -p fluree-db-api --bench query_hot_bsbm
+          cargo run -p fluree-bench-support --bin bench-baseline -- \
+            compare --baseline bench-baselines/guardrails-pre.json \
+            --allow-host-mismatch
+
+  bench-capture:
+    # On-demand CI-class baseline capture (review item 1c). Captures the cheap
+    # subset on ubuntu-latest with runner_class=ci-ubuntu-latest and uploads the
+    # JSON as an artifact. Committing it to bench-baselines/ is a human follow-up
+    # — once a ci-* baseline lands, the per-PR compare's TIME half enforces
+    # automatically (runner classes match). workflow_dispatch only (not on the
+    # nightly schedule) to avoid the extra cost every night.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FLUREE_BENCH_PROFILE: quick
+      FLUREE_BENCH_SCALE: tiny
+      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      # Same cheap subset and scales (tiny+small) as the committed baseline, so
+      # the artifact is a drop-in ci-* replacement once a human commits it.
+      #
+      # Each pass reruns the benches and folds the fresh criterion means into the
+      # same file with --accumulate, which is what turns N runs into one median +
+      # MAD. Passes must NOT be parallelised and the sidecars are cleared each
+      # time: a sample has to be an independent measurement of the same thing.
+      - name: Capture cheap subset (CI-class)
+        run: |
+          samples="${{ github.event.inputs.capture_samples || '1' }}"
+          # `seq 1 0` runs zero passes, so a 0 (or any non-number) would produce
+          # no baseline at all while the job still reported success. Fail loudly
+          # instead — a capture job that captures nothing is worse than one that
+          # errors, because the artifact step would then upload nothing quietly.
+          if ! [[ "$samples" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::capture_samples must be a positive integer, got '$samples'"
+            exit 1
+          fi
+          rm -f bench-baselines/guardrails-pre-ci.json
+          for pass in $(seq 1 "$samples"); do
+            echo "::group::capture pass $pass/$samples"
+            rm -rf target/fluree-bench-mem target/fluree-bench-meta
+            for scale in tiny small; do
+              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_overlay_matrix
+              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_hot_bsbm
+            done
+            cargo run -p fluree-bench-support --bin bench-baseline -- \
+              capture --label guardrails-pre-ci --out bench-baselines/guardrails-pre-ci.json \
+              --accumulate
+            echo "::endgroup::"
+          done
+
+      - name: Upload CI-class baseline artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardrails-pre-ci-baseline
+          path: bench-baselines/guardrails-pre-ci.json
+          # Default is `warn`, which lets the job go green having produced no
+          # artifact — the exact silent success this job exists to avoid.
+          if-no-files-found: error

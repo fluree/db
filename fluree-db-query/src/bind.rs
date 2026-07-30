@@ -150,6 +150,16 @@ impl Operator for BindOperator {
         effective_schema(&self.out_schema, &self.in_schema)
     }
 
+    fn set_row_budget(&mut self, budget: usize) {
+        // Categorically sound (BIND is 1:1 row-preserving and order-preserving);
+        // switch-gated for differential hygiene, not soundness. Forwarding lets a
+        // top-of-tree LIMIT budget reach a scan sitting under a BIND (e.g. a
+        // `?s ?p ?o . BIND(... AS ?v)` UNION branch — F17/q029).
+        if crate::r2rml::union_budget_enabled() {
+            self.child.set_row_budget(budget);
+        }
+    }
+
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;

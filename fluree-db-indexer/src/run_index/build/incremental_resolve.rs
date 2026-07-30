@@ -139,6 +139,14 @@ pub struct IncrementalNovelty {
     pub records: Vec<RunRecordV2>,
     /// Parallel ops array: 1=assert, 0=retract. Same length as `records`.
     pub ops: Vec<u8>,
+    /// Events superseded by lifecycle dedup: an identity's intermediate
+    /// steps, dropped from `records`. Routed to the leaf merges, which
+    /// record the ones that were real state transitions as history-sidecar
+    /// entries. Every superseded event's identity has a winner in
+    /// `records`.
+    pub superseded: Vec<RunRecordV2>,
+    /// Parallel ops array for `superseded`: 1=assert, 0=retract.
+    pub superseded_ops: Vec<u8>,
     /// The decoded base root (needed by downstream phases).
     pub base_root: IndexRoot,
     /// Updated resolver state.
@@ -547,6 +555,8 @@ pub async fn resolve_incremental_commits_v6(
         return Ok(IncrementalNovelty {
             records: Vec::new(),
             ops: Vec::new(),
+            superseded: Vec::new(),
+            superseded_ops: Vec::new(),
             base_root: root,
             shared,
             updated_watermarks: base_subject_watermarks,
@@ -664,6 +674,26 @@ pub async fn resolve_incremental_commits_v6(
     v1_records.sort_unstable_by(|a, b| a.g_id.cmp(&b.g_id).then_with(|| spot_cmp(a, b)));
     let t_sort_ms = t0.elapsed().as_millis() as u64;
 
+    // 10a. Dedup fact lifecycles (RDF set semantics). Commit files are
+    //      event logs of user assertions, not state deltas: the same fact may
+    //      be asserted by several commits in this window, or asserted and
+    //      retracted within it. The leaf merge (`merge_novelty`) consumes at
+    //      most one op per fact identity, so each identity's event sequence
+    //      is resolved to its final state here.
+    let t0 = Instant::now();
+    let event_count = v1_records.len();
+    let (v1_records, v1_superseded) = dedup_fact_lifecycles(v1_records, &o_type_registry);
+    let t_dedup_ms = t0.elapsed().as_millis() as u64;
+    let deduped_count = event_count - v1_records.len();
+    if deduped_count > 0 {
+        tracing::debug!(
+            event_count,
+            deduped_count,
+            superseded_count = v1_superseded.len(),
+            "V6 incremental resolve: deduped fact lifecycles (set semantics)"
+        );
+    }
+
     // 11. Convert V1 → V2 + extract ops.
     let t0 = Instant::now();
     let mut records = Vec::with_capacity(v1_records.len());
@@ -671,6 +701,12 @@ pub async fn resolve_incremental_commits_v6(
     for v1 in &v1_records {
         records.push(RunRecordV2::from_v1(v1, &o_type_registry));
         ops.push(v1.op);
+    }
+    let mut superseded = Vec::with_capacity(v1_superseded.len());
+    let mut superseded_ops = Vec::with_capacity(v1_superseded.len());
+    for v1 in &v1_superseded {
+        superseded.push(RunRecordV2::from_v1(v1, &o_type_registry));
+        superseded_ops.push(v1.op);
     }
     let t_convert_ms = t0.elapsed().as_millis() as u64;
 
@@ -686,6 +722,7 @@ pub async fn resolve_incremental_commits_v6(
         remap_fulltext_ms = t_remap_fulltext_ms,
         remap_records_ms = t_remap_records_ms,
         sort_ms = t_sort_ms,
+        dedup_ms = t_dedup_ms,
         convert_ms = t_convert_ms,
         total_ms = t_start.elapsed().as_millis() as u64,
         commit_count,
@@ -698,6 +735,8 @@ pub async fn resolve_incremental_commits_v6(
     Ok(IncrementalNovelty {
         records,
         ops,
+        superseded,
+        superseded_ops,
         base_root: root,
         shared,
         new_subjects: reconcile.new_subjects,
@@ -712,6 +751,157 @@ pub async fn resolve_incremental_commits_v6(
         base_numbig_counts,
         fulltext_string_bytes,
     })
+}
+
+// ============================================================================
+// Internal: Fact lifecycle dedup
+// ============================================================================
+
+/// True when two records agree on every field the `(g_id, SPOT)` comparator
+/// orders by, other than `dt`, `t`, and `op`. Records with the same prefix
+/// are adjacent in a sorted stream (`dt` sorts immediately after the prefix,
+/// so all `dt` variants of one value are contiguous). Fact identity is
+/// resolved within the group; see [`dedup_fact_lifecycles`].
+fn same_sort_prefix(a: &RunRecord, b: &RunRecord) -> bool {
+    a.g_id == b.g_id
+        && a.s_id == b.s_id
+        && a.p_id == b.p_id
+        && a.o_kind == b.o_kind
+        && a.o_key == b.o_key
+}
+
+/// Resolved V2 fact identity within a sort-prefix group: `(o_type, o_i)` —
+/// the identity `merge_novelty`, replay, and the query overlay compare by.
+type ResolvedIdentity = (u16, u32);
+
+/// Resolve each fact's event sequence within the commit window to a single
+/// final op, so the updated index materializes the same state the in-memory
+/// novelty view resolves:
+///
+/// - A re-assert of a currently-asserted fact is a no-op: the earlier assert
+///   (and its `t`) survives, matching `NoveltyFactState`'s skip rule.
+/// - Every other op becomes the identity's winner: a retract after an assert,
+///   an assert after a retract, and a repeat retract at higher `t`.
+/// - An assert at the same `t` as a winning retract loses (same-`t` ties
+///   resolve retract-wins), matching `resolve_overlay_ops`.
+///
+/// Fact identity is the resolved V2 identity `(o_type, o_i)` within the
+/// sort-prefix group — the identity `merge_novelty`, replay, and the query
+/// overlay all compare by. `OTypeRegistry::resolve` collapses `dt` for 1:1
+/// object kinds (a boolean is `xsd:boolean` whatever datatype IRI the commit
+/// carried) and consults `lang_id` only for `rdf:langString` (folded into
+/// `o_type`), so `dt`/`lang` variants of one fact dedup together while
+/// distinct language tags and list positions stay distinct.
+///
+/// Input must be sorted by `(g_id, SPOT)`; winner output preserves that
+/// order. Compacts in place behind a write cursor — winners are always a
+/// subset of already-read input, so the stream-dominant case (every group a
+/// single event) copies nothing and allocates nothing.
+///
+/// Superseded events — a winner replaced by a later op of the same identity —
+/// are returned as **transition superseded** (`op` embedded in each record,
+/// per identity in chronological order). They carry the intermediate
+/// lifecycle steps the winner stream collapses away; `merge_novelty` turns
+/// the ones that were real state transitions into history-sidecar entries so
+/// index-served time travel can see states a fact held only within this
+/// window. No-op re-asserts and same-`t` losers are discarded outright: they
+/// transition nothing anywhere.
+pub(crate) fn dedup_fact_lifecycles(
+    mut records: Vec<RunRecord>,
+    o_types: &OTypeRegistry,
+) -> (Vec<RunRecord>, Vec<RunRecord>) {
+    let len = records.len();
+    let mut write = 0;
+    let mut start = 0;
+    let mut superseded: Vec<RunRecord> = Vec::new();
+    // Scratch for multi-record groups, reused across groups.
+    let mut keyed: Vec<(ResolvedIdentity, RunRecord)> = Vec::new();
+
+    while start < len {
+        let mut end = start + 1;
+        while end < len && same_sort_prefix(&records[start], &records[end]) {
+            end += 1;
+        }
+
+        if end - start == 1 {
+            // Overwhelmingly common: a single event needs no identity
+            // resolution and, absent earlier compaction, no copy.
+            if write != start {
+                records[write] = records[start];
+            }
+            write += 1;
+        } else {
+            dedup_group(&records[start..end], o_types, &mut keyed, &mut superseded);
+            for &(_, winner) in &keyed {
+                records[write] = winner;
+                write += 1;
+            }
+        }
+        start = end;
+    }
+
+    records.truncate(write);
+    (records, superseded)
+}
+
+/// Dedup one multi-record sort-prefix group, leaving the per-identity winners
+/// in `keyed` in comparator order (`dt`, `t`, `op`) and appending superseded
+/// events to `superseded`.
+///
+/// The group is keyed by resolved V2 identity and sorted by
+/// `(identity, t, op)` first: the incoming `(g_id, SPOT)` order interleaves
+/// `dt` before `t`, so events of one identity spread across `dt` variants
+/// would otherwise arrive out of chronological order.
+fn dedup_group(
+    group: &[RunRecord],
+    o_types: &OTypeRegistry,
+    keyed: &mut Vec<(ResolvedIdentity, RunRecord)>,
+    superseded: &mut Vec<RunRecord>,
+) {
+    keyed.clear();
+    keyed.extend(group.iter().map(|&rec| {
+        let o_type = o_types
+            .resolve(
+                rec.obj_kind(),
+                DatatypeDictId::from_u16(rec.dt),
+                rec.lang_id,
+            )
+            .as_u16();
+        ((o_type, rec.i), rec)
+    }));
+    keyed.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.t.cmp(&b.1.t))
+            .then(a.1.op.cmp(&b.1.op))
+    });
+
+    // Compact each identity run to its winner, in place. Replaced winners
+    // are the identity's intermediate lifecycle steps → superseded.
+    let mut w = 0;
+    for r in 1..keyed.len() {
+        if keyed[r].0 != keyed[w].0 {
+            // First event of a new identity always counts.
+            w += 1;
+            keyed[w] = keyed[r];
+            continue;
+        }
+        let rec = keyed[r].1;
+        let winner = &mut keyed[w].1;
+        let noop_reassert = rec.op == 1 && winner.op == 1;
+        let same_t_retract_wins = rec.op == 1 && winner.op == 0 && rec.t == winner.t;
+        if !noop_reassert && !same_t_retract_wins {
+            superseded.push(*winner);
+            *winner = rec;
+        }
+    }
+    keyed.truncate(w + 1);
+
+    keyed.sort_unstable_by(|a, b| {
+        a.1.dt
+            .cmp(&b.1.dt)
+            .then(a.1.t.cmp(&b.1.t))
+            .then(a.1.op.cmp(&b.1.op))
+    });
 }
 
 // ============================================================================
@@ -1404,4 +1594,313 @@ fn remap_record(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::subject_id::SubjectId;
+
+    const OP_RETRACT: u8 = 0;
+    const OP_ASSERT: u8 = 1;
+
+    /// Integer-valued record in the default graph, no list index, no language.
+    fn rec(s_id: u64, p_id: u32, o_key: u64, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            s_id: SubjectId::from_u64(s_id),
+            o_key,
+            p_id,
+            t,
+            i: u32::MAX,
+            g_id: 0,
+            dt: 0,
+            lang_id: 0,
+            o_kind: 1,
+            op,
+        }
+    }
+
+    /// `rdf:langString` record: `lang_id` folds into the resolved `o_type`,
+    /// so distinct language tags are distinct fact identities.
+    fn lang_rec(s_id: u64, p_id: u32, o_key: u64, lang_id: u16, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            o_kind: ObjKind::LEX_ID.as_u8(),
+            dt: DatatypeDictId::LANG_STRING.as_u16(),
+            lang_id,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    /// Boolean record with an explicit datatype dict id: `resolve` ignores
+    /// `dt` for 1:1 object kinds, so `dt` variants share one fact identity.
+    fn bool_rec(s_id: u64, p_id: u32, o_key: u64, dt: u16, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            o_kind: ObjKind::BOOL.as_u8(),
+            dt,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    fn list_rec(s_id: u64, p_id: u32, o_key: u64, i: u32, t: u32, op: u8) -> RunRecord {
+        RunRecord {
+            i,
+            ..rec(s_id, p_id, o_key, t, op)
+        }
+    }
+
+    fn dedup(records: Vec<RunRecord>) -> Vec<RunRecord> {
+        dedup_fact_lifecycles(records, &OTypeRegistry::builtin_only()).0
+    }
+
+    fn dedup_with_superseded(records: Vec<RunRecord>) -> (Vec<RunRecord>, Vec<RunRecord>) {
+        dedup_fact_lifecycles(records, &OTypeRegistry::builtin_only())
+    }
+
+    /// Field projection for assertions (`RunRecord` has no `Debug`).
+    type RecordKey = (u64, u32, u64, u16, u32, u16, u32, u8);
+
+    fn key(r: &RunRecord) -> RecordKey {
+        (
+            r.s_id.as_u64(),
+            r.p_id,
+            r.o_key,
+            r.dt,
+            r.i,
+            r.lang_id,
+            r.t,
+            r.op,
+        )
+    }
+
+    fn keys(records: &[RunRecord]) -> Vec<RecordKey> {
+        records.iter().map(key).collect()
+    }
+
+    /// Issue #1412: the same fact asserted by two commits in one window must
+    /// dedup to the first assert (the later one is a no-op re-assert), so
+    /// the leaf merge sees each identity at most once.
+    #[test]
+    fn duplicate_asserts_dedup_to_first_assert() {
+        let records = vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 6, OP_ASSERT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+    }
+
+    /// Assert-then-retract of a new fact within one window resolves to the
+    /// retract; without the dedup the leaf merge emits the assert as a row
+    /// and only logs the retract, leaving a ghost row.
+    #[test]
+    fn assert_then_retract_dedups_to_retract() {
+        let records = vec![rec(1, 1, 10, 5, OP_ASSERT), rec(1, 1, 10, 6, OP_RETRACT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+    }
+
+    #[test]
+    fn reassert_after_retract_survives_with_reassert_t() {
+        let records = vec![
+            rec(1, 1, 10, 3, OP_ASSERT),
+            rec(1, 1, 10, 4, OP_RETRACT),
+            rec(1, 1, 10, 5, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+    }
+
+    #[test]
+    fn repeat_retract_keeps_highest_t() {
+        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 6, OP_RETRACT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+    }
+
+    /// Same-`t` ties resolve retract-wins, matching `resolve_overlay_ops` and
+    /// `NoveltyFactState`. Sorted input puts the retract first (op 0 < 1).
+    #[test]
+    fn same_t_retract_beats_assert() {
+        let records = vec![rec(1, 1, 10, 5, OP_RETRACT), rec(1, 1, 10, 5, OP_ASSERT)];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    }
+
+    /// Distinct language tags on `rdf:langString` values are distinct fact
+    /// identities (the tag folds into the resolved `o_type`), so records
+    /// differing only in language must not dedup into each other.
+    #[test]
+    fn distinct_lang_ids_do_not_dedup() {
+        let records = vec![
+            lang_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            lang_rec(1, 1, 10, 2, 5, OP_ASSERT),
+            lang_rec(1, 1, 10, 1, 6, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                lang_rec(1, 1, 10, 1, 5, OP_ASSERT),
+                lang_rec(1, 1, 10, 2, 5, OP_ASSERT),
+            ])
+        );
+    }
+
+    /// V2 identity collapses `dt` for 1:1 object kinds: the same boolean
+    /// value asserted under two datatype IRIs is one fact, and the second
+    /// assert is a no-op re-assert even though the records differ in `dt`.
+    #[test]
+    fn datatype_iri_variants_of_one_value_dedup() {
+        let records = vec![
+            bool_rec(1, 1, 10, 5, 5, OP_ASSERT), // dt slot 5
+            bool_rec(1, 1, 10, 9, 6, OP_ASSERT), // dt slot 9, same V2 identity
+        ];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[bool_rec(1, 1, 10, 5, 5, OP_ASSERT)]));
+    }
+
+    /// A lifecycle can span `dt` variants, and the input sort interleaves
+    /// `dt` before `t`, so the events arrive out of chronological order: the
+    /// retract@6 (dt 2) sorts before the assert@5 (dt 9). The lifecycle must
+    /// still resolve chronologically to the final retract.
+    #[test]
+    fn lifecycle_spans_datatype_variants_out_of_t_order() {
+        let records = vec![
+            bool_rec(1, 1, 10, 2, 6, OP_RETRACT),
+            bool_rec(1, 1, 10, 9, 5, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(keys(&out), keys(&[bool_rec(1, 1, 10, 2, 6, OP_RETRACT)]));
+    }
+
+    /// A stray `lang_id` on a non-langString record does not split identity:
+    /// `resolve` consults `lang_id` only for `rdf:langString`, matching
+    /// `FactKey::from_run_record`'s normalization.
+    #[test]
+    fn stray_lang_on_non_lang_string_does_not_split_identity() {
+        let stray = RunRecord {
+            lang_id: 3,
+            ..rec(1, 1, 10, 5, OP_ASSERT)
+        };
+        let records = vec![stray, rec(1, 1, 10, 6, OP_ASSERT)];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[stray]),
+            "first assert wins; lang ignored"
+        );
+    }
+
+    /// Superseded lifecycle steps come back as transition superseded in
+    /// chronological order; discarded no-ops do not.
+    #[test]
+    fn superseded_events_are_surfaced() {
+        // assert@3 superseded by retract@4, superseded by assert@5.
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 3, OP_ASSERT),
+            rec(1, 1, 10, 4, OP_RETRACT),
+            rec(1, 1, 10, 5, OP_ASSERT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+        assert_eq!(
+            keys(&superseded),
+            keys(&[rec(1, 1, 10, 3, OP_ASSERT), rec(1, 1, 10, 4, OP_RETRACT)])
+        );
+    }
+
+    /// No-op re-asserts are discarded outright, not surfaced as superseded:
+    /// they transition nothing in any base state.
+    #[test]
+    fn noop_reasserts_are_discarded() {
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 5, OP_ASSERT),
+            rec(1, 1, 10, 6, OP_ASSERT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 5, OP_ASSERT)]));
+        assert!(superseded.is_empty());
+    }
+
+    /// A superseded repeat retract is surfaced: whether it or the winner
+    /// was the real transition into absence depends on base state, which the
+    /// leaf merge resolves.
+    #[test]
+    fn superseded_repeat_retract_is_surfaced() {
+        let (winners, superseded) = dedup_with_superseded(vec![
+            rec(1, 1, 10, 5, OP_RETRACT),
+            rec(1, 1, 10, 6, OP_RETRACT),
+        ]);
+        assert_eq!(keys(&winners), keys(&[rec(1, 1, 10, 6, OP_RETRACT)]));
+        assert_eq!(keys(&superseded), keys(&[rec(1, 1, 10, 5, OP_RETRACT)]));
+    }
+
+    /// In-place compaction: records after a collapsed group shift backward
+    /// behind the write cursor without loss or reordering.
+    #[test]
+    fn records_after_a_collapsed_group_shift_back_intact() {
+        let records = vec![
+            bool_rec(1, 1, 10, 5, 5, OP_ASSERT),
+            bool_rec(1, 1, 10, 9, 6, OP_ASSERT), // collapses into the above
+            rec(2, 1, 20, 7, OP_ASSERT),
+            rec(3, 1, 30, 8, OP_RETRACT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                bool_rec(1, 1, 10, 5, 5, OP_ASSERT),
+                rec(2, 1, 20, 7, OP_ASSERT),
+                rec(3, 1, 30, 8, OP_RETRACT),
+            ])
+        );
+    }
+
+    /// The list index `i` is part of fact identity but not of the sort
+    /// comparator: the same value at different list positions must not dedup.
+    #[test]
+    fn distinct_list_indices_do_not_dedup() {
+        let records = vec![
+            list_rec(1, 1, 10, 0, 5, OP_ASSERT),
+            list_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            list_rec(1, 1, 10, 0, 6, OP_ASSERT),
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                list_rec(1, 1, 10, 0, 5, OP_ASSERT),
+                list_rec(1, 1, 10, 1, 5, OP_ASSERT),
+            ])
+        );
+    }
+
+    /// Distinct facts pass through untouched, in input order.
+    #[test]
+    fn distinct_facts_are_preserved_in_order() {
+        let records = vec![
+            rec(1, 1, 10, 5, OP_ASSERT),
+            rec(1, 1, 20, 5, OP_ASSERT),
+            rec(2, 1, 10, 6, OP_RETRACT),
+            rec(3, 2, 30, 7, OP_ASSERT),
+        ];
+        let expected = keys(&records);
+        let out = dedup(records);
+        assert_eq!(keys(&out), expected);
+    }
+
+    /// Winners within one sort-prefix group are emitted in `(t, op)` order so
+    /// the output stays sorted for the V1→V2 conversion and leaf slicing.
+    #[test]
+    fn group_winners_stay_sorted_by_t() {
+        let records = vec![
+            lang_rec(1, 1, 10, 1, 3, OP_ASSERT),  // lang 1: survives at t=3
+            lang_rec(1, 1, 10, 2, 4, OP_ASSERT),  // lang 2: superseded below
+            lang_rec(1, 1, 10, 1, 5, OP_ASSERT),  // lang 1: no-op re-assert
+            lang_rec(1, 1, 10, 2, 6, OP_RETRACT), // lang 2: winner at t=6
+        ];
+        let out = dedup(records);
+        assert_eq!(
+            keys(&out),
+            keys(&[
+                lang_rec(1, 1, 10, 1, 3, OP_ASSERT),
+                lang_rec(1, 1, 10, 2, 6, OP_RETRACT),
+            ])
+        );
+    }
 }

@@ -1086,3 +1086,194 @@ async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
     assert_eq!(stats.distinct_annotations, 1);
     assert_eq!(stats.live_attachment_pairs, 1);
 }
+
+// ============================================================================
+// Insert-flow seal matrix — regression pins for the write-only ingest trap:
+// a background index build racing an annotated insert used to run with
+// "delta unknown" (ledger not resident in the manager), defensively drop
+// the arena, and stamp the sticky bit; an explicit reindex then read a
+// stale NsRecord and rebuilt under Augment with no base arena — leaving
+// `annotation_index = None` permanently. Three fixes pinned here:
+// transient provider load, Augment merge with the previous root's arena,
+// and the post-quiesce record re-fetch in `Fluree::reindex`.
+// ============================================================================
+
+async fn assert_seals(fluree: &fluree_db_api::Fluree, ledger_id: &str, label: &str) {
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(
+        post.snapshot.has_annotations,
+        "{label}: sticky bit after annotated insert"
+    );
+    assert!(
+        post.snapshot.annotation_index.is_some(),
+        "{label}: first reindex must seal the arena"
+    );
+}
+
+#[tokio::test]
+async fn seal_file_backed_small_insert() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fluree: fluree_db_api::Fluree =
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .build()
+            .expect("fluree");
+    let ledger_id = "bisect/file-small:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "file+create_ledger+small").await;
+}
+
+#[tokio::test]
+async fn seal_memory_create_ledger_insert() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "bisect/mem-create:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "memory+create_ledger+small").await;
+}
+
+#[tokio::test]
+async fn seal_memory_lpg_graph_insert() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "bisect/mem-lpg:main";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@graph": [
+                    {"@id": "n0", "@type": "INDEXED", "value": "v0",
+                     "order": {"@id": "n1", "@annotation": {"w": 1}}},
+                    {"@id": "n1", "@type": "INDEXED", "value": "v1",
+                     "related": {"@id": "n0", "@annotation": {"w": 2}}}
+                ],
+                "opts": {"lpgEdgeLifecycle": true}
+            }),
+        )
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "memory+genesis+lpg-graph").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seal_survives_background_index_race() {
+    // Probe-scale: hundreds of annotated edges in one transaction, enough
+    // novelty for the background indexer to race the explicit reindex.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let fluree: fluree_db_api::Fluree =
+        FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+            .build()
+            .expect("fluree");
+    let ledger_id = "bisect/file-large:main";
+    let ledger0 = fluree.create_ledger(ledger_id).await.expect("create");
+    let nodes = 500usize;
+    let graph: Vec<JsonValue> = (0..nodes)
+        .map(|i| {
+            json!({
+                "@id": format!("http://kb.example/node/{i}"),
+                "@type": "INDEXED",
+                "value": format!("http://kb.example/entity/{i}"),
+                "order": {
+                    "@id": format!("http://kb.example/node/{}", (i + 1) % nodes),
+                    "@annotation": {"w": 1}
+                }
+            })
+        })
+        .collect();
+    fluree
+        .insert(
+            ledger0,
+            &json!({"@graph": graph, "opts": {"lpgEdgeLifecycle": true}}),
+        )
+        .await
+        .expect("insert");
+    assert_seals(&fluree, ledger_id, "file+large-lpg-graph").await;
+}
+
+/// Arena-backed probe over a LITERAL reified triple with a VAR object.
+/// The recognized chain accepts a var object; the arena keys literal
+/// edges by (value, dt, lang) exactly as they were written, so the probe
+/// must match them — previously a runtime literal binding dropped the
+/// row (returned nothing) instead of probing.
+#[tokio::test]
+async fn arena_probe_matches_literal_object_annotation() {
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:literal-object";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after_insert = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@id": "ex:alice",
+                        "ex:score": {
+                            "@value": 42,
+                            "@annotation": {"ex:confidence": "high"}
+                        }
+                    }),
+                )
+                .await
+                .expect("literal annotated insert");
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_insert.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            assert!(
+                post.snapshot.annotation_index.is_some(),
+                "arena must be sealed for this test to exercise the probe lane"
+            );
+
+            let sparql = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?score ?conf WHERE {
+                  ex:alice ex:score ?score {| ex:confidence ?conf |} .
+                }
+            ";
+            let result = support::query_sparql(&fluree, &post, sparql)
+                .await
+                .expect("var-object literal annotation query");
+            let rows = result.to_sparql_json(&post.snapshot).expect("sparql json");
+            let bindings = rows["results"]["bindings"]
+                .as_array()
+                .expect("bindings array")
+                .clone();
+            assert_eq!(
+                bindings.len(),
+                1,
+                "the literal reified triple must match via the arena probe: {bindings:#?}"
+            );
+            assert_eq!(bindings[0]["score"]["value"].as_str(), Some("42"));
+            assert_eq!(bindings[0]["conf"]["value"].as_str(), Some("high"));
+        })
+        .await;
+}
