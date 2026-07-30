@@ -128,15 +128,27 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let mut lexer = StreamingLexer::new(input);
         let current_token = lexer.next_token()?;
 
-        // Pre-size caches based on input length. ~20 bytes per token on
-        // average in Turtle, ~3 tokens per unique term → ~60 bytes per
-        // unique term. Cap at 2M to avoid reserving hundreds of MB for
-        // very large chunks.
-        let est_unique = (input.len() / 60).min(2_000_000);
+        // Pre-size the caches for a document with few distinct terms, and let
+        // the rest arrive by growth.
+        //
+        // The estimate this replaces was `input.len()/60` capped at 2M, into
+        // BOTH maps: on a 118 MB document that reserved ~1.97M entries each,
+        // which at hashbrown's load factor is 2 × 4.19M buckets ≈ 210 MB of
+        // empty table before a single token was read. The document it was
+        // measured against has 800K distinct terms, and a document's LENGTH is
+        // not evidence about its distinct-term COUNT — one subject with ten
+        // million properties and ten million subjects are the same number of
+        // bytes and differ by six orders of magnitude in what they need here.
+        //
+        // Growing instead costs a rehash per doubling, ~17 of them on the way
+        // to 800K entries and O(n) in total, which is under the noise floor of
+        // the parse itself (measured: within run-to-run variance on a 4M-triple
+        // corpus). The floor keeps small documents from rehashing at all.
+        const INITIAL_TERM_CACHE: usize = 1024;
         let mut iri_term_cache = FxHashMap::default();
-        iri_term_cache.reserve(est_unique);
+        iri_term_cache.reserve(INITIAL_TERM_CACHE);
         let mut prefixed_term_cache = FxHashMap::default();
-        prefixed_term_cache.reserve(est_unique);
+        prefixed_term_cache.reserve(INITIAL_TERM_CACHE);
 
         Ok(Self {
             current_graph: None,
