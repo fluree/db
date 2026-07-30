@@ -14,6 +14,14 @@
 //! See the Phase 3 plan for full semantics documentation.
 
 mod inner {
+    /// Bytes of ingest-shaped Turtle per distinct term, used to hint the
+    /// parser's term-cache size. Empirical and historical: it is the ratio the
+    /// parser's own unconditional reservation used before that reservation
+    /// became the caller's decision, so passing it here keeps this path's
+    /// memory profile — and the budget formula calibrated against it —
+    /// exactly where it was.
+    const BYTES_PER_DISTINCT_TERM: usize = 60;
+
     use crate::commit_v2::CodecEnvelope;
     use crate::commit_v2::StreamingCommitWriter;
     use crate::error::{Result, TransactError};
@@ -341,11 +349,24 @@ mod inner {
             sink.set_spool_context(spool_ctx);
         }
 
-        fluree_graph_turtle::parse_with_prefixes_base(
+        // Import is the caller that HAS an estimate, so it passes one. The
+        // parser starts small without a hint, which is right for a converter
+        // handed an arbitrary document and wrong here: an import chunk is
+        // ingest-shaped and routinely holds more than a million distinct terms,
+        // where growing the caches by doubling peaks at ~1.5× the final table —
+        // roughly +200 MiB per in-flight chunk at 2M distinct, against a memory
+        // budget calibrated when this reservation was unconditional.
+        //
+        // The ratio is the one that reservation used: ~60 bytes of ingest-shaped
+        // Turtle per distinct term. It is a hint, clamped by the parser, and
+        // wrong only in the direction the old code was already wrong in.
+        let terms_hint = ttl.len() / BYTES_PER_DISTINCT_TERM;
+        fluree_graph_turtle::parse_with_prefixes_base_options(
             ttl,
             &mut sink,
             &prelude.prefixes,
             prelude.base.as_deref(),
+            fluree_graph_turtle::ParserOptions::default().with_distinct_terms_hint(terms_hint),
         )
         .map_err(|e| TransactError::Parse(e.to_string()))?;
         drop(_parse_span);
@@ -977,11 +998,24 @@ mod inner {
             sink.set_spool_context(spool_ctx);
         }
 
-        fluree_graph_turtle::parse_with_prefixes_base(
+        // Import is the caller that HAS an estimate, so it passes one. The
+        // parser starts small without a hint, which is right for a converter
+        // handed an arbitrary document and wrong here: an import chunk is
+        // ingest-shaped and routinely holds more than a million distinct terms,
+        // where growing the caches by doubling peaks at ~1.5× the final table —
+        // roughly +200 MiB per in-flight chunk at 2M distinct, against a memory
+        // budget calibrated when this reservation was unconditional.
+        //
+        // The ratio is the one that reservation used: ~60 bytes of ingest-shaped
+        // Turtle per distinct term. It is a hint, clamped by the parser, and
+        // wrong only in the direction the old code was already wrong in.
+        let terms_hint = ttl.len() / BYTES_PER_DISTINCT_TERM;
+        fluree_graph_turtle::parse_with_prefixes_base_options(
             ttl,
             &mut sink,
             &prelude.prefixes,
             prelude.base.as_deref(),
+            fluree_graph_turtle::ParserOptions::default().with_distinct_terms_hint(terms_hint),
         )
         .map_err(|e| TransactError::Parse(e.to_string()))?;
         drop(_parse_span);
