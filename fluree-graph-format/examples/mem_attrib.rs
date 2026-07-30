@@ -294,7 +294,6 @@ fn main() {
         counting.triples,
         counting.statements,
     );
-    drop(counting);
 
     // Stage 3 — the real writer over a null destination. Everything above plus
     // whatever the writer keeps.
