@@ -24,6 +24,7 @@ set -euo pipefail
 
 require_bash 5 "EPOCHREALTIME (the measurement clock) is a bash 5 builtin"
 require_dot_decimal_clock
+bench_lock_acquire "run-matrix"
 require_cmd jq
 ensure_dirs
 
