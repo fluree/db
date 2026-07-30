@@ -2579,8 +2579,16 @@ fn inline_values_to_pattern(values: &InlineValues) -> Result<Pattern> {
 /// query existing values and generate retractions for them. This implements the
 /// "replace mode" semantics of Upsert.
 ///
-/// Named graph support: retractions are created in the same graph as the insert templates
-/// to ensure proper cancellation with assertions.
+/// Subjects absent from both the persisted subject dictionary and novelty are
+/// skipped without any index query: they cannot have existing values. This
+/// matters because a bound-subject scan for a subject the dictionaries can't
+/// resolve degrades to a full PSOT predicate-partition walk with per-row IRI
+/// decoding (`unresolved_bound_subject_iri` in `BinaryScanOperator`) — for bulk
+/// upserts of new entities that turned staging into minutes of work producing
+/// zero retractions.
+///
+/// Named graph support: retractions are created in the same graph as the insert
+/// templates to ensure proper cancellation with assertions.
 async fn generate_upsert_deletions(
     ledger: &LedgerState,
     txn: &Txn,
@@ -2588,23 +2596,30 @@ async fn generate_upsert_deletions(
     graph_sids: &std::collections::HashMap<u16, Sid>,
 ) -> Result<Vec<fluree_db_core::Flake>> {
     use fluree_db_binary_index::BinaryGraphView;
-    use fluree_db_core::Flake;
+    use fluree_db_core::{Flake, IndexType};
     use fluree_db_query::materializer::JoinKeyMode;
     use fluree_db_query::{BinaryRangeProvider, Materializer};
 
-    // Collect unique (subject, predicate, graph_id) tuples from insert templates
-    // Include graph_id to ensure retractions are created in the correct graph
-    let mut spg_tuples: HashSet<(Sid, Sid, Option<u16>)> = HashSet::new();
+    // Group deduplicated predicates by (subject, graph_id) so subject existence
+    // is resolved once per subject rather than once per (subject, predicate).
+    let mut subject_groups: HashMap<(Sid, Option<u16>), Vec<Sid>> = HashMap::new();
     for template in &txn.insert_templates {
         if let (TemplateTerm::Sid(s), TemplateTerm::Sid(p)) =
             (&template.subject, &template.predicate)
         {
-            spg_tuples.insert((s.clone(), p.clone(), template.graph_id));
+            subject_groups
+                .entry((s.clone(), template.graph_id))
+                .or_default()
+                .push(p.clone());
         }
         // Variables and blank nodes are skipped - we can't query for them
     }
+    for predicates in subject_groups.values_mut() {
+        predicates.sort_unstable();
+        predicates.dedup();
+    }
 
-    if spg_tuples.is_empty() {
+    if subject_groups.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -2618,65 +2633,86 @@ async fn generate_upsert_deletions(
     let binary_store = brp_ref.map(|brp| Arc::clone(brp.store()));
     let dict_novelty = brp_ref.map(|brp| Arc::clone(brp.dict_novelty()));
 
+    // IMPORTANT: `TripleTemplate.graph_id` is a transaction-local ID.
+    // It must be translated to a ledger-stable GraphId before we can query
+    // the correct per-graph index partition.
+    //
+    // txn_local_g_id -> graph IRI (txn.graph_delta) -> ledger g_id (GraphRegistry)
+    // None in the value position means the graph is not yet in the ledger
+    // registry (new graph in this txn), so there cannot be existing values.
+    let ledger_g_for_txn_g: HashMap<Option<u16>, Option<u16>> = subject_groups
+        .keys()
+        .map(|(_, txn_g)| *txn_g)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .map(|txn_g| {
+            let ledger_g = match txn_g {
+                None => Some(0),
+                Some(tg) => txn
+                    .graph_delta
+                    .get(&tg)
+                    .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(iri)),
+            };
+            (txn_g, ledger_g)
+        })
+        .collect();
+
+    // Novelty presence, resolved lazily: the per-graph set is built by a
+    // filtered overlay walk only when a subject misses the base dictionary
+    // (see the skip below), so upserts whose subjects all resolve in the
+    // persisted dictionary never pay it. The walk is O(novelty flakes in the
+    // graph), and novelty is bounded by `reindex_max_bytes` — up to 20% of
+    // system RAM when indexing lags — which is why it runs at most once per
+    // graph, and only on demand. It is authoritative in Sid space, needing
+    // no dictionary translation.
+    let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
+    if binary_store.is_some() {
+        for (subject, txn_g) in subject_groups.keys() {
+            if let Some(Some(ledger_g)) = ledger_g_for_txn_g.get(txn_g) {
+                per_g_subjects.entry(*ledger_g).or_default().insert(subject);
+            }
+        }
+    }
+    let mut novelty_present: HashMap<u16, HashSet<Sid>> = HashMap::new();
+
+    // Persisted presence: the subject reverse dictionary is authoritative under
+    // canonical namespace encoding (see `fluree_db_core::ns_encoding`) — a miss
+    // on both the (ns_code, suffix) key and the full-IRI key means the subject
+    // has no rows in the base index. Lookup errors fall back to "present" so the
+    // per-predicate query surfaces the real failure.
+    let subject_in_base = |subject: &Sid| -> bool {
+        let Some(store) = binary_store.as_deref() else {
+            return true;
+        };
+        if matches!(
+            store.find_subject_id_by_parts(subject.namespace_code, &subject.name),
+            Ok(Some(_))
+        ) {
+            return true;
+        }
+        match ledger.snapshot.decode_sid(subject) {
+            Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
+            None => true,
+        }
+    };
+
     let mut retractions = Vec::new();
+    let mut skipped_subjects = 0usize;
 
     // Query existing values for each (subject, predicate, graph) tuple
     let mut query_vars = VarRegistry::new();
     let o_var = query_vars.get_or_insert("?o");
 
-    for (subject, predicate, graph_id) in spg_tuples {
-        // IMPORTANT: `TripleTemplate.graph_id` is a transaction-local ID.
-        // It must be translated to a ledger-stable GraphId before we can query
-        // the correct per-graph index partition.
-        //
-        // txn_local_g_id -> graph IRI (txn.graph_delta) -> ledger g_id (GraphRegistry)
-        let ledger_g_id: Option<u16> = graph_id.and_then(|txn_g_id| {
-            txn.graph_delta
-                .get(&txn_g_id)
-                .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(iri))
-        });
+    for ((subject, graph_id), predicates) in &subject_groups {
+        let ledger_g_id: Option<u16> = ledger_g_for_txn_g.get(graph_id).copied().flatten();
 
-        // Query: <subject> <predicate> ?o
-        let pattern = TriplePattern::new(
-            Ref::Sid(subject.clone()),
-            Ref::Sid(predicate.clone()),
-            Term::Var(o_var),
-        );
-
-        let batches = if graph_id.is_some() {
-            // Named graph: translate txn-local g_id to ledger g_id before querying.
-            match ledger_g_id {
-                None => {
-                    // Graph is not yet in the ledger registry (new graph in this txn),
-                    // so there cannot be existing values to retract.
-                    Vec::new()
-                }
-                Some(g_id) => {
-                    if ledger.snapshot.range_provider.is_some() {
-                        fluree_db_query::execute_pattern(
-                            ledger.as_graph_db_ref(g_id),
-                            &query_vars,
-                            pattern,
-                        )
-                        .await?
-                    } else {
-                        // No binary store available (genesis / not indexed): scan novelty directly.
-                        query_novelty_for_graph(ledger, &subject, &predicate, g_id, o_var)
-                    }
-                }
-            }
-        } else {
-            // Default graph: use standard query path through range_provider
-            fluree_db_query::execute_pattern(ledger.as_graph_db_ref(0), &query_vars, pattern)
-                .await?
-        };
-
-        // Convert each result to a retraction flake in the appropriate graph.
-        // Here we use the txn-local g_id to look up the graph Sid (flake.g).
+        // Retraction flakes carry the graph Sid (flake.g), looked up by the
+        // txn-local g_id. Resolved before any skip so broken graph delta/sid
+        // wiring still surfaces as an error.
         let graph_sid: Option<Sid> = match graph_id {
             None => None,
             Some(txn_g_id) => Some(
-                graph_sids.get(&txn_g_id).cloned().ok_or_else(|| {
+                graph_sids.get(txn_g_id).cloned().ok_or_else(|| {
                     TransactError::FlakeGeneration(format!(
                         "upsert deletion generation references graph_id {txn_g_id} but no graph Sid was provided; \
                          this indicates a bug in graph delta/sid wiring"
@@ -2685,10 +2721,44 @@ async fn generate_upsert_deletions(
             ),
         };
 
+        // Named graph not yet in the ledger registry: nothing to retract.
+        if graph_id.is_some() && ledger_g_id.is_none() {
+            continue;
+        }
+        let effective_g_id = ledger_g_id.unwrap_or(0);
+
+        // Skip subjects with no persisted or novelty presence entirely. The
+        // base dictionary is a point probe, so it is consulted first; the
+        // per-graph novelty set is built on the first dictionary miss only.
+        if binary_store.is_some() && !subject_in_base(subject) {
+            let present = novelty_present.entry(effective_g_id).or_insert_with(|| {
+                let mut set = HashSet::new();
+                if let Some(subjects) = per_g_subjects.get(&effective_g_id) {
+                    ledger.novelty.for_each_overlay_flake(
+                        effective_g_id,
+                        IndexType::Spot,
+                        None,
+                        None,
+                        true,
+                        ledger.t(),
+                        &mut |flake| {
+                            if subjects.contains(&flake.s) && !set.contains(&flake.s) {
+                                set.insert(flake.s.clone());
+                            }
+                        },
+                    );
+                }
+                set
+            });
+            if !present.contains(subject) {
+                skipped_subjects += 1;
+                continue;
+            }
+        }
+
         // Create a materializer for this graph context if a binary store exists.
         // BinaryGraphView::with_novelty handles watermark routing internally,
         // so novelty-only string/subject IDs resolve correctly.
-        let effective_g_id = ledger_g_id.unwrap_or(0);
         let mut materializer = binary_store.as_ref().map(|store| {
             let view = BinaryGraphView::with_novelty(
                 Arc::clone(store),
@@ -2698,38 +2768,71 @@ async fn generate_upsert_deletions(
             Materializer::new(view, JoinKeyMode::SingleLedger)
         });
 
-        for batch in &batches {
-            for row in 0..batch.len() {
-                let flake_obj = batch
-                    .get(row, o_var)
-                    .and_then(|b| binding_to_flake_object(b, materializer.as_mut()));
-                if let Some((o, dt)) = flake_obj {
-                    let flake = match graph_sid.clone() {
-                        Some(g) => Flake::new_in_graph(
-                            g,
-                            subject.clone(),
-                            predicate.clone(),
-                            o,
-                            dt,
-                            new_t,
-                            false, // retraction
-                            None,
-                        ),
-                        None => Flake::new(
-                            subject.clone(),
-                            predicate.clone(),
-                            o,
-                            dt,
-                            new_t,
-                            false, // retraction
-                            None,
-                        ),
-                    };
-                    retractions.push(flake);
+        for predicate in predicates {
+            // Query: <subject> <predicate> ?o
+            let pattern = TriplePattern::new(
+                Ref::Sid(subject.clone()),
+                Ref::Sid(predicate.clone()),
+                Term::Var(o_var),
+            );
+
+            let batches = if graph_id.is_some() {
+                if ledger.snapshot.range_provider.is_some() {
+                    fluree_db_query::execute_pattern(
+                        ledger.as_graph_db_ref(effective_g_id),
+                        &query_vars,
+                        pattern,
+                    )
+                    .await?
+                } else {
+                    // No binary store available (genesis / not indexed): scan novelty directly.
+                    query_novelty_for_graph(ledger, subject, predicate, effective_g_id, o_var)
+                }
+            } else {
+                // Default graph: use standard query path through range_provider
+                fluree_db_query::execute_pattern(ledger.as_graph_db_ref(0), &query_vars, pattern)
+                    .await?
+            };
+
+            for batch in &batches {
+                for row in 0..batch.len() {
+                    let flake_obj = batch
+                        .get(row, o_var)
+                        .and_then(|b| binding_to_flake_object(b, materializer.as_mut()));
+                    if let Some((o, dt)) = flake_obj {
+                        let flake = match graph_sid.clone() {
+                            Some(g) => Flake::new_in_graph(
+                                g,
+                                subject.clone(),
+                                predicate.clone(),
+                                o,
+                                dt,
+                                new_t,
+                                false, // retraction
+                                None,
+                            ),
+                            None => Flake::new(
+                                subject.clone(),
+                                predicate.clone(),
+                                o,
+                                dt,
+                                new_t,
+                                false, // retraction
+                                None,
+                            ),
+                        };
+                        retractions.push(flake);
+                    }
                 }
             }
         }
     }
+
+    tracing::debug!(
+        subject_count = subject_groups.len(),
+        skipped_subjects,
+        "upsert deletion subject pre-check"
+    );
 
     Ok(retractions)
 }

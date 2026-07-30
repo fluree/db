@@ -258,6 +258,11 @@ pub struct BinaryIndexStore {
     ns_split_mode: NsSplitMode,
     /// Whether `set_ns_split_mode` was called. Debug-asserted on first encode.
     ns_split_mode_set: bool,
+    /// Lazily-built persisted `p_id → Sid` table, shared by scan operators.
+    /// Initialized on first query use — always after load-time `&mut`
+    /// configuration (`set_ns_split_mode`, namespace augmentation), which
+    /// cannot occur once the store is behind `Arc`.
+    p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
 }
 
 impl BinaryIndexStore {
@@ -382,6 +387,7 @@ impl BinaryIndexStore {
             lex_sorted_string_ids: root.lex_sorted_string_ids,
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
+            p_sid_table: std::sync::OnceLock::new(),
         })
     }
 
@@ -1447,6 +1453,25 @@ impl BinaryIndexStore {
     /// Resolve a predicate ID to its IRI.
     pub fn resolve_predicate_iri(&self, p_id: u32) -> Option<&str> {
         self.dicts.predicates.resolve(p_id)
+    }
+
+    /// Shared persisted `p_id → Sid` table, built once per store on first use.
+    ///
+    /// Scan opens previously rebuilt this table (one dictionary resolve +
+    /// namespace encode per predicate) on every call — a fixed cost
+    /// proportional to the ledger's predicate count that dominated
+    /// bound-subject point lookups.
+    pub fn p_sid_table(&self) -> &Arc<[Sid]> {
+        self.p_sid_table.get_or_init(|| {
+            let mut table = Vec::new();
+            for p_id in 0u32.. {
+                match self.resolve_predicate_iri(p_id) {
+                    Some(iri) => table.push(self.encode_iri(iri)),
+                    None => break,
+                }
+            }
+            table.into()
+        })
     }
 
     /// Lookup a predicate IRI → p_id.
@@ -3039,6 +3064,7 @@ mod tests {
             lex_sorted_string_ids: false,
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
+            p_sid_table: std::sync::OnceLock::new(),
         }
     }
 
