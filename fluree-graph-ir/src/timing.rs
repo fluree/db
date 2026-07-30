@@ -88,6 +88,17 @@ pub enum Phase {
     Read,
     /// Decoding a compression layer (`.gz`, `.zst`) off those bytes.
     Decompress,
+    /// Cutting the document into independently-parseable chunks.
+    ///
+    /// Single-threaded and whole-document, so it is the parallel path's Amdahl
+    /// term: it runs to completion before the first worker starts and no
+    /// thread count touches it. It exists only when the run chunks — a serial
+    /// run reports zero.
+    ///
+    /// It has its own lane because it went unattributed for a whole bucket and
+    /// turned out to be 43% of the wall at 16 threads. Time that no lane owns
+    /// is time nobody optimizes.
+    Chunk,
     /// Lexing and parsing the decoded text into sink events.
     Parse,
     /// Parse time summed across parallel workers.
@@ -113,9 +124,10 @@ pub enum Phase {
 
 impl Phase {
     /// Every phase, in pipeline order. Report ordering follows this.
-    pub const ALL: [Phase; 8] = [
+    pub const ALL: [Phase; 9] = [
         Phase::Read,
         Phase::Decompress,
+        Phase::Chunk,
         Phase::Parse,
         Phase::Workers,
         Phase::Reassembly,
@@ -135,7 +147,7 @@ impl Phase {
     /// of them to a pipeline total would claim more time than the run took,
     /// and the gap that is supposed to reveal unmeasured work would saturate
     /// to zero and reveal nothing.
-    pub const SEQUENTIAL: [Phase; 3] = [Phase::Read, Phase::Decompress, Phase::Parse];
+    pub const SEQUENTIAL: [Phase; 4] = [Phase::Read, Phase::Decompress, Phase::Chunk, Phase::Parse];
 
     /// Whether this phase runs inside another rather than beside it.
     pub fn is_nested(self) -> bool {
@@ -147,6 +159,7 @@ impl Phase {
         match self {
             Phase::Read => "read",
             Phase::Decompress => "decompress",
+            Phase::Chunk => "chunk",
             Phase::Parse => "parse",
             Phase::Workers => "workers",
             Phase::Reassembly => "reassembly",
@@ -160,12 +173,13 @@ impl Phase {
         match self {
             Phase::Read => 0,
             Phase::Decompress => 1,
-            Phase::Parse => 2,
-            Phase::Workers => 3,
-            Phase::Reassembly => 4,
-            Phase::Sink => 5,
-            Phase::Serialize => 6,
-            Phase::Write => 7,
+            Phase::Chunk => 2,
+            Phase::Parse => 3,
+            Phase::Workers => 4,
+            Phase::Reassembly => 5,
+            Phase::Sink => 6,
+            Phase::Serialize => 7,
+            Phase::Write => 8,
         }
     }
 }

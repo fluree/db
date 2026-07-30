@@ -138,10 +138,17 @@ pub fn run(common: &RdfCommonArgs, args: &ConvertArgs<'_>, quiet: bool) -> CliRe
     // Plan §1.4 specifies the fallback; aborting was the wrong reading.
     let mut plan = plan;
     let chunked = plan.workers.and_then(|workers| {
-        match fluree_graph_turtle::splitter::chunk_in_memory(
+        // Its own lane. This is a whole-document single-threaded pass that runs
+        // before the first worker starts, so it is the parallel path's Amdahl
+        // term — and while it had no lane it landed in `unattributed_ns`, where
+        // it went unnoticed at 43% of the wall.
+        timings.enter(Phase::Chunk);
+        let split = fluree_graph_turtle::splitter::chunk_in_memory(
             &loaded.text,
             ParallelConfig::for_input(workers, loaded.text.len()).chunk_bytes,
-        ) {
+        );
+        timings.enter(Phase::Parse);
+        match split {
             Ok(split) => Some((workers, split)),
             Err(e) => {
                 plan = ParallelPlan::serial(match e {

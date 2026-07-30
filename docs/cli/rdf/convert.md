@@ -293,6 +293,14 @@ Parallelism trades memory for threads: in-flight chunks are bounded, so peak
 usage is roughly `(threads + queue) × chunk output size` rather than the whole
 output.
 
+Before any worker starts, the document is scanned once, single-threaded, to
+find the statement boundaries it can be cut at. That scan is the floor on what
+parallelism can achieve — no thread count reduces it — and it is reported as
+the `chunk` phase, so when sixteen threads do not divide your wall clock by
+sixteen, the profile says how much of the answer is this pass. It is a single
+sweep over the input at scan speed rather than a parse, which on ordinary
+hardware puts it well under a second for a corpus of a few hundred megabytes.
+
 `--profile` reports `threads_used` and a `parallel_reason`, so a run that fell
 back to serial says why. It also records the machine's 1-minute load average
 next to the core count, and prints a `LOADED` line when the average exceeds the

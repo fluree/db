@@ -2582,6 +2582,22 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
     assert!(phases.contains(&"workers"), "phases: {phases:?}");
     assert!(phases.contains(&"reassembly"), "phases: {phases:?}");
 
+    // The pre-scan must be visible and must have fired. A lane that exists but
+    // reports nothing is how 43% of the wall went unattributed for a whole
+    // bucket, so "the lane is present" is not enough to assert.
+    assert!(phases.contains(&"chunk"), "phases: {phases:?}");
+    let chunk_ns = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase"] == "chunk")
+        .and_then(|p| p["ns"].as_u64())
+        .unwrap();
+    assert!(
+        chunk_ns > 0,
+        "the chunk lane reported zero on a chunked run"
+    );
+
     // Worker time is a cross-thread sum, so it may exceed wall — and must not
     // have been folded into the sequential total.
     let unattributed = v["unattributed_ns"].as_u64().unwrap();
@@ -2590,6 +2606,44 @@ fn the_profile_reports_the_parallel_decision_and_its_phases() {
         unattributed <= wall,
         "unattributed {unattributed} > wall {wall}"
     );
+    // And the pre-scan is no longer hiding inside it: what the chunker costs
+    // now has a name.
+    assert!(
+        unattributed < chunk_ns,
+        "unattributed {unattributed} did not shrink below the chunk lane {chunk_ns} — \
+         the scan is still being charged to nobody"
+    );
+}
+
+#[test]
+fn a_serial_run_reports_no_chunk_phase() {
+    // The lane is not decoration: the serial path never chunks, so the phase
+    // must be absent rather than reported as a suspicious zero.
+    let tmp = TempDir::new().unwrap();
+    let input = fixture(&tmp, "big.ttl", &parallel_corpus(60_000));
+    let out = tmp.path().join("out.nt");
+
+    let stderr = rdf_cmd()
+        .args(["--parallelism", "1", "-q", "rdf", "convert"])
+        .arg(&input)
+        .args(["--to", "nt"])
+        .arg("-o")
+        .arg(&out)
+        .args(["--profile=json", "--no-hash"])
+        .assert()
+        .success()
+        .get_output()
+        .stderr
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+
+    let phases: Vec<&str> = v["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["phase"].as_str().unwrap())
+        .collect();
+    assert!(!phases.contains(&"chunk"), "phases: {phases:?}");
 }
 
 // ============================================================================
